@@ -9,6 +9,7 @@ import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
   MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -74,6 +75,11 @@ export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
+
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
 
 // agent_skill_write result
 export type AgentSkillWriteToolResult =
@@ -171,6 +177,12 @@ export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
 
+// Session-history tool types, derived from schema (avoid drift)
+export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
+export type SessionHistoryToolResult = z.infer<
+  typeof TOOL_DEFINITIONS.session_history.resultSchema
+>;
+
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
 export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
@@ -267,7 +279,6 @@ export const EDIT_FAILED_NOTE_PREFIX = "EDIT FAILED - file was NOT modified.";
 export const NOTE_READ_FILE_RETRY = "Read the file to get current content, then retry.";
 export const NOTE_READ_FILE_FIRST_RETRY =
   "Read the file first to get the exact current content, then retry.";
-export const NOTE_READ_FILE_AGAIN_RETRY = "Read the file again and retry.";
 
 /**
  * Tool description warning for file edit tools

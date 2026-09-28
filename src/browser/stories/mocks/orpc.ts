@@ -12,6 +12,7 @@ import type {
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
 import type { APIClient } from "@/browser/contexts/API";
+import { createMockReviewStateApi } from "./reviewState";
 import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
@@ -41,7 +42,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
-import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
+import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
@@ -81,6 +82,10 @@ import {
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
@@ -166,6 +171,8 @@ export interface MockORPCClientOptions {
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
+  /** Initial keep-screen-awake toggle for config.getConfig */
+  keepScreenAwake?: boolean;
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
@@ -176,6 +183,8 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
+  autoModelRouting?: AutoModelRoutingConfig;
   /**
    * Pre-seeded goal-board snapshots per workspaceId. Stories that want
    * the GoalTab's Upcoming / Completed / Archived sections to render
@@ -268,11 +277,10 @@ export interface MockORPCClientOptions {
       toolAllowlist?: Record<string, string[]>;
     }
   >;
-  /** MCP test results - maps server name to tools list or error */
-  mcpTestResults?: Map<
-    string,
-    { success: true; tools: string[] } | { success: false; error: string }
-  >;
+  /** MCP test results - maps server name to tools list (optionally with serverInfo) or error */
+  mcpTestResults?: Map<string, MockMcpTestResult>;
+  /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
+  mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
   listBranches?: (input: {
     projectPath: string;
@@ -360,7 +368,9 @@ interface MockMcpOverrides {
   toolAllowlist?: Record<string, string[]>;
 }
 
-type MockMcpTestResult = { success: true; tools: string[] } | { success: false; error: string };
+type MockMcpTestResult =
+  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
+  | { success: false; error: string };
 
 /**
  * Creates a mock ORPC client for Storybook.
@@ -371,7 +381,7 @@ type MockMcpTestResult = { success: true; tools: string[] } | { success: false; 
  *   projects: new Map([...]),
  *   workspaces: [...],
  *   onChat: (wsId, emit) => {
- *     emit({ type: "caught-up" });
+ *     emit({ type: "caught-up", historyReplayStatus: "complete" });
  *     // optionally return cleanup function
  *   },
  * });
@@ -409,6 +419,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
     mcpTestResults = new Map<string, MockMcpTestResult>(),
+    mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
@@ -416,11 +427,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
+    keepScreenAwake: initialKeepScreenAwake = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
     memoryFiles = [],
@@ -464,6 +477,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   const projects = new Map(providedProjects);
   const workspaceMap = new Map(workspaces.map((w) => [w.id, w]));
+  // Metadata pushes for handlers that change persisted workspace settings (mirrors the
+  // backend's emitCurrentWorkspaceMetadata so metadata-driven controls update in stories).
+  interface MetadataEvent {
+    workspaceId: string;
+    metadata: FrontendWorkspaceMetadata | null;
+  }
+  const metadataListeners = new Set<(event: MetadataEvent) => void>();
+  const publishWorkspaceMetadata = (metadata: FrontendWorkspaceMetadata) => {
+    workspaceMap.set(metadata.id, metadata);
+    for (const listener of metadataListeners) {
+      listener({ workspaceId: metadata.id, metadata });
+    }
+  };
 
   // Terminal sessions are used by RightSidebar and TerminalView.
   // Stories can seed deterministic sessions (with screenState) to make the embedded terminal look
@@ -554,6 +580,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
+  let keepScreenAwake = initialKeepScreenAwake;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -567,6 +594,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
+  let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
   let routeOverrides = { ...initialRouteOverrides };
   const configChangeSubscribers = new Set<(value: void) => void>();
@@ -799,9 +827,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
+          autoModelRouting,
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
+          keepScreenAwake,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -847,6 +877,40 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
+      updateAutoModelRouting: (input: { autoModelRouting: unknown }) => {
+        autoModelRouting = normalizeAutoModelRoutingConfig(input.autoModelRouting);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      getAutoModelRoutingEvaluationStatus: (input?: { evaluationModel?: string }) =>
+        Promise.resolve({
+          evaluationModel: input?.evaluationModel ?? autoModelRouting.evaluationModel,
+          available: true,
+        }),
+      previewAutoModelRouting: (input: { prompt: string; config?: AutoModelRoutingConfig }) => {
+        // Deterministic stand-in for the evaluation model: longer prompts land on later tiers.
+        const { tiers } = input.config ?? autoModelRouting;
+        const index = Math.min(tiers.length - 1, Math.floor(input.prompt.length / 40));
+        const chosen = tiers[index];
+        const probabilities = Object.fromEntries(
+          tiers.map((tier, tierIndex) => [
+            tier.id,
+            tierIndex === index ? 0.7 : 0.3 / (tiers.length - 1),
+          ])
+        );
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            tierId: chosen.id,
+            tierLabel: chosen.label,
+            confidence: 0.7,
+            probabilities,
+            evaluationModel: input.config?.evaluationModel ?? autoModelRouting.evaluationModel,
+            ...(chosen.model != null ? { model: chosen.model } : {}),
+            ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+          },
+        });
+      },
       updateMuxGatewayPrefs: (input: {
         muxGatewayEnabled: boolean;
         muxGatewayModels: string[];
@@ -867,6 +931,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateChatTranscriptFullWidth: (input: { enabled: boolean }) => {
         chatTranscriptFullWidth = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateKeepScreenAwake: (input: { enabled: boolean }) => {
+        keepScreenAwake = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -1032,6 +1101,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providers: {
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
+      discoverModels: () => Promise.resolve({ status: "unsupported" }),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
@@ -1224,6 +1294,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         // Default: return empty tools.
         return Promise.resolve({ success: true, tools: [] });
       },
+      icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
+      icons: (input: { iconRefs: string[] }) =>
+        Promise.resolve(
+          Object.fromEntries(
+            input.iconRefs.map((iconRef) => [iconRef, mcpIcons.get(iconRef) ?? null])
+          )
+        ),
       setEnabled: (input: { name: string; enabled: boolean }) => {
         const server = globalMcpServersState[input.name];
         if (server) {
@@ -1687,8 +1764,39 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           success: true,
           data: { previousEnabled: true, enabled: true },
         }),
-      getStartupAutoRetryModel: () => Promise.resolve({ success: true, data: null }),
-      setAutoCompactionThreshold: () => Promise.resolve({ success: true, data: undefined }),
+      setUnrelatedWorkspaceConsent: (input: { workspaceId: string; enabled: boolean }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same generation rules as the backend: off deletes, off→on mints, on→on retains.
+        const { unrelatedWorkspaceConsent: _previous, ...rest } = current;
+        const next: FrontendWorkspaceMetadata = input.enabled
+          ? {
+              ...rest,
+              unrelatedWorkspaceConsent:
+                current.unrelatedWorkspaceConsent ??
+                `mock-consent-${workspaceMap.size}-${Date.now()}`,
+            }
+          : rest;
+        publishWorkspaceMetadata(next);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      setAgentMessageDispatchMode: (input: {
+        workspaceId: string;
+        mode: "tool-end" | "turn-end";
+      }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same storage rule as the backend: the tool-end default is an absent field.
+        const { agentMessageDispatchMode: _previous, ...rest } = current;
+        publishWorkspaceMetadata(
+          input.mode === "turn-end" ? { ...rest, agentMessageDispatchMode: "turn-end" } : rest
+        );
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
@@ -1736,7 +1844,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         if (!onChat) {
           // Default mock behavior: subscriptions should remain open.
           // If this ends, WorkspaceStore will retry and reset state, which flakes stories.
-          const caughtUp: WorkspaceChatMessage = { type: "caught-up", hasOlderHistory: false };
+          const caughtUp: WorkspaceChatMessage = {
+            type: "caught-up",
+            historyReplayStatus: "complete",
+            hasOlderHistory: false,
+          };
           yield caughtUp;
 
           await new Promise<void>((resolve) => {
@@ -1762,9 +1874,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
       },
       onMetadata: async function* () {
-        // No metadata updates in the mock, but keep the subscription open.
-        yield* [];
-        await new Promise<void>(() => undefined);
+        // Deliver pushes from settings handlers; otherwise keep the subscription open.
+        const queue: MetadataEvent[] = [];
+        let wake: (() => void) | null = null;
+        const listener = (event: MetadataEvent) => {
+          queue.push(event);
+          wake?.();
+        };
+        metadataListeners.add(listener);
+        try {
+          while (true) {
+            while (queue.length > 0) {
+              yield queue.shift()!;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+            wake = null;
+          }
+        } finally {
+          metadataListeners.delete(listener);
+        }
       },
       activity: {
         list: () => Promise.resolve(workspaceActivitySnapshots),
@@ -1805,6 +1935,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         },
         sendToBackground: () => Promise.resolve({ success: true, data: undefined }),
       },
+      reviewState: createMockReviewStateApi(),
       stats: {
         subscribe: async function* (input: { workspaceId: string }) {
           const snapshot = workspaceStatsSnapshots.get(input.workspaceId);

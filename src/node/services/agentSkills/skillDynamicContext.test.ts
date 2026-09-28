@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  extractSkillDynamicCommands,
   injectSkillDynamicContext,
   MAX_SKILL_DYNAMIC_COMMANDS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
@@ -12,47 +11,32 @@ function okExec(stdout: string): SkillDynamicExecResult {
   return { stdout, stderr: "", exitCode: 0 };
 }
 
-describe("extractSkillDynamicCommands", () => {
-  test("matches whole-line directives including surrounding whitespace", () => {
-    const body = ["Intro", "!`git status`", "  !`git log -1`  ", "Outro"].join("\n");
-    expect(extractSkillDynamicCommands(body)).toEqual(["git status", "git log -1"]);
-  });
-
-  test("ignores mid-line and inline directives", () => {
-    const body = [
+describe("injectSkillDynamicContext", () => {
+  test("executes only whole-line directives, including surrounding whitespace", async () => {
+    const literalLines = [
       "Run !`git status` before continuing.",
       "prefix !`echo hi`",
       "!`echo hi` suffix",
-    ].join("\n");
-    expect(extractSkillDynamicCommands(body)).toEqual([]);
-  });
-
-  test("ignores lines that merely contain backticks or are malformed", () => {
-    const body = [
       "`git status`",
       "! `git status`",
       "!``",
       "!`unterminated",
       "!`nested ` backtick`",
       "plain text",
-    ].join("\n");
-    expect(extractSkillDynamicCommands(body)).toEqual([]);
+    ];
+    const executed: string[] = [];
+    const result = await injectSkillDynamicContext({
+      body: [...literalLines, "  !`git log -1`  "].join("\n"),
+      execute: (command) => {
+        executed.push(command);
+        return Promise.resolve(okExec("x"));
+      },
+    });
+
+    expect(executed).toEqual(["git log -1"]);
+    expect(result.body.split("\n").slice(0, literalLines.length)).toEqual(literalLines);
   });
 
-  test("caps extraction at the directive limit", () => {
-    const body = Array.from({ length: 15 }, (_, i) => `!\`echo ${i}\``).join("\n");
-    const commands = extractSkillDynamicCommands(body);
-    expect(commands).toHaveLength(MAX_SKILL_DYNAMIC_COMMANDS);
-    expect(commands[0]).toBe("echo 0");
-    expect(commands[commands.length - 1]).toBe(`echo ${MAX_SKILL_DYNAMIC_COMMANDS - 1}`);
-  });
-
-  test("returns empty for a body without directives", () => {
-    expect(extractSkillDynamicCommands("just text\nmore text")).toEqual([]);
-  });
-});
-
-describe("injectSkillDynamicContext", () => {
   test("replaces a directive line with a labeled fenced output block", async () => {
     const result = await injectSkillDynamicContext({
       body: "Before\n!`git status`\nAfter",

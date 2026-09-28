@@ -3,7 +3,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { createTaskStopTool } from "./task_stop";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { TaskService } from "@/node/services/taskService";
 import { Err, Ok, type Result } from "@/common/types/result";
 
@@ -169,13 +169,13 @@ describe("task_stop tool", () => {
         Promise.resolve(Ok({ workspaceId: "child-workspace" }))
     );
     const taskService = {
-      interruptWorkspaceTurn,
       stopDescendantAgentTask: mock(() => {
         throw new Error("workspace turn IDs must not reach agent task termination");
       }),
     } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ interruptWorkspaceTurn });
 
-    const tool = createTaskStopTool({ ...baseConfig, taskService });
+    const tool = createTaskStopTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["wst_turn"] }, mockToolCallOptions)
@@ -190,6 +190,35 @@ describe("task_stop tool", () => {
           note: "Workspace turn stopped. The workspace is preserved for future messages.",
         },
       ],
+    });
+  });
+
+  it("reports a workspace turn handle owned by another workspace as invalid_scope", async () => {
+    using tempDir = new TestTempDir("test-task-terminate-foreign-workspace-turn");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+
+    // WorkspaceTurnManager.interruptWorkspaceTurn resolves handles only in the caller's own
+    // ownership store; a handle another workspace owns is indistinguishable from a missing one.
+    const interruptWorkspaceTurn = mock(
+      (): Promise<Result<{ workspaceId: string }, string>> =>
+        Promise.resolve(Err("Workspace turn not found or out of scope"))
+    );
+    const taskService = {
+      stopDescendantAgentTask: mock(() => {
+        throw new Error("workspace turn IDs must not reach agent task termination");
+      }),
+    } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ interruptWorkspaceTurn });
+
+    const tool = createTaskStopTool({ ...baseConfig, taskService, workspaceTurnManager });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["wst_foreign"] }, mockToolCallOptions)
+    );
+
+    expect(interruptWorkspaceTurn).toHaveBeenCalledWith("root-workspace", "wst_foreign");
+    expect(result).toEqual({
+      results: [{ status: "invalid_scope", taskId: "wst_foreign" }],
     });
   });
 

@@ -93,6 +93,8 @@ function updateAgentDefaultEntry(
     !updated.modelString &&
     !updated.thinkingLevel &&
     !updated.reasoningMode &&
+    updated.autoModelRouting === undefined &&
+    updated.autoThinkingLevel === undefined &&
     updated.enabled === undefined &&
     updated.advisorEnabled === undefined &&
     updated.subagent === undefined
@@ -284,6 +286,12 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
     if ((aEntry?.reasoningMode ?? undefined) !== (bEntry?.reasoningMode ?? undefined)) {
       return false;
     }
+    if ((aEntry?.autoModelRouting ?? undefined) !== (bEntry?.autoModelRouting ?? undefined)) {
+      return false;
+    }
+    if ((aEntry?.autoThinkingLevel ?? undefined) !== (bEntry?.autoThinkingLevel ?? undefined)) {
+      return false;
+    }
     if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
       return false;
     }
@@ -315,6 +323,8 @@ interface AiDefaultsControlsProps {
   hiddenModelsForSelector: string[];
   inheritLabel?: string;
   showThinkingResetButton?: boolean;
+  modelAutoRouting?: { active: boolean; onSelect: () => void };
+  thinkingAutoRouting?: { active: boolean; onSelect: () => void };
   onModelChange: (value: string) => void;
   onThinkingChange: (value: string) => void;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
@@ -337,8 +347,9 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             hiddenModels={props.hiddenModelsForSelector}
             variant="box"
             className="bg-modal-bg"
+            autoRouting={props.modelAutoRouting}
           />
-          {props.modelValue !== INHERIT ? (
+          {props.modelValue !== INHERIT || props.modelAutoRouting?.active === true ? (
             <Button
               type="button"
               variant="ghost"
@@ -370,9 +381,12 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             variant="box"
             inheritOption={{
               label: inheritLabel,
-              selected: props.thinkingValue === INHERIT,
+              // Inherit remains the fallback, but only Auto reads as selected.
+              selected:
+                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
               onSelect: () => props.onThinkingChange(INHERIT),
             }}
+            autoRouting={props.thinkingAutoRouting}
           />
           {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
             <Button
@@ -427,6 +441,7 @@ export function TasksSection() {
   const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
   // mirror that gate for its Settings card.
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
@@ -679,6 +694,8 @@ export function TasksSection() {
   const setAgentModel = (agentId: string, value: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
+        // Any non-Auto model selection exits Auto.
+        delete updated.autoModelRouting;
         if (value === INHERIT || value.trim().length === 0) {
           delete updated.modelString;
         } else {
@@ -691,6 +708,7 @@ export function TasksSection() {
   const setAgentThinking = (agentId: string, value: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
+        delete updated.autoThinkingLevel;
         if (value === INHERIT) {
           // The Inherit row resets the whole reasoning config: a retained
           // reasoning override would be invisible (explicit "standard" renders
@@ -704,6 +722,34 @@ export function TasksSection() {
       })
     );
   };
+
+  // Selecting Auto keeps any concrete value as the routing fallback.
+  const setAgentAutoRouting = (agentId: string, flag: "autoModelRouting" | "autoThinkingLevel") => {
+    setAgentAiDefaults((prev) =>
+      updateAgentDefaultEntry(prev, agentId, (updated) => {
+        updated[flag] = true;
+      })
+    );
+  };
+
+  // Unknown IDs may be UI agents defined elsewhere, so keep stored Auto flags clearable.
+  // Delegated and internal agents never route prompts.
+  const getAutoRoutingProps = (
+    agentId: string,
+    entry: AgentAiDefaultsEntry | undefined
+  ): Pick<AiDefaultsControlsProps, "modelAutoRouting" | "thinkingAutoRouting"> =>
+    autoModelRoutingEnabled
+      ? {
+          modelAutoRouting: {
+            active: entry?.autoModelRouting === true,
+            onSelect: () => setAgentAutoRouting(agentId, "autoModelRouting"),
+          },
+          thinkingAutoRouting: {
+            active: entry?.autoThinkingLevel === true,
+            onSelect: () => setAgentAutoRouting(agentId, "autoThinkingLevel"),
+          },
+        }
+      : {};
 
   // Mirrors resolveAgentAiSettings' field-wise base-chain walk (ACP
   // resolution): agents without their own default inherit each field from the
@@ -1044,6 +1090,7 @@ export function TasksSection() {
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
+          {...(agent.uiSelectable ? getAutoRoutingProps(agent.id, entry) : {})}
           onModelChange={(value) => setAgentModel(agent.id, value)}
           onThinkingChange={(value) => setAgentThinking(agent.id, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agent.id, mode)}
@@ -1155,6 +1202,7 @@ export function TasksSection() {
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
+          {...getAutoRoutingProps(agentId, entry)}
           onModelChange={(value) => setAgentModel(agentId, value)}
           onThinkingChange={(value) => setAgentThinking(agentId, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agentId, mode)}

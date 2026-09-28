@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as fs from "fs/promises";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Config } from "@/node/config";

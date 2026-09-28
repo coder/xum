@@ -1,4 +1,5 @@
 import type { AssistantModelMessage, ModelMessage, ToolModelMessage, ToolResultPart } from "ai";
+import { getToolOutputUiOnly, stripToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import { stripWorkflowRunRecordForModel } from "@/common/utils/workflowRunMessages";
 
 type ToolResultOutput = ToolResultPart["output"];
@@ -8,7 +9,11 @@ function stripToolResultPart<P extends { type: string }>(part: P, onChange: () =
     return part;
   }
   const toolResult = part as P & ToolResultPart;
-  const strippedOutput = stripWorkflowRunRecordForModel(toolResult.toolName, toolResult.output);
+  const withoutRunRecord = stripWorkflowRunRecordForModel(toolResult.toolName, toolResult.output);
+  const strippedOutput =
+    getToolOutputUiOnly(withoutRunRecord) === undefined
+      ? withoutRunRecord
+      : stripToolOutputUiOnly(withoutRunRecord);
   if (strippedOutput === toolResult.output) {
     return part;
   }
@@ -19,11 +24,12 @@ function stripToolResultPart<P extends { type: string }>(part: P, onChange: () =
 /**
  * Request-only rewrite for *internal* streamText steps.
  *
- * applyToolOutputRedaction strips workflow run records when building a request from persisted
- * history, but within a single streamText turn the SDK feeds tool results straight back into
- * the next step. Without this, the model step immediately after a workflow_run/workflow_resume
- * call still sees the full run record (script source + event log) this redaction exists to
- * keep out of context.
+ * applyToolOutputRedaction strips workflow run records and `ui_only` fields when building a
+ * request from persisted history, but within a single streamText turn the SDK feeds tool results
+ * straight back into the next step. Without this, the model step immediately after a
+ * workflow_run/workflow_resume call still sees the full run record (script source + event log)
+ * this redaction exists to keep out of context, and the next request replays a different prefix
+ * than the model saw, which invalidates thinking blocks that are bound to it.
  *
  * Returns the original array when nothing changed so prepareStep can skip the rewrite.
  */

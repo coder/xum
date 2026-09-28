@@ -168,8 +168,12 @@ const WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS: Array<{
   { value: "snapshot", label: "Snapshot and delete" },
 ];
 
-// Browser mode: window.api is not set (only exists in Electron via preload)
-const isBrowserMode = typeof window !== "undefined" && !window.api;
+// Browser mode: window.api is not set (only exists in Electron via preload). Read it when
+// used rather than at module evaluation, so the answer never depends on which environment
+// happened to import this module first (e.g. an earlier test file in the same process).
+function isBrowserMode(): boolean {
+  return typeof window !== "undefined" && !window.api;
+}
 
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
@@ -285,6 +289,7 @@ export function GeneralSection() {
   const editorConfig = normalizeEditorConfig(rawEditorConfig);
   const [sshHost, setSshHost] = useState<string>("");
   const [sshHostLoaded, setSshHostLoaded] = useState(false);
+  const sshHostEditRef = useRef(0);
   const [defaultProjectDir, setDefaultProjectDir] = useState("");
   const [cloneDirLoaded, setCloneDirLoaded] = useState(false);
   // Track whether the initial load succeeded to prevent saving empty string
@@ -301,6 +306,7 @@ export function GeneralSection() {
   const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
   const [chatTranscriptFullWidth, setChatTranscriptFullWidth] = useState(false);
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
+  const [keepScreenAwake, setKeepScreenAwake] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
   const archiveBehaviorRef = useRef<CoderWorkspaceArchiveBehavior>(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
   const worktreeArchiveBehaviorRef = useRef<WorktreeArchiveBehavior>(
@@ -309,12 +315,21 @@ export function GeneralSection() {
 
   const chatTranscriptFullWidthLoadNonceRef = useRef(0);
   const llmDebugLogsLoadNonceRef = useRef(0);
+  const keepScreenAwakeLoadNonceRef = useRef(0);
+  const keepScreenAwakeSavedRef = useRef(false);
+  // Local saves still in flight; an external refresh must not replace the user's newest choice.
+  const keepScreenAwakePendingWritesRef = useRef(0);
+  // An external config change arrived while local saves were pending; replay it once they settle
+  // so a later value accepted by the backend (e.g. from the palette command) is not lost.
+  const keepScreenAwakeRefreshDeferredRef = useRef(false);
+  const keepScreenAwakeRefreshRef = useRef<(() => Promise<void>) | null>(null);
 
   // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
   // selections can't race and persist a stale value via out-of-order writes.
   const archiveBehaviorUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const chatTranscriptFullWidthUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const llmDebugLogsUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
+  const keepScreenAwakeUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const archiveBehaviorPendingUpdateRef = useRef<CoderWorkspaceArchiveBehavior | undefined>(
     undefined
   );
@@ -331,6 +346,7 @@ export function GeneralSection() {
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const chatTranscriptFullWidthNonce = ++chatTranscriptFullWidthLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
+    const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;
 
     void api.config
       .getConfig()
@@ -365,6 +381,11 @@ export function GeneralSection() {
 
         if (llmDebugLogsNonce === llmDebugLogsLoadNonceRef.current) {
           setLlmDebugLogs(cfg.llmDebugLogs === true);
+        }
+
+        if (keepScreenAwakeNonce === keepScreenAwakeLoadNonceRef.current) {
+          keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
+          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
         }
       })
       .catch(() => {
@@ -500,9 +521,116 @@ export function GeneralSection() {
       });
   };
 
+  const handleKeepScreenAwakeChange = (checked: boolean) => {
+    if (!api) {
+      return;
+    }
+    // Invalidate any in-flight config load so it does not overwrite the user's selection.
+    const nonce = ++keepScreenAwakeLoadNonceRef.current;
+    setKeepScreenAwake(checked);
+
+    // Serialize writes, but only roll back the latest selection when persistence fails.
+    keepScreenAwakePendingWritesRef.current++;
+    keepScreenAwakeUpdateChainRef.current = keepScreenAwakeUpdateChainRef.current
+      .then(async () => {
+        await api.config.updateKeepScreenAwake({ enabled: checked });
+        keepScreenAwakeSavedRef.current = checked;
+      })
+      .catch(() => {
+        if (nonce === keepScreenAwakeLoadNonceRef.current) {
+          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
+        }
+      })
+      .finally(() => {
+        keepScreenAwakePendingWritesRef.current--;
+        assert(
+          keepScreenAwakePendingWritesRef.current >= 0,
+          "keep-awake pending write count went negative"
+        );
+        if (
+          keepScreenAwakePendingWritesRef.current === 0 &&
+          keepScreenAwakeRefreshDeferredRef.current
+        ) {
+          keepScreenAwakeRefreshDeferredRef.current = false;
+          return keepScreenAwakeRefreshRef.current?.().catch(() => {
+            // Best-effort: keep the last known value and wait for the next change.
+          });
+        }
+      });
+  };
+
+  // The setting can also change outside this section (the "Toggle Keep Screen Awake" palette
+  // command runs while Settings is open), so follow config changes instead of showing a stale
+  // switch whose next click would rewrite the current value rather than toggle it.
+  useEffect(() => {
+    const onConfigChanged = api?.config?.onConfigChanged;
+    if (!api || onConfigChanged == null) {
+      return;
+    }
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+
+    const refresh = async () => {
+      // Defer while our own saves are in flight: disk may still hold an older value. The last
+      // save to settle replays this refresh, so a newer external value still wins.
+      if (keepScreenAwakePendingWritesRef.current > 0) {
+        keepScreenAwakeRefreshDeferredRef.current = true;
+        return;
+      }
+      const nonce = keepScreenAwakeLoadNonceRef.current;
+      const cfg = await api.config.getConfig();
+      if (signal.aborted) {
+        return;
+      }
+      if (
+        nonce !== keepScreenAwakeLoadNonceRef.current ||
+        keepScreenAwakePendingWritesRef.current > 0
+      ) {
+        // A local click started a save during the read; re-read once it settles.
+        keepScreenAwakeRefreshDeferredRef.current = true;
+        return;
+      }
+      keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
+      setKeepScreenAwake(keepScreenAwakeSavedRef.current);
+    };
+    keepScreenAwakeRefreshRef.current = refresh;
+
+    let iterator: AsyncIterator<unknown> | null = null;
+    const listen = async () => {
+      try {
+        iterator = await onConfigChanged(undefined, { signal });
+        if (signal.aborted) {
+          await iterator.return?.();
+          return;
+        }
+        for (;;) {
+          const event = await iterator.next();
+          if (event.done || signal.aborted) {
+            return;
+          }
+          await refresh().catch(() => {
+            // Best-effort: keep the last known value and wait for the next change.
+          });
+        }
+      } catch {
+        // Subscription cancellation is expected during unmount/API reconnects.
+      }
+    };
+    // Settles on its own once aborted; errors are handled inside listen().
+    void listen();
+
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+      if (keepScreenAwakeRefreshRef.current === refresh) {
+        keepScreenAwakeRefreshRef.current = null;
+      }
+    };
+  }, [api]);
+
   // Load SSH host from server on mount (browser mode only)
   useEffect(() => {
-    if (isBrowserMode && api) {
+    if (isBrowserMode() && api) {
       void api.server.getSshHost().then((host) => {
         setSshHost(host ?? "");
         setSshHostLoaded(true);
@@ -584,9 +712,18 @@ export function GeneralSection() {
 
   const handleSshHostChange = useCallback(
     (value: string) => {
+      const edit = ++sshHostEditRef.current;
       setSshHost(value);
+      if (!api) return;
       // Save to server (debounced effect would be better, but keeping it simple)
-      void api?.server.setSshHost({ sshHost: value || null });
+      api.server.setSshHost({ sshHost: value || null }).catch(async () => {
+        // A rejected save leaves the backend on its old host (#4748): show that instead of the
+        // unsaved value, unless the user has typed again since.
+        const saved = await api.server.getSshHost().catch(() => undefined);
+        if (saved !== undefined && edit === sshHostEditRef.current) {
+          setSshHost(saved ?? "");
+        }
+      });
     },
     [api]
   );
@@ -987,6 +1124,34 @@ export function GeneralSection() {
         </div>
       </div>
 
+      {/* The sleep blocker lives in the Electron main process, so browser mode (including
+          `xum server` and desktop server windows) has nothing to toggle. */}
+      {!isBrowserMode() && (
+        <div className="border-border-light border-t pt-6">
+          <h3 className="text-foreground mb-4 text-sm font-medium">System</h3>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex-1">
+                <div className="text-foreground text-sm">
+                  Keep screen awake while agents are working
+                </div>
+                <div className="text-muted mt-0.5 text-xs">
+                  {/* Electron's display-sleep blocker does not guarantee the OS lock policy is
+                      suppressed, so only promise display/system sleep. */}
+                  Prevents display and system sleep while any chat is streaming or waiting on
+                  background bash or workflow activity. Released as soon as all agents are idle.
+                </div>
+              </div>
+              <Switch
+                checked={keepScreenAwake}
+                onCheckedChange={handleKeepScreenAwakeChange}
+                aria-label="Toggle keep screen awake while agents are working"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
         <div className="space-y-4">
@@ -1086,7 +1251,7 @@ export function GeneralSection() {
                   className="border-border-medium bg-background-secondary h-9 w-40"
                 />
               </div>
-              {isBrowserMode && (
+              {isBrowserMode() && (
                 <div className="text-warning text-xs">
                   Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
                 </div>
@@ -1108,7 +1273,7 @@ export function GeneralSection() {
             />
           </div>
 
-          {isBrowserMode && sshHostLoaded && (
+          {isBrowserMode() && sshHostLoaded && (
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-foreground text-sm">SSH Host</div>

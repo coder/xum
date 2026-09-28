@@ -3,7 +3,12 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar, setWorkspaceInput } from "@/browser/stories/helpers/uiState";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey, getReasoningModeKey } from "@/common/constants/storage";
+import {
+  getAutoModelRoutingKey,
+  getModelKey,
+  getReasoningModeKey,
+} from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
@@ -12,7 +17,7 @@ import {
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
 import { within, userEvent, waitFor } from "@storybook/test";
-import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
+import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
 const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
@@ -167,6 +172,36 @@ export const QueuedFollowUp: AppStory = {
                   "Also verify the narrow layout and make sure the action buttons stay easy to scan.",
                 queueDispatchMode: "tool-end",
               });
+              // Refused (held) inputs share the queued message's dock; covering them here keeps
+              // the phone and laptop Pixel variants of that dock in one story (snapshot budget).
+              emit({
+                type: "held-inputs-changed",
+                workspaceId,
+                heldInputs: [
+                  {
+                    id: "held-reported",
+                    reason: "reported",
+                    displayText: "Summarize what changed in the settings validation.",
+                    attachmentCount: 1,
+                    reviewCount: 1,
+                  },
+                  {
+                    id: "held-indeterminate",
+                    reason: "indeterminate",
+                    displayText: "",
+                    attachmentCount: 2,
+                    reviewCount: 0,
+                  },
+                  {
+                    // Returned by Stop while the composer could not take it (#4448).
+                    id: "held-interrupted",
+                    reason: "interrupted",
+                    displayText: "Run the migration once the lint pass is green.",
+                    attachmentCount: 0,
+                    reviewCount: 0,
+                  },
+                ],
+              });
             }, 75);
           },
         });
@@ -176,6 +211,8 @@ export const QueuedFollowUp: AppStory = {
   parameters: {
     ...appMeta.parameters,
     pixel: {
+      // The phone variant (below the narrow breakpoint) pins the held banners' hidden shortcut
+      // hints; laptop pins them visible on the oldest banner.
       matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
     },
   },
@@ -219,6 +256,52 @@ export const QueuedFollowUp: AppStory = {
       }
       if (statusBounds.right > groupBounds.right + 1) {
         throw new Error("Queued follow-up status overflows its right-aligned metadata row");
+      }
+    });
+
+    await waitFor(() => {
+      const banners = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
+      ];
+      if (banners.length !== 3) throw new Error("Held input banners not rendered");
+      for (const banner of banners) {
+        if (banner.scrollWidth > banner.clientWidth) {
+          throw new Error("Held input banner overflows horizontally");
+        }
+      }
+      // Static contract: every shortcut hint carries the narrow-viewport hide rule.
+      const hints = banners.flatMap((banner) => [...banner.querySelectorAll<HTMLElement>("kbd")]);
+      if (
+        hints.some(
+          (hint) =>
+            !hint.className.includes(`[@media(max-width:${NARROW_VIEWPORT_MAX_WIDTH_PX}px)]:hidden`)
+        )
+      ) {
+        throw new Error("Held input shortcut hints must be hidden below the narrow breakpoint");
+      }
+      // Rendered contract at whatever width this runs: hidden on phones (Pixel's phone variant,
+      // the story's mobile viewport), shown only on the oldest banner otherwise (the test-runner
+      // plays at desktop width).
+      const narrow = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+      const visibleHints = banners.map(
+        (banner) =>
+          [...banner.querySelectorAll<HTMLElement>("kbd")].filter(
+            (hint) => getComputedStyle(hint).display !== "none"
+          ).length
+      );
+      const expected = narrow ? [0, 0, 0] : [2, 0, 0];
+      if (visibleHints.join() !== expected.join()) {
+        throw new Error(
+          `Held input shortcut hints visible ${visibleHints.join()} (expected ${expected.join()}, narrow=${narrow})`
+        );
+      }
+      // Only a confirmed report may say the task reported.
+      if (
+        !banners[0].textContent?.includes("the task reported") ||
+        banners[1].textContent?.includes("reported") ||
+        banners[2].textContent?.includes("reported")
+      ) {
+        throw new Error("Held input banner wording does not match its refusal reason");
       }
     });
 
@@ -839,5 +922,109 @@ export const CenteredTranscriptAlignment: AppStory = {
     blurActiveElement();
 
     await assertDockSurfacesMatchTranscript(storyRoot, "capped");
+  },
+};
+
+export const AutoModelRoutingActive: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+        updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
+        updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
+        return setupSimpleChatStory({
+          workspaceId: "ws-auto-routing",
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone", "laptop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Composer with the auto-model-routing experiment on and Auto selected: the model trigger reads Auto and the picker pins the Auto row above the concrete models.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("combobox");
+    await waitFor(() => {
+      if (!trigger.textContent?.includes("Auto")) throw new Error("Trigger does not read Auto");
+    });
+    await userEvent.click(trigger);
+    await waitFor(() => {
+      const autoRow = storyRoot.querySelector<HTMLElement>("[data-auto-routing-option]");
+      if (autoRow?.getAttribute("aria-selected") !== "true") {
+        throw new Error("Auto row is not the selected option");
+      }
+    });
+  },
+};
+
+/** Keyboard-only path onto Auto: the row sits above the first model in the arrow-key order. */
+export const AutoModelRoutingKeyboard: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+        updatePersistedState(getModelKey("ws-auto-routing-keyboard"), "openai:gpt-5.6-sol");
+        return setupSimpleChatStory({
+          workspaceId: "ws-auto-routing-keyboard",
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    docs: {
+      description: {
+        story:
+          "Opens the model picker with Auto off, moves the highlight above the first model with ArrowUp, and selects Auto with Enter.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("combobox");
+    if (trigger.textContent?.includes("Auto")) throw new Error("Auto should start inactive");
+    await userEvent.click(trigger);
+    await within(storyRoot).findByPlaceholderText(/Search \[provider:model-name\]/i);
+
+    await userEvent.keyboard("{ArrowUp}");
+    await waitFor(() => {
+      const autoRow = storyRoot.querySelector<HTMLElement>("[data-auto-routing-option]");
+      if (autoRow?.getAttribute("data-highlighted") !== "true") {
+        throw new Error("ArrowUp did not highlight the Auto row");
+      }
+    });
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => {
+      const nextTrigger = within(storyRoot).getByRole("combobox");
+      if (!nextTrigger.textContent?.includes("Auto")) throw new Error("Enter did not select Auto");
+    });
   },
 };

@@ -1,3 +1,8 @@
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, spyOn, test } from "bun:test";
 
 import * as fs from "node:fs/promises";
@@ -15,6 +20,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
@@ -181,6 +187,41 @@ describe("isRlmModeEnabled", () => {
 });
 
 describe("buildAbandonedBranchTranscript", () => {
+  test("hidden review rows do not consume transcript space and authentic feedback survives", () => {
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    const feedbackText = formatPlanReviewEnvelope(feedback);
+    const visible = [
+      createMuxMessage("visible", "user", "visible work"),
+      createMuxMessage("feedback", "user", feedbackText, {
+        muxMetadata: buildPlanReviewMetadata(feedback),
+      }),
+    ];
+    const hidden = (["snapshot", "resolve", "reopen"] as const).map((kind) =>
+      createMuxMessage(
+        kind,
+        "user",
+        "HIDDEN_REVIEW_SENTINEL".repeat(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS),
+        {
+          muxMetadata: { type: "plan-review", kind, recordId: kind },
+        }
+      )
+    );
+    expect(buildAbandonedBranchTranscript([...visible, ...hidden])).toBe(
+      buildAbandonedBranchTranscript(visible)
+    );
+    expect(buildAbandonedBranchTranscript(visible)).toContain(feedbackText);
+  });
+
   test("keeps text and tool markers, strips reasoning parts", () => {
     const message: MuxMessage = {
       id: "a1",
@@ -406,6 +447,38 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("hidden review tokens cannot make a tiny abandoned segment eligible", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    let calls = 0;
+    try {
+      const result = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        workspaceId: "hidden-review-budget",
+        experiments: RLM_ON,
+        aiService: fakeAiService(
+          summaryModel("summary", () => {
+            calls++;
+          })
+        ),
+        abandonedMessages: [
+          createMuxMessage("visible", "user", "tiny visible turn"),
+          createMuxMessage(
+            "hidden",
+            "user",
+            "hidden tokens ".repeat(BRANCH_SUMMARY_MIN_SEGMENT_TOKENS * 3),
+            {
+              muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "hidden" },
+            }
+          ),
+        ],
+      });
+      expect(result).toBeNull();
+      expect(calls).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("tiny abandoned segments skip the model call", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
@@ -511,6 +584,51 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           : "";
       expect(systemText).not.toContain("investigated the flaky roles test");
       expect(userText).toContain("investigated the flaky roles test");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("candidates that cannot disable thinking get low effort and thinking headroom", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const calls: Array<{ maxOutputTokens?: number; effort?: unknown }> = [];
+      const model = new MockLanguageModelV3({
+        doStream: (options: LanguageModelV3CallOptions) => {
+          calls.push({
+            maxOutputTokens: options.maxOutputTokens,
+            effort: options.providerOptions?.anthropic?.effort,
+          });
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Summarized the branch." },
+                { type: "text-end", id: "t1" },
+                finishChunk(),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      for (const workspaceModel of ["anthropic:claude-opus-5-5", "anthropic:claude-haiku-4-5"]) {
+        const appended = await maybeAppendAbandonedBranchSummary({
+          historyService,
+          aiService: fakeAiService(model, { workspaceModel }),
+          workspaceId: `ws-${workspaceModel}`,
+          abandonedMessages: meatyExchange(workspaceModel),
+          experiments: RLM_ON,
+        });
+        expect(appended).not.toBeNull();
+      }
+      expect(calls).toEqual([
+        {
+          maxOutputTokens:
+            BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
+          effort: "low",
+        },
+        { maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS, effort: undefined },
+      ]);
     } finally {
       await cleanup();
     }

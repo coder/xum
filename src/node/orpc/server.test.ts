@@ -1,12 +1,14 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
+import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
 
@@ -53,6 +55,11 @@ async function waitForWebSocketOpen(ws: WebSocket): Promise<void> {
 }
 
 async function waitForWebSocketRejection(ws: WebSocket): Promise<void> {
+  // Since Bun 1.3.10 the `ws` client shim's once() installs two native forwarders, so a
+  // rejected handshake fires 'error' twice (and terminate() before 'close' re-emits it).
+  // The listeners below detach once settled, so keep one for the socket's lifetime;
+  // otherwise the extra 'error' is thrown as unhandled.
+  ws.on("error", () => undefined);
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
@@ -1152,6 +1159,54 @@ describe("createOrpcServer", () => {
     }
   });
 
+  test("MCP OAuth callback forwards the RFC 9207 iss parameter (query + form_post)", async () => {
+    // The MCP SDK rejects the code exchange for issuers that advertise RFC 9207
+    // unless the route passes `iss` through (Linear login regression).
+    const callbackInputs: unknown[] = [];
+    const stubContext: Partial<ORPCContext> = {
+      mcpOauthService: {
+        handleServerCallbackAndExchange: (input: unknown) => {
+          callbackInputs.push(input);
+          return Promise.resolve({ success: true, data: undefined });
+        },
+      } as unknown as ORPCContext["mcpOauthService"],
+    };
+
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+      });
+
+      const issuer = "https://mcp.linear.app";
+      const queryRes = await fetch(
+        `${server.baseUrl}/auth/mcp-oauth/callback?state=query-state&code=query-code&iss=${encodeURIComponent(issuer)}`
+      );
+      expect(queryRes.status).toBe(200);
+
+      const formRes = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          state: "form-state",
+          code: "form-code",
+          iss: issuer,
+        }).toString(),
+      });
+      expect(formRes.status).toBe(200);
+
+      expect(callbackInputs).toEqual([
+        expect.objectContaining({ state: "query-state", code: "query-code", iss: issuer }),
+        expect.objectContaining({ state: "form-state", code: "form-code", iss: issuer }),
+      ]);
+    } finally {
+      await server?.close();
+    }
+  });
+
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
     const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
     const stubContext: Partial<ORPCContext> = {
@@ -1319,6 +1374,101 @@ describe("createOrpcServer", () => {
       expect(callbackCalls.map((c) => c.state)).toEqual(["known-state", "stale-state"]);
     } finally {
       await server?.close();
+    }
+  });
+
+  test("localhost binds both loopback families on one port", async () => {
+    // Regression: binding "localhost" used to take only the first resolved family,
+    // leaving the other loopback address free for another dev server on the same port.
+    // Mixed case also exercises hostname normalization.
+    const stubContext: Partial<ORPCContext> = {};
+    const server = await createOrpcServer({
+      host: "LocalHost",
+      port: 0,
+      context: stubContext as ORPCContext,
+      authToken: "test-token",
+    });
+
+    try {
+      expect(server.baseUrl).toBe(`http://LocalHost:${server.port}`);
+      const v4 = await fetch(`http://127.0.0.1:${server.port}/version`);
+      expect(v4.status).toBe(200);
+
+      let v6: Response;
+      try {
+        v6 = await fetch(`http://[::1]:${server.port}/version`);
+      } catch {
+        // Some CI environments do not have IPv6 loopback; the server falls back to IPv4 only.
+        return;
+      }
+      expect(v6.status).toBe(200);
+
+      // WebSocket upgrades arriving on ::1 must reach the shared upgrade handler.
+      const ws = new WebSocket(`ws://[::1]:${server.port}${ORPC_WS_PATH}?token=test-token`);
+      try {
+        await waitForWebSocketOpen(ws);
+      } finally {
+        ws.terminate();
+      }
+    } finally {
+      await server.close();
+    }
+
+    // close() must release both listeners.
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(server.port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+
+  test("localhost fails with EADDRINUSE when another process holds the IPv6 loopback port", async () => {
+    const squatter = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject);
+        squatter.listen(0, "::1", () => resolve());
+      });
+    } catch (error) {
+      const code = getErrorCode(error);
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        return;
+      }
+      throw error;
+    }
+
+    const address = squatter.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected TCP address");
+    }
+    const port = address.port;
+
+    try {
+      const stubContext: Partial<ORPCContext> = {};
+      let caught: unknown = null;
+      try {
+        const server = await createOrpcServer({
+          host: "localhost",
+          port,
+          context: stubContext as ORPCContext,
+          authToken: "test-token",
+        });
+        await server.close();
+      } catch (error) {
+        caught = error;
+      }
+      expect(getErrorCode(caught)).toBe("EADDRINUSE");
+
+      // The IPv4 listener bound before the failure must be released.
+      const reuse = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        reuse.once("error", reject);
+        reuse.listen(port, "127.0.0.1", () => resolve());
+      });
+      await new Promise<void>((resolve) => reuse.close(() => resolve()));
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
     }
   });
 
@@ -1636,6 +1786,35 @@ describe("createOrpcServer", () => {
       await expectWebSocketOriginCase(wsCase);
     });
   }
+
+  test("does not log the auth token of a blocked cross-origin WebSocket upgrade", async () => {
+    // Browser clients authenticate the oRPC WebSocket with `?token=` (#4853).
+    const secret = "SECRET-auth-token-4853";
+    const warnSpy = spyOn(log, "warn");
+
+    try {
+      await withTestOrpcServer(async (server) => {
+        const ws = new WebSocket(`${server.wsUrl}?token=${secret}`, {
+          headers: { origin: "https://evil.example.com" },
+        });
+
+        try {
+          await waitForWebSocketRejection(ws);
+        } finally {
+          ws.terminate();
+        }
+      });
+
+      const blockedCalls = warnSpy.mock.calls.filter(
+        ([message]) => message === "Blocked cross-origin WebSocket upgrade request"
+      );
+      expect(blockedCalls).toHaveLength(1);
+      expect(blockedCalls[0]?.[1]).toMatchObject({ path: ORPC_WS_PATH });
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 
   test("returns restrictive CORS preflight headers for same-origin requests", async () => {
     const stubContext: Partial<ORPCContext> = {};

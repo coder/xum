@@ -75,9 +75,10 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
             "Your previous turn was interrupted by a context rollover; continue the task. Completed tool results remain in the previous window: retrieve them rather than re-executing their side effects.",
           ]
         : []),
-    // A model-requested reset never "filled" the window; the model chose the timing.
+    // Flush headroom does not tell us whether an earlier handoff was delivered. A model-requested
+    // reset never "filled" the window; the model chose the timing.
     ...(!rollover.flushOpportunity && rollover.requestedBy !== "model"
-      ? ["The window filled before a safe notes-flush opportunity."]
+      ? ["The window reached its usable limit."]
       : []),
   ].join("\n");
 }
@@ -89,17 +90,37 @@ interface ContextBudgetWarningOptions {
   memoryWritable: boolean;
   sessionHistoryAvailable: boolean;
   final?: boolean;
+  handoff?: boolean;
+  handoffTokens?: number;
+  newContextAvailable?: boolean | "unknown";
 }
 
 export function buildBudgetWarningText(options: ContextBudgetWarningOptions): string {
-  const { contextTokens, maxTokens, budgetTokens, memoryWritable, sessionHistoryAvailable, final } =
-    options;
+  const {
+    contextTokens,
+    maxTokens,
+    budgetTokens,
+    memoryWritable,
+    sessionHistoryAvailable,
+    final,
+    handoff,
+    handoffTokens,
+  } = options;
+  assert(
+    !(final && handoff),
+    "A budget advisory cannot be both a handoff and a legacy final flush"
+  );
+  assert(
+    handoffTokens == null ||
+      (Number.isFinite(handoffTokens) && handoffTokens > 0 && handoffTokens <= maxTokens),
+    "Handoff target must be within the model limit"
+  );
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
   assert(
     budgetTokens > 0 && budgetTokens <= maxTokens,
     "context budget warnings require a positive budget within the model limit"
   );
-  const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before this window rolls over).`;
+  const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before ${final ? "this window rolls over" : "Xum forces a rollover at the usable limit"}).`;
   if (final) {
     // The final flush is only offered while memory is writable and history recovery is
     // available, so no degraded wording is needed here.
@@ -116,17 +137,37 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }
-  return `${usage} ${
-    memoryWritable
-      ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (keep notes concise and essential state first; only a bounded excerpt is preloaded), then continue the current task without commentary.`
-      : sessionHistoryAvailable
-        ? "Memory writes are unavailable for this turn. Use session_history to retrieve prior windows after rollover, and continue the current task."
-        : "Memory writes and history recovery are unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
+  // Permissions do not guarantee advertising; deferred tools or middleware may still hide them.
+  const checkpoint = memoryWritable
+    ? `If a writable memory tool is available to you, write or update ${CONTEXT_NOTES_MEMORY_PATH}, essential state first: goal, decisions, invariants, open tasks, blockers, and paths/IDs needed to resume. Confirm the write succeeded before requesting a new window.`
+    : "Memory writes are unavailable for this turn; skip the notes steps.";
+  if (handoff && sessionHistoryAvailable) {
+    return [
+      usage,
+      "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.",
+      checkpoint,
+      // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
+      options.newContextAvailable === false
+        ? "new_context is not available under the current tool policy. Save any writable notes and continue; Xum will attempt a rollover at the usable limit or pause safely."
+        : "If the new_context tool is available to you, call it in a later step; otherwise save any writable notes and continue.",
+      "If the task is already complete, finish the reply instead. If session_history is available in the next window, use it to retrieve this transcript.",
+    ].join(" ");
+  }
+  const target =
+    handoffTokens != null && !handoff
+      ? ` The upcoming handoff target is ${handoffTokens} tokens; prepare to finish a small unit of work and checkpoint notes there.`
+      : "";
+  return `${usage}${target} ${
+    !sessionHistoryAvailable
+      ? "History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
+      : memoryWritable
+        ? `If a writable memory tool is available and you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (keep notes concise and essential state first; only a bounded excerpt is preloaded), then continue the current task without commentary.`
+        : "Memory writes are unavailable for this turn. If session_history is available after rollover, use it to retrieve prior windows; continue the current task."
   }`;
 }
 
 export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {
-  const { contextTokens, maxTokens, budgetTokens, final } = options;
+  const { contextTokens, maxTokens, budgetTokens, final, handoff, handoffTokens } = options;
   return createMuxMessage(createUserMessageId(), "user", buildBudgetWarningText(options), {
     timestamp: Date.now(),
     synthetic: true,
@@ -137,6 +178,8 @@ export function createContextBudgetWarning(options: ContextBudgetWarningOptions)
       maxTokens,
       budgetTokens,
       ...(final ? { final: true as const } : {}),
+      ...(handoff ? { handoff: true as const } : {}),
+      ...(handoffTokens != null ? { handoffTokens } : {}),
     },
   });
 }
@@ -163,6 +206,12 @@ export function estimateLastStepToolResults(message: MuxMessage | undefined): {
   imageParts: number;
 } {
   if (!message) return { toolResultChars: 0, imageParts: 0 };
+  return estimateToolResultSize(getLastStepToolResults(message));
+}
+
+/** Share the same last-step slice with real-encoding admission, including tolerant history reads. */
+export function getLastStepToolResults(message: MuxMessage | undefined): unknown[] {
+  if (!message) return [];
   const indices = message.metadata?.stepStartPartIndices;
   const lastStart = Array.isArray(indices) ? indices.at(-1) : undefined;
   // Damaged persisted metadata must not crash a send or hide settled tool outputs.
@@ -173,11 +222,9 @@ export function estimateLastStepToolResults(message: MuxMessage | undefined): {
     lastStart <= message.parts.length
       ? lastStart
       : 0;
-  return estimateToolResultSize(
-    message.parts
-      .slice(start)
-      .flatMap((part) =>
-        part.type === "dynamic-tool" && part.state === "output-available" ? [part.output] : []
-      )
-  );
+  return message.parts
+    .slice(start)
+    .flatMap((part) =>
+      part.type === "dynamic-tool" && part.state === "output-available" ? [part.output] : []
+    );
 }

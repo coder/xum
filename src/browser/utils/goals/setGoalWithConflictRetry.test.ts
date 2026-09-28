@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { setGoalWithConflictRetry } from "./setGoalWithConflictRetry";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 function makeGoal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
   return {
@@ -28,12 +29,15 @@ interface FakeApi {
   setGoal: ReturnType<typeof mock>;
 }
 
-function makeApi(getGoalImpl: () => unknown, setGoalImpl: () => unknown): APIClient {
-  const fake: FakeApi = {
-    getGoal: mock(getGoalImpl),
-    setGoal: mock(setGoalImpl),
+type GoalResult = Awaited<ReturnType<APIClient["workspace"]["getGoal"]>>;
+type SetGoalResult = Awaited<ReturnType<APIClient["workspace"]["setGoal"]>>;
+
+function makeApi(getGoalImpl: () => GoalResult, setGoalImpl: () => SetGoalResult): APIClient {
+  const workspace: TestApiOverrides<APIClient["workspace"]> = {
+    getGoal: mock(() => Promise.resolve(getGoalImpl())),
+    setGoal: mock(() => Promise.resolve(setGoalImpl())),
   };
-  return { workspace: fake } as unknown as APIClient;
+  return createTestApiClient({ workspace });
 }
 
 describe("setGoalWithConflictRetry", () => {
@@ -71,7 +75,11 @@ describe("setGoalWithConflictRetry", () => {
         setGoalCall++ === 0
           ? {
               success: false,
-              error: { type: "goal_conflict" as const, expectedGoalId: stale.goalId },
+              error: {
+                type: "goal_conflict" as const,
+                expectedGoalId: stale.goalId,
+                actualGoalId: fresh.goalId,
+              },
             }
           : { success: true, data: fresh }
     );

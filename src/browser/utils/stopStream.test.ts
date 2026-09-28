@@ -2,20 +2,27 @@ import { describe, expect, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import { dismissChatError, peekChatError } from "./chatErrorToasts";
 import { stopStream } from "./stopStream";
+import { createTestApiClient } from "@/browser/testUtils";
+
+// Compile-time contract of createTestApiClient, enforced by `make typecheck`.
+// @ts-expect-error misspelled procedure names are rejected
+createTestApiClient({ workspace: { interruptStreem: () => Promise.resolve() } });
+// @ts-expect-error return values must match the real procedure output
+createTestApiClient({ workspace: { interruptStream: () => Promise.resolve({ success: true }) } });
 
 describe("stopStream", () => {
   function apiReturning(
     result: { success: true; data: undefined } | { success: false; error: string }
   ): { api: APIClient; calls: unknown[] } {
     const calls: unknown[] = [];
-    const api = {
+    const api = createTestApiClient({
       workspace: {
         interruptStream: (input: unknown) => {
           calls.push(input);
           return Promise.resolve(result);
         },
       },
-    } as unknown as APIClient;
+    });
     return { api, calls };
   }
 
@@ -32,11 +39,11 @@ describe("stopStream", () => {
   });
 
   test("a Stop whose request fails in transport is retained as the workspace's chat error", async () => {
-    const api = {
+    const api = createTestApiClient({
       workspace: {
         interruptStream: () => Promise.reject(new Error("backend unreachable")),
       },
-    } as unknown as APIClient;
+    });
 
     await stopStream(api, "ws-transport");
 

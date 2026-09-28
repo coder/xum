@@ -1888,11 +1888,25 @@ describe("MemoryService", () => {
         (await fsPromises.readdir(path.dirname(legacyRoot))).filter((name) =>
           name.startsWith(`${path.basename(manifestPath)}.malformed-`)
         );
-      for (const body of ["{nope", "[]", JSON.stringify({ "note.md": { content: 1 } })]) {
-        await fsPromises.writeFile(manifestPath, body);
-        await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      const malformedBodies = ["{nope", "[]", JSON.stringify({ "note.md": { content: 1 } })];
+      // Each quarantine must preserve its bytes even within the same clock tick.
+      const now = spyOn(Date, "now").mockReturnValue(Date.now());
+      try {
+        for (const body of malformedBodies) {
+          await fsPromises.writeFile(manifestPath, body);
+          await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+        }
+      } finally {
+        now.mockRestore();
       }
-      expect((await quarantined()).length).toBe(3);
+      const quarantinedFiles = await quarantined();
+      expect(quarantinedFiles.length).toBe(3);
+      const quarantinedBodies = await Promise.all(
+        quarantinedFiles.map((name) =>
+          fsPromises.readFile(path.join(path.dirname(legacyRoot), name), "utf-8")
+        )
+      );
+      expect(quarantinedBodies.sort()).toEqual(malformedBodies.sort());
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(true);
       expect(await pathExists(path.join(ownerRoot, "only-child.md"))).toBe(true);
       // The rewritten manifest records the re-adopted notes.

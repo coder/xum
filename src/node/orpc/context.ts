@@ -42,6 +42,7 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { InstructionsService } from "@/node/services/instructionsService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TaskService } from "@/node/services/taskService";
@@ -51,6 +52,7 @@ import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserB
 import type { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
@@ -109,9 +111,11 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   memoryConsolidationService: MemoryConsolidationService;
   refineService: RefineService;
   sessionUsageService: SessionUsageService;
+  evaluationService: EvaluationService;
   instructionsService: InstructionsService;
   workspaceGoalService: WorkspaceGoalService;
   devToolsService: DevToolsService;
+  reviewStateService: ReviewStateService;
   browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   browserBridgeTokenManager: BrowserBridgeTokenManager;
   browserBridgeServer: BrowserBridgeServer;

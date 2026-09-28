@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as jsonc from "jsonc-parser";
 import { Config } from "@/node/config";
+import * as disposableExec from "@/node/utils/disposableExec";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
@@ -62,6 +63,34 @@ describe("BackupService against a real repository", () => {
       .sort();
   }
 
+  // #4417: a first push once stalled past the 5 s test timeout, and the IO_ERROR it returned
+  // after teardown could not say which git child it was waiting on. Report every spawn still
+  // running at teardown, and any that took over a second, so a recurrence names the command.
+  const runningSpawns = new Map<number, { command: string; startedAt: number }>();
+  let spawnCount = 0;
+  let execSpy: { mockRestore: () => void } | undefined;
+
+  beforeEach(() => {
+    const realExecFileAsync = disposableExec.execFileAsync;
+    execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation((file, args, options) => {
+      const id = spawnCount++;
+      const startedAt = Date.now();
+      const command = [file, ...args].join(" ");
+      runningSpawns.set(id, { command, startedAt });
+      const spawned = realExecFileAsync(file, args, options);
+      const settled = () => {
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs > 1_000) {
+          console.warn(`[#4417] slow spawn (${elapsedMs} ms): ${command}`);
+        }
+        runningSpawns.delete(id);
+      };
+      // Observes the caller's promise; the caller still receives and handles the original.
+      void spawned.result.then(settled, settled);
+      return spawned;
+    });
+  });
+
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-backup-e2e-"));
     muxRoot = path.join(tempDir, "mux-root");
@@ -103,6 +132,12 @@ describe("BackupService against a real repository", () => {
   });
 
   afterEach(async () => {
+    const now = Date.now();
+    for (const { command, startedAt } of runningSpawns.values()) {
+      console.warn(`[#4417] still running at teardown (${now - startedAt} ms): ${command}`);
+    }
+    runningSpawns.clear();
+    execSpy?.mockRestore();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 

@@ -44,6 +44,24 @@ function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   );
 }
 
+// Space activates buttons/summaries instead of scrolling the scrollport, so
+// pressing it on a transcript control (e.g. keyboard-expanding the last tool card)
+// is not scroll intent. Treating it as intent let the resulting layout-growth
+// scroll event release the bottom lock; Pixel caught this as a flaky
+// "Jump to bottom" state in App/AgentCommunication/Long Message.
+// Links are deliberately excluded: they activate on Enter, and Space on a focused
+// link still scrolls the transcript.
+const ACTIVATION_SCROLL_KEYS = new Set([" ", "Spacebar"]);
+const SPACE_ACTIVATED_CONTROL_SELECTOR = 'button, summary, [role="button"]';
+
+function isActivationKeyOnControl(key: string, target: EventTarget | null): boolean {
+  return (
+    ACTIVATION_SCROLL_KEYS.has(key) &&
+    target instanceof Element &&
+    target.closest(SPACE_ACTIVATED_CONTROL_SELECTOR) !== null
+  );
+}
+
 function isMouseDownExemptFromScrollIntent(
   target: EventTarget | null,
   currentTarget: HTMLElement
@@ -221,6 +239,7 @@ export function useAutoScroll() {
       // buttons or links. Editable controls keep those keys local for caret/text
       // navigation, so they must not open a transcript scroll-intent window.
       if (!TRANSCRIPT_SCROLL_KEYS.has(event.key) || isEditableKeyboardTarget(event.target)) return;
+      if (isActivationKeyOnControl(event.key, event.target)) return;
 
       markUserScrollIntent();
     },

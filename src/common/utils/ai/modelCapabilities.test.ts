@@ -1,9 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-  extractModelCapabilities,
-  getModelCapabilities,
-  getSupportedInputMediaTypes,
-} from "./modelCapabilities";
+import { extractModelCapabilities, getModelCapabilities } from "./modelCapabilities";
 
 describe("getModelCapabilities", () => {
   it("returns capabilities for known models", () => {
@@ -81,19 +77,5 @@ describe("getModelCapabilities", () => {
 
   it("returns null for unknown models", () => {
     expect(getModelCapabilities("anthropic:this-model-does-not-exist")).toBeNull();
-  });
-});
-
-describe("getSupportedInputMediaTypes", () => {
-  it("includes pdf when model supports_pdf_input is true", () => {
-    const supported = getSupportedInputMediaTypes("anthropic:claude-sonnet-4-5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
-  });
-
-  it("includes pdf for OpenAI vision models that rely on the fallback", () => {
-    const supported = getSupportedInputMediaTypes("openai:gpt-5.5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
   });
 });

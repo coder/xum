@@ -1,6 +1,7 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
+import cjsFs from "fs";
 import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
@@ -301,7 +302,7 @@ describe("ProjectService", () => {
       const projectPath = path.join(tempDir, "persist-fail-project");
       const nonPersistingConfig = new Config(tempDir);
       // Run the transform (so create() reaches its success path) but drop the save,
-      // modeling saveConfig's log-and-continue behavior on write failures.
+      // modeling a write that did not land.
       nonPersistingConfig.editConfig = (transform) => {
         transform(nonPersistingConfig.loadConfigOrDefault());
         return Promise.resolve();
@@ -1136,6 +1137,33 @@ exit 1
         const err = error as NodeJS.ErrnoException;
         expect(err.code).toBe("ENOENT");
       }
+    });
+
+    it("yields error and rolls back when the config write rejects", async () => {
+      const sourceRepoPath = await createLocalGitRepository(tempDir, "source-repo-write-reject");
+      const cloneParentDir = path.join(tempDir, "write-reject-clones");
+      const rejectingConfig = new Config(tempDir);
+      rejectingConfig.editConfig = () => Promise.reject(new Error("EACCES: permission denied"));
+      const rejectingService = new ProjectService(rejectingConfig);
+
+      const events: CloneEvent[] = [];
+      for await (const event of rejectingService.cloneWithProgress({
+        repoUrl: sourceRepoPath,
+        cloneParentDir,
+      })) {
+        events.push(event);
+      }
+
+      const terminalEvent = events[events.length - 1];
+      expect(terminalEvent?.type).toBe("error");
+      if (terminalEvent?.type !== "error") throw new Error("Expected error event");
+      expect(terminalEvent.error).toContain("EACCES");
+      // A rejected registration must not orphan the clone at the user's chosen path (#4444).
+      const expectedProjectPath = path.resolve(cloneParentDir, "source-repo-write-reject");
+      const stat = await fs
+        .stat(expectedProjectPath)
+        .catch((error: NodeJS.ErrnoException) => error);
+      expect(stat).toMatchObject({ code: "ENOENT" });
     });
 
     it("cleans up partial clone and yields cancellation event when aborted", async () => {
@@ -2384,6 +2412,28 @@ exit 1
         config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
       ).toBeUndefined();
     });
+
+    it("keeps the sync error when the rollback write also fails (#4748)", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.writeFile(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+      const realEdit = config.editConfig.bind(config);
+      spyOn(config, "editConfig")
+        .mockImplementationOnce(realEdit)
+        .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+      const thrown = await service
+        .setCodeWorkspaceSyncPath(projectPath, "broken.code-workspace")
+        .catch((error: unknown) => error);
+
+      // The user needs the reason the sync failed, not the secondary rollback failure.
+      expect(thrown).toBeInstanceOf(ORPCError);
+      expect((thrown as Error).message).toContain("not valid JSONC");
+    });
   });
 
   describe("assignWorkspaceToSubProject", () => {
@@ -3113,6 +3163,45 @@ exit 1
       if (result.success) throw new Error("Expected failure");
       expect(result.error).toContain("Failed to create project");
     });
+
+    // #4746: secrets are irreversible, so they may only be deleted after the config
+    // write that forgets the project lands. A failed write must leave both intact.
+    for (const kind of ["sub-project", "project"] as const) {
+      it(`keeps ${kind} secrets when the removal's config write fails`, async () => {
+        const parentPath = "/fake/parent";
+        const childPath = "/fake/parent/packages/api";
+        const targetPath = kind === "sub-project" ? childPath : parentPath;
+        const cfg = config.loadConfigOrDefault();
+        cfg.projects.set(parentPath, { workspaces: [] });
+        cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        await config.editConfig(() => cfg);
+        const secret = { key: "TOKEN", value: "kept" };
+        expect((await service.updateSecrets(targetPath, [secret])).success).toBe(true);
+
+        const realRename = cjsFs.rename.bind(cjsFs);
+        const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+          from: cjsFs.PathLike,
+          to: cjsFs.PathLike,
+          callback: cjsFs.NoParamCallback
+        ) => {
+          if (path.basename(String(to)) === "config.json") {
+            callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+            return;
+          }
+          realRename(from, to, callback);
+        }) as typeof cjsFs.rename);
+        let result: Awaited<ReturnType<ProjectService["remove"]>>;
+        try {
+          result = await service.remove(targetPath);
+        } finally {
+          renameSpy.mockRestore();
+        }
+
+        expect(result.success).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(targetPath)).toBe(true);
+        expect(service.getSecrets(targetPath)).toEqual([secret]);
+      });
+    }
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";

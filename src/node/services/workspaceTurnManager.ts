@@ -1,11 +1,18 @@
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import {
+  acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
+  inspectCrossProcessLock,
+} from "@/node/utils/main/crossProcessLock";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import {
-  areArchiveUntrackedPathListsEqual,
   formatSubagentFailureUserMessage,
   formatSubagentReportUserMessage,
   getIsoNow,
@@ -17,6 +24,7 @@ import {
   type TaskCreateArgs,
   type WorkspaceHost,
   type WorkspaceLifecycleResult,
+  type WorkspaceTurnHost,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
@@ -41,7 +49,11 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  formatRuntimeUnreachableError,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import {
   coerceNonEmptyString,
   tryReadGitBranchMatchesOrigin,
@@ -91,6 +103,14 @@ import {
   resolveNodeAgentAiSettings,
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
+import {
+  AgentTaskAiInputsChangedError,
+  applyAgentTaskTurnAiSnapshot,
+  buildReawakenContextKey,
+  computeReawakenInputsKey,
+  type AgentTaskTurnAi,
+} from "@/node/services/agentTaskReawakenAi";
+import { formatReawakenChangedMessage } from "@/constants/taskMessages";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -169,11 +189,17 @@ interface WorkspaceLifecycleTarget {
   workspaceId?: string;
 }
 
+// Deliberately no untracked-file acknowledgement option (#3950): any path list returned to the
+// model can be echoed straight back, so a model-side "confirmation" is not user consent. Lossy
+// snapshot archives are refused here; the user archives through the UI confirmation dialog.
 interface WorkspaceLifecycleOptions {
   interruptActive?: boolean;
-  acknowledgedUntrackedPaths?: string[];
-  acknowledgedUntrackedPathsByWorkspaceId?: Record<string, string[]>;
 }
+
+const LOSSY_SNAPSHOT_ARCHIVE_REFUSAL =
+  "Archiving would permanently delete the untracked files listed in paths, because the snapshot archive behavior cannot preserve them. " +
+  "This tool cannot approve that loss, and you must not delete the files to get around it. " +
+  "Ask the user to archive this workspace manually; the archive dialog lists the files and asks for confirmation.";
 
 interface ResolvedWorkspaceLifecycleTarget {
   action: WorkspaceLifecycleAction;
@@ -219,6 +245,39 @@ interface WorkspaceTurnAgentContext {
   includeAgentPlugins: boolean;
   /** Source config, kept so owner/target contexts can be compared for host identity. */
   runtimeConfig: RuntimeConfig;
+}
+
+export interface WorkspaceAgentContextParams {
+  runtimeConfig: RuntimeConfig;
+  projectPath: string;
+  workspaceName: string;
+  persistedWorkspacePath?: string;
+  subProjectPath?: string;
+  includeAgentPlugins: boolean;
+}
+
+/**
+ * Agent-discovery context for a workspace checkout. Uses
+ * createRuntimeContextForWorkspace — the same helper the stream uses in
+ * aiService — so definitions resolve from the exact discovery path that will
+ * stream (Docker container-side paths, subproject directories included).
+ * Shared with TaskService, which reads a reawakened child's definition chain.
+ */
+export function buildWorkspaceAgentContext(
+  params: WorkspaceAgentContextParams
+): WorkspaceTurnAgentContext {
+  const context = createRuntimeContextForWorkspace({
+    runtimeConfig: params.runtimeConfig,
+    projectPath: params.projectPath,
+    name: params.workspaceName,
+    namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
+    subProjectPath: coerceNonEmptyString(params.subProjectPath),
+  });
+  return {
+    ...context,
+    includeAgentPlugins: params.includeAgentPlugins,
+    runtimeConfig: params.runtimeConfig,
+  };
 }
 
 /**
@@ -277,7 +336,21 @@ export interface WorkspaceTurnCreateArgs {
    */
   /** Internal-only: allow a persistent descendant agent workspace as an existing target. */
   allowAgentWorkspace?: boolean;
+  /**
+   * Internal-only (ancestor reawakening of a new-style sub-agent): AI settings TaskService
+   * already planned for this turn. Replaces this manager's frozen resolution, dispatches
+   * without send-time AI-settings persistence, and commits the snapshot inside the same
+   * config write that claims the execution at acceptance, only if its inputs are unchanged.
+   */
+  agentTaskAi?: AgentTaskTurnAi;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * Internal-only: dispatch the prompt through this sender instead of
+   * workspaceService.sendMessage. A bash-monitor wake that reactivates an inactive
+   * sub-agent keeps the wake row's own metadata and acceptance callbacks while the
+   * handle lifecycle around the send stays this manager's.
+   */
+  sendMessage?: WorkspaceTurnHost["sendMessage"];
 }
 
 export interface WorkspaceTurnCreateResult {
@@ -327,6 +400,35 @@ const WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS: ReadonlySet<StreamErrorType> = n
 
 /** Marker persisted by settleStaleWorkspaceTurn when restart recovery interrupts a handle. */
 const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after restart";
+
+/**
+ * Live-owner lock of one workspace turn (#4446). A handle's liveness lives in the memory of the
+ * backend that runs it, so with several backends on one Xum root (desktop beside `xum server`,
+ * XUM_ALLOW_MULTIPLE_INSTANCES=1) no other backend may judge it stale from its own memory. The
+ * running backend holds this lock while the handle is active and releases it when the handle
+ * settles; the lock kit never reclaims it from a live holder (#4461), so another backend can take
+ * it only once the owner has died (restart recovery) or never took it (records from older builds).
+ */
+export function workspaceTurnOwnerLockPath(rootDir: string, handleId: string): string {
+  return path.join(rootDir, "locks", "workspace-turns", `${handleId}.lock`);
+}
+/** Renewal cadence for the lock kit only (a new lock: no older build reclaims it by age). */
+const WORKSPACE_TURN_OWNER_LOCK_STALE_MS = 5 * 60 * 1000;
+
+/** Handle store whose writes release the live-owner lock once a handle is no longer active. */
+class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
+  constructor(
+    config: Config,
+    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>
+  ) {
+    super(config);
+  }
+
+  override async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    await super.upsertWorkspaceTurn(record);
+    await this.afterUpsert(record);
+  }
+}
 
 /**
  * Reason persisted when other queued input (a manual user message, /compact)
@@ -546,7 +648,184 @@ export class WorkspaceTurnManager {
     private readonly streamManager?: StreamManager,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.taskHandleStore = new TaskHandleStore(config);
+    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
+      this.afterHandleWrite(record)
+    );
+  }
+
+  /**
+   * Handles whose target this process created and whose default unrelated-messaging consent is
+   * still to be granted (#4453): added once create() returned Ok, removed at the first terminal
+   * write (see afterHandleWrite). In memory on purpose: a restart empties it, so every later
+   * settlement clears the default instead of granting it.
+   */
+  private readonly creationConsentFinalizers = new Set<string>();
+
+  /** Live-owner locks this manager holds, by handle id (see workspaceTurnOwnerLockPath). */
+  private readonly turnOwnerLocks = new Map<string, () => Promise<void>>();
+
+  /**
+   * Hold the handle's live-owner lock: "held" when this manager holds it now (already, or taken
+   * just now because nobody live held it), "foreign-live" when a live holder (another backend)
+   * owns the turn, or its state cannot be read (fail closed: never act on another's handle).
+   */
+  private async acquireTurnOwnerLock(handleId: string): Promise<"held" | "foreign-live"> {
+    if (this.turnOwnerLocks.has(handleId)) return "held";
+    try {
+      const release = await acquireCrossProcessLock({
+        lockPath: workspaceTurnOwnerLockPath(this.config.rootDir, handleId),
+        acquireTimeoutMs: 0,
+        staleMs: WORKSPACE_TURN_OWNER_LOCK_STALE_MS,
+        timeoutMessage: `Workspace turn ${handleId} is owned by another live Xum backend.`,
+      });
+      if (this.turnOwnerLocks.has(handleId)) {
+        await release(); // A concurrent caller in this manager took it first.
+      } else {
+        this.turnOwnerLocks.set(handleId, release);
+      }
+      return "held";
+    } catch (error: unknown) {
+      if (!(error instanceof CrossProcessLockTimeoutError)) {
+        log.warn("Workspace turn live-owner lock unreadable; leaving the handle alone", {
+          handleId,
+          error: getErrorMessage(error),
+        });
+      }
+      return "foreign-live";
+    }
+  }
+
+  /**
+   * Settlements still publishing, by handle id (#4801): a terminal handle write inside one of
+   * them leaves the live-owner lock held (the release becomes owed) until the execution mirror is
+   * written too. Releasing between the two writes lets another backend revive the handle (mirror
+   * "running", handle "running"), after which this settlement's terminal mirror write pairs an
+   * active handle with an inactive mirror.
+   */
+  private readonly turnOwnerLockReleaseDeferrals = new Map<string, number>();
+  private readonly turnOwnerLockReleasesOwed = new Set<string>();
+
+  /** Holds the handle's lock until disposal, even across a terminal handle write (see above). */
+  private deferTurnOwnerLockRelease(handleId: string): AsyncDisposable {
+    this.turnOwnerLockReleaseDeferrals.set(
+      handleId,
+      (this.turnOwnerLockReleaseDeferrals.get(handleId) ?? 0) + 1
+    );
+    return {
+      [Symbol.asyncDispose]: async () => {
+        const remaining = (this.turnOwnerLockReleaseDeferrals.get(handleId) ?? 1) - 1;
+        if (remaining > 0) {
+          this.turnOwnerLockReleaseDeferrals.set(handleId, remaining);
+          return;
+        }
+        this.turnOwnerLockReleaseDeferrals.delete(handleId);
+        // Still owed only if no active write (a revival in this process) followed the terminal one.
+        if (this.turnOwnerLockReleasesOwed.delete(handleId)) {
+          await this.releaseTurnOwnerLock(handleId);
+        }
+      },
+    };
+  }
+
+  private async releaseTurnOwnerLock(handleId: string): Promise<void> {
+    const release = this.turnOwnerLocks.get(handleId);
+    if (release == null) return;
+    this.turnOwnerLocks.delete(handleId);
+    await release();
+  }
+
+  /**
+   * Every handle write lands here. A terminal one finalizes a created target's default consent,
+   * then releases the live-owner lock. Default consent of a delegated target (#4453):
+   *
+   * | Event (any backend)                                  | Action                            |
+   * | ---------------------------------------------------- | --------------------------------- |
+   * | mode "new", not disposable: lock taken, create()     | row written with the pending mark |
+   * | create() Err                                         | create()'s finally clears it      |
+   * | exit before the handle record persists               | creation finalizer clears it      |
+   * | explicit toggle (any backend)                        | the toggle deletes the mark       |
+   * | first terminal write in the creating process         | Set.delete, then grant (mark CAS) |
+   * | any other terminal write (other backend, restart,    | clear                             |
+   * |   stale settlement, later rewrite)                   |                                   |
+   * | the grant's config write fails                       | logged; stays off                 |
+   * | mode "existing" follow-up                            | createdWorkspace false: no hook   |
+   * | disposable target                                    | create() "none": never marked     |
+   * | row pending removal at grant time                    | the grant clears the mark instead |
+   *
+   * The grant needs the mark, so a toggle always wins. Granting only in the creating process
+   * keeps an older build's opt-out (which leaves the mark in place) from being overridden after a
+   * restart. The grant runs after the terminal write and before the reservation is dropped;
+   * consent means reachability, and in-process admission still refuses while it exists.
+   */
+  private async afterHandleWrite(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    if (isActiveWorkspaceTurnTaskStatus(record.status)) {
+      this.turnOwnerLockReleasesOwed.delete(record.handleId);
+      return;
+    }
+    try {
+      if (record.createdWorkspace && !record.disposableWorkspace) {
+        await (this.creationConsentFinalizers.delete(record.handleId)
+          ? this.workspaceService.grantPendingDefaultUnrelatedWorkspaceConsent(record.workspaceId)
+          : this.workspaceService.clearPendingDefaultUnrelatedConsent(record.workspaceId));
+      }
+    } finally {
+      if (this.turnOwnerLockReleaseDeferrals.has(record.handleId)) {
+        this.turnOwnerLockReleasesOwed.add(record.handleId);
+      } else {
+        await this.releaseTurnOwnerLock(record.handleId);
+      }
+    }
+  }
+
+  /**
+   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
+   * turn (crash between create() and the handle record, or between the terminal write and the
+   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
+   * has a live holder, here or in another backend, is still being created and is left alone.
+   * Never throws: startup must not fail.
+   */
+  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      for (const workspace of project.workspaces) {
+        const tags = workspace.tags ?? {};
+        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+        const workspaceId = workspace.id;
+        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
+        if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
+        try {
+          await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+            // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
+            if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
+              return;
+            }
+            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
+            // its creator locked it before create(), and the lock outlives the creator until the
+            // record settles. Without a lock only a record that created this target counts.
+            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+            const locked = await fsPromises.access(lockPath).then(
+              () => true,
+              () => false
+            );
+            if (!locked) {
+              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+            }
+            if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
+            try {
+              await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+            } finally {
+              await this.releaseTurnOwnerLock(handleId);
+            }
+          });
+        } catch (error: unknown) {
+          log.warn("Failed to clear an orphaned delegated consent default", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+    }
   }
 
   /**
@@ -657,25 +936,13 @@ export class WorkspaceTurnManager {
    * aiService — so validation resolves agents from the exact discovery path that
    * will stream (Docker container-side paths, subproject directories included).
    */
-  private buildWorkspaceTurnAgentContext(params: {
-    runtimeConfig: RuntimeConfig;
-    projectPath: string;
-    workspaceName: string;
-    persistedWorkspacePath?: string;
-    subProjectPath?: string;
-  }): WorkspaceTurnAgentContext {
-    const context = createRuntimeContextForWorkspace({
-      runtimeConfig: params.runtimeConfig,
-      projectPath: params.projectPath,
-      name: params.workspaceName,
-      namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
-      subProjectPath: coerceNonEmptyString(params.subProjectPath),
-    });
-    return {
-      ...context,
+  private buildWorkspaceTurnAgentContext(
+    params: Omit<WorkspaceAgentContextParams, "includeAgentPlugins">
+  ): WorkspaceTurnAgentContext {
+    return buildWorkspaceAgentContext({
+      ...params,
       includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
-      runtimeConfig: params.runtimeConfig,
-    };
+    });
   }
 
   /**
@@ -741,7 +1008,16 @@ export class WorkspaceTurnManager {
         scope: entry.scope,
         ...(entry.source != null ? { source: entry.source } : {}),
       }));
-    } catch {
+    } catch (error) {
+      // An unreachable host is not an unknown agent (#4831): say it can be retried.
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
@@ -752,7 +1028,15 @@ export class WorkspaceTurnManager {
         params.agentId,
         { includeAgentPlugins: params.includeAgentPlugins }
       );
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     if (!resolveAgentVisibility(frontmatter.ui).selectable) {
@@ -867,7 +1151,15 @@ export class WorkspaceTurnManager {
         { includeAgentPlugins: params.owner.includeAgentPlugins }
       );
       resolvedScope = definition.scope;
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     if (resolvedScope === "project") {
@@ -989,8 +1281,42 @@ export class WorkspaceTurnManager {
     let targetTaskExperiments: TaskCreateArgs["experiments"];
     let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
+    let createdTargetBranch = false;
     let queuedForExistingWorkspace = false;
     let maySupersedeTaskId: string | undefined;
+    let persistedHandle = false;
+    // Until the handle record persists, this call owns the created target's pending default
+    // (#4453, see afterHandleWrite): every earlier exit clears it and releases the lock.
+    // It also owns the target itself (#4819): no record means the parent never learns its id and a
+    // mode="existing" retry is invalid_scope, so every such exit removes it. It was created moments
+    // ago and its turn never started, so a forced removal is lossless. Bypass the task-tree
+    // lifecycle lock: we hold this.mutex and the established order is tree lock → this.mutex
+    // (createMany), so acquiring the tree lock here would invert it; removeUnlocked stays safe
+    // regardless via its own idempotency guard and fail-closed descendant check.
+    await using _creationFinalizer = {
+      [Symbol.asyncDispose]: async () => {
+        if (persistedHandle) return;
+        this.creationConsentFinalizers.delete(handleId);
+        if (createdWorkspace) {
+          // Forced removal runs `branch -D`: keep a branch this creation only reused.
+          const cleanup = await this.workspaceService
+            .removeWhileTaskTreeLocked(targetWorkspaceId, true, undefined, {
+              keepBranch: !createdTargetBranch,
+            })
+            .catch((error: unknown) => Err(getErrorMessage(error)));
+          if (!cleanup.success) {
+            log.error("createWorkspaceTurn: failed to remove the workspace of a failed creation", {
+              ownerWorkspaceId,
+              targetWorkspaceId,
+              error: cleanup.error,
+            });
+          }
+          // A no-op once the row is gone; fails closed if the removal did not complete.
+          await this.workspaceService.clearPendingDefaultUnrelatedConsent(targetWorkspaceId);
+        }
+        await this.releaseTurnOwnerLock(handleId);
+      },
+    };
 
     if (mode === "fork") {
       return Err('Task.createWorkspaceTurn: workspace.mode="fork" is not supported yet');
@@ -1209,6 +1535,11 @@ export class WorkspaceTurnManager {
       }
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
+      // Held from before the row exists, so no other backend can settle this handle while its
+      // target carries the pending mark. The id is fresh: only an unreadable lock state refuses.
+      if ((await this.acquireTurnOwnerLock(handleId)) !== "held") {
+        return Err("Task.createWorkspaceTurn: could not take the workspace turn's live-owner lock");
+      }
       const tags = {
         [WORKSPACE_TURN_TASK_TAGS.handle]: handleId,
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
@@ -1224,14 +1555,21 @@ export class WorkspaceTurnManager {
         false,
         tags,
         // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves.
-        { awaitMaterialization: true }
+        // a local worktree must be populated before create() resolves. The default consent is
+        // granted when this turn settles (afterHandleWrite); disposable targets never get it.
+        {
+          awaitMaterialization: true,
+          defaultUnrelatedConsent:
+            args.workspace?.disposable === true ? "none" : "caller-finalizes",
+        }
       );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      createdTargetBranch = createResult.data.createdBranch === true;
+      if (args.workspace?.disposable !== true) this.creationConsentFinalizers.add(handleId);
       if (requestedAgentId != null && ownerContext != null) {
         // Post-create stage: re-validate against the TARGET checkout — project-local agent
         // definitions can diverge across branches/worktrees, so owner-path resolution is not
@@ -1284,6 +1622,19 @@ export class WorkspaceTurnManager {
       workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }
 
+    const agentTaskAi = args.agentTaskAi;
+    if (agentTaskAi != null) {
+      assert(
+        requestedAgentId == null,
+        "createWorkspaceTurn: agentTaskAi excludes agentId overrides"
+      );
+      // The planned snapshot belongs to the agent identity TaskService read; any other
+      // target (or identity) means the child changed meanwhile: refuse retryably.
+      if (!targetIsAgentWorkspace || agentTaskAi.snapshot.agentId !== workspaceTurnAgentId) {
+        return Err(formatReawakenChangedMessage(targetWorkspaceId));
+      }
+    }
+
     // Unified per-field precedence (see resolveAgentAiSettings): explicit
     // per-launch override → target workspace's own persisted settings
     // (mode="existing" follow-ups, plus task-frozen settings for resumed agent
@@ -1304,43 +1655,55 @@ export class WorkspaceTurnManager {
     let thinkingLevel: ThinkingLevel;
     let reasoningMode: OpenAIReasoningMode | undefined;
     try {
-      const resolved = await resolveNodeAgentAiSettings({
-        agentId: workspaceTurnAgentId,
-        profile: "interactive",
-        cfg,
-        providersConfig: this.aiService.getProvidersConfig(),
-        explicit: {
-          model: coerceNonEmptyString(args.modelString) ?? undefined,
-          thinkingLevel: args.thinkingLevel ?? undefined,
-        },
-        targetWorkspaceSettings: targetLayer,
-        parentRuntime: args.parentRuntimeAiSettings
-          ? {
-              model: coerceNonEmptyString(args.parentRuntimeAiSettings.modelString) ?? undefined,
-              thinkingLevel: args.parentRuntimeAiSettings.thinkingLevel,
-            }
-          : undefined,
-        fallbacks: this.taskHost.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
-        // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
-        // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
-        // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
-        // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
-        // already selected here (waiting for init is not an option under the service-wide mutex).
-        // This is bounded to convenience defaults: callers wanting determinism pass explicit
-        // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
-        // request time, and the authoritative prompt/tool policy is always resolved at stream
-        // time (after init) with strictAgentResolution guarding agent identity.
-        ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
-      });
-      // Selected (not effective) values: sendMessage persists what it
-      // receives, and the send path re-clamps thinking and re-gates reasoning
-      // per model/route at request time.
-      model = resolved.selected.model;
-      thinkingLevel = resolved.selected.thinkingLevel;
-      reasoningMode = resolved.selected.reasoningMode;
+      if (agentTaskAi != null) {
+        // Reawakening: TaskService resolved current defaults + pins; do not re-freeze here.
+        model = agentTaskAi.snapshot.taskModelString;
+        thinkingLevel = agentTaskAi.snapshot.thinkingLevel;
+        reasoningMode = agentTaskAi.snapshot.reasoningMode;
+      } else {
+        const resolved = await resolveNodeAgentAiSettings({
+          agentId: workspaceTurnAgentId,
+          profile: "interactive",
+          cfg,
+          providersConfig: this.aiService.getProvidersConfig(),
+          explicit: {
+            model: coerceNonEmptyString(args.modelString) ?? undefined,
+            thinkingLevel: args.thinkingLevel ?? undefined,
+          },
+          targetWorkspaceSettings: targetLayer,
+          parentRuntime: args.parentRuntimeAiSettings
+            ? {
+                model: coerceNonEmptyString(args.parentRuntimeAiSettings.modelString) ?? undefined,
+                thinkingLevel: args.parentRuntimeAiSettings.thinkingLevel,
+              }
+            : undefined,
+          fallbacks: this.taskHost.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
+          // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
+          // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
+          // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
+          // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
+          // already selected here (waiting for init is not an option under the service-wide mutex).
+          // This is bounded to convenience defaults: callers wanting determinism pass explicit
+          // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
+          // request time, and the authoritative prompt/tool policy is always resolved at stream
+          // time (after init) with strictAgentResolution guarding agent identity.
+          ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
+        });
+        // Selected (not effective) values: sendMessage persists what it
+        // receives, and the send path re-clamps thinking and re-gates reasoning
+        // per model/route at request time.
+        model = resolved.selected.model;
+        thinkingLevel = resolved.selected.thinkingLevel;
+        reasoningMode = resolved.selected.reasoningMode;
+      }
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createWorkspaceTurn: ${error.message}`);
+      }
+      // The agent's definition defaults could not be read (#4829): fail retryably
+      // instead of dispatching with default AI settings.
+      if (isRuntimeTransportError(error)) {
+        return Err(formatRuntimeUnreachableError("Task.createWorkspaceTurn", error));
       }
       throw error;
     }
@@ -1388,13 +1751,16 @@ export class WorkspaceTurnManager {
       ownerWorkspaceId === targetWorkspaceId
         ? [targetWorkspaceId]
         : [ownerWorkspaceId, targetWorkspaceId].sort();
-    let persistedHandle = false;
     const persisted = await this.withWorkspaceLifecycleLockKeys(
       lifecycleLockKeys,
       async (): Promise<"persisted" | "target_archived" | "owner_archived"> => {
         if (isArchivedInConfig(targetWorkspaceId)) return "target_archived";
         if (isArchivedInConfig(ownerWorkspaceId)) return "owner_archived";
         return await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, async () => {
+          // The handle id is fresh, so only an unreadable lock state can refuse this.
+          if ((await this.acquireTurnOwnerLock(handleId)) !== "held") {
+            throw new Error("could not take the workspace turn's live-owner lock");
+          }
           await this.taskHandleStore.upsertWorkspaceTurn(record);
           persistedHandle = true;
           if (record.status !== "queued") {
@@ -1434,26 +1800,8 @@ export class WorkspaceTurnManager {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
     }
     if (persisted === "owner_archived") {
-      // A workspace created in this call has no persisted ownership handle yet, so refusing
-      // here would leak an unmanageable checkout + config entry (the archived owner can never
-      // reach it through the lifecycle API). It was materialized moments ago and its turn never
-      // started, so force-removing it is lossless. Bypass the task-tree lifecycle lock: we hold
-      // this.mutex and the established order is tree lock → this.mutex (createMany), so
-      // acquiring the tree lock here would invert it; removeUnlocked stays safe regardless via
-      // its own idempotency guard and fail-closed descendant check.
-      if (createdWorkspace) {
-        const cleanup = await this.workspaceService.removeWhileTaskTreeLocked(
-          targetWorkspaceId,
-          true
-        );
-        if (!cleanup.success) {
-          log.error("createWorkspaceTurn: failed to clean up workspace after owner archive", {
-            ownerWorkspaceId,
-            targetWorkspaceId,
-            error: cleanup.error,
-          });
-        }
-      }
+      // A workspace created in this call is removed by _creationFinalizer (the archived owner
+      // could never reach it through the lifecycle API).
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
     }
     if (agentValidationError != null) {
@@ -1491,7 +1839,14 @@ export class WorkspaceTurnManager {
         }
         if (targetIsAgentWorkspace) {
           const claimed = await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, () =>
-            this.persistAgentTaskExecutionState(targetWorkspaceId, handleId, "running", true)
+            this.persistAgentTaskExecutionState(
+              targetWorkspaceId,
+              handleId,
+              "running",
+              true,
+              undefined,
+              agentTaskAi
+            )
           );
           if (!claimed) throw new Error("Workspace turn was superseded before stream start");
         }
@@ -1518,10 +1873,24 @@ export class WorkspaceTurnManager {
           ownerWorkspaceId,
           accepted: true,
         });
+        if (agentTaskAi != null) {
+          // The claim write skipped its own publication (see persistAgentTaskExecutionState).
+          // Publication is the only post-commit step whose failure must not fail the turn.
+          try {
+            await this.taskHost.emitWorkspaceMetadata(targetWorkspaceId);
+          } catch (error) {
+            log.warn("createWorkspaceTurn: failed to publish reawakened sub-agent metadata", {
+              workspaceId: targetWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
       });
     };
 
-    const sendResult = await this.workspaceService.sendMessage(
+    const sendMessage =
+      args.sendMessage ?? this.workspaceService.sendMessage.bind(this.workspaceService);
+    const sendResult = await sendMessage(
       targetWorkspaceId,
       prompt,
       {
@@ -1535,7 +1904,8 @@ export class WorkspaceTurnManager {
         // A per-turn agent override on an existing workspace must not overwrite the target's
         // saved agent/settings (maybePersistAISettingsFromOptions persists them on every
         // ordinary send). New workspaces still persist: the requested agent IS their default.
-        ...(mode === "existing" && requestedAgentId != null
+        // A reawakening snapshot persists only at acceptance, with the execution claim.
+        ...((mode === "existing" && requestedAgentId != null) || agentTaskAi != null
           ? { skipAiSettingsPersistence: true }
           : {}),
         // Explicit overrides were validated pre-dispatch, but that validation races init
@@ -2316,11 +2686,17 @@ export class WorkspaceTurnManager {
                   ),
                 }
           );
-          await this.updateAgentTaskExecutionState(
-            current.workspaceId,
-            current.handleId,
-            current.status
-          );
+          try {
+            await this.updateAgentTaskExecutionState(
+              current.workspaceId,
+              current.handleId,
+              current.status
+            );
+          } finally {
+            // Another backend's settlement won and could not release this backend's lock (#4446).
+            // Released only after the mirror publishes (#4801, see deferTurnOwnerLockRelease).
+            await this.releaseTurnOwnerLock(current.handleId);
+          }
           this.taskHost.markTaskForegroundRelevant(current.handleId);
           return { pendingNotify: null, winningStatus: current.status };
         }
@@ -2401,6 +2777,7 @@ export class WorkspaceTurnManager {
             refreshForContinuation: true,
           });
         }
+        await using _publishing = this.deferTurnOwnerLockRelease(nextRecord.handleId);
         await this.taskHandleStore.upsertWorkspaceTurn(nextRecord);
         await this.updateAgentTaskExecutionState(
           nextRecord.workspaceId,
@@ -2871,7 +3248,9 @@ export class WorkspaceTurnManager {
           consumingWorkspaceId: options.consumingWorkspaceId,
         });
       }
-      if (message.role !== "user") {
+      // Model-hidden user rows (plan-review snapshot/resolve/reopen records) are UI state, not
+      // prompts: they must not read as a newer, superseding prompt that disables revival.
+      if (message.role !== "user" || isModelHiddenMessage(message)) {
         continue;
       }
       const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
@@ -3043,6 +3422,10 @@ export class WorkspaceTurnManager {
           ? { deferredMessageIds: options.deferredMessageIds }
           : {}),
       };
+      // The settlement released the live-owner lock; the revived turn is this backend's again.
+      // Take it before any durable mutation: a live backend that holds it owns the handle.
+      const lockHeldBefore = this.turnOwnerLocks.has(record.handleId);
+      if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return current;
       // Re-admission can fail if another child now controls this desktop. Do not revive the
       // handle, erase terminal attention, or register it live until its durable mirror reserves it.
       const taskEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
@@ -3050,7 +3433,10 @@ export class WorkspaceTurnManager {
         const claimed = await this.desktopInputCoordinator.withAdmission(record.workspaceId, () =>
           this.persistAgentTaskExecutionState(record.workspaceId, record.handleId, "running", true)
         );
-        if (!claimed) return current;
+        if (!claimed) {
+          if (!lockHeldBefore) await this.releaseTurnOwnerLock(record.handleId);
+          return current;
+        }
       }
       delete next.error;
       // The revived turn's next terminal transition is a new outcome; re-arm its wake-up.
@@ -3174,6 +3560,7 @@ export class WorkspaceTurnManager {
         };
         // Keep explicit stop's latch/mirror ordering in this lock, not the central helper.
         this.assertWorkspaceTurnSettlementCause({ kind: "explicit-interrupt" });
+        await using _publishing = this.deferTurnOwnerLockRelease(record.handleId);
         await this.taskHandleStore.upsertWorkspaceTurn(next);
         interruptedRecord = next;
         // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
@@ -3367,10 +3754,6 @@ export class WorkspaceTurnManager {
             });
           }
 
-          const acknowledgedUntrackedPaths =
-            options.acknowledgedUntrackedPaths ??
-            options.acknowledgedUntrackedPathsByWorkspaceId?.[resolved.workspaceId];
-
           const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
             ownerWorkspaceId,
             resolved
@@ -3518,13 +3901,12 @@ export class WorkspaceTurnManager {
                 });
               }
               // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
-              // being interrupted can create/remove untracked files between any preflight scan and
-              // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
-              // work and STILL bounce with requires_confirmation, stranding the workspace
-              // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
-              // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
-              // after which the untracked set is stable and any confirmation round-trip is
-              // deterministic.
+              // being interrupted can create untracked files between any preflight scan and the
+              // sink's recheck, so interruption could destroy in-flight work and STILL end in the
+              // lossy-archive refusal, stranding the workspace interrupted-but-unarchived. No
+              // worktree-freeze mechanism exists, so refuse to interrupt here: the caller stops the
+              // listed turns explicitly (task_stop / await), after which the untracked set is
+              // stable and the archive outcome is deterministic.
               if (
                 this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
                   resolved.workspaceId,
@@ -3538,7 +3920,7 @@ export class WorkspaceTurnManager {
                   ...this.lifecycleTargetFields(resolved),
                   activeTaskIds: activeTurns.map((turn) => turn.handleId),
                   note:
-                    "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
+                    "interrupt_active was not honored: under the snapshot archive behavior, an interrupted turn can leave untracked files that would make the archive refuse after the interruption. " +
                     "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
                 });
               }
@@ -3560,9 +3942,8 @@ export class WorkspaceTurnManager {
                 });
               }
               // Interruption destroys in-flight work, so surface every archive blocker BEFORE
-              // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
-              // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
-              // sub-agents) must all leave the active turns running.
+              // stopping anything: a lossy-untracked-files refusal or archive-blocking errors
+              // (e.g. active descendant sub-agents) must leave the active turns running.
               const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId, {
                 worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
               });
@@ -3575,25 +3956,7 @@ export class WorkspaceTurnManager {
                 });
               }
               if (preflight.data.kind === "confirm-lossy-untracked-files") {
-                // The archive sink requires exact normalized equality between the acknowledged and
-                // current path lists (a subset check would accept a stale acknowledgement whose extra
-                // paths no longer exist, interrupt the turns, and then still bounce with
-                // requires_confirmation). Mirror the sink's check so interruption only happens when
-                // the acknowledgement would actually be accepted.
-                if (
-                  acknowledgedUntrackedPaths == null ||
-                  !areArchiveUntrackedPathListsEqual(
-                    acknowledgedUntrackedPaths,
-                    preflight.data.paths
-                  )
-                ) {
-                  return Ok({
-                    status: "requires_confirmation",
-                    action: "archive",
-                    ...this.lifecycleTargetFields(resolved),
-                    paths: preflight.data.paths,
-                  });
-                }
+                return Ok(this.lossySnapshotArchiveRefusal(resolved, preflight.data.paths));
               }
               // Arm the sink's admission gate BEFORE destroying anything: in-flight user
               // activity the earlier snapshot cannot see (admission counters, workflow
@@ -3664,7 +4027,9 @@ export class WorkspaceTurnManager {
             // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
             const result = await this.workspaceService.archiveWhileTaskTreeLocked(
               resolved.workspaceId,
-              acknowledgedUntrackedPaths,
+              // Never an acknowledgement (#3950): with none, the sink's own rechecks refuse any
+              // lossy untracked files, including ones that appeared after the preflight above.
+              undefined,
               // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
               // close the settings-flip races the early behavior checks above cannot cover,
               // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
@@ -3687,12 +4052,7 @@ export class WorkspaceTurnManager {
               });
             }
             if (result.data.kind === "confirm-lossy-untracked-files") {
-              return Ok({
-                status: "requires_confirmation",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                paths: result.data.paths,
-              });
+              return Ok(this.lossySnapshotArchiveRefusal(resolved, result.data.paths));
             }
             return Ok({
               status: "archived",
@@ -3869,6 +4229,22 @@ export class WorkspaceTurnManager {
    *   orphan those results, because terminal attention draining supersedes handles whose
    *   owner is archived.
    */
+  // Same "error" shape as the other refusals that need a human (e.g. the Delete checkout policy),
+  // plus the lossy paths so the model can tell the user which files block the archive.
+  private lossySnapshotArchiveRefusal(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    paths: string[]
+  ): WorkspaceLifecycleResult {
+    assert(paths.length > 0, "a lossy snapshot archive refusal must list the untracked paths");
+    return {
+      status: "error",
+      action: "archive",
+      ...this.lifecycleTargetFields(resolved),
+      paths,
+      error: LOSSY_SNAPSHOT_ARCHIVE_REFUSAL,
+    };
+  }
+
   private lifecycleTargetFields(resolved: ResolvedWorkspaceLifecycleTarget): {
     taskId?: string;
     workspaceId: string;
@@ -3995,8 +4371,10 @@ export class WorkspaceTurnManager {
       if (record.workspaceId !== workspaceId || !this.isActiveWorkspaceTurn(record)) {
         continue;
       }
-      if (!(await this.isLiveWorkspaceTurn(record))) {
-        await this.settleStaleWorkspaceTurn(record);
+      if (
+        !(await this.isLiveWorkspaceTurn(record)) &&
+        (await this.settleStaleWorkspaceTurn(record)) !== "keep"
+      ) {
         continue;
       }
       return record;
@@ -4071,13 +4449,23 @@ export class WorkspaceTurnManager {
     return await this.hasActiveWorkspaceTurnDeferredBlockers(record);
   }
 
-  private async settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+  /**
+   * "keep": callers must keep the record active. It is live in this backend, or another live
+   * backend holds its live-owner lock (#4446), including when this backend returns early before
+   * settling anything: dropping it there undercounted another backend's live turn (#4801).
+   * undefined: this call settled the record, it is inactive, or an early return found its lock
+   * held by this backend, absent or dead. Those keep the old skip, so a stale handle never counts
+   * as active (a new turn would otherwise queue behind it until a later call settles it).
+   */
+  private async settleStaleWorkspaceTurn(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<"keep" | undefined> {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
     // Admission exclusion also covers sends whose user row is not durable yet.
     const admission = this.workspaceService.acquireIdleTurnExclusion(record.workspaceId);
-    if (!admission.success) return;
+    if (!admission.success) return await this.keepIfOwnedElsewhere(record.handleId);
     let admissionHold: Disposable | undefined = admission.data;
     let recoveryLock: AsyncDisposable | undefined;
     await using recoveryScope = {
@@ -4093,11 +4481,13 @@ export class WorkspaceTurnManager {
     // Lock order: admission, stream start, then handle settlement.
     recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
     // Preparing input stays visible until registration. Existing streams include finalization.
-    if (
-      this.streamManager?.getStreamInfo(record.workspaceId, true) != null ||
-      (await this.isLiveWorkspaceTurn(record))
-    )
-      return;
+    if (this.streamManager?.getStreamInfo(record.workspaceId, true) != null) {
+      return await this.keepIfOwnedElsewhere(record.handleId);
+    }
+    if (await this.isLiveWorkspaceTurn(record)) return "keep";
+    // Not live in THIS backend's memory proves nothing about another backend that runs the turn
+    // (#4446): settle only a handle whose live-owner lock this manager holds or can take now.
+    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return "keep";
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
@@ -4114,7 +4504,7 @@ export class WorkspaceTurnManager {
     }
 
     // Recovery reads can overlap a continuation start. Check live work again before the fallback.
-    if (await this.isLiveWorkspaceTurn(record)) return;
+    if (await this.isLiveWorkspaceTurn(record)) return "keep";
     // No runtime work remains. A missing history row must not keep a deferred handle active forever.
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
@@ -4134,6 +4524,18 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * Read-only: "keep" when another live backend holds the handle's live-owner lock (an unreadable
+   * lock counts as held, fail closed). Never takes the lock: the caller is not settling.
+   */
+  private async keepIfOwnedElsewhere(handleId: string): Promise<"keep" | undefined> {
+    if (this.turnOwnerLocks.has(handleId)) return undefined;
+    const lock = await inspectCrossProcessLock(
+      workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
+    );
+    return lock.state === "held" ? "keep" : undefined;
+  }
+
   async countActiveWorkspaceTurns(
     records?: readonly WorkspaceTurnTaskHandleRecord[]
   ): Promise<number> {
@@ -4149,8 +4551,10 @@ export class WorkspaceTurnManager {
       if (!this.isActiveWorkspaceTurn(record)) {
         continue;
       }
-      if (!(await this.isLiveWorkspaceTurn(record))) {
-        await this.settleStaleWorkspaceTurn(record);
+      if (
+        !(await this.isLiveWorkspaceTurn(record)) &&
+        (await this.settleStaleWorkspaceTurn(record)) !== "keep"
+      ) {
         continue;
       }
       if (record.status === "queued") {
@@ -4175,8 +4579,10 @@ export class WorkspaceTurnManager {
     const taskIds: string[] = [];
     for (const record of records) {
       if (isActiveWorkspaceTurnTaskStatus(record.status)) {
-        if (!(await this.isLiveWorkspaceTurn(record))) {
-          await this.settleStaleWorkspaceTurn(record);
+        if (
+          !(await this.isLiveWorkspaceTurn(record)) &&
+          (await this.settleStaleWorkspaceTurn(record)) !== "keep"
+        ) {
           continue;
         }
         taskIds.push(record.handleId);
@@ -4514,11 +4920,13 @@ export class WorkspaceTurnManager {
   ): boolean {
     const muxMetadata = message.metadata?.muxMetadata;
     if (!isPlainObject(muxMetadata)) return false;
-    if (muxMetadata.type === "workspace-turn-task") {
+    // A workspace-turn-task row, or the wake row that reactivated an inactive sub-agent.
+    const correlation = parseWorkspaceTurnTaskCorrelation(muxMetadata);
+    if (correlation != null) {
       return (
-        muxMetadata.taskHandleId === record.handleId &&
-        muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        muxMetadata.turnId === record.turnId
+        correlation.taskHandleId === record.handleId &&
+        correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+        correlation.turnId === record.turnId
       );
     }
     if (muxMetadata.type === "compaction-summary" && isPlainObject(muxMetadata.pendingFollowUp)) {
@@ -5249,6 +5657,17 @@ export class WorkspaceTurnManager {
 
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           const taskId = task.id;
+          // "The restart killed any live stream" holds only when no live backend owns the turn
+          // (#4446). Two new backends may both adopt a dead owner's handle; the second settlement
+          // then finds a terminal record and does nothing.
+          const lockHeldBefore = this.turnOwnerLocks.has(normalized.handleId);
+          if ((await this.acquireTurnOwnerLock(normalized.handleId)) !== "held") {
+            log.info("Skipping a persistent sub-agent execution owned by a live backend", {
+              taskId,
+              handleId: normalized.handleId,
+            });
+            continue;
+          }
           let claimed: boolean;
           try {
             claimed = await this.desktopInputCoordinator.withAdmission(taskId, () =>
@@ -5272,7 +5691,12 @@ export class WorkspaceTurnManager {
             });
             continue;
           }
-          if (!claimed) continue;
+          if (!claimed) {
+            // Another backend published a newer execution: this manager neither adopted nor
+            // settled the handle, so it must not keep that handle's lock.
+            if (!lockHeldBefore) await this.releaseTurnOwnerLock(normalized.handleId);
+            continue;
+          }
         } else {
           await this.taskHost.editWorkspaceEntry(
             task.id,
@@ -5361,8 +5785,14 @@ export class WorkspaceTurnManager {
     handleId: string,
     status: WorkspaceTurnTaskStatus | null,
     allowNewExecution = false,
-    reconciledPreviousExecutionId?: string
+    reconciledPreviousExecutionId?: string,
+    /** Acceptance of a reawakening: commit these AI settings atomically with the claim. */
+    agentTaskAi?: AgentTaskTurnAi
   ): Promise<boolean> {
+    assert(
+      agentTaskAi == null || status === "running",
+      "persistAgentTaskExecutionState: agentTaskAi commits only with a running claim"
+    );
     // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
     // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
     // points at — track whether the matching mirror was actually mutated.
@@ -5408,6 +5838,27 @@ export class WorkspaceTurnManager {
           // commits so a competing controller published meanwhile rejects the active mirror
           // (terminal/clear branches stay ungated: releasing must always be allowed).
           this.desktopInputCoordinator.assertAdmission(config, workspaceId);
+          if (agentTaskAi != null) {
+            // Commit point of a reawakening: the planned settings land in this same write,
+            // only if nothing they were derived from changed. Throwing aborts the whole
+            // write, so a refusal persists neither the claim nor the settings.
+            const freshEntry = findWorkspaceEntry(config, workspaceId);
+            const freshContextKey =
+              freshEntry != null
+                ? buildReawakenContextKey(
+                    freshEntry,
+                    this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
+                  )
+                : null;
+            if (
+              freshContextKey !== agentTaskAi.contextKey ||
+              computeReawakenInputsKey(config, workspaceId, freshContextKey) !==
+                agentTaskAi.inputsKey
+            ) {
+              throw new AgentTaskAiInputsChangedError(workspaceId);
+            }
+            applyAgentTaskTurnAiSnapshot(workspace, agentTaskAi.snapshot);
+          }
           return;
         }
         if (workspace.taskExecutionId === handleId) {
@@ -5424,11 +5875,11 @@ export class WorkspaceTurnManager {
       // until restart. A non-matching handle settling leaves the live execution unrefuted, so
       // its latch must stay.
       //
-      // Remove the matching live registration BEFORE releasing (synchronously, in the same
-      // tick): Config.saveConfig swallows write failures, so `updated` does not prove the
-      // terminal mirror reached disk — a peer admission probe reading a stale running mirror
-      // between this release and the caller's own guarded registration delete would otherwise
-      // still find an accepted live handle and escape the stop. Without the registration,
+      // Remove the matching live registration BEFORE releasing (synchronously, in the same tick):
+      // `updated` alone does not prove the terminal mirror is what disk holds (another writer may
+      // replace it; a failed save rejects, #4444) — a peer admission probe reading a stale running
+      // mirror between this release and the caller's own guarded registration delete would
+      // otherwise still find an accepted live handle and escape the stop. Without the registration,
       // hasLiveRunningExecution refuses regardless of what the on-disk mirror claims. Callers'
       // later guarded deletes simply no-op.
       if (settledMatchingMirror) {
@@ -5438,7 +5889,11 @@ export class WorkspaceTurnManager {
         }
         this.taskHost.releaseRetainedStopLatches(workspaceId);
       }
-      await this.taskHost.emitWorkspaceMetadata(workspaceId);
+      // A reawakening's acceptance hook publishes after its remaining steps, tolerating
+      // publication failure (the settings are already committed).
+      if (agentTaskAi == null) {
+        await this.taskHost.emitWorkspaceMetadata(workspaceId);
+      }
     }
     return claimedActiveMirror || settledMatchingMirror;
   }

@@ -5,7 +5,8 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
-import type { StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
 
 function readWorkspaceId(payload: unknown): string | undefined {
@@ -676,7 +677,8 @@ describe("MockAiStreamPlayer", () => {
     expect(completion).toMatchObject({ status: "completed", streamEnd });
     expect(player.isStreaming(workspaceId)).toBe(false);
 
-    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high" });
+    // Turn metadata must arrive at start so the renderer can classify the turn before deltas.
+    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high", muxMetadata });
     expect(streamEnd?.metadata).toMatchObject({
       agentId: "explore",
       thinkingLevel: "high",
@@ -853,4 +855,212 @@ describe("MockAiStreamPlayer", () => {
       }
     }
   );
+  test("dispatches text deltas in schedule order when a later timer fires before an earlier one", async () => {
+    // Regression (tests/ui bottomLayoutShift under 4-worker load): each scheduled event has an
+    // independent setTimeout, and when several are overdue the runtime may fire the later-delay
+    // timer first. processQueue serializes handlers in *enqueue* order, so the deltas were emitted
+    // reversed; buildCompletedParts later replaced the accumulated text with the adapter's full
+    // text, hiding the wrong live order from persisted history. Drive the timers directly so the
+    // inversion is deterministic instead of load-dependent.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-timer-order";
+    const userText = "Seed idle target transcript";
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+
+    // Derive the expected schedule from the adapter so the test follows chunking/delay constants.
+    const expectedEvents = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    );
+    const expectedDeltas = expectedEvents.flatMap((event) =>
+      event.kind === "stream-delta" ? [event.text] : []
+    );
+    expect(expectedDeltas.length).toBeGreaterThanOrEqual(2);
+    const scheduledDelays = new Set(expectedEvents.map((event) => event.delay));
+
+    const emittedDeltas: string[] = [];
+    let deltasSeenAtStreamEnd = -1;
+    aiServiceStub.on("stream-delta", (event: StreamDeltaEvent) => {
+      emittedDeltas.push(event.delta);
+    });
+    aiServiceStub.on("stream-end", () => {
+      deltasSeenAtStreamEnd = emittedDeltas.length;
+    });
+
+    // Capture only the player's event timers (delays taken from the adapter schedule); every
+    // other timer (stream-start watchdog, lock retries, tokenizer fallback) keeps the real clock.
+    const captured: Array<{ delay: number; fire: () => void }> = [];
+    const scheduled = Promise.withResolvers<void>();
+    const realSetTimeout = globalThis.setTimeout;
+    const capturingSetTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (scheduledDelays.has(delay ?? 0)) {
+        captured.push({ delay: delay ?? 0, fire: () => callback(...args) });
+        if (captured.length === expectedEvents.length) scheduled.resolve();
+        return { ref: () => undefined, unref: () => undefined } as unknown as ReturnType<
+          typeof setTimeout
+        >;
+      }
+      return realSetTimeout(callback, delay, ...args);
+    }) as typeof setTimeout;
+
+    globalThis.setTimeout = capturingSetTimeout;
+    let playResult: Awaited<ReturnType<MockAiStreamPlayer["play"]>>;
+    try {
+      const playPromise = player.play([user], workspaceId);
+      // play() resolves only after stream-start fires; observe scheduling directly instead of polling.
+      await Promise.race([
+        scheduled.promise,
+        playPromise.then(() => {
+          throw new Error("Mock player returned before scheduling its event timers");
+        }),
+      ]);
+      expect(captured).toHaveLength(expectedEvents.length);
+      globalThis.setTimeout = realSetTimeout;
+
+      const byDelay = [...captured].sort((a, b) => a.delay - b.delay);
+      const [streamStart, ...rest] = byDelay;
+      const terminal = rest.pop();
+      if (!terminal) throw new Error("expected a terminal mock event");
+      // All deadlines are overdue by now; fire the deltas latest-first, as the loaded runtime did.
+      await new Promise<void>((resolve) => realSetTimeout(resolve, terminal.delay + 5));
+      streamStart.fire();
+      for (const timer of [...rest].reverse()) timer.fire();
+      terminal.fire();
+      playResult = await playPromise;
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+
+    expect(playResult.success).toBe(true);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+
+    // Live emission must follow the adapter schedule with no duplicates, and the terminal event
+    // must not overtake the deltas.
+    expect(emittedDeltas).toEqual(expectedDeltas);
+    expect(deltasSeenAtStreamEnd).toBe(expectedDeltas.length);
+
+    await player.stop(workspaceId);
+  });
+
+  test("replays a mid-stream subscriber's missed events before the live tail, without duplicates", async () => {
+    // Chat-switch reconnects (#4542): a subscriber that joins mid-stream must see the stream's
+    // events so far (full replay) or only those after its cursor (incremental replay), then the
+    // live tail, with nothing duplicated, dropped, or interleaved.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-mid-stream-replay";
+
+    interface SeenEvent {
+      type: string;
+      replay: boolean;
+      messageId: string;
+      delta?: string;
+      timestamp?: number;
+    }
+    const seen: SeenEvent[] = [];
+    for (const type of ["stream-start", "stream-delta", "usage-delta", "stream-end"]) {
+      aiServiceStub.on(
+        type,
+        (event: {
+          workspaceId: string;
+          messageId: string;
+          replay?: boolean;
+          delta?: string;
+          timestamp?: number;
+        }) => {
+          if (event.workspaceId !== workspaceId) return;
+          seen.push({
+            type,
+            replay: event.replay === true,
+            messageId: event.messageId,
+            delta: event.delta,
+            timestamp: event.timestamp,
+          });
+        }
+      );
+    }
+    const deltasOf = (events: SeenEvent[]) =>
+      events.filter((event) => event.type === "stream-delta");
+
+    // Long enough (~15 chunks) that the stream is still running when the subscriber joins.
+    const userText = "replay ".repeat(50).trim();
+    const expectedDeltas = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    ).flatMap((event) => (event.kind === "stream-delta" ? [event.text] : []));
+
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+    const playResult = await player.play([user], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const messageId = playResult.data.messageId;
+    await waitForCondition(() => deltasOf(seen).length >= 3, 5000);
+
+    const joinIndex = seen.length;
+    const deltasBeforeJoin = deltasOf(seen);
+    expect(deltasBeforeJoin.length).toBeLessThan(expectedDeltas.length);
+    // The reconnect cursor is StreamManager-shaped: the last part carries the newest delta time.
+    const info = player.getStreamInfo(workspaceId);
+    expect(info?.messageId).toBe(messageId);
+    expect(info?.parts.at(-1)?.timestamp).toBe(deltasBeforeJoin.at(-1)?.timestamp);
+
+    const cursor = deltasBeforeJoin[0].timestamp;
+    if (cursor === undefined) throw new Error("live deltas must carry timestamps");
+    // Subscriber A has no stream cursor (full replay); subscriber B saw only the first delta.
+    const fullReplay = player.replayStream(workspaceId);
+    const fullEnd = seen.length;
+    const incrementalReplay = player.replayStream(workspaceId, { afterTimestamp: cursor });
+    const incrementalEnd = seen.length;
+    await Promise.all([fullReplay, incrementalReplay]);
+
+    const full = seen.slice(joinIndex, fullEnd);
+    const incremental = seen.slice(fullEnd, incrementalEnd);
+    for (const replayed of [full, incremental]) {
+      expect(replayed.every((event) => event.replay && event.messageId === messageId)).toBe(true);
+      expect(replayed[0]?.type).toBe("stream-start");
+      expect(replayed.some((event) => event.type === "stream-end")).toBe(false);
+    }
+    const pick = (events: SeenEvent[]) =>
+      events.map(({ delta, timestamp }) => ({ delta, timestamp }));
+    expect(pick(deltasOf(full))).toEqual(pick(deltasBeforeJoin));
+    expect(pick(deltasOf(incremental))).toEqual(pick(deltasBeforeJoin.slice(1)));
+    // Incremental replays carry stream context only, never stale usage snapshots.
+    expect(incremental.some((event) => event.type === "usage-delta")).toBe(false);
+
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+    const tail = seen.slice(incrementalEnd);
+    expect(tail.every((event) => !event.replay)).toBe(true);
+
+    // Each subscriber's view: its replay, then the live tail. Together they are the whole reply.
+    for (const replayed of [full, [...deltasBeforeJoin.slice(0, 1), ...incremental]]) {
+      const view = [...deltasOf(replayed), ...deltasOf(tail)];
+      expect(view.map((event) => event.delta)).toEqual(expectedDeltas);
+      const timestamps = view.map((event) => event.timestamp ?? Number.NaN);
+      expect(
+        timestamps.every((timestamp, index) => index === 0 || timestamp > timestamps[index - 1])
+      ).toBe(true);
+    }
+
+    // A finished stream has nothing to replay.
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const afterEnd = seen.length;
+    await player.replayStream(workspaceId);
+    expect(seen.length).toBe(afterEnd);
+  });
 });

@@ -208,12 +208,26 @@ async function resolvePackagedMacExecutable(appBundlePath: string): Promise<stri
   return path.join(macOsDir, match.name);
 }
 
+// `lipo` only reads the Mach-O header, but /usr/bin/lipo is an xcrun shim that first locates the
+// developer tool, which can be slow on a loaded macOS runner. The previous 10 s limit timed out
+// there (#4940; that job's cleanup found an orphaned xcodebuild). A longer limit plus one retry on
+// ETIMEDOUT only absorbs that stall; every other lipo failure stays fatal.
+const LIPO_TIMEOUT_MS = 60_000;
+
+function runLipoArchs(executablePath: string) {
+  const run = () =>
+    spawnSync("lipo", ["-archs", executablePath], { encoding: "utf8", timeout: LIPO_TIMEOUT_MS });
+  const first = run();
+  if ((first.error as NodeJS.ErrnoException | undefined)?.code !== "ETIMEDOUT") return first;
+  console.warn(
+    `[attach-file-smoke] lipo timed out after ${LIPO_TIMEOUT_MS} ms for ${executablePath}; retrying once`
+  );
+  return run();
+}
+
 async function getPackagedAppArchitectures(appBundlePath: string): Promise<MacAppArchitecture[]> {
   const executablePath = await resolvePackagedMacExecutable(appBundlePath);
-  const result = spawnSync("lipo", ["-archs", executablePath], {
-    encoding: "utf8",
-    timeout: 10_000,
-  });
+  const result = runLipoArchs(executablePath);
 
   if (result.error != null) {
     throw result.error;
@@ -289,7 +303,20 @@ async function runPackagedSmokeApp(
 async function main(): Promise<void> {
   assert(process.platform === "darwin", "checkMacAttachFileRuntime.ts only runs on macOS");
 
-  const requestedAppBundle = process.argv[2];
+  // `--arch <x64|arm64>` checks a single-architecture build (CI builds each arch on its
+  // own runner). Only the host's native arch is launched for the smoke run; other arches
+  // get the static sharp-asset verification, matching the two-arch default below, which
+  // likewise only launches the native bundle.
+  const args = process.argv.slice(2);
+  const archFlagIndex = args.indexOf("--arch");
+  let requestedArchitecture: MacAppArchitecture | null = null;
+  if (archFlagIndex !== -1) {
+    const value = args[archFlagIndex + 1];
+    assert(value === "x64" || value === "arm64", `--arch expects x64 or arm64, got ${value}`);
+    requestedArchitecture = value;
+    args.splice(archFlagIndex, 2);
+  }
+  const requestedAppBundle = args[0];
   let appBundles: string[];
   let smokeAppBundle: string;
   if (requestedAppBundle != null) {
@@ -323,7 +350,9 @@ async function main(): Promise<void> {
   }
 
   if (requestedAppBundle == null) {
-    for (const requiredArchitecture of ["x64", "arm64"] as const) {
+    const requiredArchitectures: readonly MacAppArchitecture[] =
+      requestedArchitecture != null ? [requestedArchitecture] : ["x64", "arm64"];
+    for (const requiredArchitecture of requiredArchitectures) {
       assert(
         verifiedArchitectures.has(requiredArchitecture),
         `Missing ${requiredArchitecture} macOS app bundle under ${RELEASE_DIR}. Verified architectures: ${
@@ -331,6 +360,13 @@ async function main(): Promise<void> {
         }`
       );
     }
+  }
+
+  if (requestedArchitecture != null && requestedArchitecture !== process.arch) {
+    console.log(
+      `[attach-file-smoke] skipping launch of non-native ${requestedArchitecture} bundle on ${process.arch}`
+    );
+    return;
   }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-attach-file-smoke-"));

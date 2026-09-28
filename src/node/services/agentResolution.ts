@@ -26,11 +26,12 @@ import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentFrontmatter,
+  type AgentDefinitionRequestCache,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
@@ -72,6 +73,11 @@ export interface ResolveAgentOptions {
   isAdvisorExperimentEnabled?: boolean;
   /** agent-plugins experiment: also resolve agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
+  /**
+   * Per-request definition reuse. The stream pipeline passes the same cache to
+   * system-context assembly so one turn reads each definition once.
+   */
+  agentDefinitionCache?: AgentDefinitionRequestCache;
 }
 
 /** Result of agent resolution — all computed values needed by the stream pipeline. */
@@ -205,6 +211,7 @@ export async function resolveAgentForStream(
     emitError,
     isAdvisorExperimentEnabled,
     includeAgentPlugins,
+    agentDefinitionCache: cache,
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
@@ -258,7 +265,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -267,7 +274,10 @@ export async function resolveAgentForStream(
           break;
         }
         fallbackDefinition ??= { definition, discovery };
-      } catch {
+      } catch (error) {
+        // An unreadable agent (unreachable host, permission) is not an absent agent:
+        // fail instead of trying the next context or falling back to exec (#4438, #4827).
+        if (isRuntimeReadFailure(error)) throw error;
         // Parent-only project agents may be untracked and absent from child worktrees.
         // Try the next discovery context before moving to the next persisted agent id.
       }
@@ -303,6 +313,7 @@ export async function resolveAgentForStream(
     });
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       includeAgentPlugins,
+      cache,
     });
   }
 
@@ -349,6 +360,7 @@ export async function resolveAgentForStream(
         {
           includeAgentPlugins,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+          cache,
         }
       );
 
@@ -398,11 +410,14 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache }
         );
         effectiveAgentId = agentDefinition.id;
       }
     } catch (error: unknown) {
+      // An unreadable definition is neither an ineligible agent nor a skippable check:
+      // TurnRequestBuilder.prepare reports it as a startup failure (#4831, #4827).
+      if (isRuntimeReadFailure(error)) throw error;
       // Strict sends fail closed when eligibility cannot be verified: a hook or edit
       // that breaks the definition (e.g. a base pointing at a missing definition) after
       // launch validation would otherwise stream a partially resolved prompt/tool policy.
@@ -433,6 +448,7 @@ export async function resolveAgentForStream(
     agentDefinition,
     workspaceId,
     includeAgentPlugins,
+    cache,
   });
 
   // Strict chain pin: inheritance resolution reloads every base independently, so a

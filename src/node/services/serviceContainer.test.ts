@@ -37,7 +37,9 @@ import {
   DesktopSessionManagerTag,
   DesktopTokenManagerTag,
   DevTools,
+  ReviewState,
   Editor,
+  Evaluation,
   Experiments,
   FileLeaseManagerTag,
   History,
@@ -147,9 +149,11 @@ const ORPC_FIELD_TAGS: Record<
   memoryConsolidationService: MemoryConsolidation,
   refineService: Refine,
   sessionUsageService: SessionUsage,
+  evaluationService: Evaluation,
   instructionsService: Instructions,
   workspaceGoalService: WorkspaceGoal,
   devToolsService: DevTools,
+  reviewStateService: ReviewState,
   browserSessionDiscoveryService: AgentBrowserSessionDiscovery,
   browserBridgeTokenManager: BrowserBridgeTokenManagerTag,
   browserBridgeServer: BrowserBridgeServerTag,
@@ -761,6 +765,31 @@ describe("ServiceContainer", () => {
     expect(idleCompactionStart).not.toHaveBeenCalled();
   });
 
+  it("dispose joins a queue drain that startup recovery left launching tasks", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Recovery returned, but the drain it scheduled is still launching a task.
+    const drain = Promise.withResolvers<void>();
+    const drainSettled = spyOn(services.taskService, "queueDrainSettled").mockReturnValue(
+      drain.promise
+    );
+    const closeAll = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+
+    await services.initializeCore();
+    const disposed = services.dispose();
+    while (drainSettled.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    // Teardown past the join waits for the launch to settle (within the join bound).
+    expect(closeAll).not.toHaveBeenCalled();
+    drain.resolve();
+    await disposed;
+    expect(closeAll).toHaveBeenCalledTimes(1);
+  });
+
   it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
     services = new ServiceContainer(stores);
     spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
@@ -786,6 +815,7 @@ describe("ServiceContainer", () => {
     "extensionMetadata.initialize",
     "telemetryService.initialize",
     "policyService.initialize",
+    "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "taskService.recoverInterruptedTasks",
   ];
@@ -885,6 +915,175 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
+  it("initializeCore lets a hung discovered-models migration time out without failing startup", async () => {
+    // Same TestClock harness as above; the migration is the one best-effort core step, so
+    // exceeding the bound must log and continue with the later steps instead of rejecting.
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let migrationCalled: (() => void) | undefined;
+    const migrationCalledPromise = new Promise<void>((resolve) => {
+      migrationCalled = resolve;
+    });
+    spyOn(services.coderOauthService, "separateDiscoveredModelsOnce").mockImplementation(() => {
+      migrationCalled?.();
+      return new Promise<void>(() => {
+        // Never settles: the providers-file lock is held elsewhere for good.
+      });
+    });
+    const experimentsInitialize = spyOn(services.experimentsService, "initialize");
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
+      undefined
+    );
+
+    let outcome: { settled: boolean; error?: unknown } = { settled: false };
+    const core = services.initializeCore().then(
+      () => {
+        outcome = { settled: true };
+      },
+      (error: unknown) => {
+        outcome = { settled: true, error };
+      }
+    );
+    await migrationCalledPromise;
+
+    // The migration still gets the full budget: the later steps wait for it...
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(outcome.settled).toBe(false);
+    expect(experimentsInitialize).not.toHaveBeenCalled();
+    // ...and at the budget it is abandoned while startup goes on and succeeds.
+    await runtime.runPromise(TestClock.adjust(Duration.millis(1)));
+    await core;
+    expect(outcome).toEqual({ settled: true });
+    expect(experimentsInitialize).toHaveBeenCalledTimes(1);
+    expect(recoverTasks).toHaveBeenCalledTimes(1);
+    expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
+  });
+
+  it("initializeCore continues past a rejected discovered-models migration", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.coderOauthService, "separateDiscoveredModelsOnce").mockImplementation(() =>
+      Promise.reject(new Error("providers lock unavailable"))
+    );
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
+      undefined
+    );
+
+    await services.initializeCore();
+
+    expect(recoverTasks).toHaveBeenCalledTimes(1);
+    expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
+  });
+
+  it("initializeCore lets a hung task recovery time out and defers housekeeping until it settles", async () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let recoveryCalled: (() => void) | undefined;
+    const recoveryCalledPromise = new Promise<void>((resolve) => {
+      recoveryCalled = resolve;
+    });
+    let finishRecovery: (() => void) | undefined;
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() => {
+      recoveryCalled?.();
+      return new Promise<void>((resolve) => {
+        finishRecovery = resolve;
+      });
+    });
+    const workspaceInitialize = spyOn(services.workspaceService, "initialize").mockResolvedValue(
+      undefined
+    );
+    spyOn(services.taskService, "runStartupHousekeeping").mockResolvedValue(undefined);
+
+    const core = services.initializeCore();
+    await recoveryCalledPromise;
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS)));
+    // Startup succeeds (the listener may bind) although recovery is still running...
+    await core;
+    const housekeeping = services.runStartupHousekeeping();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // ...but housekeeping does not overlap the still-running recovery.
+    expect(workspaceInitialize).not.toHaveBeenCalled();
+    finishRecovery?.();
+    await housekeeping;
+    expect(workspaceInitialize).toHaveBeenCalledTimes(1);
+  });
+
+  it("runStartupHousekeeping stops waiting for a permanently hung task recovery after the bound", async () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let recoveryCalled: (() => void) | undefined;
+    const recoveryCalledPromise = new Promise<void>((resolve) => {
+      recoveryCalled = resolve;
+    });
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() => {
+      recoveryCalled?.();
+      return new Promise<void>(() => {
+        // Never settles.
+      });
+    });
+    const workspaceInitialize = spyOn(services.workspaceService, "initialize").mockResolvedValue(
+      undefined
+    );
+    spyOn(services.taskService, "runStartupHousekeeping").mockResolvedValue(undefined);
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+
+    const core = services.initializeCore();
+    await recoveryCalledPromise;
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS)));
+    await core;
+    const housekeeping = services.runStartupHousekeeping();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(workspaceInitialize).not.toHaveBeenCalled();
+    // At the bound housekeeping and the periodic services start without the recovery.
+    await runtime.runPromise(TestClock.adjust(Duration.millis(1)));
+    await housekeeping;
+    expect(workspaceInitialize).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("initializeCore continues past a rejected task recovery", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.reject(new Error("config unreadable"))
+    );
+    spyOn(services.workspaceService, "initialize").mockResolvedValue(undefined);
+    const taskHousekeeping = spyOn(
+      services.taskService,
+      "runStartupHousekeeping"
+    ).mockResolvedValue(undefined);
+
+    await services.initializeCore();
+    await services.runStartupHousekeeping();
+
+    expect(taskHousekeeping).toHaveBeenCalledTimes(1);
+  });
+
   it("initializeCore rejects with the failing step's own error and skips the later steps", async () => {
     services = new ServiceContainer(stores);
     const boom = new Error("policy endpoint unreachable");
@@ -910,7 +1109,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the five core steps and re-runs them when called again", async () => {
+  it("initializeCore records the six core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
@@ -1127,6 +1326,7 @@ describe("ServiceContainer", () => {
         }
         const h = await createAgentSessionHarness({
           workspaceId,
+          config: services.config,
           historyService,
           aiEmitter: emitter,
           streamManager: services.streamManager,

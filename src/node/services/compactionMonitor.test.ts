@@ -2,6 +2,10 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import {
+  DEFAULT_AUTO_COMPACTION_THRESHOLD,
+  FORCE_COMPACTION_BUFFER_PERCENT,
+} from "@/common/constants/ui";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
 
 const BETA_SONNET_MODEL = "anthropic:claude-sonnet-4-5";
@@ -44,6 +48,7 @@ describe("CompactionMonitor", () => {
 
     const lowResult = monitor.checkBeforeSend({
       model: BETA_SONNET_MODEL,
+      threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
       usage: { lastContextUsage: createUsageDisplay(120_000) },
       use1MContext: false,
       providersConfig: null,
@@ -53,6 +58,7 @@ describe("CompactionMonitor", () => {
 
     const forceResult = monitor.checkBeforeSend({
       model: BETA_SONNET_MODEL,
+      threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
       usage: { lastContextUsage: createUsageDisplay(150_000) },
       use1MContext: false,
       providersConfig: null,
@@ -60,9 +66,9 @@ describe("CompactionMonitor", () => {
     expect(forceResult.shouldForceCompact).toBe(true);
     expect(forceResult.usagePercentage).toBe(75);
 
-    monitor.setThreshold(0.8);
     const customThresholdResult = monitor.checkBeforeSend({
       model: BETA_SONNET_MODEL,
+      threshold: 0.8,
       usage: { lastContextUsage: createUsageDisplay(150_000) },
       use1MContext: false,
       providersConfig: null,
@@ -77,6 +83,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(140_000),
         use1MContext: false,
         providersConfig: null,
@@ -87,6 +94,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(150_000),
         use1MContext: false,
         providersConfig: null,
@@ -103,6 +111,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(160_000),
         use1MContext: false,
         providersConfig: null,
@@ -129,6 +138,7 @@ describe("CompactionMonitor", () => {
     expect(
       oauthMonitor.checkMidStream({
         model: "openai:gpt-5.5",
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage,
         use1MContext: false,
         providersConfig,
@@ -139,6 +149,7 @@ describe("CompactionMonitor", () => {
     expect(
       apiKeyMonitor.checkMidStream({
         model: "openai:gpt-5.5",
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage,
         use1MContext: false,
         providersConfig,
@@ -147,13 +158,13 @@ describe("CompactionMonitor", () => {
     ).toBe(false);
   });
 
-  test("checkMidStream stays disabled when threshold is set to 1.0", () => {
+  test("checkMidStream stays disabled when threshold is 1.0", () => {
     const { monitor, statusEvents } = createMonitor();
-    monitor.setThreshold(1);
 
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: 1,
         usage: createMidStreamUsage(210_000),
         use1MContext: false,
         providersConfig: null,
@@ -174,6 +185,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: "openai:gpt-4o",
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(42),
         use1MContext: false,
         providersConfig: malformedProvidersConfig,
@@ -191,6 +203,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(145_000, 10_000),
         use1MContext: false,
         providersConfig: null,
@@ -205,6 +218,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(150_000),
         use1MContext: false,
         providersConfig: null,
@@ -217,6 +231,7 @@ describe("CompactionMonitor", () => {
     expect(
       monitor.checkMidStream({
         model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage: createMidStreamUsage(160_000),
         use1MContext: false,
         providersConfig: null,
@@ -225,14 +240,67 @@ describe("CompactionMonitor", () => {
     expect(statusEvents).toHaveLength(2);
   });
 
-  test("setThreshold enforces valid bounds", () => {
+  test("pressure that stays high after an auto-compaction does not trigger another (#4421)", () => {
+    const { monitor, statusEvents } = createMonitor();
+    const check = (inputTokens: number) =>
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
+        usage: createMidStreamUsage(inputTokens),
+        use1MContext: false,
+        providersConfig: null,
+      });
+
+    const forcePercent = DEFAULT_AUTO_COMPACTION_THRESHOLD * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    // 200K window: the force level in tokens, and a reading between threshold and force.
+    const forceTokens = forcePercent * 2_000;
+    const belowForceTokens = forceTokens - 2_000;
+    expect(belowForceTokens).toBeGreaterThan(DEFAULT_AUTO_COMPACTION_THRESHOLD * 200_000);
+
+    expect(check(150_000)).toBe(true);
+    // A request alone does not arm the guard: it may be refused, cancelled or fail.
+    monitor.noteAutoCompactionRequested(forcePercent);
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(true);
+    monitor.noteAutoCompactionCompleted();
+
+    // The follow-up stream after that compaction still reports the same pressure.
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(false);
+    expect(check(150_000)).toBe(false);
+    expect(statusEvents).toHaveLength(2);
+    expect(monitor.suppressRepeatedAutoCompaction("on-send", 75)).toBe(true);
+
+    // Falling under the level that triggered the compaction is relief, even above the threshold.
+    monitor.resetForNewStream();
+    expect(check(belowForceTokens)).toBe(false);
+    expect(check(150_000)).toBe(true);
+    expect(statusEvents).toHaveLength(3);
+
+    // A user turn also lifts the guard.
+    monitor.noteAutoCompactionRequested(forcePercent);
+    monitor.noteAutoCompactionCompleted();
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(false);
+    monitor.noteUserTurn();
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(true);
+  });
+
+  test("checks enforce valid threshold bounds", () => {
     const { monitor } = createMonitor();
+    const check = (threshold: number) =>
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        threshold,
+        usage: createMidStreamUsage(1),
+        use1MContext: false,
+        providersConfig: null,
+      });
 
-    expect(() => monitor.setThreshold(0)).toThrow("invalid threshold");
-    expect(() => monitor.setThreshold(1.01)).toThrow("invalid threshold");
-    expect(() => monitor.setThreshold(Number.NaN)).toThrow("threshold must be finite");
-
-    monitor.setThreshold(0.55);
-    expect(monitor.getThreshold()).toBe(0.55);
+    expect(() => check(0)).toThrow("invalid threshold");
+    expect(() => check(1.01)).toThrow("invalid threshold");
+    expect(() => check(Number.NaN)).toThrow("threshold must be finite");
+    expect(check(0.55)).toBe(false);
   });
 });

@@ -1,0 +1,498 @@
+import React, { useEffect, useState } from "react";
+import { ArrowDown, ArrowUp, Loader2, Plus, RotateCcw, Trash2, X } from "lucide-react";
+
+import { Button } from "@/browser/components/Button/Button";
+import { Input } from "@/browser/components/Input/Input";
+import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import { useAPI } from "@/browser/contexts/API";
+import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
+import { formatWorkspaceLabel, isPersistedWorkspaceSelection } from "./LayoutsSection";
+import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
+import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { formatPercent } from "@/browser/features/Messages/AutoModelRoutingBadge";
+import {
+  getDefaultAutoModelRoutingConfig,
+  isAutoModelRoutingEvaluationModel,
+  type AutoModelRoutingEvaluationStatus,
+  type AutoModelRoutingTier,
+} from "@/common/types/autoModelRouting";
+import { THINKING_LEVELS, isThinkingLevel } from "@/common/types/thinking";
+import { getErrorMessage } from "@/common/utils/errors";
+import { formatModelStringForDisplay } from "@/common/utils/ai/models";
+import {
+  AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS,
+  AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS,
+  AUTO_MODEL_ROUTING_MAX_LABEL_CHARS,
+  AUTO_MODEL_ROUTING_MAX_TIERS,
+  AUTO_MODEL_ROUTING_MIN_TIERS,
+  AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT,
+  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+} from "@/constants/autoModelRouting";
+
+const INHERIT_THINKING = "inherit";
+const SUPPORTED_EVALUATION_PROVIDERS = AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS.join(", ");
+const EVALUATION_MODEL_ERROR = `Enter provider:model using one of ${SUPPORTED_EVALUATION_PROVIDERS}`;
+
+type TierTextField = "label" | "description";
+type TierTextDraft = Record<TierTextField, string>;
+
+interface RoutingPreview {
+  tierId: string;
+  tierLabel: string;
+  confidence?: number;
+  probabilities?: Record<string, number>;
+  evaluationModel: string;
+  model?: string;
+  thinkingLevel?: string;
+}
+
+function nextTierId(tiers: AutoModelRoutingTier[]): string {
+  const taken = new Set(tiers.map((tier) => tier.id));
+  let index = tiers.length + 1;
+  while (taken.has(`tier-${index}`)) index += 1;
+  return `tier-${index}`;
+}
+
+export function AutoModelRoutingExperimentConfig() {
+  const { api } = useAPI();
+  const { models, hiddenModelsForSelector } = useModelsFromSettings();
+  const { config, setConfig, writeError } = useAutoModelRouting();
+  const { config: providersConfig } = useProvidersConfig();
+  const tiers = config.tiers;
+
+  // Text fields commit on blur or Enter, not per keystroke: the IPC boundary rejects empty
+  // intermediate values and would revert the field mid-edit. An invalid draft shows its
+  // message while typing and reverts to the saved value on blur.
+  const [textDrafts, setTextDrafts] = useState<Record<string, Partial<TierTextDraft>>>({});
+  const [textErrors, setTextErrors] = useState<Record<string, Partial<TierTextDraft>>>({});
+
+  // null means "not editing": the field shows the saved evaluation model.
+  const [evaluationDraft, setEvaluationDraft] = useState<string | null>(null);
+  const evaluationValue = (evaluationDraft ?? config.evaluationModel).trim();
+  const evaluationValid = isAutoModelRoutingEvaluationModel(evaluationValue);
+  const [evaluationStatus, setEvaluationStatus] = useState<AutoModelRoutingEvaluationStatus | null>(
+    null
+  );
+  const [samplePrompt, setSamplePrompt] = useState("");
+  const [preview, setPreview] = useState<RoutingPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [classifying, setClassifying] = useState(false);
+  // The preview is a paid evaluator request billed to a workspace's usage ledger. Settings
+  // routes carry no workspace in the URL, so it goes to the last selected one (the target
+  // LayoutsSection captures into as well). The stored selection is untrusted and may be a
+  // legacy shape, so only its id is read and the workspace itself is resolved through live
+  // metadata: a removed workspace disables the preview instead of being billed.
+  const workspaceContext = useOptionalWorkspaceContext();
+  const [persistedWorkspaceId] = useState(() => {
+    const stored = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);
+    return isPersistedWorkspaceSelection(stored) ? stored.workspaceId : null;
+  });
+  const previewWorkspaceId =
+    workspaceContext?.selectedWorkspace?.workspaceId ?? persistedWorkspaceId;
+  const previewWorkspace =
+    previewWorkspaceId != null
+      ? workspaceContext?.workspaceMetadata.get(previewWorkspaceId)
+      : undefined;
+
+  // The status follows the field as typed, not the saved value, so the user sees
+  // whether a candidate evaluator is usable before committing it. Availability is a
+  // credentials question, so it is re-checked whenever the providers config changes (a key
+  // added or a provider disabled from another window), not only after this panel's own write.
+  useEffect(() => {
+    if (!api || !evaluationValid) return;
+    let cancelled = false;
+    api.config
+      .getAutoModelRoutingEvaluationStatus({ evaluationModel: evaluationValue })
+      .then((status) => {
+        if (!cancelled) setEvaluationStatus(status);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [api, evaluationValid, evaluationValue, providersConfig]);
+
+  const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
+  const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
+    replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, ...patch } : tier)));
+  const moveTier = (index: number, delta: -1 | 1) => {
+    const target = index + delta;
+    if (target < 0 || target >= tiers.length) return;
+    const next = [...tiers];
+    [next[index], next[target]] = [next[target], next[index]];
+    replaceTiers(next);
+  };
+  const validateText = (id: string, field: TierTextField, value: string): string | null => {
+    const trimmed = value.trim();
+    if (!trimmed) return field === "label" ? "Label is required" : "Description is required";
+    if (
+      field === "label" &&
+      tiers.some(
+        (tier) => tier.id !== id && tier.label.trim().toLowerCase() === trimmed.toLowerCase()
+      )
+    ) {
+      return "Another tier already uses this label";
+    }
+    return null;
+  };
+  const setTextError = (id: string, field: TierTextField, error: string | null) =>
+    setTextErrors((prev) => ({ ...prev, [id]: { ...prev[id], [field]: error ?? undefined } }));
+  const handleTextChange = (id: string, field: TierTextField, value: string) => {
+    setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: value } }));
+    setTextError(id, field, validateText(id, field, value));
+  };
+  const commitText = (id: string, field: TierTextField) => {
+    const draft = textDrafts[id]?.[field];
+    if (draft === undefined) return;
+    setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: undefined } }));
+    setTextError(id, field, null);
+    // An invalid draft never reaches the backend; the field shows the saved value again.
+    if (validateText(id, field, draft)) return;
+    replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, [field]: draft.trim() } : tier)));
+  };
+
+  const commitEvaluationModel = () => {
+    if (evaluationDraft === null) return;
+    if (!evaluationValid) {
+      // An invalid draft never reaches the backend; blur reverts to the saved value.
+      setEvaluationDraft(null);
+      return;
+    }
+    setEvaluationDraft(null);
+    if (evaluationValue !== config.evaluationModel) {
+      setConfig({ ...config, evaluationModel: evaluationValue });
+    }
+  };
+
+  const classifySample = async () => {
+    if (!api || samplePrompt.trim().length === 0 || previewWorkspace == null) return;
+    setClassifying(true);
+    setPreview(null);
+    setPreviewError(null);
+    try {
+      // Classify against the tiers and evaluator on screen: setConfig saves optimistically and
+      // the write may still be in flight when the click lands.
+      const result = await api.config.previewAutoModelRouting({
+        prompt: samplePrompt,
+        workspaceId: previewWorkspace.id,
+        config,
+      });
+      if (result.success) setPreview(result.data);
+      else setPreviewError(result.error);
+    } catch (error) {
+      setPreviewError(getErrorMessage(error));
+    } finally {
+      setClassifying(false);
+    }
+  };
+
+  if (!api) {
+    return (
+      <div className="bg-background-secondary px-4 py-3">
+        <div className="text-muted text-xs">Connect to xum to configure this setting.</div>
+      </div>
+    );
+  }
+
+  const evaluationStatusText = !evaluationValid
+    ? EVALUATION_MODEL_ERROR
+    : evaluationStatus?.evaluationModel !== evaluationValue
+      ? "Checking evaluation model..."
+      : evaluationStatus.available
+        ? "Ready to classify prompts"
+        : (evaluationStatus.reason ?? "Evaluation model unavailable");
+
+  return (
+    <div className="bg-background-secondary space-y-4 px-4 py-3" data-auto-model-routing-config>
+      <p className="text-muted text-xs">
+        Choose Auto for the model, the thinking level, or both in the composer. Each prompt (with up
+        to {AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT} of your previous prompts in the workspace) is
+        sent to the evaluation model, which picks a difficulty tier. The turn then runs on that
+        tier&apos;s model and/or thinking level, whichever you set to Auto.
+      </p>
+
+      <div className="space-y-2">
+        <label className="text-foreground block text-sm" htmlFor="auto-model-routing-evaluation">
+          Evaluation model
+        </label>
+        <Input
+          id="auto-model-routing-evaluation"
+          aria-invalid={!evaluationValid}
+          autoComplete="off"
+          spellCheck={false}
+          value={evaluationDraft ?? config.evaluationModel}
+          placeholder={DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL}
+          onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+            setEvaluationDraft(event.target.value)
+          }
+          onBlur={commitEvaluationModel}
+          onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === "Enter") commitEvaluationModel();
+            if (event.key === "Escape") setEvaluationDraft(null);
+          }}
+          className="border-border-medium bg-modal-bg h-9 w-full font-mono text-xs"
+        />
+        <div className="text-muted text-xs">
+          provider:model with one of {SUPPORTED_EVALUATION_PROVIDERS}. Credentials come from
+          Providers settings.
+        </div>
+        <div
+          className={
+            evaluationValid && evaluationStatus?.available !== false
+              ? "text-muted text-xs"
+              : "text-danger-light text-xs"
+          }
+          data-auto-model-routing-evaluation-status
+        >
+          {evaluationStatusText}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <div className="text-foreground text-sm">Difficulty tiers</div>
+            <div className="text-muted text-xs">
+              Ordered easiest to hardest. The evaluation model picks one tier per prompt from these
+              descriptions; each tier maps to a model, a thinking level, or both.
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="shrink-0"
+            onClick={() => replaceTiers(getDefaultAutoModelRoutingConfig().tiers)}
+          >
+            <RotateCcw aria-hidden="true" />
+            Reset to defaults
+          </Button>
+        </div>
+
+        <div className="divide-border-light border-border-light divide-y rounded border">
+          {tiers.map((tier, index) => (
+            <div key={tier.id} className="space-y-2 p-3" data-auto-model-routing-tier={tier.id}>
+              <div className="flex items-center gap-2">
+                <Input
+                  aria-label={`Tier ${index + 1} label`}
+                  aria-invalid={textErrors[tier.id]?.label != null}
+                  maxLength={AUTO_MODEL_ROUTING_MAX_LABEL_CHARS}
+                  value={textDrafts[tier.id]?.label ?? tier.label}
+                  onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTextChange(tier.id, "label", event.target.value)
+                  }
+                  onBlur={() => commitText(tier.id, "label")}
+                  onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+                    if (event.key === "Enter") commitText(tier.id, "label");
+                  }}
+                  className="border-border-medium bg-modal-bg h-8 min-w-0 flex-1 text-sm"
+                />
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  aria-label={`Move tier ${index + 1} up`}
+                  disabled={index === 0}
+                  onClick={() => moveTier(index, -1)}
+                >
+                  <ArrowUp aria-hidden="true" />
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  aria-label={`Move tier ${index + 1} down`}
+                  disabled={index === tiers.length - 1}
+                  onClick={() => moveTier(index, 1)}
+                >
+                  <ArrowDown aria-hidden="true" />
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  aria-label={`Remove tier ${index + 1}`}
+                  disabled={tiers.length <= AUTO_MODEL_ROUTING_MIN_TIERS}
+                  onClick={() =>
+                    replaceTiers(tiers.filter((candidate) => candidate.id !== tier.id))
+                  }
+                >
+                  <Trash2 aria-hidden="true" />
+                </Button>
+              </div>
+              {textErrors[tier.id]?.label ? (
+                <div className="text-danger-light text-xs" data-auto-model-routing-text-error>
+                  {textErrors[tier.id]?.label}
+                </div>
+              ) : null}
+              <Input
+                aria-label={`Tier ${index + 1} description`}
+                aria-invalid={textErrors[tier.id]?.description != null}
+                maxLength={AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS}
+                value={textDrafts[tier.id]?.description ?? tier.description}
+                onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+                  handleTextChange(tier.id, "description", event.target.value)
+                }
+                onBlur={() => commitText(tier.id, "description")}
+                onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+                  if (event.key === "Enter") commitText(tier.id, "description");
+                }}
+                className="border-border-medium bg-modal-bg h-8 w-full text-xs"
+              />
+              {textErrors[tier.id]?.description ? (
+                <div className="text-danger-light text-xs" data-auto-model-routing-text-error>
+                  {textErrors[tier.id]?.description}
+                </div>
+              ) : null}
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div className="flex min-w-0 flex-1 items-center gap-1">
+                  <ModelSelector
+                    triggerAriaLabel={`Tier ${index + 1} model`}
+                    value={tier.model ?? ""}
+                    onChange={(model) => updateTier(tier.id, { model })}
+                    models={models}
+                    hiddenModels={hiddenModelsForSelector}
+                    emptyLabel="Use selected composer model"
+                    variant="box"
+                    className="bg-modal-bg min-w-0"
+                  />
+                  {tier.model ? (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="h-8 w-8 shrink-0"
+                      aria-label={`Clear tier ${index + 1} model`}
+                      onClick={() => updateTier(tier.id, { model: undefined })}
+                    >
+                      <X aria-hidden="true" />
+                    </Button>
+                  ) : null}
+                </div>
+                <Select
+                  value={tier.thinkingLevel ?? INHERIT_THINKING}
+                  onValueChange={(value) =>
+                    updateTier(tier.id, {
+                      thinkingLevel: isThinkingLevel(value) ? value : undefined,
+                    })
+                  }
+                >
+                  <SelectTrigger
+                    aria-label={`Tier ${index + 1} thinking level`}
+                    className="border-border-medium bg-modal-bg h-9 w-full sm:w-40"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={INHERIT_THINKING}>Inherit thinking</SelectItem>
+                    {THINKING_LEVELS.map((level) => (
+                      <SelectItem key={level} value={level}>
+                        {level}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          ))}
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={tiers.length >= AUTO_MODEL_ROUTING_MAX_TIERS}
+          onClick={() => {
+            const id = nextTierId(tiers);
+            replaceTiers([
+              ...tiers,
+              {
+                id,
+                label: `Tier ${tiers.length + 1}`,
+                description: "Describe the work this tier covers",
+              },
+            ]);
+          }}
+        >
+          <Plus aria-hidden="true" />
+          Add tier
+        </Button>
+        {writeError ? (
+          <div className="text-danger-light text-xs" data-auto-model-routing-write-error>
+            Could not save routing settings: {writeError}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-foreground text-sm">Test routing</div>
+        <textarea
+          aria-label="Sample prompt"
+          value={samplePrompt}
+          placeholder="Paste a prompt to see which tier the evaluation model would choose"
+          rows={3}
+          onChange={(event) => setSamplePrompt(event.target.value)}
+          className="border-border-medium bg-modal-bg text-foreground placeholder:text-muted w-full rounded border px-2 py-1 text-xs outline-none"
+        />
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            disabled={classifying || samplePrompt.trim().length === 0 || previewWorkspace == null}
+            onClick={() => void classifySample()}
+          >
+            {classifying ? <Loader2 aria-hidden="true" className="animate-spin" /> : null}
+            Classify
+          </Button>
+          <span className="text-muted text-xs" data-auto-model-routing-preview-workspace>
+            {previewWorkspace != null
+              ? `Usage is recorded under ${formatWorkspaceLabel(previewWorkspace.projectName, previewWorkspace.namedWorkspacePath)}.`
+              : "Open a workspace first: usage is recorded under the last selected workspace."}
+          </span>
+        </div>
+        {previewError ? (
+          <div className="text-danger-light text-xs" data-auto-model-routing-preview-error>
+            {previewError}
+          </div>
+        ) : null}
+        {preview ? (
+          <div className="text-xs" data-auto-model-routing-preview>
+            <div className="text-foreground">
+              {preview.tierLabel}
+              {preview.confidence != null
+                ? ` (${formatPercent(preview.confidence)} confidence)`
+                : ""}
+              {preview.model
+                ? ` on ${formatModelStringForDisplay(preview.model)}`
+                : " (no model mapped; the composer model would be used)"}
+              {preview.thinkingLevel ? `, thinking ${preview.thinkingLevel}` : ""}
+            </div>
+            {preview.probabilities ? (
+              <div className="text-muted">
+                {Object.entries(preview.probabilities)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([tierId, probability]) => `${tierId}: ${formatPercent(probability)}`)
+                  .join(", ")}
+              </div>
+            ) : null}
+            <div className="text-muted">
+              Evaluated by {formatModelStringForDisplay(preview.evaluationModel)}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}

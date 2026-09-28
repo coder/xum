@@ -13,6 +13,7 @@ import { Context, Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import { EventEmitter } from "node:events";
+import { runSubscriptionLoop } from "@/browser/stores/subscriptionTransport";
 import { subscriptionIterable, type SubscriptionEmit } from "./streamBridge";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -286,6 +287,95 @@ describe("subscriptionIterable ordering and buffering", () => {
     }
     expect(detached).toBe(1);
   });
+
+  test("progressiveInitialize failure after a push surfaces the error and detaches", async () => {
+    const emitter = new EventEmitter();
+    const boom = new Error("replay failed");
+    const iterable = subscriptionIterable<number>({
+      progressiveInitialize: true,
+      subscribe: (emit) => {
+        emitter.on("value", emit.push);
+        return () => emitter.off("value", emit.push);
+      },
+      initialize: async (emit) => {
+        emit.push(1);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw boom;
+      },
+    });
+
+    const values: number[] = [];
+    try {
+      for await (const value of iterable) values.push(value);
+      expect.unreachable("initialize failure must reject the subscription");
+    } catch (error) {
+      expect(error).toBe(boom);
+    }
+    expect(values).toEqual([1]);
+    expect(emitter.listenerCount("value")).toBe(0);
+  });
+
+  // End to end with the renderer's retry loop (#4506): a replay slower than the stall watchdog
+  // must not be aborted while heartbeats flow. The blocking path is the negative control.
+  test.each([
+    [true, false],
+    [false, true],
+  ])(
+    "stall watchdog vs a slow initialize (progressiveInitialize=%p, expectStall=%p)",
+    async (progressiveInitialize, expectStall) => {
+      const heartbeatMs = 25;
+      const watchdogMs = 250;
+      const replayMs = 4 * watchdogMs;
+      const loopController = new AbortController();
+      const received: string[] = [];
+      let attempts = 0;
+      let stalled = false;
+      let heartbeatsBeforeCaughtUp = 0;
+
+      await runSubscriptionLoop<true, string, undefined>({
+        name: "onChat-test",
+        signal: loopController.signal,
+        getClient: () => Promise.resolve(true),
+        getClientChangeSignal: () => new AbortController().signal,
+        subscribe: (_client, attemptSignal) => {
+          attempts += 1;
+          const events = subscriptionIterable<string>({
+            signal: attemptSignal,
+            heartbeat: { value: "heartbeat", intervalMs: heartbeatMs },
+            progressiveInitialize,
+            subscribe: () => () => undefined,
+            initialize: async (emit) => {
+              await new Promise((resolve) => setTimeout(resolve, replayMs));
+              emit.push("caught-up");
+            },
+          });
+          return Promise.resolve({ events, context: undefined });
+        },
+        onEvent: (event) => {
+          received.push(event);
+          if (event === "caught-up") loopController.abort();
+          else if (!received.includes("caught-up")) heartbeatsBeforeCaughtUp += 1;
+        },
+        // Only an attempt that did not deliver caught-up gets here (the watchdog aborted it).
+        // Stop instead of retrying so the blocking path cannot loop forever.
+        onAttemptFinished: (status) => {
+          stalled = status.attemptAborted;
+          loopController.abort();
+        },
+        watchdog: { timeoutMs: watchdogMs, checkIntervalMs: 10 },
+        sleep: () => Promise.resolve(),
+      });
+
+      expect(attempts).toBe(1);
+      expect(stalled).toBe(expectStall);
+      if (!expectStall) {
+        expect(received.at(-1)).toBe("caught-up");
+        expect(heartbeatsBeforeCaughtUp).toBeGreaterThan(0);
+      } else {
+        expect(received).toEqual([]);
+      }
+    }
+  );
 
   test("nothing runs until the consumer starts pulling", async () => {
     const app = makeAppRuntime(TestClock.layer());

@@ -31,7 +31,7 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR, isRuntimeTransportError } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
@@ -39,6 +39,7 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
   type SSHRuntimeConfig,
   getControlPath,
@@ -1100,6 +1101,15 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    // A probe that hit its own client-side deadline proved nothing about the
+    // file: a stalled link (docker pause, dead peer before keepalives notice)
+    // reaches the 5–10 s probe deadlines first (#4825). The callers of this
+    // hook are trivial non-login primitives (cat, stat, find, mv); resolvePath
+    // runs a slow `bash -lc` login shell and deliberately does not use it.
+    return exitCode === EXIT_CODE_TIMEOUT || this.transport.isConnectionFailure(exitCode, stderr);
+  }
+
   protected async spawnRemoteProcess(
     fullCommand: string,
     options: ExecOptions & { deadlineMs?: number }
@@ -1126,6 +1136,23 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== Runtime interface implementations =====
 
   async resolvePath(filePath: string): Promise<string> {
+    // One bounded retry on a transport failure (#4830), as for reads and
+    // stats: each attempt is already capped at 10 s, so a persistent outage
+    // still fails fast. A login-shell timeout is not transport and never
+    // retries. If the retry fails too, callers see the first failure.
+    try {
+      return await this.resolvePathOnce(filePath);
+    } catch (error) {
+      if (!isRuntimeTransportError(error)) throw error;
+      log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
+      return this.resolvePathOnce(filePath).catch((retryError: unknown) => {
+        log.debug(`Retry of SSH path resolution of ${filePath} failed too`, retryError);
+        throw error;
+      });
+    }
+  }
+
+  protected override async resolvePathOnce(filePath: string): Promise<string> {
     // Expand ~ on the remote host.
     // Note: `p='~/x'; echo "$p"` does NOT expand ~ (tilde expansion happens before assignment).
     // We do explicit expansion using parameter substitution (no reliance on `realpath`, `readlink -f`, etc.).
@@ -1167,6 +1194,11 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (result.exitCode !== 0) {
         const message = result.stderr || result.stdout || "Unknown error";
+        // An unreachable host says nothing about the path; callers must not
+        // skip the root as if it were absent (#4438).
+        if (this.transport.isConnectionFailure(result.exitCode, result.stderr)) {
+          throw new RuntimeError(`Failed to resolve SSH path: ${message}`, "network");
+        }
         throw new Error(`Failed to resolve SSH path: ${message}`);
       }
 
@@ -1806,6 +1838,16 @@ export class SSHRuntime extends RemoteRuntime {
       const errorDetail = stderr || stdout || "git unavailable";
       const isCommandMissing =
         verifyResult.exitCode === 127 || /command not found/i.test(stderr || stdout);
+
+      // A stall that hits the verify deadline is not a missing repository:
+      // keep it retryable instead of a permanent runtime_not_ready (#4825).
+      if (verifyResult.exitCode === EXIT_CODE_TIMEOUT) {
+        return {
+          ready: false,
+          error: "Failed to reach SSH host: repository check timed out",
+          errorType: "runtime_start_failed",
+        };
+      }
 
       if (this.transport.isConnectionFailure(verifyResult.exitCode, verifyResult.stderr)) {
         return {
@@ -3161,7 +3203,8 @@ export class SSHRuntime extends RemoteRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Check if already aborted
     if (abortSignal?.aborted) {
@@ -3356,7 +3399,12 @@ export class SSHRuntime extends RemoteRuntime {
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
         const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
-        if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
+        // keepBranch: the caller undoes a creation that reused this branch (#4819).
+        if (
+          branchToDelete &&
+          !PROTECTED_BRANCHES.includes(branchToDelete) &&
+          options?.keepBranch !== true
+        ) {
           // HEAD neutralization migrates legacy *Xum-owned* base repos whose
           // HEAD still points at a user branch (the Graphite-poisoning state)
           // so `branch -D` keeps Git's native checked-out-branch guard instead

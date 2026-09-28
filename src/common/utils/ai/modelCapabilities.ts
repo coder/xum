@@ -23,8 +23,6 @@ export interface ModelCapabilities {
   maxPdfSizeMb?: number;
 }
 
-export type SupportedInputMediaType = "image" | "pdf" | "audio" | "video";
-
 // Exported for tests: upstream LiteLLM no longer ships max_pdf_size_mb, so the
 // inference branches can only be exercised with injected metadata.
 export function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabilities {
@@ -81,18 +79,4 @@ export function getModelCapabilitiesResolved(
 ): ModelCapabilities | null {
   const metadataModel = resolveModelForMetadata(modelString, providersConfig);
   return getModelCapabilities(metadataModel);
-}
-
-export function getSupportedInputMediaTypes(
-  modelString: string
-): Set<SupportedInputMediaType> | null {
-  const caps = getModelCapabilities(modelString);
-  if (!caps) return null;
-
-  const result = new Set<SupportedInputMediaType>();
-  if (caps.supportsVision) result.add("image");
-  if (caps.supportsPdfInput) result.add("pdf");
-  if (caps.supportsAudioInput) result.add("audio");
-  if (caps.supportsVideoInput) result.add("video");
-  return result;
 }

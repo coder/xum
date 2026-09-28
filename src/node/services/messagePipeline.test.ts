@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantModelMessage, ModelMessage } from "ai";
+import { generateText, type AssistantModelMessage, type ModelMessage } from "ai";
+import { createOpenAI } from "@ai-sdk/openai";
 
 import { transformModelMessages } from "@/browser/utils/messages/modelMessageTransform";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -224,7 +225,7 @@ describe("reasoning replay in built provider requests", () => {
     expect(JSON.stringify(result)).not.toContain("orphan thoughts");
   });
 
-  it("includes OpenAI reasoning itemId and encrypted content", async () => {
+  it("includes OpenAI reasoning encrypted content but not the server-side itemId", async () => {
     const result = await buildRequest(
       "openai",
       "high",
@@ -242,9 +243,10 @@ describe("reasoning replay in built provider requests", () => {
       {
         type: "reasoning",
         text: "redacted summary",
-        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc_blob" } },
+        providerOptions: { openai: { reasoningEncryptedContent: "enc_blob" } },
       },
     ]);
+    expect(JSON.stringify(result)).not.toContain("rs_1");
   });
 
   it("includes xAI reasoning itemId and encrypted content", async () => {
@@ -366,7 +368,7 @@ describe("reasoning replay in built provider requests", () => {
       {
         type: "reasoning",
         text: "ab",
-        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        providerOptions: { openai: { reasoningEncryptedContent: "enc" } },
       },
     ]);
   });
@@ -414,7 +416,7 @@ describe("reasoning replay in built provider requests", () => {
       {
         type: "reasoning",
         text: "abc",
-        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        providerOptions: { openai: { reasoningEncryptedContent: "enc" } },
       },
     ]);
   });
@@ -466,5 +468,132 @@ describe("reasoning replay in built provider requests", () => {
     } finally {
       await cleanup();
     }
+  });
+
+  describe("OpenAI Responses request bodies (real @ai-sdk/openai converter)", () => {
+    // The SDK turns a reasoning itemId into a server-side `item_reference` under
+    // its default store=true and ignores the encrypted blob. That reference is
+    // unresolvable after a route/credential change (gateway<->direct, Codex
+    // store=false turns) and OpenAI answers 400 "Item with id 'rs_…' not found"
+    // on every retry. Pin the wire shape: self-contained encrypted reasoning,
+    // no item_reference, stale id absent from the whole body.
+    interface ResponsesInputItem {
+      type: string;
+      id?: string;
+      encrypted_content?: string;
+      summary?: Array<{ type: string; text: string }>;
+    }
+
+    async function captureResponsesBody(
+      messages: ModelMessage[],
+      store: boolean | undefined
+    ): Promise<{ raw: string; input: ResponsesInputItem[] }> {
+      const captured: string[] = [];
+      const captureFetch = Object.assign(
+        (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+          if (typeof init?.body !== "string") {
+            throw new Error("Expected the OpenAI provider to send a JSON string body");
+          }
+          captured.push(init.body);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_test",
+                model: "gpt-5.6-sol",
+                output: [],
+                usage: { input_tokens: 1, output_tokens: 0 },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const openai = createOpenAI({ apiKey: "test", fetch: captureFetch });
+
+      await generateText({
+        model: openai.responses("gpt-5.6-sol"),
+        messages,
+        providerOptions: store === undefined ? undefined : { openai: { store } },
+        maxRetries: 0,
+      });
+
+      expect(captured).toHaveLength(1);
+      const body = JSON.parse(captured[0]) as { input: ResponsesInputItem[] };
+      return { raw: captured[0], input: body.input };
+    }
+
+    const staleReplayHistory = historyWith([
+      {
+        type: "reasoning",
+        text: "prior reasoning summary",
+        providerOptions: { openai: { itemId: "rs_stale", reasoningEncryptedContent: "blob" } },
+      },
+      { type: "text", text: "answer" },
+    ]);
+
+    it.each([
+      ["default store (unset)", undefined],
+      ["store: true", true],
+      ["store: false", false],
+    ] as const)(
+      "replays prior reasoning as encrypted content, never as item_reference (%s)",
+      async (_label, store) => {
+        const { raw, input } = await captureResponsesBody(
+          await buildRequest("openai", "high", staleReplayHistory),
+          store
+        );
+
+        const reasoningItems = input.filter((item) => item.type === "reasoning");
+        expect(reasoningItems).toEqual([
+          {
+            type: "reasoning",
+            encrypted_content: "blob",
+            summary: [{ type: "summary_text", text: "prior reasoning summary" }],
+          },
+        ]);
+        expect(input.some((item) => item.type === "item_reference")).toBe(false);
+        expect(raw).not.toContain("rs_stale");
+      }
+    );
+
+    it("sends one encrypted reasoning item for a fragmented streamed run", async () => {
+      // Streaming persists one reasoning block as several parts that share the
+      // itemId; encrypted content lands only on the first. Without the id the
+      // SDK cannot group them itself, so Pass 0 coalescing must already have
+      // produced a single part carrying the blob and the full summary text.
+      const { raw, input } = await captureResponsesBody(
+        await buildRequest(
+          "openai",
+          "high",
+          historyWith([
+            {
+              type: "reasoning",
+              text: "first half ",
+              providerOptions: {
+                openai: { itemId: "rs_stale", reasoningEncryptedContent: "blob" },
+              },
+            },
+            {
+              type: "reasoning",
+              text: "second half",
+              providerOptions: { openai: { itemId: "rs_stale" } },
+            },
+            { type: "text", text: "answer" },
+          ])
+        ),
+        undefined
+      );
+
+      expect(input.filter((item) => item.type === "reasoning")).toEqual([
+        {
+          type: "reasoning",
+          encrypted_content: "blob",
+          summary: [{ type: "summary_text", text: "first half second half" }],
+        },
+      ]);
+      expect(input.some((item) => item.type === "item_reference")).toBe(false);
+      expect(raw).not.toContain("rs_stale");
+    });
   });
 });

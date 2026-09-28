@@ -289,6 +289,7 @@ describe("applyWorkspaceChatEventToAggregator", () => {
   test("throws when aggregator is missing", () => {
     const event: WorkspaceChatMessage = {
       type: "caught-up",
+      historyReplayStatus: "complete",
     };
 
     expect(() =>

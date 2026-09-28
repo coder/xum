@@ -2,8 +2,8 @@
 // real script against a throwaway git repo and asserts the memoization
 // contract (check hits only while the worktree fingerprint is unchanged).
 //
-// Not part of the `bun test src` CI lane (like other scripts/ tooling tests);
-// run explicitly: bun test ./scripts/gate_fingerprint.test.ts
+// Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
+// bun test ./scripts/gate_fingerprint.test.ts
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { appendFile, chmod, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

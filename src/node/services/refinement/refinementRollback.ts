@@ -27,7 +27,7 @@
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { DurableEvent } from "@/common/types/durableEvent";
 import {

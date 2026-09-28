@@ -88,7 +88,7 @@ function StoryScaffold(props: {
   const api = createMockORPCClient({
     workspaceActivitySnapshots: props.workspaceActivitySnapshots,
     onChat: (workspaceId, emit) => {
-      emit({ type: "caught-up", hasOlderHistory: false });
+      emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
       if (workspaceId === "ws-active") {
         emit({
           type: "stream-start",

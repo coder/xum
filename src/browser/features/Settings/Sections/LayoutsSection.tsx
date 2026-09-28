@@ -160,7 +160,9 @@ interface PersistedWorkspaceSelection {
   workspaceId: string;
 }
 
-function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorkspaceSelection {
+export function isPersistedWorkspaceSelection(
+  value: unknown
+): value is PersistedWorkspaceSelection {
   if (!value || typeof value !== "object") {
     return false;
   }
@@ -169,7 +171,7 @@ function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorksp
   return typeof candidate.workspaceId === "string";
 }
 
-function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
+export function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
   return `${projectName}/${namedWorkspacePath.split("/").pop() ?? namedWorkspacePath}`;
 }
 
@@ -198,7 +200,7 @@ export function LayoutsSection() {
   const [capturingSlot, setCapturingSlot] = useState<LayoutSlotNumber | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
-  // selectedWorkspace is URL-derived and becomes null on /settings routes.
+  // selectedWorkspace is null when settings opens from a cold link or a non-workspace page.
   // Fall back to the last selected workspace so capture/apply actions remain usable.
   const persistedWorkspaceSelection = useMemo(() => {
     const raw = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);

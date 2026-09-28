@@ -35,6 +35,17 @@ const PIXEL_STABILITY_CSS = `
     scroll-behavior: auto !important;
     transition: none !important;
   }
+  /*
+   * Sticky elements (the chat composer dock, tool headers, sidebars) often rest at a
+   * fractional offset inside a composited scroller. Chromium rasterizes them either
+   * in their own layer or with the scroller depending on timing, which snaps their
+   * text/borders a device pixel apart between otherwise identical captures (seen as
+   * a composer "jitter" diff on App/MCP Identity/Chat/Plugin Server Details).
+   * Forcing a dedicated layer makes the snapping path deterministic.
+   */
+  .sticky {
+    will-change: transform;
+  }
 `;
 
 const STORYBOOK_FONTS_READY_TIMEOUT_MS = 2500;
@@ -63,9 +74,21 @@ function ensureStorybookFontsReady(): Promise<void> {
 
   return fontsReadyPromise;
 }
-// Mock Date.now() globally for deterministic snapshots
-// Components using Date.now() for elapsed time calculations need stable reference
-Date.now = () => NOW;
+// Freeze the wall clock globally for deterministic snapshots. Components using
+// Date.now() for elapsed-time math need a stable reference, and so does every
+// zero-arg `new Date()`: mocking only Date.now left `new Date()` on the real
+// clock, so fixtures stamped with it (e.g. createWorkspace's default createdAt)
+// sorted by whichever millisecond each call landed in. That reordered the
+// sidebar in App/ChatLoading/Replay between otherwise identical captures.
+const RealDate = Date;
+globalThis.Date = new Proxy(RealDate, {
+  construct: (target, args: unknown[], newTarget: new (...args: unknown[]) => unknown) =>
+    Reflect.construct(target, args.length === 0 ? [NOW] : args, newTarget) as object,
+  // `Date()` called as a function returns the current time as a string.
+  apply: () => new RealDate(NOW).toString(),
+  get: (target, property, receiver) =>
+    property === "now" ? () => NOW : Reflect.get(target, property, receiver),
+});
 
 // Disable tutorials by default in Storybook to prevent them from interfering with stories
 // Individual stories can override this by setting localStorage before rendering

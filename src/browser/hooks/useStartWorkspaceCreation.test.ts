@@ -4,6 +4,7 @@ import {
   type StartWorkspaceCreationDetail,
 } from "./useStartWorkspaceCreation";
 import {
+  getAutoModelRoutingKey,
   getInputKey,
   getModelKey,
   getPendingScopeId,
@@ -47,8 +48,19 @@ describe("persistWorkspaceCreationPrefill", () => {
     expect(callMap.get(getInputKey(getPendingScopeId(projectPath)))).toBe("Ship it");
     expect(callMap.get(getModelKey(getProjectScopeId(projectPath)))).toBe("provider/model");
     expect(callMap.get(getTrunkBranchKey(projectPath))).toBe("main");
+    expect(callMap.get(getAutoModelRoutingKey(getProjectScopeId(projectPath)))).toBe(false);
     // runtime is intentionally not persisted - default can only be changed via icon selector
-    expect(calls.length).toBe(3);
+    expect(calls.length).toBe(4);
+  });
+
+  test("a prefilled model is an explicit pick and leaves the project's Auto routing", () => {
+    const { persist, calls } = createPersistSpy();
+
+    persistWorkspaceCreationPrefill(projectPath, { projectPath, model: "provider/model" }, persist);
+
+    const callMap = new Map<string, unknown>(calls.map(([key, value]) => [key, value]));
+    expect(callMap.get(getModelKey(getProjectScopeId(projectPath)))).toBe("provider/model");
+    expect(callMap.get(getAutoModelRoutingKey(getProjectScopeId(projectPath)))).toBe(false);
   });
 
   test("clears persisted values when empty strings are provided", () => {

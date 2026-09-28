@@ -198,7 +198,10 @@ export class ServerUpdater {
           return;
         }
       }
-      // No await between the idle snapshot, atomic swap, and the CLI's shutdown latch.
+      // No await between the idle snapshot, the (synchronous) restarting broadcast, atomic swap,
+      // and the CLI's shutdown latch. Clients swap to the restart screen on this status; the
+      // graceful restart below can take up to the teardown budget.
+      this.setStatus({ type: "restarting", info: { version: staged.version } });
       (this.deps.activate ?? activateUpdate)(this.layout, staged.entry);
       await this.deps.restart();
     } catch (error) {

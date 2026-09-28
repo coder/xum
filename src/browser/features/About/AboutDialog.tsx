@@ -32,6 +32,7 @@ const blockerLabels: Record<RestartBlocker["kind"], string> = {
   requests: "Requests in flight",
   "desktop-sessions": "Live desktop sessions",
   "queued-messages": "Sessions with queued messages",
+  "held-inputs": "Sessions with unsent messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",
   "background-processes": "Running background processes",
@@ -117,6 +118,12 @@ export function AboutDialog() {
           }
           setUpdateStatus(status);
           setPendingAction(null);
+          // The restart screen takes over; releasing this modal also releases its focus trap and
+          // the aria-hidden it put on the app, so the restarting status is what keyboard and
+          // assistive technology land on.
+          if (status.type === "restarting") {
+            close();
+          }
         }
       } catch (error) {
         if (!signal.aborted) {
@@ -128,7 +135,7 @@ export function AboutDialog() {
     return () => {
       controller.abort();
     };
-  }, [api, isOpen]);
+  }, [api, close, isOpen]);
 
   useEffect(() => {
     if (!isOpen || !api) {
@@ -160,6 +167,7 @@ export function AboutDialog() {
     (updateStatus.type === "checking" ||
       updateStatus.type === "downloading" ||
       pendingAction === "check");
+  const isRestarting = updateStatus.type === "restarting";
 
   const handleChannelChange = (next: UpdateChannel) => {
     if (!api || next === channel || channelLoading) {
@@ -260,7 +268,9 @@ export function AboutDialog() {
                           handleChannelChange(next);
                         }
                       }}
-                      disabled={channelLoading || isChecking || pendingAction !== null}
+                      disabled={
+                        channelLoading || isChecking || isRestarting || pendingAction !== null
+                      }
                       aria-label="Update channel"
                       size="sm"
                     >
@@ -278,7 +288,7 @@ export function AboutDialog() {
               <Button
                 variant="outline"
                 size="sm"
-                disabled={isChecking}
+                disabled={isChecking || isRestarting}
                 onClick={handleCheckForUpdates}
               >
                 {isChecking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
@@ -319,6 +329,16 @@ export function AboutDialog() {
                   ) : (
                     <>Downloading update: {updateStatus.percent}%</>
                   )}
+                </div>
+              )}
+
+              {updateStatus.type === "restarting" && (
+                <div className="text-muted text-xs">
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Restarting to install{" "}
+                    <span className="font-mono">{updateStatus.info.version}</span>…
+                  </span>
                 </div>
               )}
 

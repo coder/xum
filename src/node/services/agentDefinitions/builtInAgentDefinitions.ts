@@ -46,8 +46,3 @@ export function getBuiltInAgentDefinitions(): AgentDefinitionPackage[] {
   cachedPackages ??= parseBuiltIns();
   return cachedPackages;
 }
-
-/** Exposed for testing - clears cached parsed packages */
-export function clearBuiltInAgentCache(): void {
-  cachedPackages = null;
-}

@@ -2,7 +2,7 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import * as fs from "fs/promises";
 import { EventEmitter } from "events";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Config } from "@/node/config";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { normalizeToCanonical } from "@/common/utils/ai/models";

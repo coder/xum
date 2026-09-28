@@ -1,6 +1,7 @@
 import { Duration, Effect, Exit, Schedule, Scope, type Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import type { MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { WorkspaceActivitySnapshot, WorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -839,7 +840,10 @@ export class HeartbeatService {
       return { eligible: false, reason: "no_completed_turn" };
     }
 
-    const lastMessage = history[history.length - 1];
+    // Judge the tail by the last row the model would see: hidden plan-review records
+    // (resolve/reopen or an on-demand snapshot appended while idle) are user-role rows but never
+    // a prompt awaiting a response, and must not disable scheduled heartbeats.
+    const lastMessage = history.findLast((message) => !isPlanReviewRecordMessage(message));
     // An idle unanswered user message stays a hard gate for every whenBusy policy: injecting a
     // scheduled message into that abnormal state risks clobbering a failed/interrupted user
     // turn. During an active stream, however, the in-progress assistant output lives only in

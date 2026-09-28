@@ -93,11 +93,13 @@ import {
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
 import { getStatusStateKey } from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   CONTEXT_BOUNDARY_KINDS,
   getContextBoundaryKind,
 } from "@/common/utils/messages/compactionBoundary";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 // Hidden synthetic snapshot rows (skill, MCP prompt, and @file materializations) precede the
 // durable first message and never render, so they must not drop the presentation-only pending
@@ -128,7 +130,10 @@ const AgentStatusSchema = z.object({
 
 // Synthetic agent-skill snapshot messages include metadata.agentSkillSnapshot.
 // We use this to keep the SkillIndicator in sync for /{skillName} invocations.
-const AgentSkillSnapshotMetadataSchema = z.object({
+// Exported for tests: the replay test counts parse attempts, because a parse per
+// snapshot-less history row is the #4869 regression. Production callers are
+// maybeCollectAgentSkillSnapshot and maybeTrackLoadedSkillFromAgentSkillSnapshot below.
+export const AgentSkillSnapshotMetadataSchema = z.object({
   skillName: z.string().min(1),
   scope: z.enum(["project", "global", "built-in"]),
   sha256: z.string().optional(),
@@ -532,6 +537,32 @@ export interface TranscriptRevealTarget {
   toolCallId?: string;
 }
 
+/**
+ * A peer message is persisted as two rows: the assistant payload (rendered as the agent-message
+ * card) and a fixed user-role trigger that wakes the recipient. The trigger only repeats the card
+ * to the user, so drop it when its payload card is among the rendered rows. This runs on the
+ * final (truncated) rows and keys on rendered cards, which exist only for payloads that passed
+ * the envelope authenticity check. A trigger whose card was truncated away, failed that check,
+ * or is missing keeps its own notification row, so a message never disappears entirely.
+ */
+function foldAgentPeerTriggers(messages: DisplayedMessage[]): DisplayedMessage[] {
+  const renderedCards = new Set<string>();
+  for (const message of messages) {
+    if (message.type === "assistant" && message.agentPeerMessage != null) {
+      renderedCards.add(`${message.historyId}\n${message.agentPeerMessage.fromWorkspaceId}`);
+    }
+  }
+  if (renderedCards.size === 0) return messages;
+  return messages.filter(
+    (message) =>
+      message.type !== "user" ||
+      message.agentPeerTriggerPayload == null ||
+      !renderedCards.has(
+        `${message.agentPeerTriggerPayload.payloadMessageId}\n${message.agentPeerTriggerPayload.fromWorkspaceId}`
+      )
+  );
+}
+
 export class StreamingMessageAggregator {
   private messages = new Map<string, MuxMessage>();
   private activeStreams = new Map<string, StreamingContext>();
@@ -558,6 +589,21 @@ export class StreamingMessageAggregator {
   private recencyTimestamp: number | null = null;
   private lastResponseCompletedAt: number | null = null;
   private historyEpoch = 0;
+
+  /**
+   * Rows this aggregator created without a server row behind them (a pre-stream error's
+   * synthetic assistant row carries a locally assigned historySequence for ordering). They are
+   * not evidence for an edit fence; a server row with the same id replaces the object, so the
+   * membership expires with the fabricated row itself.
+   */
+  private readonly locallyFabricatedRows = new WeakSet<MuxMessage>();
+  /**
+   * Persisted rows a frontend projection currently overlays under the same id (a workflow-run
+   * card refreshed with the run's live status, see `addEphemeralMessage`): the projection is
+   * displayed, the persisted row stays the edit evidence — it is what the backend fingerprints.
+   * Refreshed when the backend sends a newer version of the row, dropped with the row.
+   */
+  private readonly overlaidPersistedRows = new Map<string, MuxMessage>();
 
   /** Oldest historySequence from the server's last replay window.
    *  Used for reconnect cursors instead of the absolute minimum (which
@@ -772,40 +818,27 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
-  /** Load persisted agent status from localStorage */
+  // statusState stays persisted (unlike derived caches): the renderer replays history only
+  // from the latest compaction boundary, so a status_set result compacted away cannot be
+  // re-derived after reload. Keep its JSON format stable for up/downgrade.
   private loadPersistedAgentStatus(): AgentStatus | undefined {
     if (!this.workspaceId) return undefined;
-    try {
-      const stored = localStorage.getItem(getStatusStateKey(this.workspaceId));
-      if (!stored) return undefined;
-      const parsed = AgentStatusSchema.safeParse(JSON.parse(stored));
-      return parsed.success ? parsed.data : undefined;
-    } catch {
-      // Ignore localStorage errors or JSON parse failures
-    }
-    return undefined;
+    const parsed = AgentStatusSchema.safeParse(
+      readPersistedState<unknown>(getStatusStateKey(this.workspaceId), undefined)
+    );
+    return parsed.success ? parsed.data : undefined;
   }
 
-  /** Persist agent status to localStorage */
   private savePersistedAgentStatus(status: AgentStatus): void {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
     if (!parsed.success) return;
-    try {
-      localStorage.setItem(getStatusStateKey(this.workspaceId), JSON.stringify(parsed.data));
-    } catch {
-      // Ignore localStorage errors
-    }
+    updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
   }
 
-  /** Remove persisted agent status from localStorage */
   private clearPersistedAgentStatus(): void {
     if (!this.workspaceId) return;
-    try {
-      localStorage.removeItem(getStatusStateKey(this.workspaceId));
-    } catch {
-      // Ignore localStorage errors
-    }
+    updatePersistedState(getStatusStateKey(this.workspaceId), null);
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
@@ -867,6 +900,7 @@ export class StreamingMessageAggregator {
 
   private deleteMessage(messageId: string): boolean {
     const didDelete = this.messages.delete(messageId);
+    this.overlaidPersistedRows.delete(messageId);
     if (didDelete) {
       this.displayedMessageCache.delete(messageId);
       this.messageVersions.delete(messageId);
@@ -1028,6 +1062,15 @@ export class StreamingMessageAggregator {
 
   addMessage(message: MuxMessage): void {
     const normalizedMessage = normalizeMessageRouteProvider(message);
+    // A backend row for an overlaid id is the persisted version the fence must see, whether or
+    // not the richer displayed projection below keeps its place.
+    if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+    }
+    this.upsertMessage(normalizedMessage);
+  }
+
+  private upsertMessage(normalizedMessage: MuxMessage): void {
     const existing = this.messages.get(normalizedMessage.id);
     if (existing) {
       const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
@@ -1048,6 +1091,29 @@ export class StreamingMessageAggregator {
     // Just store the message - backend assigns historySequence
     this.messages.set(normalizedMessage.id, normalizedMessage);
     this.markMessageDirty(normalizedMessage.id);
+  }
+
+  /**
+   * Add a frontend-only row (a `/plan show` preview, a projected workflow-run card): displayed
+   * like any other row but never persisted, so it is not evidence a server-side history check
+   * can be asked about (see `getHistoryEvidenceMessages`).
+   */
+  addEphemeralMessage(message: MuxMessage): void {
+    const normalizedMessage = normalizeMessageRouteProvider(message);
+    const existing = this.messages.get(normalizedMessage.id);
+    const overlaysPersistedRow =
+      existing !== undefined &&
+      !this.locallyFabricatedRows.has(existing) &&
+      !this.overlaidPersistedRows.has(normalizedMessage.id);
+    if (overlaysPersistedRow) {
+      // A projection over a persisted row (same id): keep the persisted version as evidence.
+      this.overlaidPersistedRows.set(normalizedMessage.id, existing);
+    }
+    this.upsertMessage(normalizedMessage);
+    const stored = this.messages.get(normalizedMessage.id);
+    if (stored !== undefined && !this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.locallyFabricatedRows.add(stored);
+    }
   }
 
   /**
@@ -1081,6 +1147,7 @@ export class StreamingMessageAggregator {
       this.historyEpoch++;
       // Clear existing state to prevent stale messages from persisting.
       this.messages.clear();
+      this.overlaidPersistedRows.clear();
       this.displayedMessageCache.clear();
       this.messageVersions.clear();
       this.deltaHistory.clear();
@@ -1108,6 +1175,9 @@ export class StreamingMessageAggregator {
     // Add/overwrite messages in the map
     for (const message of messages) {
       const normalizedMessage = normalizeMessageRouteProvider(message);
+      if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+        this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+      }
       const existing = mode === "append" ? this.messages.get(normalizedMessage.id) : undefined;
 
       if (existing) {
@@ -1171,6 +1241,8 @@ export class StreamingMessageAggregator {
         this.maybeTrackLoadedSkillFromAgentSkillSnapshot(message.metadata?.agentSkillSnapshot);
 
         if (message.role === "user") {
+          // Plan-review record rows are hidden UI state, not user turns (see handleMuxMessage).
+          if (isPlanReviewRecordMessage(message)) continue;
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
@@ -1231,7 +1303,10 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
 
     if (!opts?.skipDerivedState && !hasActiveStream && this.pendingStreamStartTime !== null) {
-      const latestMessage = this.getAllMessages().at(-1);
+      // Hidden plan-review records can trail the settling assistant row; they are not turns.
+      const latestMessage = this.getAllMessages().findLast(
+        (message) => !isPlanReviewRecordMessage(message)
+      );
       const historySettledThePendingTurn =
         latestMessage?.role === "assistant" ||
         (latestMessage?.role === "user" && this.optimisticPendingStreamStart) ||
@@ -1351,6 +1426,11 @@ export class StreamingMessageAggregator {
       if (existing) {
         removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
       }
+      // A backend row for an overlaid id is the persisted version the edit fence must see
+      // (this path bypasses addMessage/loadHistoricalMessages, which refresh it too).
+      if (this.overlaidPersistedRows.has(incoming.id)) {
+        this.overlaidPersistedRows.set(incoming.id, incoming);
+      }
       this.messages.set(incoming.id, incoming);
       this.bumpMessageVersion(incoming.id);
       this.displayedMessageCache.delete(incoming.id);
@@ -1408,6 +1488,35 @@ export class StreamingMessageAggregator {
 
   setEstablishedOldestHistorySequence(sequence: number | null): void {
     this.establishedOldestHistorySequence = sequence;
+  }
+
+  /** Oldest sequence of the server's replay window; rows below it are paginated older pages. */
+  getEstablishedOldestHistorySequence(): number | null {
+    return this.establishedOldestHistorySequence;
+  }
+
+  /**
+   * Drop the paginated rows below the server replay window. A since replay never re-sends
+   * or verifies them, so a caller that needs a fresh copy of older history (an edit whose
+   * range starts in an earlier compaction epoch) discards them and re-pages from the floor.
+   * Returns the number of rows removed.
+   */
+  discardMessagesBelowSequence(sequence: number): number {
+    assert(Number.isInteger(sequence), `discardMessagesBelowSequence requires an integer floor`);
+    let removed = 0;
+    for (const [messageId, message] of Array.from(this.messages.entries())) {
+      const historySequence = message.metadata?.historySequence;
+      if (historySequence !== undefined && historySequence < sequence) {
+        this.deleteMessage(messageId);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
+      this.historyEpoch++;
+      this.invalidateCache();
+    }
+    return removed;
   }
 
   getHistoryEpoch(): number {
@@ -1599,6 +1708,9 @@ export class StreamingMessageAggregator {
         continue;
       }
       if (message.role !== "user") continue;
+      // Hidden plan-review records (snapshot/resolve/reopen) appended after the request are
+      // state, not user turns; they must not hide the request on reconnect recovery.
+      if (isPlanReviewRecordMessage(message)) continue;
       const muxMetadata = message.metadata?.muxMetadata;
       if (muxMetadata?.type === "compaction-request") {
         return sawCompletedCompaction
@@ -1630,7 +1742,8 @@ export class StreamingMessageAggregator {
   }
 
   private isDefaultPostCompactionContinueTurn(): boolean {
-    const messages = this.getAllMessages();
+    // A hidden plan-review record can sit between the summary and its follow-up row.
+    const messages = this.getAllMessages().filter((message) => !isPlanReviewRecordMessage(message));
     const latestMessage = messages.at(-1);
     const previousMessage = messages.at(-2);
     if (latestMessage?.role !== "user" || previousMessage?.role !== "assistant") {
@@ -1769,6 +1882,27 @@ export class StreamingMessageAggregator {
 
   getActiveStreamMessageId(): string | undefined {
     return this.getActiveStreamEntry()?.[0];
+  }
+
+  /**
+   * Committed rows a server-side history check can be asked about: every held row except a
+   * locally fabricated one (`locallyFabricatedRows`: the pre-stream error row and ephemeral
+   * frontend-only rows, whose display-only `historySequence` the backend can never reproduce).
+   * An active stream's row IS evidence —
+   * its persisted counterpart is the empty placeholder the turn appended before streaming, and
+   * an edit that interrupts the turn deletes that placeholder, so the fence must name it as
+   * the newest row. It is presented as `partial` so both sides hash it by identity only (see
+   * computeHistoryRangeFingerprint): the client holds whatever streamed so far, the server
+   * holds the placeholder, and neither is settled content the fence protects.
+   */
+  getHistoryEvidenceMessages(): MuxMessage[] {
+    return this.getAllMessages().flatMap((displayed) => {
+      if (this.locallyFabricatedRows.has(displayed)) return [];
+      const message = this.overlaidPersistedRows.get(displayed.id) ?? displayed;
+      // Every active stream's row (two can overlap briefly around a terminal event).
+      if (!this.isStreamActive(message.id)) return [message];
+      return [{ ...message, metadata: { ...message.metadata, partial: true } }];
+    });
   }
 
   isStreamActive(messageId: string): boolean {
@@ -1928,6 +2062,7 @@ export class StreamingMessageAggregator {
 
   clear(): void {
     this.messages.clear();
+    this.overlaidPersistedRows.clear();
     this.activeStreams.clear();
     this.displayedMessageCache.clear();
     this.messageVersions.clear();
@@ -1971,6 +2106,9 @@ export class StreamingMessageAggregator {
 
     this.clearPendingStreamLifecycleState();
     this.lastAbortReason = null;
+    if (data.replay !== true) {
+      this.dropPreStreamErrorRowsFrom(data.historySequence);
+    }
 
     // NOTE: We do NOT clear agentStatus or currentTodos here.
     // They are cleared when a new user message arrives (see handleMessage),
@@ -1982,7 +2120,10 @@ export class StreamingMessageAggregator {
     this.backgroundHandoffCompletion = undefined;
     const routeProvider = resolveRouteProvider(data.routeProvider, data.routedThroughGateway);
 
+    // A hidden token-budget flush turn is maintenance, not a reply: never notify with
+    // output the transcript intentionally hides (e.g. a resumed flush with no continuation).
     const suppressNotification =
+      data.muxMetadata?.contextBudgetFlush === true ||
       this.isDefaultPostCompactionContinueTurn() ||
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
@@ -2036,8 +2177,12 @@ export class StreamingMessageAggregator {
         existingMessage.metadata.model = data.model;
         existingMessage.metadata.routedThroughGateway = data.routedThroughGateway;
         existingMessage.metadata.routeProvider = routeProvider;
+        existingMessage.metadata.autoModelRouting = data.autoModelRouting;
         if (data.agentId != null) {
           existingMessage.metadata.agentId = data.agentId;
+        }
+        if (data.muxMetadata != null) {
+          existingMessage.metadata.muxMetadata = data.muxMetadata;
         }
         existingMessage.metadata.mode = data.mode;
         existingMessage.metadata.thinkingLevel = data.thinkingLevel;
@@ -2057,13 +2202,39 @@ export class StreamingMessageAggregator {
       model: data.model,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
+      autoModelRouting: data.autoModelRouting,
       agentId: data.agentId,
       mode: data.mode,
       thinkingLevel: data.thinkingLevel,
+      // Turn classification must be known before the first delta so a hidden maintenance
+      // turn (token-budget flush) never paints; stream-end re-merges the same metadata.
+      ...(data.muxMetadata != null ? { muxMetadata: data.muxMetadata } : {}),
     });
 
     this.messages.set(data.messageId, streamingMessage);
     this.markMessageDirty(data.messageId);
+  }
+
+  /**
+   * A new stream's persisted row claims `historySequence`, so every pre-stream error row at or
+   * above it is from an attempt the server never recorded (e.g. a failed auto-retry before the
+   * one that started): drop it, as handleMuxMessage drops rows a new user message supersedes.
+   * Without this, an error fabricated at max + 1 sorts after the successful reply and revives
+   * the "Stream interrupted" barrier (#4832). Later errors are fabricated after this stream's
+   * row, so they still show.
+   */
+  private dropPreStreamErrorRowsFrom(historySequence: number): void {
+    let dropped = false;
+    for (const [messageId, message] of Array.from(this.messages.entries())) {
+      if (
+        this.locallyFabricatedRows.has(message) &&
+        message.metadata?.error != null &&
+        (message.metadata.historySequence ?? 0) >= historySequence
+      ) {
+        dropped = this.deleteMessage(messageId) || dropped;
+      }
+    }
+    if (dropped) this.invalidateCache();
   }
 
   handleStreamDelta(data: StreamDeltaEvent): void {
@@ -2173,8 +2344,10 @@ export class StreamingMessageAggregator {
       const completedAt = isFinal ? Date.now() : null;
 
       // Recency policy: only non-compaction final streams inflate lastResponseCompletedAt.
-      // Compaction recency comes from the compacted summary's own timestamp.
-      if (completedAt !== null && !activeStream.isCompacting) {
+      // Compaction recency comes from the compacted summary's own timestamp. A hidden
+      // token-budget flush adds no visible row, so it must not mark the workspace unread.
+      const isHiddenFlushTurn = message?.metadata?.muxMetadata?.contextBudgetFlush === true;
+      if (completedAt !== null && !activeStream.isCompacting && !isHiddenFlushTurn) {
         this.lastResponseCompletedAt = completedAt;
       }
 
@@ -2323,6 +2496,7 @@ export class StreamingMessageAggregator {
         },
       };
       this.messages.set(data.messageId, errorMessage);
+      this.locallyFabricatedRows.add(errorMessage);
       this.markMessageDirty(data.messageId);
     }
   }
@@ -2524,6 +2698,13 @@ export class StreamingMessageAggregator {
   }
 
   private maybeTrackLoadedSkillFromAgentSkillSnapshot(snapshot: unknown): void {
+    // Replay calls this for every history row, and almost no row carries a snapshot.
+    // A failing safeParse builds a ZodError per row, which cost seconds at 500k+ rows
+    // (#4869). Any present value (including null or malformed objects) is still parsed.
+    if (snapshot === undefined) {
+      return;
+    }
+
     const parsed = AgentSkillSnapshotMetadataSchema.safeParse(snapshot);
     if (!parsed.success) {
       return;
@@ -2765,7 +2946,12 @@ export class StreamingMessageAggregator {
             // Create new objects to trigger React re-render (immutable update pattern)
             const updatedNestedCalls = parentPart.nestedCalls.map((nc, i) =>
               i === nestedIndex
-                ? { ...nc, state: "output-available" as const, output: data.result }
+                ? {
+                    ...nc,
+                    state: "output-available" as const,
+                    output: data.result,
+                    ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
+                  }
                 : nc
             );
             message.parts[parentIndex] = { ...parentPart, nestedCalls: updatedNestedCalls };
@@ -2786,6 +2972,7 @@ export class StreamingMessageAggregator {
           ...toolPart,
           state: "output-available",
           output: data.result,
+          ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
         };
 
         // Process tool result to update derived state (todos, agentStatus, etc.)
@@ -3058,6 +3245,13 @@ export class StreamingMessageAggregator {
     this.maybeTrackLoadedSkillFromAgentSkillSnapshot(incomingMessage.metadata?.agentSkillSnapshot);
 
     if (incomingMessage.role !== "user") {
+      return;
+    }
+
+    if (isPlanReviewRecordMessage(incomingMessage)) {
+      // Plan-review snapshot/resolve/reopen rows are hidden UI state appended without starting
+      // a model turn (e.g. resolving a thread while idle). Keep the row for review-state replay
+      // but leave the lifecycle, agent status, compaction and pending-stream state untouched.
       return;
     }
 
@@ -3590,10 +3784,21 @@ export class StreamingMessageAggregator {
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
+      // The token-budget flush turn is machine maintenance (one memory write before the
+      // window is sealed), not a reply to the user. Its trigger row is already a hidden
+      // synthetic user row; the assistant output it produces carries the same turn flag on
+      // the live stream, the recovered partial, and the settled history row, so hide the
+      // whole turn by that flag rather than by the text it happens to emit. A failed flush
+      // stays visible: its error row and retry controls are the only explanation the user gets.
+      // Plan-review record rows stay hidden even in debug-LLM mode: that mode shows what the
+      // model sees, and these rows are never sent (isModelHiddenMessage).
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
-        !showSyntheticMessages &&
-        ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
-          isWorkflowResultMessage(message));
+        isPlanReviewRecordMessage(message) ||
+        (!showSyntheticMessages &&
+          ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
+            (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
+              message.metadata.error == null) ||
+            isWorkflowResultMessage(message)));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.
       const latestAgentSkillSnapshotByKey = new Map<string, AgentSkillSnapshotContent>();
@@ -3753,6 +3958,11 @@ export class StreamingMessageAggregator {
           truncationPlan.hiddenCount > 0
             ? this.normalizeLastPartFlags(truncationPlan.rows)
             : truncationPlan.rows;
+      }
+
+      // Debug-LLM mode keeps triggers visible: it shows what the model actually received.
+      if (!showSyntheticMessages) {
+        resultMessages = foldAgentPeerTriggers(resultMessages);
       }
 
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);

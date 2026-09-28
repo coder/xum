@@ -23,10 +23,10 @@ describe("codexOAuth model gating", () => {
   it("allows the GPT-5.6 family through Codex OAuth without requiring it", () => {
     // Includes the bare alias: it is a servable model id (OpenAI routes it to Sol).
     const contextLimits = {
-      "gpt-5.6": 372_000,
-      "gpt-5.6-sol": 372_000,
-      "gpt-5.6-terra": 372_000,
-      "gpt-5.6-luna": 372_000,
+      "gpt-5.6": 272_000,
+      "gpt-5.6-sol": 272_000,
+      "gpt-5.6-terra": 272_000,
+      "gpt-5.6-luna": 272_000,
     } as const;
 
     for (const [model, contextLimit] of Object.entries(contextLimits)) {
@@ -39,13 +39,17 @@ describe("codexOAuth model gating", () => {
     }
   });
 
-  it("allows GPT-6 Astra through Codex OAuth with the GPT-5.6 context cap", () => {
-    expect(isCodexOauthAllowedModelId("gpt-6-astra")).toBe(true);
-    expect(isCodexOauthAllowedModelId("openai:gpt-6-astra")).toBe(true);
-    expect(isCodexOauthRequiredModelId("gpt-6-astra")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-6-astra")).toBe(false);
-    expect(getCodexOauthContextWindowOverride("gpt-6-astra")).toBe(372_000);
-    expect(getCodexOauthContextWindowOverride("openai:gpt-6-astra")).toBe(372_000);
+  it.each([
+    // The pinned Codex catalog publishes a 272K default context_window for all three.
+    ["gpt-6-astra", 272_000],
+    ["gpt-6-sol", 272_000],
+    ["gpt-6-luna", 272_000],
+  ])("allows %s through Codex OAuth with a %d context cap", (model, contextLimit) => {
+    for (const id of [model, `openai:${model}`]) {
+      expect(isCodexOauthAllowedModelId(id)).toBe(true);
+      expect(isCodexOauthRequiredModelId(id)).toBe(false);
+      expect(getCodexOauthContextWindowOverride(id)).toBe(contextLimit);
+    }
   });
 
   it("does not allow GPT-5.5 Pro through the Codex OAuth route", () => {

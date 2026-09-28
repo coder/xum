@@ -9,4 +9,6 @@ export const VSCODE_CHAT_UI_SUPPORT = {
   reviewAnnotations: "unsupported",
   bashForegroundControls: "unsupported",
   jsonRawView: "supported",
+  // workspace.replaceChatHistory is a destructive write the bridge does not allow (#4942).
+  chatHistoryReplacement: "unsupported",
 } as const satisfies Record<ChatUiFeatureId, ChatUiSupport>;

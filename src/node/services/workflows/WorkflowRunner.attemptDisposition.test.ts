@@ -1,6 +1,4 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type { WorkflowRunEvent } from "@/common/types/workflow";
@@ -36,6 +34,7 @@ const summarizeSpec: WorkflowAgentSpec = {
   markdownOnly: true,
 };
 const summarizeHash = hashWorkflowStepInput(summarizeSpec.id, summarizeSpec);
+const PRIOR_ATTEMPT = "att_00000000000000e5";
 
 async function createStore(sessionDir: string, source = SINGLE_STEP_SOURCE) {
   const store = new WorkflowRunStore({ sessionDir, staleLeaseMs: STALE_LEASE_MS });
@@ -83,24 +82,6 @@ function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
     if (signal.aborted) return resolve();
     signal.addEventListener("abort", () => resolve(), { once: true });
   });
-}
-
-/**
- * A lease renewal tick that fired just before a run ended can still hold the lease mutation lock
- * for a few ms after release; acquireLease deliberately does not wait through that lock. Wait for
- * it to clear so a back-to-back run in the same test cannot see a spurious "already active".
- */
-async function waitForLeaseLockRelease(sessionDir: string): Promise<void> {
-  const lockDir = path.join(sessionDir, "workflows", RUN_ID, "lease.json.lock");
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try {
-      await fs.stat(lockDir);
-    } catch {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error(`lease mutation lock still held: ${lockDir}`);
 }
 
 const report = (taskId: string): WorkflowAgentResult => ({
@@ -267,7 +248,12 @@ describe("WorkflowRunner attempt disposition", () => {
         await okReport.promise;
         return report(taskId);
       },
-      readSettledAgentResult: async () => ({ kind: "terminal-no-report" }),
+      readSettledAgentResult: async () => ({
+        kind: "terminal-no-report",
+        attemptId: "att_00000000000000a1",
+      }),
+      // The retry consults the failed step's child (ended, no report) and retires it first.
+      claimRetiredAttempt: mock(async () => ({ success: true as const, nonce: "nonce-retry" })),
       async interruptRun() {
         okReport.resolve();
       },
@@ -280,11 +266,13 @@ describe("WorkflowRunner attempt disposition", () => {
       { stepId: "ok", taskId: "task_ok_1", status: "completed" },
     ]);
 
-    await waitForLeaseLockRelease(tmp.path);
     const retried = await runner.run(RUN_ID, { allowRetryFromFailedCheckpoint: true });
     expect(retried).toEqual({ reportMarkdown: "report from task_fail_2|report from task_ok_1" });
     // Only the failed step reran; the settled sibling was reused.
     expect(createAgentTasks.mock.calls.at(-1)?.[0].map((spec) => spec.id)).toEqual(["fail"]);
+    expect(createAgentTasks.mock.calls.at(-1)?.[1]).toMatchObject({
+      retires: [{ taskId: "task_fail_1", attemptId: "att_00000000000000a1", nonce: "nonce-retry" }],
+    });
   });
 
   test("pipeline fail-fast disposes live siblings concurrently, keeping their reports and the original error", async () => {
@@ -384,7 +372,6 @@ describe("WorkflowRunner attempt disposition", () => {
         run.steps.find((step) => step.stepId === "reported")?.result?.structuredOutput
       ).toEqual({ label: "r" });
       // Every settled sibling is disposed and the lease is free for a checkpoint retry.
-      await waitForLeaseLockRelease(tmp.path);
       await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
     }
   });
@@ -490,12 +477,14 @@ describe("WorkflowRunner attempt disposition", () => {
     await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:00.750Z");
     const settlementWaits: Array<{ taskId: string; timeoutMs: number; hasSignal: boolean }> = [];
     const created: string[] = [];
+    const order: string[] = [];
     const runner = createRunner(store, {
       async runAgent() {
         throw new Error("must reserve through createAgentTasks");
       },
       async createAgentTasks(specs, lifecycle) {
         created.push(...specs.map((spec) => spec.id));
+        order.push(`reserve retires ${JSON.stringify(lifecycle?.retires)}`);
         await lifecycle?.onTaskCreated?.(0, "task_replacement");
         return [{ taskId: "task_replacement", status: "running" }];
       },
@@ -509,7 +498,11 @@ describe("WorkflowRunner attempt disposition", () => {
           timeoutMs: options.timeoutMs,
           hasSignal: options.abortSignal != null,
         });
-        return { kind: "terminal-no-report" };
+        return { kind: "terminal-no-report", attemptId: PRIOR_ATTEMPT };
+      },
+      async claimRetiredAttempt(taskId, attemptId, claimant) {
+        order.push(`claim ${taskId} ${attemptId} ${claimant.stepId}`);
+        return { success: true, nonce: "nonce-1" };
       },
     });
 
@@ -520,6 +513,11 @@ describe("WorkflowRunner attempt disposition", () => {
       { taskId: "task_prior", timeoutMs: WORKFLOW_ATTEMPT_SETTLEMENT_TIMEOUT_MS, hasSignal: true },
     ]);
     expect(created).toEqual(["summarize"]);
+    // The ended attempt is retired first; the replacement's reservation consumes that claim.
+    expect(order).toEqual([
+      `claim task_prior ${PRIOR_ATTEMPT} summarize`,
+      `reserve retires ${JSON.stringify([{ taskId: "task_prior", attemptId: PRIOR_ATTEMPT, nonce: "nonce-1" }])}`,
+    ]);
     const run = await store.getRun(RUN_ID);
     expect(run.steps).toMatchObject([{ taskId: "task_replacement", status: "completed" }]);
     expect(taskEvents(run.events)).toEqual([
@@ -528,6 +526,50 @@ describe("WorkflowRunner attempt disposition", () => {
       ["task_replacement", "completed"],
     ]);
   });
+
+  test.each([
+    ["the claim is refused", PRIOR_ATTEMPT, true],
+    ["the ended attempt has no identity (pre-identity)", undefined, true],
+    ["the task adapter cannot claim", PRIOR_ATTEMPT, false],
+  ] as const)(
+    "a no-report prior attempt is never replaced when %s: the run stays interrupted and nothing is reserved",
+    async (_label, attemptId, canClaim) => {
+      using tmp = new DisposableTempDir("workflow-runner-claim-refused");
+      const store = await createStore(tmp.path);
+      await seedPriorAttempt(store, "task_prior");
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:00.750Z");
+      const createAgentTasks = mock(async () => {
+        throw new Error("an unclaimed prior attempt must not be replaced");
+      });
+      const runner = createRunner(store, {
+        async runAgent() {
+          throw new Error("an unclaimed prior attempt must not be replaced");
+        },
+        createAgentTasks,
+        async waitForAgentTask() {
+          throw new Error("a settled attempt is not awaited");
+        },
+        readSettledAgentResult: async () =>
+          attemptId != null
+            ? { kind: "terminal-no-report", attemptId }
+            : { kind: "terminal-no-report" },
+        ...(canClaim
+          ? {
+              claimRetiredAttempt: async () => ({
+                success: false as const,
+                error: "claim lost: the task now names attempt att_00000000000000ff",
+              }),
+            }
+          : {}),
+      });
+
+      await expect(runner.run(RUN_ID, { allowResumeFromInterrupted: true })).rejects.toThrow(
+        /previous attempt task_prior is unresolved/
+      );
+      expect(createAgentTasks).not.toHaveBeenCalled();
+      expect((await store.getRun(RUN_ID)).status).toBe("interrupted");
+    }
+  );
 
   test("resume on unresolved cleanup releases the lease, keeps the run interrupted, and starts nothing", async () => {
     using tmp = new DisposableTempDir("workflow-runner-resume-cleanup-timeout");
@@ -567,7 +609,8 @@ describe("WorkflowRunner attempt disposition", () => {
     expect(errorEvent?.type === "error" ? errorEvent.message : "").toContain(
       "cleanup is still in progress"
     );
-    // The lease was released: a fresh runner can take the run immediately.
+    // The lease was released: a fresh runner can take the run immediately (run() joins an
+    // in-flight renewal tick before releasing, so no renewal can hold the lease lock now).
     await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
   });
 

@@ -183,7 +183,7 @@ describeIntegration("Thinking selector", () => {
 
       // Grok uses the same thinking selector with its native low/medium/high/xhigh
       // ladder, while Fast mode writes xAI's priority tier instead of OpenAI's.
-      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_46.id);
+      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_47.id);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {
         throw new Error("Pro toggle should not render for Grok");

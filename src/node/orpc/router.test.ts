@@ -4,11 +4,160 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { Err, Ok, type Result } from "@/common/types/result";
+import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
+import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
 
 import type { ORPCContext } from "./context";
 import { inFlightProcedureCount } from "./inFlightProcedures";
+import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
+
+describe("config.previewAutoModelRouting", () => {
+  const PREVIEW_TIERS = {
+    tiers: [
+      { id: "easy", label: "Easy", description: "Trivial" },
+      { id: "hard", label: "Hard", description: "Complex", model: "openai:gpt-5.5" },
+    ],
+  };
+  const EVALUATOR_USAGE = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+
+  function createPreviewClient(outcome: Result<AutoModelRoutingDecision, AutoModelRouterFailure>) {
+    const classifyEffect = mock((_input: unknown) => Effect.succeed(outcome));
+    const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
+    const context = {
+      config: {
+        loadConfigOrDefault: () => ({}),
+        // Only ws-live is registered; a stale persisted selection resolves to nothing.
+        findWorkspace: (workspaceId: string) =>
+          workspaceId === "ws-live" ? { workspacePath: "/repo/ws", projectPath: "/repo" } : null,
+      },
+      initStateManager: { waitForInit: mock(async () => undefined) },
+      sessionUsageService: { recordHeadlessUsage },
+      "effect/context": Context.make(AutoModelRouterTag, {
+        classifyEffect,
+      } as unknown as AutoModelRouter),
+    } as unknown as ORPCContext;
+    return {
+      client: createRouterClient(router(), { context }),
+      classifyEffect,
+      recordHeadlessUsage,
+    };
+  }
+
+  test("bills the evaluator's usage to the named workspace like the send path", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+        providerMetadata: { typesafe: { requestId: "req-1" } },
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result).toEqual(
+      Ok({
+        tierId: "hard",
+        tierLabel: "Hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        model: "openai:gpt-5.5",
+      })
+    );
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]).toEqual([
+      "ws-live",
+      "typesafe:jev-latest",
+      EVALUATOR_USAGE,
+      { typesafe: { requestId: "req-1" } },
+      { analyticsSource: "auto_model_routing_preview" },
+    ]);
+  });
+
+  test("a verdict naming a tier the panel no longer has still bills its usage", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "extreme",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(true);
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+  });
+
+  test("bills a rejected verdict the provider already billed (#4774)", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Err({ reason: "Evaluation failed (AI_InvalidResponseDataError)", usage: EVALUATOR_USAGE })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result).toEqual(Err("Evaluation failed (AI_InvalidResponseDataError)"));
+    expect(recordHeadlessUsage.mock.calls).toEqual([
+      [
+        "ws-live",
+        "typesafe:jev-latest",
+        EVALUATOR_USAGE,
+        undefined,
+        { analyticsSource: "auto_model_routing_preview" },
+      ],
+    ]);
+  });
+
+  test("refuses a workspace it does not know before calling the evaluator", async () => {
+    const { client, classifyEffect, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-removed",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(false);
+    expect(classifyEffect).not.toHaveBeenCalled();
+    expect(recordHeadlessUsage).not.toHaveBeenCalled();
+  });
+});
+
+describe("router terminal.create", () => {
+  test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
+    const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
+    const context = {
+      terminalService: {
+        create: mock(() => Promise.reject(new WorkspaceMutationInProgressError(message))),
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+
+    let refused: unknown;
+    await client.terminal
+      .create({ workspaceId: "ws-1", cols: 80, rows: 24 })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("CONFLICT");
+    expect((refused as Error).message).toBe(message);
+  });
+});
 
 describe("router agent skill routes", () => {
   test("subproject workspaces inherit parent skills with nearest precedence", async () => {
@@ -243,6 +392,23 @@ describe("router config transcript mutation", () => {
     await client.config.updateChatTranscriptFullWidth({ enabled: false });
     expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(false);
     expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
+  });
+
+  test("persists the keep-screen-awake config flag", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+    await client.config.updateKeepScreenAwake({ enabled: true });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(true);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBe(true);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(true);
+
+    // Off state removes the key entirely (absent = off) instead of persisting `false`.
+    await client.config.updateKeepScreenAwake({ enabled: false });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBeUndefined();
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
   });
 
   test("refuses procedure calls once the server has begun shutting down", async () => {

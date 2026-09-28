@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
@@ -147,9 +147,15 @@ function isUnderAnyRoot(managedRootDirs: string[], candidate: string): boolean {
 }
 
 /**
- * Reconcile the file's `folders` array with `desiredPaths` under the
- * managed-entry invariant. Creates the file (with `seedFolders`) when missing.
- * Uses jsonc-parser edits so user comments and unknown keys survive.
+ * Test entry point for the file-level reconcile engine. It runs the same three
+ * steps as `syncProjectCodeWorkspace` (resolve symlinks, take the per-file write
+ * lock, reconcile) but takes the desired state directly, so format, cap and
+ * symlink cases can be tested without a Config fixture. Production code calls
+ * `syncProjectCodeWorkspace`, which must derive the desired state inside the lock.
+ *
+ * The engine reconciles the file's `folders` array with `desiredPaths` under the
+ * managed-entry invariant, creates the file (with `seedFolders`) when missing, and
+ * uses jsonc-parser edits so user comments and unknown keys survive.
  */
 export async function updateCodeWorkspaceFile(
   update: CodeWorkspaceFileUpdate

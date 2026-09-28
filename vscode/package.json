@@ -105,5 +105,5 @@
     "directory": "vscode"
   },
   "license": "AGPL-3.0-only",
-  "packageManager": "bun@1.1.42"
+  "packageManager": "bun@1.3.12"
 }

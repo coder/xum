@@ -48,41 +48,56 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
+  // The latest attachments, including updates React has not rendered yet. Persisting from here,
+  // outside a state updater, makes a write durable when setAttachments returns: an updater may
+  // only run at the next render, which never comes if the composer unmounts first. A Stop
+  // restore acknowledges the backend's copy right after this call (#4448).
+  const latestAttachmentsRef = useRef(attachments);
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) =>
-    setAttachmentsState((previous) => {
-      const next = value instanceof Function ? value(previous) : value;
-      const persists =
-        next.length > 0 &&
-        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-      selfWriteRef.current = true;
-      try {
-        updatePersistedState<ChatAttachment[] | undefined>(
-          attachmentsKey,
-          persists ? next : undefined
-        );
-      } finally {
-        selfWriteRef.current = false;
-      }
-      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-        tooLargeToastKeyRef.current = attachmentsKey;
-        pushToast({
-          type: "error",
-          message:
-            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-          duration: 5000,
-        });
-      }
-      return next;
-    });
+  ) => {
+    const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
+    const previousCount = latestAttachmentsRef.current.length;
+    latestAttachmentsRef.current = next;
+    const withinCap =
+      next.length > 0 &&
+      estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+    let persists = false;
+    selfWriteRef.current = true;
+    try {
+      persists =
+        withinCap && updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, next);
+      // A failed write (quota exceeded even after evicting caches) leaves the previous list on
+      // disk; drop it like an over-cap draft so a reload never restores stale attachments.
+      if (!persists) updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, undefined);
+    } finally {
+      selfWriteRef.current = false;
+    }
+    if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+    // Warn once per failing draft, and again whenever another attachment is added to it: the
+    // earlier toast auto-dismisses, so a later add would otherwise fail with no feedback.
+    else if (tooLargeToastKeyRef.current !== attachmentsKey || next.length > previousCount) {
+      tooLargeToastKeyRef.current = attachmentsKey;
+      pushToast({
+        type: "error",
+        message:
+          "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+        duration: 5000,
+      });
+    }
+    setAttachmentsState(next);
+  };
   useEffect(() => {
     tooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+    const syncFromStorage = () => {
+      const stored = readPersistedChatAttachments(attachmentsKey);
+      latestAttachmentsRef.current = stored;
+      setAttachmentsState(stored);
+    };
+    syncFromStorage();
     return subscribePersistedStateWrites((event) => {
       if (event.key === attachmentsKey && !selfWriteRef.current) {
-        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+        syncFromStorage();
       }
     });
   }, [attachmentsKey]);
@@ -136,7 +151,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {
-    storageKeys: { inputKey },
+    storageKeys: { inputKey, attachmentsKey },
     input,
     setInput,
     latestInputValueRef,

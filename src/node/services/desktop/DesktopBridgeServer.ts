@@ -167,7 +167,10 @@ export class DesktopBridgeServer {
   public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     this.ensureReady();
     if (this.isStopping) {
-      log.debug("DesktopBridgeServer: rejecting upgrade while stopping", { url: request.url });
+      // Log only the path: the upgrade URL carries the desktop token as `?token=` (#4853).
+      log.debug("DesktopBridgeServer: rejecting upgrade while stopping", {
+        path: request.url?.split("?", 1)[0],
+      });
       rejectUpgrade(socket);
       return;
     }
@@ -239,7 +242,10 @@ export class DesktopBridgeServer {
     const requestUrl = new URL(request.url ?? "/", `http://${VNC_HOST}`);
     const token = requestUrl.searchParams.get("token");
     if (!token) {
-      log.warn("DesktopBridgeServer: rejecting upgrade with missing token", { url: request.url });
+      // Path only: `?token=&token=<real>` reaches this branch with a token in the URL (#4853).
+      log.warn("DesktopBridgeServer: rejecting upgrade with missing token", {
+        path: requestUrl.pathname,
+      });
       closeWebSocket(ws, INVALID_TOKEN_CLOSE_CODE, "invalid token");
       return;
     }

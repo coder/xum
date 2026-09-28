@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { SUPPORTED_PROVIDERS } from "@/common/constants/providers";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
+import { isValidCustomProviderId } from "@/common/utils/providers/customProviders";
 import { EffectivePolicySchema, PolicyFileSchema } from "./policy";
 
 function policyFileWithProvider(id: string): unknown {
@@ -20,6 +22,15 @@ describe("policy provider ids", () => {
     for (const id of ["BAD.id", "__proto__", "with space", "with:colon", ""]) {
       expect(PolicyFileSchema.safeParse(policyFileWithProvider(id)).success).toBe(false);
     }
+  });
+
+  test("accepts the auto-routing classifier id even though it is not a custom provider", () => {
+    // An enforced provider_access must be able to authorize the classifier, while the id
+    // stays unavailable for custom provider creation.
+    expect(isValidCustomProviderId(TYPESAFE_PROVIDER_KEY)).toBe(false);
+    expect(PolicyFileSchema.safeParse(policyFileWithProvider(TYPESAFE_PROVIDER_KEY)).success).toBe(
+      true
+    );
   });
 
   test("continues to parse built-in provider ids", () => {

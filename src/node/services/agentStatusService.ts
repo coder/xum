@@ -18,6 +18,8 @@ import {
 import type { Config } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -552,13 +554,28 @@ export class AgentStatusService {
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
-    const result = await this.historyService.getLastMessages(
+    // Sidebar status is a provider request too, so it reads the same context the agent's model
+    // sees: getHistoryFromLatestBoundary starts at the latest compaction boundary (the summary
+    // row is kept, the conversation it replaced is not; #4421) or manual reset. It honors RAW
+    // reset floors, so a malformed reset row still discards everything before it (#4555).
+    // Only the trailing window is read: the suffix holds at least the last
+    // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
+    // is unchanged without parsing the whole epoch under the history lock (#4720).
+    //
+    // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
+    // must not leak into the request, and a readable reset marker is structure, not
+    // conversation. The window is counted in VISIBLE rows: counting before filtering would let
+    // a burst of hidden records (resolving many threads) evict the recent conversation, and
+    // each hidden append would change the hash by evicting a visible row.
+    const history = await this.historyService.getHistorySuffixFromLatestBoundary(
       workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
+      AGENT_STATUS_MAX_TRAILING_MESSAGES,
+      isStatusTranscriptRow
     );
-    if (!result.success) return "";
-
-    const committedMessages: MuxMessage[] = [...result.data];
+    if (!history.success) return "";
+    const committedMessages = history.data
+      .filter(isStatusTranscriptRow)
+      .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
     const partial = await this.historyService.readPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees
@@ -589,6 +606,11 @@ export class AgentStatusService {
     }
     return formatted.slice(drop).join("\n\n");
   }
+}
+
+/** Status-visible rows; also the suffix read's stop predicate, so the window cannot differ. */
+function isStatusTranscriptRow(message: MuxMessage): boolean {
+  return !isDurableContextResetBoundaryMarker(message) && !isModelHiddenMessage(message);
 }
 
 function extractMessageText(message: MuxMessage): string {

@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as fs from "fs/promises";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";

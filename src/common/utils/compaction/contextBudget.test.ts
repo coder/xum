@@ -4,19 +4,26 @@ import { z } from "zod";
 import {
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
-  WARNING_ADVANCE_MIN_TOKENS,
-  FLUSH_RESERVE_TOKENS,
+  WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   getContextBudgetHardCeiling,
-  getContextBudgetRolloverPoint,
-  estimateFreshRequestTokens,
-  estimateAssembledRequestTokens,
+  getContextBudgetHandoffPoint,
   estimateToolResultSize,
-  checkAssembledRequestBudget,
+  prepareAssembledRequestTokenCount,
+  prepareFreshRequestTokenCount,
+  type AssembledRequestBudgetInput,
+  type FreshRequestBudgetInput,
   type StepBudgetInput,
 } from "./contextBudget";
+
+// Heuristic halves of the production counters; the real-encoding guards that
+// consume them are covered in contextBudgetCounting.test.ts.
+const estimateFreshRequestTokens = (input: FreshRequestBudgetInput) =>
+  prepareFreshRequestTokenCount(input).heuristicTokens;
+const estimateAssembledRequestTokens = (payload: AssembledRequestBudgetInput) =>
+  prepareAssembledRequestTokenCount(payload).heuristicTokens;
 
 function evaluate(overrides: Partial<StepBudgetInput> = {}) {
   return evaluateStepBudget({
@@ -27,31 +34,38 @@ function evaluate(overrides: Partial<StepBudgetInput> = {}) {
     modelContextLimit: 100_000,
     threshold: 0.7,
     warningEmitted: false,
+    handoffRequested: false,
     ...overrides,
   });
 }
 
-describe("rollover point", () => {
+describe("handoff point", () => {
   test.each([
-    [100_000, 0.7, 75_000],
-    [100_000, 0.99, 100_000 - OUTPUT_RESERVE_TOKENS],
-    [4096, 0.7, 3072],
-    [200_000, 0.5, 110_000],
-    [1_050_000, 0.3, 367_500],
-  ])(
-    "matches the decision boundary for limit %d and threshold %s",
-    (modelContextLimit, threshold, expected) => {
-      const point = getContextBudgetRolloverPoint(modelContextLimit, threshold);
-      expect(point).toBe(expected);
-      // A prior warning avoids the separate early rollover when warning headroom runs out.
-      const input = { modelContextLimit, threshold, warningEmitted: true };
-      expect(evaluate({ ...input, contextTokens: point }).decision).toBe("rollover");
-      expect(evaluate({ ...input, contextTokens: point - 1 }).decision).not.toBe("rollover");
+    [4096, [409, 2048, 2867, 3686], 3072],
+    [100_000, [10_000, 50_000, 70_000, 90_000], 91_808],
+    [128_000, [12_800, 64_000, 89_600, 115_200], 119_808],
+    [200_000, [20_000, 100_000, 140_000, 180_000], 191_808],
+    [1_000_000, [100_000, 500_000, 700_000, 900_000], 991_808],
+  ] as const)(
+    "separates targets from the forced ceiling for %d tokens",
+    (limit, targets, ceiling) => {
+      [0.1, 0.5, 0.7, 0.9].forEach((threshold, index) => {
+        expect(getContextBudgetHandoffPoint(limit, threshold)).toBe(targets[index]);
+        expect(
+          evaluate({ modelContextLimit: limit, threshold, contextTokens: ceiling }).decision
+        ).toBe("rollover");
+        expect(
+          evaluate({ modelContextLimit: limit, threshold, contextTokens: ceiling - 1 }).decision
+        ).not.toBe("rollover");
+      });
     }
   );
 
   test.each([0, -1, 1, NaN, Infinity])("rejects disabled or invalid threshold %s", (threshold) => {
-    expect(() => getContextBudgetRolloverPoint(100_000, threshold)).toThrow();
+    expect(() => getContextBudgetHandoffPoint(100_000, threshold)).toThrow();
+  });
+  test.each([0, -1, NaN, Infinity])("rejects invalid limit %s", (limit) => {
+    expect(() => getContextBudgetHandoffPoint(limit, 0.7)).toThrow();
   });
 });
 
@@ -59,12 +73,14 @@ describe("step budget decisions", () => {
   test.each([
     [59_999, "continue"],
     [60_000, "warn"],
-    [74_999, "warn"],
-    [75_000, "rollover"],
+    [69_999, "warn"],
+    [70_000, "handoff"],
+    [89_759, "handoff"],
+    [89_760, "continue"],
+    [91_807, "continue"],
+    [91_808, "rollover"],
   ] as const)("threshold boundary at %d", (contextTokens, decision) => {
-    const result = evaluate({ contextTokens });
-    expect(result.decision).toBe(decision);
-    expect(result.flushOpportunity).toBe(decision !== "continue");
+    expect(evaluate({ contextTokens }).decision).toBe(decision);
   });
 
   test("projects output, rounded tool text, and media without dropping the context baseline", () => {
@@ -79,50 +95,73 @@ describe("step budget decisions", () => {
     expect(evaluate({ contextTokens: result.projected, warningEmitted: true }).decision).toBe(
       "continue"
     );
-    expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("rollover");
+    expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("handoff");
   });
 
-  test("rollover flush opportunity requires reserve headroom below the hard ceiling", () => {
-    const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
-    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 1 })).toMatchObject({
-      decision: "rollover",
-      flushOpportunity: true,
-    });
-    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS })).toMatchObject({
-      decision: "rollover",
-      flushOpportunity: false,
-    });
-    // Real-encoding tool tokens can exceed the chars/4 heuristic and consume the reserve.
-    expect(
-      evaluate({
-        contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 100,
-        toolResultChars: 4,
-        toolResultTokens: 100,
-      })
-    ).toMatchObject({ decision: "rollover", flushOpportunity: false });
-  });
+  // #4855: provider usage can sit well below the assembled estimate the next step's preflight
+  // enforces. The settled decision must use the stricter of the two, or the preflight hard-stops
+  // the turn before the forced rollover can ever fire.
+  test.each([
+    [0.7, "rollover"],
+    [1, "block"],
+  ] as const)(
+    "a next-request estimate at the ceiling forces the stop at threshold %d",
+    (threshold, decision) => {
+      const result = evaluate({ contextTokens: 80_000, nextRequestTokens: 91_808, threshold });
+      expect(result).toMatchObject({ decision, projected: 91_808 });
+      expect(evaluate({ contextTokens: 80_000, threshold }).decision).not.toBe(decision);
+    }
+  );
 
-  test("hard ceiling overrides a higher configured threshold", () => {
-    const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
-    expect(evaluate({ contextTokens: hardCeiling, threshold: 0.99 })).toMatchObject({
-      decision: "rollover",
-      flushOpportunity: false,
+  test("a next-request estimate below the ceiling does not move the advisory stages", () => {
+    // Only the hard stop uses the floor: advisories keep the provider-based projection, so the
+    // estimator's overshoot cannot fire the warning or handoff early.
+    expect(evaluate({ contextTokens: 40_000, nextRequestTokens: 75_000 })).toMatchObject({
+      decision: "continue",
+      projected: 40_000,
     });
+    // It still withholds advisories that the forced stop would pre-empt.
     expect(
-      evaluate({ contextTokens: hardCeiling - 1, threshold: 0.99, warningEmitted: true }).decision
+      evaluate({ contextTokens: 60_000, nextRequestTokens: 91_808 - WARNING_RESERVE_TOKENS })
+        .decision
     ).toBe("continue");
   });
 
-  test("warning must fit strictly below the hard ceiling", () => {
-    const contextTokens = 100_000 - OUTPUT_RESERVE_TOKENS - FLUSH_RESERVE_TOKENS;
-    expect(evaluate({ contextTokens, threshold: 0.99 })).toMatchObject({
+  test.each([60_000, 75_000, 89_000])(
+    "a delivered handoff suppresses both advisories at %d",
+    (contextTokens) => {
+      expect(evaluate({ contextTokens, handoffRequested: true }).decision).toBe("continue");
+    }
+  );
+
+  test("advisory admission requires conservative reserve headroom, never an earlier forced reset", () => {
+    const contextTokens = 119_808 - WARNING_RESERVE_TOKENS;
+    expect(
+      evaluate({ modelContextLimit: 128_000, threshold: 0.9, contextTokens: contextTokens - 1 })
+        .decision
+    ).toBe("handoff");
+    expect(evaluate({ modelContextLimit: 128_000, threshold: 0.9, contextTokens }).decision).toBe(
+      "continue"
+    );
+    expect(
+      evaluate({ modelContextLimit: 128_000, threshold: 0.9, contextTokens: 118_000 }).decision
+    ).toBe("continue");
+    expect(
+      evaluate({
+        modelContextLimit: 128_000,
+        contextTokens: 90_000,
+        toolResultChars: 4,
+        toolResultTokens: 28_000,
+      }).decision
+    ).toBe("continue");
+  });
+
+  test("hard ceiling overrides a higher configured target", () => {
+    expect(evaluate({ contextTokens: 91_808, threshold: 0.99 })).toMatchObject({
       decision: "rollover",
       flushOpportunity: false,
     });
-    expect(evaluate({ contextTokens: contextTokens - 1, threshold: 0.99 })).toMatchObject({
-      decision: "warn",
-      flushOpportunity: true,
-    });
+    expect(evaluate({ contextTokens: 91_807, threshold: 0.99 }).decision).toBe("continue");
   });
 
   test.each([undefined, null, 0, -1, NaN, Infinity])(
@@ -136,10 +175,11 @@ describe("step budget decisions", () => {
     }
   );
 
-  test("disabled auto-compaction blocks the hard ceiling without proactive rollover", () => {
-    expect(evaluate({ contextTokens: 1_000_000, threshold: 1 })).toMatchObject({
+  test("disabled auto-compaction blocks only at the hard ceiling", () => {
+    expect(evaluate({ contextTokens: 91_807, threshold: 1 }).decision).toBe("continue");
+    expect(evaluate({ contextTokens: 91_808, threshold: 1 })).toMatchObject({
       decision: "block",
-      hardCeiling: 100_000 - OUTPUT_RESERVE_TOKENS,
+      hardCeiling: 91_808,
     });
   });
 });
@@ -187,24 +227,8 @@ describe("small-model context budgets", () => {
         decision: "continue",
         hardCeiling,
       });
-      const fitting = { system: "instructions", messages: [{ role: "user", content: "hello" }] };
-      expect(
-        checkAssembledRequestBudget(fitting, { model: "small-model", modelContextLimit })
-      ).toBeUndefined();
       const freshInput = { userText: "hello", modelContextLimit };
       expect(estimateFreshRequestTokens(freshInput)).toBeLessThan(hardCeiling);
-
-      const oversized = {
-        messages: [{ role: "user", content: "x".repeat(modelContextLimit * 4) }],
-      };
-      expect(
-        checkAssembledRequestBudget(oversized, { model: "small-model", modelContextLimit })
-      ).toEqual({
-        type: "context_budget_exceeded",
-        model: "small-model",
-        estimate: estimateAssembledRequestTokens(oversized),
-        hardCeiling,
-      });
       expect(
         estimateFreshRequestTokens({ ...freshInput, userText: "x".repeat(modelContextLimit * 4) })
       ).toBeGreaterThan(hardCeiling);
@@ -233,12 +257,12 @@ describe("small-model context budgets", () => {
   );
 
   test.each([4096, 8192])(
-    "rolls over without a flush if the warning cannot fit in %d tokens",
+    "skips advisories if the warning cannot fit in %d tokens",
     (modelContextLimit) => {
       expect(
         evaluate({ modelContextLimit, contextTokens: Math.ceil(modelContextLimit * 0.6) })
       ).toMatchObject({
-        decision: "rollover",
+        decision: "continue",
         flushOpportunity: false,
       });
     }
@@ -246,57 +270,40 @@ describe("small-model context budgets", () => {
 });
 
 describe("absolute warning advance floor", () => {
-  test("large windows keep the percent-based warning point", () => {
-    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_799 }).decision).toBe(
-      "continue"
-    );
-    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_800 }).decision).toBe("warn");
-  });
+  test.each([
+    [128_000, 0.7, 76_800],
+    [32_768, 0.7, 16_793],
+    [128_000, 0.1, 6400],
+  ])(
+    "warns ahead of the handoff target for %d tokens at %s",
+    (modelContextLimit, threshold, warnAt) => {
+      expect(evaluate({ modelContextLimit, threshold, contextTokens: warnAt - 1 }).decision).toBe(
+        "continue"
+      );
+      expect(evaluate({ modelContextLimit, threshold, contextTokens: warnAt }).decision).toBe(
+        "warn"
+      );
+    }
+  );
 
-  test("small windows warn at least the floor ahead of the ceiling-anchored rollover", () => {
-    // For this window hardCeiling (limit - OUTPUT_RESERVE_TOKENS) coincides with forceAt, so it
-    // is the rollover point; the warning fires WARNING_ADVANCE_MIN_TOKENS ahead of it instead of
-    // at the later percent-based point.
-    const warnAt = 24_576 - WARNING_ADVANCE_MIN_TOKENS;
-    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt - 1 }).decision).toBe(
-      "continue"
-    );
-    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt })).toMatchObject({
-      decision: "warn",
-      flushOpportunity: true,
-    });
-  });
-
-  test("the hard ceiling anchors the floor when it precedes the force point", () => {
-    // At this threshold forceAt reaches the whole limit, so hardCeiling (limit -
-    // OUTPUT_RESERVE_TOKENS) anchors the floor; the percent rule alone would warn later than
-    // WARNING_ADVANCE_MIN_TOKENS ahead of the ceiling.
-    const warnAt = 55_808 - WARNING_ADVANCE_MIN_TOKENS;
+  test("does not pull a target earlier when it exceeds the usable ceiling", () => {
     expect(
-      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt - 1 }).decision
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: 54_656 }).decision
     ).toBe("continue");
     expect(
-      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt }).decision
-    ).toBe("warn");
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: 55_808 }).decision
+    ).toBe("rollover");
   });
 
-  test("a low threshold still keeps the first half of the usable window warning-free", () => {
-    // Low threshold: the percent rule would warn from the first request; rolloverAt = forceAt
-    // (threshold + FORCE_COMPACTION_BUFFER_PERCENT) and the floor clamps to half of it.
-    expect(evaluate({ threshold: 0.1, contextTokens: 7_499 }).decision).toBe("continue");
-    expect(evaluate({ threshold: 0.1, contextTokens: 7_500 }).decision).toBe("warn");
-  });
-
-  test("a tiny window keeps its first half usable and then rolls over without a flush", () => {
-    // hardCeiling (limit - OUTPUT_RESERVE_TOKENS) is below WARNING_ADVANCE_MIN_TOKENS: the floor
-    // is clamped to half the rollover point, where FLUSH_RESERVE_TOKENS no longer fits, so the
-    // outcome is rollover.
-    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_499 }).decision).toBe("continue");
-    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_500 })).toMatchObject({
-      decision: "rollover",
-      flushOpportunity: false,
-    });
-  });
+  test.each([1434, 2867, 3071])(
+    "a tiny window skips advisories at %d without resetting",
+    (contextTokens) => {
+      expect(evaluate({ modelContextLimit: 4096, contextTokens })).toMatchObject({
+        decision: "continue",
+        flushOpportunity: false,
+      });
+    }
+  );
 });
 
 test("measured dense tool tokens enforce the hard ceiling while ordinary proactive estimates remain conservative", () => {
@@ -398,33 +405,5 @@ describe("request estimates", () => {
       });
       expect(estimate).toBeGreaterThanOrEqual(base + 4000);
     }
-  });
-
-  test("per-attempt preflight blocks smaller fallback windows and includes exact-ceiling semantics", () => {
-    const payload = {
-      system: "s".repeat(1000),
-      messages: [{ role: "user", content: "u".repeat(350_000) }],
-    };
-    const estimate = estimateAssembledRequestTokens(payload);
-    expect(
-      checkAssembledRequestBudget(payload, {
-        model: "large",
-        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS,
-      })
-    ).toBeUndefined();
-    expect(
-      checkAssembledRequestBudget(payload, {
-        model: "fallback",
-        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS - 1,
-      })
-    ).toEqual({
-      type: "context_budget_exceeded",
-      model: "fallback",
-      estimate,
-      hardCeiling: estimate - 1,
-    });
-    expect(
-      checkAssembledRequestBudget(payload, { model: "unknown", modelContextLimit: undefined })
-    ).toBeUndefined();
   });
 });

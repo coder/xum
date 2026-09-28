@@ -6,6 +6,7 @@
  */
 
 import { getModelStats, type ModelStats } from "./modelStats";
+import { normalizeOpenAIServiceTier, withServiceTierPricing } from "./serviceTierPricing";
 import type { ChatUsageDisplay } from "./usageAggregator";
 import type { AiSdkUsageLike } from "./usageHelpers";
 
@@ -146,8 +147,17 @@ export function createDisplayUsage(
   const outputWithoutReasoning =
     rawOutputTokens >= reasoningTokens ? rawOutputTokens - reasoningTokens : rawOutputTokens;
 
-  // Get model stats for cost calculation
-  const modelStats = getModelStats(metadataModelOverride ?? model);
+  // Get model stats for cost calculation, at the service tier the provider
+  // reported it billed (#4352); no reported tier keeps the base rates.
+  const pricingModel = metadataModelOverride ?? model;
+  const baseStats = getModelStats(pricingModel);
+  const serviceTier = normalizeOpenAIServiceTier(
+    (providerMetadata?.openai as { serviceTier?: unknown } | undefined)?.serviceTier
+  );
+  const modelStats =
+    baseStats !== null && serviceTier !== undefined
+      ? withServiceTierPricing(baseStats, pricingModel, serviceTier)
+      : baseStats;
 
   const costsIncluded =
     (providerMetadata?.mux as { costsIncluded?: boolean } | undefined)?.costsIncluded === true;
@@ -205,6 +215,8 @@ export function createDisplayUsage(
 
   return {
     ...(costsIncluded ? { costsIncluded: true } : {}),
+    // Persisted so a later repricing uses the same tier (#4787).
+    ...(serviceTier !== undefined && serviceTier !== "standard" ? { serviceTier } : {}),
     input: {
       tokens: inputTokens,
       cost_usd: inputCost,
@@ -245,6 +257,8 @@ export function recomputeUsageCosts(
   options?: RecomputeUsageCostsOptions
 ): ChatUsageDisplay {
   const modelStats = getModelStats(metadataModel);
+  const serviceTier = usage.serviceTier;
+  const tierField = serviceTier !== undefined ? { serviceTier } : {};
 
   if (!modelStats) {
     // Unknown model — strip costs and flag as unknown
@@ -256,10 +270,15 @@ export function recomputeUsageCosts(
       reasoning: { tokens: usage.reasoning.tokens },
       model: usage.model,
       hasUnknownCosts: true,
+      ...tierField,
     };
   }
 
-  if (options?.aggregatedUsage === true && hasTieredPricing(modelStats)) {
+  // A sum across service tiers cannot be split back into per-tier tokens (#4787).
+  if (
+    serviceTier === "mixed" ||
+    (options?.aggregatedUsage === true && hasTieredPricing(modelStats))
+  ) {
     // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
     // non-linear, so choosing a single tier from the sum can inflate costs once multiple
     // sub-threshold requests add up past the long-context boundary. Preserve the stored costs
@@ -270,7 +289,11 @@ export function recomputeUsageCosts(
     };
   }
 
-  const costs = calculateUsageCosts(modelStats, {
+  const pricedStats =
+    serviceTier !== undefined
+      ? withServiceTierPricing(modelStats, metadataModel, serviceTier)
+      : modelStats;
+  const costs = calculateUsageCosts(pricedStats, {
     inputTokens: usage.input.tokens,
     cachedTokens: usage.cached.tokens,
     cacheCreateTokens: usage.cacheCreate.tokens,
@@ -300,5 +323,6 @@ export function recomputeUsageCosts(
       cost_usd: costs.reasoningCost,
     },
     model: usage.model,
+    ...tierField,
   };
 }

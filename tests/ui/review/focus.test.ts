@@ -37,9 +37,9 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
 
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");
-        const costsTab = view.container.querySelector(
+        const costsTab = view.container.querySelector<HTMLElement>(
           '[role="tab"][aria-controls*="costs"]'
-        ) as HTMLElement | null;
+        );
         expect(costsTab).not.toBeNull();
         costsTab?.focus();
 
@@ -50,9 +50,7 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
 
         await waitFor(
           () => {
-            const reviewPanel = view.container.querySelector(
-              '[data-testid="review-panel"]'
-            ) as HTMLElement | null;
+            const reviewPanel = view.container.querySelector('[data-testid="review-panel"]');
             if (!reviewPanel) {
               throw new Error("Review panel not mounted");
             }

@@ -14,15 +14,39 @@ def codex_without_help:
     + "- A regular code review gets triggered (for example, \"@codex review\" or when a PR is opened), and you’re opted in so security review runs alongside code review\n\n"
     + "Once complete, Codex will leave suggestions, or a comment if no findings are found.\n\n\n</details>");
 
-def codex_comment_is_informational($bot):
-  if .author.login != $bot then false
+def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
+
+# Input: review thread nodes. Output: the root comment IDs of resolved Codex
+# threads, the IDs that board advisory links use (#discussion_r<id>).
+def codex_resolved_discussions($bot):
+  [.[] | select(.isResolved == true and .comments.nodes[0].author.login == $bot)
+    | .comments.nodes[0].fullDatabaseId // empty];
+
+def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
+def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$";
+def codex_relative_time: "<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>";
+def codex_completed_row: codex_review_row_prefix + "Completed\\*\\*( " + codex_relative_time + ")?" + codex_review_row_suffix;
+def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_relative_time + codex_review_row_suffix;
+
+# Parse the review summary board Codex edits in place. Emit "completed" or
+# "running" only when every line has an observed informational shape; emit null
+# for anything else so unknown content stays blocking. The metadata status tracks
+# the security review alone (observed on coder/mux#4271: "completed" while the
+# Code Review row still read Running), so a Running row also means "running".
+# $head is the PR's current head commit. Codex records the reviewed head in the
+# board's metadata; a Completed board for another head is a review of an older
+# push, not of this one. Codex re-reviews on new commits and edits the board in
+# place, so that state is "running" for the current head, never "completed".
+# $resolved is the output of codex_resolved_discussions.
+def codex_summary_status($bot; $head; $resolved):
+  if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
-    | if $body | startswith("<!-- codex-pull-request-review-summary -->") then
+    | if $body | startswith(codex_summary_marker) then
         (try (
           ($body | split("\n") | map(select(length > 0))) as $lines
           | ($lines[1] | capture("^<!-- codex-security-review:v1 (?<payload>.*) -->$").payload | fromjson) as $security
-          | $lines[0] == "<!-- codex-pull-request-review-summary -->"
+          | if $lines[0] == codex_summary_marker
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
             and ($security | type == "object"
@@ -32,28 +56,50 @@ def codex_comment_is_informational($bot):
               and (.headSha | test("^[0-9a-f]{40}$"))
               and (.pullRequestNumber | type == "number")
               and (.repository | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
-              # CI calls this checker before reviews finish; pending metadata or
-              # a pending review row must keep that gate blocking independently.
-              and .status == "completed")
+              and (.status == "completed" or .status == "running"))
             and ($lines[2:] | length >= 5)
             and ($lines[2:] | all(
               . == "## Codex Review Summary"
               or . == "This comment shows the latest Codex review activity on this pull request."
               or . == "| Review | Status | Commit | Review trigger |"
               or . == "| --- | --- | --- | --- |"
-              or test("^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| "
-                + "[^[:alnum:]|]*\\*\\*Completed\\*\\*"
-                + "( <relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
-                + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$")
-              # Security advisories stay listed after their review threads are resolved, and
-              # Codex adds the Resolved marker only when a later review completes. A bullet
-              # without it is a live finding and keeps blocking; other sections stay unknown.
+              or test(codex_completed_row)
+              or test(codex_running_row)
+              # Security advisories stay listed after their review threads are resolved.
+              # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
+              # resolved linked thread also clears its bullet. A bullet with neither is a
+              # live finding and keeps blocking; other sections stay unknown.
               or . == "### Security findings"
               or test("^#### Advisory findings \\([0-9]+\\)$")
-              or test("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r[0-9]+\\)"
-                + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
+              # capture() yields empty on a mismatch, and all() would pass an empty
+              # condition, so `// false` keeps an unknown bullet blocking.
+              or (first(capture("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r(?<id>[0-9]+)\\)"
+                + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$")
+                | .marker != null or (.id | IN($resolved[]))) // false)
             ))
-        ) catch false) // false
+            then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+                     or $security.headSha != $head
+                  then "running" else "completed" end)
+            else null
+            end
+        # capture() yields empty, not an error, on a non-matching metadata line;
+        # `// null` turns that into an explicit unknown so callers never fail open.
+        ) catch null) // null
+      else null
+      end
+  end;
+
+# Codex is still reviewing. Callers may wait on this state instead of failing on
+# it, but it never supplies approval: after any wait budget it blocks like before.
+def codex_review_in_progress($bot; $head; $resolved):
+  codex_summary_status($bot; $head; $resolved) == "running";
+
+def codex_comment_is_informational($bot; $head; $resolved):
+  if .author.login != $bot then false
+  else
+    (.body | codex_without_help) as $body
+    | if $body | startswith(codex_summary_marker) then
+        codex_summary_status($bot; $head; $resolved) == "completed"
       else
         ($body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or

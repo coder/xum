@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { Err, Ok, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";

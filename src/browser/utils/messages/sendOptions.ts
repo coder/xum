@@ -1,5 +1,7 @@
 import {
   getAgentIdKey,
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
   getModelKey,
   getReasoningModeKey,
   getThinkingLevelByModelKey,
@@ -84,6 +86,16 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     false
   );
 
+  // Same gate as useAutoRoutingSelection: a stale persisted true must not
+  // reach the backend once the experiment is off.
+  const autoRoutingEnabled = isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const autoModelRouting =
+    autoRoutingEnabled &&
+    readPersistedState<boolean>(getAutoModelRoutingKey(workspaceId), false) === true;
+  const autoThinkingLevel =
+    autoRoutingEnabled &&
+    readPersistedState<boolean>(getAutoThinkingLevelKey(workspaceId), false) === true;
+
   return buildSendMessageOptions({
     model: baseModel,
     agentId,
@@ -91,6 +103,8 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     reasoningMode,
     providerOptions,
     disableWorkspaceAgents,
+    autoModelRouting,
+    autoThinkingLevel,
     experiments: {
       programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
       rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),

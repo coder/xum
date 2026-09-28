@@ -1,47 +1,14 @@
 import type { ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { APIContext } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 
 import { installDom } from "../../../../../tests/ui/dom";
-void mock.module("@/browser/features/Tools/WorkflowToolShared", () => ({
-  WorkflowJsonBlock: (props: { value: unknown; ariaLabel: string }) => (
-    <pre aria-label={props.ariaLabel}>{JSON.stringify(props.value)}</pre>
-  ),
-}));
-
-let workflowTaskWorkspaces = new Map<string, FrontendWorkspaceMetadata>();
-let navigateToWorkspace: (workspaceId: string) => void = () => undefined;
-const workspaceStoreSubscribers = new Set<() => void>();
-
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceStore =
-  require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
-
-// Spread the real module and overlay (not replace) the raw store: bun evaluates every test
-// file before running tests and static import bindings freeze at eval time, so this
-// file-scope mock is what any later-evaluated file in the same bun process gets forever.
-// Replacing the whole module (or exposing a bare fake missing store methods) breaks those
-// files' cleanup and cascades into unrelated CI failures.
-void mock.module("@/browser/stores/WorkspaceStore", () => ({
-  ...actualWorkspaceStore,
-  useWorkspaceStoreRaw: () =>
-    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
-      subscribeDerived: (listener: () => void) => {
-        workspaceStoreSubscribers.add(listener);
-        return () => workspaceStoreSubscribers.delete(listener);
-      },
-      getWorkspaceMetadata: (workspaceId: string) => workflowTaskWorkspaces.get(workspaceId),
-      navigateToWorkspace: (workspaceId: string) => navigateToWorkspace(workspaceId),
-    }),
-}));
-
 import type { WorkflowRunView } from "./projectWorkflowRun";
 import { WorkflowTimeline } from "./WorkflowTimeline";
 
@@ -56,13 +23,6 @@ function createWorkflowTaskWorkspaceMetadata(workspaceId: string): FrontendWorks
     createdAt: "2026-05-29T00:00:00.000Z",
     runtimeConfig: { type: "local", srcBaseDir: "/tmp/mux-src" },
   };
-}
-
-function syncWorkflowTaskWorkspaces(nextWorkspaces: Map<string, FrontendWorkspaceMetadata>): void {
-  workflowTaskWorkspaces = nextWorkspaces;
-  for (const subscriber of workspaceStoreSubscribers) {
-    subscriber();
-  }
 }
 
 function normalizeText(element: Element): string {
@@ -190,6 +150,44 @@ function makeCompletedStepView(taskId: string): WorkflowRunView {
   };
 }
 
+function makeCompletedEvaluationStepView(evaluation: {
+  modelString: string;
+  responseModelId: string;
+}): WorkflowRunView {
+  const startedAt = "2026-06-25T12:00:00.000Z";
+  const completedAt = "2026-06-25T12:00:02.000Z";
+  return {
+    ...makeCompletedView(),
+    phases: [
+      {
+        name: "screen",
+        label: "Screen",
+        steps: [
+          {
+            stepId: "screen-issue",
+            status: "completed",
+            title: "Screen issue",
+            phaseName: "screen",
+            startedAt,
+            completedAt,
+            durationMs: 2000,
+            evaluation: { ...evaluation, attempt: 1, cached: false },
+          },
+        ],
+        done: 1,
+        total: 1,
+        running: false,
+        failed: false,
+        lifecycle: "completed",
+        latest: true,
+      },
+    ],
+    steps: [],
+    result: null,
+    stats: { total: 1, done: 1, running: 0, failed: 0, elapsedMs: 2000 },
+  };
+}
+
 function makeNestedWorkflowParentView(): WorkflowRunView {
   const timestamp = "2026-06-25T12:00:00.000Z";
   return {
@@ -308,19 +306,20 @@ describe("WorkflowTimeline", () => {
 
   afterEach(() => {
     cleanup();
-    navigateToWorkspace = () => undefined;
-    syncWorkflowTaskWorkspaces(new Map());
-    workspaceStoreSubscribers.clear();
+    // Tests drive the real store singleton (syncWorkspaces bumps the derived "workspaces"
+    // channel the timeline subscribes to), so reset it for the next test and file.
+    useWorkspaceStoreRaw().setNavigateToWorkspace(() => undefined);
+    useWorkspaceStoreRaw().syncWorkspaces(new Map());
     cleanupDom?.();
     cleanupDom = null;
   });
 
   test("opens an available child task workspace from a workflow step", () => {
     const navigatedTo: string[] = [];
-    navigateToWorkspace = (workspaceId) => {
+    useWorkspaceStoreRaw().setNavigateToWorkspace((workspaceId) => {
       navigatedTo.push(workspaceId);
-    };
-    syncWorkflowTaskWorkspaces(
+    });
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_live", createWorkflowTaskWorkspaceMetadata("task_live")]])
     );
 
@@ -345,7 +344,7 @@ describe("WorkflowTimeline", () => {
   });
 
   test("hides workspace action when a step only references another task id", () => {
-    syncWorkflowTaskWorkspaces(
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_source", createWorkflowTaskWorkspaceMetadata("task_source")]])
     );
     const workflowView = makeRunningStepView("task_source");
@@ -361,10 +360,10 @@ describe("WorkflowTimeline", () => {
 
   test("opens completed step details independently from workspace navigation", () => {
     const navigatedTo: string[] = [];
-    navigateToWorkspace = (workspaceId) => {
+    useWorkspaceStoreRaw().setNavigateToWorkspace((workspaceId) => {
       navigatedTo.push(workspaceId);
-    };
-    syncWorkflowTaskWorkspaces(
+    });
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_completed", createWorkflowTaskWorkspaceMetadata("task_completed")]])
     );
     const view = render(<WorkflowTimeline view={makeCompletedStepView("task_completed")} />);
@@ -382,6 +381,29 @@ describe("WorkflowTimeline", () => {
     fireEvent.click(view.getByRole("button", { name: "Review implementation 2s" }));
 
     expect(view.getByText("Completed step report body.")).toBeDefined();
+  });
+
+  test("shows the response model only when it differs from the requested model id", () => {
+    // Providers report bare ids (and the service falls back to the requested
+    // bare id), while the admitted model string carries the provider prefix.
+    const renderExpanded = (responseModelId: string) => {
+      const view = render(
+        <WorkflowTimeline
+          view={makeCompletedEvaluationStepView({ modelString: "openai:gpt-5", responseModelId })}
+        />
+      );
+      fireEvent.click(view.getByRole("button", { name: "Screen 1/1" }));
+      fireEvent.click(view.getByRole("button", { name: /^Screen issue/ }));
+      return view;
+    };
+
+    const same = renderExpanded("gpt-5");
+    expect(same.getByText("openai:gpt-5")).toBeDefined();
+    expect(same.queryByText(/^↳/)).toBeNull();
+    same.unmount();
+
+    const snapshot = renderExpanded("gpt-5-2026-03-01");
+    expect(snapshot.getByText("↳ gpt-5-2026-03-01")).toBeDefined();
   });
 
   test("inlines a nested workflow run under its parent step", async () => {
@@ -506,7 +528,12 @@ describe("WorkflowTimeline", () => {
   });
 
   test("renders final report stat chips as bold key before value", () => {
-    const { container } = render(<WorkflowTimeline view={makeCompletedView()} />);
+    // The real WorkflowJsonBlock renders the final result through the themed code renderer.
+    const { container } = render(
+      <ThemeProvider forcedTheme="dark">
+        <WorkflowTimeline view={makeCompletedView()} />
+      </ThemeProvider>
+    );
 
     const statTexts = Array.from(container.querySelectorAll("span"), normalizeText);
     const boldTexts = Array.from(container.querySelectorAll("b"), normalizeText);

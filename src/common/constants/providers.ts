@@ -261,5 +261,7 @@ export const PROVIDER_REGISTRY = Object.fromEntries(
  * Type guard to check if a string is a valid provider name
  */
 export function isValidProvider(provider: string): provider is ProviderName {
-  return provider in PROVIDER_REGISTRY;
+  // Own-property check: `in` also matches inherited Object.prototype keys such as
+  // "toString", "constructor", and "__proto__".
+  return Object.hasOwn(PROVIDER_REGISTRY, provider);
 }

@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
@@ -1757,9 +1758,7 @@ describe("compaction replacement acceptance", () => {
               args[0] === (artifact === "file" ? chatPath : path.dirname(chatPath))
             ) {
               const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
-              const token = await fs.readFile(lockPath, "utf8");
-              await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-              await fs.utimes(lockPath, new Date(0), new Date(0));
+              await markLockOwnerDead(lockPath);
               successor = await acquireProcessFileLock({
                 lockPath,
                 timeoutMs: 1000,
@@ -3040,10 +3039,13 @@ describe("compaction replacement acceptance", () => {
       ).join("\n") + "\n";
     await fs.writeFile(archivePath, archived);
     let holdingLock = false;
+    let observedHistoryLock = false;
     let archiveBytesReadUnderLock = 0;
     const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
     spyOn(workspaceFileLocks, "withLock").mockImplementation((key, operation) =>
       withLock(key, async () => {
+        if (key !== workspaceId) return operation();
+        observedHistoryLock = true;
         holdingLock = true;
         try {
           return await operation();
@@ -3055,11 +3057,36 @@ describe("compaction replacement acceptance", () => {
     beforeFileRead(archivePath, (args) => {
       if (holdingLock && typeof args[2] === "number") archiveBytesReadUnderLock += args[2];
     });
-    expect(await history.findCompactionReplacementWitness(workspaceId, expected.nonce!)).toEqual(
-      Ok({ nonce: expected.nonce! })
-    );
-    expect(await stop.retireReplacement({ nonce: expected.nonce! })).toBe("applied");
-    expect(archiveBytesReadUnderLock).toBe(0);
+    // Other services can hold a different workspace's mutex during this scan in a shared run.
+    const foreignEntered = Promise.withResolvers<void>();
+    const releaseForeign = Promise.withResolvers<void>();
+    const foreignLock = workspaceFileLocks.withLock("history-observer-unrelated", async () => {
+      foreignEntered.resolve();
+      await releaseForeign.promise;
+    });
+    await foreignEntered.promise;
+    try {
+      expect(await history.findCompactionReplacementWitness(workspaceId, expected.nonce!)).toEqual(
+        Ok({ nonce: expected.nonce! })
+      );
+      expect(await stop.retireReplacement({ nonce: expected.nonce! })).toBe("applied");
+      expect(observedHistoryLock).toBe(true);
+      expect(archiveBytesReadUnderLock).toBe(0);
+    } finally {
+      releaseForeign.resolve();
+      await foreignLock;
+    }
+
+    // The scoped witness must still detect a real read under this workspace's lock.
+    await workspaceFileLocks.withLock(workspaceId, async () => {
+      const handle = await fs.open(archivePath, "r");
+      try {
+        await handle.read(Buffer.alloc(1), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    expect(archiveBytesReadUnderLock).toBe(1);
   });
 
   it.each(["Stop", "append"] as const)(

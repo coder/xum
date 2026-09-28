@@ -823,8 +823,8 @@ export class ProjectService {
           createResult.success &&
           !this.config.loadConfigOrDefault().projects.has(normalizedPath)
         ) {
-          // Config persistence (editConfig → private saveConfig) logs-and-continues on
-          // write failures. Without this check a git-initialized project would report
+          // editConfig rejects when the save fails (#4444); this check is belt and braces against a
+          // write another writer replaced. Without it a git-initialized project could report
           // success, vanish after restart, and block retries on the leftover .git.
           await cleanupCreatedDirectory();
           return Err("Failed to save project configuration");
@@ -1126,18 +1126,26 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
+      // A rejected write takes the same rollback as an unpersisted one (#4444): jumping to the
+      // outer catch would orphan the clone at the user's chosen path.
+      let persistError: unknown;
+      await this.config
+        .editConfig((freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath)) {
+            return freshConfig;
+          }
+          const updatedProjects = new Map(freshConfig.projects);
+          updatedProjects.set(normalizedPath, projectConfig);
+          return { ...freshConfig, projects: updatedProjects };
+        })
+        .catch((error: unknown) => {
+          persistError = error;
+        });
 
+      // Decide from the fresh config, not the rejection: another backend may have registered
+      // this path meanwhile, and its checkout must not be deleted. The re-read is also belt and
+      // braces against a write another writer replaced.
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
-        // failures, so verify persistence explicitly before reporting success.
         try {
           await fsPromises.rm(normalizedPath, { recursive: true, force: true });
         } catch {
@@ -1146,7 +1154,10 @@ export class ProjectService {
         yield {
           type: "error",
           code: "clone_failed",
-          error: "Failed to persist cloned project configuration",
+          error:
+            persistError === undefined
+              ? "Failed to persist cloned project configuration"
+              : `Failed to persist cloned project configuration: ${getErrorMessage(persistError)}`,
         };
         return;
       }
@@ -1385,11 +1396,6 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
-        try {
-          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
-        } catch (error) {
-          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
-        }
         // Mutate inside the serialized editConfig transform, re-resolving the sub-project
         // and its parent from FRESH config: persisting the pre-read snapshot would clobber
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
@@ -1407,6 +1413,14 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        // Delete secrets only after the config write lands (#4746): a rejected write
+        // must not leave the sub-project configured without its secrets. A failed
+        // delete here only orphans the secrets file entry.
+        try {
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
+        } catch (error) {
+          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
+        }
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
         return Ok(undefined);
       }
@@ -1503,6 +1517,9 @@ export class ProjectService {
           }
         }
 
+        // Each WorkspaceService.remove records its own removal durably before deleting
+        // (pendingRemoval marker) and drops its config row, so a later failure leaves the
+        // project configured with only the workspaces that still exist (#4746).
         for (const workspace of orderWorkspacesForCascadeRemoval(projectConfig.workspaces)) {
           // Legacy workspace entries can be missing `id`. Resolve through metadata so
           // WorkspaceService.remove() receives the canonical workspace ID (it cannot remove by path).
@@ -2069,13 +2086,21 @@ export class ProjectService {
     if (result.ok) {
       return;
     }
-    await this.config.editConfig((config) => {
-      const project = config.projects.get(normalizedPath);
-      if (project?.codeWorkspaceSyncPath === trimmed) {
-        project.codeWorkspaceSyncPath = previousValue;
-      }
-      return config;
-    });
+    // Best effort (#4748): a failed rollback must not replace the sync error the user needs.
+    await this.config
+      .editConfig((config) => {
+        const project = config.projects.get(normalizedPath);
+        if (project?.codeWorkspaceSyncPath === trimmed) {
+          project.codeWorkspaceSyncPath = previousValue;
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back the code workspace sync path", {
+          projectPath: normalizedPath,
+          error: getErrorMessage(rollbackError),
+        });
+      });
     throw new ORPCError("BAD_REQUEST", { message: result.error });
   }
   // ─────────────────────────────────────────────────────────────────────────────

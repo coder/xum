@@ -22,7 +22,11 @@ import { AIService } from "./aiService";
 import type { StreamManager } from "./streamManager";
 import type { MCPServerManager } from "./mcpServerManager";
 import { createTestHistoryService } from "./testHistoryService";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  seedAutoCompactionThreshold,
+} from "./agentSession.testHarness";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { eventSpine } from "./events/eventSpine";
@@ -169,7 +173,6 @@ async function setup(
   const registration = eventSpine.useRequestContext(assembly, { workspaceId });
   const oldCache = Reflect.get(h.session, "memoryContextByModelString") as Map<string, unknown>;
   oldCache.set("preserved-model", { context: { hotMemoriesBlock: "Preserved old notes" } });
-  h.session.setAutoCompactionThreshold(0.7);
   expect(
     (
       await historyService.appendManyToHistory(workspaceId, [
@@ -597,7 +600,18 @@ describe("pinned full-payload rollover admission", () => {
     const { h, config, start, assembleTools, assembly, oldCache } = fixture;
     assembleTools.mockImplementation(getToolsForModel);
     spyOn(contextLimit, "getEffectiveContextLimit").mockReturnValue(256000);
-    h.session.setAutoCompactionThreshold(0.1);
+    // A low slider only requests a handoff; this reset-lifetime test must reach the usable ceiling.
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("ceiling-reached", "assistant", "Settled work", {
+            model,
+            contextUsage: { inputTokens: 248000, outputTokens: 10, totalTokens: 248010 },
+          })
+        )
+      ).success
+    ).toBe(true);
     const sessionDir = path.join(config.sessionsDir, workspaceId);
     const mountOptions = {
       lifetime: "persistent" as const,
@@ -652,7 +666,7 @@ describe("pinned full-payload rollover admission", () => {
     const mcpServerManager = service.turnRequestBuilderBindings.mcpServerManager!;
     const startServers = spyOn(mcpServerManager, "getToolsForWorkspace");
     // No on-send auto-compaction: the persisted trigger must be the request's last user row.
-    h.session.setAutoCompactionThreshold(1);
+    await seedAutoCompactionThreshold(h.config, model, 100);
     try {
       // A persisted flush trigger resumed after a restart keeps its flag for the request builder
       // even with token-budget mode off (a fresh queued entry would be degraded instead).
@@ -718,7 +732,7 @@ describe("pinned full-payload rollover admission", () => {
       modelFallbacks: { [model]: { models: [fallbackModel] } },
       minThinkingLevelByModel: { [fallbackModel]: "high" },
     }));
-    h.session.setAutoCompactionThreshold(1);
+    await seedAutoCompactionThreshold(h.config, model, 100);
     try {
       expect(
         (

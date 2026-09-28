@@ -36,6 +36,7 @@ import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserB
 import type { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -90,8 +91,10 @@ import {
   DesktopSessionManagerTag,
   DesktopTokenManagerTag,
   DevTools,
+  ReviewState,
   Editor,
   Experiments,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   Heartbeat,
@@ -139,12 +142,13 @@ import {
 } from "@/node/services/di/tags";
 
 /**
- * A hard startup step of `ServiceContainer.initializeCore()` did not settle
- * within `STARTUP_STEP_TIMEOUT_MS`. Rejects `initializeCore()` like any other
- * step failure, so the roots' existing startup-failure paths apply unchanged;
- * `name` is set explicitly so their default `Error` formatting (desktop
- * "Startup Failed" dialog, `Failed to initialize server:` line) shows the
- * class together with the step.
+ * A startup step of `ServiceContainer.initializeCore()` did not settle within
+ * `STARTUP_STEP_TIMEOUT_MS`. For a hard step this rejects `initializeCore()`
+ * like any other step failure, so the roots' existing startup-failure paths
+ * apply unchanged; `name` is set explicitly so their default `Error`
+ * formatting (desktop "Startup Failed" dialog, `Failed to initialize server:`
+ * line) shows the class together with the step. A best-effort step only logs
+ * it (see `StartupStep.bestEffort`).
  */
 export class StartupStepTimeoutError extends Error {
   constructor(
@@ -160,6 +164,14 @@ interface StartupStep {
   /** `stepDurationsMs` key of the startup completion log and `StartupStepTimeoutError.step`. */
   readonly name: string;
   readonly run: () => Promise<void>;
+  /**
+   * Log and continue with the next step instead of rejecting `initializeCore()` when this step
+   * fails or exceeds `STARTUP_STEP_TIMEOUT_MS`. For work that should land before IPC/HTTP mount
+   * but must not keep the app from starting (the one-shot providers.jsonc migration, agent-task
+   * recovery); the abandoned step keeps running as a plain promise exactly like a timed-out hard
+   * step. Absent means hard: the step is mandatory and a failure stops startup.
+   */
+  readonly bestEffort?: boolean;
 }
 
 /**
@@ -199,6 +211,7 @@ export class ServiceContainer {
   public readonly mcpConfigService: CoreServices["mcpConfigService"];
   public readonly mcpServerManager: CoreServices["mcpServerManager"];
   public readonly sessionUsageService: CoreServices["sessionUsageService"];
+  public readonly evaluationService: CoreServices["evaluationService"];
   public readonly workspaceGoalService: CoreServices["workspaceGoalService"];
   public readonly memoryService: CoreServices["memoryService"];
   public readonly memoryMetaService: CoreServices["memoryMetaService"];
@@ -230,6 +243,7 @@ export class ServiceContainer {
   public readonly sessionTimingService: SessionTimingService;
   public readonly timelineService: TimelineService;
   public readonly devToolsService: DevToolsService;
+  public readonly reviewStateService: ReviewStateService;
   public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
   public readonly browserBridgeServer: BrowserBridgeServer;
@@ -258,6 +272,9 @@ export class ServiceContainer {
   // Retained so dispose() can wait for the in-flight housekeeping step to settle (bounded)
   // before tearing down the services it is using.
   private startupHousekeepingSettled: Promise<void> | null = null;
+  // Settles when the latest task recovery run settles, even one the startup bound abandoned:
+  // housekeeping and the periodic services must not overlap the recovery transitions.
+  private taskRecoverySettled: Promise<void> = Promise.resolve();
 
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
@@ -292,6 +309,7 @@ export class ServiceContainer {
     this.mcpConfigService = get(MCPConfig);
     this.mcpServerManager = get(MCPServerManagerTag);
     this.sessionUsageService = get(SessionUsage);
+    this.evaluationService = get(Evaluation);
     this.workspaceGoalService = get(WorkspaceGoal);
     this.memoryService = get(Memory);
     this.memoryMetaService = get(MemoryMeta);
@@ -322,6 +340,7 @@ export class ServiceContainer {
     this.sessionTimingService = get(SessionTiming);
     this.timelineService = get(Timeline);
     this.devToolsService = get(DevTools);
+    this.reviewStateService = get(ReviewState);
     this.browserSessionDiscoveryService = get(AgentBrowserSessionDiscovery);
     this.browserBridgeTokenManager = get(BrowserBridgeTokenManagerTag);
     this.browserBridgeServer = get(BrowserBridgeServerTag);
@@ -361,34 +380,62 @@ export class ServiceContainer {
   }
 
   /**
-   * The hard startup steps, in order: everything request handling depends on, plus agent-task
-   * restart recovery. All five are mandatory — a failure stops startup — and every name is a
-   * `stepDurationsMs` key of the `[startup] ServiceContainer.initialize completed` line (and the
-   * `step` of a `StartupStepTimeoutError`), so names and order are an observability contract.
-   * Downgrading a step to best-effort is runStartupHousekeeping()'s policy, not a change here.
+   * The startup steps that run before IPC/HTTP mount, in order: everything request handling
+   * depends on, plus agent-task restart recovery. Every step but the one marked `bestEffort` is
+   * mandatory — a failure stops startup — and every name is a `stepDurationsMs` key of the
+   * `[startup] ServiceContainer.initialize completed` line (and the `step` of a
+   * `StartupStepTimeoutError`), so names and order are an observability contract. Work that
+   * scales with deployment size belongs in runStartupHousekeeping(), not here.
    */
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
     // Startup gating
     { name: "policyService.initialize", run: () => this.policyService.initialize() },
+    // One-shot providers.jsonc migration; ordered before IPC/HTTP mount so no client reads or
+    // edits the coder section's pre-migration model list. Best-effort: it is internally
+    // non-throwing and the OAuth writers finish a migration that did not land, so a stuck
+    // providers-file lock must delay startup by at most the step timeout, never fail it.
+    {
+      name: "coderOauthService.separateDiscoveredModels",
+      run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
+      bestEffort: true,
+    },
     { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
+    // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
+    // that restarts xum, re-driving the same partial recovery each time. The listener still waits
+    // for it within the step bound (sub-second normally), so clients do not race recovery in the
+    // common case; past the bound it keeps running and runStartupHousekeeping() waits for it.
     {
       name: "taskService.recoverInterruptedTasks",
-      run: () => this.taskService.recoverInterruptedTasks(),
+      run: () => {
+        // Same dispose-aborted signal as housekeeping: a recovery outliving the step bound must
+        // not keep reserving or re-driving tasks once shutdown began.
+        const recovery = this.taskService.recoverInterruptedTasks({
+          signal: this.startupHousekeepingAbort.signal,
+        });
+        this.taskRecoverySettled = recovery.then(
+          () => undefined,
+          () => undefined
+        );
+        return recovery;
+      },
+      bestEffort: true,
     },
   ];
 
   /**
    * Runs `startupCoreSteps` on the app runtime (startup contract in di/appRuntime.ts). The
-   * server entry point awaits this before binding its listener: task recovery must finish before
-   * any client can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and
-   * it is bounded by the number of active tasks rather than by deployment size. The per-workspace
+   * server entry point awaits this before binding its listener so task recovery normally finishes
+   * before any client can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks);
+   * a recovery past the step bound keeps running while startup continues. The per-workspace
    * housekeeping lives in runStartupHousekeeping().
    *
    * Rejects with the failing step's own error (identity preserved — a synchronous throw included)
    * or with a `StartupStepTimeoutError` once a step exceeds `STARTUP_STEP_TIMEOUT_MS` on the
-   * runtime clock; later steps do not run. A timed-out step keeps running as a plain promise
+   * runtime clock; later steps do not run. A `bestEffort` step is the exception: its failure or
+   * timeout is logged and the next step runs. A timed-out step keeps running as a plain promise
    * (nothing here observes its result afterwards), which is why every root runs the bounded
    * `dispose()` before exiting on a rejected startup. Not re-entrancy guarded: a second call
    * re-runs the steps, as the plain promise chain did.
@@ -423,25 +470,36 @@ export class ServiceContainer {
   private timedStartupStep(step: StartupStep): Effect.Effect<void, unknown> {
     return Effect.suspend(() => {
       const stepStartedAt = Date.now();
-      return Effect.tryPromise({
+      const timed = Effect.tryPromise({
         try: async () => step.run(),
         catch: (error: unknown) => error,
       }).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
-          // Fatal on purpose — the same exit path a throwing step already takes on every root
-          // (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are the hard steps
-          // request handling depends on (#4058): continuing past a timed-out step would, e.g., let
-          // the server accept task operations while task recovery is still running. The
-          // "startup must never crash the app" rule governs the best-effort work in
-          // runStartupHousekeeping(), which stays non-fatal; this bound only turns an indefinite
-          // hang (splash pinned, listener never bound, no dispose) into the existing failure path.
+          // Fatal on purpose for a hard step — the same exit path a throwing step already takes
+          // on every root (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are
+          // the steps request handling depends on (#4058). The "startup must never crash the
+          // app" rule governs the best-effort work (runStartupHousekeeping() and the `bestEffort`
+          // steps, task recovery included), which stays non-fatal;
+          // this bound only turns an indefinite hang (splash pinned, listener never bound, no
+          // dispose) into the existing failure path.
           orElse: () =>
             Effect.fail(new StartupStepTimeoutError(step.name, STARTUP_STEP_TIMEOUT_MS)),
         }),
         Effect.ensuring(
           Effect.sync(() => {
             this.startupStepDurationsMs[step.name] = Date.now() - stepStartedAt;
+          })
+        )
+      );
+      if (!step.bestEffort) {
+        return timed;
+      }
+      // Same bound, different outcome: the failure or timeout is logged and startup continues.
+      return timed.pipe(
+        Effect.catch((error) =>
+          Effect.sync(() => {
+            log.error(`[startup] best-effort step ${step.name} did not complete`, { error });
           })
         )
       );
@@ -467,6 +525,33 @@ export class ServiceContainer {
   private async runStartupHousekeepingSteps(): Promise<void> {
     const housekeepingStartedAt = Date.now();
     const signal = this.startupHousekeepingAbort.signal;
+    // A task recovery that outlived its startup bound is still mutating task state: wait for it
+    // (or for dispose) before the housekeeping passes and periodic services act on the same tasks.
+    // Bounded again on the runtime clock: a permanently hung recovery must not disable the
+    // periodic services for the server's lifetime, nor keep `initialize()` callers (ACP) waiting.
+    const recoveryWait = this.runtime.managed
+      .runPromise(
+        Effect.promise(() => this.taskRecoverySettled).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({
+            duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
+            orElse: () => Effect.succeed(false),
+          })
+        )
+      )
+      .catch(() => true);
+    const recoverySettled = await new Promise<boolean>((resolve) => {
+      if (signal.aborted) return resolve(true);
+      signal.addEventListener("abort", () => resolve(true), { once: true });
+      void recoveryWait.then(resolve);
+    });
+    if (!recoverySettled) {
+      log.warn("[startup] Task recovery still running; starting housekeeping without it");
+    }
+    if (signal.aborted) {
+      log.info("[startup] Startup housekeeping cancelled by dispose before it started");
+      return;
+    }
     // Housekeeping is best-effort and may run while the server is already serving requests: a
     // failing step must not skip the periodic services below (startup-time rule: never let
     // background housekeeping take the app down).
@@ -601,12 +686,14 @@ export class ServiceContainer {
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
       sessionUsageService: this.sessionUsageService,
+      evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
       memoryService: this.memoryService,
       memoryMetaService: this.memoryMetaService,
       memoryConsolidationService: this.memoryConsolidationService,
       refineService: this.refineService,
       devToolsService: this.devToolsService,
+      reviewStateService: this.reviewStateService,
       browserSessionDiscoveryService: this.browserSessionDiscoveryService,
       browserBridgeTokenManager: this.browserBridgeTokenManager,
       browserBridgeServer: this.browserBridgeServer,
@@ -725,19 +812,25 @@ export class ServiceContainer {
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
     shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());
     await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
-    const housekeepingSettled = this.startupHousekeepingSettled;
-    if (housekeepingSettled != null) {
-      await shutdownStep("startupHousekeeping.join", async () => {
-        const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+    // Joined with a task recovery that outlived its startup bound (already settled otherwise):
+    // both observe the abort above only at their step boundaries.
+    const housekeepingSettled = Promise.all([
+      this.startupHousekeepingSettled,
+      this.taskRecoverySettled,
+      // Recovery schedules its queue drain instead of awaiting it (see
+      // TaskService.recoverInterruptedTasks), so its launches are joined separately.
+      this.taskService.queueDrainSettled(),
+    ]);
+    await shutdownStep("startupHousekeeping.join", async () => {
+      const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+        timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+      });
+      if (joined.kind === "timeout") {
+        log.warn("[shutdown] startup housekeeping still running; teardown continues", {
           timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
         });
-        if (joined.kind === "timeout") {
-          log.warn("[shutdown] startup housekeeping still running; teardown continues", {
-            timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
-          });
-        }
-      });
-    }
+      }
+    });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
     // per-stream supervisors (StreamManager.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —

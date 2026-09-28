@@ -29,6 +29,7 @@ import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
@@ -128,9 +129,12 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
     // useProvidersConfig consumers read the shared store, which gets its
     // client from AppLoader in the real app — wire it manually here too.
     getProvidersConfigStore().setClient(client);
+    // Same for the review-state store: without a client the review panel never hydrates.
+    getReviewStateStore().setClient(client);
     return () => {
       workspaceStore.setClient(null);
       getProvidersConfigStore().setClient(null);
+      getReviewStateStore().setClient(null);
     };
   }, [client, workspaceStore]);
 

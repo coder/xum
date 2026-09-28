@@ -22,6 +22,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
 import {
@@ -36,7 +37,7 @@ import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
-  "[IMPORTANT]\n\nDO NOT use `cat`, `rg`, or `grep` to read files. Use the `file_read` tool instead (supports offset/limit paging). Bash output may be truncated or auto-filtered, which can hide parts of the file.";
+  "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
 
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
@@ -1378,6 +1379,9 @@ ${scriptWithEnv}`;
       // normal completion path so we don't drop any last-millisecond output (especially
       // on Windows, where stream/exit events can arrive slightly out of order).
       const BACKGROUND_EXIT_GRACE_MS = 100;
+      // Bounded wait for a terminated command's exit after a failed migration (#4805), like the
+      // MCP stdio kill join: a removal's cleanup() waits on the migration until then.
+      const FAILED_MIGRATION_EXIT_JOIN_MS = 5_000;
 
       let exitCode: number;
       try {
@@ -1392,6 +1396,19 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Claim the migrated record's name across backends BEFORE the exit check below
+          // (#4878): the claim may wait on another backend's spawn lock, and a command that
+          // exits during that wait must take the normal completion path, not be reported as
+          // backgrounded (or as a failed migration). The lock stays held until the migrated
+          // record directory exists (end of this block).
+          const claim =
+            config.backgroundProcessManager && config.workspaceId
+              ? await config.backgroundProcessManager.claimMigrationProcessId(
+                  config.workspaceId,
+                  safeDisplayName
+                )
+              : null;
+          await using claimLock = claim?.success ? claim : null;
           const didExit =
             exitCodeResolved ||
             (await Promise.race([
@@ -1402,9 +1419,19 @@ ${scriptWithEnv}`;
             ]));
 
           if (didExit) {
+            // Nothing was written under the claimed name. Release it before draining, which
+            // can outlast the exit (e.g. a grandchild holding stdout open).
+            claimLock?.releaseName();
+            await claimLock?.[Symbol.asyncDispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
+            // Held until the command is registered below or terminated after a failed
+            // migration: a removal's cleanup() in between waits for it (#4805).
+            using _migration =
+              config.backgroundProcessManager && config.workspaceId
+                ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+                : undefined;
             // Detach from abort signal as early as possible - process should continue running
             // even when the stream ends and fires abort.
             abortDetached = true;
@@ -1430,14 +1457,10 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
-            let migrationError = "background process manager unavailable";
-            if (config.backgroundProcessManager && config.workspaceId) {
-              // Allocate-and-reserve atomically: the migration awaits below would otherwise
-              // let a concurrent same-name migration receive the same ID and share this
-              // process's output directory and manager entry (see reserveUniqueProcessId).
-              const reservation =
-                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
-              const processId = reservation.processId;
+            let migrationError =
+              claim?.success === false ? claim.error : "background process manager unavailable";
+            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+              const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1457,6 +1480,9 @@ ${scriptWithEnv}`;
                   processId,
                   script,
                   existingOutput: lines,
+                  // Abort is detached from the tool call once backgrounded, so the wrapped
+                  // controller now only fires through the handle's terminate (#4760).
+                  kill: () => wrappedAbortController.abort(),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );
@@ -1471,7 +1497,7 @@ ${scriptWithEnv}`;
                   safeDisplayName
                 );
                 // The processes map now holds the name; the reservation has done its job.
-                reservation.release();
+                claimLock.releaseName();
 
                 return withNotice({
                   success: true,
@@ -1486,7 +1512,9 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
+              void execStream.exitCode
+                .catch(() => undefined)
+                .finally(() => claimLock.releaseName());
             }
 
             // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
@@ -1502,6 +1530,11 @@ ${scriptWithEnv}`;
             stderrForMigration.cancel().catch(() => {
               /* ignore */ return;
             });
+            // Keep the migration pending (the `using` above) until the terminated command exits,
+            // so a removal's cleanup() cannot delete the checkout while it is still stopping.
+            await raceWithAbortAndTimeout(execStream.exitCode, {
+              timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+            }).catch(() => undefined);
             return withNotice({
               success: false,
               error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,

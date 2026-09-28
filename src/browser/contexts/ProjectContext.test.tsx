@@ -1,73 +1,28 @@
 import type { ProjectConfig } from "@/node/config";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
-import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
-import type * as APIModule from "./API";
-import type * as ProjectContextModule from "./ProjectContext";
-import type { APIClient } from "./API";
+import { APIProvider, type APIClient } from "./API";
+import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
 
 // Keep the client local to each test instead of using bun's process-global
 // mock.module registry for API, which leaks across context suites.
-let currentClientMock: RecursivePartial<APIClient> = {};
-
-let APIProvider!: typeof APIModule.APIProvider;
-let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
-let useProjectContext!: typeof ProjectContextModule.useProjectContext;
-let isolatedModuleDir: string | null = null;
-
-const contextsDir = dirname(fileURLToPath(import.meta.url));
-
-// Import unique temp copies of the real modules so leaked Bun mock.module registrations and
-// module cache entries from earlier suites cannot replace the API or ProjectContext implementations.
-async function importIsolatedProjectModules() {
-  const tempDir = await mkdtemp(join(contextsDir, ".project-context-test-"));
-  const isolatedApiPath = join(tempDir, "API.real.tsx");
-  const isolatedProjectContextPath = join(tempDir, "ProjectContext.real.tsx");
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-
-  const projectContextSource = await readFile(join(contextsDir, "ProjectContext.tsx"), "utf8");
-  const isolatedProjectContextSource = projectContextSource.replace(
-    'from "@/browser/contexts/API";',
-    'from "./API.real.tsx";'
-  );
-
-  if (isolatedProjectContextSource === projectContextSource) {
-    throw new Error("Failed to rewrite ProjectContext API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedProjectContextPath, isolatedProjectContextSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({ ProjectProvider, useProjectContext } = requireTestModule<{
-    ProjectProvider: typeof ProjectContextModule.ProjectProvider;
-    useProjectContext: typeof ProjectContextModule.useProjectContext;
-  }>(isolatedProjectContextPath));
-
-  return tempDir;
-}
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 describe("ProjectContext", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
 
-  beforeEach(async () => {
-    isolatedModuleDir = await importIsolatedProjectModules();
-
+  beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalLocalStorage = globalThis.localStorage;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
     mock.restore();
 
@@ -76,11 +31,6 @@ describe("ProjectContext", () => {
     globalThis.localStorage = originalLocalStorage;
 
     currentClientMock = {};
-
-    if (isolatedModuleDir) {
-      await rm(isolatedModuleDir, { recursive: true, force: true });
-      isolatedModuleDir = null;
-    }
   });
 
   test("loads projects on mount and supports add/remove mutations", async () => {
@@ -143,7 +93,7 @@ describe("ProjectContext", () => {
     currentClientMock = {
       ...currentClientMock,
       config: {
-        onConfigChanged: onConfigChanged as unknown as APIClient["config"]["onConfigChanged"],
+        onConfigChanged,
       },
     };
 
@@ -511,10 +461,10 @@ describe("ProjectContext", () => {
       const oldRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const newRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const oldApi = createMockAPI({ list: () => oldRequest.promise });
-      const oldClient = currentClientMock as APIClient;
+      const oldClient = createTestApiClient(currentClientMock);
       const newList = mock(() => newRequest.promise);
       const newClient = { ...oldClient, projects: { ...oldClient.projects, list: newList } };
-      let context: ProjectContextModule.ProjectContext | null = null;
+      let context: ProjectContext | null = null;
       function Capture() {
         context = useProjectContext();
         return null;
@@ -749,13 +699,13 @@ describe("ProjectContext", () => {
 });
 
 async function setup() {
-  const contextRef = { current: null as ProjectContextModule.ProjectContext | null };
+  const contextRef = { current: null as ProjectContext | null };
   function ContextCapture() {
     contextRef.current = useProjectContext();
     return null;
   }
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <ProjectProvider>
         <ContextCapture />
       </ProjectProvider>
@@ -765,7 +715,7 @@ async function setup() {
   return () => contextRef.current!;
 }
 
-function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
+function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
   const projects = {
     create: mock(
       overrides.create ??
@@ -804,8 +754,8 @@ function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
 
   // Update the global mock
   currentClientMock = {
-    projects: projects as unknown as RecursivePartial<APIClient["projects"]>,
-    secrets: projects.secrets as unknown as RecursivePartial<APIClient["secrets"]>,
+    projects: projects as unknown as TestApiOverrides<APIClient["projects"]>,
+    secrets: projects.secrets as unknown as TestApiOverrides<APIClient["secrets"]>,
   };
 
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;

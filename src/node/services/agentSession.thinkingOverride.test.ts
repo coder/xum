@@ -1,8 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
 
-import type { MuxMessage } from "@/common/types/message";
 import { Ok, Err } from "@/common/types/result";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 
@@ -38,13 +37,15 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(first).toEqual({ accepted: true });
       expect(second).toEqual({ accepted: true });
       expect(opts.activeTurnThinkingOverride?.pending).toBe("low");
+      // A slider write marks the turn as user-controlled, which disables Auto's escalation.
+      expect(opts.activeTurnThinkingOverride?.manual).toBe(true);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-active",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     sessionRef = session;
@@ -82,7 +83,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-preparing",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -117,7 +118,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-prestream-failure",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -133,13 +134,13 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
   });
 
   it("clears the holder when an onAccepted failure aborts the turn before streaming", async () => {
-    const streamMessage = mock((_history: MuxMessage[]) =>
+    const streamMessage = mock((_options: StreamMessageOptions) =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-onaccepted-failure",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 

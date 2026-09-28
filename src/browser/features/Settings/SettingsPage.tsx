@@ -1,9 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
-  ArrowLeft,
   Blocks,
   Brain,
-  Menu,
   Settings,
   Key,
   Cpu,
@@ -21,10 +19,10 @@ import {
   ArchiveRestore,
   ScrollText,
 } from "lucide-react";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
@@ -48,6 +46,7 @@ import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
 const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
+const FOCUS_HISTORY_LIMIT = 3;
 
 const BASE_SECTIONS: SettingsSection[] = [
   {
@@ -218,21 +217,42 @@ export function getSettingsSectionRedirect(
   return null;
 }
 
-interface SettingsPageProps {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}
-
-export function SettingsPage(props: SettingsPageProps) {
-  const { close, activeSection, setActiveSection } = useSettings();
+export function SettingsPage() {
+  const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
+  // Radix only returns focus to a DialogTrigger, and settings opens from shortcuts, menus, and the
+  // command palette, whose focused item often unmounts as settings opens. Recent focus is tracked
+  // while closed so closing can fall back to the latest element still on the page.
+  const focusHistoryRef = useRef<HTMLElement[]>([]);
+  const returnFocusRef = useRef<HTMLElement[]>([]);
+
+  useEffect(() => {
+    if (isOpen) {
+      return;
+    }
+    const recordFocus = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      focusHistoryRef.current = [
+        target,
+        ...focusHistoryRef.current.filter((element) => element !== target),
+      ].slice(0, FOCUS_HISTORY_LIMIT);
+    };
+    document.addEventListener("focusin", recordFocus);
+    return () => document.removeEventListener("focusin", recordFocus);
+  }, [isOpen]);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
     const redirect = getSettingsSectionRedirect(
       activeSection,
       governorEnabled,
@@ -251,6 +271,7 @@ export function SettingsPage(props: SettingsPageProps) {
 
     setActiveSection(redirect.section);
   }, [
+    isOpen,
     activeSection,
     setActiveSection,
     governorEnabled,
@@ -259,23 +280,6 @@ export function SettingsPage(props: SettingsPageProps) {
     remoteConnectionAvailable,
   ]);
 
-  // Close settings on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
-  // Popover, Dialog) that call stopPropagation/preventDefault on Escape get first
-  // right of refusal—only an unclaimed Escape navigates away from settings.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
-      if (e.defaultPrevented) return;
-      if (isEditableElement(e.target)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      close();
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [close]);
   const sections = getSettingsSections(
     governorEnabled,
     memoryEnabled,
@@ -286,58 +290,48 @@ export function SettingsPage(props: SettingsPageProps) {
   const SectionComponent = currentSection.component;
 
   return (
-    <div className="bg-surface-primary flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/*
-        Keep explicit mobile escape controls in the page chrome:
-        - The desktop close button is hidden below md.
-        - On touch layouts, the left sidebar is often off-canvas by default.
-        Without back + menu actions here, /settings/:section can trap users in-pane.
-      */}
-      <div
-        className="bg-surface-primary border-border-light flex shrink-0 items-center 
-        justify-between border-b px-2 md:hidden [@media(max-width:768px)]:h-auto 
-        [@media(max-width:768px)]:py-2"
+    <Dialog open={isOpen} onOpenChange={(open) => !open && close()}>
+      {/* Phone widths get a full-screen sheet; md+ gets a large centered dialog. */}
+      <DialogContent
+        showCloseButton={false}
+        allowEditableEscape
+        aria-describedby={undefined}
+        onOpenAutoFocus={() => {
+          returnFocusRef.current = focusHistoryRef.current;
+        }}
+        onCloseAutoFocus={(e) => {
+          e.preventDefault();
+          const candidates = returnFocusRef.current;
+          returnFocusRef.current = [];
+          // Closing by navigating elsewhere can hand focus to the destination (a newly shown chat
+          // input autofocuses); only recover focus that fell back to the body.
+          const active = document.activeElement;
+          if (active instanceof HTMLElement && active !== document.body && active.isConnected) {
+            return;
+          }
+          for (const candidate of candidates) {
+            if (!candidate.isConnected) {
+              continue;
+            }
+            candidate.focus();
+            if (document.activeElement === candidate) {
+              return;
+            }
+          }
+        }}
+        className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
-        <div className="flex min-w-0 items-center gap-2">
-          {props.leftSidebarCollapsed && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={props.onToggleLeftSidebarCollapsed}
-              title="Open sidebar"
-              aria-label="Open sidebar menu"
-              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
-            >
-              <Menu className="h-4 w-4" />
-            </Button>
-          )}
-          <span className="text-foreground text-sm font-semibold">Settings</span>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={close}
-          title="Back"
-          aria-label="Back to previous page"
-          className="text-muted hover:text-foreground px-2"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Back
-        </Button>
-      </div>
-
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <aside className="border-border-medium hidden w-48 shrink-0 flex-col border-r md:flex">
-          <div className="border-border-medium flex h-12 items-center border-b px-4">
-            <span className="text-foreground text-sm font-semibold">Settings</span>
+        <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
+          <div className="border-border-medium flex h-12 shrink-0 items-center border-b px-4">
+            <DialogTitle className="text-sm leading-normal tracking-normal">Settings</DialogTitle>
           </div>
-          <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
+          <nav className="flex gap-1 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-hidden md:overflow-y-auto">
             {sections.map((section) => (
               <Button
                 key={section.id}
                 variant="ghost"
                 onClick={() => setActiveSection(section.id)}
-                className={`flex h-auto w-full items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap md:w-full ${
                   activeSection === section.id
                     ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
                     : "text-muted hover:bg-hover hover:text-foreground"
@@ -351,43 +345,11 @@ export function SettingsPage(props: SettingsPageProps) {
               </Button>
             ))}
           </nav>
-        </aside>
+        </div>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div className="border-border-medium shrink-0 border-b md:hidden">
-            <nav className="flex gap-1 overflow-x-auto p-2">
-              {sections.map((section) => (
-                <Button
-                  key={section.id}
-                  variant="ghost"
-                  onClick={() => setActiveSection(section.id)}
-                  className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap ${
-                    activeSection === section.id
-                      ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
-                      : "text-muted hover:bg-hover hover:text-foreground"
-                  }`}
-                >
-                  {section.icon}
-                  {section.label}
-                  {section.experimental && (
-                    <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
-                  )}
-                </Button>
-              ))}
-            </nav>
-          </div>
-
-          <div className="border-border-medium hidden h-12 items-center justify-between border-b px-6 md:flex">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="border-border-medium hidden h-12 shrink-0 items-center border-b px-6 md:flex">
             <span className="text-foreground text-sm font-medium">{currentSection.label}</span>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={close}
-              className="h-6 w-6"
-              aria-label="Close settings"
-            >
-              <X className="h-4 w-4" />
-            </Button>
           </div>
           <div className="flex-1 overflow-y-auto p-4 md:p-6">
             {/* Keep settings content width bounded so long forms remain readable on wide screens.
@@ -406,7 +368,18 @@ export function SettingsPage(props: SettingsPageProps) {
             </div>
           </div>
         </div>
-      </div>
-    </div>
+
+        {/* One close button for both layouts: it sits in the top-right header row either way. */}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={close}
+          className="absolute top-[calc(env(safe-area-inset-top)+0.75rem)] right-4 h-6 w-6 md:right-6"
+          aria-label="Close settings"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </DialogContent>
+    </Dialog>
   );
 }

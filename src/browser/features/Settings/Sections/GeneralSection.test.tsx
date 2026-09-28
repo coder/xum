@@ -1,19 +1,23 @@
+// Keep this first: tests/ui/dom installs a baseline DOM on import, and GeneralSection reads
+// `window` (browser vs Electron mode) when its module evaluates below.
+import { installDom } from "../../../../../tests/ui/dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { requireTestModule } from "@/browser/testUtils";
-import type * as APIModule from "@/browser/contexts/API";
-import type * as ExperimentsModule from "@/browser/contexts/ExperimentsContext";
-import type * as GeneralModule from "./GeneralSection";
+import { APIProvider } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
+import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
+import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
+import { GeneralSection } from "./GeneralSection";
 import {
   EXPERIMENT_IDS,
   getExperimentKey,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { installDom } from "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -24,19 +28,14 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 
-interface MockConfig {
-  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
-  worktreeArchiveBehavior: WorktreeArchiveBehavior;
-  chatTranscriptFullWidth: boolean;
-  llmDebugLogs: boolean;
-}
+type MockConfig = TestClientConfig;
 
 type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
 interface MockAPIClient {
   experiments: {
     getOverrides: () => Promise<ExperimentOverrides>;
-    setOverride: (input: { experimentId: ExperimentId; enabled: boolean }) => Promise<void>;
+    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
     getConfig: () => Promise<MockConfig>;
@@ -46,6 +45,11 @@ interface MockAPIClient {
     }) => Promise<void>;
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
+    updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    onConfigChanged: (
+      input?: unknown,
+      options?: { signal?: AbortSignal }
+    ) => Promise<AsyncIterableIterator<void>>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -174,55 +178,19 @@ const mockSelectPrimitive = (() => {
   };
 })();
 
-let APIProvider: typeof APIModule.APIProvider;
-let ExperimentsProvider: typeof ExperimentsModule.ExperimentsProvider;
-let useExperiment: typeof ExperimentsModule.useExperiment;
-let GeneralSection: typeof GeneralModule.GeneralSection;
-let isolatedModuleDir: string;
-
-beforeAll(async () => {
-  // Isolate the real provider and its consumer from other suites' global hook mocks.
-  const root = join(process.cwd(), ".tmp");
-  await mkdir(root, { recursive: true });
-  isolatedModuleDir = await mkdtemp(join(root, "general-section-test-"));
-  await copyFile("src/browser/contexts/API.tsx", join(isolatedModuleDir, "API.tsx"));
-  for (const [sourcePath, filename] of [
-    ["src/browser/contexts/ExperimentsContext.tsx", "ExperimentsContext.tsx"],
-    ["src/browser/features/Settings/Sections/GeneralSection.tsx", "GeneralSection.tsx"],
-  ]) {
-    const source = await readFile(sourcePath, "utf8");
-    const isolatedSource = source
-      .replace('from "@/browser/contexts/API";', 'from "./API";')
-      .replace('from "@/browser/hooks/useTelemetry";', 'from "./Telemetry";')
-      .replace('from "@/browser/contexts/ExperimentsContext";', 'from "./ExperimentsContext";')
-      .replace('from "@/browser/components/SelectPrimitive/SelectPrimitive";', 'from "./Select";');
-    expect(isolatedSource).not.toBe(source);
-    await writeFile(join(isolatedModuleDir, filename), isolatedSource);
-  }
-  const selectPath = join(isolatedModuleDir, "Select.tsx");
-  await writeFile(selectPath, "export {};\n");
-  void mock.module(selectPath, () => mockSelectPrimitive);
-  const telemetryPath = join(isolatedModuleDir, "Telemetry.ts");
-  await writeFile(telemetryPath, "export {};\n");
-  void mock.module(telemetryPath, () => ({
-    useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
-  }));
-  ({ APIProvider } = requireTestModule<typeof APIModule>(join(isolatedModuleDir, "API.tsx")));
-  ({ ExperimentsProvider, useExperiment } = requireTestModule<typeof ExperimentsModule>(
-    join(isolatedModuleDir, "ExperimentsContext.tsx")
-  ));
-  ({ GeneralSection } = requireTestModule<typeof GeneralModule>(
-    join(isolatedModuleDir, "GeneralSection.tsx")
-  ));
-});
-
-afterAll(async () => {
-  await rm(isolatedModuleDir, { recursive: true, force: true });
-});
+// Snapshot the real exports before mocking so later suites get them back after this file.
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...RealSelectPrimitiveModule }],
+  ["@/browser/hooks/useTelemetry", { ...RealTelemetryModule }],
+]);
+void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => mockSelectPrimitive);
+void mock.module("@/browser/hooks/useTelemetry", () => ({
+  useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
+}));
 
 function TestProviders(props: { children: React.ReactNode }) {
   return (
-    <APIProvider client={mockApi as APIModule.APIClient}>
+    <APIProvider client={createTestApiClient(mockApi)}>
       <ExperimentsProvider>
         <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
       </ExperimentsProvider>
@@ -234,6 +202,9 @@ interface RenderGeneralSectionOptions {
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   chatTranscriptFullWidth?: boolean;
+  keepScreenAwake?: boolean;
+  /** Render as the Electron app (window.api set by the preload) instead of browser mode. */
+  desktop?: boolean;
   localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
@@ -256,6 +227,15 @@ interface MockAPISetup {
   updateChatTranscriptFullWidthMock: ReturnType<
     typeof mock<(input: { enabled: boolean }) => Promise<void>>
   >;
+  updateKeepScreenAwakeMock: ReturnType<
+    typeof mock<(input: { enabled: boolean }) => Promise<void>>
+  >;
+  getSshHostMock: ReturnType<typeof mock<() => Promise<string | null>>>;
+  setSshHostMock: ReturnType<typeof mock<(input: { sshHost: string | null }) => Promise<void>>>;
+  /** Mutable backing config, so tests can simulate edits made outside this section. */
+  config: MockConfig;
+  /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
+  emitConfigChanged: () => void;
 }
 
 function createMockAPI(
@@ -265,18 +245,17 @@ function createMockAPI(
   const backendOverrides = { ...experimentOverrides };
   const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
   const setOverrideMock = mock(
-    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled: boolean }) => {
-      backendOverrides[experimentId] = enabled;
+    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
+      // Like the backend, a null/omitted value clears the override.
+      if (enabled == null) {
+        delete backendOverrides[experimentId];
+      } else {
+        backendOverrides[experimentId] = enabled;
+      }
       return Promise.resolve();
     }
   );
-  const config: MockConfig = {
-    coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-    worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    chatTranscriptFullWidth: false,
-    llmDebugLogs: false,
-    ...configOverrides,
-  };
+  const config: MockConfig = createTestConfig(configOverrides);
 
   const getConfigMock = mock(() => Promise.resolve({ ...config }));
   const updateCoderPrefsMock = mock(
@@ -297,6 +276,54 @@ function createMockAPI(
     return Promise.resolve();
   });
 
+  const updateKeepScreenAwakeMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.keepScreenAwake = enabled;
+
+    return Promise.resolve();
+  });
+
+  const getSshHostMock = mock(() => Promise.resolve<string | null>(null));
+  const setSshHostMock = mock((_input: { sshHost: string | null }) => Promise.resolve());
+
+  // Minimal stand-in for the backend's config-change event stream: each subscriber
+  // counts its own pending notifications.
+  const configChangeNotifiers = new Set<() => void>();
+  const emitConfigChanged = () => {
+    for (const notify of Array.from(configChangeNotifiers)) notify();
+  };
+  const onConfigChanged = (_input?: unknown, options?: { signal?: AbortSignal }) => {
+    let pending = 0;
+    let wake: (() => void) | null = null;
+    const notify = () => {
+      pending += 1;
+      wake?.();
+    };
+    configChangeNotifiers.add(notify);
+    const done = () => {
+      configChangeNotifiers.delete(notify);
+      wake?.();
+    };
+    options?.signal?.addEventListener("abort", done, { once: true });
+    // The real procedure resolves to an async-iterable iterator; GeneralSection drives it with next().
+    const iterator: AsyncIterableIterator<void> = {
+      [Symbol.asyncIterator]: () => iterator,
+      next: async () => {
+        while (pending === 0 && !options?.signal?.aborted) {
+          await new Promise<void>((resolve) => (wake = resolve));
+          wake = null;
+        }
+        if (options?.signal?.aborted) return { done: true, value: undefined };
+        pending -= 1;
+        return { done: false, value: undefined };
+      },
+      return: () => {
+        done();
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+    return Promise.resolve(iterator);
+  };
+
   return {
     api: {
       experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
@@ -309,10 +336,12 @@ function createMockAPI(
 
           return Promise.resolve();
         }),
+        updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        onConfigChanged,
       },
       server: {
-        getSshHost: mock(() => Promise.resolve(null)),
-        setSshHost: mock((_input: { sshHost: string | null }) => Promise.resolve()),
+        getSshHost: getSshHostMock,
+        setSshHost: setSshHostMock,
       },
       projects: {
         getDefaultProjectDir: mock(() => Promise.resolve("")),
@@ -325,6 +354,11 @@ function createMockAPI(
     getConfigMock,
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
+    updateKeepScreenAwakeMock,
+    getSshHostMock,
+    setSshHostMock,
+    config,
+    emitConfigChanged,
   };
 }
 
@@ -350,12 +384,14 @@ describe("GeneralSection", () => {
     const setup = createMockAPI(
       {
         chatTranscriptFullWidth: options.chatTranscriptFullWidth,
+        keepScreenAwake: options.keepScreenAwake,
         coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
         worktreeArchiveBehavior: options.worktreeArchiveBehavior,
       },
       options.backendOverrides
     );
     mockApi = setup.api;
+    if (options.desktop) window.api = { platform: "linux", versions: {} };
 
     const view = render(
       <TestProviders>
@@ -413,6 +449,20 @@ describe("GeneralSection", () => {
     { continuous: false, budget: true, label: "Token Budget" },
     { continuous: true, budget: true, label: "Continuous" },
   ];
+
+  /**
+   * Settle the mount-time config and SSH host reads inside act. The mocks resolve at once, but
+   * the commits they trigger land outside act, so polling for them with waitFor raced its 1 s
+   * wall-clock budget on loaded CI runners (#4463). Awaiting the reads themselves inside act
+   * flushes those commits before returning, with no wall-clock budget.
+   */
+  async function settleMountLoads(setup: MockAPISetup) {
+    const reads = [...setup.getConfigMock.mock.results, ...setup.getSshHostMock.mock.results];
+    expect(reads.length).toBeGreaterThan(0);
+    await act(async () => {
+      await Promise.all(reads.map((result) => result.value));
+    });
+  }
 
   async function hydrateExperiments(setup: MockAPISetup) {
     await act(async () => {
@@ -606,15 +656,44 @@ describe("GeneralSection", () => {
     );
   });
 
-  test("loads and persists the full-width chat transcript toggle", async () => {
-    const { updateChatTranscriptFullWidthMock, view } = renderGeneralSection({
-      chatTranscriptFullWidth: true,
+  test("loads the SSH host setting in browser mode", async () => {
+    // Browser mode means no window.api. It is read at render time, so this holds even when
+    // another test file in the same process imported GeneralSection before the DOM existed.
+    const setup = renderGeneralSection();
+    // The mount effect requests the host synchronously; a missing call means browser mode was
+    // not detected, which is a different failure from a slow load.
+    expect(setup.getSshHostMock).toHaveBeenCalledTimes(1);
+
+    await settleMountLoads(setup);
+    expect(setup.view.getByText("SSH Host")).toBeTruthy();
+  });
+
+  test("shows the saved SSH host again when saving an edit fails (#4748)", async () => {
+    const setup = renderGeneralSection();
+    await settleMountLoads(setup);
+    // What the backend still holds after the rejected save.
+    setup.getSshHostMock.mockResolvedValue("saved-host");
+    setup.setSshHostMock.mockRejectedValueOnce(new Error("config write failed"));
+    const label = await setup.view.findByText("SSH Host");
+    const input = label.parentElement?.parentElement?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error("SSH host input not found");
+
+    await userEvent.setup({ document: input.ownerDocument }).type(input, "n");
+
+    // The backend kept the old host, so the field must not keep advertising the unsaved one.
+    await waitFor(() => {
+      expect(setup.setSshHostMock).toHaveBeenCalledWith({ sshHost: "n" });
+      expect(input.value).toBe("saved-host");
     });
+  });
+
+  test("loads and persists the full-width chat transcript toggle", async () => {
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const { updateChatTranscriptFullWidthMock, view } = setup;
 
     const toggle = view.getByRole("switch", { name: "Toggle full-width chat transcript" });
-    await waitFor(() => {
-      expect(toggle.getAttribute("aria-checked")).toBe("true");
-    });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
 
     fireEvent.click(toggle);
 
@@ -622,6 +701,172 @@ describe("GeneralSection", () => {
       expect(toggle.getAttribute("aria-checked")).toBe("false");
       expect(updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false });
     });
+  });
+
+  test("shows the keep screen awake toggle only in the desktop app", async () => {
+    const browser = renderGeneralSection();
+    await settleMountLoads(browser);
+    expect(browser.view.queryByText("Keep screen awake while agents are working")).toBeNull();
+    browser.view.unmount();
+
+    const desktop = renderGeneralSection({ desktop: true });
+    await settleMountLoads(desktop);
+    expect(desktop.view.getByText("Keep screen awake while agents are working")).toBeTruthy();
+  });
+
+  test("loads and persists the keep screen awake toggle", async () => {
+    const setup = renderGeneralSection({ desktop: true, keepScreenAwake: true });
+    const { updateKeepScreenAwakeMock, view } = setup;
+
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: false });
+    });
+  });
+
+  test.each([true, false])("reverts a rejected keep-awake save from %s", async (saved) => {
+    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: saved,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await act(() => Promise.resolve());
+    expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    updateKeepScreenAwakeMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe(String(!saved));
+    await waitFor(() => {
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: !saved });
+      expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    });
+  });
+
+  test.each([true, false])(
+    "rolls rapid keep-awake toggles back to the confirmed value (first save succeeds: %s)",
+    async (firstSucceeds) => {
+      const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+        desktop: true,
+        keepScreenAwake: true,
+      });
+      const toggle = view.getByRole("switch", {
+        name: "Toggle keep screen awake while agents are working",
+      });
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+      const writes: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+      updateKeepScreenAwakeMock.mockImplementation(
+        () => new Promise<void>((resolve, reject) => writes.push({ resolve, reject }))
+      );
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(writes).toHaveLength(1));
+      fireEvent.click(toggle);
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(writes).toHaveLength(1);
+
+      act(() => {
+        if (firstSucceeds) writes[0].resolve();
+        else writes[0].reject(new Error("first save failed"));
+      });
+      await waitFor(() => expect(writes).toHaveLength(2));
+      // A stale failure must not replace the newer selection, even before its write starts.
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[1].reject(new Error("second save failed")));
+      await waitFor(() => expect(writes).toHaveLength(3));
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[2].reject(new Error("last save failed")));
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe(String(!firstSucceeds)));
+    }
+  );
+
+  test("follows keep-awake changes made outside the mounted section", async () => {
+    // e.g. the "Toggle Keep Screen Awake" palette command runs while Settings is open.
+    const { config, emitConfigChanged, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+
+    config.keepScreenAwake = true;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  test("an external config change does not override an in-flight keep-awake save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let finishWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      return new Promise<void>((resolve) => {
+        finishWrite = () => {
+          config.keepScreenAwake = enabled;
+          resolve();
+        };
+      });
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(finishWrite).not.toBeNull());
+    // An unrelated config edit lands while our write is still pending (disk still says false).
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => finishWrite?.());
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  test("replays an external keep-awake change that landed during a local save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let resolveWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      // The backend applies our write right away, but its response is still in flight.
+      config.keepScreenAwake = enabled;
+      return new Promise<void>((resolve) => (resolveWrite = resolve));
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(resolveWrite).not.toBeNull());
+    // The palette command then turns it back off before our response arrives.
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    act(() => resolveWrite?.());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
   });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {

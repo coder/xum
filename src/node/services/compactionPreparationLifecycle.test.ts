@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage } from "@/common/types/message";
 import { CompactionPendingState, type CompactionPendingRetention } from "./compactionPendingState";
 import { CompactionPreparationLifecycle } from "./compactionPreparationLifecycle";

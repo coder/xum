@@ -310,8 +310,12 @@ interface TaskRowProps {
   agentType?: string;
   title?: string;
   depth?: number;
-  /** Tree relationship to the calling workspace (task_list scope:"tree" rows). */
+  /** Tree relationship to the calling workspace (task_list scope:"tree"/"instance" rows). */
   relationship?: string;
+  /** Project the root workspace belongs to (task_list scope:"instance" rows only). */
+  projectPath?: string;
+  /** Availability snapshot at listing time (task_list scope:"instance" rows only). */
+  activity?: string;
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
@@ -407,6 +411,16 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
         <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
       )}
       {props.relationship && <span className="text-muted text-[10px]">{props.relationship}</span>}
+      {props.projectPath && (
+        // Instance rows need recognizable project context, not the full path in compact chrome.
+        <span className="text-muted max-w-[160px] truncate text-[10px]">
+          {props.projectPath
+            .split(/[\\/]+/)
+            .filter(Boolean)
+            .pop() ?? props.projectPath}
+        </span>
+      )}
+      {props.activity && <span className="text-muted text-[10px]">{props.activity}</span>}
       {typeof props.depth === "number" && props.depth > 0 && (
         <span className="text-muted text-[10px]">depth: {props.depth}</span>
       )}
@@ -1694,11 +1708,17 @@ const TaskListItem: React.FC<{
     taskId={task.taskId}
     status={task.status}
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
-    title={task.title}
+    // Untitled instance rows (the only rows carrying projectPath) would otherwise show just an
+    // opaque ID; their workspace name is the recognizable label. Other rows keep the title only.
+    title={task.title ?? (task.projectPath != null ? task.workspaceName : undefined)}
     depth={task.depth}
     // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
     // self) — the key context for interpreting the tree view and addressing peer messages.
     relationship={task.relationship}
+    // Instance-scope rows additionally carry the project and an activity snapshot; both are
+    // absent on every other row, so ordinary listings render exactly as before.
+    projectPath={task.projectPath}
+    activity={task.activity}
     openWorkspaceId={task.workspaceId}
   />
 );
@@ -1728,6 +1748,16 @@ const MESSAGE_DELIVERY: Record<
   rate_limited: { status: "failed", label: "Rate limited" },
 };
 
+// Results persisted before the dispatch mode was recorded have no mode ("unknown").
+type QueuedDispatchMode = NonNullable<
+  Extract<TaskSendMessageToolSuccessResult, { status: "queued" }>["queueDispatchMode"]
+>;
+const QUEUED_LABEL: Record<QueuedDispatchMode | "unknown", string> = {
+  "tool-end": "Queued for next step",
+  "turn-end": "Queued until turn end",
+  unknown: "Queued for delivery",
+};
+
 export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
   const workspaceContext = useOptionalWorkspaceContext();
   const workspace = findWorkspaceForTaskTarget(
@@ -1742,7 +1772,13 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   const invalidResult =
     (props.result != null || props.status === "completed") && result == null && toolError == null;
   // A finished tool call can still mean delivery was refused or queued, not sent.
-  const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  const baseDelivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  // The card shows only the send-time result and never learns when the queue entry dispatches,
+  // so a bare "Queued" read as never delivered (#4736). Name when it dispatches instead.
+  const delivery =
+    result?.status === "queued" && baseDelivery != null
+      ? { ...baseDelivery, label: QUEUED_LABEL[result.queueDispatchMode ?? "unknown"] }
+      : baseDelivery;
   const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
   const error = toolError?.error ?? (result && "error" in result ? result.error : undefined);
 
@@ -1894,8 +1930,12 @@ interface TaskRemoveToolCallProps {
 export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const results = props.result?.results ?? [];
-  const displayResults: Array<{ taskId: string; status?: string; error?: string }> =
-    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const displayResults: Array<{
+    taskId: string;
+    status?: string;
+    error?: string;
+    paths?: string[];
+  }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
     <ToolContainer expanded={expanded}>
@@ -1920,6 +1960,11 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
                 {result.error != null && (
                   <div className="text-danger mt-1 text-[11px]">{result.error}</div>
                 )}
+                {result.paths?.map((filePath) => (
+                  <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
+                    {filePath}
+                  </div>
+                ))}
               </div>
             ))}
           </div>

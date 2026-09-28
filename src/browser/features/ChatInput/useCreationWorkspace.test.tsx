@@ -1,5 +1,5 @@
-import type { APIClient } from "@/browser/contexts/API";
-import * as APIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -8,7 +8,11 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import type { ProjectConfig } from "@/common/types/project";
 import {
   GLOBAL_SCOPE_ID,
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
+  getAutoModelRoutingKey,
+  getAutoRoutingChoiceByAgentKey,
+  getAutoThinkingLevelKey,
   getInputKey,
   getInputAttachmentsKey,
   getModelKey,
@@ -61,16 +65,17 @@ const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
 });
 
 const updatePersistedStateCalls: Array<[string, unknown]> = [];
-const updatePersistedStateMock = mock((key: string, value: unknown) => {
+const updatePersistedStateMock = mock((key: string, value: unknown): boolean => {
   updatePersistedStateCalls.push([key, value]);
   if (typeof window === "undefined" || !window.localStorage) {
-    return;
+    return false;
   }
   if (value === undefined || value === null) {
     window.localStorage.removeItem(key);
-    return;
+    return true;
   }
   window.localStorage.setItem(key, JSON.stringify(value));
+  return true;
 });
 
 const readPersistedStringMock = mock((key: string) => {
@@ -136,7 +141,6 @@ const useDraftWorkspaceSettingsMock = mock(
   }
 );
 
-const actualAPIModule = { ...APIModule };
 const actualDraftWorkspaceSettingsModule = { ...DraftWorkspaceSettingsModule };
 const actualProjectContextModule = { ...ProjectContextModule };
 const actualRouterContextModule = { ...RouterContextModule };
@@ -173,19 +177,6 @@ async function installUseCreationWorkspaceModuleMocks() {
       pendingSectionId: null,
       pendingDraftId: routerState.pendingDraftId,
     }),
-  }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => {
-      if (!currentORPCClient) {
-        return { api: null, status: "connecting" as const, error: null };
-      }
-      return {
-        api: currentORPCClient as APIClient,
-        status: "connected" as const,
-        error: null,
-      };
-    },
   }));
   await mock.module("@/browser/contexts/ProjectContext", () => ({
     ...actualProjectContextModule,
@@ -228,7 +219,6 @@ async function restoreUseCreationWorkspaceModuleMocks() {
     () => actualDraftWorkspaceSettingsModule
   );
   await mock.module("@/browser/contexts/RouterContext", () => actualRouterContextModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/contexts/ProjectContext", () => actualProjectContextModule);
 }
 
@@ -1489,7 +1479,7 @@ describe("useCreationWorkspace", () => {
     // No user turn is queued, but the workspace still runs init, so the creation card is carried.
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: false,
       pendingUserMessage: undefined,
       pendingCreationInit: {
@@ -1709,6 +1699,62 @@ describe("useCreationWorkspace", () => {
     const [sendRequest] = sendCall;
     expect(sendRequest?.options?.agentId).toBe("ask");
   });
+
+  test.each([true, false])(
+    "records only creation routing picks that differ from the agent's Auto default (experiment %p)",
+    async (autoRoutingEnabled) => {
+      setupWindow({
+        listBranches: mock(
+          (): Promise<BranchListResult> =>
+            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+        ),
+        sendMessage: mock(
+          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+            Promise.resolve({ success: true as const, data: {} })
+        ),
+        create: mock(
+          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+        ),
+      });
+
+      const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
+      persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
+      persistedPreferences[getAgentIdKey(projectScopeId)] = "exec";
+      persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+      // Model Auto came from the default; thinking Auto was picked in the creation composer.
+      persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
+      persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
+      draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+
+      const getHook = renderUseCreationWorkspace({
+        projectPath: TEST_PROJECT_PATH,
+        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+        message: "launch workspace",
+        autoRoutingEnabled,
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      await act(async () => {
+        await getHook().handleSend("launch workspace");
+      });
+
+      expect(updatePersistedStateCalls).toContainEqual([
+        getAutoModelRoutingKey(TEST_WORKSPACE_ID),
+        true,
+      ]);
+      expect(updatePersistedStateCalls).toContainEqual([
+        getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
+        true,
+      ]);
+      const recordedChoices = updatePersistedStateCalls
+        .filter(([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID))
+        .map(([, updater]) => (updater as (prev: unknown) => unknown)({}));
+      expect(recordedChoices).toEqual(
+        autoRoutingEnabled ? [{ exec: { thinkingLevel: true } }] : []
+      );
+    }
+  );
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
     const listBranchesMock = mock(
@@ -2008,7 +2054,7 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: true,
       pendingUserMessage: {
         content: "test message",
@@ -2201,6 +2247,7 @@ interface HookOptions {
     }
   ) => void;
   dynamicWorkflowsEnabled?: boolean;
+  autoRoutingEnabled?: boolean;
   message?: string;
   draftId?: string | null;
 }
@@ -2218,7 +2265,16 @@ function renderUseCreationWorkspace(options: HookOptions) {
     return null;
   }
 
-  render(<Harness {...options} />);
+  // Inject the client through the real provider; mocking the API module leaks
+  // process-wide into later suites.
+  if (!currentORPCClient) {
+    throw new Error("Tests must call setupWindow() before rendering the hook");
+  }
+  render(
+    <APIProvider client={createTestApiClient(currentORPCClient)}>
+      <Harness {...options} />
+    </APIProvider>
+  );
 
   return () => {
     if (!resultRef.current) {

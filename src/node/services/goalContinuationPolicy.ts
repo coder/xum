@@ -184,12 +184,6 @@ export function evaluateGoalContinuationGoal(
     : { kind: "continue", mode: "continuation" };
 }
 
-export function evaluateGoalContinuation(
-  state: GoalContinuationPolicyState
-): GoalContinuationDecision {
-  return evaluateGoalContinuationBeforeGoal(state) ?? evaluateGoalContinuationGoal(state);
-}
-
 export function hasReachedGoalBudgetLimit(goal: GoalRecordV1): boolean {
   const { budgetCents } = goal;
   if (budgetCents == null || !hasGoalBudgetLimit(budgetCents)) {

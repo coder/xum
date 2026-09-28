@@ -39,6 +39,22 @@ interface CreationHarness {
   dispose(): Promise<void>;
 }
 
+// The Send button enables before the project's branches load. Sending then fails the
+// backend's "Trunk branch is required" check, and no workspace is created. That happened on
+// a cold CI jest worker, so wait until a source branch is selected.
+async function waitForSourceBranch(view: RenderedApp): Promise<void> {
+  await waitFor(
+    () => {
+      const trigger = view.container.querySelector('[aria-label="Select source branch"]');
+      const selected = trigger?.textContent?.trim();
+      if (!selected || selected === "Select source branch") {
+        throw new Error("Source branch not selected yet");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
 async function createCreationHarness(options?: {
   beforeRender?: (env: TestEnvironment) => void;
 }): Promise<CreationHarness> {
@@ -54,6 +70,7 @@ async function createCreationHarness(options?: {
     const view = renderApp({ apiClient: env.orpc });
     const projectPath = await addProjectViaUI(view, repoPath);
     await openProjectCreationView(view, projectPath);
+    await waitForSourceBranch(view);
     const draftId = await waitForLatestDraftId(projectPath);
     const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId));
 
@@ -114,7 +131,6 @@ function overrideWorkspaceCreate(env: TestEnvironment, override: WorkspaceCreate
   };
 }
 
-// eslint-disable-next-line local/no-unsafe-child-process
 const execAsync = promisify(exec);
 
 function gate(): { release: () => void; wait: Promise<void> } {
@@ -157,9 +173,7 @@ describe("New chat streaming flash regression", () => {
     let restoreSendMessage: () => void = () => {};
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        const originalSendMessage = env.orpc.workspace.sendMessage.bind(env.orpc.workspace);
         restoreSendMessage = overrideWorkspaceSendMessage(env, (async (input) => {
           await sendGate;
           return originalSendMessage(input);
@@ -247,21 +261,17 @@ describe("New chat streaming flash regression", () => {
     const typed = "Show my first message before the workspace exists";
     const createGate = gate();
     const sendGate = gate();
-    const restores: Array<() => void> = [];
+    const restores: (() => void)[] = [];
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalCreate = env.orpc.workspace.create.bind(
-          env.orpc.workspace
-        ) as WorkspaceCreateFn;
+        const originalCreate = env.orpc.workspace.create.bind(env.orpc.workspace);
         restores.push(
           overrideWorkspaceCreate(env, (async (input) => {
             await createGate.wait;
             return originalCreate(input);
           }) as WorkspaceCreateFn)
         );
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        const originalSendMessage = env.orpc.workspace.sendMessage.bind(env.orpc.workspace);
         restores.push(
           overrideWorkspaceSendMessage(env, (async (input) => {
             await sendGate.wait;

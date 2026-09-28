@@ -1,20 +1,14 @@
 import { describe, expect, mock, test } from "bun:test";
 
+import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
-  MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
   PEER_MESSAGE_RATE_WINDOW_MS,
   PEER_MESSAGE_TARGET_RATE_LIMIT_MAX,
 } from "@/constants/agentMessaging";
-import {
-  TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
-  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS,
-  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
-} from "@/constants/taskMessages";
+import { TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS } from "@/constants/taskMessages";
 import { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 
 function createHarness(initialNow = 1_000) {
@@ -93,75 +87,6 @@ describe("AgentPeerMessageBroker", () => {
     expect(harness.countQueuedAgentPeerMessages).not.toHaveBeenCalled();
   });
 
-  test("caps consecutive wakes until attention resets the target", () => {
-    const { broker } = createHarness();
-    for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
-      broker.chargeConsecutivePeerWake("target");
-    }
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toEqual({
-      code: "refused",
-      reason: "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-    });
-    broker.resetConsecutivePeerWakes("target");
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toBeNull();
-  });
-
-  test.each([
-    {
-      name: "pair message count",
-      fill: (broker: AgentPeerMessageBroker) => {
-        for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-          expect(broker.reserveBudget("sender", "target", 1)).not.toBeNull();
-        }
-        return broker.reserveBudget("sender", "target", 1);
-      },
-    },
-    {
-      name: "pair character count",
-      fill: (broker: AgentPeerMessageBroker) => {
-        expect(
-          broker.reserveBudget("sender", "target", TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS)
-        ).not.toBeNull();
-        return broker.reserveBudget("sender", "target", 1);
-      },
-    },
-    {
-      name: "target message count",
-      fill: (broker: AgentPeerMessageBroker) => {
-        for (let i = 0; i < TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES; i++) {
-          expect(broker.reserveBudget(`sender-${i}`, "target", 1)).not.toBeNull();
-        }
-        return broker.reserveBudget("another-sender", "target", 1);
-      },
-    },
-    {
-      name: "target character count",
-      fill: (broker: AgentPeerMessageBroker) => {
-        const senderCount =
-          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS;
-        for (let i = 0; i < senderCount; i++) {
-          expect(
-            broker.reserveBudget(`sender-${i}`, "target", TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS)
-          ).not.toBeNull();
-        }
-        return broker.reserveBudget("another-sender", "target", 1);
-      },
-    },
-  ])("enforces the $name budget", ({ fill }) => {
-    expect(fill(createHarness().broker)).toBeNull();
-  });
-
-  test("refunds reservations idempotently", () => {
-    const { broker } = createHarness();
-    const refund = broker.reserveBudget("sender", "target", TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS);
-    expect(refund).not.toBeNull();
-    refund?.();
-    refund?.();
-    expect(
-      broker.reserveBudget("sender", "target", TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS)
-    ).not.toBeNull();
-  });
-
   test("caps titles and composes the peer envelope and trigger", () => {
     const { broker } = createHarness();
     const title = "T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 1);
@@ -200,8 +125,29 @@ describe("AgentPeerMessageBroker", () => {
     expect(sibling.triggerLabel).toBe("Family message notification from sibling task sender");
   });
 
-  test("charges a queued trigger separator", () => {
-    const { broker } = createHarness();
-    expect(broker.triggerCharge("trigger")).toBe("trigger".length + "\n".length);
-  });
+  test.each([
+    { relation: "target_ancestor", relationship: "descendant" },
+    { relation: "peer", relationship: "sibling" },
+    { relation: "target_unrelated", relationship: "unrelated" },
+  ] as const)(
+    "maps routing relation $relation to envelope relationship $relationship",
+    ({ relation, relationship }) => {
+      const { broker } = createHarness();
+      const prepared = broker.preparePeerMessage({
+        senderWorkspaceId: "ws-sender",
+        senderTitle: "Sender",
+        relation,
+        message: "hello",
+      });
+      expect(prepared.relationship).toBe(relationship);
+      // The envelope the recipient's model reads must agree with the metadata the UI reads;
+      // the provider neutralizer and the transcript card both fall back on a mismatch.
+      expect(parseAgentMessageEnvelope(prepared.envelope)).toEqual({
+        from: "ws-sender",
+        fromTitle: "Sender",
+        relationship,
+        message: "hello",
+      });
+    }
+  );
 });

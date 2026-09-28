@@ -55,7 +55,6 @@ class MuxAgent(BaseInstalledAgent):
         "tsconfig.main.json",
         "src",
         "dist",
-        "scripts/postinstall.sh",
         # bun install applies package.json patchedDependencies; without the patch
         # files the in-sandbox install fails outright.
         "patches",

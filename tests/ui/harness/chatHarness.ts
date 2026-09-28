@@ -16,8 +16,10 @@ export class ChatHarness {
         // There can be multiple ChatInput instances mounted (e.g., ProjectPage + Workspace view).
         // Use the last textarea in DOM order to target the active view.
         const textareas = Array.from(
-          this.container.querySelectorAll('textarea[aria-label="Message Claude"]')
-        ) as HTMLTextAreaElement[];
+          this.container.querySelectorAll<HTMLTextAreaElement>(
+            'textarea[aria-label="Message Claude"]'
+          )
+        );
 
         if (textareas.length === 0) {
           throw new Error("Chat textarea not found");
@@ -62,9 +64,9 @@ export class ChatHarness {
 
     const sendButton = await waitFor(
       () => {
-        const el = chatInputSection.querySelector(
+        const el = chatInputSection.querySelector<HTMLButtonElement>(
           'button[aria-label="Send message"]'
-        ) as HTMLButtonElement | null;
+        );
         if (!el) {
           throw new Error("Send button not found");
         }
@@ -79,10 +81,7 @@ export class ChatHarness {
     fireEvent.click(sendButton);
   }
 
-  async expectTranscriptContains(
-    needle: string | RegExp,
-    timeoutMs: number = 30_000
-  ): Promise<void> {
+  async expectTranscriptContains(needle: string | RegExp, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const text = this.container.textContent ?? "";
@@ -102,7 +101,7 @@ export class ChatHarness {
    * phase (canInterrupt) before resolving — ensuring all lifecycle callbacks
    * (recency update, onResponseComplete) have completed.
    */
-  async expectStreamComplete(timeoutMs: number = 30_000): Promise<void> {
+  async expectStreamComplete(timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const state = workspaceStore.getWorkspaceSidebarState(this.workspaceId);
@@ -124,7 +123,7 @@ export class ChatHarness {
     );
   }
 
-  async expectTranscriptNotContains(needle: string, timeoutMs: number = 30_000): Promise<void> {
+  async expectTranscriptNotContains(needle: string, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const text = this.container.textContent ?? "";
@@ -167,7 +166,7 @@ export class ChatHarness {
   /**
    * Assert the chat input contains the expected text.
    */
-  async expectInputValue(expected: string, timeoutMs: number = 5_000): Promise<void> {
+  async expectInputValue(expected: string, timeoutMs = 5_000): Promise<void> {
     await waitFor(
       async () => {
         const value = await this.getInputValue();

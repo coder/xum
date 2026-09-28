@@ -1,7 +1,7 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { FilePart, HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -26,6 +26,8 @@ interface PrepareMessagePayloadInput {
   reviews?: ReviewNoteDataForDisplay[];
   reviewIds: string[];
   editMessageId?: string;
+  /** Required with editMessageId: the RPC refuses an unfenced UI edit. */
+  historyEditPrecondition?: HistoryEditPrecondition;
   baseMetadata?: MuxMessageMetadata;
   agentSkillRefs: AgentSkillReference[];
   mcpPromptRefs: MCPPromptReference[];
@@ -121,7 +123,12 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       ...(input.modelOneShot?.modelString ? { model: input.modelOneShot.modelString } : {}),
       ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
+      // A one-shot command is the user's explicit choice for this turn, per dimension: a
+      // model one-shot pins the model and a thinking override pins the level, so a
+      // thinking-only command (`/+2 hello`) leaves model Auto routing the turn.
       ...(input.modelOneShot ? { skipAiSettingsPersistence: true } : {}),
+      ...(input.modelOneShot?.modelString ? { autoModelRouting: false } : {}),
+      ...(thinkingOverride ? { autoThinkingLevel: false } : {}),
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),
@@ -135,8 +142,14 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       additionalSystemInstructions,
       editMessageId: input.editMessageId,
+      ...(input.editMessageId && input.historyEditPrecondition
+        ? { historyEditPrecondition: input.historyEditPrecondition }
+        : {}),
       fileParts: sendFileParts,
       muxMetadata: metadata,
+      // Reviews were formatted into `message`; keep the authored text (with any staged-file
+      // notice) for queue restores and held-input previews of this send.
+      ...(input.reviews?.length ? { authoredText: userMessageText } : {}),
     },
   };
 }

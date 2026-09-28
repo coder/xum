@@ -8,6 +8,7 @@ import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   discoverAgentDefinitions,
@@ -20,6 +21,7 @@ import {
   resolveAgentFrontmatter,
 } from "./agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
+import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
 
 async function writeAgent(root: string, id: string, name: string): Promise<void> {
   await fs.mkdir(root, { recursive: true });
@@ -1028,4 +1030,107 @@ base: a
       expect(pkg.frontmatter.name).toBe("Helper (plugin)");
     });
   });
+});
+
+// #4438: on SSH runtimes a transport failure says nothing about an agent file.
+// It must never let a lower scope, a truncated base chain or a skipped root win.
+describe("transport failures", () => {
+  const networkError = () => new RuntimeError("ssh: Connection refused", "network");
+  const agent = (body: string, base?: string) =>
+    `---\nname: ${body}\n${base ? `base: ${base}\n` : ""}---\n${body}`;
+
+  async function scopedAgents(tempDir: string) {
+    const projectRoot = path.join(tempDir, "project-agents");
+    const globalRoot = path.join(tempDir, "global-agents");
+    await fs.mkdir(projectRoot);
+    await fs.mkdir(globalRoot);
+    await fs.writeFile(path.join(globalRoot, "reviewer.md"), agent("Global"));
+    return { projectRoot, globalRoot, roots: { projectRoots: [projectRoot], globalRoot } };
+  }
+
+  test("a project agent that fails in transport does not fall back to global", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-scope");
+    const { projectRoot, roots } = await scopedAgents(tempDir.path);
+    await fs.writeFile(path.join(projectRoot, "reviewer.md"), agent("Project"));
+    const runtime = new LocalRuntime(tempDir.path);
+    const stat = runtime.stat.bind(runtime);
+    spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+      filePath.startsWith(projectRoot) ? Promise.reject(networkError()) : stat(filePath, signal)
+    );
+
+    const read = readAgentDefinition(runtime, tempDir.path, "reviewer", { roots });
+    expect(await read.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+    // A skipped root in discovery is the same fallback.
+    spyOn(runtime, "resolvePath").mockRejectedValue(networkError());
+    const discovered = discoverAgentDefinitions(runtime, tempDir.path, { roots });
+    expect(await discovered.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+  });
+
+  test("a missing project agent still falls back to global", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-control");
+    const { roots } = await scopedAgents(tempDir.path);
+    const runtime = new LocalRuntime(tempDir.path);
+
+    const resolved = await readAgentDefinition(runtime, tempDir.path, "reviewer", { roots });
+    expect(resolved.scope).toBe("global");
+  });
+
+  test("a base agent that fails in transport does not truncate the chain", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-base");
+    const agentsDir = path.join(tempDir.path, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    await fs.writeFile(path.join(agentsDir, "child.md"), agent("Child", "parent"));
+    await fs.writeFile(path.join(agentsDir, "parent.md"), agent("Parent"));
+    const runtime = new LocalRuntime(tempDir.path);
+    const child = await readAgentDefinition(runtime, tempDir.path, "child");
+    const stat = runtime.stat.bind(runtime);
+    spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+      filePath.endsWith("parent.md") ? Promise.reject(networkError()) : stat(filePath, signal)
+    );
+
+    const chain = resolveAgentInheritanceChain({
+      runtime,
+      workspacePath: tempDir.path,
+      agentId: "child",
+      agentDefinition: child,
+      workspaceId: "ws",
+    });
+    expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+  });
+});
+
+// #4827: a permission error is not a missing agent file either.
+test("an unreadable project agent or base neither falls back nor truncates the chain", async () => {
+  using tempDir = new DisposableTempDir("agent-unreadable");
+  const agentsDir = path.join(tempDir.path, ".xum", "agents");
+  await fs.mkdir(agentsDir, { recursive: true });
+  const agent = (name: string, base?: string) =>
+    `---\nname: ${name}\n${base ? `base: ${base}\n` : ""}---\n${name}`;
+  await fs.writeFile(path.join(agentsDir, "child.md"), agent("Child", "exec"));
+  await fs.writeFile(path.join(agentsDir, "exec.md"), agent("Project exec"));
+  const runtime = new LocalRuntime(tempDir.path);
+  const child = await readAgentDefinition(runtime, tempDir.path, "child");
+  const stat = runtime.stat.bind(runtime);
+  spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+    filePath.endsWith("exec.md")
+      ? Promise.reject(
+          new RuntimeError(
+            `Failed to stat ${filePath}: stat: ${filePath}: Permission denied`,
+            "file_io"
+          )
+        )
+      : stat(filePath, signal)
+  );
+
+  // Before #4827 this silently resolved the built-in exec.
+  const read = readAgentDefinition(runtime, tempDir.path, "exec");
+  expect(await read.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+  const chain = resolveAgentInheritanceChain({
+    runtime,
+    workspacePath: tempDir.path,
+    agentId: "child",
+    agentDefinition: child,
+    workspaceId: "ws",
+  });
+  expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
 });

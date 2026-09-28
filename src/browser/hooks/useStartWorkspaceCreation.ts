@@ -3,6 +3,7 @@ import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
+  getAutoModelRoutingKey,
   getInputKey,
   getModelKey,
   getPendingScopeId,
@@ -33,7 +34,11 @@ export function persistWorkspaceCreationPrefill(
   }
 
   if (detail.model !== undefined) {
-    persist(getModelKey(getProjectScopeId(projectPath)), detail.model);
+    const projectScopeId = getProjectScopeId(projectPath);
+    persist(getModelKey(projectScopeId), detail.model);
+    // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin);
+    // otherwise the creation send would treat it as the routing fallback.
+    persist(getAutoModelRoutingKey(projectScopeId), false);
   }
 
   if (detail.trunkBranch !== undefined) {

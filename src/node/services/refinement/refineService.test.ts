@@ -1,3 +1,8 @@
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, it, spyOn } from "bun:test";
 
 import * as fsPromises from "node:fs/promises";
@@ -15,7 +20,7 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { REFINE_SUMMARY_LABEL } from "@/constants/refine";
+import { REFINE_MAX_MESSAGES, REFINE_SUMMARY_LABEL } from "@/constants/refine";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
@@ -26,6 +31,7 @@ import { loadStagedRefineSet, saveStagedRefineSet } from "./refineStaging";
 import { listRefinements, rollbackRefinement } from "./refinementRollback";
 import { RefineService } from "./refineService";
 import { TestTempDir } from "../tools/testHelpers";
+import { createWorkspaceServiceHarness } from "../workspaceService.testHarness";
 
 /**
  * Behavior under test: the /refine orchestration rails — RLM gating (backend
@@ -354,6 +360,55 @@ describe("RefineService", () => {
     expect(refused.success).toBe(false);
     if (!refused.success) expect(refused.error).toContain("rlm-mode experiment is disabled");
     expect(enabledFixture.modelCalls).toHaveLength(0);
+  });
+
+  it("hidden review rows do not displace the visible refinement trajectory", async () => {
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["visible older trajectory"]);
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          WORKSPACE_ID,
+          createMuxMessage("feedback", "user", formatPlanReviewEnvelope(feedback), {
+            muxMetadata: buildPlanReviewMetadata(feedback),
+          })
+        )
+      ).success
+    ).toBe(true);
+    for (let i = 0; i <= REFINE_MAX_MESSAGES; i++) {
+      expect(
+        (
+          await fixture.historyService.appendToHistory(
+            WORKSPACE_ID,
+            createMuxMessage(`hidden-${i}`, "user", "HIDDEN_REVIEW_SENTINEL", {
+              muxMetadata: { type: "plan-review", kind: "snapshot", recordId: `hidden-${i}` },
+            })
+          )
+        ).success
+      ).toBe(true);
+    }
+    const before = await fixture.readChat();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("visible older trajectory");
+    expect(prompts[0]).toContain("visible feedback");
+    expect(prompts[0]).not.toContain("HIDDEN_REVIEW_SENTINEL");
+    const originalIds = new Set(before.map((row) => row.id));
+    expect((await fixture.readChat()).filter((row) => originalIds.has(row.id))).toEqual(before);
   });
 
   it("neutralizes workspace_trajectory delimiters embedded in the transcript (r32)", async () => {
@@ -2205,6 +2260,110 @@ describe("RefineService", () => {
     });
     expect(rollback.success).toBe(true);
     expect(await pathExists(skillFile)).toBe(false);
+  });
+
+  // #4965: model-driven archive and task_remove hold workspace admission through their lossy-work
+  // checks and the destructive step. An apply writes approved skills into the checkout, so it must
+  // refuse under that hold, and an apply already writing must refuse the hold.
+  describe("archive/removal admission hold (#4965)", () => {
+    const skillMarkdown = [
+      "---",
+      "name: held-lesson",
+      "description: Run bun install before make test in this repo.",
+      "---",
+      "",
+      "Run `bun install` before `make test`.",
+      "",
+    ].join("\n");
+    const holdOptions = {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+      operation: "remove" as const,
+    };
+
+    async function createHeldFixture(onStagedEditAttempted?: (toolCallId: string) => void) {
+      const harness = await createWorkspaceServiceHarness();
+      await harness.config.addWorkspace("/tmp/refine-hold-project", {
+        id: WORKSPACE_ID,
+        name: WORKSPACE_ID,
+        projectName: "refine-hold-project",
+        projectPath: "/tmp/refine-hold-project",
+        runtimeConfig: { type: "local" },
+      });
+      const fixture = await createFixture({
+        withSkillTool: true,
+        modelFactory: () =>
+          toolCallModel(
+            [
+              {
+                toolCallId: "refine-skill-held",
+                toolName: "agent_skill_write",
+                input: { name: "held-lesson", content: skillMarkdown },
+              },
+            ],
+            "held-lesson: repo test setup procedure."
+          ),
+        // The production wiring (di/layers/desktop.ts).
+        acquireTurnExclusion: (workspaceId) =>
+          harness.service.acquireIdleTurnExclusion(workspaceId),
+        ...(onStagedEditAttempted ? { onStagedEditAttempted } : {}),
+      });
+      await fixture.seedTrajectory();
+      const staged = await fixture.service.run(WORKSPACE_ID);
+      expect(staged.success).toBe(true);
+      const skillFile = path.join(
+        fixture.workspacePath,
+        ".xum",
+        "skills",
+        "held-lesson",
+        "SKILL.md"
+      );
+      return { harness, fixture, skillFile };
+    }
+
+    it("refuses to apply while the hold is armed and writes nothing into the checkout", async () => {
+      const { harness, fixture, skillFile } = await createHeldFixture();
+      await using _harness = harness;
+      using _fixture = fixture;
+
+      const hold = harness.service.acquirePreInterruptionArchiveHold(WORKSPACE_ID, holdOptions);
+      expect(hold.success ? "" : hold.error).toBe("");
+      if (!hold.success) return;
+      const refused = await fixture.applyShown();
+      hold.data[Symbol.dispose]();
+
+      expect(refused.success ? "" : refused.error).toContain("being archived or removed");
+      expect(await pathExists(skillFile)).toBe(false);
+      expect(await loadStagedRefineSet(fixture.sessionDir)).not.toBeNull();
+
+      // Released: the retained staged set applies.
+      const applied = await fixture.applyShown();
+      expect(applied.success ? "" : applied.error).toBe("");
+      expect(await pathExists(skillFile)).toBe(true);
+    });
+
+    it("an apply that is writing refuses a hold armed mid-apply", async () => {
+      let holdDuringApply: Result<Disposable, string> | undefined;
+      const { harness, fixture } = await createHeldFixture(() => {
+        holdDuringApply = harness.service.acquirePreInterruptionArchiveHold(
+          WORKSPACE_ID,
+          holdOptions
+        );
+      });
+      await using _harness = harness;
+      using _fixture = fixture;
+
+      const applied = await fixture.applyShown();
+
+      expect(applied.success ? "" : applied.error).toBe("");
+      expect(holdDuringApply?.success ? "" : holdDuringApply?.error).toContain(
+        "a refine apply or publication in progress"
+      );
+      // Released with the apply: a later hold is admitted.
+      const after = harness.service.acquirePreInterruptionArchiveHold(WORKSPACE_ID, holdOptions);
+      expect(after.success).toBe(true);
+      if (after.success) after.data[Symbol.dispose]();
+    });
   });
 
   it("refuses to apply a staged skill write whose target changed after staging (r49)", async () => {

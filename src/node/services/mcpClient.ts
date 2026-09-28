@@ -102,6 +102,8 @@ export interface MCPClientHandle {
    * the legacy initialize fallback).
    */
   negotiatedProtocolVersion(): string | undefined;
+  /** Self-reported display metadata; never an authorization identity. */
+  serverInfo(): unknown;
   /**
    * Persistable era verdict for this connection, suitable for `prior` on a
    * later connect against the same server config.
@@ -304,6 +306,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
+    serverInfo: () => client.getServerVersion(),
     priorDiscovery: (): PriorDiscovery => {
       const discover = client.getDiscoverResult();
       return discover !== undefined ? { kind: "modern", discover } : { kind: "legacy" };

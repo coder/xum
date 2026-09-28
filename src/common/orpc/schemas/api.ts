@@ -7,6 +7,7 @@ import {
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -21,9 +22,19 @@ import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
   ProjectRemoveErrorSchema,
   SendMessageErrorSchema,
 } from "./errors";
+import { PlanReviewAnchorSchema } from "@/common/utils/planReview/planReviewRecord";
+import {
+  PLAN_REVIEW_MAX_BODY_CHARS,
+  PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_QUOTE_CHARS,
+  PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_SUMMARY_CHARS,
+} from "@/constants/planReview";
+import { PlanReviewStateSchema } from "@/common/utils/planReview/planReviewState";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
 import {
   GoalClearInputSchema,
@@ -63,6 +74,8 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  hasExactlyOneEditFence,
+  EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
   ToolPolicySchema,
   UpdateStatusSchema,
@@ -84,6 +97,14 @@ import {
 import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateUpdateOutputSchema,
+} from "./reviewState";
+import {
+  AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
   GitStatusSchema,
@@ -124,9 +145,11 @@ import {
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
   MCPSetToolAllowlistParamsSchema,
+  MCPIconRefSchema,
   MCPTestGlobalParamsSchema,
   MCPTestParamsSchema,
   MCPTestResultSchema,
+  PngDataUrlSchema,
   WorkspaceMCPOverridesSchema,
 } from "./mcp";
 import {
@@ -142,6 +165,7 @@ import {
 import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
+  EvaluationDefaultsSchema,
   ModelFallbacksSchema,
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
@@ -155,6 +179,7 @@ import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntr
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 
 // Experiments
 export const experiments = {
@@ -325,15 +350,16 @@ export const ProviderConfigInfoSchema = z.object({
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   /**
    * Coder-only: model IDs discovered from the deployment's AI Bridge
-   * catalogs. Authoritative for gateway routing when present; `models` is the
-   * user-visible union of these and manually added entries.
+   * catalogs. Authoritative for gateway routing when present; never merged
+   * into `models`, which holds only the entries the user added.
    */
   discoveredModels: z.array(z.string()).optional(),
   /**
-   * Coder-only: model IDs the user explicitly removed. Excluded from
+   * Coder-only: legacy routing tombstones — model IDs the user removed while
+   * discovery still merged the catalog into `models`. Excluded from
    * accessibility even while the discovered catalog is unknown, so the
    * frontend mirrors the backend's routing decisions (see
-   * gatewayModelCatalog.ts).
+   * gatewayModelCatalog.ts). Never written anymore; cleared on re-add.
    */
   removedModels: z.array(z.string()).optional(),
 });
@@ -388,7 +414,28 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
   }),
 ]);
 
+export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), modelIds: z.array(z.string()) }),
+  z.object({ status: z.literal("unsupported") }),
+  z.object({ status: z.literal("not-configured") }),
+  z.object({
+    status: z.literal("error"),
+    reason: z.enum([
+      "aborted",
+      "timeout",
+      "request-failed",
+      "invalid-response",
+      "limit-exceeded",
+      "stale-config",
+    ]),
+  }),
+]);
+
 export const providers = {
+  discoverModels: {
+    input: z.object({ provider: z.string() }),
+    output: ProviderModelDiscoveryResultSchema,
+  },
   addCustomProvider: {
     input: z.object({
       provider: z.string(),
@@ -1039,6 +1086,21 @@ export const mcp = {
     input: MCPTestGlobalParamsSchema,
     output: MCPTestResultSchema,
   },
+  /** Session-local lookup of a tool-call snapshot's `iconRef`; null when unknown or expired. */
+  icon: {
+    input: z.object({ iconRef: MCPIconRefSchema }),
+    output: PngDataUrlSchema.nullable(),
+  },
+  /**
+   * Bulk form of `icon` for a visible transcript: one answer per requested ref.
+   * Lookup only, bounded by the renderer cache size so one call covers a screen.
+   */
+  icons: {
+    input: z.object({
+      iconRefs: z.array(MCPIconRefSchema).max(MCP_ICON_LIMITS.registryMaxEntries),
+    }),
+    output: z.record(MCPIconRefSchema, PngDataUrlSchema.nullable()),
+  },
   setEnabled: {
     input: MCPSetEnabledGlobalParamsSchema,
     output: ResultSchema(z.void(), z.string()),
@@ -1633,6 +1695,9 @@ export const workspace = {
       message: z.string(),
       options: SendMessageOptionsSchema.extend({
         fileParts: z.array(FilePartSchema).optional(),
+      }).refine(hasExactlyOneEditFence, {
+        message: EDIT_FENCE_REQUIRED_MESSAGE,
+        path: ["historyEditPrecondition"],
       }),
     }),
     output: ResultSchema(z.object({}), SendMessageErrorSchema),
@@ -1684,14 +1749,21 @@ export const workspace = {
       z.string()
     ),
   },
-  getStartupAutoRetryModel: {
-    input: z.object({ workspaceId: z.string() }),
-    output: ResultSchema(z.string().nullable(), z.string()),
-  },
-  setAutoCompactionThreshold: {
+  // Recipient opt-in for cross-tree discovery/messaging. The caller only says on/off; the
+  // backend mints and owns the generation (see WorkspaceMetadata.unrelatedWorkspaceConsent).
+  setUnrelatedWorkspaceConsent: {
     input: z.object({
       workspaceId: z.string(),
-      threshold: z.number().finite().min(0.1).max(1.0),
+      enabled: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // Recipient-side delivery preference for agent messages that arrive while this workspace is
+  // busy (see WorkspaceMetadata.agentMessageDispatchMode).
+  setAgentMessageDispatchMode: {
+    input: z.object({
+      workspaceId: z.string(),
+      mode: AgentMessageDispatchModeSchema,
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -1718,6 +1790,19 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Re-send a held input (see HeldInputsChangedEventSchema) as a new manual send. It stays held
+   * unless the send is accepted; the error explains why it was not.
+   */
+  sendHeldInput: {
+    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    output: ResultSchema(z.void(), SendMessageErrorSchema),
+  },
+  /** Drop a held input without sending it. */
+  discardHeldInput: {
+    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   setQueuedMessageDispatchMode: {
     input: z.object({
       workspaceId: z.string(),
@@ -1735,6 +1820,86 @@ export const workspace = {
   resetContext: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.enum(["reset", "noop"]), z.string()),
+  },
+  /**
+   * Native plan review (history-backed). Every mutation returns the fresh projection; the UI
+   * never composes `<mux_plan_review>` envelopes itself.
+   */
+  planReview: {
+    getState: {
+      input: z.object({ workspaceId: z.string() }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    ensureSnapshot: {
+      input: z.object({
+        workspaceId: z.string(),
+        /** Bind the snapshot to a `propose_plan` call when snapshotting on behalf of its card. */
+        proposalToolCallId: z.string().min(1).nullish(),
+      }),
+      output: ResultSchema(
+        z.object({
+          snapshotId: z.string(),
+          contentHash: z.string(),
+          created: z.boolean(),
+          state: PlanReviewStateSchema,
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
+    setThreadResolved: {
+      input: z.object({
+        workspaceId: z.string(),
+        threadId: z.string().min(1),
+        resolved: z.boolean(),
+      }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    submitFeedback: {
+      input: z.object({
+        workspaceId: z.string(),
+        snapshotId: z.string().min(1),
+        // Bounded at the boundary: unresolved feedback is re-rendered into every plan turn's
+        // system prompt and persisted as one history row, so sizes are product limits, not
+        // storage details (see src/constants/planReview.ts).
+        summary: z.string().max(PLAN_REVIEW_MAX_SUMMARY_CHARS).nullish(),
+        comments: z
+          .array(
+            z.object({
+              anchor: PlanReviewAnchorSchema,
+              quote: z.string().max(PLAN_REVIEW_MAX_QUOTE_CHARS),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK),
+        replies: z
+          .array(
+            z.object({
+              threadId: z.string().min(1),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK),
+        /**
+         * Agent/model/thinking for the resulting user turn, as the plan card's Implement sends
+         * them. Edit semantics are excluded: an edit truncates history before the row persists,
+         * which could delete the very snapshot/thread the feedback references.
+         */
+        options: SendMessageOptionsSchema.omit({
+          editMessageId: true,
+          historyEditPrecondition: true,
+          unfencedEdit: true,
+        }),
+      }),
+      output: ResultSchema(
+        z.object({
+          feedbackId: z.string(),
+          // null when the feedback was sent but refreshing review state afterwards failed: the
+          // mutation is committed, so callers must not retry it; refresh via getState instead.
+          state: PlanReviewStateSchema.nullable(),
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
   },
   replaceChatHistory: {
     input: z.object({
@@ -1982,6 +2147,21 @@ export const workspace = {
       excluded: z.boolean(),
     }),
     output: ResultSchema(z.void(), z.string()),
+  },
+  // Per-workspace code-review state persisted in <sessionDir>/review-state.json.
+  reviewState: {
+    subscribe: {
+      input: z.object({ workspaceId: z.string() }),
+      output: eventIterator(ReviewStateEventSchema),
+    },
+    update: {
+      input: z.object({ workspaceId: z.string(), delta: ReviewStateDeltaSchema }),
+      output: ReviewStateUpdateOutputSchema,
+    },
+    importLegacy: {
+      input: z.object({ workspaceId: z.string(), sections: ReviewStateSectionsSchema }),
+      output: ReviewStateImportLegacyOutputSchema,
+    },
   },
   stats: {
     subscribe: {
@@ -2599,6 +2779,7 @@ export const config = {
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
       modelFallbacks: ModelFallbacksSchema.optional(),
+      autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
@@ -2617,9 +2798,11 @@ export const config = {
       muxGovernorEnrolled: z.boolean(),
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
+      keepScreenAwake: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
+      evaluationDefaults: EvaluationDefaultsSchema.optional(),
     }),
   },
   saveConfig: {
@@ -2683,6 +2866,52 @@ export const config = {
     }),
     output: z.void(),
   },
+  updateAutoModelRouting: {
+    input: z.object({
+      // Full replacement. This schema enforces tier shape and count; the backend only
+      // dedupes ids before persisting.
+      autoModelRouting: AutoModelRoutingConfigSchema,
+    }),
+    output: z.void(),
+  },
+  getAutoModelRoutingEvaluationStatus: {
+    // Omit to check the saved evaluation model; pass one to check an unsaved edit.
+    input: z.object({ evaluationModel: z.string().optional() }).optional(),
+    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    output: z.object({
+      evaluationModel: z.string(),
+      available: z.boolean(),
+      reason: z.string().optional(),
+    }),
+  },
+  previewAutoModelRouting: {
+    input: z.object({
+      prompt: z.string().min(1),
+      /**
+       * The preview is a paid evaluator request outside any turn. Usage ledgers are
+       * per-workspace, so the panel names the workspace it bills (the one last selected) and
+       * the backend refuses to spend without one it knows.
+       */
+      workspaceId: z.string().min(1),
+      /**
+       * The tiers and evaluator the panel shows. The panel saves edits optimistically, so a
+       * preview must classify against what the user sees, not the last persisted config.
+       */
+      config: AutoModelRoutingConfigSchema.optional(),
+    }),
+    output: ResultSchema(
+      z.object({
+        tierId: z.string(),
+        tierLabel: z.string(),
+        confidence: z.number().optional(),
+        probabilities: z.record(z.string(), z.number()).optional(),
+        evaluationModel: z.string(),
+        model: z.string().optional(),
+        thinkingLevel: ThinkingLevelSchema.optional(),
+      }),
+      z.string()
+    ),
+  },
   updateCoderPrefs: {
     input: z
       .object({
@@ -2705,6 +2934,7 @@ export const config = {
   },
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
+  updateKeepScreenAwake: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({
@@ -2730,6 +2960,15 @@ export const config = {
     input: z
       .object({
         goalDefaults: GoalDefaultsConfigSchema,
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateEvaluationDefaults: {
+    input: z
+      .object({
+        // Blank or null clears the default.
+        model: z.string().nullish(),
       })
       .strict(),
     output: z.void(),
@@ -3087,17 +3326,6 @@ export const general = {
     input: z.string(),
     output: z.string(),
   },
-  /**
-   * Test endpoint: emits numbered ticks at an interval.
-   * Useful for verifying streaming works over HTTP and WebSocket.
-   */
-  tick: {
-    input: z.object({
-      count: z.number().int().min(1).max(100),
-      intervalMs: z.number().int().min(10).max(5000),
-    }),
-    output: eventIterator(z.object({ tick: z.number(), timestamp: z.number() })),
-  },
   restartApp: {
     input: z.void(),
     output: RestartAppResultSchema,
@@ -3211,21 +3439,6 @@ export const voice = {
   transcribe: {
     input: z.object({ audioBase64: z.string() }),
     output: ResultSchema(z.string(), z.string()),
-  },
-};
-
-// Debug endpoints (test-only, not for production use)
-export const debug = {
-  /**
-   * Trigger an artificial stream error for testing recovery.
-   * Used by integration tests to simulate network errors mid-stream.
-   */
-  triggerStreamError: {
-    input: z.object({
-      workspaceId: z.string(),
-      errorMessage: z.string().optional(),
-    }),
-    output: z.boolean(), // true if error was triggered on an active stream
   },
 };
 

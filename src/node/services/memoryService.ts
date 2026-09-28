@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
 import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
@@ -807,6 +807,11 @@ class LocalMemoryStore implements MemoryStore {
 // ---------------------------------------------------------------------------
 
 const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+
+/** Memory body without its leading YAML frontmatter (the index already carries the description). */
+export function stripMemoryFrontmatter(content: string): string {
+  return content.replace(FRONTMATTER_PATTERN, "");
+}
 
 /**
  * Extract a sanitized single-line description from optional YAML frontmatter.
@@ -2428,7 +2433,7 @@ export class MemoryService extends EventEmitter {
    * Strict manifest read that self-heals a MALFORMED file: its bytes are the
    * file's state, and refusing forever would block every access-time pass
    * and non-forced removal of the child. The file is quarantined beside
-   * itself (`<name>.malformed-<ts>`) and the pass continues from an empty
+   * itself (`<name>.malformed-<ts>-<uuid>`) and the pass continues from an empty
    * record map — safe because adoption is idempotent: identical files are
    * skipped and differing ones land under imported/<child>/. Only the
    * provenance of copies this adoption created is lost (they read as the
@@ -2454,7 +2459,8 @@ export class MemoryService extends EventEmitter {
     childId: string,
     error: LegacyAdoptionManifestMalformedError
   ): Promise<void> {
-    const quarantined = `${manifestPath}.malformed-${Date.now()}`;
+    // Multiple quarantines can share a clock tick; never replace earlier recovery bytes.
+    const quarantined = `${manifestPath}.malformed-${Date.now()}-${randomUUID()}`;
     try {
       await fsPromises.rename(manifestPath, quarantined);
     } catch (renameError) {

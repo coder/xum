@@ -71,10 +71,16 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
-ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
+# Each encoding ships as its own bundle next to the worker, and the worker bundle requires it
+# lazily. Inlining all four made every per-encoding worker parse ~14 MB (~11.7 s CPU) before it
+# loaded its one encoding (#4816). Keep this list in sync with ENCODING_LOADERS in tokenizer.worker.ts.
+TOKENIZER_ENCODINGS := claude o200k_base cl100k_base p50k_base
+TOKENIZER_ENCODING_BUNDLES := $(foreach e,$(TOKENIZER_ENCODINGS),dist/runtime/tokenizer-encoding-$(e).js)
+ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify $(foreach e,$(TOKENIZER_ENCODINGS),--alias:ai-tokenizer/encoding/$(e)=./tokenizer-encoding-$(e).js) --external:./tokenizer-encoding-*
+ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
 
 # Include formatting rules
 include fmt.mk
@@ -82,14 +88,14 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
+.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build test-storybook
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal
-.PHONY: ensure-deps rebuild-native mux
-.PHONY: check-eager-imports check-bundle-size check-startup
+.PHONY: ensure-deps mux
+.PHONY: check-startup-imports check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -134,13 +140,6 @@ node_modules/.installed: package.json bun.lock
 
 # Legacy target for backwards compatibility
 ensure-deps: node_modules/.installed
-
-# Rebuild native modules for Electron
-rebuild-native: node_modules/.installed ## Rebuild native modules (node-pty, DuckDB) for Electron
-	@echo "Rebuilding native modules for Electron..."
-	@npx @electron/rebuild -f -m node_modules/node-pty
-	@npx @electron/rebuild -f -m node_modules/@duckdb/node-bindings
-	@echo "Native modules rebuilt successfully"
 
 # Run compiled CLI with trailing arguments (builds only if missing)
 mux: ## Run the compiled mux CLI (e.g., make mux server --port 3000)
@@ -310,11 +309,16 @@ build-static: ## Copy static assets to dist
 		cp "$$f" "dist/typescript-lib/$$(basename $$f).txt"; \
 	done
 
-build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/static/.copied ## Build Docker runtime artifacts
+build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
+	@for e in $(TOKENIZER_ENCODINGS); do \
+		test -f dist/runtime/tokenizer-encoding-$$e.js && \
+		grep -qF "./tokenizer-encoding-$$e.js" dist/runtime/tokenizer.worker.js || exit 1; \
+	done
+	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -328,11 +332,27 @@ dist/runtime/server-bundle.js: build-main $(TS_SOURCES)
 
 # Bundle tokenizer worker next to server-bundle.js so workerPool resolves it at runtime.
 # Depend on build-main explicitly because tokenizer worker JS is emitted under dist/node/ as a side effect.
-dist/runtime/tokenizer.worker.js: build-main
+dist/runtime/tokenizer.worker.js: build-main $(TOKENIZER_ENCODING_BUNDLES)
 	@echo "Bundling tokenizer worker for Docker..."
 	@test -f dist/node/utils/main/tokenizer.worker.js
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
+
+dist/runtime/tokenizer-encoding-%.js: node_modules/.installed
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) ai-tokenizer/encoding/$* --bundle --platform=node --target=node22 --format=cjs --outfile=$@ --minify
+
+# The disposable icon decoder must remain a separate process in bundled runtimes.
+dist/runtime/mcpIconDecode.js: build-main
+	@echo "Bundling MCP icon decoder for Docker..."
+	@test -f dist/node/workers/mcpIconDecode.js
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
+
+.PHONY: test-mcp-icon-electron
+test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
@@ -368,9 +388,27 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-eager-imports check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
 
-static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
+static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
+
+# Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
+# adapter against the same Harbor API the scheduled benchmark runs.
+TB_HARBOR_VERSION := 0.6.4
+
+# pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
+test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter with offline fixtures
+	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
+	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
+	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
+
+check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
+	@./scripts/check-test-routing.sh
+
+# <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
+check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
+	@bun test ./scripts/check-test-seam-comments.test.ts
+	@bun scripts/check-test-seam-comments.ts
 
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
@@ -410,17 +448,24 @@ pin-actions: ## Pin GitHub Actions to SHA hashes (requires GH_TOKEN or gh CLI)
 	./scripts/pin-actions.sh .github/workflows/*.yml .github/actions/*/action.yml
 
 ifeq ($(OS),Windows_NT)
-typecheck: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
 	@# On Windows, use npm run because bun x doesn't correctly pass arguments
 	@npm x concurrently -g \
 		"$(TSGO) --noEmit" \
-		"$(TSGO) --noEmit -p tsconfig.main.json"
+		"$(TSGO) --noEmit -p tsconfig.main.json" \
+		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 else
-typecheck: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@bun x concurrently -g \
 		"$(TSGO) --noEmit" \
-		"$(TSGO) --noEmit -p tsconfig.main.json"
+		"$(TSGO) --noEmit -p tsconfig.main.json" \
+		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 endif
+
+# tsconfig.tooling.json type-checks vscode/src (which needs the extension's own devDependencies,
+# e.g. @types/vscode) and scripts/**/*.test.ts alongside the app sources.
+vscode/node_modules/.installed: vscode/package.json vscode/bun.lock
+	@$(MAKE) -C vscode node_modules/.installed
 
 PERF_REPETITIONS ?= 3
 .PHONY: perf-workspace-scale
@@ -446,12 +491,15 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
-.PHONY: test-codex-comments test-pr-checks
+.PHONY: test-codex-comments test-pr-checks test-required-superseded
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
 
 test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
 	@python3 scripts/pr_checks_test.py
+
+test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
+	@python3 scripts/required_superseded_test.py
 
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src
@@ -459,7 +507,11 @@ test-integration: node_modules/.installed build-main ## Run all tests (unit + in
 
 test-unit: node_modules/.installed build-main ## Run unit tests
 	@bun test src
-	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts
+	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/
+
+# CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.
+test-unit-ci: node_modules/.installed build-main ## Run the CI unit suite with coverage (sharded via SHARD_INDEX/SHARD_TOTAL)
+	@./scripts/test-unit-ci.sh
 
 test: test-unit ## Alias for test-unit
 
@@ -530,15 +582,19 @@ dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
 	@bun x electron-builder --mac --x64 --arm64 --publish always
 	@echo "✅ Both architectures built and published successfully"
 
+# MAC_TARGETS narrows electron-builder's mac targets (e.g. MAC_TARGETS=dmg); empty keeps
+# package.json's full list. PR CI builds only the DMG it uploads; the auto-update zip
+# roughly doubles packaging time and is still built by merge-queue/main runs.
+MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -556,8 +612,9 @@ dist-linux: build ## Build Linux distributable
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
 
+# MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
-	@bun scripts/checkMacAttachFileRuntime.ts
+	@bun scripts/checkMacAttachFileRuntime.ts $(if $(MAC_ARCH),--arch $(MAC_ARCH))
 
 check-appimage-icons: ## Validate AppImage icon structure (requires prior dist-linux build)
 	@./scripts/check-appimage-icons.sh
@@ -598,6 +655,13 @@ storybook-build: node_modules/.installed src/version.ts ## Build static Storyboo
 	$(check_node_version)
 	@bun x storybook build
 
+storybook-flake-check: node_modules/.installed src/version.ts ## Replay Pixel captures to find nondeterministic stories (STORYBOOK_FLAKE_ARGS='--files a.stories.tsx --runs 5')
+	$(check_node_version)
+	@# Always rebuild: a stale storybook-static/ would vouch for code that is no longer there.
+	@bun x storybook build
+	@# Node, not Bun: relaunching Playwright under Bun intermittently hangs.
+	@node scripts/storybook-flake-check.mjs $(STORYBOOK_FLAKE_ARGS)
+
 capture-readme-screenshots: node_modules/.installed src/version.ts ## Capture README screenshots from running Storybook
 	@echo "Capturing README screenshots from Storybook (must be running on port 6006)..."
 	@bun run scripts/capture-readme-screenshots.ts
@@ -607,12 +671,17 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
 
+storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@# Node, not Bun: it drives Playwright like pixel-storybook (see storybook-flake-check).
+	@node scripts/check-storybook-snapshot-budget.mjs --url $(or $(STORYBOOK_URL),http://127.0.0.1:6006)
+
 ## Benchmarks
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
 	@# Force the Daytona SDK to the cursor-pagination API while keeping Harbor stable.
 	@# Harbor removed --task-name, so keep smoke-test task filtering on the current dataset filter flag.
-	@HARBOR_PACKAGE=$${TB_HARBOR_PACKAGE:-harbor[daytona]==0.6.4}; \
+	@HARBOR_PACKAGE=$${TB_HARBOR_PACKAGE:-harbor[daytona]==$(TB_HARBOR_VERSION)}; \
 	HARBOR_DAYTONA_PACKAGE=$${TB_HARBOR_DAYTONA_PACKAGE:-daytona>=0.180.0,<2}; \
 	TB_DATASET=$${TB_DATASET:-terminal-bench@2.0}; \
 	TB_TIMEOUT=$${TB_TIMEOUT:-1800}; \
@@ -648,13 +717,15 @@ clean: ## Clean build artifacts
 	@echo "Done!"
 
 ## Startup Performance Checks
-check-eager-imports: ## Check for eager AI SDK imports in critical files
-	@./scripts/check_eager_imports.sh
+# Walks the static import graph of the startup entry points (no build needed).
+# The analyzer's fixture tests run first so a broken guard cannot pass vacuously.
+check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Check that heavy packages stay off the eager startup import path
+	@bun test ./scripts/check-startup-imports.test.ts
+	@bun scripts/check-startup-imports.ts
 
-check-bundle-size: build ## Check that bundle sizes are within limits
-	@./scripts/check_bundle_size.sh
-
-check-startup: check-eager-imports check-bundle-size ## Run all startup performance checks
+# ~3 s: compiles only the hot-path files listed in the script, so it runs in static-check.
+check-react-compiler: node_modules/.installed ## Fail when a hot renderer component stops compiling under React Compiler
+	@bun scripts/check_react_compiler_coverage.ts
 
 # Parallel build optimization - these can run concurrently
 .NOTPARALLEL: build-main  # TypeScript can handle its own parallelism

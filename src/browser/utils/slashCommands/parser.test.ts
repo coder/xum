@@ -172,17 +172,6 @@ describe("commandParser", () => {
         subcommand: "enable",
       });
     });
-
-    it("should parse /fork with no args (seamless fork)", () => {
-      expectParse("/fork", { type: "fork" });
-    });
-
-    it("should parse /fork with start message", () => {
-      expectParse("/fork let's explore this idea", {
-        type: "fork",
-        startMessage: "let's explore this idea",
-      });
-    });
   });
 });
 

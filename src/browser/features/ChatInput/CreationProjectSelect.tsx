@@ -6,27 +6,40 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
+import type { ProjectConfig } from "@/common/types/project";
+import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 
 interface CreationProjectSelectProps {
+  /** Current creation scope: SCRATCH_PROJECT_CONFIG_KEY or a project path. */
   selected: string;
-  selectedLabel: string;
-  tooltip?: string;
-  options: Array<{ value: string; label: string }>;
-  onChange: (value: string) => void;
+  userProjects: Map<string, ProjectConfig>;
+  onChange: (scope: string) => void;
+}
+
+function formatScopeLabel(scope: string, userProjects: Map<string, ProjectConfig>): string {
+  return scope === SCRATCH_PROJECT_CONFIG_KEY
+    ? SCRATCH_PROJECT_NAME
+    : formatProjectHierarchyLabel(scope, userProjects);
 }
 
 /**
- * Current-scope heading for creation composers: a project switcher when there
- * is more than one choice, otherwise a static heading. Shared by the project
- * creation header (CreationControls) and the scratch creation header.
+ * Current-scope heading for creation composers. Every creation page offers the
+ * same destinations, Scratch and every project, so a draft can move between
+ * any two scopes. Shared by the project creation header (CreationControls)
+ * and the scratch creation header; a static heading when there is nothing to
+ * switch to.
  */
 export function CreationProjectSelect(props: CreationProjectSelectProps) {
-  const tooltip = props.tooltip ?? props.selected;
-  if (props.options.length <= 1) {
+  const scopes = [SCRATCH_PROJECT_CONFIG_KEY, ...props.userProjects.keys()];
+  const label = formatScopeLabel(props.selected, props.userProjects);
+  // Project labels may be display names, so the tooltip shows the path.
+  const tooltip = props.selected === SCRATCH_PROJECT_CONFIG_KEY ? label : props.selected;
+  if (scopes.length <= 1) {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <h2 className="text-foreground shrink-0 text-lg font-semibold">{props.selectedLabel}</h2>
+          <h2 className="text-foreground shrink-0 text-lg font-semibold">{label}</h2>
         </TooltipTrigger>
         <TooltipContent align="start">{tooltip}</TooltipContent>
       </Tooltip>
@@ -44,15 +57,15 @@ export function CreationProjectSelect(props: CreationProjectSelectProps) {
             {/* Explicit child instead of Radix's <SelectValue/> mirror of the
                 matched <SelectItem/> text, so unmatched values still render
                 the caller's label rather than falling back to nothing. */}
-            <SelectValue placeholder={props.selectedLabel}>{props.selectedLabel}</SelectValue>
+            <SelectValue placeholder={label}>{label}</SelectValue>
           </SelectTrigger>
         </TooltipTrigger>
         <TooltipContent align="start">{tooltip}</TooltipContent>
       </Tooltip>
       <SelectContent>
-        {props.options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            {option.label}
+        {scopes.map((scope) => (
+          <SelectItem key={scope} value={scope}>
+            {formatScopeLabel(scope, props.userProjects)}
           </SelectItem>
         ))}
       </SelectContent>

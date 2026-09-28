@@ -9,7 +9,7 @@ import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelop
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
-import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -75,6 +75,15 @@ function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
   );
 }
 
+// Plan-review feedback is authentic only while its metadata and its single envelope text describe
+// the same record (getAuthenticPlanReviewRecord). Batched behind an earlier message it would lose
+// the metadata; batched ahead of a later message its envelope would gain trailing text — either
+// way the persisted row is rejected and the submitted comments never enter review state.
+function isPlanReviewMetadata(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  return (meta as Record<string, unknown>).type === "plan-review";
+}
+
 // Peer messages are sealed single-message entries (their sends use removable dedupe keys), so
 // counting entries by this metadata type is an exact count of queued peer messages.
 function isAgentPeerMessageMetadata(meta: unknown): boolean {
@@ -103,6 +112,20 @@ export type QueuedInput = Pick<
   Extract<WorkspaceChatMessage, { type: "restore-to-input" }>,
   "text" | "fileParts" | "reviews"
 >;
+
+/**
+ * The original send of a manual queued entry that the dequeue gate refused (see
+ * AgentSession.heldInputs): exactly what the user queued, so re-sending it later reproduces the
+ * same provider message, send options, attachments and review metadata.
+ */
+export interface RefusedManualSend {
+  message: string;
+  options: SendMessageOptions & { fileParts?: FilePart[] };
+  /** Display text: the authored text (or slash command), not the review-formatted message. */
+  displayText: string;
+  attachmentCount: number;
+  reviewCount: number;
+}
 
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
 export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
@@ -165,14 +188,20 @@ interface QueuedMessageInternalOptions {
    * append could land between that turn's user row and its assistant response.
    */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
-  onPreTurnRowsPersisted?: () => void;
   /**
    * Caller staleness probe re-emitted at dispatch and re-checked by the session's
    * turn-admission gates. Peer agent sends use it so a Stop/task_stop landing after
    * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
    */
   admissionStale?: () => boolean;
+  /** See AgentSession SendMessageInternalOptions.skipOnSendCompaction (entries carrying it are sealed). */
+  skipOnSendCompaction?: boolean;
+  /**
+   * Task-attempt obligation for this send. The queue owns it from insertion (onEnqueued) until
+   * the entry dispatches (the session reports admission) or is removed (disposed here). Entries
+   * carrying one are sealed: the token correlates to exactly one dispatch.
+   */
+  turnAdmission?: TurnAdmissionToken;
   /** Stop capture shared by otherwise batchable additions; caller probes remain isolated. */
   compactionAdmissionStale?: () => boolean;
   /** The original acquired storage frontier survives preflight, batching, and queue waits. */
@@ -189,6 +218,16 @@ type QueueClearCallbacks = Pick<
   "onCanceled" | "onAcceptedPreStreamFailure"
 >;
 
+/** Cancellation notifications for one removed entry (the token is disposed by the queue itself). */
+function clearCallbacksFor(entry: QueueEntry): QueueClearCallbacks {
+  return {
+    ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+    ...(entry.onAcceptedPreStreamFailure != null
+      ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+      : {}),
+  };
+}
+
 /**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
@@ -201,6 +240,12 @@ interface QueueEntry {
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   messages: string[];
+  /**
+   * Same index as `messages`: the text the user authored for that message (its
+   * SendMessageOptions.authoredText, else the message itself). Composer restores take this, so
+   * review notes formatted into the message are restored only as structured reviews.
+   */
+  authoredMessages: string[];
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -244,10 +289,12 @@ interface QueueEntry {
   cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
-  onPreTurnRowsPersisted?: () => void;
   /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
   admissionStale?: () => boolean;
+  /** Dispatch without on-send compaction (sealed; see QueuedMessageInternalOptions). */
+  skipOnSendCompaction?: boolean;
+  /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
+  turnAdmission?: TurnAdmissionToken;
 }
 
 /**
@@ -256,11 +303,11 @@ interface QueueEntry {
  * The queue holds ordered entries that dispatch one at a time (see dequeueNext):
  * - Plain messages batch into the newest open entry (texts joined, file parts
  *   accumulated, first muxMetadata preserved, latest options win).
- * - Compaction requests, agent-skill invocations, workspace-turn follow-ups, and
- *   callback-carrying internal sends each start their own entry, so queueing one
- *   never blocks later sends — they simply dispatch after it (no enqueue errors).
- * - Agent-skill / workspace-turn / callback entries are sealed: later messages
- *   start a new entry instead of adopting their metadata or callbacks.
+ * - Compaction requests, agent-skill invocations, workspace-turn follow-ups, plan-review
+ *   feedback, and callback-carrying internal sends each start their own entry, so queueing
+ *   one never blocks later sends — they simply dispatch after it (no enqueue errors).
+ * - Agent-skill / workspace-turn / plan-review / callback entries are sealed: later
+ *   messages start a new entry instead of adopting their metadata or callbacks.
  * - User-authored and background/agent-initiated messages never share an entry,
  *   so renderer/restoration projections can omit background work precisely.
  * - Compaction entries stay open: a follow-up typed behind a pending /compact
@@ -318,10 +365,16 @@ export class MessageQueue {
   countAgentPeerMessageEntries(): number {
     // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
     // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    // Family-message entries (task_message_parent/sibling) are recognized by their payload row:
+    // their triggers carry neither marker, and they share the same queue cap.
     return this.entries.filter(
       (entry) =>
         isAgentPeerMessageMetadata(entry.muxMetadata) ||
-        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX)) ||
+        (entry.preTurnMessages?.some(
+          (row) => row.metadata?.muxMetadata?.type === "family-message"
+        ) ??
+          false)
     ).length;
   }
 
@@ -390,6 +443,14 @@ export class MessageQueue {
         metadata.turnId === turnId
       );
     });
+  }
+
+  /**
+   * Whether a tool-end add flagged promoteAheadOfHiddenTurnEnd would become the FIFO head (and so
+   * cut the active stream): the queue is empty or holds only hidden turn-end entries.
+   */
+  promotedToolEndWouldLead(): boolean {
+    return this.trailingHiddenTurnEndRunStart() === 0;
   }
 
   /**
@@ -510,17 +571,12 @@ export class MessageQueue {
         if (entry.workspaceTurnContinuation) {
           // Mirror WorkspaceService.stripWorkspaceTurnCorrelation for entries whose correlation
           // goes stale while QUEUED: a peer trigger keeps its machine-notification identity
-          // (downgraded to plain peer attribution) plus its onCanceled AND
-          // onAcceptedPreStreamFailure — both carry the sender's budget refund, tied to this
-          // entry rather than the superseded owner handle. Owner handle-settling callbacks are
-          // still dropped.
+          // (downgraded to plain peer attribution). Owner handle-settling callbacks are dropped.
           const peerTrigger = getValidAgentPeerTriggerMeta(metadata.agentPeerMessageTrigger);
           entry.muxMetadata =
             peerTrigger != null ? { type: "agent-peer-message", ...peerTrigger } : undefined;
-          if (peerTrigger == null) {
-            entry.onCanceled = undefined;
-            entry.onAcceptedPreStreamFailure = undefined;
-          }
+          entry.onCanceled = undefined;
+          entry.onAcceptedPreStreamFailure = undefined;
         }
       } else {
         priorCorrelation ??= metadata;
@@ -648,6 +704,7 @@ export class MessageQueue {
       internal?.removableDedupeKey === true ||
       isAgentSkillMetadata(options?.muxMetadata) ||
       isWorkspaceTurnMetadata(options?.muxMetadata) ||
+      isPlanReviewMetadata(options?.muxMetadata) ||
       hasSnapshotRefs(options?.muxMetadata) ||
       // Pre-turn rows must stay 1:1 with their triggering text: batching two
       // family sends would join their triggers while both payload rows pile
@@ -656,6 +713,9 @@ export class MessageQueue {
       // A staleness probe gates exactly one dispatch; batching would let one
       // sender's stop-refusal veto unrelated queued messages.
       internal?.admissionStale != null ||
+      // The on-send compaction opt-out applies to exactly the guarded send that asked for it.
+      internal?.skipOnSendCompaction === true ||
+      internal?.turnAdmission != null ||
       internal?.goalKind != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
@@ -682,6 +742,7 @@ export class MessageQueue {
       entry = {
         entryId: randomUUID(),
         messages: [],
+        authoredMessages: [],
         fileParts: [],
         dedupeKeys: new Set<string>(),
         dispatchMode: incomingMode,
@@ -717,10 +778,12 @@ export class MessageQueue {
     // Add text message if non-empty
     if (trimmedMessage.length > 0) {
       entry.messages.push(trimmedMessage);
+      entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
     }
 
     if (options) {
-      const { fileParts, ...restOptions } = options;
+      // authoredText describes this add only: it must not ride along as the entry's options.
+      const { fileParts, authoredText, ...restOptions } = options;
 
       // Preserve first muxMetadata per entry (see class docblock for rationale)
       if (options.muxMetadata !== undefined && entry.muxMetadata === undefined) {
@@ -741,20 +804,6 @@ export class MessageQueue {
     if (internal?.onAcceptedPreStreamFailure != null) {
       entry.onAcceptedPreStreamFailure = internal.onAcceptedPreStreamFailure;
     }
-    if (internal?.onPreTurnRowsPersisted != null) {
-      // Callback-carrying sends seal their entries, but pre-turn batches can
-      // in principle concatenate — chain instead of overwrite so no
-      // producer's persistence signal is dropped (r54).
-      const previous = entry.onPreTurnRowsPersisted;
-      const next = internal.onPreTurnRowsPersisted;
-      entry.onPreTurnRowsPersisted =
-        previous == null
-          ? next
-          : () => {
-              previous();
-              next();
-            };
-    }
 
     if (internal?.cancelState != null) {
       entry.cancelState = internal.cancelState;
@@ -764,6 +813,15 @@ export class MessageQueue {
     }
     if (internal?.admissionStale != null) {
       entry.admissionStale = internal.admissionStale;
+    }
+    if (internal?.skipOnSendCompaction === true) {
+      entry.skipOnSendCompaction = true;
+    }
+    if (internal?.turnAdmission != null) {
+      // Sealed entries are 1:1 with their token; a batched add can never reach a token-carrying
+      // entry, so this is always the entry's own insertion.
+      entry.turnAdmission = internal.turnAdmission;
+      entry.turnAdmission.onEnqueued();
     }
     entry.addCount += 1;
     entry.acceptanceOrigins.push({
@@ -835,7 +893,10 @@ export class MessageQueue {
     return entries.flatMap((entry) => entry.messages);
   }
 
-  private getDisplayTextForEntries(entries: readonly QueueEntry[]): string {
+  private getDisplayTextForEntries(
+    entries: readonly QueueEntry[],
+    textsOf: (entry: QueueEntry) => readonly string[] = (entry) => entry.messages
+  ): string {
     return entries
       .map((entry) => {
         if (
@@ -844,7 +905,9 @@ export class MessageQueue {
         ) {
           return entry.muxMetadata.rawCommand;
         }
-        return entry.messages.join("\n");
+        return textsOf(entry)
+          .filter((text) => text.length > 0)
+          .join("\n");
       })
       .filter((text) => text.length > 0)
       .join("\n");
@@ -905,17 +968,41 @@ export class MessageQueue {
     return this.inputForRestore(this.entries);
   }
 
-  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
-    const restorable = entries.filter(
+  /**
+   * Each restorable entry's send (see {@link manualSend}), for the same entries and at the same
+   * moment as {@link getInputForRestore}: Stop keeps them as held input until a composer takes
+   * the restored input (AgentSession.restoreQueueToInput, #4448).
+   */
+  getRestorableManualSends(): RefusedManualSend[] {
+    return this.restorableEntries(this.entries).flatMap((entry) => this.manualSend(entry) ?? []);
+  }
+
+  /** The user's own manual input that Stop may restore. */
+  private restorableEntries(entries: readonly QueueEntry[]): QueueEntry[] {
+    return entries.filter(
       (entry) =>
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
         !entry.cancelSignal?.aborted &&
-        entry.admissionStale?.() !== true
+        entry.admissionStale?.() !== true &&
+        // A task-stale entry is kept as held input instead (getTaskStaleManualSends): never both.
+        entry.turnAdmission?.admissionStale() !== true
     );
+  }
+
+  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
+    const restorable = this.restorableEntries(entries);
+    for (const entry of restorable) {
+      assert(
+        entry.authoredMessages.length === entry.messages.length,
+        "every queued message keeps its authored text at the same index"
+      );
+    }
     return restorable.length > 0
       ? {
-          text: this.getDisplayTextForEntries(restorable),
+          // Authored text, not the provider-facing message: reviews formatted into a message
+          // come back as `reviews` below, so the composer would otherwise hold them twice.
+          text: this.getDisplayTextForEntries(restorable, (entry) => entry.authoredMessages),
           fileParts: this.getFilePartsForEntries(restorable),
           reviews: this.getReviewsForEntries(restorable),
         }
@@ -934,12 +1021,7 @@ export class MessageQueue {
   getClearCallbacks(): QueueClearCallbacks[] {
     return this.entries
       .filter((entry) => entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null)
-      .map((entry) => ({
-        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-        ...(entry.onAcceptedPreStreamFailure != null
-          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-          : {}),
-      }));
+      .map(clearCallbacksFor);
   }
 
   /**
@@ -959,12 +1041,22 @@ export class MessageQueue {
       return null;
     }
     const [entry] = this.entries.splice(index, 1);
-    return {
-      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-      ...(entry.onAcceptedPreStreamFailure != null
-        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-        : {}),
-    };
+    entry.turnAdmission?.onDisposed("canceled-before-admission");
+    return clearCallbacksFor(entry);
+  }
+
+  /**
+   * Remove exactly the queued entry identified by a {@link peekNext} capture (the dequeue gate
+   * refusing a stale task-attempt obligation before any turn is claimed); its token is disposed
+   * as refused. Returns the entry's cancellation callbacks, or null when the head moved since
+   * the capture.
+   */
+  removeEntry(identity: unknown): QueueClearCallbacks | null {
+    const index = this.entries.findIndex((entry) => entry === identity);
+    if (index === -1) return null;
+    const [entry] = this.entries.splice(index, 1);
+    entry.turnAdmission?.onDisposed("refused");
+    return clearCallbacksFor(entry);
   }
 
   /** Remove queued entries carrying a dedupe key with the given prefix. */
@@ -989,12 +1081,14 @@ export class MessageQueue {
       // but multiple progress sends can still batch together. Remove only the matched messages and
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
-      const keptMessages = entry.messages.filter((_message, index) => {
+      const isKept = (_message: string, index: number) => {
         const key = [...entry.dedupeKeys][index];
         return key == null || !matchingKeySet.has(key);
-      });
+      };
+      const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
         entry.messages = keptMessages;
+        entry.authoredMessages = entry.authoredMessages.filter(isKept);
         for (const key of matchingKeys) {
           entry.dedupeKeys.delete(key);
         }
@@ -1006,13 +1100,9 @@ export class MessageQueue {
         );
         return [entry];
       }
+      entry.turnAdmission?.onDisposed("canceled-before-admission");
       if (entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null) {
-        removedCallbacks.push({
-          ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-          ...(entry.onAcceptedPreStreamFailure != null
-            ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-            : {}),
-        });
+        removedCallbacks.push(clearCallbacksFor(entry));
       }
       return [];
     });
@@ -1050,6 +1140,12 @@ export class MessageQueue {
         muxMetadata: unknown;
         acceptanceOrigin: TurnAcceptanceOrigin;
         inputForRestore: () => QueuedInput | undefined;
+        /** The send behind {@link inputForRestore}, when it has one (Stop holds it, #4448). */
+        sendForRestore: () => RefusedManualSend | undefined;
+        /** The entry's original send when it is the user's manual input (the dequeue gate holds it). */
+        refusedManualSend: () => RefusedManualSend | undefined;
+        /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
+        turnAdmission: TurnAdmissionToken | undefined;
       }
     | undefined {
     const entry = this.entries[0];
@@ -1059,8 +1155,80 @@ export class MessageQueue {
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
           inputForRestore: () => this.inputForRestore([entry]),
+          sendForRestore: () =>
+            this.restorableEntries([entry]).length > 0 ? this.manualSend(entry) : undefined,
+          refusedManualSend: () => this.refusedManualSend(entry),
+          turnAdmission: entry.turnAdmission,
         }
       : undefined;
+  }
+
+  /**
+   * Manual user input whose task-attempt admission went stale while it waited (its attempt was
+   * released, closed or superseded). Stop's composer restore skips stale entries, because that
+   * staleness refuses their EXECUTION; the input still belongs to the user, so the session keeps
+   * it as held input (see AgentSession.restoreQueueToInput). Each comes with the dequeue gate's
+   * refusal for it when the token names one (read-only consultation).
+   */
+  getTaskStaleManualSends(): Array<{ send: RefusedManualSend; refusal: string | undefined }> {
+    return this.entries.flatMap((entry) => {
+      if (entry.turnAdmission?.admissionStale() !== true) return [];
+      const send = this.refusedManualSend(entry);
+      if (send == null) return [];
+      const decision = entry.turnAdmission.resolveDispatch?.();
+      return [{ send, refusal: typeof decision === "object" ? decision.refuse : undefined }];
+    });
+  }
+
+  private refusedManualSend(entry: QueueEntry): RefusedManualSend | undefined {
+    // Same selection as a Stop restore minus the staleness probe (that probe is what refused it):
+    // only the user's own manual input is held; automatic and synthetic sends are just refused.
+    if (
+      !entry.userAuthored ||
+      this.getAcceptanceOrigin(entry) !== "manual" ||
+      entry.cancelSignal?.aborted === true
+    ) {
+      return undefined;
+    }
+    // Only token-carrying entries are refused at dispatch, and those are sealed: one add per
+    // entry, so its latest options are exactly the options of the one send it holds.
+    assert(entry.turnAdmission != null, "only task-attempt entries are refused at dispatch");
+    assert(entry.addCount === 1, "a refused task-attempt entry holds exactly one send");
+    assert(entry.latestOptions != null, "a manual queued send keeps its send options");
+    return this.manualSend(entry);
+  }
+
+  /**
+   * The send an entry holds, as {@link dequeueNext} would send it (joined texts with the latest
+   * options, first metadata, all file parts), plus its display data. Undefined when it has nothing
+   * to send or no send options to re-send with.
+   */
+  private manualSend(entry: QueueEntry): RefusedManualSend | undefined {
+    if (entry.latestOptions == null) return undefined;
+    const reviewCount = this.getReviewsForEntries([entry])?.length ?? 0;
+    if (entry.messages.length === 0 && entry.fileParts.length === 0 && reviewCount === 0) {
+      return undefined;
+    }
+    const options: SendMessageOptions & { fileParts?: FilePart[] } = { ...entry.latestOptions };
+    // The original dispatch mode described the queue it waited in; a re-send picks its own.
+    delete options.queueDispatchMode;
+    if (entry.goalInterventionPolicy != null) {
+      options.goalInterventionPolicy = entry.goalInterventionPolicy;
+    }
+    const authoredText = entry.authoredMessages.join("\n");
+    return {
+      message: entry.messages.join("\n"),
+      options: {
+        ...options,
+        muxMetadata: entry.muxMetadata,
+        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        // Kept so a re-send that is queued and refused again is held with the same display text.
+        ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
+      },
+      displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+      attachmentCount: entry.fileParts.length,
+      reviewCount,
+    };
   }
 
   /**
@@ -1160,6 +1328,8 @@ export class MessageQueue {
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
       admissionStale != null ||
+      entry.skipOnSendCompaction === true ||
+      entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
@@ -1179,10 +1349,9 @@ export class MessageQueue {
           ...(entry.preTurnMessages != null && entry.preTurnMessages.length > 0
             ? { preTurnMessages: entry.preTurnMessages }
             : {}),
-          ...(entry.onPreTurnRowsPersisted != null
-            ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
-            : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
+          ...(entry.skipOnSendCompaction === true ? { skipOnSendCompaction: true } : {}),
+          ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
         }
@@ -1202,6 +1371,9 @@ export class MessageQueue {
    * capture {@link getClearCallbacks} beforehand.
    */
   clear(): void {
+    for (const entry of this.entries) {
+      entry.turnAdmission?.onDisposed("canceled-before-admission");
+    }
     this.entries = [];
   }
 
@@ -1210,6 +1382,19 @@ export class MessageQueue {
    */
   isEmpty(): boolean {
     return this.entries.length === 0;
+  }
+
+  /**
+   * Whether the user's own manual input is queued, including an entry whose admission already
+   * reads stale (the dequeue gate will refuse it into held input, not drop it).
+   */
+  hasManualUserInput(): boolean {
+    return this.entries.some(
+      (entry) =>
+        entry.userAuthored &&
+        this.getAcceptanceOrigin(entry) === "manual" &&
+        entry.cancelSignal?.aborted !== true
+    );
   }
 
   /**

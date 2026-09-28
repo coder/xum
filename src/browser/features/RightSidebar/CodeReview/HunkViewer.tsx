@@ -18,8 +18,7 @@ import {
   TooltipContent,
   TooltipIfPresent,
 } from "@/browser/components/Tooltip/Tooltip";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewExpandStateKey } from "@/common/constants/storage";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import { cn } from "@/common/lib/utils";
@@ -242,18 +241,16 @@ export const HunkViewer = React.memo<HunkViewerProps>(
       setShowSliceAfter(false);
     }, [hunkSlice]);
 
-    // Persist manual expand/collapse state across remounts per workspace
+    // Persist manual expand/collapse state across remounts per workspace (backend
+    // review-state store, shared by all HunkViewer instances).
     // Maps hunkId -> isExpanded for user's manual preferences
-    // Enable listener to synchronize updates across all HunkViewer instances
-    const [expandStateMap, setExpandStateMap] = usePersistedState<Record<string, boolean>>(
-      getReviewExpandStateKey(workspaceId),
-      {},
-      { listener: true }
+    const manualExpandState = useReviewStateSelector(
+      workspaceId,
+      (view) => view.sections.hunkExpand?.[hunkId]
     );
 
     // Check if user has manually set expand state for this hunk
-    const hasManualState = hunkId in expandStateMap;
-    const manualExpandState = expandStateMap[hunkId];
+    const hasManualState = manualExpandState !== undefined;
 
     // Agent-flagged hunks should default to expanded even when they're already
     // read, "large", or in a heavy review where everything else is collapsed —
@@ -310,12 +307,11 @@ export const HunkViewer = React.memo<HunkViewerProps>(
         const newExpandState = !isExpanded;
         setIsExpanded(newExpandState);
         // Persist manual expand/collapse choice
-        setExpandStateMap((prev) => ({
-          ...prev,
-          [hunkId]: newExpandState,
+        getReviewStateStore().mutate(workspaceId, "hunkExpand", () => ({
+          set: { [hunkId]: newExpandState },
         }));
       },
-      [isExpanded, hunkId, setExpandStateMap]
+      [isExpanded, hunkId, workspaceId]
     );
 
     // Register toggle method with parent component

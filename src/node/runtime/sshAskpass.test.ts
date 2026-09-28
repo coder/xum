@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -140,10 +141,26 @@ describe("sshAskpass", () => {
     });
 
     test("cleanup is idempotent", async () => {
-      const session = await createAskpassSession(() => Promise.resolve("ok"));
+      // This test closes the session right after creating it. Bun 1.3.5 leaks one blocked
+      // thread-pool thread for each real directory watcher closed that early, and enough
+      // leaks stall every later fs call in the shared test process (#4715). Cleanup only
+      // needs something to close, so hand the session a stand-in watcher.
+      const watcher = Object.assign(new EventEmitter(), { close: () => undefined });
+      const watch = spyOn(fs, "watch").mockReturnValue(watcher as unknown as fs.FSWatcher);
+      try {
+        const session = await createAskpassSession(() => Promise.resolve("ok"));
+        expect(watch).toHaveBeenCalledTimes(1);
 
-      session.cleanup();
-      expect(() => session.cleanup()).not.toThrow();
+        session.cleanup();
+        expect(() => session.cleanup()).not.toThrow();
+        const dirRemoved = await fs.promises.access(session.env.MUX_ASKPASS_DIR).then(
+          () => false,
+          () => true
+        );
+        expect(dirRemoved).toBe(true);
+      } finally {
+        watch.mockRestore();
+      }
     });
 
     test("ignores duplicate request IDs", async () => {

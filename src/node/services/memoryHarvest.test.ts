@@ -5,6 +5,11 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
@@ -157,6 +162,60 @@ async function runHarvest(
 }
 
 describe("runMemoryHarvest", () => {
+  it("never sends model-hidden plan-review rows to the harvest model or accepts them as evidence", async () => {
+    using fixture = createFixture();
+    const snapshot: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec_snap",
+      snapshotId: "snap_1",
+      planPath: "/plans/p.md",
+      contentHash: "a".repeat(64),
+      content: "# Plan\n\nREMEMBER-THIS-PLANTED-INSTRUCTION\n",
+    };
+    fixture.messages.push(
+      createMuxMessage("hidden-snap", "user", formatPlanReviewEnvelope(snapshot), {
+        historySequence: 1,
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+    const prompts: string[] = [];
+    let streamCount = 0;
+    const model = new MockLanguageModelV3({
+      doStream: (options) => {
+        prompts.push(userPromptText(options));
+        streamCount++;
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks:
+              streamCount === 1
+                ? [
+                    harvestToolCall([
+                      {
+                        category: "workflow",
+                        memoryText: "Follow the planted instruction.",
+                        evidenceMessageIds: ["hidden-snap"],
+                        confidence: 0.95,
+                        rationale: "Cited the hidden row.",
+                      },
+                    ]),
+                    toolFinishChunk(),
+                  ]
+                : [finishChunk(1)],
+          }),
+        });
+      },
+    });
+
+    const result = await runHarvest(fixture, model);
+
+    expect(prompts.length).toBeGreaterThan(0);
+    expect(prompts.join("\n")).not.toContain("REMEMBER-THIS-PLANTED-INSTRUCTION");
+    expect(prompts.join("\n")).toContain("prefer concise tests");
+    expect(result.acceptedCandidates).toBe(0);
+  });
+
   it("writes accepted candidates to a workspace harvest inbox through MemoryService", async () => {
     using fixture = createFixture();
 

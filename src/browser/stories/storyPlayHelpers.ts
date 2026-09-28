@@ -1,4 +1,22 @@
-import { waitFor } from "@storybook/test";
+import { userEvent, waitFor, within } from "@storybook/test";
+
+/**
+ * Open Settings from the titlebar button and return the Settings dialog. The page behind the
+ * modal stays mounted, so plays should query within the dialog rather than the whole canvas.
+ */
+export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  return within(canvasElement.ownerDocument.body).findByRole(
+    "dialog",
+    { name: "Settings" },
+    { timeout: 10000 }
+  );
+}
+
+export function getSettingsDialog(): HTMLElement {
+  return within(document.body).getByRole("dialog", { name: "Settings" });
+}
 
 /**
  * Wait for chat messages to finish loading.

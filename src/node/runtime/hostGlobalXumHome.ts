@@ -8,7 +8,7 @@ import { RemoteRuntime } from "./RemoteRuntime";
  * arbitrary or offline hosts. Their global reads still resolve through the host's canonical
  * ~/.xum directory; Docker's separate /var/mux contract remains inside the container.
  */
-export function shouldUseHostGlobalXumFallback(runtime: Runtime): boolean {
+function shouldUseHostGlobalXumFallback(runtime: Runtime): boolean {
   return runtime instanceof RemoteRuntime && runtime.getXumHome() === LEGACY_REMOTE_MUX_HOME;
 }
 

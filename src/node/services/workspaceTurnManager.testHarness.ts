@@ -1,8 +1,19 @@
 import * as path from "path";
-import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import { HistoryService } from "@/node/services/historyService";
+import {
+  buildAgentTaskIndex,
+  countActiveAgentTasks,
+  hasActiveDescendantAgentTasksUsingIndex,
+  isDescendantAgentTaskUsingParentById,
+  listAgentTaskWorkspaces,
+  resolveWorkspaceAISettings,
+} from "@/node/services/agentTaskIndex";
+import { buildParentAiSettingsFallbacks } from "@/node/services/agentTaskReawakenAi";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import type { StreamManager } from "@/node/services/streamManager";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -12,12 +23,21 @@ import type {
   BackgroundableForegroundWaiter,
   WorkspaceHost,
   WorkspaceTurnManagerHost,
+  QueueCutAttributionSnapshot,
 } from "@/node/services/taskWorkspaceSeam";
 import {
   createAIServiceMocks,
   createMockInitStateManager,
   createWorkspaceServiceMocks,
+  runWithTaskTreeHold,
+  createTestConfig,
+  makeWorkspaceTurnCreateMock,
+  saveLocalParentWorkspace,
+  stubStableIds,
 } from "@/node/services/taskService.testHarness";
+import type { mock } from "bun:test";
+import { expect } from "bun:test";
+import type { StreamEndEvent } from "@/common/types/stream";
 
 type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
@@ -32,37 +52,19 @@ function createWorkspaceTurnManagerHost(
   const lifecycleLocks = new MutexMap<string>();
   const foregroundWaiters = new Map<string, Set<BackgroundableForegroundWaiter>>();
   const foregroundAwaitCounts = new Map<string, number>();
-  const agentTasks = (cfg: ReturnType<Config["loadConfigOrDefault"]>) =>
-    Array.from(cfg.projects.values())
-      .flatMap((project) => project.workspaces)
-      .filter((workspace) => workspace.id != null && workspace.parentWorkspaceId != null);
-  const isActiveAgentTask = (workspace: WorkspaceConfigEntry) => {
-    if (
-      workspace.archivedAt != null &&
-      (workspace.unarchivedAt == null || workspace.unarchivedAt < workspace.archivedAt)
-    ) {
-      return workspace.id != null && aiService.isStreaming(workspace.id);
-    }
-    return (
-      ["starting", "running", "awaiting_report"].includes(workspace.taskStatus ?? "running") ||
-      ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
-    );
-  };
+  // Tree and activity rules come from the production predicates so this host cannot drift from
+  // TaskService (queued tasks, archived streams, the streaming fallback, agent-ID normalization).
+  const isStreaming = (workspaceId: string) => aiService.isStreaming(workspaceId);
   const isDescendant = (
     cfg: ReturnType<Config["loadConfigOrDefault"]>,
     ancestorWorkspaceId: string,
     taskId: string
-  ) => {
-    const parents = new Map(
-      agentTasks(cfg).map((workspace) => [workspace.id, workspace.parentWorkspaceId])
+  ) =>
+    isDescendantAgentTaskUsingParentById(
+      buildAgentTaskIndex(cfg).parentById,
+      ancestorWorkspaceId,
+      taskId
     );
-    let current: string | undefined = taskId;
-    for (let depth = 0; depth < 32 && current != null; depth++) {
-      current = parents.get(current);
-      if (current === ancestorWorkspaceId) return true;
-    }
-    return false;
-  };
   const backgroundForegroundWaitsForWorkspace = (workspaceId: string) => {
     let signaled = 0;
     for (const waiter of foregroundWaiters.get(workspaceId) ?? []) {
@@ -87,24 +89,13 @@ function createWorkspaceTurnManagerHost(
       backgroundForegroundWaitsForWorkspace(workspaceId);
     },
     backgroundForegroundWaitsForWorkspace,
-    buildParentAiSettingsFallbacks: (parent, targetAgentId) =>
-      [
-        parent.aiSettingsByAgent?.[targetAgentId],
-        parent.agentId == null ? undefined : parent.aiSettingsByAgent?.[parent.agentId],
-        parent.aiSettings,
-      ].filter((settings) => settings != null),
+    buildParentAiSettingsFallbacks,
     bumpWorkspaceStopEpoch: () => undefined,
     countActiveAgentTasks: (cfg) =>
-      agentTasks(cfg).filter(
-        (workspace) =>
-          isActiveAgentTask(workspace) &&
-          workspace.id != null &&
-          !foregroundAwaitCounts.has(workspace.id) &&
-          !(
-            workspace.taskExecutionId?.startsWith("wst_") === true &&
-            ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
-          )
-      ).length,
+      countActiveAgentTasks(listAgentTaskWorkspaces(cfg), {
+        isStreaming,
+        isForegroundAwaiting: (workspaceId) => foregroundAwaitCounts.has(workspaceId),
+      }),
     editWorkspaceEntry: async (workspaceId, updater, options) => {
       let found = false;
       await config.editConfig((cfg) => {
@@ -127,12 +118,7 @@ function createWorkspaceTurnManagerHost(
       await terminalAttentionStore.enqueueIfAbsent(params);
     },
     hasActiveDescendantAgentTasks: (cfg, workspaceId) =>
-      agentTasks(cfg).some(
-        (workspace) =>
-          workspace.id != null &&
-          isActiveAgentTask(workspace) &&
-          isDescendant(cfg, workspaceId, workspace.id)
-      ),
+      hasActiveDescendantAgentTasksUsingIndex(buildAgentTaskIndex(cfg), workspaceId, isStreaming),
     isDescendantAgentTaskInConfig: isDescendant,
     isForegroundAwaiting: (workspaceId) => foregroundAwaitCounts.has(workspaceId),
     latchWorkspaceStopsInProgress: () => () => undefined,
@@ -146,7 +132,7 @@ function createWorkspaceTurnManagerHost(
           (run) =>
             referencedRunIds.includes(run.id) &&
             run.workspaceId === workspaceId &&
-            ["pending", "running", "backgrounded"].includes(run.status)
+            isActiveWorkflowRunStatus(run.status)
         )
         .map((run) => run.id);
     },
@@ -160,12 +146,12 @@ function createWorkspaceTurnManagerHost(
           (run) =>
             run.workspaceId === workspaceId &&
             run.parentWorkflow == null &&
-            ["pending", "running", "backgrounded"].includes(run.status)
+            isActiveWorkflowRunStatus(run.status)
         )
         .map((run) => run.id);
     },
     listAgentReferencedWorkflowRunIds: () => Promise.resolve([]),
-    listAgentTaskExecutionEntries: agentTasks,
+    listAgentTaskExecutionEntries: listAgentTaskWorkspaces,
     markTaskForegroundRelevant: () => undefined,
     maybeStartPatchGenerationForReportedTask: () => Promise.resolve(),
     registerBackgroundableForegroundWaiter: (workspaceId, waiter) => {
@@ -174,9 +160,7 @@ function createWorkspaceTurnManagerHost(
       foregroundWaiters.set(workspaceId, waiters);
     },
     releaseRetainedStopLatches: () => undefined,
-    resolveWorkspaceAISettings: (workspace, agentId) =>
-      (agentId != null ? workspace.aiSettingsByAgent?.[agentId] : undefined) ??
-      workspace.aiSettings,
+    resolveWorkspaceAISettings,
     scheduleMaybeStartQueuedTasks: () => undefined,
     scheduleTerminalAttentionDrain: () => undefined,
     startForegroundAwait: (workspaceId) => {
@@ -193,7 +177,7 @@ function createWorkspaceTurnManagerHost(
       if (waiters?.size === 0) foregroundWaiters.delete(workspaceId);
     },
     withTaskTreeLifecycleLock: (workspaceId, operation) =>
-      lifecycleLocks.withLock(workspaceId, operation),
+      lifecycleLocks.withLock(workspaceId, () => runWithTaskTreeHold(operation)),
   };
 }
 
@@ -204,6 +188,7 @@ export function createWorkspaceTurnManagerHarness(
     aiService?: AIService;
     workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
+    streamManager?: StreamManager;
   }
 ): {
   historyService: HistoryService;
@@ -232,7 +217,8 @@ export function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
     taskHost,
-    terminalAttentionStore
+    terminalAttentionStore,
+    overrides?.streamManager
   );
 
   return {
@@ -243,4 +229,79 @@ export function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
   };
+}
+
+// Helpers shared by the workspaceTurnManager.*.test.ts section files, moved verbatim when
+// workspaceTurnManager.test.ts was split; the describe-level ones that used the suite's
+// rootDir now take it as their first parameter.
+export async function startWorkspaceTurnForTest(
+  rootDir: string,
+  options: {
+    stableIds?: string[];
+    disposable?: boolean;
+    sendMessage?: ReturnType<typeof mock>;
+    remove?: ReturnType<typeof mock>;
+    isStreaming?: ReturnType<typeof mock>;
+    hasQueuedMessages?: ReturnType<typeof mock>;
+    hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
+    hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
+    hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+    getQueueCutCutter?: ReturnType<typeof mock>;
+    hasPendingAutoRetry?: ReturnType<typeof mock>;
+    waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
+  } = {}
+) {
+  const config = await createTestConfig(rootDir);
+  stubStableIds(config, options.stableIds ?? ["handle", "turn"]);
+  const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+  const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+  const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, ...options });
+  const aiMocks = createAIServiceMocks(config, {
+    ...(options.isStreaming != null ? { isStreaming: options.isStreaming } : {}),
+  });
+  const { historyService, taskService, taskHost } = createWorkspaceTurnManagerHarness(config, {
+    aiService: aiMocks.aiService,
+    workspaceService: workspaceMocks.workspaceService,
+  });
+
+  const created = await taskService.createWorkspaceTurn({
+    ownerWorkspaceId: parentId,
+    prompt: "Summarize",
+    title: "Workspace turn",
+    workspace: { mode: "new", ...(options.disposable === true ? { disposable: true } : {}) },
+  });
+  expect(created.success).toBe(true);
+  if (!created.success) {
+    throw new Error(created.error);
+  }
+
+  return {
+    config,
+    parentId,
+    projectPath,
+    taskService,
+    taskHost,
+    workspaceMocks,
+    aiMocks,
+    historyService,
+    created: created.data,
+  };
+}
+
+export async function finalizeWorkspaceTurnStreamEndForTest(
+  taskService: WorkspaceTurnManager,
+  event: StreamEndEvent
+): Promise<boolean> {
+  const internal = taskService as unknown as {
+    captureQueueCutAttributionSnapshot: (workspaceId: string) => QueueCutAttributionSnapshot;
+    finalizeWorkspaceTurnFromStreamEnd: (
+      event: StreamEndEvent,
+      queueCutSnapshot: QueueCutAttributionSnapshot
+    ) => Promise<boolean>;
+  };
+  return await internal.finalizeWorkspaceTurnFromStreamEnd(
+    event,
+    internal.captureQueueCutAttributionSnapshot(event.workspaceId)
+  );
 }

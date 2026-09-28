@@ -2,12 +2,11 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { createWebFetchTool } from "./web_fetch";
-import type { WebFetchToolArgs, WebFetchToolResult } from "@/common/types/tools";
+import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 import { WEB_FETCH_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 
-const itIntegration = process.env.TEST_INTEGRATION === "1" ? it : it.skip;
 const toolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
@@ -66,53 +65,39 @@ afterEach(() => {
 });
 
 describe("web_fetch tool", () => {
-  itIntegration("should fetch and convert a real web page to markdown", async () => {
+  // These cases used to hit live sites behind TEST_INTEGRATION, which nothing in CI sets.
+  // Canned curl output keeps each response-handling branch deterministic; HTML-to-markdown
+  // extraction and resolver failures are covered by the fixture tests below.
+  it("returns plain text responses verbatim without HTML processing", async () => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://example.com",
-    };
+    const url = "https://93.184.216.34/cdn-cgi/trace";
+    const body = "fl=123f45\nh=example.com\n<b>not html</b>\n";
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        stdout: "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body,
+      })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!({ url }, toolCallOptions)) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.title).toContain("Example Domain");
-      expect(result.url).toBe("https://example.com");
-      expect(result.content).toContain("documentation");
-      expect(result.length).toBeGreaterThan(0);
-    }
+    expect(result).toEqual({ success: true, title: url, content: body, url, length: body.length });
   });
 
-  itIntegration("should fetch plain text content without HTML processing", async () => {
+  it.each([
+    { exitCode: 6, error: "Failed to fetch URL: Could not resolve host" },
+    { exitCode: 7, error: "Failed to fetch URL: Failed to connect" },
+  ])("maps curl exit $exitCode to a readable error", async ({ exitCode, error }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://cloudflare.com/cdn-cgi/trace",
-    };
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({ exitCode, stderr: "curl: transport failure" })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/page" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.content).toContain("fl=");
-      expect(result.content).toContain("h=");
-      expect(result.content).toContain("ip=");
-      expect(result.title).toBe("https://cloudflare.com/cdn-cgi/trace");
-      expect(result.length).toBeGreaterThan(0);
-    }
-  });
-
-  itIntegration("should handle DNS failure gracefully", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://this-domain-does-not-exist.invalid/page",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Failed to fetch URL");
-    }
+    expect(result).toEqual({ success: false, error });
   });
 
   it.each(["file:///tmp/secret.txt", "data:text/plain,hello", "javascript:alert(1)"])(
@@ -476,32 +461,50 @@ describe("web_fetch tool", () => {
     }
   });
 
-  itIntegration("should include HTTP status code in error for non-2xx responses", async () => {
+  it("reports the HTTP status for non-2xx responses", async () => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://httpbin.dev/status/404",
-    };
+    // curl --fail-with-body exits 22 on HTTP errors but still prints the response.
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        exitCode: 22,
+        stdout:
+          "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<html><body></body></html>",
+      })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/missing" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("HTTP 404");
-    }
+    expect(result).toEqual({ success: false, error: "HTTP 404" });
   });
 
-  itIntegration("should detect Cloudflare challenge pages", async () => {
+  it.each([
+    {
+      name: "cf-mitigated header",
+      headers: "HTTP/2 403\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><body>Blocked</body></html>",
+    },
+    {
+      name: "interstitial body",
+      headers: "HTTP/2 403\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><title>Just a moment...</title><body>Enable JavaScript and cookies to continue</body></html>",
+    },
+  ])("detects Cloudflare challenge pages from the $name", async ({ headers, body }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://platform.openai.com",
-    };
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({ exitCode: 22, stdout: headers + body })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Cloudflare");
-      expect(result.error).toContain("JavaScript");
-    }
+    expect(result).toEqual({
+      success: false,
+      error: "HTTP 403: Cloudflare security challenge (page requires JavaScript)",
+    });
   });
 });

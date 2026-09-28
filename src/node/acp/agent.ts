@@ -199,6 +199,18 @@ export class MuxAgent implements Agent {
   private readonly chatSubscriptionReady = new Map<string, Promise<void>>();
   /** Mode used for the currently active/connecting onChat subscription per session. */
   private readonly chatSubscriptionModeBySessionId = new Map<string, OnChatMode>();
+  /**
+   * Sessions whose last observed replay reported `historyReplayStatus: "failed"`: their history
+   * is unreadable and unverified, so prompts are refused (as the browser and CLI refuse sends)
+   * until a later caught-up reports a complete replay.
+   */
+  private readonly historyReplayFailedSessionIds = new Set<string>();
+  /**
+   * Settles at the first caught-up of a session's active full-mode subscription (or when that
+   * subscription ends without one). A prompt awaits it before dispatching so a failed replay is
+   * observed and refused rather than raced by the send.
+   */
+  private readonly firstCaughtUpBySessionId = new Map<string, Promise<void>>();
   /** Async iterators for active onChat streams so we can cancel on mode switch/eviction. */
   private readonly chatIteratorsBySessionId = new Map<
     string,
@@ -578,6 +590,10 @@ export class MuxAgent implements Agent {
     const sessionState = await this.refreshSessionState(sessionId);
     const parsedPrompt = parsePromptBlocks(params.prompt);
 
+    // Slash commands mutate too (`/clear` truncates, `/compact` sends), so the transcript is
+    // verified before any of them, not only before an ordinary send. The gate sits directly
+    // before each mutation: slash-command discovery awaits skill lookup, and a subscription
+    // that dies during that wait must still refuse the destructive command.
     const slashCommandResponse = await this.tryHandleSlashCommand(
       sessionId,
       workspaceId,
@@ -588,6 +604,7 @@ export class MuxAgent implements Agent {
       return slashCommandResponse;
     }
 
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.sendWorkspaceMessageAndAwaitTurn({
       sessionId,
       workspaceId,
@@ -711,12 +728,9 @@ export class MuxAgent implements Agent {
     try {
       // Re-establish chat subscription if a prior one dropped (e.g., transient
       // websocket interruption). Register the turn first so subscription
-      // failures can reject it instead of leaving prompt() hanging.
-      await this.ensureChatSubscription(
-        args.sessionId,
-        args.workspaceId,
-        this.getSessionOnChatMode(args.sessionId)
-      );
+      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
+      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
+      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
 
       this.markTurnDispatched(args.sessionId, promptCorrelationId);
 
@@ -757,6 +771,33 @@ export class MuxAgent implements Agent {
       this.takeTurnCompletion(args.sessionId);
       throw error;
     }
+  }
+
+  /**
+   * Ensure the session's transcript is verified before a mutation. A full-mode replay must
+   * be observed first: an unreadable history closes it with `historyReplayStatus: "failed"`
+   * (or the stream ends before reporting), and a mutation against that unverified transcript
+   * would persist a user row or truncate rows the client never saw. A failed subscription is
+   * torn down here because prompts reuse a ready subscription, so it would never replay
+   * again on its own; the next prompt re-subscribes and replays afresh.
+   */
+  private async assertTranscriptVerified(sessionId: string, workspaceId: string): Promise<void> {
+    // A session whose last replay failed must replay again to be verified, whatever mode a
+    // later resume chose: a live subscription reads no history and could never clear the flag.
+    const onChatMode = this.historyReplayFailedSessionIds.has(sessionId)
+      ? ON_CHAT_MODE_FULL
+      : this.getSessionOnChatMode(sessionId);
+    await this.ensureChatSubscription(sessionId, workspaceId, onChatMode);
+    await this.firstCaughtUpBySessionId.get(sessionId);
+    if (!this.historyReplayFailedSessionIds.has(sessionId)) {
+      return;
+    }
+
+    await this.stopChatSubscription(sessionId, "history replay failed");
+    this.firstCaughtUpBySessionId.delete(sessionId);
+    throw new Error(
+      `prompt: workspace ${workspaceId} history could not be read; refusing to mutate an unverified transcript`
+    );
   }
 
   private attachPromptCorrelationToSendOptions(
@@ -826,6 +867,8 @@ export class MuxAgent implements Agent {
       return null;
     }
 
+    // Verified after discovery (which awaits), immediately before the command mutates.
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.handleSlashCommand(
       sessionId,
       workspaceId,
@@ -1379,6 +1422,8 @@ export class MuxAgent implements Agent {
     this.sessionSkillsById.delete(sessionId);
     this.onChatModeBySessionId.delete(sessionId);
     this.chatSubscriptionModeBySessionId.delete(sessionId);
+    this.historyReplayFailedSessionIds.delete(sessionId);
+    this.firstCaughtUpBySessionId.delete(sessionId);
     this.latestUsageBySessionId.delete(sessionId);
     this.sessionLastTouchedAtById.delete(sessionId);
 
@@ -1423,6 +1468,11 @@ export class MuxAgent implements Agent {
         }
       }
     };
+
+    // Retire the token before unwinding so the subscription's own teardown observes an
+    // intentional stop: its drain loop must neither count the missing caught-up as a failed
+    // replay nor reject a turn that already moved to the replacement subscription.
+    this.chatSubscriptionTokenBySessionId.delete(sessionId);
 
     const iterator = this.chatIteratorsBySessionId.get(sessionId);
     if (iterator != null) {
@@ -1584,6 +1634,17 @@ export class MuxAgent implements Agent {
       workspaceId,
       mode: onChatMode,
     });
+    // Registered before the connected signal so a prompt released by it always finds the
+    // gate. Full mode reads history; live mode reads none and cannot report on it, so it
+    // neither sets nor clears the failed flag and needs no first-caught-up gate.
+    const firstCaughtUp = Promise.withResolvers<void>();
+    if (onChatMode.type === "full") {
+      this.firstCaughtUpBySessionId.set(sessionId, firstCaughtUp.promise);
+    } else {
+      // A replaced subscription's gate must not outlive it (its teardown can linger).
+      this.firstCaughtUpBySessionId.delete(sessionId);
+      firstCaughtUp.resolve();
+    }
     onConnected();
     this.touchSession(sessionId);
 
@@ -1666,6 +1727,12 @@ export class MuxAgent implements Agent {
           this.handleStreamEvent(sessionId, event);
           if (event.type === "caught-up") {
             hasCaughtUp = true;
+            if (event.historyReplayStatus === "failed") {
+              this.historyReplayFailedSessionIds.add(sessionId);
+            } else if (event.replay !== "live") {
+              this.historyReplayFailedSessionIds.delete(sessionId);
+            }
+            firstCaughtUp.resolve();
           }
           // Skip heartbeats from the queue: they produce no sessionUpdate
           // output and are emitted periodically, so they would accumulate
@@ -1698,6 +1765,14 @@ export class MuxAgent implements Agent {
           }
         }
       } finally {
+        // A current full-mode subscription that ends before its caught-up verified nothing:
+        // treat it as a failed replay so the waiting prompt is refused (and re-subscribes
+        // next time) instead of sending into an unverified transcript. A replaced
+        // subscription breaking out of the loop says nothing about the session.
+        if (!hasCaughtUp && isCurrentSubscription()) {
+          this.historyReplayFailedSessionIds.add(sessionId);
+        }
+        firstCaughtUp.resolve();
         end();
       }
     })();

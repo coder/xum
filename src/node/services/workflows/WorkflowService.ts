@@ -19,6 +19,8 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -54,6 +56,7 @@ import { deriveChildWorkflowRunId, MAX_NESTED_WORKFLOW_DEPTH } from "./nestedWor
 import {
   acquireWorkflowArchiveAdmission,
   registerInProcessWorkflowRun,
+  type WorkflowArchiveAdmissionGuard,
 } from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
 import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
@@ -62,9 +65,11 @@ import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
 import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
+import { WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
+import type { WorkflowEvaluationPort } from "./workflowEvaluationStep";
 
 export interface WorkflowBackgroundRunTerminalEvent {
   runId: string;
@@ -81,10 +86,18 @@ export interface WorkflowRunStatusChangedEvent {
 
 export interface WorkflowServiceOptions {
   runStore: WorkflowRunStore;
+  /** The owning WorkspaceService's archive gate; start/resume/retry admissions consult it. */
+  archiveAdmission: WorkflowArchiveAdmissionGuard;
   runtimeFactory: IJSRuntimeFactory;
   taskAdapter?: WorkflowTaskAdapter;
   /** workflowName is the human-readable display name, used to label spawned tasks. */
   taskAdapterFactory?: (runId: string, workflowName?: string) => WorkflowTaskAdapter;
+  /**
+   * Shared by every run (including nested ones) of this service; the adapter
+   * holds no run state. Absent ⇒ `evaluate()` fails closed as
+   * `unsupported/runtime-unavailable`.
+   */
+  evaluationAdapter?: WorkflowEvaluationPort;
   resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
@@ -152,6 +165,7 @@ export class WorkflowService {
     runId: string,
     workflowName?: string
   ) => WorkflowTaskAdapter;
+  private readonly evaluationAdapter?: WorkflowEvaluationPort;
   private readonly resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   private readonly onBackgroundRunTerminal?: (
     event: WorkflowBackgroundRunTerminalEvent
@@ -164,6 +178,7 @@ export class WorkflowService {
   private readonly getCurrentProjectTrusted?: () => boolean | Promise<boolean>;
   private readonly runnerId: string;
   private readonly clock?: WorkflowRunnerClock;
+  private readonly archiveAdmission: WorkflowArchiveAdmissionGuard;
 
   private readonly backgroundRuns = new Set<Promise<void>>();
 
@@ -177,6 +192,7 @@ export class WorkflowService {
     );
     this.taskAdapter = options.taskAdapter;
     this.taskAdapterFactory = options.taskAdapterFactory;
+    this.evaluationAdapter = options.evaluationAdapter;
     this.resolveWorkflowScript = options.resolveWorkflowScript;
     this.onBackgroundRunTerminal = options.onBackgroundRunTerminal;
     this.onRunStatusChanged = options.onRunStatusChanged;
@@ -186,6 +202,7 @@ export class WorkflowService {
     this.getCurrentProjectTrusted = options.getCurrentProjectTrusted;
     this.runnerId = options.runnerId;
     this.clock = options.clock;
+    this.archiveAdmission = options.archiveAdmission;
   }
 
   async listRuns(input: { workspaceId: string }): Promise<WorkflowRunRecord[]> {
@@ -357,7 +374,10 @@ export class WorkflowService {
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
     // Archive admission pairing; see resumeRunInBackground.
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -380,7 +400,10 @@ export class WorkflowService {
     // Archive admission pairing: refuse while the workspace is archiving/archived, and hold
     // the admission across the method so the archive sink observes a resume that has not yet
     // durably re-activated its run (see workflowArchiveAdmission).
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -402,7 +425,10 @@ export class WorkflowService {
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
     // Archive admission pairing; see resumeRunInBackground.
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -423,7 +449,10 @@ export class WorkflowService {
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
     // Archive admission pairing; see resumeRunInBackground.
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -518,7 +547,10 @@ export class WorkflowService {
 
   async startWorkflowInBackground(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
     // Archive admission pairing; see resumeRunInBackground.
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const createdRun = await this.createWorkflowRun({
       ...input,
       attentionPolicy: "notify_on_terminal",
@@ -541,7 +573,10 @@ export class WorkflowService {
 
   async startWorkflow(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
     // Archive admission pairing; see resumeRunInBackground.
-    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(
+      this.archiveAdmission,
+      input.workspaceId
+    );
     const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
@@ -941,6 +976,7 @@ export class WorkflowService {
       runStore: this.runStore,
       runtimeFactory: this.runtimeFactory,
       taskAdapter: this.taskAdapterFactory?.(runId, workflowName) ?? this.requireTaskAdapter(),
+      evaluationAdapter: this.evaluationAdapter,
       nestedWorkflowAdapter: {
         createRun: async (input) => {
           const run = await this.createNestedWorkflowRun(input);
@@ -980,6 +1016,8 @@ export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are d
 export interface WorkflowServiceContext {
   config: Config;
   aiService: AIService;
+  evaluationService: EvaluationService;
+  sessionUsageService: SessionUsageService;
   initStateManager: InitStateManager;
   workspaceService: WorkspaceService;
   taskService: TaskService;
@@ -1055,14 +1093,25 @@ export async function resolveWorkflowContext(
     skillStorageContext,
     projectTrusted,
     service: new WorkflowService({
+      archiveAdmission: context.workspaceService,
       notifyInterruptedBackgroundRunTerminal:
         options.notifyInterruptedBackgroundRunTerminal === true,
       runStore: new WorkflowRunStore({
         sessionDir: path.join(context.config.sessionsDir, workspaceId),
       }),
       runtimeFactory: context.workflowRuntimeFactory,
+      evaluationAdapter: new WorkflowEvaluationAdapter({
+        evaluationService: context.evaluationService,
+        aiService: context.aiService,
+        sessionUsageService: context.sessionUsageService,
+        config: context.config,
+        workspaceId,
+        requestAnalyticsIngest: (usageWorkspaceId) => {
+          context.workspaceService.emit("analyticsIngest", { workspaceId: usageWorkspaceId });
+        },
+      }),
       taskAdapterFactory: (runId, workflowName) =>
-        new WorkflowTaskServiceAdapter({
+        createProductionWorkflowTaskAdapter({
           taskService: context.taskService,
           parentWorkspaceId: workspaceId,
           workflowRunId: runId,
@@ -1194,7 +1243,10 @@ export async function resumeWorkflowRun(
   context: WorkflowServiceContext,
   input: { workspaceId: string; runId: string }
 ): Promise<StartNamedWorkflowResult> {
-  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(
+    context.workspaceService,
+    input.workspaceId
+  );
   const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId);
   return service.resumeRunInBackground({ ...input, projectTrusted });
 }
@@ -1203,7 +1255,10 @@ export async function retryWorkflowRunFromCheckpoint(
   context: WorkflowServiceContext,
   input: { workspaceId: string; runId: string }
 ): Promise<StartNamedWorkflowResult> {
-  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(
+    context.workspaceService,
+    input.workspaceId
+  );
   const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId, {
     onBackgroundRunTerminal: (event) => {
       const name = event.run.workflow.sourcePath ?? event.run.workflow.name;
@@ -1223,7 +1278,10 @@ export async function startWorkflowRun(
   input: WorkflowStartRequest,
   signal?: AbortSignal
 ): Promise<StartNamedWorkflowResult & { invocationMessagePersisted?: boolean }> {
-  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(
+    context.workspaceService,
+    input.workspaceId
+  );
   let invocationMessagePersisted: boolean | undefined;
   let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
   const invocationPersistence = new Promise<boolean>((resolve) => {

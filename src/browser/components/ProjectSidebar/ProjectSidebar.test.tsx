@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 
 import React, { type ComponentProps, type PropsWithChildren } from "react";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
@@ -44,7 +44,11 @@ import * as WorkspaceSectionDropZoneModule from "../WorkspaceSectionDropZone/Wor
 import * as WorkspaceDragLayerModule from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type ProjectSidebarComponent from "./ProjectSidebar";
+import type * as AgentListItemModuleExports from "@/browser/components/AgentListItem/AgentListItem";
 import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -57,23 +61,54 @@ const ProviderIconSvgStub = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="provider-icon-mock" {...props} />
 );
 
-function installProviderIconSvgMocks() {
-  const providerIconSvgPaths = [
-    "@/browser/assets/icons/anthropic.svg?react",
-    "@/browser/assets/icons/openai.svg?react",
-    "@/browser/assets/icons/google.svg?react",
-    "@/browser/assets/icons/xai.svg?react",
-    "@/browser/assets/icons/openrouter.svg?react",
-    "@/browser/assets/icons/ollama.svg?react",
-    "@/browser/assets/icons/deepseek.svg?react",
-    "@/browser/assets/icons/moonshotai.svg?react",
-    "@/browser/assets/icons/zai.svg?react",
-    "@/browser/assets/icons/aws.svg?react",
-    "@/browser/assets/icons/github.svg?react",
-    "@/browser/assets/icons/coder.svg?react",
-  ] as const;
+const PROVIDER_ICON_SVG_PATHS = [
+  "@/browser/assets/icons/anthropic.svg?react",
+  "@/browser/assets/icons/openai.svg?react",
+  "@/browser/assets/icons/google.svg?react",
+  "@/browser/assets/icons/xai.svg?react",
+  "@/browser/assets/icons/openrouter.svg?react",
+  "@/browser/assets/icons/ollama.svg?react",
+  "@/browser/assets/icons/deepseek.svg?react",
+  "@/browser/assets/icons/moonshotai.svg?react",
+  "@/browser/assets/icons/zai.svg?react",
+  "@/browser/assets/icons/aws.svg?react",
+  "@/browser/assets/icons/github.svg?react",
+  "@/browser/assets/icons/coder.svg?react",
+] as const;
 
-  for (const svgPath of providerIconSvgPaths) {
+// installProjectSidebarTestDoubles() registers module mocks from setup hooks, and `mock.restore()`
+// in cleanup does not undo mock.module, so restore the real modules once the suite ends; they
+// otherwise leak into every later test file in the bun process (#4639).
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
+  ["@/browser/components/PositionedMenu/PositionedMenu", { ...RealPositionedMenuModule }],
+]);
+// AgentListItem and the SVGs (logos, provider icons) are restored lazily instead: loading them
+// (or AgentListItem's SVG icons) while this file's module graph is being evaluated makes bun's
+// warm transpiler cache parse the SVG assets as JSX ("Legacy HTML comments not implemented").
+// The query-suffixed AgentListItem is the same real instance the real-row tests render. Without
+// svgr, bun test's real `?react` SVG module is the file loader's `{ default: <asset path> }`.
+function realAgentListItemModule(): typeof AgentListItemModuleExports {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  return require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as typeof AgentListItemModuleExports;
+  /* eslint-enable @typescript-eslint/no-require-imports */
+}
+afterAll(() => {
+  for (const svgPath of [
+    "@/browser/assets/logos/xum-logo-dark.svg?react",
+    "@/browser/assets/logos/xum-logo-light.svg?react",
+    ...PROVIDER_ICON_SVG_PATHS,
+  ]) {
+    void mock.module(svgPath, () => ({
+      default: Bun.resolveSync(svgPath.replace(/\?react$/, ""), import.meta.dir),
+    }));
+  }
+  const realAgentListItem = { ...realAgentListItemModule() };
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => realAgentListItem);
+});
+
+function installProviderIconSvgMocks() {
+  for (const svgPath of PROVIDER_ICON_SVG_PATHS) {
     void mock.module(svgPath, () => ({
       __esModule: true,
       default: ProviderIconSvgStub,
@@ -146,15 +181,6 @@ let latestArchiveWorkspaceHandler:
   | null = null;
 
 let ProjectSidebar!: typeof ProjectSidebarComponent;
-let latestArchiveConfirmationModalProps: {
-  isOpen: boolean;
-  title: string;
-  description?: string;
-  warning?: string;
-  confirmLabel?: string;
-  onConfirm: () => void | Promise<void>;
-  onCancel: () => void;
-} | null = null;
 let preflightArchiveWorkspaceMock = mock(
   (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
 );
@@ -171,6 +197,7 @@ let archivePopoverShowErrorMock = mock(
 );
 
 let interruptibleWorkspaceIds = new Set<string>();
+let monitoredWorkspaceIds = new Set<string>();
 let workspaceStoreSubscriptions = new Map<string, () => void>();
 let activeWorkflowRunIdsByWorkspaceId = new Map<string, string[]>();
 
@@ -183,6 +210,7 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
     userProjects: new Map([[projectPath, { workspaces: [] }]]),
   });
   interruptibleWorkspaceIds = new Set();
+  monitoredWorkspaceIds = new Set();
   workspaceStoreSubscriptions = new Map();
   activeWorkflowRunIdsByWorkspaceId = new Map();
   installProjectSidebarTestDoubles();
@@ -215,11 +243,8 @@ function renderProjectSidebarForWorkspace(
   );
 }
 
-function useArchiveActions(
-  actions: Pick<
-    ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>,
-    "preflightArchiveWorkspace" | "archiveWorkspace"
-  >
+function mockWorkspaceActions(
+  actions: Partial<ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>>
 ) {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
@@ -303,7 +328,6 @@ function installProjectSidebarTestDoubles() {
   );
   confirmDialogMock = mock(() => Promise.resolve(true));
   latestArchiveWorkspaceHandler = null;
-  latestArchiveConfirmationModalProps = null;
   void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
     __esModule: true,
     default: () => <svg data-testid="xum-logo-dark" />,
@@ -312,7 +336,7 @@ function installProjectSidebarTestDoubles() {
     __esModule: true,
     default: () => <svg data-testid="xum-logo-light" />,
   }));
-  void mock.module("../AgentListItem/AgentListItem", () => ({
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => ({
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
@@ -329,13 +353,8 @@ function installProjectSidebarTestDoubles() {
       const metadata = props.metadata;
 
       if (renderRealAgentListItems) {
-        /* eslint-disable @typescript-eslint/no-require-imports */
-        const ActualAgentListItem = (
-          require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as {
-            AgentListItem: React.ComponentType<Record<string, unknown>>;
-          }
-        ).AgentListItem;
-        /* eslint-enable @typescript-eslint/no-require-imports */
+        const ActualAgentListItem = realAgentListItemModule()
+          .AgentListItem as unknown as React.ComponentType<Record<string, unknown>>;
         return <ActualAgentListItem {...(props as unknown as Record<string, unknown>)} />;
       }
 
@@ -592,6 +611,7 @@ function installProjectSidebarTestDoubles() {
         getWorkspaceMetadata: () => undefined,
         getWorkspaceSidebarState: (workspaceId: string) => ({
           canInterrupt: interruptibleWorkspaceIds.has(workspaceId),
+          activeBashMonitorCount: monitoredWorkspaceIds.has(workspaceId) ? 1 : 0,
           isStarting: false,
           awaitingUserQuestion: false,
           lastAbortReason: null,
@@ -631,7 +651,6 @@ function installProjectSidebarTestDoubles() {
     onConfirm: () => void | Promise<void>;
     onCancel: () => void;
   }) => {
-    latestArchiveConfirmationModalProps = props;
     return props.isOpen ? (
       <div data-testid="archive-confirmation-modal">
         <div>{props.title}</div>
@@ -681,7 +700,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceDragLayerModule, "WorkspaceDragLayer").mockImplementation(
     (() => null) as unknown as typeof WorkspaceDragLayerModule.WorkspaceDragLayer
   );
-  void mock.module("../PositionedMenu/PositionedMenu", () => ({
+  void mock.module("@/browser/components/PositionedMenu/PositionedMenu", () => ({
     PositionedMenu: (props: { open: boolean; children: React.ReactNode }) =>
       props.open ? <div data-testid="project-actions-menu">{props.children}</div> : null,
     PositionedMenuItem: (props: {
@@ -832,7 +851,9 @@ describe("ProjectSidebar scratch chats", () => {
       agentItemTestId("alpha"),
     ]);
 
-    act(() => updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false));
+    act(() => {
+      updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false);
+    });
     await waitFor(() => {
       expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
       expect(view.getByLabelText("Expand project beta")).toBeTruthy();
@@ -926,6 +947,140 @@ describe("ProjectSidebar flat chat list", () => {
   const singleProjectRefs = [
     { projectPath: "/projects/demo-project", projectName: "demo-project" },
   ];
+
+  describe("New chat button", () => {
+    const olderDemo = {
+      ...createWorkspace("older-demo", { title: "Older demo chat" }),
+      projects: singleProjectRefs,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const newerOther = {
+      ...createWorkspace("newer-other", { title: "Newer other chat" }),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+      createdAt: "2026-01-02T00:00:00.000Z",
+    };
+
+    function renderFlatSidebar(
+      sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>
+    ) {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({ createWorkspaceDraft });
+      const view = render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={sortedWorkspacesByProject}
+          workspaceRecency={{}}
+        />
+      );
+      fireEvent.click(view.getByRole("button", { name: "New chat" }));
+      return createWorkspaceDraft;
+    }
+
+    test("targets the project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("ignores a newer sub-agent because it is not a user-created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+      const newestChild = {
+        ...createWorkspace("newest-child", {
+          title: "Newest sub-agent",
+          parentWorkspaceId: olderDemo.id,
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo, newestChild]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("targets scratch when the most recently created chat is a scratch chat", () => {
+      const scratchPath = "/home/user/.xum/scratch/scratch-newest";
+      const scratch: FrontendWorkspaceMetadata = {
+        kind: "scratch",
+        id: "scratch-newest",
+        name: "scratch-scratch-newest",
+        projectName: "Scratch",
+        projectPath: scratchPath,
+        namedWorkspacePath: scratchPath,
+        createdAt: "2026-01-03T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          [SCRATCH_PROJECT_CONFIG_KEY, [scratch]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+
+    test("targets the sub-project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          [
+            "/projects/demo-project/features",
+            { parentProjectPath: "/projects/demo-project", workspaces: [] },
+          ],
+        ]),
+      });
+      const newerInSection = {
+        ...createWorkspace("newer-section", {
+          title: "Newer section chat",
+          subProjectPath: "/projects/demo-project/features",
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([["/projects/demo-project", [olderDemo, newerInSection]]])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("falls back to scratch when there are no chats", () => {
+      const createWorkspaceDraft = renderFlatSidebar(new Map());
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+  });
 
   test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
@@ -1427,6 +1582,40 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     expect(view.queryByText("Multi-Project")).toBeNull();
     expect(view.queryByTestId(agentItemTestId("parent"))).toBeNull();
     expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+  });
+
+  test("shows a reported child only while its background Bash monitor is armed", () => {
+    const parentWorkspace = createWorkspace("parent");
+    const childWorkspace = {
+      ...createWorkspace("child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      taskExecutionStatus: "completed" as const,
+    };
+    // The stream hint stays true throughout, as it can during final-turn teardown.
+    // Arming/retiring a monitor must still trigger a render when isWorking is unchanged.
+    interruptibleWorkspaceIds.add("child");
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childWorkspace]]])
+        }
+        workspaceRecency={{}}
+      />
+    );
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    act(() => {
+      monitoredWorkspaceIds.add("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.getByTestId(agentItemTestId("child"))).toBeTruthy();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("1");
+    act(() => {
+      monitoredWorkspaceIds.delete("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("0");
   });
 
   test("keeps inactive persistent children out of the left sidebar", () => {
@@ -2583,119 +2772,6 @@ describe("ProjectSidebar archive confirmations", () => {
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
     expect(view.getByRole("button", { name: "Archive and delete files" })).toBeTruthy();
   });
-
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    let archiveAttempt = 0;
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        archiveAttempt += 1;
-        if (archiveAttempt === 1) {
-          return resolveArchiveResult({
-            kind: "confirm-lossy-untracked-files",
-            paths: ["late-file.txt"],
-          });
-        }
-
-        expect(workspaceId).toBe("archive-late-confirm");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return resolveArchiveResult({ kind: "archived" });
-      }
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-late-confirm"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-    expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(1, workspace.id, undefined);
-
-    act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive and delete files" }));
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(2);
-    });
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(2, workspace.id, {
-      acknowledgedUntrackedPaths: ["late-file.txt"],
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-  });
-
-  test("surfaces archive errors after confirmation when untracked paths are unchanged", async () => {
-    let preflightCallCount = 0;
-    preflightArchiveWorkspaceMock = mock(
-      (_workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        preflightCallCount += 1;
-        return resolveArchivePreflight({
-          kind: "confirm-lossy-untracked-files",
-          paths: ["late-file.txt"],
-        });
-      }
-    );
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        expect(workspaceId).toBe("archive-stable-untracked");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return Promise.resolve({ success: false as const, error: "snapshot failed" });
-      }
-    );
-
-    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
-      () =>
-        ({
-          error: null,
-          showError: archivePopoverShowErrorMock,
-          clearError: mock(() => undefined),
-        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-stable-untracked"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-      expect(archivePopoverShowErrorMock).toHaveBeenCalledTimes(1);
-    });
-    expect(preflightCallCount).toBe(2);
-    expect(archivePopoverShowErrorMock).toHaveBeenCalledWith(workspace.id, "snapshot failed");
-    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
-  });
 });
 
 describe("ProjectSidebar archive errors", () => {
@@ -2771,70 +2847,6 @@ describe("ProjectSidebar archive errors", () => {
     expect(args?.[0]).toBe(workspace.id);
     expect(args?.[1]).toBe("snapshot failed");
     expect(args?.length).toBe(2);
-  });
-});
-
-describe("ProjectSidebar archive confirmations", () => {
-  beforeEach(() => setupProjectSidebarDom());
-  afterEach(cleanupProjectSidebarDom);
-
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    const workspace = {
-      ...createWorkspace("archive-race-window"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    let preflightCallCount = 0;
-    const preflightArchiveWorkspace = mock(
-      (workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        if (workspaceId !== workspace.id) {
-          return Promise.resolve({ success: true, data: { kind: "ready" } });
-        }
-        preflightCallCount += 1;
-        if (preflightCallCount === 1) {
-          return Promise.resolve({
-            success: true,
-            data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
-          });
-        }
-        return Promise.resolve({
-          success: true,
-          data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt", "b.txt"] },
-        });
-      }
-    );
-    const archiveWorkspace = mock(() =>
-      Promise.resolve({
-        success: false as const,
-        error:
-          "Untracked files changed since you reviewed them. New files: b.txt. Please try again.",
-      })
-    );
-
-    useArchiveActions({ preflightArchiveWorkspace, archiveWorkspace });
-
-    renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("a.txt")).toBe(true);
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(preflightArchiveWorkspace.mock.calls.length).toBe(2);
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("b.txt")).toBe(true);
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
   });
 });
 

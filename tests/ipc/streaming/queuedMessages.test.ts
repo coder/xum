@@ -66,7 +66,7 @@ async function waitForQueueDrained(
   for (;;) {
     const queuedEvents = collector.getEvents().filter(isQueuedMessageChanged);
     const latest = queuedEvents[queuedEvents.length - 1];
-    if (latest && latest.queuedMessages.length === 0 && (latest.fileParts ?? []).length === 0) {
+    if (latest?.queuedMessages.length === 0 && (latest.fileParts ?? []).length === 0) {
       return latest;
     }
     if (Date.now() - startTime >= timeoutMs) return null;

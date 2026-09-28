@@ -15,12 +15,12 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | ---------------------- | ----------------------------- | ------------------------------------------------------------ | ------- |
 | Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |
 | Mythos 5.1             | anthropic:claude-mythos-5-1   | `mythos`                                                     |         |
-| Opus 5                 | anthropic:claude-opus-5       | `opus`                                                       | ✓       |
+| Opus 5.5               | anthropic:claude-opus-5-5     | `opus`                                                       | ✓       |
 | Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |
 | Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |
-| GPT-5.6 Sol            | openai:gpt-5.6-sol            | `gpt`, `sol`                                                 |         |
+| GPT-6 Sol              | openai:gpt-6-sol              | `gpt`, `sol`                                                 |         |
 | GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |
-| GPT-5.6 Luna           | openai:gpt-5.6-luna           | `luna`                                                       |         |
+| GPT-6 Luna             | openai:gpt-6-luna             | `luna`                                                       |         |
 | GPT-6 Astra            | openai:gpt-6-astra            | `astra`, `gpt-6-astra`                                       |         |
 | GPT-5.5 Pro            | openai:gpt-5.5-pro            | `gpt-pro`, `gpt-5.5-pro`                                     |         |
 | GPT-5.4 Mini           | openai:gpt-5.4-mini           | `gpt-mini`                                                   |         |
@@ -33,7 +33,7 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Daybreak Red Latest    | openai:daybreak-red-latest    | —                                                            |         |
 | Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |
 | Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |
-| Grok 4.6               | xai:grok-4.6                  | `grok`, `grok-4.6`                                           |         |
+| Grok 4.7               | xai:grok-4.7                  | `grok`, `grok-4.7`                                           |         |
 | DeepSeek V4 Pro        | deepseek:deepseek-v4-pro      | `deepseek`, `deepseek-pro`, `deepseek-v4`, `deepseek-v4-pro` |         |
 | DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |
 | Kimi K3                | moonshotai:kimi-k3            | `kimi`, `k3`, `kimi-k3`                                      |         |
@@ -41,9 +41,11 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 
 {/* END KNOWN_MODELS_TABLE */}
 
-### Pro reasoning mode (GPT-5.6 and GPT-6 Astra)
+GPT-6 Sol and Luna support thinking from off through max on the default Responses API route. On the opt-in Chat Completions route, Xum disables their reasoning because OpenAI only supports function calling there with reasoning off.
 
-GPT-6 Astra and every GPT-5.6 model (Sol, Terra, and Luna) support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
+### Pro reasoning mode (GPT-5.6 and GPT-6)
+
+GPT-6 models (Astra, Sol, and Luna) and every GPT-5.6 model support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
 
 For advisor calls, enable the Advisor Tool experiment and use its **Reasoning** picker under **Settings → Experiments**. Advisor Pro mode is saved independently of reasoning effort and the calling chat’s mode.
 
@@ -64,6 +66,44 @@ Alternatively, use the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`):
 3. Choose from available models
 
 Models are specified in the format: `provider:model-name`
+
+## Add custom models
+
+Under **Settings → Models**, choose a provider and use the **Model ID** field to
+search its catalog or enter an ID. Clicking a suggestion, or selecting one with
+arrow keys and Enter, adds it immediately. Without an explicit selection, **Add**
+or Enter adds the ID you typed.
+
+Opening the field requests suggestions for the selected provider. Discovery does
+not add models to your configured list or change routing. You can still enter IDs
+while suggestions load, when the catalog is empty, or when listing fails.
+
+### Suggestion availability
+
+| Provider                                          | Catalog used for suggestions                                                                                                                                                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anthropic, xAI, DeepSeek, Moonshot AI, OpenRouter | The configured provider's model-list API.                                                                                                                                                                                    |
+| OpenAI                                            | The API-key catalog. Codex OAuth-only listing and Azure deployment enumeration are not supported. If both an API key and OAuth are configured, suggestions describe the API-key account, not OAuth access.                   |
+| Google                                            | Gemini Developer API models that advertise content generation. Vertex AI is not included.                                                                                                                                    |
+| Ollama                                            | Models installed on the configured Ollama server.                                                                                                                                                                            |
+| GitHub Copilot                                    | The configured endpoint's catalog, using the existing token without updating Copilot's login catalog.                                                                                                                        |
+| Coder                                             | The existing deployment catalog. Use **Settings → Providers → Coder → Refresh models** to update it.                                                                                                                         |
+| Z.ai and custom providers                         | Available only if the configured server supports model listing. Supporting inference alone does not guarantee a listing API. This applies to OpenAI-compatible, OpenAI Responses, and Anthropic Messages custom providers.   |
+| Bedrock                                           | On-demand text foundation models and active inference profiles backed only by text models, in the configured region. Listing requires a supported fixed credential configuration and permission for both catalog operations. |
+
+Bedrock suggestions support configured or environment bearer tokens, explicit AWS
+keys, and environment AWS keys when no profile is selected. They use standard
+regional endpoints. Profile-based authentication, SSO, role assumption, credential
+processes, metadata credentials, and custom endpoints are not supported for
+suggestions; enter model IDs manually for those configurations. These limits apply
+to discovery, not to inference.
+
+Xum Gateway remains a routing option, not a provider in this field. Configure it
+through the **Route** column instead.
+
+A catalog entry does not guarantee account access, tool support, or availability
+through every route. Adding a model is separate from choosing its route; see
+[Providers](/config/providers) for routing and credential setup.
 
 ## One-shot Overrides
 

@@ -74,6 +74,20 @@ describe("replacement history row evidence", () => {
     mock.restore();
     await fs.rm(directory, { recursive: true, force: true });
   });
+  /**
+   * fs.open is process-global. Detached history work left running by an earlier file in the same
+   * bun process can open its own files while a spy is installed (#5000: its still-open handle
+   * failed the "closes all acquired handles" check). Intercept only opens under this test's
+   * directory and pass every other caller through to the real implementation.
+   */
+  function spyOnOwnOpens(
+    ownOpen: (...args: Parameters<typeof fs.open>) => ReturnType<typeof fs.open>
+  ) {
+    const open = fs.open;
+    spyOn(fs, "open").mockImplementation((...args: Parameters<typeof open>) =>
+      String(args[0]).startsWith(directory + path.sep) ? ownOpen(...args) : open(...args)
+    );
+  }
   async function collect(content: string | Buffer, name = "chat.jsonl") {
     const file = path.join(directory, name);
     await fs.writeFile(file, content);
@@ -102,7 +116,7 @@ describe("replacement history row evidence", () => {
       await fs.writeFile(file, mutation === "append-after-empty-stat" ? "" : original);
       const open = fs.open;
       let captured: fs.FileHandle | undefined;
-      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+      spyOnOwnOpens(async (...args: Parameters<typeof open>) => {
         const handle = await open(...args);
         if (!captured) {
           captured = handle;
@@ -178,7 +192,7 @@ describe("replacement history row evidence", () => {
       const reason = { canceled: "outer disposal" };
       const open = fs.open;
       let outer: fs.FileHandle | undefined;
-      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+      spyOnOwnOpens(async (...args: Parameters<typeof open>) => {
         const handle = await open(...args);
         if (!outer) {
           outer = handle;
@@ -378,7 +392,7 @@ describe("replacement history row evidence", () => {
     const [, right] = await collect("null\n" + raw + "\n", "archive.jsonl");
     const open = fs.open;
     let reads = 0;
-    spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+    spyOnOwnOpens(async (...args: Parameters<typeof open>) => {
       const handle = await open(...args);
       const read = handle.read.bind(handle);
       spyOn(handle, "read").mockImplementation(
@@ -427,7 +441,7 @@ describe("replacement history row evidence", () => {
     const [row] = await collect(JSON.stringify(message()) + "\n" + JSON.stringify(message()));
     const open = fs.open;
     const handles: fs.FileHandle[] = [];
-    spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+    spyOnOwnOpens(async (...args: Parameters<typeof open>) => {
       const handle = await open(...args);
       handles.push(handle);
       return handle;
@@ -446,6 +460,8 @@ describe("replacement history row evidence", () => {
     release.resolve();
     expect(await pending).toBe(false);
     expect(visits).toBe(1);
+    // spyOnOwnOpens records only opens under this test's directory; guard against a vacuous every([]).
+    expect(handles.length).toBeGreaterThan(0);
     expect(handles.every((handle) => handle.fd === -1)).toBe(true);
   });
 
@@ -459,7 +475,7 @@ describe("replacement history row evidence", () => {
     const controller = new AbortController();
     const reason = { canceled: "while opening missing artifact" };
     const open = fs.open;
-    spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+    spyOnOwnOpens(async (...args: Parameters<typeof open>) => {
       try {
         return await open(...args);
       } finally {
@@ -472,7 +488,7 @@ describe("replacement history row evidence", () => {
       )
     ).toBe(reason);
     mock.restore();
-    spyOn(fs, "open").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+    spyOnOwnOpens(() => Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" })));
     const denied = await scanHistoryReplacementRows(missing, () => true).catch(
       (error: unknown) => error
     );

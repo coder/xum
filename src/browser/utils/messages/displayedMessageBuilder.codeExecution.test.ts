@@ -43,7 +43,23 @@ describe("buildDisplayedMessagesForMessage code_execution nested-call reconstruc
     ]);
     expect(row.nestedCalls).toHaveLength(1);
     expect(row.nestedCalls?.[0]?.output).toEqual({ output: "a b c" });
+    expect(row.nestedCalls?.[0]?.state).toBe("output-available");
   });
+
+  test.each([undefined, "true", 1, null])(
+    "does not hide malformed missing results without a compact ok flag: %j",
+    (ok) => {
+      const row = buildToolRow([
+        {
+          toolName: "task_send_message",
+          args: { task_id: "child", message: "Hello" },
+          ok,
+          duration_ms: 1,
+        },
+      ]);
+      expect(row.nestedCalls?.[0]?.state).toBe("output-available");
+    }
+  );
 
   test("kernel compact records reconstruct without a synthetic output", () => {
     const row = buildToolRow([
@@ -52,6 +68,11 @@ describe("buildDisplayedMessagesForMessage code_execution nested-call reconstruc
       { toolName: "bash", args: { cmd: "rm" }, ok: false, bytes: 0, error: "boom", duration_ms: 1 },
     ]);
     expect(row.nestedCalls).toHaveLength(3);
+    expect(row.nestedCalls?.map((call) => call.state)).toEqual([
+      "output-available",
+      "output-available",
+      "output-available",
+    ]);
     // No fabricated output shape: a real tool result could collide with it,
     // so failure travels out-of-band via the failed flag instead.
     expect(row.nestedCalls?.[0]?.output).toBeUndefined();

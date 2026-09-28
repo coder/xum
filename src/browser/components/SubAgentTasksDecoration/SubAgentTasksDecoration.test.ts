@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import {
   collectDescendantAgents,
+  decodeDescendantActivity,
+  encodeDescendantActivity,
   getSubAgentStatusPresentation,
   isSubAgentActive,
   mergeActiveWorkflowGroups,
@@ -231,6 +234,150 @@ describe("collectDescendantAgents", () => {
         workspace("failed", { taskStatus: "reported", taskExecutionStatus: "error" })
       ).label
     ).toBe("Failed");
+  });
+});
+
+describe("descendant activity hints", () => {
+  /** Sidebar state of an idle child; `canInterrupt` stands in for a stale live hint. */
+  function sidebarState(overrides: Partial<WorkspaceSidebarState> = {}): WorkspaceSidebarState {
+    return {
+      canInterrupt: false,
+      isStarting: false,
+      awaitingUserQuestion: false,
+      lastAbortReason: null,
+      currentModel: null,
+      pendingStreamModel: null,
+      recencyTimestamp: null,
+      loadedSkills: [],
+      skillLoadErrors: [],
+      agentStatus: undefined,
+      activeWorkflowRunCount: 0,
+      activeBashMonitorCount: 0,
+      terminalActiveCount: 0,
+      terminalSessionCount: 0,
+      ...overrides,
+    };
+  }
+  const monitors = (count: number) => sidebarState({ activeBashMonitorCount: count });
+  const reported = workspace("reported", { taskStatus: "reported" });
+  const completed = workspace("completed", {
+    taskStatus: "reported",
+    taskExecutionStatus: "completed",
+  });
+
+  test("a reported child with no monitors stays inactive even under stale live hints", () => {
+    const hints = decodeDescendantActivity(
+      encodeDescendantActivity([reported.id], () => sidebarState({ canInterrupt: true }))
+    ).get(reported.id);
+    expect(hints).toEqual({ hasActiveBashMonitor: false, isLiveActive: true });
+    expect(isSubAgentActive(reported, hints)).toBe(false);
+    expect(getSubAgentStatusPresentation(reported, hints).label).toBe("Completed");
+    expect(isSubAgentActive(completed, hints)).toBe(false);
+    expect(getSubAgentStatusPresentation(completed, hints).label).toBe("Completed");
+  });
+
+  test("monitors arming and retiring on an unchanged child flip the snapshot and the row", () => {
+    // Only the monitor count moves 0 -> 1 -> 0; the stale live hint stays true throughout.
+    const keys = [0, 1, 0].map((count) =>
+      encodeDescendantActivity([completed.id], () =>
+        sidebarState({ activeBashMonitorCount: count, canInterrupt: true })
+      )
+    );
+    // Monitor-only changes must produce a new snapshot so useSyncExternalStore re-renders,
+    // and retirement must return to the exact previous snapshot (no spurious churn).
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys[2]).toBe(keys[0]);
+    const steps = keys.map((key) => {
+      const hints = decodeDescendantActivity(key).get(completed.id);
+      return {
+        active: isSubAgentActive(completed, hints),
+        presentation: getSubAgentStatusPresentation(completed, hints),
+      };
+    });
+    expect(steps.map((step) => step.active)).toEqual([false, true, false]);
+    expect(steps.map((step) => step.presentation.label)).toEqual([
+      "Completed",
+      "Monitoring",
+      "Completed",
+    ]);
+    // Monitoring is a distinct settled-but-armed presentation, not a spinner.
+    expect(steps[1].presentation.icon).not.toBe(steps[0].presentation.icon);
+    expect(steps[1].presentation.iconClassName).not.toContain("animate-spin");
+  });
+
+  test("counts monitored children, not monitors, and partial retirement stays active", () => {
+    const two = encodeDescendantActivity([reported.id], () => monitors(2));
+    const one = encodeDescendantActivity([reported.id], () => monitors(1));
+    expect(one).toBe(two);
+    expect(isSubAgentActive(reported, decodeDescendantActivity(two).get(reported.id))).toBe(true);
+  });
+
+  test("a monitor moving between children with an unchanged total updates both rows", () => {
+    const first = workspace("first", { taskStatus: "reported" });
+    const second = workspace("second", { taskStatus: "reported" });
+    const encode = (monitored: string) =>
+      encodeDescendantActivity([first.id, second.id], (id) => monitors(id === monitored ? 1 : 0));
+    const before = encode(first.id);
+    const after = encode(second.id);
+    expect(after).not.toBe(before);
+    const label = (key: string, child: FrontendWorkspaceMetadata) =>
+      getSubAgentStatusPresentation(child, decodeDescendantActivity(key).get(child.id)).label;
+    expect([label(before, first), label(before, second)]).toEqual(["Monitoring", "Completed"]);
+    expect([label(after, first), label(after, second)]).toEqual(["Completed", "Monitoring"]);
+  });
+
+  test("keeps queued, reawakened and unfinished live children active without monitors", () => {
+    const noMonitor = sidebarState();
+    const live = sidebarState({ canInterrupt: true });
+    const decode = (child: FrontendWorkspaceMetadata, state: WorkspaceSidebarState) =>
+      decodeDescendantActivity(encodeDescendantActivity([child.id], () => state)).get(child.id);
+    const queued = workspace("queued", { taskStatus: "queued" });
+    expect(isSubAgentActive(queued, decode(queued, noMonitor))).toBe(true);
+    expect(getSubAgentStatusPresentation(queued, decode(queued, noMonitor)).label).toBe("Queued");
+    const reawakened = workspace("reawakened", {
+      taskStatus: "reported",
+      taskExecutionStatus: "running",
+    });
+    expect(isSubAgentActive(reawakened, decode(reawakened, noMonitor))).toBe(true);
+    // An interrupted child without a finalized report may still be streaming, so the
+    // live hint decides, as it does for the sidebar.
+    const interrupted = workspace("interrupted", { taskStatus: "interrupted" });
+    expect(isSubAgentActive(interrupted, decode(interrupted, noMonitor))).toBe(false);
+    expect(isSubAgentActive(interrupted, decode(interrupted, live))).toBe(true);
+    // ...but a finalized report fences the live hint off.
+    const finalized = workspace("finalized", {
+      taskStatus: "interrupted",
+      reportedAt: "2026-08-09T00:00:00.000Z",
+    });
+    expect(isSubAgentActive(finalized, decode(finalized, live))).toBe(false);
+    // A question waiting on the user is not "working" for the sidebar either.
+    const asking = sidebarState({ canInterrupt: true, awaitingUserQuestion: true });
+    expect(isSubAgentActive(interrupted, decode(interrupted, asking))).toBe(false);
+  });
+
+  test("running rows keep their precedence over an armed monitor", () => {
+    const running = workspace("running", { taskStatus: "running" });
+    const hints = decodeDescendantActivity(
+      encodeDescendantActivity([running.id], () => monitors(1))
+    ).get(running.id);
+    expect(getSubAgentStatusPresentation(running, hints).label).toBe("Running");
+    const failed = workspace("failed", { taskStatus: "reported", taskExecutionStatus: "error" });
+    expect(getSubAgentStatusPresentation(failed, hints).label).toBe("Failed");
+  });
+
+  test("missing or removed sidebar state reads as no hints", () => {
+    const key = encodeDescendantActivity([reported.id, "gone"], (id) =>
+      id === reported.id ? monitors(1) : null
+    );
+    const hints = decodeDescendantActivity(key);
+    expect(hints.get("gone")).toEqual({ hasActiveBashMonitor: false, isLiveActive: false });
+    expect(hints.get(reported.id)?.hasActiveBashMonitor).toBe(true);
+    expect(decodeDescendantActivity(encodeDescendantActivity([], () => null)).size).toBe(0);
+    // A descendant absent from the snapshot (undefined hints) falls back to metadata alone.
+    expect(isSubAgentActive(reported, hints.get("never-encoded"))).toBe(false);
+    expect(getSubAgentStatusPresentation(reported, hints.get("never-encoded")).label).toBe(
+      "Completed"
+    );
   });
 });
 

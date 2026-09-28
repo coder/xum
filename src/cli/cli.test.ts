@@ -71,6 +71,9 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
     tempDir,
     close: async () => {
       await server.close();
+      // Closing HTTP leaves service fibers and intervals alive; stop them before deleting config.
+      await services.dispose();
+      await services.shutdown();
       // Cleanup temp directory
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     },
@@ -177,12 +180,6 @@ describe("CLI via HTTP", () => {
     test("workspace get-info with workspace-id option", async () => {
       const result = await runCli(["workspace", "get-info", "--workspace-id", "nonexistent"]);
       expect(result).toBeNull(); // Non-existent workspace returns null
-    });
-
-    test("general tick with object options", async () => {
-      const result = await runCli(["general", "tick", "--count", "2", "--interval-ms", "10"]);
-      // tick returns an async generator, so result should be the generator
-      expect(result).toBeDefined();
     });
   });
 });

@@ -1,5 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { waitFor, within } from "@storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { isDialogOpen } from "@/browser/utils/ui/keybinds";
 import { Button } from "../Button/Button.js";
 import { Popover, PopoverContent, PopoverTrigger } from "./Popover.js";
 
@@ -38,4 +40,15 @@ export const Default: Story = {
       </Popover>
     </div>
   ),
+  // A non-modal popover also renders role="dialog"; it must NOT count as an open modal, or
+  // every global shortcut would go dead while a menu is showing.
+  play: async () => {
+    const panel = await waitFor(() => within(document.body).getByRole("dialog"));
+    if (panel.getAttribute("data-state") !== "open") {
+      throw new Error("popover panel must be open for the guard contract to be meaningful");
+    }
+    if (isDialogOpen()) {
+      throw new Error("isDialogOpen() must ignore a non-modal Popover");
+    }
+  },
 };

@@ -1,12 +1,13 @@
 import "../dom";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { configure, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { preloadTestModules } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo } from "../../ipc/helpers";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSettingsDialog } from "../helpers";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
@@ -14,6 +15,12 @@ import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/m
 import { execFileAsync } from "@/node/utils/disposableExec";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
+
+// Every wait in this suite covers real backend work: git preview/install, full-tree
+// content hashing, registry writes, MCP reconciliation and plugin discovery. A single
+// component save measured up to ~0.7 s locally under load, so the 1 s default made
+// waits after saves flake on loaded CI runners (#4394). Use one suite-wide budget.
+configure({ asyncUtilTimeout: 10000 });
 
 async function commit(remote: string) {
   using add = execFileAsync("git", ["-C", remote, "add", "-A"]);
@@ -23,14 +30,13 @@ async function commit(remote: string) {
 }
 
 async function openPreview(app: AppHarness, remote: string) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "Plugins" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "Plugins" }));
   fireEvent.click(await canvas.findByRole("button", { name: "Add plugin" }));
   const user = userEvent.setup({ document: app.view.container.ownerDocument });
   await user.type(canvas.getByLabelText("Git URL or owner/repo"), remote);
   await user.click(canvas.getByRole("button", { name: "Preview" }));
-  await canvas.findByRole("checkbox", { name: "review" }, { timeout: 10000 });
+  await canvas.findByRole("checkbox", { name: "review" });
   return { canvas, user };
 }
 
@@ -118,7 +124,7 @@ describeIntegration("Selective plugin imports", () => {
     for (const checkbox of canvas.getAllByRole("checkbox"))
       expect(checkbox.getAttribute("aria-checked")).toBe("false");
     await user.click(install);
-    await canvas.findByText(/0 of 2 skills imported/, {}, { timeout: 10000 });
+    await canvas.findByText(/0 of 2 skills imported/);
     expect(installSpy).toHaveBeenCalledTimes(2);
     expect((await inventory(app)).importedComponents).toEqual({ skills: [], mcpServers: [] });
 
@@ -207,7 +213,7 @@ describeIntegration("Selective plugin imports", () => {
       await user.click(canvas.getByRole("checkbox", { name: "research" }));
       await user.click(canvas.getByRole("checkbox", { name: "reference" }));
       await user.click(canvas.getByRole("button", { name: "Install" }));
-      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await canvas.findByText(/1 of 2 skills imported/);
       await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
       await user.click(await canvas.findByRole("checkbox", { name: "review" }));
       await user.click(canvas.getByRole("checkbox", { name: "research" }));
@@ -283,7 +289,7 @@ describeIntegration("Selective plugin imports", () => {
       await user.click(canvas.getByRole("checkbox", { name: "research" }));
       await user.click(canvas.getByRole("checkbox", { name: "reference" }));
       await user.click(canvas.getByRole("button", { name: "Install" }));
-      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await canvas.findByText(/1 of 2 skills imported/);
       await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
       await user.click(await canvas.findByRole("checkbox", { name: "review" }));
 
@@ -369,7 +375,7 @@ describeIntegration("Selective plugin imports", () => {
       await user.click(canvas.getByRole("checkbox", { name: "research" }));
       await user.click(canvas.getByRole("checkbox", { name: "reference" }));
       await user.click(canvas.getByRole("button", { name: "Install" }));
-      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await canvas.findByText(/1 of 2 skills imported/);
       await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
       await user.click(await canvas.findByRole("checkbox", { name: "review" }));
       const backend = app.env.services.agentPluginInstallService;
@@ -436,15 +442,23 @@ describeIntegration("Selective plugin imports", () => {
   test.each(["button", "keyboard", "palette"] as const)(
     "reopening installation via %s clears prior success through the next failed attempt",
     async (entryPoint) => {
-      const { canvas, user } = await openPreview(app, remote);
+      const opened = await openPreview(app, remote);
+      let canvas = opened.canvas;
+      const user = opened.user;
       await user.click(canvas.getByRole("button", { name: "Install" }));
-      await canvas.findByText("Plugin installed.", {}, { timeout: 10000 });
+      await canvas.findByText("Plugin installed.");
 
       if (entryPoint === "palette") {
+        // The palette cannot open over the settings modal, so it reopens settings from the page.
+        await user.click(canvas.getByRole("button", { name: "Close settings" }));
+        const body = within(app.view.container.ownerDocument.body);
+        await waitFor(() =>
+          expect(body.queryByRole("dialog", { name: "Settings" }) === null).toBe(true)
+        );
         await user.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
-        const palette = within(app.view.container.ownerDocument.body);
-        await user.type(await palette.findByLabelText("Command palette"), "> Install Agent Plugin");
-        await user.click(await palette.findByRole("option", { name: "Install Agent Plugin…" }));
+        await user.type(await body.findByLabelText("Command palette"), "> Install Agent Plugin");
+        await user.click(await body.findByRole("option", { name: "Install Agent Plugin…" }));
+        canvas = within(await body.findByRole("dialog", { name: "Settings" }));
       } else {
         const add = canvas.getByRole("button", { name: "Add plugin" });
         if (entryPoint === "keyboard") {
@@ -464,7 +478,7 @@ describeIntegration("Selective plugin imports", () => {
       await commit(remote);
       await user.type(sourceInput, remote);
       await user.click(canvas.getByRole("button", { name: "Preview" }));
-      await canvas.findByRole("checkbox", { name: "review" }, { timeout: 10000 });
+      await canvas.findByRole("checkbox", { name: "review" });
       expect(canvas.queryByText("Plugin installed.")).toBeNull();
       jest
         .spyOn(app.env.services.agentPluginInstallService, "install")
@@ -482,7 +496,7 @@ describeIntegration("Selective plugin imports", () => {
     await user.click(canvas.getByRole("checkbox", { name: "research" }));
     await user.click(canvas.getByRole("checkbox", { name: "reference" }));
     await user.click(canvas.getByRole("button", { name: "Install" }));
-    await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+    await canvas.findByText(/1 of 2 skills imported/);
     await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
     await user.click(await canvas.findByRole("checkbox", { name: "research" }));
     const before = await inventory(app);
@@ -526,7 +540,7 @@ describeIntegration("Selective plugin imports", () => {
     await user.click(canvas.getByRole("checkbox", { name: "research" }));
     await user.click(canvas.getByRole("checkbox", { name: "reference" }));
     await user.click(canvas.getByRole("button", { name: "Install" }));
-    await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+    await canvas.findByText(/1 of 2 skills imported/);
     jest
       .spyOn(app.env.services.agentPluginInstallService, "getComponents")
       .mockRejectedValueOnce(new Error("Inventory unavailable"));
@@ -539,10 +553,8 @@ describeIntegration("Selective plugin imports", () => {
     await fs.writeFile(path.join(remote, "README.txt"), "Capability-neutral update\n");
     await commit(remote);
     await user.click(canvas.getByRole("button", { name: "Check for updates" }));
-    await user.click(await canvas.findByRole("button", { name: "Update" }, { timeout: 10000 }));
-    await waitFor(async () => expect((await inventory(app)).lockedSha).not.toBe(before.lockedSha), {
-      timeout: 10000,
-    });
+    await user.click(await canvas.findByRole("button", { name: "Update" }));
+    await waitFor(async () => expect((await inventory(app)).lockedSha).not.toBe(before.lockedSha));
     await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByRole("alert");
     await waitFor(() =>

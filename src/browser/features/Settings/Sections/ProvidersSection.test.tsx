@@ -6,9 +6,13 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import type { APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
+import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
   AddCustomProviderInput,
@@ -16,22 +20,18 @@ import type {
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 
-function installTestDoubles() {
-  // Bun mock.module registrations are global across files, so keep this test
-  // insulated from incomplete WorkspaceStore mocks registered by earlier files.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
-
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
-
 let repairRemovedProviderMock = mock(
   (_provider: string, _workspaceIds: Iterable<string>) => undefined
 );
+
+// Snapshot the real exports before any mock below replaces them: the namespace import is a live
+// binding, so restoring from it would republish the mock into later test files.
+const actualSelectPrimitiveModule = { ...ActualSelectPrimitiveModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", actualSelectPrimitiveModule],
+  ["@/browser/utils/modelPreferenceRepair", { ...ActualModelPreferenceRepairModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
+]);
 
 // Radix Select portals its dropdown content, which happy-dom cannot render;
 // swap in the conditional-rendering double so option clicks work.
@@ -47,7 +47,6 @@ void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
-let apiMock: APIClient | null = null;
 const providersRefreshMock = mock(() => Promise.resolve());
 const updateOptimisticallyMock = mock((provider: string, updates: Partial<ProviderConfigInfo>) => {
   if (!providersConfigMock?.[provider]) {
@@ -83,10 +82,12 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: apiMock }),
-}));
-
+// Restore the real contexts after this suite; the stubs below would otherwise leak into later
+// suites that render the real PolicyProvider/WorkspaceProvider (PolicyContext/AgentContext tests).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/PolicyContext", { ...ActualPolicyContextModule }],
+  ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
+]);
 void mock.module("@/browser/contexts/PolicyContext", () => ({
   usePolicy: () => ({
     status: { state: "disabled" as const },
@@ -205,7 +206,6 @@ function renderProvidersSection() {
   const providersConfig = createProvidersConfig();
   providersConfigMock = providersConfig;
   const client = setupSettingsStory({ providersConfig: {} });
-  apiMock = client;
   const providerMocks = patchProviderMethods(client, providersConfig);
   const view = render(
     <SettingsSectionStory setup={() => client}>
@@ -233,12 +233,10 @@ describe("ProvidersSection", () => {
     void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
       createSelectPrimitiveDouble()
     );
-    installTestDoubles();
     repairRemovedProviderMock = mock(
       (_provider: string, _workspaceIds: Iterable<string>) => undefined
     );
     providersConfigMock = null;
-    apiMock = null;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
   });
@@ -250,10 +248,9 @@ describe("ProvidersSection", () => {
     // restore the real SelectPrimitive for other test files.
     void mock.module(
       "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
+      () => actualSelectPrimitiveModule
     );
     providersConfigMock = null;
-    apiMock = null;
     restoreDom?.();
     restoreDom = null;
   });
@@ -664,7 +661,6 @@ describe("ProvidersSection", () => {
     };
     providersConfigMock = providersConfig;
     const client = setupSettingsStory({ providersConfig: {} });
-    apiMock = client;
 
     const startDesktopFlow = mock((_input: { deploymentUrl: string; flowId?: string }) =>
       Promise.resolve({

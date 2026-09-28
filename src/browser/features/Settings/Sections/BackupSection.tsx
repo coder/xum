@@ -248,6 +248,20 @@ function ChangeList(props: {
   );
 }
 
+// Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
+// only while focus is in the dialog hosting this section, never in a nested dialog or popover.
+// A nested dialog without a trigger drops focus to the body when it closes; the section owns the
+// keys again once its host is the topmost (last portaled) dialog.
+function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | null): boolean {
+  const hostDialog = root?.closest('[role="dialog"]');
+  if (!hostDialog) return !isDialogOpen();
+  if (target === document.body) {
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    return dialogs[dialogs.length - 1] === hostDialog;
+  }
+  return target instanceof Element && target.closest('[role="dialog"]') === hostDialog;
+}
+
 export function BackupSection() {
   const { api } = useAPI();
   const [draft, setDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
@@ -718,6 +732,7 @@ export function BackupSection() {
       }
     },
   };
+  const rootRef = useRef<HTMLDivElement>(null);
   const toggleContentRef = useRef<(option: BackupContentOption) => void>(() => undefined);
   toggleContentRef.current = (option) => {
     if (busy) return;
@@ -730,7 +745,8 @@ export function BackupSection() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (isDialogOpen() || isEditableElement(event.target)) return;
+      if (!ownsBackupShortcuts(rootRef.current, event.target)) return;
+      if (isEditableElement(event.target)) return;
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
@@ -754,7 +770,7 @@ export function BackupSection() {
   }
 
   return (
-    <div className="space-y-6">
+    <div ref={rootRef} className="space-y-6">
       <div className="bg-warning/10 border-warning/30 text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
         <TriangleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         <p>

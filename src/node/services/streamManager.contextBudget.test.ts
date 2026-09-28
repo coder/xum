@@ -2,17 +2,25 @@ import { tmpdir } from "node:os";
 import { prepareToolSearch, type ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
 import { createToolSearchTool } from "./tools/toolSearch";
 import { createTestToolConfig } from "./tools/testHelpers";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { tool } from "ai";
 import { z } from "zod";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { createMuxMessage } from "@/common/types/message";
+import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
+import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { evaluateStepBudget } from "@/common/utils/compaction/contextBudget";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { StreamManager } from "./streamManager";
+import { StreamManager, type SettledStepBudget, type TurnEngineEvent } from "./streamManager";
+import { onTurnEngineEvent } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import * as budgetCounting from "./contextBudgetCounting";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 
 describe("settled context hard ceiling", () => {
   test.each(["inactive", "activation-fits", "activation-overflow", "search-off"] as const)(
@@ -334,18 +342,19 @@ describe("settled context hard ceiling", () => {
         onStepSettled: (step) => {
           expect(Math.ceil(step.toolResultChars / 4) + 1010).toBeLessThan(119808);
           expect(step.toolResultTokens).toBeGreaterThan(119808);
-          return Promise.resolve(
-            evaluateStepBudget({
-              contextTokens: step.usage?.inputTokens ?? 0,
-              outputTokens: step.usage?.outputTokens ?? 0,
-              toolResultChars: step.toolResultChars,
-              imageParts: step.imageParts,
-              toolResultTokens: step.toolResultTokens,
-              modelContextLimit: 128000,
-              threshold: 1,
-              warningEmitted: false,
-            })
-          );
+          const { decision } = evaluateStepBudget({
+            contextTokens: step.usage?.inputTokens ?? 0,
+            outputTokens: step.usage?.outputTokens ?? 0,
+            toolResultChars: step.toolResultChars,
+            imageParts: step.imageParts,
+            toolResultTokens: step.toolResultTokens,
+            modelContextLimit: 128000,
+            threshold: 1,
+            warningEmitted: false,
+            handoffRequested: false,
+          });
+          // The session maps the internal handoff decision onto the callback's "warn" stop.
+          return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
         },
       });
       expect(started.success).toBe(true);
@@ -390,4 +399,413 @@ describe("settled context hard ceiling", () => {
       await h.cleanup();
     }
   }, 20000);
+
+  // #4855: the provider reports far fewer input tokens than the assembled estimate the next
+  // step's preflight enforces. The settled step must see that same estimate so the forced
+  // rollover wins; before the fix the preflight hard-stopped the turn every time. With a roomy
+  // limit, the settled measure must equal what the next step's preflight actually checks.
+  test.each([10_000, 100_000])(
+    "a settled step measures the next preflight request (limit %d)",
+    async (limit) => {
+      const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
+      const h = await createTestHistoryService();
+      const workspaceId = "next-request-rollover";
+      const messageId = "assistant-next-request";
+      let providerCalls = 0;
+      const settled: SettledStepBudget[] = [];
+      const usage = {
+        inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 10, text: 10, reasoning: 0 },
+      };
+      const model = new MockLanguageModelV3({
+        doStream: () => {
+          providerCalls += 1;
+          return Promise.resolve({
+            stream: simulateReadableStream<LanguageModelV3StreamPart>({
+              chunks:
+                providerCalls === 1
+                  ? [
+                      { type: "stream-start", warnings: [] },
+                      { type: "tool-call", toolCallId: "read", toolName: "read", input: "{}" },
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                        usage,
+                      },
+                    ]
+                  : [
+                      { type: "stream-start", warnings: [] },
+                      { type: "text-start", id: "answer" },
+                      { type: "text-delta", id: "answer", delta: "Done" },
+                      { type: "text-end", id: "answer" },
+                      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+                    ],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = path.join(h.tempDir, "runtime");
+      await fs.mkdir(runtimeDir);
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Read the part"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Read the part" }],
+          // Large enough that the first request fits and the second does not (hard ceiling 7,500).
+          system: "system prompt line ".repeat(1200),
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools: {
+            read: tool({
+              inputSchema: z.object({}),
+              execute: () => "part text line ".repeat(700),
+            }),
+          },
+          contextBudgetLimit: limit,
+          onStepSettled: (step) => {
+            settled.push(step);
+            // The same evaluation the token-budget strategy runs, with rollover enabled.
+            const { decision } = evaluateStepBudget({
+              contextTokens: step.usage?.inputTokens ?? 0,
+              outputTokens: step.usage?.outputTokens ?? 0,
+              toolResultChars: step.toolResultChars,
+              imageParts: step.imageParts,
+              toolResultTokens: step.toolResultTokens,
+              nextRequestTokens: step.nextRequestTokens,
+              modelContextLimit: limit,
+              threshold: 0.9,
+              warningEmitted: true,
+              handoffRequested: true,
+            });
+            return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+          },
+        });
+        if (!started.success) throw new Error("Expected stream startup");
+        const completion = await started.data.completion;
+        // Before the fix the next step's preflight failed the stream as "context_budget_blocked".
+        expect(
+          completion.status === "failed" ? completion.streamError.errorType : completion.status
+        ).toBe("completed");
+        if (limit === 10_000) {
+          expect(providerCalls).toBe(1);
+          expect(settled).toHaveLength(1);
+          // Provider usage plus the settled tool output alone stays below the ceiling...
+          expect(110 + (settled[0].toolResultTokens ?? 0)).toBeLessThan(7_500);
+          // ...but the next assembled request does not, so the step stops as a rollover.
+          expect(settled[0].nextRequestTokens).toBeGreaterThan(7_500);
+        } else {
+          expect(providerCalls).toBe(2);
+          // The last preflight checked step two's request: re-measure its exact payload.
+          const [payload, budget] = preflights.mock.calls.at(-1)!;
+          expect(settled[0].nextRequestTokens).toBe(
+            (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
+          );
+        }
+      } finally {
+        preflights.mockRestore();
+        await manager.stopStream(workspaceId);
+        await h.cleanup();
+      }
+    },
+    20000
+  );
+
+  test("a successful new_context settles as a request even when its checkpoint sibling failed", async () => {
+    const h = await createTestHistoryService();
+    const workspaceId = "new-context-sibling";
+    const messageId = "assistant-new-context";
+    let providerCalls = 0;
+    const settled: SettledStepBudget[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: () => {
+        providerCalls += 1;
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "stream-start", warnings: [] },
+              {
+                type: "tool-call",
+                toolCallId: "checkpoint",
+                toolName: "memory",
+                input: '{"command":"create"}',
+              },
+              { type: "tool-call", toolCallId: "reset", toolName: "new_context", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  inputTokens: { total: 1000, noCache: 1000, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 10, text: 10, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        });
+      },
+    });
+    const manager = new StreamManager(h.historyService);
+    const runtimeDir = path.join(h.tempDir, "runtime");
+    await fs.mkdir(runtimeDir);
+    try {
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("user", "user", "Save notes, then reset"),
+            createMuxMessage(messageId, "assistant", ""),
+          ])
+        ).success
+      ).toBe(true);
+      const started = await manager.startStream({
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model,
+        modelString: "openai:gpt-4o",
+        messages: [{ role: "user", content: "Save notes, then reset" }],
+        system: "Run tools",
+        runtime: new LocalRuntime(h.tempDir),
+        providedRuntimeTempDir: runtimeDir,
+        tools: {
+          memory: tool({
+            inputSchema: z.object({ command: z.string() }),
+            execute: () => ({ success: false, error: "memory is read-only" }),
+          }),
+          new_context: tool({
+            inputSchema: z.object({}),
+            execute: () => ({ success: true, status: "scheduled", message: "scheduled" }),
+          }),
+        },
+        onStepSettled: (step) => {
+          settled.push(step);
+          return Promise.resolve({ decision: "rollover" });
+        },
+      });
+      expect(started.success).toBe(true);
+      if (!started.success) throw new Error("Expected stream startup");
+      const completion = await started.data.completion;
+      expect(completion.status).toBe("completed");
+      // The request is derived from the new_context result alone; the failed sibling neither
+      // hides it nor triggers a second provider step before the rollover.
+      expect(settled.map((step) => step.newContextRequested)).toEqual([true]);
+      expect(providerCalls).toBe(1);
+      expect((await h.historyService.commitPartial(workspaceId)).success).toBe(true);
+      const history = await h.historyService.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      const resultParts = history.data
+        .find((row) => row.id === messageId)
+        ?.parts.filter((part) => part.type === "dynamic-tool");
+      expect(
+        resultParts?.map((part) => ({
+          id: part.toolCallId,
+          output: part.state === "output-available" ? part.output : undefined,
+        }))
+      ).toEqual([
+        { id: "checkpoint", output: { success: false, error: "memory is read-only" } },
+        { id: "reset", output: { success: true, status: "scheduled", message: "scheduled" } },
+      ]);
+    } finally {
+      await manager.stopStream(workspaceId);
+      await h.cleanup();
+    }
+  }, 20000);
+});
+
+describe("final flush turn transcript visibility", () => {
+  const CREATED_AT = "2026-01-01T00:00:00.000Z";
+  const FLUSH_TEXT_DELTAS = ["Saved the ", "notes; window ", "can close."];
+  const USAGE = {
+    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 10, text: 10, reasoning: 0 },
+  };
+
+  const displayedRowsFor = (aggregator: StreamingMessageAggregator, messageId: string) =>
+    aggregator
+      .getDisplayedMessages()
+      .filter((row) => "historyId" in row && row.historyId === messageId);
+
+  const loadIntoFreshAggregator = (rows: MuxMessage[]) => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages(
+      rows.map((row) => MuxMessageSchema.parse(row)),
+      false
+    );
+    return aggregator;
+  };
+
+  // The renderer only ever sees engine events after the IPC schema parsed them, so a flag
+  // the emitter or schema drops never reaches the aggregator no matter what the engine knew.
+  const applyThroughIpcSchema = (aggregator: StreamingMessageAggregator, event: TurnEngineEvent) =>
+    applyWorkspaceChatEventToAggregator(aggregator, WorkspaceChatMessageSchema.parse(event), {
+      allowSideEffects: false,
+    });
+
+  test.each([
+    { flush: true, ending: "completed" },
+    { flush: true, ending: "stopped" },
+    { flush: false, ending: "completed" },
+  ] as const)(
+    "flush output never surfaces while an ordinary turn does (flush=$flush, $ending)",
+    async ({ flush, ending }) => {
+      const h = await createTestHistoryService();
+      const manager = new StreamManager(h.historyService);
+      const workspaceId = `flush-visibility-${ending}`;
+      const messageId = "flush-assistant";
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "context-budget-stream-"));
+      // The provider stream is hand-driven so the test can observe the renderer between
+      // deltas and stop the turn mid-text; the engine reads it lazily after startStream.
+      const controllerReady =
+        Promise.withResolvers<ReadableStreamDefaultController<LanguageModelV3StreamPart>>();
+      const model = new MockLanguageModelV3({
+        doStream: ({ abortSignal }) =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              start: (streamController) => {
+                streamController.enqueue({ type: "stream-start", warnings: [] });
+                streamController.enqueue({ type: "text-start", id: "answer" });
+                // Like a real transport, a stop must surface to the consumer as an abort.
+                abortSignal?.addEventListener("abort", () => {
+                  try {
+                    streamController.error(new DOMException("Stopped", "AbortError"));
+                  } catch {
+                    // Already closed.
+                  }
+                });
+                controllerReady.resolve(streamController);
+              },
+            }),
+          }),
+      });
+      const events: TurnEngineEvent[] = [];
+      let firstDelta!: () => void;
+      const firstDeltaSeen = new Promise<void>((resolve) => {
+        firstDelta = resolve;
+      });
+      for (const type of ["stream-start", "stream-delta", "stream-end", "stream-abort"] as const) {
+        onTurnEngineEvent(manager, type, (event) => {
+          events.push(event);
+          if (event.type === "stream-delta") firstDelta();
+        });
+      }
+      try {
+        // Rows as the request builder persists them: the hidden synthetic trigger and the
+        // empty assistant placeholder that the stream fills in.
+        const trigger = createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: {
+            type: "normal",
+            contextBudgetContinuation: true,
+            ...(flush ? { contextBudgetFlush: true } : {}),
+          },
+        });
+        const placeholder = createMuxMessage(messageId, "assistant", "");
+        expect(
+          (await h.historyService.appendManyToHistory(workspaceId, [trigger, placeholder])).success
+        ).toBe(true);
+        const before = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!before.success) throw new Error(before.error);
+        const live = loadIntoFreshAggregator(before.data);
+
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: placeholder.metadata?.historySequence ?? 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Flush context notes now." }],
+          system: "Write notes",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          initialMetadata: {
+            muxMetadata: {
+              type: "normal",
+              contextBudgetContinuation: true,
+              ...(flush ? { contextBudgetFlush: true } : {}),
+            },
+          },
+        });
+        expect(started.success).toBe(true);
+        if (!started.success) throw new Error("Expected stream construction");
+        const controller = await controllerReady.promise;
+        controller.enqueue({ type: "text-delta", id: "answer", delta: FLUSH_TEXT_DELTAS[0] });
+        await firstDeltaSeen;
+        if (ending === "stopped") {
+          await manager.stopStream(workspaceId);
+        } else {
+          for (const delta of FLUSH_TEXT_DELTAS.slice(1)) {
+            controller.enqueue({ type: "text-delta", id: "answer", delta });
+          }
+          controller.enqueue({ type: "text-end", id: "answer" });
+          controller.enqueue({
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: USAGE,
+          });
+          controller.close();
+        }
+        const completion = await started.data.completion;
+        expect(completion.status).toBe(ending === "stopped" ? "aborted" : "completed");
+
+        // Live path: replay the real engine emissions into the renderer aggregator and check
+        // after every event, so a partially streamed flush cannot flash into the transcript.
+        const expectedEventTypes: Array<TurnEngineEvent["type"]> =
+          ending === "stopped"
+            ? ["stream-start", "stream-delta", "stream-abort"]
+            : [
+                "stream-start",
+                ...FLUSH_TEXT_DELTAS.map(() => "stream-delta" as const),
+                "stream-end",
+              ];
+        expect(events.map((event) => event.type)).toEqual(expectedEventTypes);
+        const seenLive: string[][] = [];
+        for (const event of events) {
+          applyThroughIpcSchema(live, event);
+          seenLive.push(displayedRowsFor(live, messageId).map((row) => row.type));
+        }
+        if (flush) {
+          expect(seenLive.flat()).toEqual([]);
+        } else {
+          expect(seenLive.at(-1)).toEqual(["assistant"]);
+          expect(displayedRowsFor(live, messageId)[0]).toMatchObject({
+            content: FLUSH_TEXT_DELTAS.join(""),
+          });
+        }
+        // The hidden trigger row is unaffected either way.
+        expect(displayedRowsFor(live, trigger.id)).toEqual([]);
+
+        // Durable path: the same rows a reload or crash recovery replays from disk.
+        if (ending === "stopped") {
+          // Stopping commits the partial into history with its streamed text.
+          expect(await h.historyService.readPartial(workspaceId)).toBeNull();
+        }
+        const persisted = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!persisted.success) throw new Error(persisted.error);
+        const assistantRow = persisted.data.find((row) => row.id === messageId);
+        expect(
+          assistantRow?.parts.map((part) => (part.type === "text" ? part.text : part.type)).join("")
+        ).toBe(ending === "stopped" ? FLUSH_TEXT_DELTAS[0] : FLUSH_TEXT_DELTAS.join(""));
+        const reloaded = loadIntoFreshAggregator(persisted.data);
+        expect(displayedRowsFor(reloaded, messageId).map((row) => row.type)).toEqual(
+          flush ? [] : ["assistant"]
+        );
+      } finally {
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    },
+    20000
+  );
 });

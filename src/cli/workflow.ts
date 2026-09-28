@@ -39,6 +39,7 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
+import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
@@ -65,6 +66,7 @@ interface WorkflowCLIOptions {
   runtime: string;
   model: string;
   thinking: string;
+  evaluationModel?: string;
   verbose?: boolean;
   logLevel?: string;
   json?: boolean;
@@ -219,7 +221,10 @@ async function copyPersistentConfig(
   const config = runStores.config;
   const realProvidersStore = realStores.providersConfigStore;
   const existingProviders = realProvidersStore.loadProvidersConfig();
-  if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
+  // Copy every entry, not only configured chat providers: the evaluation-only
+  // `typesafe` key never counts as a chat provider, yet an evaluate()-only
+  // workflow needs it in the run's providers copy.
+  if (existingProviders != null && Object.keys(existingProviders).length > 0) {
     runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
   const existingSecrets = realStores.secretsStore.loadSecretsConfig();
@@ -350,7 +355,9 @@ async function createWorkflowContext(options: {
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        runProvidersStore.saveProvidersConfig(providersFromEnv);
+        // Merge over the copied file so evaluation-only entries (typesafe)
+        // survive chat-provider hydration from the environment.
+        runProvidersStore.saveProvidersConfig({ ...existingProviders, ...providersFromEnv });
       }
     }
 
@@ -400,6 +407,7 @@ async function createWorkflowContext(options: {
     // below would lose TypeScript's definite-assignment narrowing.
     const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      contextManagement: services.contextManagement,
       effectRunner: services.runtime.get(EffectRunnerTag),
       appFiberScope: services.appFiberScope,
       workspaceId,
@@ -479,8 +487,22 @@ function createWorkflowService(input: {
   const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
+    archiveAdmission: input.ctx.services.workspaceService,
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
     runtimeFactory: new QuickJSRuntimeFactory(),
+    evaluationAdapter: new WorkflowEvaluationAdapter({
+      evaluationService: input.ctx.services.evaluationService,
+      aiService: input.ctx.services.aiService,
+      sessionUsageService: input.ctx.services.sessionUsageService,
+      // The ephemeral run config copies only providers/secrets/trust, so the
+      // Settings default (`evaluationDefaults.model`) must be read from the
+      // real config. Precedence: per-call `model` > --evaluation-model > Settings.
+      config: input.ctx.realConfig,
+      workspaceId: input.ctx.workspaceId,
+      ...(input.opts.evaluationModel !== undefined
+        ? { evaluationModelOverride: input.opts.evaluationModel }
+        : {}),
+    }),
     taskAdapterFactory: (runId) =>
       new WorkflowTaskServiceAdapter({
         taskService: input.ctx.services.taskService,
@@ -535,6 +557,12 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
     );
   }
   const thinkingLevel = resolveThinkingInput(parseThinkingLevel(options.thinking), model);
+  // Passed verbatim like a per-call `model`; the evaluation resolver reports
+  // unknown/unsupported models per step. Only a blank value is rejected here
+  // (it would otherwise shadow the Settings default with nothing).
+  if (options.evaluationModel?.trim().length === 0) {
+    throw new Error('Invalid --evaluation-model: expected a non-blank "provider:model-id"');
+  }
   const suppressHuman = options.json === true || options.quiet === true;
   const writeLine = (line = "") => {
     if (!suppressHuman) process.stdout.write(`${line}\n`);
@@ -622,6 +650,10 @@ export async function main(): Promise<number> {
       "-t, --thinking <level>",
       `thinking level: ${THINKING_LABELS_LIST}`,
       THINKING_DISPLAY_LABELS[DEFAULT_THINKING_LEVEL]
+    )
+    .option(
+      "--evaluation-model <model>",
+      "model for evaluate() steps without a per-call model (overrides the Settings default)"
     )
     .option("--json", "emit JSON/NDJSON output")
     .option("-q, --quiet", "only output final result")

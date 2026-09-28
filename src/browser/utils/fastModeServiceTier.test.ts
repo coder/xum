@@ -24,9 +24,10 @@ describe("fast mode service tier", () => {
     expect(getFastModeProvider("openai:gpt-5.6-sol", { resolvedRouteProvider: "direct" })).toBe(
       "openai"
     );
+    expect(getFastModeProvider("xai:grok-4.7", { resolvedRouteProvider: "direct" })).toBe("xai");
     expect(getFastModeProvider("xai:grok-4.6", { resolvedRouteProvider: "direct" })).toBe("xai");
     expect(getFastModeProvider("xai:grok-4.5", { resolvedRouteProvider: "direct" })).toBe("xai");
-    expect(getFastModeProvider("xai:grok-4.6", { resolvedRouteProvider: "openrouter" })).toBeNull();
+    expect(getFastModeProvider("xai:grok-4.7", { resolvedRouteProvider: "openrouter" })).toBeNull();
     expect(
       getFastModeProvider("xai:team-grok", {
         resolvedRouteProvider: "direct",

@@ -5,6 +5,7 @@ import {
   AGE_THRESHOLDS_DAYS,
   buildSortedWorkspacesByProject,
   buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   orderMultiProjectSectionRows,
   computeWorkspaceDepthMap,
   computeAgentRowRenderMeta,
@@ -677,6 +678,29 @@ describe("buildSortedWorkspacesFlat", () => {
       "scratch",
       "recent",
     ]);
+  });
+});
+
+describe("findMostRecentlyCreatedWorkspace", () => {
+  it("prefers the newest createdAt over higher recency", () => {
+    const active = { ...createWorkspace("active"), createdAt: "2026-01-01T00:00:00.000Z" };
+    const newest = { ...createWorkspace("newest"), createdAt: "2026-01-02T00:00:00.000Z" };
+
+    expect(findMostRecentlyCreatedWorkspace([newest, active], { active: 500, newest: 1 })?.id).toBe(
+      "newest"
+    );
+  });
+
+  it("breaks createdAt ties by recency", () => {
+    // Legacy rows share one default createdAt, so the tiebreak decides.
+    const createdAt = "2025-01-01T00:00:00.000Z";
+    const quiet = { ...createWorkspace("quiet"), createdAt };
+    const active = { ...createWorkspace("active"), createdAt };
+
+    expect(findMostRecentlyCreatedWorkspace([quiet, active], { quiet: 1, active: 2 })?.id).toBe(
+      "active"
+    );
+    expect(findMostRecentlyCreatedWorkspace([], {})).toBeUndefined();
   });
 });
 describe("buildSortedWorkspacesByProject pinning", () => {
@@ -1362,6 +1386,49 @@ describe("sub-agent row render metadata", () => {
     expect(
       computeAgentRowRenderMeta(flattened, depthByWorkspaceId).has("unfinished-interrupted-child")
     ).toBe(false);
+  });
+
+  it("keeps reported children visible while a background Bash monitor is active", () => {
+    const flattened = [
+      createWorkspace("parent"),
+      createWorkspace("reported-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        taskExecutionStatus: "completed",
+      }),
+    ];
+    let monitorActive = true;
+    const options = {
+      isWorkspaceLiveActive: () => false,
+      hasActiveBashMonitor: (workspaceId: string) =>
+        workspaceId === "reported-child" && monitorActive,
+    };
+
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+      "reported-child",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount
+    ).toBe(1);
+    expect(
+      computeSubAgentsSummaryByWorkspaceId(flattened, options).get("parent")?.runningSubAgentCount
+    ).toBe(1);
+    const metadata = computeAgentRowRenderMeta(
+      flattened,
+      computeWorkspaceDepthMap(flattened),
+      new Set(),
+      options
+    );
+    expect(metadata.get("reported-child")?.sharedTrunkActiveThroughRow).toBe(true);
+
+    monitorActive = false;
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount ?? 0
+    ).toBe(0);
   });
 
   it("does not resurrect reported children from stale live workspace state", () => {

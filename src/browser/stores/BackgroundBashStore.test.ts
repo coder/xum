@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { BackgroundBashStore } from "./BackgroundBashStore";
-import type { APIClient } from "@/browser/contexts/API";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
+import { createTestApiClient } from "@/browser/testUtils";
 
 interface BashSubscriptionState {
   processes: BackgroundProcessInfo[];
@@ -46,13 +46,13 @@ function createControlledBashClient() {
     },
   };
 
-  const client = {
+  const client = createTestApiClient({
     workspace: {
       backgroundBashes: {
         subscribe: () => Promise.resolve(iterator),
       },
     },
-  } as unknown as APIClient;
+  });
 
   return {
     client,
@@ -108,13 +108,15 @@ describe("BackgroundBashStore state-known signal", () => {
 
   test("a failing subscription self-heals to known so it cannot block first paint", async () => {
     const store = new BackgroundBashStore();
-    store.setClient({
-      workspace: {
-        backgroundBashes: {
-          subscribe: () => Promise.reject(new Error("backend down")),
+    store.setClient(
+      createTestApiClient({
+        workspace: {
+          backgroundBashes: {
+            subscribe: () => Promise.reject(new Error("backend down")),
+          },
         },
-      },
-    } as unknown as APIClient);
+      })
+    );
 
     // The retrying self-heal path should be cleaned up like a real component
     // unmount; otherwise the test leaves a retry timer logging failures into

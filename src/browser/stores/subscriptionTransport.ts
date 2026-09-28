@@ -40,6 +40,13 @@ interface SubscriptionLoopOptions<TClient, TEvent, TContext> {
   watchdog?: false | { timeoutMs?: number; checkIntervalMs?: number };
   backoffAfterAbort?: boolean;
   sleep?: (timeoutMs: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * Which events count as a successful attempt for backoff purposes. Defaults to every
+   * event. A subscriber whose attempts can deliver events and still fail (onChat emits
+   * queue snapshots and a `failed` caught-up on a broken replay) passes a predicate so
+   * consecutive failures keep backing off instead of retrying at the base delay forever.
+   */
+  isSuccessEvent?: (event: TEvent) => boolean;
 }
 
 export function sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
@@ -107,7 +114,7 @@ export async function runSubscriptionLoop<TClient, TEvent, TContext>(
       for await (const event of result.events) {
         if (options.signal.aborted) return;
         lastEventAt = Date.now();
-        attempt = 0;
+        if (options.isSuccessEvent?.(event) ?? true) attempt = 0;
         options.onEvent(event, result.context, attemptController.signal);
       }
 

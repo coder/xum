@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import * as path from "path";
 /**
  * /refine orchestration (RLM track, phase r11): user-invokable trajectory
@@ -586,9 +587,8 @@ export class RefineService {
     const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
     if (!turnExclusionResult.success) {
       return Err(
-        `a turn is active in this workspace (${turnExclusionResult.error}); refinements cannot ` +
-          `be applied into a running conversation — run /refine apply again once the workspace ` +
-          `is idle (nothing was applied)`
+        `refinements cannot be applied now (${turnExclusionResult.error}) — run /refine apply ` +
+          `again once the workspace is idle (nothing was applied)`
       );
     }
     using _turnExclusion = turnExclusionResult.data;
@@ -948,7 +948,10 @@ export class RefineService {
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
     // transcript size.
-    const transcript = buildAbandonedBranchTranscript(activeSegment.slice(-REFINE_MAX_MESSAGES));
+    // Keep the raw fingerprints above, but do not spend the model's row budget on hidden state.
+    const transcript = buildAbandonedBranchTranscript(
+      activeSegment.filter((message) => !isModelHiddenMessage(message)).slice(-REFINE_MAX_MESSAGES)
+    );
     if (transcript.length === 0) {
       // Empty trajectory: a clean first-class no-op without spending a model call.
       return Ok({ applied: [], summary: "Nothing worth distilling.", noOp: true });
@@ -1140,9 +1143,8 @@ export class RefineService {
       const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
       if (!turnExclusionResult.success) {
         return Err(
-          `a turn is active in this workspace (${turnExclusionResult.error}); the distilled ` +
-            `proposal cannot be published into a running conversation — run /refine again once ` +
-            `the workspace is idle`
+          `the distilled proposal cannot be published now (${turnExclusionResult.error}) — run ` +
+            `/refine again once the workspace is idle`
         );
       }
       using _turnExclusion = turnExclusionResult.data;

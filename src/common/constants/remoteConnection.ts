@@ -11,5 +11,7 @@ export const REMOTE_CONNECTION_CHANNELS = {
   getState: "xum:remote-connection:get-state",
   connect: "xum:remote-connection:connect",
   disconnect: "xum:remote-connection:disconnect",
+  openLocalServer: "xum:remote-connection:open-local-server",
   stateChanged: "xum:remote-connection:state-changed",
+  openServerWindowRequested: "xum:remote-connection:open-server-window-requested",
 } as const;

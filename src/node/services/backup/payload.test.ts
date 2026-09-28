@@ -72,6 +72,29 @@ import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/cons
 /** Every core category selected, as a fresh install's defaults leave them. */
 const CONTENTS = resolveBackupContents({});
 
+/**
+ * The JSON.stringify calls that serialize one of `paths`. A spy on JSON.stringify is
+ * process-global, so async work left over from earlier tests in the same Bun process can call
+ * it inside the spy window (#4920). Only calls on this manifest's redaction paths come from the
+ * payload code under test, which keys each path with JSON.stringify to find duplicates.
+ */
+function redactionPathSerializations(
+  calls: ReadonlyArray<readonly unknown[]>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>
+): unknown[] {
+  return calls
+    .map((args) => args[0])
+    .filter(
+      (value) =>
+        Array.isArray(value) &&
+        paths.some(
+          (jsonPath) =>
+            jsonPath.length === value.length &&
+            jsonPath.every((segment, index) => segment === value[index])
+        )
+    );
+}
+
 async function isExecutable(filePath: string): Promise<boolean> {
   return ((await fs.stat(filePath)).mode & 0o111) !== 0;
 }
@@ -759,6 +782,10 @@ describe("backup payload", () => {
     });
   });
 
+  // This boundary-sized round trip adds two markers per server, each applied as its own
+  // jsonc edit, and can exceed the default timeout late in the full `bun test src` process
+  // (measured 208 ms standalone vs 4.2 s after 825 files). Keep the fixture at the limit
+  // rather than reducing coverage; this is completion headroom, not a performance assertion.
   it("keeps a large backup restorable when deselecting a category adds many markers", async () => {
     const servers = Object.fromEntries(
       Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
@@ -788,7 +815,7 @@ describe("backup payload", () => {
     expect(jsonc.parse(await fs.readFile(path.join(restoreRoot, "mcp.jsonc"), "utf-8"))).toEqual({
       servers,
     });
-  });
+  }, 30_000);
 
   it("does not create manifests above the MCP redaction limit", async () => {
     const redactedValues = Object.fromEntries(
@@ -1049,7 +1076,10 @@ describe("backup payload", () => {
       exportedAt: "2026-08-07T00:00:00.000Z",
       muxVersion: "1.2.3",
       sourceLabel: "test-host",
-      mcpRedactions: Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [index]),
+      // Distinctive paths, so the serialization check below cannot match unrelated calls.
+      mcpRedactions: Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
+        `too-many-mcp-redactions-${index}`,
+      ]),
       files: [],
     };
     const manifestPath = path.join(destination, "manifest.json");
@@ -1062,7 +1092,9 @@ describe("backup payload", () => {
       expect((rejected as Error).message).toBe(
         `Backup has more than ${MAX_BACKUP_MCP_REDACTIONS} MCP redactions`
       );
-      expect(stringify.mock.calls).toHaveLength(0);
+      expect(
+        redactionPathSerializations(stringify.mock.calls, manifest.mcpRedactions)
+      ).toHaveLength(0);
     } finally {
       stringify.mockRestore();
     }
@@ -1117,7 +1149,9 @@ describe("backup payload", () => {
       expect((cumulative as Error).message).toBe(
         `Backup MCP redaction paths have more than ${MAX_BACKUP_MCP_REDACTION_SEGMENTS} total segments`
       );
-      expect(stringify.mock.calls).toHaveLength(0);
+      expect(redactionPathSerializations(stringify.mock.calls, overCumulativeLimit)).toHaveLength(
+        0
+      );
     } finally {
       stringify.mockRestore();
     }

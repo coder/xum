@@ -1,10 +1,11 @@
+// Bootstrap DOM before API imports can initialize Radix layout effects.
+import { installDom } from "../../../tests/ui/dom";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import * as APIModule from "@/browser/contexts/API";
 import * as PolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RoutingModule from "@/browser/hooks/useRouting";
-import { installDom } from "../../../tests/ui/dom";
 import {
   filterHiddenModels,
   getDefaultModel,
@@ -390,6 +391,7 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     const { result } = renderHook(() => useModelsFromSettings());
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_LUNA.id);
     expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
     expect(result.current.models).toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);

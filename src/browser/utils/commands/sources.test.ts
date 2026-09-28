@@ -1,5 +1,7 @@
-import { expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -12,6 +14,7 @@ import {
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import type { UpdateChannel } from "@/common/types/project";
 import {
   consumePendingPluginsSectionIntent,
@@ -20,6 +23,7 @@ import {
 } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { CommandIds } from "@/browser/utils/commandIds";
+import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -80,7 +84,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onOpenWorkspaceInTerminal: () => undefined,
     onToggleTheme: () => undefined,
     onSetTheme: () => undefined,
-    api: {
+    api: createTestApiClient({
       workspace: {
         resetContext: () => Promise.resolve({ success: true, data: "reset" }),
         truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -89,7 +93,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
       analytics: {
         rebuildDatabase: () => Promise.resolve({ success: true, workspacesIngested: 2 }),
       },
-    } as unknown as APIClient,
+    }),
     getBranchesForProject: () =>
       Promise.resolve({
         branches: ["main"],
@@ -109,15 +113,62 @@ interface ToastEventDetail {
 const getActions = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) =>
   mk(over).flatMap((source) => source());
 
-const workspaceApi = (workspace: Record<string, unknown>) =>
-  ({
+describe("Auto routing palette actions", () => {
+  const ids = [
+    CommandIds.toggleAutoRouting("model"),
+    CommandIds.toggleAutoRouting("thinkingLevel"),
+  ];
+
+  test("appear only while the experiment is on, for the workspace and the creation composer", () => {
+    const wired = {
+      getAutoRouting: () => false,
+      onSetAutoRouting: () => undefined,
+    };
+    const off = getActions({ ...wired, autoModelRoutingEnabled: false }).map((a) => a.id);
+    expect(off).not.toContain(ids[0]);
+    expect(off).not.toContain(ids[1]);
+
+    const on = getActions({ ...wired, autoModelRoutingEnabled: true }).map((a) => a.id);
+    expect(on).toContain(ids[0]);
+    expect(on).toContain(ids[1]);
+
+    const creation = getActions({
+      ...wired,
+      autoModelRoutingEnabled: true,
+      selectedWorkspace: null,
+      creationScopeId: "project:/repo/b",
+    }).map((a) => a.id);
+    expect(creation).toContain(ids[0]);
+    expect(creation).toContain(ids[1]);
+  });
+
+  test("each action flips its own dimension for the composer's scope", () => {
+    const onSetAutoRouting = mock(
+      (_scopeId: string, _dimension: "model" | "thinkingLevel", _active: boolean) => undefined
+    );
+    const actions = getActions({
+      autoModelRoutingEnabled: true,
+      getAutoRouting: (_scopeId, dimension) => dimension === "model",
+      onSetAutoRouting,
+    });
+    void actions.find((a) => a.id === ids[0])?.run();
+    void actions.find((a) => a.id === ids[1])?.run();
+    expect(onSetAutoRouting.mock.calls).toEqual([
+      ["w1", "model", false],
+      ["w1", "thinkingLevel", true],
+    ]);
+  });
+});
+
+const workspaceApi = (workspace: TestApiOverrides<APIClient["workspace"]>) =>
+  createTestApiClient({
     workspace: {
       resetContext: () => Promise.resolve({ success: true as const, data: "reset" as const }),
       truncateHistory: () => Promise.resolve({ success: true as const, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true as const, data: undefined }),
       ...workspace,
     },
-  }) as unknown as APIClient;
+  });
 
 const getResetContextAction = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const action = getActions(over).find(
@@ -152,11 +203,19 @@ const collectCommandEvents = () => {
   };
 };
 
-async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
+async function withTestWindow<T>(
+  fn: () => Promise<T> | T,
+  options: { transcriptCaughtUp?: boolean } = {}
+): Promise<T> {
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
   const originalCustomEvent = globalThis.CustomEvent;
+  // History-mutating chat actions read the transcript barrier from the singleton store at
+  // dispatch time; pin it instead of replaying an onChat subscription for the palette tests.
+  const barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockReturnValue(
+    options.transcriptCaughtUp ?? true
+  );
 
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
@@ -168,6 +227,7 @@ async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
   try {
     return await fn();
   } finally {
+    barrierSpy.mockRestore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
@@ -211,6 +271,52 @@ test("chat commands include separate reset context and clear history actions", a
     await Promise.resolve(clearAction.run());
     expect(truncateHistory).toHaveBeenCalledWith({ workspaceId: "w1", percentage: 1.0 });
   });
+});
+
+test("reset context and history truncation refuse while the transcript is not caught up", async () => {
+  await withTestWindow(
+    async () => {
+      const resetContext = mock(() =>
+        Promise.resolve({ success: true as const, data: "reset" as const })
+      );
+      const truncateHistory = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const actions = getActions({ api: workspaceApi({ resetContext, truncateHistory }) });
+      const guarded = actions.filter(
+        (action) =>
+          action.title === "Reset Context, Preserve History" ||
+          action.title === "Clear History" ||
+          action.title.startsWith("Truncate History to ")
+      );
+      expect(guarded.length).toBe(5);
+
+      for (const action of guarded) {
+        const events = collectCommandEvents();
+        try {
+          let thrown: unknown;
+          try {
+            await Promise.resolve(action.run());
+          } catch (error) {
+            thrown = error;
+          }
+          expect(thrown).toBeInstanceOf(Error);
+          expect(thrown instanceof Error ? thrown.message : undefined).toBe(
+            TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+          );
+          expect(events.receivedToasts).toEqual([
+            { type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE },
+          ]);
+          expect(events.clearEvents).toEqual([]);
+        } finally {
+          events.dispose();
+        }
+      }
+      expect(resetContext).not.toHaveBeenCalled();
+      expect(truncateHistory).not.toHaveBeenCalled();
+    },
+    { transcriptCaughtUp: false }
+  );
 });
 
 test("reset context command dispatches composer and toast outcomes", async () => {
@@ -545,7 +651,7 @@ test.each(["stable", "nightly", "npm"] as const)(
     );
     const actions = getActions({
       onOpenAbout,
-      api: { update: { install, setChannel } } as unknown as APIClient,
+      api: createTestApiClient({ update: { install, setChannel } }),
       supportedUpdateChannels: ["stable", "nightly", "npm"],
     });
     await actions.find((a) => a.title === "Install Update and Restart")!.run();
@@ -607,7 +713,7 @@ test("Disconnect Coder command revokes via RPC and is gated on a stored credenti
   // must stay revocable.
   const disconnect = mock(() => Promise.resolve({ success: true as const, data: undefined }));
   const actions = getActions({
-    api: { coderOauth: { disconnect } } as unknown as APIClient,
+    api: createTestApiClient({ coderOauth: { disconnect } }),
     providersConfig: {
       coder: { coderOauthSet: false, coderOauthCredentialStored: true },
     } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
@@ -697,6 +803,8 @@ const makeGoalSnapshot = (
   ...overrides,
 });
 
+type SetGoalResult = Awaited<ReturnType<APIClient["workspace"]["setGoal"]>>;
+
 const makeGoalRecord = (status: "active" | "paused" | "budget_limited" | "complete") => ({
   version: 1 as const,
   goalId: "00000000-0000-4000-8000-000000000001",
@@ -718,14 +826,17 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     name: "feat-x",
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,
     awaitingUserQuestion: false,
     loading: false,
     isTranscriptCaughtUp: true,
+    transcriptReplayFailed: false,
     isHydratingTranscript: false,
     isTranscriptStale: false,
+    isIncrementalCatchUp: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],
@@ -854,28 +965,30 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
       lifecycle: "active",
       goal: null,
     } as unknown as WorkspaceState,
-    api: {
+    api: createTestApiClient({
       config: {
         // Even with default budget settings, blank palette budget means no budget.
         getConfig: () =>
-          Promise.resolve({
-            goalDefaults: {
-              alwaysRequireExplicitBudget: true,
-              defaultBudgetCents: 800,
-              defaultTurnCap: 5,
-            },
-          }),
+          Promise.resolve(
+            createTestConfig({
+              goalDefaults: {
+                alwaysRequireExplicitBudget: true,
+                defaultBudgetCents: 800,
+                defaultTurnCap: 5,
+              },
+            })
+          ),
       },
       workspace: {
         getGoal: () => Promise.resolve({ goal: null }),
-        setGoal: (input: Record<string, unknown>) => {
+        setGoal: (input) => {
           setGoalCalls.push(input);
           return Promise.resolve({
             success: true,
             data: {
               version: 1,
               goalId: "11111111-1111-4111-8111-111111111111",
-              objective: input.objective,
+              objective: input.objective ?? "",
               status: "active",
               budgetCents: input.budgetCents ?? null,
               turnCap: input.turnCap ?? null,
@@ -891,7 +1004,7 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
           });
         },
       },
-    } as unknown as APIClient,
+    }),
   });
   const actions = sources.flatMap((s) => s());
   const setObjectiveAction = actions.find((action) => action.id === "goal:set-objective");
@@ -912,13 +1025,15 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
 });
 
 test("goal set objective prompt allows zero budget on unpriced model", async () => {
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
-      config: { getConfig: mock(() => Promise.resolve({})) },
+    api: createTestApiClient({
+      config: { getConfig: mock(() => Promise.resolve(createTestConfig())) },
       providers: { getConfig: mock(() => Promise.resolve({})) },
       workspace: { getGoal: mock(() => Promise.resolve({ goal: null })), setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: {
       ...makeWorkspaceState(null),
       currentModel: "custom:unpriced-model",
@@ -941,11 +1056,13 @@ test("goal set objective prompt allows zero budget on unpriced model", async () 
 
 test("goal set objective prompt submits objective and parsed budget", async () => {
   const getGoal = mock(() => Promise.resolve({ goal: null }));
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
+    api: createTestApiClient({
       workspace: { getGoal, setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: makeWorkspaceState(null),
   });
 
@@ -978,13 +1095,15 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
 
   try {
     const getGoal = mock(() => Promise.resolve({ goal: null }));
-    const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+    const setGoal = mock(() =>
+      Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+    );
     const state = makeWorkspaceState(null);
     state.currentModel = "openai:gpt-4o";
     const actions = getVisibleGoalActions({
-      api: {
+      api: createTestApiClient({
         workspace: { getGoal, setGoal },
-      } as unknown as APIClient,
+      }),
       selectedWorkspaceState: state,
     });
 
@@ -1005,11 +1124,13 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
 
 test("goal mark complete prompt submits completion summary", async () => {
   const getGoal = mock(() => Promise.resolve({ goal: makeGoalRecord("active") }));
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("complete") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("complete") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
+    api: createTestApiClient({
       workspace: { getGoal, setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("active")),
   });
 
@@ -1039,18 +1160,18 @@ test("goal palette surfaces invalid transition messages without throwing", async
 
   try {
     const setGoal = mock(() =>
-      Promise.resolve({
+      Promise.resolve<SetGoalResult>({
         success: false,
         error: { type: "invalid_transition", message: "Cannot complete a missing goal." },
       })
     );
     const actions = getVisibleGoalActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           getGoal: mock(() => Promise.resolve({ goal: makeGoalRecord("active") })),
           setGoal,
         },
-      } as unknown as APIClient,
+      }),
       selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("active")),
     });
 
@@ -1111,6 +1232,55 @@ test("buildCoreSources includes rebuild analytics database action with discovera
   expect(rebuildAction?.keywords).toContain("stats");
 });
 
+test("toggle keep screen awake command is only offered in the desktop app", () => {
+  const originalWindow = globalThis.window;
+  const hasToggle = () => getActions().some((a) => a.id === "settings:toggle-keep-screen-awake");
+  try {
+    const testWindow = new GlobalWindow();
+    globalThis.window = testWindow as unknown as Window & typeof globalThis;
+    // Browser mode: no preload bridge.
+    expect(hasToggle()).toBe(false);
+
+    globalThis.window.api = { platform: "linux", versions: {} };
+    expect(hasToggle()).toBe(true);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
+test("toggle keep screen awake command inverts the persisted config flag", async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+  globalThis.window.api = { platform: "linux", versions: {} };
+  try {
+    let keepScreenAwake = false;
+    const updateKeepScreenAwake = mock((input: { enabled: boolean }) => {
+      keepScreenAwake = input.enabled;
+      return Promise.resolve();
+    });
+    const actions = getActions({
+      api: createTestApiClient({
+        config: {
+          getConfig: () => Promise.resolve(createTestConfig({ keepScreenAwake })),
+          updateKeepScreenAwake,
+        },
+      }),
+    });
+    const toggleAction = actions.find((a) => a.id === "settings:toggle-keep-screen-awake");
+
+    expect(toggleAction).toBeDefined();
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: true });
+
+    // Reads the current backend value each time instead of tracking local state.
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: false });
+    expect(keepScreenAwake).toBe(false);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test("analytics rebuild command calls route and dispatches toast feedback", async () => {
   const rebuildDatabase = mock(() => Promise.resolve({ success: true, workspacesIngested: 4 }));
 
@@ -1141,13 +1311,13 @@ test("analytics rebuild command calls route and dispatches toast feedback", asyn
 
   try {
     const actions = getActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
           interruptStream: () => Promise.resolve({ success: true, data: undefined }),
         },
         analytics: { rebuildDatabase },
-      } as unknown as APIClient,
+      }),
     });
     const rebuildAction = actions.find((a) => a.id === "analytics:rebuild-database");
 
@@ -1186,13 +1356,13 @@ test("analytics rebuild command falls back to alert when chat input toast host i
 
   try {
     const actions = getActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
           interruptStream: () => Promise.resolve({ success: true, data: undefined }),
         },
         analytics: { rebuildDatabase },
-      } as unknown as APIClient,
+      }),
     });
     const rebuildAction = actions.find((a) => a.id === "analytics:rebuild-database");
 
@@ -1551,4 +1721,74 @@ test("plugin component action is gated and only targets present managed installs
   } finally {
     unsubscribe();
   }
+});
+
+describe("Open Server Window palette action", () => {
+  const makeBridge = (result: OpenLocalServerResult) =>
+    ({
+      getState: () => Promise.resolve({ status: "disconnected" as const, serverUrl: null }),
+      connect: () => Promise.resolve(),
+      disconnect: () => Promise.resolve(),
+      onStateChanged: () => () => undefined,
+      openLocalServer: mock(() => Promise.resolve(result)),
+      onOpenServerWindowRequested: () => () => undefined,
+    }) satisfies RemoteConnectionApi;
+
+  test("is only offered in the desktop window, which has the remote connection bridge", () => {
+    const ids = (over: Partial<Parameters<typeof buildCoreSources>[0]>) =>
+      getActions({ onOpenSettings: mock(), ...over }).map((action) => action.id);
+    expect(ids({})).not.toContain(CommandIds.openServerWindow());
+    expect(ids({ remoteConnection: makeBridge({ status: "shown" }) })).toContain(
+      CommandIds.openServerWindow()
+    );
+  });
+
+  test("shows Remote Connection settings only when the server window could not be shown", async () => {
+    for (const [result, expectedSettingsCalls] of [
+      [{ status: "shown" }, 0],
+      [{ status: "unavailable" }, 1],
+    ] satisfies Array<[OpenLocalServerResult, number]>) {
+      const onOpenSettings = mock();
+      const remoteConnection = makeBridge(result);
+      const action = getActions({ onOpenSettings, remoteConnection }).find(
+        (candidate) => candidate.id === CommandIds.openServerWindow()
+      );
+      await action!.run();
+      expect(remoteConnection.openLocalServer).toHaveBeenCalledTimes(1);
+      expect(onOpenSettings).toHaveBeenCalledTimes(expectedSettingsCalls);
+      if (expectedSettingsCalls) expect(onOpenSettings).toHaveBeenCalledWith("remote-connection");
+    }
+  });
+});
+
+describe("Implement Latest Plan palette action (#4963)", () => {
+  test("asks the latest plan card to run, and says so when no card started it", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.chatRunLatestPlanAction()
+      );
+      expect(action).toBeDefined();
+      const events = collectCommandEvents();
+      try {
+        // No card handled the request (no plan, or its action is disabled).
+        await action!.run();
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["error"]);
+
+        // The selected workspace's card starts its action and marks the request handled.
+        const requests: string[] = [];
+        const card = (event: Event) => {
+          const { detail } = event as CustomEvent<{ workspaceId: string; handled: boolean }>;
+          requests.push(detail.workspaceId);
+          detail.handled = true;
+        };
+        window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        await action!.run();
+        window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        expect(requests).toEqual(["w1"]);
+        expect(events.receivedToasts).toHaveLength(1);
+      } finally {
+        events.dispose();
+      }
+    });
+  });
 });

@@ -15,6 +15,7 @@ import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { stopStream } from "@/browser/utils/stopStream";
+import type { RuntimeStatusEvent } from "@/common/types/stream";
 
 type StreamingPhase =
   | "starting" // Message sent, waiting for stream-start
@@ -135,6 +136,38 @@ function useStabilizedStreamingStatusText(
   return debouncedText;
 }
 
+/** Live turn state the barrier renders from; each host derives it from its own stream source. */
+export interface StreamingBarrierState {
+  canInterrupt: boolean;
+  isCompacting: boolean;
+  isStreamStarting: boolean;
+  /** The user triggered an interrupt and the stream-abort has not arrived yet. */
+  isInterrupting: boolean;
+  awaitingUserQuestion: boolean;
+  currentModel: string | null;
+  pendingStreamModel: string | null;
+  runtimeStatus: RuntimeStatusEvent | null;
+  activeBashMonitorCount: number;
+}
+
+/** Phases whose Stop button is shown; the host decides how each one cancels. */
+export type StreamingBarrierCancelPhase = "starting" | "streaming" | "compacting";
+
+interface StreamingBarrierContentProps {
+  workspaceId: string;
+  state: StreamingBarrierState;
+  streamingStats: { tokenCount: number; tps: number } | null;
+  vimEnabled?: boolean;
+  className?: string;
+  /** Stop button handler; called only for cancelable phases. */
+  onCancel: (phase: StreamingBarrierCancelPhase) => void;
+  /**
+   * Opens compaction-model settings. Hosts without a Settings surface omit it, and then the
+   * compaction "configure" hint is not shown.
+   */
+  onConfigureCompaction?: () => void;
+}
+
 /**
  * Self-contained streaming status barrier.
  * Computes streaming state internally from workspaceId.
@@ -143,7 +176,7 @@ function useStabilizedStreamingStatusText(
 export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   workspaceId,
   className,
-  vimEnabled: vimEnabledFromParent,
+  vimEnabled,
   onCancelCompaction,
 }) => {
   const workspaceState = useWorkspaceState(workspaceId);
@@ -155,16 +188,80 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   const { api } = useAPI();
   const { open: openSettings } = useSettings();
 
+  const state: StreamingBarrierState = {
+    canInterrupt: workspaceState.canInterrupt,
+    isCompacting: workspaceState.isCompacting,
+    isStreamStarting: workspaceState.isStreamStarting,
+    isInterrupting: aggregator?.hasInterruptingStream() ?? false,
+    awaitingUserQuestion: workspaceState.awaitingUserQuestion,
+    currentModel: workspaceState.currentModel,
+    pendingStreamModel: workspaceState.pendingStreamModel,
+    runtimeStatus: workspaceState.runtimeStatus,
+    activeBashMonitorCount: workspaceState.activeBashMonitorCount,
+  };
+
+  const handleCancel = (phase: StreamingBarrierCancelPhase) => {
+    if (!api) {
+      return;
+    }
+
+    if (phase === "compacting") {
+      // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
+      // edit restoration + follow-up content behavior consistent across input methods.
+      if (onCancelCompaction) {
+        onCancelCompaction();
+        return;
+      }
+
+      void stopStream(api, workspaceId, { abandonPartial: true, disableAutoRetry: true });
+      return;
+    }
+
+    if (phase === "streaming") {
+      storeRaw.setInterrupting(workspaceId);
+    }
+
+    void stopStream(api, workspaceId, { disableAutoRetry: true });
+  };
+
+  return (
+    <StreamingBarrierContent
+      workspaceId={workspaceId}
+      state={state}
+      streamingStats={streamingStats}
+      vimEnabled={vimEnabled}
+      className={className}
+      onCancel={handleCancel}
+      onConfigureCompaction={() => openSettings("tasks")}
+    />
+  );
+};
+
+/**
+ * Presentational barrier logic shared by desktop and the VS Code webview (#4971): phase,
+ * status text (with debouncing), cancel affordance and stats. Returns null when there's
+ * nothing to show.
+ */
+export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = ({
+  workspaceId,
+  state,
+  streamingStats,
+  vimEnabled: vimEnabledFromParent,
+  className,
+  onCancel,
+  onConfigureCompaction,
+}) => {
   const {
     canInterrupt,
     isCompacting,
     isStreamStarting: isStarting,
+    isInterrupting,
     awaitingUserQuestion,
     currentModel,
     pendingStreamModel,
     runtimeStatus,
     activeBashMonitorCount,
-  } = workspaceState;
+  } = state;
 
   // Compute streaming phase
   const phase: StreamingPhase | null = (() => {
@@ -173,7 +270,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
     // bash monitor is still watching output, the agent will be woken on match.
     // Surface that so the idle chat doesn't read as "done" or stalled.
     if (!canInterrupt) return activeBashMonitorCount > 0 ? "waiting-on-monitor" : null;
-    if (aggregator?.hasInterruptingStream()) return "interrupting";
+    if (isInterrupting) return "interrupting";
     if (awaitingUserQuestion) return "awaiting-input";
     if (isCompacting) return "compacting";
     return "streaming";
@@ -257,36 +354,16 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
 
   const canTapCancel = phase === "starting" || phase === "streaming" || phase === "compacting";
   const handleCancelClick = () => {
-    if (!api) {
-      return;
-    }
-
     if (phase !== "starting" && phase !== "streaming" && phase !== "compacting") {
       return;
     }
-
-    if (phase === "compacting") {
-      // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
-      // edit restoration + follow-up content behavior consistent across input methods.
-      if (onCancelCompaction) {
-        onCancelCompaction();
-        return;
-      }
-
-      void stopStream(api, workspaceId, { abandonPartial: true, disableAutoRetry: true });
-      return;
-    }
-
-    if (phase === "streaming") {
-      storeRaw.setInterrupting(workspaceId);
-    }
-
-    void stopStream(api, workspaceId, { disableAutoRetry: true });
+    onCancel(phase);
   };
 
   // Show settings hint during compaction if no custom compaction model is configured
   const showCompactionHint =
     phase === "compacting" &&
+    onConfigureCompaction != null &&
     !readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}).compact?.modelString;
 
   return (
@@ -306,7 +383,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       hintElement={
         showCompactionHint ? (
           <button
-            onClick={() => openSettings("tasks")}
+            onClick={onConfigureCompaction}
             className="text-muted hover:text-foreground text-[10px] underline decoration-dotted underline-offset-2"
           >
             configure

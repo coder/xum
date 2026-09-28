@@ -17,8 +17,11 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { CoreLive, CoreOptionsTag } from "@/node/services/di/layers/core";
 import {
   AI,
+  AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
+  ContextManagement,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -45,6 +48,7 @@ import {
   type CoreRootTags,
   type CoreTags,
 } from "@/node/services/di/tags";
+import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { createCoreServices, type CoreServicesRoot } from "./coreServicesRoot";
 
@@ -53,14 +57,17 @@ import { createCoreServices, type CoreServicesRoot } from "./coreServicesRoot";
  * di/layers/core.ts); `Record<keyof CoreServices, …>` keeps it exhaustive.
  */
 const CORE_FIELD_TAGS: Record<keyof CoreServices, Context.Key<CoreTags, unknown>> = {
+  contextManagement: ContextManagement,
   historyService: History,
   initStateManager: InitStateManagerTag,
   providerService: Provider,
+  autoModelRouter: AutoModelRouterTag,
   backgroundProcessManager: BackgroundProcessManagerTag,
   sessionUsageService: SessionUsage,
   workspaceGoalService: WorkspaceGoal,
   idleDispatcher: IdleDispatcherTag,
   aiService: AI,
+  evaluationService: Evaluation,
   streamManager: StreamManagerTag,
   mcpConfigService: MCPConfig,
   mcpServerManager: MCPServerManagerTag,
@@ -105,6 +112,8 @@ describe("createCoreServices", () => {
     >) {
       expect(root.runtime.get(tag)).toBe(root[field]);
     }
+    const workspace = root.workspaceService as unknown as Pick<CoreServices, "contextManagement">;
+    expect(workspace.contextManagement).toBe(root.contextManagement);
     expect(root.appFiberScope).toBe(root.runtime.get(AppFiberScopeTag));
     expect(root.appFiberScope.state._tag).not.toBe("Closed");
     expect(root.runtime.get(EffectRunnerTag)).toBeDefined();
@@ -385,6 +394,44 @@ describe("createCoreServices", () => {
     expect(extensionMetadataInternals.registrationProbe).not.toBeNull();
     const probe = extensionMetadataInternals.registrationProbe!;
     expect(await probe("no-such-workspace")).toBe(false);
+  });
+
+  it("keeps the graph-owned tool-call display registry when caller options carry a foreign one", () => {
+    const foreign = new ToolCallDisplayRegistry();
+    root = createCoreServices({
+      ...stores,
+      extensionMetadataPath: path.join(tempDir, "extensionMetadata.json"),
+      mcpServerManagerOptions: {
+        inlineServers: { echo: "cat" },
+        ignoreConfigFile: true,
+        toolCallDisplayRegistry: foreign,
+      },
+    });
+    const managerInternals = root.mcpServerManager as unknown as {
+      toolCallDisplayRegistry: ToolCallDisplayRegistry;
+      inlineServers: Record<string, string>;
+      ignoreConfigFile: boolean;
+    };
+    const streamInternals = root.streamManager as unknown as {
+      toolCallDisplayRegistry: ToolCallDisplayRegistry;
+    };
+    // Ordinary caller options still apply.
+    expect(managerInternals.inlineServers).toEqual({ echo: "cat" });
+    expect(managerInternals.ignoreConfigFile).toBe(true);
+    // The registry is a shared dependency the core graph owns: the MCP manager
+    // publishes into the same instance the stream consumes, never a foreign one.
+    expect(managerInternals.toolCallDisplayRegistry).toBe(streamInternals.toolCallDisplayRegistry);
+    expect(managerInternals.toolCallDisplayRegistry).not.toBe(foreign);
+    const scope = { workspaceId: "ws", messageId: "m", token: "t" };
+    const snapshot = {
+      connection: { key: "echo", transport: "stdio" as const },
+      identity: { name: "n", version: "1" },
+      source: "connection" as const,
+    };
+    streamInternals.toolCallDisplayRegistry.open(scope);
+    expect(managerInternals.toolCallDisplayRegistry.set(scope, "call", snapshot)).toBe(true);
+    expect(streamInternals.toolCallDisplayRegistry.take(scope, "call")).toEqual(snapshot);
+    expect(foreign.take(scope, "call")).toBeUndefined();
   });
 
   it("rejects a core graph whose inputs are missing at compile time", () => {

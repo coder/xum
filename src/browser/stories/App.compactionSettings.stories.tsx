@@ -2,6 +2,7 @@ import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import { wrapAsyncIterator } from "@orpc/shared";
 import type { APIClient } from "@/browser/contexts/API";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
@@ -45,8 +46,7 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
 }
 
 async function openCompactionSettings(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const canvas = within(await openSettingsDialog(canvasElement));
   const trigger = await canvas.findByRole("combobox", { name: "Compaction strategy" });
   trigger.scrollIntoView({ block: "center" });
   // Initial local-override uploads belong to provider reconciliation, not a dropdown choice.
@@ -90,7 +90,9 @@ async function selectStrategy(trigger: HTMLElement, name: string) {
   await userEvent.click(trigger);
   const body = within(trigger.ownerDocument.body);
   await userEvent.click(await body.findByRole("option", { name }));
-  await expect(trigger).toHaveTextContent(name);
+  // Radix commits the choice asynchronously; asserting synchronously threw on
+  // loaded Pixel runners and captured a half-finished interaction.
+  await waitFor(() => expect(trigger).toHaveTextContent(name));
 }
 
 async function exerciseCompactionSettings(canvasElement: HTMLElement) {
@@ -176,15 +178,15 @@ export const TokenBudgetConflict: AppStory = {
   render: () => <AppWithMocks setup={() => setupCompactionSettings("conflict")} />,
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
-    const canvas = within(canvasElement);
+    const canvas = within(getSettingsDialog());
     await expect(trigger).toHaveTextContent("Token Budget");
     const warning = canvas.getByRole("status");
     await expect(warning).toBeVisible();
     await expect(trigger).toHaveAttribute("aria-describedby", warning.id);
     await selectStrategy(trigger, "Continuous");
-    await expect(canvas.queryByRole("status")).toBeNull();
+    await waitFor(() => expect(canvas.queryByRole("status")).toBeNull());
     await selectStrategy(trigger, "Token Budget");
     await expectPersistedStrategy(false, true);
-    await expect(canvas.getByRole("status")).toBeVisible();
+    await expect(await canvas.findByRole("status")).toBeVisible();
   },
 };

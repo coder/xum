@@ -1,3 +1,4 @@
+import fs from "fs/promises";
 import path from "path";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
@@ -8,6 +9,39 @@ const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
 const TYPING_SAMPLE =
   "Diagnose typing latency in a large chat transcript while keeping input responsive.";
+
+// Stub Coder CLI that reports a version below the minimum. The "outdated" state still
+// renders the Coder runtime controls, like a machine with the real CLI installed, without
+// needing whoami/templates. Without it, CI (no Coder CLI) skips the Coder props entirely and
+// cannot catch per-keystroke churn in them.
+const OUTDATED_CODER_STUB = `#!/bin/sh
+if [ "$1" = "version" ]; then echo '{"version":"0.0.1"}'; exit 0; fi
+exit 1
+`;
+
+// Setup runs before Electron launches, because the `app` fixture depends on `workspace`.
+const newWsTest = test.extend({
+  workspace: async ({ workspace }, use) => {
+    // The New Workspace page shows a "Configure an LLM Provider" prompt instead of the
+    // composer until a provider is configured, and CI has no provider credentials. The test
+    // never sends, and the harness runs with mock AI, so the placeholder key is never used.
+    const providersFile = path.join(workspace.configRoot, "providers.jsonc");
+    await fs.writeFile(providersFile, JSON.stringify({ anthropic: { apiKey: "e2e-placeholder" } }));
+
+    const stubBinDir = path.join(workspace.configRoot, "stub-bin");
+    await fs.mkdir(stubBinDir, { recursive: true });
+    await fs.writeFile(path.join(stubBinDir, "coder"), OUTDATED_CODER_STUB, { mode: 0o755 });
+    // The app fixture copies process.env into Electron's environment at launch.
+    const originalPath = process.env.PATH;
+    if (originalPath === undefined) throw new Error("Expected PATH to be set");
+    process.env.PATH = `${stubBinDir}${path.delimiter}${originalPath}`;
+    try {
+      await use(workspace);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  },
+});
 
 test.skip(
   ({ browserName }) => browserName !== "chromium",
@@ -51,7 +85,7 @@ test.describe("chat typing performance profiling", () => {
     expect(reactProfile.enabled).toBe(true);
   });
 
-  test("perf: type in the New Workspace composer", async ({ page, workspace }, testInfo) => {
+  newWsTest("perf: type in the New Workspace composer", async ({ page, workspace }, testInfo) => {
     const projectName = path.basename(workspace.demoProject.projectPath);
     await page.getByRole("button", { name: `Create workspace in ${projectName}` }).click();
 

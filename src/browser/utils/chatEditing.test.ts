@@ -40,6 +40,10 @@ describe("canEditDisplayedUserMessage", () => {
     expect(canEditDisplayedUserMessage(userMessage({ isBudgetLimitWrapup: true }))).toBe(false);
   });
 
+  test("excludes authentic plan-review feedback from all edit paths", () => {
+    expect(canEditDisplayedUserMessage(userMessage({ isPlanReviewFeedback: true }))).toBe(false);
+  });
+
   test("excludes the not-yet-persisted first message of a new workspace", () => {
     expect(canEditDisplayedUserMessage(userMessage({ isPendingSend: true }))).toBe(false);
   });

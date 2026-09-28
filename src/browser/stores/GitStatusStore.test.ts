@@ -185,6 +185,8 @@ function createStore(
 
 describe("GitStatusStore", () => {
   let store: GitStatusStore;
+  let hadWindow = false;
+  let originalWindow: unknown;
 
   beforeEach(() => {
     mockExecuteBash.mockReset();
@@ -200,6 +202,8 @@ describe("GitStatusStore", () => {
     } as Result<BashToolResult, string>);
     mockGetProjectGitStatuses.mockResolvedValue([]);
 
+    hadWindow = "window" in globalThis;
+    originalWindow = (globalThis as { window?: unknown }).window;
     (globalThis as unknown as { window: unknown }).window = {
       addEventListener: jest.fn(),
       removeEventListener: jest.fn(),
@@ -216,8 +220,15 @@ describe("GitStatusStore", () => {
 
   afterEach(() => {
     store.dispose();
-    // Cleanup mocked window to avoid leaking between tests
-    delete (globalThis as { window?: unknown }).window;
+    // Restore rather than delete: an earlier suite in the same bun process may have
+    // installed a DOM, and deleting only `window` leaves `document` behind. Later
+    // module-load checks (mermaid's `typeof document` then `window.addEventListener`)
+    // then crash with an unhandled error in whichever suite imports them next.
+    if (hadWindow) {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    } else {
+      delete (globalThis as { window?: unknown }).window;
+    }
   });
 
   test("subscribe and unsubscribe", () => {
@@ -471,6 +482,47 @@ describe("GitStatusStore", () => {
     expect(listener).not.toHaveBeenCalled();
 
     unsub();
+  });
+
+  // #4662: opening a workspace must not spawn git status/fetch while its chat replay runs.
+  it("defers a workspace's status and fetch until its chat replay settles", async () => {
+    const pendingId = "replay-pending";
+    const readyId = "replay-settled";
+    let pending = true;
+    const gateListeners = new Set<() => void>();
+    store.setChatReplayGate({
+      isReplayPending: (workspaceId) => pending && workspaceId === pendingId,
+      subscribeKey: (workspaceId, listener) => {
+        if (workspaceId !== pendingId) return () => undefined;
+        gateListeners.add(listener);
+        return () => gateListeners.delete(listener);
+      },
+    });
+    const scriptsFor = (workspaceId: string) =>
+      mockExecuteBash.mock.calls
+        .map((call) => (call as unknown[])[0] as { workspaceId: string; script: string })
+        .filter((args) => args.workspaceId === workspaceId)
+        .map((args) => (args.script === GIT_FETCH_SCRIPT ? "fetch" : "status"));
+    store.syncWorkspaces(
+      new Map([
+        // Separate projects: local fetches are deduplicated per project.
+        [pendingId, { ...createWorkspaceMetadata(pendingId), projectName: "pending-project" }],
+        [readyId, createWorkspaceMetadata(readyId)],
+      ])
+    );
+    const unsubscribers = [pendingId, readyId].map((id) => store.subscribeKey(id, jest.fn()));
+
+    await waitUntil(() => scriptsFor(readyId).length === 2);
+    expect(scriptsFor(pendingId)).toEqual([]);
+    expect(gateListeners.size).toBe(1);
+
+    pending = false;
+    for (const listener of Array.from(gateListeners)) listener();
+
+    await waitUntil(() => scriptsFor(pendingId).length === 2);
+    expect(scriptsFor(pendingId).sort()).toEqual(["fetch", "status"]);
+    expect(gateListeners.size).toBe(0);
+    for (const unsubscribe of unsubscribers) unsubscribe();
   });
 
   describe("passive fetch runtime gating", () => {

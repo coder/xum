@@ -1,0 +1,558 @@
+import type { MuxMessage } from "@/common/types/message";
+import type { SettledStepBudget } from "../streamManager";
+import type { ContextSendFailure, ContextFailureRecovery } from "./types";
+import type { PreparationReceipt } from "./types";
+import { TokenBudgetStrategy } from "./strategies/tokenBudget";
+import { parseWorkspaceTurnTaskCorrelation, type MuxMessageMetadata } from "@/common/types/message";
+import { eventSpine } from "../events/eventSpine";
+import { isRlmModeEnabled } from "../branchSummary";
+import {
+  buildAutoCompactionFollowUp,
+  inheritOpenWorkspaceTurnMetadata,
+  computeKeepRecentTailStamp,
+  isCompactionRequestMetadata,
+} from "./compactionRequests";
+import type { BeforeSendInput, BeforeSendOutcome } from "./types";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import { log } from "../log";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
+import { ContinuousStrategy } from "./strategies/continuous";
+import { SummarizeStrategy } from "./strategies/summarize";
+import { resolveContextStrategy } from "./selection";
+import type { StreamContextSnapshot, ContextResetReason } from "./types";
+import { CompactionHandler } from "../compactionHandler";
+import { CompactionMonitor } from "../compactionMonitor";
+import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
+import type { ContextManagementDependencies } from "./contextManagementService";
+import type { SessionContextHost } from "./sessionContextHost";
+
+/** Owns automatic context policy; the session retains admission, publication and dispatch. */
+export class SessionContextController {
+  readonly compaction: Pick<
+    CompactionHandler,
+    | "handleCompletion"
+    | "ackPendingStateConsumed"
+    | "peekPendingState"
+    | "peekCarryoverState"
+    | "peekCachedFilePaths"
+    | "discardPendingStateDurably"
+    | "appendHeartbeatContextResetBoundary"
+    | "rollbackHeartbeatContextResetBoundary"
+  >;
+  private readonly compactionHandler: CompactionHandler;
+  private readonly compactionMonitor: CompactionMonitor;
+
+  private readonly continuous: ContinuousStrategy;
+  private readonly summarize: SummarizeStrategy;
+  private readonly tokenBudget: TokenBudgetStrategy;
+
+  constructor(
+    private readonly deps: ContextManagementDependencies,
+    private readonly host: SessionContextHost,
+    /** Lets the owning service stop fanning config changes out to a disposed controller. */
+    private readonly onDisposed?: () => void
+  ) {
+    this.compactionHandler = new CompactionHandler({
+      workspaceId: host.workspaceId,
+      historyService: deps.historyService,
+      sessionDir: host.sessionDir,
+      telemetryService: deps.telemetryService,
+      emitter: host.emitter,
+      onCompactionComplete: (metadata) => {
+        // RLM keep-recent floor: tail copies make the summary no longer the last row.
+        // Record before notifying the session's external observer, including clearing a
+        // previous continuous summary ID when a later resumeless fold has no tail.
+        host.coordinator.recordCompactionSummary(
+          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
+        );
+        host.onCompactionComplete?.(metadata);
+      },
+      onIdleCompactionOutcome: (success) => host.onIdleCompactionOutcome?.(success),
+    });
+    // Keep the handler receiver intact while limiting the session's permanent API surface.
+    this.compaction = this.compactionHandler;
+    this.compactionMonitor = new CompactionMonitor(host.workspaceId, (event) =>
+      host.emitChatEvent(event)
+    );
+    this.continuous = new ContinuousStrategy(
+      deps,
+      host,
+      this.compactionHandler,
+      this.compactionMonitor,
+      (model) => this.autoCompactionThreshold(model)
+    );
+    this.summarize = new SummarizeStrategy(host, this.continuous);
+    // The threshold is persisted per model (config.json) and resolved once per decision; the
+    // strategy holds no cached copy, so a slider change lands on its next decision.
+    this.tokenBudget = new TokenBudgetStrategy(
+      deps,
+      host,
+      (model) => this.autoCompactionThreshold(model),
+      this.compactionHandler,
+      (options) => this.isTokenBudgetActive(options)
+    );
+  }
+
+  /** Persisted preferences changed (shared listener in ContextManagementService). */
+  onPersistedPreferencesChanged(): void {
+    if (this.host.coordinator.disposed) return;
+    this.continuous.onPersistedThresholdMaybeChanged();
+  }
+
+  /**
+   * Auto-compaction threshold for one decision, resolved fresh from the persisted user
+   * preferences (`config.json`). Callers resolve once per decision and thread the value; the
+   * controller never caches it, so a slider change is honored by the next decision.
+   */
+  autoCompactionThreshold(model: string): number {
+    return resolveAutoCompactionThreshold(
+      this.deps.config.loadConfigOrDefault().userPreferences,
+      model
+    );
+  }
+
+  normalizeSend(
+    userMessage: MuxMessage,
+    options: SendMessageOptions,
+    active: boolean
+  ): SendMessageOptions {
+    return this.tokenBudget.normalizeSend(userMessage, options, active);
+  }
+  preparePublication(input: Parameters<TokenBudgetStrategy["preparePublication"]>[0]) {
+    return this.tokenBudget.preparePublication(input);
+  }
+  onSendAccepted(userMessage: MuxMessage, prefixRows: readonly MuxMessage[]): void {
+    this.tokenBudget.onSendAccepted(userMessage, prefixRows);
+  }
+  clearBudgetState(): void {
+    this.tokenBudget.clearContextBudgetState();
+  }
+  restoreStream(input: Parameters<TokenBudgetStrategy["restoreStream"]>[0]) {
+    return this.tokenBudget.restoreStream(input);
+  }
+  canRecover(stream: StreamContextSnapshot, model: string): boolean {
+    return this.tokenBudget.canRecover(stream, model);
+  }
+  prepareRecovery(input: Parameters<TokenBudgetStrategy["prepareRecovery"]>[0]) {
+    return this.tokenBudget.prepareRecovery(input);
+  }
+  checkFreshRequest(...args: Parameters<TokenBudgetStrategy["checkFreshContextBudget"]>) {
+    return this.tokenBudget.checkFreshContextBudget(...args);
+  }
+  discardFailedCarryover(
+    pendingState: Parameters<CompactionHandler["discardPendingState"]>[1]
+  ): Promise<void> {
+    return this.tokenBudget.discardFailedCarryover(pendingState);
+  }
+  onSendFailure(input: ContextSendFailure): ContextFailureRecovery | undefined {
+    if (input.phase === "preflight") {
+      return input.error.type === "context_budget_exceeded" &&
+        this.isTokenBudgetActive(input.options)
+        ? { model: input.error.model, estimate: input.error.estimate, rejectRequest: true }
+        : undefined;
+    }
+    const context = input.stream;
+    return context &&
+      !input.isCompactionRequest &&
+      this.isTokenBudgetActive(context.options) &&
+      ((input.errorType === "context_exceeded" && !input.hadOutput) || input.exceeded != null)
+      ? {
+          model: input.exceeded?.model ?? context.modelString,
+          estimate: input.exceeded?.estimate,
+          rejectRequest: !input.hadOutput,
+        }
+      : undefined;
+  }
+
+  capturePreparation(): PreparationReceipt {
+    return this.tokenBudget.capturePreparation();
+  }
+  validatePreparation(receipt: PreparationReceipt): boolean {
+    return this.tokenBudget.validatePreparation(receipt);
+  }
+
+  stepSettlement(
+    input:
+      | { kind: "prepared" }
+      | {
+          kind: "starting";
+          stream: Pick<StreamContextSnapshot, "options" | "contextBudgetFlushTurn">;
+        }
+  ) {
+    // An already prepared rollover request owns this callback even if selection changes.
+    // The ordinary start path retains its separate active-mode/flush obligation predicate.
+    return input.kind === "prepared" ||
+      this.isTokenBudgetActive(input.stream.options) ||
+      input.stream.contextBudgetFlushTurn
+      ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
+      : undefined;
+  }
+
+  /** A real user turn re-arms auto-compaction after one that brought no relief (#4421). */
+  noteUserTurn(): void {
+    this.compactionMonitor.noteUserTurn();
+  }
+
+  /** An auto-compaction boundary was published: arm the no-relief guard (#4421). */
+  noteAutoCompactionCompleted(): void {
+    this.compactionMonitor.noteAutoCompactionCompleted();
+  }
+
+  onStreamStarting(): void {
+    this.compactionMonitor.resetForNewStream();
+  }
+
+  reset(reason: ContextResetReason): void {
+    // Cancellation's upfront user-interrupt reset must not clear the budget early.
+    if (
+      reason === "context-changed" ||
+      reason === "context-mutation" ||
+      reason === "compaction-request"
+    )
+      this.tokenBudget.clearContextBudgetState();
+    this.continuous.continuousCompactor.reset(
+      reason === "settings-changed"
+        ? "context-changed"
+        : reason === "context-refresh"
+          ? "context-mutation"
+          : reason
+    );
+  }
+
+  onUserInterrupt(input: { abandonPartial: boolean }): void {
+    this.tokenBudget.clearContextBudgetState();
+    if (input.abandonPartial || this.host.coordinator.midStreamCompactionPending) {
+      this.host.coordinator.abandonCompaction();
+      this.reset("user-interrupt");
+    }
+  }
+
+  beginShutdown(): void {
+    this.continuous.continuousCompactor.reset("shutdown");
+  }
+  dispose(): void {
+    this.onDisposed?.();
+    this.continuous.continuousCompactor.reset("dispose");
+  }
+  isApplying(): boolean {
+    return this.continuous.continuousCompactor.isApplying();
+  }
+  recover(): Promise<boolean> {
+    return this.continuous.recoverCompaction();
+  }
+
+  onStreamSettled(input: { model: string; options?: SendMessageOptions }): Promise<void> {
+    return this.continuous.observeContinuousCompactionAtStreamEnd(input.model, input.options);
+  }
+
+  isTokenBudgetActive(options?: SendMessageOptions): boolean {
+    const selection = resolveContextStrategy({
+      experiments: options?.experiments,
+      isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
+      isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
+    });
+    if (
+      selection.tokenBudgetSuppressedBy === "continuous" ||
+      selection.tokenBudgetSuppressedBy === "rlm"
+    ) {
+      log.debug("Token-budget rollover yields to continuous/RLM compaction", {
+        workspaceId: this.host.workspaceId,
+      });
+    }
+    return selection.configured === "token-budget" && selection.tokenBudgetSuppressedBy == null;
+  }
+
+  async onPrefixSwapInvalidated(messageId: string): Promise<void> {
+    try {
+      if (messageId !== this.host.streams.getStreamInfo(this.host.workspaceId)?.messageId) return;
+      // Wait for the entire owning observer, including its follow-up dispatch.
+      await this.continuous.waitForContinuousCompactionObservation();
+      await this.continuous.continuousCompactor.waitForIdle();
+      await this.continuous.waitForContinuousCompactionObservation();
+      const context = this.host.state.stream;
+      if (
+        !context ||
+        this.host.coordinator.compactionIntent.observation?.kind === "continuous" ||
+        this.host.coordinator.midStreamCompactionPending ||
+        messageId !== this.host.streams.getStreamInfo(this.host.workspaceId)?.messageId ||
+        !this.host.streams.isStreaming(this.host.workspaceId)
+      )
+        return;
+      await this.continuous.runContinuousCompactionObservation(async (token) => {
+        const result = await this.continuous.observeCompaction(0, {
+          ...this.continuous.getContinuousCompactionContext(context.modelString, context.options),
+          phase: "mid-stream",
+        });
+        // The observation's finally settles the pending window only after this dispatches the
+        // continuation; settling earlier would let an idle waiter race the follow-up send.
+        await this.continuous.finishContinuousCompaction(result === "applied", context, token);
+      });
+    } catch (error) {
+      await this.continuous.recoverContinuousCompactionFailure(error);
+    }
+  }
+
+  async onUsage(input: {
+    modelForUsage: string;
+    usage: LanguageModelV2Usage;
+    stream: StreamContextSnapshot | undefined;
+    isCompactionRequest: boolean;
+  }): Promise<void> {
+    const { modelForUsage } = input;
+    // Never recurse compaction while we're already running a compaction request.
+    if (
+      input.isCompactionRequest ||
+      this.host.coordinator.midStreamCompactionPending ||
+      this.host.coordinator.compactionIntent.observation?.kind === "continuous" ||
+      this.isTokenBudgetActive(input.stream?.options)
+    ) {
+      return;
+    }
+
+    const streamContext = input.stream;
+    const streamOptions = streamContext?.options;
+    if (streamContext?.modelString !== modelForUsage) return;
+    // One threshold per usage decision: shared by the continuous context and the mid-stream check.
+    const threshold = this.autoCompactionThreshold(modelForUsage);
+    const continuousContext = this.continuous.getContinuousCompactionContext(
+      modelForUsage,
+      streamOptions,
+      threshold
+    );
+    const usagePercent =
+      continuousContext.contextWindowTokens > 0
+        ? ((input.usage.inputTokens ?? input.usage.cachedInputTokens ?? 0) /
+            continuousContext.contextWindowTokens) *
+          100
+        : 0;
+    if (!continuousContext.enabled) this.continuous.continuousCompactor.reset("disabled");
+    const consumedSwapPending = this.continuous.continuousCompactor.hasConsumedSwap();
+    let continuousResult: "none" | "applied" | "fallback" = "none";
+    if (continuousContext.enabled || consumedSwapPending) {
+      // Continuous mode reaches checkMidStream only past the force level, which is the relief bar
+      // itself, so feed its live reading to the no-relief guard (#4421, #4796) here. This is the
+      // scale continuous mode uses for its own force decision.
+      if (continuousContext.contextWindowTokens > 0)
+        this.compactionMonitor.noteLiveUsage(usagePercent);
+      // One usage handler owns the eventual resume; observe itself shares its
+      // latch result, which must not dispatch the continuation twice.
+      const observed = await this.continuous.runContinuousCompactionObservation(async (token) => {
+        const result = await this.continuous.observeCompaction(usagePercent, {
+          ...continuousContext,
+          phase: "mid-stream",
+        });
+        if (this.host.coordinator.midStreamCompactionPending) {
+          await this.continuous.finishContinuousCompaction(
+            result === "applied",
+            streamContext,
+            token
+          );
+          return undefined;
+        }
+        if (result === "applied") this.host.transitionContextState("invalidate");
+        return result;
+      });
+      if (observed === undefined) return;
+      continuousResult = observed;
+    }
+    if (
+      continuousResult === "applied" ||
+      ((continuousContext.enabled || consumedSwapPending) && continuousResult !== "fallback")
+    )
+      return;
+    if (this.host.state.stream !== streamContext) return;
+    const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
+      model: modelForUsage,
+      threshold,
+      usage: input.usage,
+      use1MContext: isAnthropic1MEffectivelyEnabled(
+        modelForUsage,
+        streamOptions?.providerOptions,
+        streamContext?.providersConfig ?? null
+      ),
+      providersConfig: streamContext?.providersConfig ?? null,
+      openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
+    });
+
+    if (shouldInterruptForCompaction) {
+      // The no-relief guard (#4421) arms only if this compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
+        threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+      );
+      await this.summarize.interruptForCompaction();
+    }
+  }
+
+  async beforeSend(input: BeforeSendInput): Promise<BeforeSendOutcome> {
+    if (input.stage === "request") {
+      const prepared = await this.tokenBudget.prepareContextBudgetSend(
+        input.userMessage,
+        input.options
+      );
+      return prepared.success
+        ? {
+            kind: "proceed",
+            prefixRows: prepared.data.prefix,
+            assemblySnapshot: prepared.data.requestAssemblySnapshot,
+          }
+        : { kind: "reject", error: prepared.error };
+    }
+    if (input.stage === "prelude") {
+      const checked = await this.tokenBudget.checkFreshContextBudget(
+        input.userMessage,
+        input.options.model,
+        input.options,
+        input.prefixRows
+      );
+      return checked.success ? { kind: "proceed" } : { kind: "reject", error: checked.error };
+    }
+    const modelForStream = input.modelForStream;
+    const optionsForStream = input.options;
+    const providersConfigForCompaction = this.host.state.providersConfig;
+    // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
+    if (await this.recover()) this.host.transitionContextState("invalidate");
+    // One threshold per admission decision: resolved from persisted preferences here and
+    // threaded through the pressure check, the continuous context and the compact-first gate.
+    const threshold = this.autoCompactionThreshold(modelForStream);
+    const compactionResult = this.compactionMonitor.checkBeforeSend({
+      model: modelForStream,
+      threshold,
+      usage: this.host.state.usage,
+      use1MContext: isAnthropic1MEffectivelyEnabled(
+        modelForStream,
+        optionsForStream.providerOptions,
+        providersConfigForCompaction
+      ),
+      providersConfig: providersConfigForCompaction,
+      openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
+    });
+
+    const continuousContext = this.continuous.getContinuousCompactionContext(
+      modelForStream,
+      optionsForStream,
+      threshold
+    );
+    if (!continuousContext.enabled) this.reset("disabled");
+    const continuousResult = continuousContext.enabled
+      ? await this.continuous.observeCompaction(compactionResult.usagePercentage, {
+          ...continuousContext,
+          phase: "on-send",
+        })
+      : "none";
+    if (continuousResult === "applied") this.host.transitionContextState("invalidate");
+    if (await input.cancelBeforeAcceptance()) return { kind: "cancelled" };
+
+    // A staged fold needs no compact turn. Without one, the experiment waits
+    // until the force threshold; the legacy path retains its on-send threshold.
+    const shouldCompactBeforeSend =
+      threshold < 1 &&
+      (continuousContext.enabled
+        ? continuousResult === "fallback" && compactionResult.shouldForceCompact
+        : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
+    // A new boundary would hide the summary needed to retire scoped Stop debt.
+    // Keep ordinary input flowing, but defer legacy compaction until cleanup succeeds.
+    // An explicit replacement instead publishes its witness before compaction can hide debt.
+    if (
+      shouldCompactBeforeSend &&
+      (input.replacement || !(await this.host.isCompactionRecoveryBlocked())) &&
+      !this.compactionMonitor.suppressRepeatedAutoCompaction(
+        "on-send",
+        compactionResult.usagePercentage
+      )
+    ) {
+      // Relief means a live reading under the level that triggered this compaction; the guard
+      // (#4421) arms only if the compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
+        continuousContext.enabled
+          ? threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+          : compactionResult.thresholdPercentage
+      );
+      this.reset("legacy-fallback");
+      const followUpFileParts = input.fileParts?.map((part) => ({
+        url: part.url,
+        mediaType: part.mediaType,
+        filename: part.filename,
+      }));
+
+      // A monitor-wake continuation of an open delegated turn is about to be
+      // consumed by compaction; capture the correlation from pre-compaction
+      // history now, because the correlated queue-cut assistant will be
+      // hidden behind the new boundary when the follow-up dispatches.
+      let inheritedWorkspaceTurnMetadata:
+        | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        | undefined;
+      if (input.muxMetadata?.type === "bash-monitor-wake") {
+        // Reactivated continuations carry a fresh identity that older history must not replace.
+        const explicitCorrelation = parseWorkspaceTurnTaskCorrelation(input.muxMetadata);
+        if (explicitCorrelation != null) {
+          inheritedWorkspaceTurnMetadata = {
+            type: "workspace-turn-task",
+            ...explicitCorrelation,
+          };
+        } else {
+          const preCompactionHistory = await this.deps.historyService.getHistoryFromLatestBoundary(
+            this.host.workspaceId
+          );
+          if (preCompactionHistory.success) {
+            inheritedWorkspaceTurnMetadata = inheritOpenWorkspaceTurnMetadata(
+              preCompactionHistory.data
+            );
+          }
+        }
+      }
+
+      const followUpContent = buildAutoCompactionFollowUp({
+        messageText: input.messageText,
+        options: optionsForStream,
+        modelForStream,
+        fileParts: followUpFileParts,
+        agentInitiated: input.agentInitiated,
+        goalKind: input.goalKind,
+        goalId: input.goalId,
+        muxMetadata: input.muxMetadata,
+        workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
+        autoModelRouting: input.autoModelRouting,
+      });
+
+      // Waterfall hook point: lets registered middleware (e.g. refinement
+      // journaling) run before context is compacted away. No-op when empty.
+      await eventSpine.run("compaction.prepare", {
+        workspaceId: this.host.workspaceId,
+        reason: "on-send",
+      });
+
+      const autoCompactionRequest = this.host.buildAutoCompactionRequest({
+        followUpContent,
+        baseOptions: optionsForStream,
+        reason: "on-send",
+      });
+
+      // RLM keep-recent floor: stamp on-send auto-compaction requests with
+      // the durable tail-start sequence. No-op when RLM is off.
+      if (autoCompactionRequest.metadata.type === "compaction-request") {
+        const enabled = isRlmModeEnabled(optionsForStream.experiments, (id) =>
+          this.deps.aiService.isExperimentEnabled(id)
+        );
+        const stamp = await computeKeepRecentTailStamp(
+          this.deps.historyService,
+          this.host.workspaceId,
+          enabled
+        );
+        if (stamp !== undefined)
+          autoCompactionRequest.metadata = {
+            ...autoCompactionRequest.metadata,
+            keepRecentTail: stamp,
+          };
+      }
+
+      return {
+        kind: "compact-first",
+        request: autoCompactionRequest,
+        usagePercent: Math.round(compactionResult.usagePercentage),
+      };
+    }
+    return { kind: "proceed" };
+  }
+}

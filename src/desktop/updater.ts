@@ -94,6 +94,7 @@ export type UpdateStatus =
   | { type: "up-to-date" } // Explicitly checked, no updates available
   | { type: "downloading"; percent: number }
   | { type: "downloaded"; info: UpdateInfo }
+  | { type: "restarting"; info: UpdateInfo }
   | { type: "error"; phase: "check" | "download" | "install"; message: string };
 
 /**
@@ -116,6 +117,8 @@ export class UpdaterService {
     install: 0,
   };
   private checkSource: "auto" | "manual" = "auto";
+  // Kept so an install retry after an install error still knows which version is restarting.
+  private downloadedInfo: UpdateInfo | null = null;
   private subscribers = new Set<(status: UpdateStatus) => void>();
   private currentChannel: UpdateChannel = "stable";
 
@@ -222,6 +225,7 @@ export class UpdaterService {
 
     autoUpdater.on("update-downloaded", (info: UpdateInfo) => {
       log.info("Update downloaded:", info.version);
+      this.downloadedInfo = info;
       this.updateStatus = { type: "downloaded", info };
       this.notifyRenderer();
     });
@@ -258,10 +262,12 @@ export class UpdaterService {
         return;
       }
 
+      // quitAndInstall() can also fail through this event (missing installer, native updater
+      // error); that is an install failure the user may retry, not a check failure.
       const phase =
         this.updateStatus.type === "downloading"
           ? "download"
-          : this.updateStatus.type === "downloaded"
+          : this.updateStatus.type === "downloaded" || this.updateStatus.type === "restarting"
             ? "install"
             : this.updateStatus.type === "error"
               ? this.updateStatus.phase
@@ -305,7 +311,7 @@ export class UpdaterService {
     // Skip when a check/download is already in progress or an update
     // is ready to install — the 4-hour interval fires unconditionally,
     // and we don't want it clobbering active states.
-    const dominated = ["checking", "downloading", "downloaded"] as const;
+    const dominated = ["checking", "downloading", "downloaded", "restarting"] as const;
     if ((dominated as readonly string[]).includes(this.updateStatus.type)) {
       // If a check is already in flight and the user explicitly triggers a manual
       // check, upgrade the source so transient failures surface to the user.
@@ -470,6 +476,7 @@ export class UpdaterService {
       // Mark as downloaded
       const version = this.fakeVersion;
       const fakeDownloadedInfo = { version } satisfies Partial<UpdateInfo> as UpdateInfo;
+      this.downloadedInfo = fakeDownloadedInfo;
       this.updateStatus = {
         type: "downloaded",
         info: fakeDownloadedInfo,
@@ -491,9 +498,11 @@ export class UpdaterService {
    * Install a downloaded update and restart the app
    */
   installUpdate(): void {
+    const info = this.downloadedInfo;
     if (
-      this.updateStatus.type !== "downloaded" &&
-      !(this.updateStatus.type === "error" && this.updateStatus.phase === "install")
+      info === null ||
+      (this.updateStatus.type !== "downloaded" &&
+        !(this.updateStatus.type === "error" && this.updateStatus.phase === "install"))
     ) {
       throw new Error("No update downloaded to install");
     }
@@ -513,6 +522,11 @@ export class UpdaterService {
       log.debug(`Fake update install requested for ${this.fakeVersion} - would restart app here`);
       return;
     }
+
+    // The renderer must swap to the restart screen before quitAndInstall(), which can block for
+    // seconds (Squirrel on macOS) or spawn an installer while the window is still visible.
+    this.updateStatus = { type: "restarting", info };
+    this.notifyRenderer();
 
     try {
       markUpdateInstallInProgress();
@@ -535,10 +549,12 @@ export class UpdaterService {
       return;
     }
 
-    const blockedStates = ["checking", "downloading", "downloaded"] as const;
+    // "restarting" is blocked too: resetting to idle here would drop the renderer's restart
+    // screen while quitAndInstall() is still in flight.
+    const blockedStates = ["checking", "downloading", "downloaded", "restarting"] as const;
     if ((blockedStates as readonly string[]).includes(this.updateStatus.type)) {
       throw new Error(
-        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : "an update is ready to install"}`
+        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : this.updateStatus.type === "restarting" ? "an update is installing" : "an update is ready to install"}`
       );
     }
 

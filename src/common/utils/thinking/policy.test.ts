@@ -246,6 +246,26 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test.each(["gpt-6-sol", "gpt-6-luna"])("preserves off and native max for %s", (model) => {
+    for (const id of [
+      `openai:${model}`,
+      `mux-gateway:openai/${model}`,
+      `openrouter:openai/${model}-2026-09-22`,
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual([
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+      expect(enforceThinkingPolicy(id, "off")).toBe("off");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    expect(enforceThinkingPolicy(`openai:${model}-mini`, "max")).toBe("high");
+  });
+
   // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
   // is not offered. Named variants and other GPT-6 ids stay outside the rule.
   test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
@@ -511,6 +531,21 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    // Opus 5.5 is the first Opus that cannot disable thinking (Opus 5 still can).
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5-20260922")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5-1")).toEqual([
       "low",
       "medium",
@@ -526,6 +561,7 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
   test("resolveEffectiveThinkingLevel clamps unset/off for forced-thinking models", () => {
@@ -535,6 +571,10 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", undefined)).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "off")).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "medium")).toBe("medium");
+    // Opus 5.5 always thinks; Opus 5 (and Bedrock-style ids) keep their own behavior.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("bedrock:anthropic.claude-opus-5-5", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5", undefined)).toBe("off");
     // Other models keep legacy behavior: unset means "off", explicit levels pass through
     // unclamped (policy enforcement happens at the call sites that own it).
     expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-4-8", undefined)).toBe("off");
@@ -1083,6 +1123,15 @@ describe("Grok 4.6 thinking policy", () => {
     expect(getDefaultMinimumThinkingLevel("xai:grok-4.6")).toBe("medium");
     expect(enforceThinkingPolicy("xai:grok-4.6", "off")).toBe("low");
     expect(enforceThinkingPolicy("xai:grok-4.6", "max")).toBe("xhigh");
+  });
+});
+
+describe("Grok 4.7 thinking policy", () => {
+  test("keeps the native-xhigh frontier Grok ladder", () => {
+    expect(getThinkingPolicyForModel("xai:grok-4.7")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(getDefaultMinimumThinkingLevel("xai:grok-4.7")).toBe("medium");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "off")).toBe("low");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "max")).toBe("xhigh");
   });
 });
 

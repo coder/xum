@@ -23,7 +23,11 @@ import type {
   UiConnectionStatus,
   UiWorkspace,
 } from "./webview/protocol";
-import { isAllowedOrpcPath } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  redactWebviewOrpcResult,
+  sanitizeWebviewOrpcInput,
+} from "./orpcAllowlist";
 import { parseWebviewToExtensionMessage } from "./parseWebviewToExtensionMessage";
 import { openWorkspace } from "./workspaceOpener";
 
@@ -65,11 +69,7 @@ function formatLogData(data: unknown): string {
   }
 }
 
-function xumLog(
-  level: "debug" | "info" | "warn" | "error",
-  message: string,
-  data?: unknown
-): void {
+function xumLog(level: "debug" | "info" | "warn" | "error", message: string, data?: unknown): void {
   const channel = getXumLogChannel();
   const suffix = data === undefined ? "" : ` ${formatLogData(data)}`;
 
@@ -134,6 +134,13 @@ function toUiWorkspace(workspace: WorkspaceWithContext): UiWorkspace {
     // Backend guarantees createdAt for new workspaces, but keep a stable fallback for legacy ones.
     createdAt: workspace.createdAt ?? new Date(0).toISOString(),
     unarchivedAt: workspace.unarchivedAt,
+    ai: {
+      agentId: workspace.agentId,
+      agentType: workspace.agentType,
+      parentWorkspaceId: workspace.parentWorkspaceId,
+      aiSettings: workspace.aiSettings,
+      aiSettingsByAgent: workspace.aiSettingsByAgent,
+    },
   };
 }
 
@@ -467,7 +474,6 @@ function createWorkspaceQuickPickItem(
 
   const aiByAgent =
     workspace.aiSettingsByAgent ??
-    workspace.aiSettingsByMode ??
     (workspace.aiSettings
       ? {
           plan: workspace.aiSettings,
@@ -527,9 +533,7 @@ async function openWorkspaceCommand(
 
     // User can't easily open Xum from VS Code, so just inform them
     if (selection === "Open Xum") {
-      vscode.window.showInformationMessage(
-        "Please open the Xum application to create workspaces."
-      );
+      vscode.window.showInformationMessage("Please open the Xum application to create workspaces.");
     }
     return;
   }
@@ -1513,6 +1517,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
   private async pumpOrpcStream(
     streamId: string,
+    path: string[],
     iterator: AsyncIterator<unknown>,
     controller: AbortController
   ): Promise<void> {
@@ -1529,7 +1534,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.postMessage({
           type: "orpcStreamData",
           streamId,
-          value,
+          // Same redaction as value responses (#4820): the allowed streams emit only void change
+          // signals today, but a future structured stream on a redacted path must not bypass it.
+          value: redactWebviewOrpcResult(path, value),
         });
       }
 
@@ -1576,6 +1583,21 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
+      const sanitized = sanitizeWebviewOrpcInput(
+        args.path,
+        args.input,
+        new Set(this.workspacesById.keys())
+      );
+      if (!sanitized.ok) {
+        this.postMessage({
+          type: "orpcResponse",
+          requestId: args.requestId,
+          ok: false,
+          error: sanitized.error,
+        });
+        return;
+      }
+
       if (this.connectionStatus.mode !== "api") {
         this.postMessage({
           type: "orpcResponse",
@@ -1617,7 +1639,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
-      const result = await procedure(args.input, {
+      const result = await procedure(sanitized.input, {
         signal: controller.signal,
         lastEventId: args.lastEventId,
       });
@@ -1643,7 +1665,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           streamId,
         });
 
-        void this.pumpOrpcStream(streamId, iterator, controller);
+        void this.pumpOrpcStream(streamId, args.path, iterator, controller);
         return;
       }
 
@@ -1652,7 +1674,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         requestId: args.requestId,
         ok: true,
         kind: "value",
-        value: result,
+        value: redactWebviewOrpcResult(args.path, result),
       });
     } catch (error) {
       if (controller.signal.aborted) {
@@ -1725,6 +1747,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       return;
     }
 
+    // Sibling pump under the same controller, so it stops with the chat subscription.
+    void this.pumpSelectedWorkspaceActivity(api.client, workspaceId, controller);
+
     try {
       const iterator = await api.client.workspace.onChat(
         { workspaceId },
@@ -1754,10 +1779,63 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         message: `Chat subscription error: ${formatError(error)}`,
       });
     } finally {
+      // Stops the sibling activity pump too, so an ended chat stream never leaves it running.
+      controller.abort();
       if (this.subscriptionAbort === controller) {
         this.subscriptionAbort = null;
         this.subscribedWorkspaceId = null;
       }
+    }
+  }
+
+  /**
+   * Forwards the selected workspace's armed bash-monitor count to the webview (#4971): the
+   * barrier's waiting-on-monitor phase needs it, and only the activity feed carries it.
+   * Best-effort: failures are logged, never shown as a notice.
+   */
+  private async pumpSelectedWorkspaceActivity(
+    client: ApiClient,
+    workspaceId: string,
+    controller: AbortController
+  ): Promise<void> {
+    // Activity events fire for every snapshot change; only a changed count is worth a message.
+    let lastPosted: number | null = null;
+    const post = (activeBashMonitorCount: number) => {
+      if (
+        controller.signal.aborted ||
+        this.selectedWorkspaceId !== workspaceId ||
+        activeBashMonitorCount === lastPosted
+      ) {
+        return;
+      }
+      lastPosted = activeBashMonitorCount;
+      this.postMessage({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
+    };
+
+    try {
+      // Subscribe before the snapshot so no change between them is lost.
+      const iterator = await client.workspace.activity.subscribe(undefined, {
+        signal: controller.signal,
+      });
+      const snapshots = await client.workspace.activity.list();
+      // null means the backend could not read activity; keep the webview's current value.
+      if (snapshots) {
+        post(snapshots[workspaceId]?.activeBashMonitorCount ?? 0);
+      }
+
+      for await (const event of iterator) {
+        if (event.type === "activity" && event.workspaceId === workspaceId) {
+          post(event.activity?.activeBashMonitorCount ?? 0);
+        }
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return;
+      }
+      xumLogDebug("mux.chatView: workspace activity subscription failed", {
+        workspaceId,
+        error: formatError(error),
+      });
     }
   }
 

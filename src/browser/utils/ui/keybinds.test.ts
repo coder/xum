@@ -1,6 +1,17 @@
-import { describe, it, expect, test } from "bun:test";
+import { afterEach, describe, it, expect, test } from "bun:test";
 import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
+
+// Many tests below swap in a stub `window` ({ api: { platform } }) without restoring it.
+// Bun shares globals across test files in a process, so the stub leaked into later files:
+// mermaid's module init saw `document` defined but a window without addEventListener,
+// threw, and every later importer of MarkdownComponents hit a TDZ ReferenceError.
+const originalWindow = globalThis.window;
+const originalNavigator = globalThis.navigator;
+afterEach(() => {
+  globalThis.window = originalWindow;
+  globalThis.navigator = originalNavigator;
+});
 
 // Helper to create a minimal keyboard event
 function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {

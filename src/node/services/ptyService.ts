@@ -140,7 +140,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else if (runtime instanceof LocalBaseRuntime) {
       try {
@@ -169,7 +168,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: true,
         env: options?.env,
         logLocalEnv: true,
       });
@@ -197,7 +195,6 @@ export class PTYService {
         cwd: process.cwd(),
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else {
       throw new Error(`Unsupported runtime type: ${runtime.constructor.name}`);

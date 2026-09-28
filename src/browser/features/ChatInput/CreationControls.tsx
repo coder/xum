@@ -22,7 +22,6 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { GitBranch, Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
-import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { CreationProjectSelect } from "./CreationProjectSelect";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
@@ -744,11 +743,7 @@ function CreationControlsContent(props: CreationControlsProps) {
           return (
             <CreationProjectSelect
               selected={selected}
-              selectedLabel={formatProjectHierarchyLabel(selected, props.userProjects)}
-              options={Array.from(props.userProjects.keys()).map((path) => ({
-                value: path,
-                label: formatProjectHierarchyLabel(path, props.userProjects),
-              }))}
+              userProjects={props.userProjects}
               onChange={props.onSelectedProjectPathChange}
             />
           );

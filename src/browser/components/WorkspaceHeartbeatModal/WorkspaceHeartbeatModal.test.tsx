@@ -4,8 +4,11 @@ import type { ReactNode } from "react";
 import { afterEach, afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import * as APIModule from "@/browser/contexts/API";
-import type { APIClient, UseAPIResult } from "@/browser/contexts/API";
+import type { UseAPIResult } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 import * as WorkspaceHeartbeatHookModule from "@/browser/hooks/useWorkspaceHeartbeat";
 import type { HeartbeatFormSettings } from "@/browser/hooks/useWorkspaceHeartbeat";
 import {
@@ -28,6 +31,9 @@ async function restoreWorkspaceHeartbeatModalMocks() {
   await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
 }
 
+// Bun module mocks are process-wide; this controlled-only stub would hide
+// uncontrolled dialogs in later suites unless the real exports are restored.
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
     props.open ? <div>{props.children}</div> : null,
@@ -64,10 +70,7 @@ interface WorkspaceHeartbeatTestAPI {
     };
   };
   config: {
-    getConfig: () => Promise<{
-      heartbeatDefaultIntervalMs?: number;
-      heartbeatDefaultPrompt?: string;
-    }>;
+    getConfig: () => Promise<TestClientConfig>;
   };
 }
 
@@ -84,7 +87,7 @@ function createHeartbeatSettings(
 
 function createConnectedUseAPIResult(api: WorkspaceHeartbeatTestAPI): ConnectedUseAPIResult {
   return {
-    api: api as APIClient,
+    api: createTestApiClient(api),
     status: "connected",
     error: null,
     authenticate: () => undefined,
@@ -204,10 +207,12 @@ describe("WorkspaceHeartbeatModal", () => {
       Promise.resolve({ success: true as const, data: undefined })
     );
     const getConfigMock = mock(() =>
-      Promise.resolve({
-        heartbeatDefaultIntervalMs: globalIntervalMs,
-        heartbeatDefaultPrompt: globalPrompt,
-      })
+      Promise.resolve(
+        createTestConfig({
+          heartbeatDefaultIntervalMs: globalIntervalMs,
+          heartbeatDefaultPrompt: globalPrompt,
+        })
+      )
     );
     const mockApi: WorkspaceHeartbeatTestAPI = {
       workspace: {

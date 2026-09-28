@@ -5,6 +5,29 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { useTheme } from "../../contexts/ThemeContext";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
+import * as realDarkLogo from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import * as realLightLogo from "@/browser/assets/logos/xum-logo-light.svg?react";
+import * as realLottie from "lottie-react";
+import * as realLoadingScreen from "@/browser/components/LoadingScreen/LoadingScreen";
+import * as realStartupConnectionError from "@/browser/components/StartupConnectionError/StartupConnectionError";
+import * as realAuthTokenModal from "@/browser/components/AuthTokenModal/AuthTokenModal";
+
+// Restore every module stubbed below once this suite finishes so none of them leak into
+// later files.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...realAPI }],
+  ["@/browser/assets/logos/xum-logo-dark.svg?react", { ...realDarkLogo }],
+  ["@/browser/assets/logos/xum-logo-light.svg?react", { ...realLightLogo }],
+  ["lottie-react", { ...realLottie }],
+  ["@/browser/components/LoadingScreen/LoadingScreen", { ...realLoadingScreen }],
+  [
+    "@/browser/components/StartupConnectionError/StartupConnectionError",
+    { ...realStartupConnectionError },
+  ],
+  ["@/browser/components/AuthTokenModal/AuthTokenModal", { ...realAuthTokenModal }],
+]);
 
 let cleanupDom: (() => void) | null = null;
 
@@ -27,6 +50,12 @@ void mock.module("lottie-react", () => ({
   default: () => <div data-testid="LottieMock" />,
 }));
 
+// Retained API module mock (restored after the suite above). Unlike other components,
+// AppLoader renders its own APIProvider, so an outer APIContext.Provider is shadowed, and
+// the provider only accepts a connected `client`. The auth_required/error/connecting states
+// under test are reachable only by driving the real WebSocket handshake (error needs a
+// failing oRPC ping over the socket), so replacing the provider here is the least brittle
+// option.
 void mock.module("@/browser/contexts/API", () => ({
   APIProvider: (props: { children: React.ReactNode }) => props.children,
   useAPI: () => {

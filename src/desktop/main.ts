@@ -43,15 +43,13 @@ if (process.platform === "darwin") {
 }
 
 import { DesktopWindowManager } from "./desktopWindowManager";
+import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
-import {
-  REMOTE_CONNECTION_CHANNELS,
-  REMOTE_CONNECTION_RETURN_ACCELERATOR,
-} from "@/common/constants/remoteConnection";
+import { getLocalServerLoadUrl } from "./localServerDiscovery";
+import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
-import { router } from "../node/orpc/router";
 import { formatOrpcError } from "../node/orpc/formatOrpcError";
 import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
@@ -75,6 +73,7 @@ import {
   dialog,
   nativeImage,
   nativeTheme,
+  powerSaveBlocker,
   screen,
   shell,
 } from "electron";
@@ -202,20 +201,22 @@ import { log } from "@/node/services/log";
 
 // IMPORTANT: Lazy-load heavy dependencies to maintain fast startup time
 //
-// To keep startup time under 4s, avoid importing AI SDK packages at the top level.
-// These files MUST use dynamic import():
-//   - main.ts, config.ts, preload.ts (startup-critical)
+// To keep startup time under 4s, nothing this file imports statically (directly or
+// transitively) may load AI SDK packages. Load them via dynamic import() instead:
 //
 // ✅ GOOD: const { createAnthropic } = await import("@ai-sdk/anthropic");
 // ❌ BAD:  import { createAnthropic } from "@ai-sdk/anthropic";
 //
-// Enforcement: scripts/check_eager_imports.sh validates this in CI
+// Enforcement: scripts/check-startup-imports.ts (make static-check) walks the static
+// import graph of this file and fails on banned packages.
 //
 // Lazy-load Config and ServiceContainer to avoid loading heavy AI SDK dependencies at startup
 // These will be loaded on-demand when createWindow() is called
 let config: Config | null = null;
 let services: ServiceContainer | null = null;
 let remoteConnectionManager: RemoteConnectionManager | null = null;
+// Holds the display-sleep blocker while local agents work (opt-in via config.keepScreenAwake).
+let keepAwake: KeepAwakeController | null = null;
 const localIpcWindows = new Map<WebContents, URL>();
 
 function isTrustedLocalUrl(target: string, expected: URL): boolean {
@@ -434,7 +435,6 @@ function timestamp(): string {
 function initializeRemoteConnections(): void {
   const manager = new RemoteConnectionManager({
     createWindow: (options) => new BrowserWindow(options),
-    onConnected: () => mainWindow?.hide(),
     onDisconnected: () => {
       if (!isQuitting) openXumFromTray();
     },
@@ -471,6 +471,14 @@ function initializeRemoteConnections(): void {
   electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.disconnect, (event) => {
     assertLocalController(event);
     manager.disconnect();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.openLocalServer, async (event) => {
+    assertLocalController(event);
+    assert(config, "Open Server Window requires the loaded config");
+    // peek() never deletes a stale lock, so discovery cannot race a starting xum server.
+    const lock = await new ServerLockfile(config.rootDir).peek();
+    // The token stays in this process: it only reaches the sandboxed window's load URL.
+    return manager.openLocalServer(getLocalServerLoadUrl(lock, process.pid));
   });
 }
 
@@ -521,9 +529,24 @@ function createMenu() {
         { role: "close" },
         { type: "separator" },
         {
+          id: "open-server-window",
+          label: "Open Server Window",
+          // No accelerator, for the same reason as Return to Local below: the renderer owns
+          // Ctrl/Cmd+Shift+O (KEYBINDS.OPEN_SERVER_WINDOW) and runs the same flow. The flow lives
+          // in the local renderer so failures land on Settings → Remote Connection.
+          click: () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            openXumFromTray();
+            mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested);
+          },
+        },
+        {
           id: "return-to-local",
           label: "Return to Local",
-          accelerator: REMOTE_CONNECTION_RETURN_ACCELERATOR,
+          // No accelerator: menu accelerators are global on macOS (registerAccelerator: false is
+          // Linux/Windows only), so it would take Ctrl/Cmd+Shift+L (Show Last Prompt) from the local
+          // window, which stays visible next to the server window. The server window's
+          // before-input-event handler provides the shortcut there.
           enabled:
             remoteConnectionManager?.getState().status !== "disconnected" &&
             remoteConnectionManager != null,
@@ -754,10 +777,14 @@ async function loadServices(): Promise<void> {
     { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
+    { router },
   ] = await Promise.all([
     import("../node/config"),
     import("../node/services/serviceContainer"),
     import("./terminalWindowManager"),
+    // The oRPC router statically reaches every handler (and the `ai` package via
+    // workspaceTitleGenerator), so it must stay off the pre-splash import path.
+    import("../node/orpc/router"),
   ]);
   /* eslint-enable no-restricted-syntax */
   const stores = createConfigStores();
@@ -770,6 +797,23 @@ async function loadServices(): Promise<void> {
   // Keep the latest update status in main so close-to-tray can prompt for installs.
   services.updateService.onStatus((status) => {
     latestUpdateStatus = status;
+  });
+
+  // Backend services run in-process here, so main can observe workspace activity directly.
+  // Only local activity is tracked: remote-backend windows run their agents elsewhere.
+  keepAwake = new KeepAwakeController({
+    blocker: powerSaveBlocker,
+    isEnabled: () => stores.config.getKeepScreenAwakeEnabled(),
+    onEnabledChanged: (callback) => stores.config.onConfigChanged(callback),
+    activity: services.workspaceService,
+  });
+  // Do not await: the initial activity seed enumerates config and probes workspace state on
+  // disk, which can be slow on large stores and must not keep the window behind the splash
+  // screen. start() subscribes synchronously, so live events already reconcile while the
+  // seed is in flight, and dispose() on quit is safe mid-seed.
+  keepAwake.start().catch((error: unknown) => {
+    // Startup must never fail over an optional convenience; live events still reconcile.
+    log.error("keep-awake: failed to start controller", { error });
   });
 
   // Generate auth token (use env var or random per-session)
@@ -1205,10 +1249,7 @@ function createWindow() {
     mainWindowFinishedLoading = true;
     flushBufferedXumDeepLinks();
 
-    // NOTE: Tokenizer modules are NOT loaded at startup anymore!
-    // The Proxy in tokenizer.ts loads them on-demand when first accessed.
-    // This reduces startup time from ~8s to <1s.
-    // First token count will use approximation, accurate count caches in background.
+    // Tokenizer encodings warm in background workers from loadServices (loadTokenizerModules).
   });
 
   // Diagnostic crash hooks — log only, no recovery side effects.
@@ -1404,6 +1445,10 @@ async function startDesktopAfterStorage(): Promise<void> {
     // IMPORTANT: must be set before any early returns.
     isQuitting = true;
     remoteConnectionManager?.dispose();
+    // Release the display-sleep blocker before services tear down; Electron would drop it on
+    // exit anyway, but a slow dispose must not keep the screen awake meanwhile.
+    keepAwake?.dispose();
+    keepAwake = null;
     if (isUpdateInstallInProgress()) {
       // Don't block updater-driven quitAndInstall() — let Electron quit immediately
       // so the platform installer can take over. Best-effort cleanup only.

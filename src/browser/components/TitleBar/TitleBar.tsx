@@ -187,7 +187,11 @@ export function TitleBar(props: TitleBarProps) {
       return <RefreshCw className="size-3.5" />;
     }
 
-    if (updateStatus.type === "downloading" || updateStatus.type === "checking") {
+    if (
+      updateStatus.type === "downloading" ||
+      updateStatus.type === "checking" ||
+      updateStatus.type === "restarting"
+    ) {
       return <Loader2 className="size-3.5 animate-spin" />;
     }
 
@@ -366,7 +370,7 @@ export function TitleBar(props: TitleBarProps) {
         </Tooltip>
         <SettingsButton
           // On touch/mobile, opening settings from the sidebar should also dismiss the
-          // off-canvas sidebar so users are not stuck with it covering the settings page.
+          // off-canvas sidebar so it is not left covering the page behind settings.
           onBeforeOpenSettings={props.onBeforeOpenSettings}
         />
       </div>

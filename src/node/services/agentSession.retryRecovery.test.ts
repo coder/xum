@@ -218,7 +218,6 @@ test("a manual successor keeps its retry envelope when startup derivation settle
     ).toBe(true);
     release.resolve();
     await recovery;
-    expect(await h.session.getStartupAutoRetryModelHint()).toBe(manualModel);
     expect(h.events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(0);
     const history = await h.historyService.getHistoryFromLatestBoundary("recovery-manual-priority");
     expect(

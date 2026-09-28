@@ -16,7 +16,10 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import {
+  acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
+} from "@/node/utils/main/crossProcessLock";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import {
@@ -150,6 +153,39 @@ function overridesOnHostFilesystem(config: RuntimeConfig | undefined): boolean {
   return (
     config !== undefined && (isHostLocalRuntimeConfig(config) || isDevcontainerRuntime(config))
   );
+}
+
+/**
+ * Seconds after which a devcontainer-side override `rm`/`mv` kills itself.
+ * Those children run in the container, so the host cannot reliably reap them:
+ * a crashed Xum (or a detached `devcontainer exec` CLI) leaves them running,
+ * and a late one could delete a document a successor saved under the lock it
+ * took over (#4481). Removing a few small files takes milliseconds; 5 s keeps
+ * slack for a slow overlay filesystem, stays below the host's own 10 s exec
+ * timeout (so the host sees the container's verdict), and is well below a
+ * realistic takeover: a restarted Xum (or a sibling backend) must notice the
+ * dead holder AND save that workspace's MCP settings.
+ */
+const CONTAINER_MUTATION_KILL_AFTER_S = 5;
+
+/**
+ * Bound a container-side mutation's lifetime from inside the container. Runs
+ * `command` as its own process group (`set -m`) with a watchdog that SIGKILLs
+ * the whole group after `killAfterSeconds`, so no step of a compound command
+ * can run later. Needs only bash (which DevcontainerRuntime.exec already
+ * requires), `sleep`, and bash's `kill`/`wait` builtins: coreutils `timeout`
+ * is not guaranteed in devcontainer images, and busybox variants differ in
+ * syntax. Braced so a failed `cd … &&` prefix skips the whole block.
+ */
+export function boundContainerMutation(
+  command: string,
+  killAfterSeconds = CONTAINER_MUTATION_KILL_AFTER_S
+): string {
+  assert(
+    Number.isInteger(killAfterSeconds) && killAfterSeconds > 0,
+    "killAfterSeconds must be a positive integer"
+  );
+  return `{ set -m; ( ${command} ) & w=$!; ( sleep ${killAfterSeconds}; kill -KILL -- -$w ) 2>/dev/null & k=$!; wait $w; rc=$?; kill -KILL -- -$k 2>/dev/null; exit $rc; }`;
 }
 
 /**
@@ -1480,8 +1516,46 @@ export class WorkspaceMcpOverridesService {
       workspacePath,
       overridesOnHostFilesystem(runtimeConfig)
     );
+    // Host-local only: a devcontainer's (name-derived) workspacePath may not
+    // be its persisted host checkout, so it stays on the exec path below.
+    if (runtimeConfig !== undefined && isHostLocalRuntimeConfig(runtimeConfig)) {
+      // In-process, not `rm -f`: this runs under the override write locks,
+      // and a host runtime's exec child is a DETACHED shell that can outlive
+      // this process — after a crash it could still delete a document a
+      // successor saved under the lock it took over (#4415). fs calls end
+      // with the process. ENOENT/ENOTDIR are the "nothing there" cases
+      // `rm -f` ignores too. Lowest read precedence first, canonical last: a
+      // crash between unlinks must never leave a stale fallback authoritative.
+      for (const relative of [...MCP_OVERRIDES_GITIGNORE_PATTERNS].reverse()) {
+        try {
+          await fsPromises.unlink(path.join(workspacePath, relative));
+        } catch (error) {
+          if (hasFsCode(error, "ENOENT") || hasFsCode(error, "ENOTDIR")) continue;
+          throw new Error(
+            `Failed to remove workspace MCP overrides file: ${getErrorMessage(error)}`
+          );
+        }
+      }
+      return;
+    }
     const paths = MCP_OVERRIDES_GITIGNORE_PATTERNS.map((filePath) => `"${filePath}"`).join(" ");
-    const result = await execBuffered(runtime, `rm -f ${paths}`, {
+    const rm = `rm -f ${paths}`;
+    // Devcontainers stay on exec: a host unlink would follow a symlink the
+    // container swapped in between the guard and the unlink (#4696). The
+    // container-side child is bounded instead (#4481); the host's timeout
+    // below also kills the local `devcontainer exec` process tree.
+    // The bound can kill `rm` between operands, so there the canonical
+    // document goes last (lowest read precedence first), as on the host path.
+    const command =
+      runtimeConfig !== undefined && isDevcontainerRuntime(runtimeConfig)
+        ? boundContainerMutation(
+            `rm -f ${[...MCP_OVERRIDES_GITIGNORE_PATTERNS]
+              .reverse()
+              .map((filePath) => `"${filePath}"`)
+              .join(" ")}`
+          )
+        : rm;
+    const result = await execBuffered(runtime, command, {
       cwd: workspacePath,
       timeout: 10,
     });
@@ -1499,14 +1573,19 @@ export class WorkspaceMcpOverridesService {
    * replacement lands as a new file that is never touched), then inspected;
    * ours is deleted, anyone else's is moved back without clobbering a newer
    * one. The symlink guard ran before the write; paths are relative to the
-   * checkout for the shell like removeOverridesFile.
+   * checkout for the shell like removeOverridesFile. Host-local checkouts
+   * use in-process fs calls instead (see removeOverridesFile for why and why
+   * devcontainers stay on exec).
    */
   private async removeExactDocument(
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string,
     filePath: string,
-    expectedContent: string
+    expectedContent: string,
+    runtimeConfig: RuntimeConfig | undefined
   ): Promise<void> {
+    const hostLocal = runtimeConfig !== undefined && isHostLocalRuntimeConfig(runtimeConfig);
+    const inContainer = runtimeConfig !== undefined && isDevcontainerRuntime(runtimeConfig);
     // Host paths are joined with the platform separator (backslashes on
     // Windows) while the candidates are spelled with `/`.
     const normalizedFilePath = filePath.replaceAll("\\", "/");
@@ -1516,8 +1595,44 @@ export class WorkspaceMcpOverridesService {
     assert(relative !== undefined, "migrated document must be a known override path");
     const suffix = `${process.pid}-${Date.now()}`;
     const aside = `${relative}.rollback-${suffix}`;
+    const asidePath = `${filePath}.rollback-${suffix}`;
+    if (hostLocal) {
+      // In-process like removeOverridesFile: a detached `mv`/`rm` child could
+      // outlive this process and move aside or delete a document a successor
+      // saved after taking over the lock (#4415).
+      const fail = (error: unknown): never => {
+        throw new Error(
+          `Failed to roll back the migrated override document: ${getErrorMessage(error)}`
+        );
+      };
+      const dropAside = () =>
+        fsPromises.unlink(asidePath).catch((error: unknown) => {
+          if (!hasFsCode(error, "ENOENT")) fail(error);
+        });
+      await fsPromises.rename(filePath, asidePath).catch(fail);
+      if ((await readFileString(runtime, asidePath)) === expectedContent) {
+        await dropAside();
+        return;
+      }
+      log.warn("[MCP] Not rolling back a migrated override document that changed meanwhile", {
+        filePath,
+      });
+      // `mv -n` equivalent: link() never replaces an existing target, so a
+      // newer document that appeared meanwhile wins (EEXIST) and the older
+      // one we hold is dropped, exactly like the shell branch below.
+      await fsPromises.link(asidePath, filePath).catch((error: unknown) => {
+        if (!hasFsCode(error, "EEXIST")) fail(error);
+      });
+      await dropAside();
+      return;
+    }
     const run = async (command: string): Promise<void> => {
-      const result = await execBuffered(runtime, command, { cwd: workspacePath, timeout: 10 });
+      // Bounded in a devcontainer, like removeOverridesFile.
+      const result = await execBuffered(
+        runtime,
+        inContainer ? boundContainerMutation(command) : command,
+        { cwd: workspacePath, timeout: 10 }
+      );
       if (result.exitCode !== 0) {
         throw new Error(
           `Failed to roll back the migrated override document: ${result.stderr.trim() || `${command.split(" ")[0]} exited with code ${result.exitCode}`}`
@@ -1525,7 +1640,7 @@ export class WorkspaceMcpOverridesService {
       }
     };
     await run(`mv "${relative}" "${aside}"`);
-    const current = await readFileString(runtime, `${filePath}.rollback-${suffix}`);
+    const current = await readFileString(runtime, asidePath);
     if (current === expectedContent) {
       await run(`rm -f "${aside}"`);
       return;
@@ -1992,12 +2107,17 @@ export class WorkspaceMcpOverridesService {
             // Compare-and-delete of exactly the document this migration wrote:
             // never the compatibility paths, and never a canonical document an
             // older process or a direct edit replaced meanwhile.
-            await this.removeExactDocument(runtime, workspacePath, canonicalPath, content).catch(
-              (rollbackError: unknown) =>
-                log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
-                  workspaceId,
-                  error: getErrorMessage(rollbackError),
-                })
+            await this.removeExactDocument(
+              runtime,
+              workspacePath,
+              canonicalPath,
+              content,
+              target.runtimeConfig
+            ).catch((rollbackError: unknown) =>
+              log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
+                workspaceId,
+                error: getErrorMessage(rollbackError),
+              })
             );
             throw error;
           }
@@ -2139,8 +2259,8 @@ export class WorkspaceMcpOverridesService {
     } finally {
       // Steps that timed out may still have a migration write in flight; the
       // caller releases the lock right after this returns, so wait for them
-      // (they are the only writes this operation started). The lock's lease
-      // renewal keeps the holder non-reclaimable meanwhile.
+      // (they are the only writes this operation started). The lock is never
+      // reclaimed from a live holder meanwhile.
       await snapshot.settleSideEffects();
     }
   }
@@ -2241,7 +2361,7 @@ export class WorkspaceMcpOverridesService {
     // One budget for the WHOLE fan-out (own publication, sharer scan, every
     // level): each probe is bounded, but thousands of candidates on stalled
     // mounts would still add up under the exclusive lock past its acquisition
-    // timeout (and the stale lease). When the budget runs out nothing below
+    // timeout. When the budget runs out nothing below
     // can be published authoritatively: evict every cache instead, and let
     // the abandoned work's cancellation flags keep it from publishing later.
     budget: PublicationBudget
@@ -2563,7 +2683,7 @@ export class WorkspaceMcpOverridesService {
    * resolution is read-only and runs OUTSIDE the lock, because an inheriting
    * SSH source probes one round of remote paths per ancestor level and holding
    * the global lock through that would stall every unrelated save/prune past
-   * the acquisition timeout (or the stale lease).
+   * the acquisition timeout.
    */
   async copyOverridesToForkedCheckout(
     sourceWorkspaceId: string,
@@ -2634,10 +2754,9 @@ export class WorkspaceMcpOverridesService {
                   // …and a write that had already started keeps the lock until it
                   // settles: it cannot be cancelled, and landing it under the
                   // released lock could clobber a newer save. Holding is safe for
-                  // as long as it takes: the cross-process lock re-stamps its lease
-                  // while held (acquireCrossProcessLock's renewal), so a live
-                  // holder waiting on a stalled write never becomes reclaimable —
-                  // only a crashed process (which cannot complete the write) does.
+                  // as long as it takes: the cross-process lock never reclaims a
+                  // live holder, however long it holds — only a provably dead
+                  // process (which cannot complete the write) loses it.
                   await locked.settleSideEffects();
                 }
               },
@@ -3458,8 +3577,8 @@ export class WorkspaceMcpOverridesService {
    *
    * LOCK ORDER: workspace locks are acquired in sorted order and ALWAYS
    * before the global lock (runExclusive), never while holding it.
-   * Staleness (crashed holder) is handled by the lock's lease renewal and
-   * reclamation, like the global lock.
+   * A crashed holder is reclaimed once provably dead (never on age), like
+   * the global lock.
    */
   acquireWorkspaceLock(
     workspaceId: string,
@@ -3696,6 +3815,8 @@ export class WorkspaceMcpOverridesService {
           !acquiredAll &&
           error instanceof Error &&
           (error instanceof CheckoutKeysChangedError ||
+            // The lock's timeout message appends holder details to ours.
+            error instanceof CrossProcessLockTimeoutError ||
             error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE) &&
           Date.now() < deadlineAt;
         if (!retry) {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -21,6 +21,8 @@ import {
   removeStoredUserPreference,
 } from "@/common/preferences/userPreferencesStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
+import { assert } from "@/common/utils/assert";
 import { normalizeOrder } from "@/common/utils/projectOrdering";
 import { stableStringify } from "@/common/utils/stableStringify";
 
@@ -296,25 +298,106 @@ export async function hydrateUserPreferencesLocalCache(params: {
     : backendPreferences;
 }
 
+const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
+
+export interface UserPreferenceSaveQueue {
+  /**
+   * Queue the latest preferences snapshot. `changedKeys` names the storage keys whose
+   * values this snapshot carries fresh writes for; each one gets a new requested version
+   * that `waitForPersisted` can wait on.
+   */
+  enqueue: (preferences: UserPreferences | undefined, changedKeys?: Iterable<string>) => void;
+  /**
+   * Record fresh local writes for `keys` that are NOT being saved yet (writes made before
+   * hydration ride along with the hydration save). Waiters on those keys stay pending until
+   * that later save acknowledges them, or `settle` confirms the backend already holds them.
+   */
+  reserve: (keys: Iterable<string>) => void;
+  /** The backend already holds the reserved values for `keys`; release their waiters. */
+  settle: (keys: Iterable<string>) => void;
+  /**
+   * Resolve once the backend has acknowledged the latest write requested for `key` at
+   * call time. Rejects when the save attempt carrying that write fails (the queue keeps
+   * retrying in the background) or when `signal` aborts; callers tell the two apart via
+   * `signal.aborted`.
+   */
+  waitForPersisted: (key: string, signal: AbortSignal) => Promise<void>;
+}
+
 export function createUserPreferenceSaveQueue(params: {
   configClient: UserPreferenceConfigClient;
   signal: AbortSignal;
   getCurrentPreferences: () => UserPreferences | undefined;
   clearDirtyKeys: () => void;
   onError: (message: string, error: unknown) => void;
-}): (preferences: UserPreferences | undefined) => void {
+}): UserPreferenceSaveQueue {
   interface PendingPreferenceSave {
     value: UserPreferences | undefined;
+    // Requested version per key at the moment the snapshot was taken, so an acknowledgement
+    // credits exactly the writes the saved payload carried.
+    versions: ReadonlyMap<string, number>;
+  }
+  interface PersistenceWaiter {
+    key: string;
+    version: number;
+    resolve: () => void;
+    reject: (error: Error) => void;
   }
   let saveInFlight = false;
   let pendingSave: PendingPreferenceSave | null = null;
   let retryAttempt = 0;
+  const requestedVersions = new Map<string, number>();
+  const acknowledgedVersions = new Map<string, number>();
+  const waiters = new Set<PersistenceWaiter>();
+
+  const takeWaiters = (shouldTake: (waiter: PersistenceWaiter) => boolean) => {
+    const taken: PersistenceWaiter[] = [];
+    for (const waiter of waiters) {
+      if (shouldTake(waiter)) {
+        waiters.delete(waiter);
+        taken.push(waiter);
+      }
+    }
+    return taken;
+  };
+
+  const acknowledgeSave = (versions: ReadonlyMap<string, number>) => {
+    for (const [key, version] of versions) {
+      const requested = requestedVersions.get(key) ?? 0;
+      const acknowledged = acknowledgedVersions.get(key) ?? 0;
+      assert(version <= requested, "acknowledged preference version cannot exceed requested");
+      assert(version >= acknowledged, "acknowledged preference versions must be monotonic");
+      acknowledgedVersions.set(key, version);
+    }
+    for (const waiter of takeWaiters(
+      (waiter) => (acknowledgedVersions.get(waiter.key) ?? 0) >= waiter.version
+    )) {
+      waiter.resolve();
+    }
+  };
+
+  const failWaiters = (shouldFail: (waiter: PersistenceWaiter) => boolean) => {
+    for (const waiter of takeWaiters(shouldFail)) {
+      waiter.reject(new Error(USER_PREFERENCE_SAVE_FAILED_MESSAGE));
+    }
+  };
+
+  // Once the owning scope aborts nothing pending is ever acknowledged, so release waiters
+  // as failures instead of letting callers hang.
+  params.signal.addEventListener(
+    "abort",
+    () => {
+      failWaiters(() => true);
+    },
+    { once: true }
+  );
 
   const flush = async () => {
     saveInFlight = true;
     try {
       while (pendingSave !== null && !params.signal.aborted) {
         const preferencesToSave = pendingSave.value;
+        const savedVersions = pendingSave.versions;
         pendingSave = null;
         const savedFingerprint = stableStringify(preferencesToSave);
 
@@ -323,8 +406,11 @@ export function createUserPreferenceSaveQueue(params: {
         } catch (error) {
           const hasNewerPendingSave = pendingSave !== null;
           if (!hasNewerPendingSave) {
-            pendingSave = { value: preferencesToSave };
+            pendingSave = { value: preferencesToSave, versions: savedVersions };
           }
+          // Only writes this attempt actually carried failed; newer versions of the same key
+          // still have their own attempt ahead of them.
+          failWaiters((waiter) => waiter.version <= (savedVersions.get(waiter.key) ?? 0));
 
           const retryDelayMs = getUserPreferenceRetryDelayMs(retryAttempt);
           retryAttempt += 1;
@@ -337,6 +423,7 @@ export function createUserPreferenceSaveQueue(params: {
         }
 
         retryAttempt = 0;
+        acknowledgeSave(savedVersions);
         if (params.signal.aborted) {
           return;
         }
@@ -356,8 +443,24 @@ export function createUserPreferenceSaveQueue(params: {
     }
   };
 
-  return (preferences) => {
-    pendingSave = { value: preferences };
+  const reserve: UserPreferenceSaveQueue["reserve"] = (keys) => {
+    for (const key of keys) {
+      requestedVersions.set(key, (requestedVersions.get(key) ?? 0) + 1);
+    }
+  };
+
+  const settle: UserPreferenceSaveQueue["settle"] = (keys) => {
+    const settled = new Map<string, number>();
+    for (const key of keys) {
+      const requested = requestedVersions.get(key) ?? 0;
+      if (requested > (acknowledgedVersions.get(key) ?? 0)) settled.set(key, requested);
+    }
+    if (settled.size > 0) acknowledgeSave(settled);
+  };
+
+  const enqueue: UserPreferenceSaveQueue["enqueue"] = (preferences, changedKeys) => {
+    reserve(changedKeys ?? []);
+    pendingSave = { value: preferences, versions: new Map(requestedVersions) };
     if (saveInFlight) {
       return;
     }
@@ -367,6 +470,83 @@ export function createUserPreferenceSaveQueue(params: {
       params.onError("Failed to flush user preference persistence:", error);
     });
   };
+
+  const waitForPersisted: UserPreferenceSaveQueue["waitForPersisted"] = (key, signal) => {
+    const requested = requestedVersions.get(key) ?? 0;
+    const acknowledged = acknowledgedVersions.get(key) ?? 0;
+    assert(acknowledged <= requested, "acknowledged preference version cannot exceed requested");
+    if (acknowledged >= requested) {
+      return Promise.resolve();
+    }
+    const abortError = (): Error =>
+      signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("Preference wait aborted", "AbortError");
+    if (signal.aborted) {
+      return Promise.reject(abortError());
+    }
+    if (params.signal.aborted) {
+      return Promise.reject(new Error(USER_PREFERENCE_SAVE_FAILED_MESSAGE));
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const waiter: PersistenceWaiter = {
+        key,
+        version: requested,
+        resolve: () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        reject: (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      };
+      function onAbort() {
+        waiters.delete(waiter);
+        waiter.reject(abortError());
+      }
+      waiters.add(waiter);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+
+  return { enqueue, reserve, settle, waitForPersisted };
+}
+
+/** Preference entries the backend reads at request time, so senders can wait on them. */
+export interface UserPreferencePersistenceEntry {
+  kind: "autoCompactionThreshold";
+  model: string;
+}
+
+export interface UserPreferencesPersistenceContextValue {
+  /**
+   * Resolve once the backend has acknowledged the latest local write for `entry`.
+   * Rejects with a user-readable Error when that write's save failed, or with the abort
+   * reason when `signal` aborts (distinguish via `signal.aborted`).
+   */
+  waitForPreferencePersisted: (
+    entry: UserPreferencePersistenceEntry,
+    signal: AbortSignal
+  ) => Promise<void>;
+}
+
+function getPersistenceEntryStorageKey(entry: UserPreferencePersistenceEntry): string {
+  switch (entry.kind) {
+    case "autoCompactionThreshold":
+      return getAutoCompactionThresholdKey(entry.model);
+  }
+}
+
+// Without a provider (unit tests, stories) nothing is pending toward a backend.
+export const UserPreferencesPersistenceContext =
+  createContext<UserPreferencesPersistenceContextValue>({
+    waitForPreferencePersisted: () => Promise.resolve(),
+  });
+
+export function useUserPreferencePersistence(): UserPreferencesPersistenceContextValue {
+  return useContext(UserPreferencesPersistenceContext);
 }
 
 export function UserPreferencesProvider(props: { children: ReactNode }) {
@@ -375,15 +555,25 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
   const workspaceContext = useWorkspaceContext();
   const currentPreferencesRef = useRef<UserPreferences | undefined>(undefined);
   const dirtyKeysRef = useRef<Set<string>>(new Set());
-  const savePreferencesRef = useRef<(preferences: UserPreferences | undefined) => void>(
-    () => undefined
-  );
+  const saveQueueRef = useRef<UserPreferenceSaveQueue | null>(null);
   const hydratedRef = useRef(false);
   const [hydrated, setHydrated] = useState(false);
 
+  const persistence: UserPreferencesPersistenceContextValue = {
+    waitForPreferencePersisted: (entry, signal) => {
+      // Without an API client nothing is pending toward the backend; before hydration the
+      // queue holds reserved versions for local writes the hydration save will carry.
+      const queue = saveQueueRef.current;
+      if (!queue) {
+        return Promise.resolve();
+      }
+      return queue.waitForPersisted(getPersistenceEntryStorageKey(entry), signal);
+    },
+  };
+
   useEffect(() => {
     if (!api) {
-      savePreferencesRef.current = () => undefined;
+      saveQueueRef.current = null;
       hydratedRef.current = false;
       setHydrated(false);
       return;
@@ -405,7 +595,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
     const { signal } = abortController;
     let iterator: AsyncIterator<unknown> | null = null;
 
-    const enqueueSave = createUserPreferenceSaveQueue({
+    const saveQueue = createUserPreferenceSaveQueue({
       configClient: api.config,
       signal,
       getCurrentPreferences: () => currentPreferencesRef.current,
@@ -417,7 +607,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       },
     });
 
-    savePreferencesRef.current = enqueueSave;
+    saveQueueRef.current = saveQueue;
 
     const applyBackendConfig = async () => {
       const config = await api.config.getConfig();
@@ -454,7 +644,12 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
         (shouldBackfill || dirtyKeysRef.current.size > 0) &&
         stableStringify(nextPreferences) !== stableStringify(backendPreferences)
       ) {
-        enqueueSave(nextPreferences);
+        // Dirty keys written before hydration were reserved, not enqueued; this save carries
+        // them, so it owns their requested versions and its acknowledgement releases waiters.
+        saveQueue.enqueue(nextPreferences, dirtyKeysRef.current);
+      } else {
+        // Nothing to save: the backend already holds every dirty value, so their waiters can go.
+        saveQueue.settle(dirtyKeysRef.current);
       }
     };
 
@@ -472,10 +667,13 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       });
 
       if (!hydratedRef.current) {
+        // Not saved yet (hydration will carry it), but a sender waiting on this key must not
+        // be released before that save is acknowledged.
+        saveQueue.reserve([event.key]);
         return;
       }
 
-      enqueueSave(currentPreferencesRef.current);
+      saveQueue.enqueue(currentPreferencesRef.current, [event.key]);
     });
 
     const initialSync = retryUserPreferenceHydration({
@@ -522,7 +720,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       unsubscribeWrites();
       const cleanup = iterator?.return?.();
       cleanup?.catch(() => undefined);
-      savePreferencesRef.current = () => undefined;
+      saveQueueRef.current = null;
     };
   }, [api]);
 
@@ -571,7 +769,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       }
     }
 
-    savePreferencesRef.current(pruned);
+    saveQueueRef.current?.enqueue(pruned);
   }, [
     hydrated,
     projectContext.loading,
@@ -584,5 +782,9 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
     workspaceContext.workspaceMetadata,
   ]);
 
-  return <>{props.children}</>;
+  return (
+    <UserPreferencesPersistenceContext.Provider value={persistence}>
+      {props.children}
+    </UserPreferencesPersistenceContext.Provider>
+  );
 }

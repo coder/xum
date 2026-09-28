@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
+  PERSISTED_KEY_REGISTRY,
   copyWorkspaceStorage,
   deleteWorkspaceStorage,
+  getDesktopPopoutKey,
+  getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getInputAttachmentsKey,
+  getPinnedTodoExpandedKey,
+  getReasoningModeKey,
+  getReviewFileFilterKey,
+  getRightSidebarLayoutKey,
+  getSubAgentTasksExpandedKey,
+  getTerminalTitlesKey,
+  getTimelineFilterKey,
+  getWorkspaceKeyPrefix,
   normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
   type TerminalBadgeConfig,
@@ -125,6 +136,44 @@ describe("storage workspace-scoped keys", () => {
     deleteWorkspaceStorage(workspaceId);
 
     expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  // These per-workspace keys were missing from the delete lists, so every deleted workspace
+  // left them behind until they filled the origin quota.
+  test("deleteWorkspaceStorage removes per-workspace keys the old lists missed", () => {
+    const workspaceId = "ws-delete-missing";
+    const otherWorkspaceKey = getReasoningModeKey("ws-other");
+    const keys = [
+      getReasoningModeKey,
+      getDisableWorkspaceAgentsKey,
+      getPinnedTodoExpandedKey,
+      getSubAgentTasksExpandedKey,
+      getRightSidebarLayoutKey,
+      getTerminalTitlesKey,
+      getReviewFileFilterKey,
+      getTimelineFilterKey,
+      getDesktopPopoutKey,
+    ].map((getKey) => getKey(workspaceId));
+    for (const key of [...keys, otherWorkspaceKey]) localStorage.setItem(key, "value");
+
+    deleteWorkspaceStorage(workspaceId);
+
+    for (const key of keys) expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(otherWorkspaceKey)).toBe("value");
+  });
+
+  // A prefix that is a prefix of another would give keys the wrong kind, so quota eviction could
+  // remove a draft or preference that merely shares a cache key's prefix.
+  test("registered key prefixes never shadow each other", () => {
+    const prefixes = PERSISTED_KEY_REGISTRY.map((entry) =>
+      entry.scope === "workspaceId" ? getWorkspaceKeyPrefix(entry.getKey) : entry.key
+    );
+    for (const [index, prefix] of prefixes.entries()) {
+      expect(prefix.length).toBeGreaterThan(0);
+      for (const [otherIndex, other] of prefixes.entries()) {
+        if (index !== otherIndex) expect(other.startsWith(prefix)).toBe(false);
+      }
+    }
   });
 });
 

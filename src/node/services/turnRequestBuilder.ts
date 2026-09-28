@@ -1,3 +1,4 @@
+import { withExecutionScope } from "./tools/withExecutionScope";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
@@ -38,6 +39,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -55,6 +57,8 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
+import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -78,6 +82,9 @@ import {
 import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { listAvailableModels } from "@/common/utils/ai/selectableModels";
+import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -93,7 +100,9 @@ import {
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
-import { readToolInstructions } from "./systemMessage";
+import type { EvaluationService } from "./evaluation/evaluationService";
+import type { InstructionSources } from "@/common/types/instructions";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -155,6 +164,7 @@ import type {
 
 import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isRuntimeReadFailure, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
@@ -177,15 +187,17 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import {
   WorkflowService,
   type WorkflowRunStatusChangedEvent,
 } from "@/node/services/workflows/WorkflowService";
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -287,6 +299,8 @@ export interface StreamMessageOptions {
   strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** ACP prompt correlation id used to match stream events to a specific request. */
   acpPromptId?: string;
+  /** Auto-model-routing provenance for this turn; session-internal, never sourced from IPC. */
+  autoModelRouting?: AutoModelRoutingRecord;
   /** Invoked with each fatal pre-start error event this call emits before returning Err. */
   onPreStartError?: (event: ErrorEvent) => void;
   /** Synchronous registration of the facade's handleless startup notification identity. */
@@ -299,6 +313,8 @@ export interface StreamMessageOptions {
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /** See ToolConfiguration.recordProposedPlan. */
+  recordProposedPlan?: (toolCallId: string, content: string) => void;
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
@@ -573,9 +589,30 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
+  /** Archive gate for tool-started workflow admissions (the WorkspaceService). */
+  workflowArchiveAdmission?: WorkflowArchiveAdmissionGuard;
+  /** Workflow `evaluate()` support for tool-started runs; absent ⇒ the step fails closed. */
+  evaluationService?: EvaluationService;
+  /** Wakes the analytics sidecar after a headless usage row (workflow evaluation) lands. */
+  requestAnalyticsIngest?: (workspaceId: string) => void;
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
+}
+
+/**
+ * Tool-started workflow runs share the WorkspaceService's archive gate. Core wiring binds it in
+ * the same stage as taskService, so a missing gate next to a bound taskService is a wiring bug.
+ */
+function requireWorkflowArchiveAdmission(
+  bindings: TurnRequestBuilderBindings
+): WorkflowArchiveAdmissionGuard {
+  const guard = bindings.workflowArchiveAdmission;
+  assert(
+    guard != null,
+    "TurnRequestBuilder: workflowArchiveAdmission must be bound with taskService"
+  );
+  return guard;
 }
 
 interface TurnRequestBuilderDependencies {
@@ -831,6 +868,77 @@ export class TurnRequestBuilder {
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
   ): Promise<PreparedTurnRequestOutcome> {
+    try {
+      return await this.prepareOrThrow(opts, context);
+    } catch (error) {
+      // #4438/#4827: a failed read while loading instructions, agents or skills
+      // means the file could not be read, not that it is missing. Fail the turn
+      // before any provider request or assistant row exists.
+      if (!isRuntimeReadFailure(error)) throw error;
+      // A canceled read is a Stop, not a failure: SSH2 reports aborted execs as
+      // "network", so end the turn as aborted like other startup cancels.
+      if (context.abortSignal.aborted) {
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(
+              context.syntheticMessageId,
+              context.abortSignal
+            )
+          ),
+        };
+      }
+      if (!isRuntimeTransportError(error)) {
+        // Permission denied or an I/O error does not fix itself, so it is not
+        // retryable (unlike an unreachable host). The title is the text before
+        // the first "." (StreamErrorMessage), so it must not contain a path.
+        const errorMessage = `Startup file unreadable. ${getErrorMessage(error).trim()}`;
+        context.startupState.logSlowStreamStartup?.({
+          outcome: "startup_file_unreadable",
+          errorMessage,
+        });
+        return this.finishWithPreStartError(opts, context, "runtime_not_ready", errorMessage);
+      }
+      const errorMessage = `Remote workspace unreachable while loading startup files: ${getErrorMessage(error)}`;
+      context.startupState.logSlowStreamStartup?.({
+        outcome: "runtime_unreachable",
+        errorMessage,
+      });
+      return this.finishWithPreStartError(opts, context, "runtime_start_failed", errorMessage);
+    }
+  }
+
+  /**
+   * Fail a turn before any provider request or assistant row exists. The error
+   * event is what makes it visible: AgentSession renders a runtime_* failure
+   * only when it arrives as a pre-start error.
+   */
+  private finishWithPreStartError(
+    opts: Pick<StreamMessageOptions, "workspaceId" | "acpPromptId" | "onPreStartError">,
+    context: TurnRequestBuildContext,
+    errorType: "runtime_not_ready" | "runtime_start_failed",
+    errorMessage: string
+  ): Extract<PreparedTurnRequestOutcome, { type: "finished" }> {
+    // Emit error event so frontend receives it via stream subscription.
+    // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
+    // call in useCreationWorkspace.ts won't see the returned Err, but will receive
+    // this event through the workspace chat subscription.
+    const errorEvent = createErrorEvent(opts.workspaceId, {
+      // Generate message ID for the error event (frontend needs this for synthetic message)
+      messageId: createAssistantMessageId(),
+      error: errorMessage,
+      errorType,
+      acpPromptId: opts.acpPromptId,
+    });
+    if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+    opts.onPreStartError?.(errorEvent);
+    return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
+  }
+
+  private async prepareOrThrow(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<PreparedTurnRequestOutcome> {
     const resources: { model?: LanguageModel; cleanupTemp?: () => Promise<void> } = {};
     let retained = false;
     let transferred = false;
@@ -852,7 +960,6 @@ export class TurnRequestBuilder {
     const {
       messages,
       workspaceId,
-      modelString,
       thinkingLevel,
       reasoningMode,
       toolPolicy,
@@ -867,6 +974,7 @@ export class TurnRequestBuilder {
       onPreStartError,
       delegatedToolNames,
       recordFileState,
+      recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
       experiments: experimentsFromOptions,
@@ -882,6 +990,10 @@ export class TurnRequestBuilder {
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
+    // Both can move once, below: an Auto-routed tier model that cannot be built falls back
+    // to the composer's model, and every later use of the pair follows that swap.
+    let modelString = opts.modelString;
+    let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
     // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
     // writing the workspace context notes, on a transcript that may carry injected tool output.
@@ -988,12 +1100,13 @@ export class TurnRequestBuilder {
         return { modelString: canonical };
       }
       // The factory creates Coder instances from the wire alone (openai
-      // type → provider.responses, openai-chat types → provider.chat), so
-      // BOTH OpenAI wire kinds must override any pre-existing wireFormat:
-      // a refusal chain that starts on direct OpenAI Chat Completions and
-      // falls back to an openai-typed Coder instance would otherwise build
-      // Chat Completions tools/options for a Responses request.
-      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType);
+      // type and bedrock openai.* models → provider.responses, openai-chat
+      // types → provider.chat), so BOTH OpenAI wire kinds must override any
+      // pre-existing wireFormat: a refusal chain that starts on direct OpenAI
+      // Chat Completions and falls back to an openai-typed Coder instance
+      // would otherwise build Chat Completions tools/options for a Responses
+      // request.
+      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType, coderWire.modelId);
       return {
         modelString: `${coderWire.origin}:${coderWire.modelId}`,
         ...(wireProtocol === "openai-chat"
@@ -1112,13 +1225,55 @@ export class TurnRequestBuilder {
       });
     };
 
-    const modelResult = await prepareModelSeed({
+    let modelResult = await prepareModelSeed({
       rawModelString: modelString,
       requestedThinkingLevel: thinkingLevel,
       minimumThinkingLevelOverride: providedMinThinkingLevel,
       enforceMinimum: false,
       recordTiming: true,
     });
+    // Auto routing promises the composer's model whenever the tier model cannot run. The
+    // factory owns every reason it cannot be built (missing credentials, disabled or removed
+    // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
+    // verdict here instead of pre-checking copies of those rules at classification time.
+    // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
+    // the fallback model here and recorded with the assembled request, like a refusal hop.
+    if (
+      !modelResult.success &&
+      autoModelRouting?.status === "routed" &&
+      autoModelRouting.model !== autoModelRouting.requestedFallbackModel
+    ) {
+      const routedRecord = autoModelRouting;
+      const tierModelError = modelResult.error;
+      const fallbackModelString = routedRecord.requestedFallbackModel;
+      const fallbackResult = await prepareModelSeed({
+        rawModelString: fallbackModelString,
+        requestedThinkingLevel: thinkingLevel,
+        minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+          this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+          fallbackModelString
+        ),
+        enforceMinimum: true,
+      });
+      if (!fallbackResult.success) {
+        // Neither model runs; the composer's own failure is the one the user can act on.
+        return { type: "finished", result: Err(fallbackResult.error) };
+      }
+      log.warn("Auto-routed tier model cannot be built; falling back to the composer's model", {
+        workspaceId,
+        tierModel: modelString,
+        fallbackModel: fallbackModelString,
+        error: tierModelError,
+      });
+      modelResult = fallbackResult;
+      modelString = fallbackModelString;
+      autoModelRouting = {
+        ...routedRecord,
+        model: fallbackModelString,
+        status: "fallback",
+        reason: formatSendMessageError(tierModelError).message,
+      };
+    }
     if (!modelResult.success) {
       return { type: "finished", result: Err(modelResult.error) };
     }
@@ -1274,6 +1429,15 @@ export class TurnRequestBuilder {
     const waitForInitStartedAt = Date.now();
     await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
+    // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
+    // must not reach MCP startup below (#4674).
+    const unsanitized = this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+    if (unsanitized) {
+      return {
+        type: "finished",
+        result: Err({ type: unsanitized.code, message: unsanitized.message }),
+      };
+    }
     if (combinedAbortSignal.aborted) {
       return {
         type: "finished",
@@ -1306,41 +1470,19 @@ export class TurnRequestBuilder {
     });
     recordStartupPhaseTiming("ensureReadyMs", ensureReadyStartedAt);
     if (!readyResult.ready) {
-      // Generate message ID for the error event (frontend needs this for synthetic message)
-      const errorMessageId = createAssistantMessageId();
       const runtimeType = metadata.runtimeConfig?.type ?? "local";
       const runtimeLabel = runtimeType === "docker" ? "Container" : "Runtime";
       const errorMessage = readyResult.error || `${runtimeLabel} unavailable.`;
-
       const errorType = readyResult.errorType;
 
-      // Emit error event so frontend receives it via stream subscription.
-      // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
-      // call in useCreationWorkspace.ts won't see the returned Err, but will receive
-      // this event through the workspace chat subscription.
-      const errorEvent = createErrorEvent(workspaceId, {
-        messageId: errorMessageId,
-        error: errorMessage,
-        errorType,
-        acpPromptId,
-      });
-      if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
-      onPreStartError?.(errorEvent);
-
+      const finished = this.finishWithPreStartError(opts, context, errorType, errorMessage);
       logSlowStreamStartup({
         outcome: "runtime_not_ready",
         runtimeType,
         errorType,
         errorMessage,
       });
-
-      return {
-        type: "finished",
-        result: Err({
-          type: errorType,
-          message: errorMessage,
-        }),
-      };
+      return finished;
     }
 
     // Memory context (memory experiment): resolved only after ensureReady so
@@ -1414,6 +1556,9 @@ export class TurnRequestBuilder {
           })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
+    // One cache per request: resolution, plan handoff, prompt body, and
+    // sub-agent discovery share definition reads; the next turn starts fresh.
+    const agentDefinitionCache = new AgentDefinitionRequestCache();
     const resolveAgentForStreamStartedAt = Date.now();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -1435,6 +1580,7 @@ export class TurnRequestBuilder {
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
+      agentDefinitionCache,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -1639,6 +1785,7 @@ export class TurnRequestBuilder {
         taskDepth,
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
+        agentDefinitionCache,
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
@@ -1688,6 +1835,10 @@ export class TurnRequestBuilder {
         agentId: "intuition",
         resolvedFrontmatter: intuitionDefinition.frontmatter,
       });
+    const evaluationService = this.dependencies.bindings.evaluationService;
+    const builtInIntuitionBody = getBuiltInAgentDefinitions().find(
+      (definition) => definition.id === "intuition"
+    )?.body;
     const intuitionSettings = intuitionToolEligible
       ? resolveHeadlessAgentSettings(
           this.dependencies.config,
@@ -1697,6 +1848,9 @@ export class TurnRequestBuilder {
           intuitionDefinition.frontmatter.ai
         )
       : undefined;
+    // Filled by the first build: later rebuilds in this turn (tool policy,
+    // model fallback) reuse the same instruction snapshot instead of re-reading.
+    const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1732,6 +1886,8 @@ export class TurnRequestBuilder {
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         agentPluginsEnabled: agentPluginsExperimentEnabled,
+        instructionSources: turnInstructionSources.current,
+        agentDefinitionCache,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -1747,8 +1903,14 @@ export class TurnRequestBuilder {
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
-    const { agentSystemPromptSections, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
-      prePolicyStreamSystemContext;
+    const {
+      agentSystemPromptSections,
+      agentDefinitions,
+      availableSkills,
+      ancestorPlanFilePaths,
+      instructionSources,
+    } = prePolicyStreamSystemContext;
+    turnInstructionSources.current = instructionSources;
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -1880,14 +2042,13 @@ export class TurnRequestBuilder {
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
     const readToolInstructionsStartedAt = Date.now();
-    const toolInstructions = await readToolInstructions(
-      metadata,
-      runtime,
-      workspacePath,
+    // Same snapshot as the system message: no second AGENTS.md scan, and the
+    // prompt and tool descriptions cannot disagree about file contents.
+    const toolInstructions = extractToolInstructionsFromSources(
+      instructionSources,
       capabilityModelString,
-      agentSystemPromptSections,
-      cfg.projects,
-      claudeSkillsCompatExperimentEnabled
+      metadata,
+      agentSystemPromptSections
     );
     recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
@@ -2013,6 +2174,7 @@ export class TurnRequestBuilder {
     const workflowService =
       dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
+            archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
             runStore: new WorkflowRunStore({
               sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
@@ -2029,8 +2191,20 @@ export class TurnRequestBuilder {
               await this.dependencies.bindings.onWorkflowRunStatusChanged?.(event);
             },
             runtimeFactory: new QuickJSRuntimeFactory(),
+            evaluationAdapter:
+              this.dependencies.bindings.evaluationService != null &&
+              this.dependencies.sessionUsageService != null
+                ? new WorkflowEvaluationAdapter({
+                    evaluationService: this.dependencies.bindings.evaluationService,
+                    aiService: this.dependencies.providerModelFactory,
+                    sessionUsageService: this.dependencies.sessionUsageService,
+                    config: this.dependencies.config,
+                    workspaceId,
+                    requestAnalyticsIngest: this.dependencies.bindings.requestAnalyticsIngest,
+                  })
+                : undefined,
             taskAdapterFactory: (runId, workflowName) =>
-              new WorkflowTaskServiceAdapter({
+              createProductionWorkflowTaskAdapter({
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,
@@ -2172,6 +2346,9 @@ export class TurnRequestBuilder {
     // stay scoped to this specific assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
+    // Bind ownership before cached MCP tools are captured by the PTC bridge.
+    // A queued invocation must keep this turn's identity after a replacement starts.
+    const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
@@ -2242,6 +2419,15 @@ export class TurnRequestBuilder {
               usesThisTurn: 0,
               createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
               resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
+              // Evaluation recall replaces only the built-in body's tool loop: a custom
+              // body was written for that loop, and evaluation ignores prompt bodies.
+              ...(evaluationService && intuitionDefinition?.body === builtInIntuitionBody
+                ? {
+                    createEvaluationModel: (ms: string) =>
+                      this.dependencies.providerModelFactory.createEvaluationModel(ms),
+                    evaluationService,
+                  }
+                : {}),
               abortSignal: combinedAbortSignal,
             },
           }
@@ -2284,6 +2470,7 @@ export class TurnRequestBuilder {
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
+      goalKickoffModel: modelString,
       enableGoalTools: goalToolAvailability,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
@@ -2305,6 +2492,7 @@ export class TurnRequestBuilder {
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,
+      recordProposedPlan,
       reportModelUsage: (event) => {
         try {
           const eventModel = event.model.trim();
@@ -2387,6 +2575,31 @@ export class TurnRequestBuilder {
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
+      // models_list: same pipeline as the composer picker, read from live backend
+      // state on every call (the tool object outlives config edits). Models are
+      // resolved on the Xum host, so this is the source even for SSH workspaces.
+      listAvailableModels: () => {
+        const appConfig = this.dependencies.config.loadConfigOrDefault();
+        const policy = this.dependencies.policyService;
+        const enforced = policy?.isEnforced() === true;
+        const effectivePolicy = enforced ? (policy?.getEffectivePolicy() ?? null) : null;
+        // Enforcement without an effective policy is the "blocked" state, where
+        // PolicyService denies every model. Shared filtering reads a null policy as
+        // "unenforced", so advertise nothing rather than every configured model.
+        if (enforced && effectivePolicy == null) {
+          return [];
+        }
+        return listAvailableModels(
+          {
+            providersConfig: this.dependencies.providerService.getConfig(),
+            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
+            routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
+            routeOverrides: appConfig.routeOverrides ?? {},
+            effectivePolicy,
+          },
+          (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
+        );
+      },
       analyticsService: this.dependencies.bindings.analyticsService,
       desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
       // Agent memory (memory experiment): per-scope write policy derived from
@@ -2421,7 +2634,7 @@ export class TurnRequestBuilder {
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
-        this.dependencies.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
+        this.dependencies.streamManager.emitNestedToolEvent(executionScope, event);
       }
     };
     const kernelFileLoader = createKernelFileLoader({
@@ -2467,6 +2680,9 @@ export class TurnRequestBuilder {
           {
             ...toolsForModelConfig,
             capabilityModelString: seed.capabilityModelString,
+            // Per attempt: a fallback model that calls set_goal must price and
+            // kick off the goal on itself, not on the primary it replaced.
+            goalKickoffModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
           },
@@ -2483,7 +2699,7 @@ export class TurnRequestBuilder {
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
-            allTools,
+            withExecutionScope(allTools, executionScope),
             delegatedToolNames
           ),
           extraTools: this.dependencies.bindings.extraTools,
@@ -3212,11 +3428,21 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
+          // When Auto set the thinking level, the record names the level this request starts
+          // at: the tier's choice clamped to the model that runs (the composer's after a
+          // model-only fallback), not the raw tier value.
+          ...(autoModelRouting != null && {
+            autoModelRouting:
+              autoModelRouting.thinkingLevel != null
+                ? { ...autoModelRouting, thinkingLevel: streamThinkingLevel }
+                : autoModelRouting,
+          }),
         },
         providerOptions: streamProviderOptions,
         maxOutputTokens,
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
+        executionScope,
         hasQueuedMessages,
         getQueuedInputStopCause,
         onStepSettled,

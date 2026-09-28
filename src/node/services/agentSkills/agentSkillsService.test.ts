@@ -9,6 +9,7 @@ import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
@@ -1919,4 +1920,83 @@ describe("agentSkillsService agent plugins", () => {
       expect(skills.find((s) => s.name === "linked-skill")).toBeUndefined();
     }
   );
+});
+
+// #4438: on SSH runtimes a transport failure says nothing about a skill. It must
+// never let a lower-scope or built-in skill win, or silently drop the skills index.
+describe("agent skills transport failures", () => {
+  /** A remote runtime with OpenSSH semantics: exit 255 is the transport's own failure. */
+  class SshLikeRuntime extends RemotePathMappedRuntime {
+    constructor(
+      localBase: string,
+      remoteBase: string,
+      private readonly failing: RegExp
+    ) {
+      super(localBase, remoteBase);
+    }
+
+    override isTransportFailureExit(exitCode: number): boolean {
+      return exitCode === 255;
+    }
+
+    override exec(
+      command: string,
+      options: Parameters<LocalRuntime["exec"]>[1]
+    ): ReturnType<LocalRuntime["exec"]> {
+      if (!this.failing.test(command)) return super.exec(command, options);
+      return super.exec(
+        "echo 'ssh: connect to host h port 22: Connection refused' >&2; exit 255",
+        options
+      );
+    }
+
+    override stat(filePath: string, abortSignal?: AbortSignal): ReturnType<LocalRuntime["stat"]> {
+      if (!this.failing.test(filePath)) return super.stat(filePath, abortSignal);
+      return Promise.reject(new RuntimeError(`Failed to stat ${filePath}: refused`, "network"));
+    }
+  }
+
+  async function remoteSkills(base: string, failing: RegExp) {
+    const local = path.join(base, "workspace");
+    await writeSkill(path.join(local, ".mux", "skills"), "shared", "from project");
+    await writeSkill(path.join(local, ".mux", "global-skills"), "shared", "from global");
+    const remote = "/remote/workspace";
+    return {
+      runtime: new SshLikeRuntime(local, remote, failing),
+      remote,
+      roots: {
+        projectRoot: path.posix.join(remote, ".mux", "skills"),
+        // Global skills resolve on the host, not the remote workspace.
+        globalRoot: path.join(local, ".mux", "global-skills"),
+      },
+    };
+  }
+
+  test("a skills listing that fails in transport rejects discovery", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-listing");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /find -L/);
+    const outcome = await discoverAgentSkills(runtime, remote, { roots }).catch(
+      (error: unknown) => error
+    );
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("a project skill that fails in transport does not fall back to global", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-read");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /^\/remote\/.*skills\/shared/);
+    const outcome = await readAgentSkill(runtime, remote, SkillNameSchema.parse("shared"), {
+      roots,
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("a missing project skill still falls back to global", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-control");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /^$/);
+    await fs.rm(path.join(base.path, "workspace", ".mux", "skills", "shared"), { recursive: true });
+    const resolved = await readAgentSkill(runtime, remote, SkillNameSchema.parse("shared"), {
+      roots,
+    });
+    expect(resolved.package.frontmatter.description).toBe("from global");
+  });
 });

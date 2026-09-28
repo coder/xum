@@ -1,5 +1,11 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn, vi, type Mock } from "bun:test";
 import { TerminalService } from "./terminalService";
+import {
+  WorkspaceMutationInProgressError,
+  WorkspaceUseLeases,
+  workspaceUseLeasesFor,
+  workspaceUseLockDir,
+} from "./workspaceUseLeases";
 import type { PTYService } from "./ptyService";
 import type { Config, SecretsStore } from "@/node/config";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -18,6 +24,7 @@ const mockSecretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = {
 };
 
 // Mock dependencies
+// rootDir holds the workspace use leases (#4476); keep them inside this run's temp dir.
 const mockConfig = {
   getAllWorkspaceMetadata: mock(() =>
     Promise.resolve([
@@ -35,6 +42,7 @@ const mockConfig = {
     terminalDefaultShell: undefined,
   })),
   sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+  rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
   srcDir: "/tmp",
 } as unknown as Config;
 
@@ -52,6 +60,7 @@ function createConfigWithMetadata(metadata: {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 }
@@ -222,6 +231,45 @@ describe("TerminalService", () => {
     expect(env.MUX_WORKSPACE_NAME).toBe("main");
     expect(env.MUX_WORKSPACE_ID).toBe("ws-1");
     expect(env.TEST_SECRET).toBe("secret-value");
+  });
+
+  // #4760: a removal can close the workspace's terminals and finish (clearing its guard)
+  // while a startup is still spawning; that startup must not publish into the deleted checkout.
+  it("kills a terminal whose startup spans a workspace close", async () => {
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    let spawnStarted!: () => void;
+    const spawnStartedPromise = new Promise<void>((resolve) => {
+      spawnStarted = resolve;
+    });
+    (mockPTYService.createSession as unknown) = mock(async (params: TerminalCreateParams) => {
+      spawnStarted();
+      await spawnGate;
+      return { sessionId: "session-spanning", workspaceId: params.workspaceId, cols: 80, rows: 24 };
+    });
+
+    const creation = service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+    await spawnStartedPromise;
+    // The removal closes sessions and completes; its guard no longer reports the workspace.
+    service.closeWorkspaceSessions("ws-1");
+    releaseSpawn();
+
+    let createError: unknown;
+    try {
+      await creation;
+    } catch (error) {
+      createError = error;
+    }
+    expect(createError).toBeInstanceOf(Error);
+    expect(closeSessionMock).toHaveBeenCalledWith("session-spanning");
+    expect(service.hasWorkspaceSessions("ws-1")).toBe(false);
+
+    // A startup that begins after the close is unaffected.
+    (mockPTYService.createSession as unknown) = createSessionMock;
+    const later = await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+    expect(later.sessionId).toBe("session-1");
   });
 
   it("uses the persisted workspace root for worktree terminals", async () => {
@@ -957,6 +1005,15 @@ describe("TerminalService", () => {
   });
 });
 
+// The registry lookup openNative makes before taking its lease (#4913): every workspace ID is
+// registered except these.
+const UNREGISTERED_WORKSPACE_IDS = new Set(["non-existent", "ws-native-lease-unknown"]);
+function findRegisteredWorkspace(workspaceId: string) {
+  return UNREGISTERED_WORKSPACE_IDS.has(workspaceId)
+    ? null
+    : { workspacePath: "/tmp/project/main", projectPath: "/tmp/project" };
+}
+
 describe("TerminalService.openNative", () => {
   let service: TerminalService;
   // Using simplified mock types since spawnSync has complex overloads
@@ -989,11 +1046,13 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1015,11 +1074,13 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1038,11 +1099,13 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1061,11 +1124,13 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1282,6 +1347,167 @@ describe("TerminalService.openNative", () => {
       expect(script).toContain("-p 2222"); // port
       expect(script).toContain("-i ~/.ssh/id_rsa"); // identity file
       expect(script).toContain("remote.example.com"); // host
+    });
+  });
+
+  // #4883: a native terminal's lifetime cannot be tracked, so this backend holds a "terminal" use
+  // lease from the first open until it archives or removes the workspace; another backend on the
+  // same Xum root refuses to rename or remove the checkout meanwhile.
+  describe("native terminal use leases", () => {
+    const workspaceId = "ws-native-lease";
+    // Never opened: the other test's durable marker would answer for workspaceId.
+    const refusedWorkspaceId = "ws-native-lease-refused";
+    const leaseRoot = `${NATIVE_TERMINAL_SESSIONS_DIR}-leases`;
+    const configWithLeaseWorkspace = {
+      ...configWithLocalWorkspace,
+      getAllWorkspaceMetadata: mock(() =>
+        Promise.resolve([
+          ...[workspaceId, refusedWorkspaceId].map((id) => ({
+            id,
+            projectPath: "/tmp/project",
+            name: "main",
+            namedWorkspacePath: "/tmp/project/main",
+            runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+          })),
+        ])
+      ),
+      sessionsDir: leaseRoot,
+      rootDir: leaseRoot,
+    } as unknown as Config;
+    // The other backend: its own instance token over the same root.
+    const otherBackend = () => new WorkspaceUseLeases(leaseRoot);
+    const gateOptions = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
+
+    beforeEach(() => {
+      setPlatform("darwin");
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+    });
+
+    it("refuses the other backend's mutation until this backend archives or removes the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative(workspaceId);
+      await service.openNative(workspaceId);
+
+      const refused = await otherBackend()
+        .acquireMutationGate([workspaceId], gateOptions)
+        .then(
+          () => "allowed",
+          (error: unknown) => String(error)
+        );
+      expect(refused).toContain("in use by another Xum process: a terminal");
+
+      await service.releaseNativeTerminalUseLease(workspaceId);
+      const release = await otherBackend().acquireMutationGate([workspaceId], gateOptions);
+      await release();
+    });
+
+    it("opens no terminal while the other backend mutates the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      const release = await otherBackend().acquireMutationGate([refusedWorkspaceId], gateOptions);
+      try {
+        let error: unknown;
+        await service.openNative(refusedWorkspaceId).catch((caught: unknown) => (error = caught));
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect(await service.hasOpenedNativeTerminal(refusedWorkspaceId)).toBe(false);
+      } finally {
+        await release();
+      }
+    });
+
+    // #4902: the lease is held before the path is read, so a mutation cannot slip in between.
+    it("refuses the other backend's mutation that starts while this backend reads the workspace path", async () => {
+      let mutationDuringRead: string | undefined;
+      const config = {
+        ...configWithLeaseWorkspace,
+        getAllWorkspaceMetadata: mock(async () => {
+          mutationDuringRead ??= await otherBackend()
+            .acquireMutationGate([workspaceId], gateOptions)
+            .then(
+              async (release) => {
+                await release();
+                return "allowed";
+              },
+              (error: unknown) => String(error)
+            );
+          return configWithLeaseWorkspace.getAllWorkspaceMetadata();
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+      try {
+        await service.openNative(workspaceId);
+        expect(mutationDuringRead).toContain("in use by another Xum process: a terminal");
+      } finally {
+        await service.releaseNativeTerminalUseLease(workspaceId);
+      }
+    });
+
+    it("refuses when this backend's own rename takes the gate while the open reads the path", async () => {
+      let releaseGate: (() => Promise<void>) | undefined;
+      const config = {
+        ...configWithLeaseWorkspace,
+        getAllWorkspaceMetadata: mock(async () => {
+          // A read made while the open holds its lease: the own rename ignores that lease.
+          const leases = workspaceUseLeasesFor(config);
+          if (releaseGate == null && leases.heldCount(workspaceId, "terminal") > 0) {
+            releaseGate = await leases.acquireMutationGate([workspaceId], {
+              ...gateOptions,
+              ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal" as const])]]),
+            });
+          }
+          return configWithLeaseWorkspace.getAllWorkspaceMetadata();
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+      try {
+        let error: unknown;
+        await service.openNative(workspaceId).catch((caught: unknown) => (error = caught));
+        expect(releaseGate).toBeDefined();
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect(workspaceUseLeasesFor(config).heldCount(workspaceId)).toBe(0);
+      } finally {
+        await releaseGate?.();
+        await service.releaseNativeTerminalUseLease(workspaceId);
+      }
+    });
+
+    // #4913: lease directories are never pruned, so an unknown ID must not create one.
+    it("publishes no lease for an unknown workspace", async () => {
+      const unknownId = "ws-native-lease-unknown";
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      let error: unknown;
+      await service.openNative(unknownId).catch((caught: unknown) => (error = caught));
+      expect(String(error)).toContain("Workspace not found");
+      expect(
+        await fs.access(workspaceUseLockDir(leaseRoot, unknownId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
+    it("probes the gate on every open, even after an earlier open of the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative(workspaceId);
+      spawnSpy.mockClear();
+      // This backend's own rename ignores its own terminals, so it can hold the gate meanwhile.
+      const release = await workspaceUseLeasesFor(configWithLeaseWorkspace).acquireMutationGate(
+        [workspaceId],
+        { ...gateOptions, ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal" as const])]]) }
+      );
+      try {
+        let error: unknown;
+        await service.openNative(workspaceId).catch((caught: unknown) => (error = caught));
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+      } finally {
+        await release();
+      }
+      // One share stays held per workspace, and the archive release ends it.
+      expect(workspaceUseLeasesFor(configWithLeaseWorkspace).heldCount(workspaceId)).toBe(1);
+      await service.releaseNativeTerminalUseLease(workspaceId);
+      expect(workspaceUseLeasesFor(configWithLeaseWorkspace).heldCount(workspaceId)).toBe(0);
     });
   });
 

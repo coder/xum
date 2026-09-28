@@ -28,8 +28,9 @@ import type {
   WorkspaceForkParams,
   WorkspaceForkResult,
   EnsureReadyResult,
+  ReadFileOptions,
 } from "./Runtime";
-import { RuntimeError } from "./Runtime";
+import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { log } from "@/node/services/log";
@@ -41,7 +42,10 @@ import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport, buildShellPathExport } from "./shellEnv";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
+  buildRegularFileReadCommand,
+  CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
+  readAttemptTimeoutSecs,
   readFileViaExec,
   statViaExec,
   writeFileViaExec,
@@ -197,10 +201,16 @@ export abstract class RemoteRuntime implements Runtime {
 
       childProcess.on("error", (err) => {
         spawnResult.onError?.(err);
+        // A transport-classified child failure (an SSH2 channel or connection
+        // lost after acquisition, #4835) stays "network" so callers never read
+        // it as a missing file. Check abort/timeout FIRST: our own kill can
+        // surface the same way, and that says nothing about the transport.
+        const isTransport =
+          isRuntimeTransportError(err) && !aborted && !timedOut && !options.abortSignal?.aborted;
         reject(
           new RuntimeError(
             `Failed to execute ${this.commandPrefix} command: ${err.message}`,
-            "exec",
+            isTransport ? "network" : "exec",
             err
           )
         );
@@ -208,6 +218,12 @@ export abstract class RemoteRuntime implements Runtime {
     });
 
     const duration = exitCode.then(() => performance.now() - startTime);
+    // A failed child rejects both promises, and callers may read neither
+    // (duration) or only after draining stdout (exitCode). Mark them handled so
+    // the rejection reaches awaiting callers without an unhandled-rejection
+    // crash in server mode.
+    exitCode.catch(() => undefined);
+    duration.catch(() => undefined);
 
     // Handle abort signal
     if (options.abortSignal) {
@@ -369,13 +385,25 @@ export abstract class RemoteRuntime implements Runtime {
 
   private async resolveFilePath(filePath: string, abortSignal?: AbortSignal): Promise<string> {
     if (filePath === "~" || filePath.startsWith("~/")) {
-      return this.resolveWithAbort(this.resolvePath(filePath), abortSignal);
+      return this.resolveWithAbort(this.resolvePathOnce(filePath), abortSignal);
     }
     if (path.posix.isAbsolute(filePath)) {
       return path.posix.normalize(filePath);
     }
-    const basePath = await this.resolveWithAbort(this.resolvePath(this.getBasePath()), abortSignal);
+    const basePath = await this.resolveWithAbort(
+      this.resolvePathOnce(this.getBasePath()),
+      abortSignal
+    );
     return path.posix.resolve(basePath, filePath);
+  }
+
+  /**
+   * One path-resolution attempt, without any retry resolvePath adds. File
+   * operations resolve inside their exec factory, which already retries once
+   * (#4830); stacking a resolvePath retry on top would double the attempts.
+   */
+  protected resolvePathOnce(filePath: string): Promise<string> {
+    return this.resolvePath(filePath);
   }
 
   /**
@@ -399,19 +427,39 @@ export abstract class RemoteRuntime implements Runtime {
   /**
    * Read file contents as a stream via exec.
    */
-  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     return readFileViaExec(
       filePath,
-      async (signal) => {
+      async (signal, attempt) => {
         const resolvedPath = await this.resolveFilePath(filePath, signal);
-        return this.exec(`cat ${this.quoteForRemote(resolvedPath)}`, {
+        const quotedPath = this.quoteForRemote(resolvedPath);
+        // The retry reads only a regular file: see readFileViaExec's StartReadExec.
+        const command =
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(quotedPath)
+            : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
+        return this.exec(command, {
           cwd: this.getBasePath(),
-          timeout: 300,
+          timeout: readAttemptTimeoutSecs(attempt, 300),
           abortSignal: signal,
         });
       },
-      abortSignal
+      abortSignal,
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
+  }
+
+  /**
+   * Whether a non-zero exit came from the transport itself (host unreachable)
+   * rather than the remote command. Only runtimes whose transport reserves an
+   * exit code for its own failures override this (SSH: exit 255, #4438).
+   */
+  isTransportFailureExit(_exitCode: number, _stderr: string): boolean {
+    return false;
   }
 
   /**
@@ -461,14 +509,19 @@ export abstract class RemoteRuntime implements Runtime {
    * Get file statistics via exec.
    */
   stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    return statViaExec(filePath, async () => {
-      const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
-      return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
-        cwd: this.getBasePath(),
-        timeout: 10,
-        abortSignal,
-      });
-    });
+    return statViaExec(
+      filePath,
+      async (attempt) => {
+        const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
+        return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
+          cwd: this.getBasePath(),
+          timeout: readAttemptTimeoutSecs(attempt, 10),
+          abortSignal,
+        });
+      },
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
+    );
   }
 
   /**

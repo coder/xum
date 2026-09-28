@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { PLACEHOLDER_TIPS, getPlaceholderTip, getPlaceholderTips } from "./placeholderTips";
 
 interface StorybookGlobal {
@@ -6,6 +6,16 @@ interface StorybookGlobal {
 }
 
 const TWENTY_MIN_MS = 20 * 60 * 1000;
+
+/** The tip the carousel shows while the wall clock reads `nowMs`. */
+function tipAt(nowMs: number): string {
+  const now = spyOn(Date, "now").mockReturnValue(nowMs);
+  try {
+    return getPlaceholderTip();
+  } finally {
+    now.mockRestore();
+  }
+}
 
 describe("PLACEHOLDER_TIPS", () => {
   test("tips are unique", () => {
@@ -49,17 +59,17 @@ describe("getPlaceholderTip", () => {
     // inside the same bucket would reshuffle the tip — which is the exact
     // flicker we're trying to prevent.
     const bucketStart = TWENTY_MIN_MS * 100; // arbitrary aligned anchor
-    const tip = getPlaceholderTip(bucketStart);
-    expect(getPlaceholderTip(bucketStart + 1)).toBe(tip);
-    expect(getPlaceholderTip(bucketStart + TWENTY_MIN_MS - 1)).toBe(tip);
+    const tip = tipAt(bucketStart);
+    expect(tipAt(bucketStart + 1)).toBe(tip);
+    expect(tipAt(bucketStart + TWENTY_MIN_MS - 1)).toBe(tip);
   });
 
   test("advances to the next tip when the bucket boundary crosses", () => {
     // Crossing the boundary must rotate — otherwise the carousel is silently
     // stuck and the discoverability rationale is broken.
     const bucketStart = TWENTY_MIN_MS * 100;
-    const before = getPlaceholderTip(bucketStart);
-    const after = getPlaceholderTip(bucketStart + TWENTY_MIN_MS);
+    const before = tipAt(bucketStart);
+    const after = tipAt(bucketStart + TWENTY_MIN_MS);
     expect(after).not.toBe(before);
   });
 
@@ -67,34 +77,32 @@ describe("getPlaceholderTip", () => {
     // Far-future timestamps should still resolve to a tip rather than
     // undefined / out-of-bounds.
     const bigFuture = TWENTY_MIN_MS * PLACEHOLDER_TIPS.length * 5 + TWENTY_MIN_MS * 3;
-    expect(PLACEHOLDER_TIPS).toContain(getPlaceholderTip(bigFuture));
+    expect(PLACEHOLDER_TIPS).toContain(tipAt(bigFuture));
   });
 
-  test("falls back to the lead tip on non-finite or negative inputs", () => {
-    // Defensive: mocked timers, broken clocks, or accidentally-passed
-    // sentinels should never produce undefined or throw.
-    expect(getPlaceholderTip(-1)).toBe(PLACEHOLDER_TIPS[0]);
-    expect(getPlaceholderTip(Number.NaN)).toBe(PLACEHOLDER_TIPS[0]);
-    expect(getPlaceholderTip(Number.POSITIVE_INFINITY)).toBe(PLACEHOLDER_TIPS[0]);
+  test("falls back to the lead tip on a non-finite or negative clock", () => {
+    // Defensive: mocked timers or broken clocks should never produce
+    // undefined or throw.
+    expect(tipAt(-1)).toBe(PLACEHOLDER_TIPS[0]);
+    expect(tipAt(Number.NaN)).toBe(PLACEHOLDER_TIPS[0]);
+    expect(tipAt(Number.POSITIVE_INFINITY)).toBe(PLACEHOLDER_TIPS[0]);
   });
 
-  test("pins the default-arg call to the lead tip when running under Storybook", () => {
+  test("pins the lead tip when running under Storybook", () => {
     // Storybook visual snapshots render 100+ stories that include ChatInput. Without
     // pinning, every reorder or insertion into PLACEHOLDER_TIPS shifts the
     // tip the wall-clock bucket lands on and forces a baseline re-accept on
     // every one of those stories. The fix is a runtime flag set by
     // .storybook/preview.tsx that short-circuits the carousel to slot 0.
-    (globalThis as StorybookGlobal).__MUX_STORYBOOK__ = true;
-
-    // Default-arg path: pinned regardless of wall-clock time.
-    expect(getPlaceholderTip()).toBe(PLACEHOLDER_TIPS[0]);
-
-    // Explicit nowMs must still rotate even with the flag set, otherwise
-    // unit tests that depend on rotation math would silently no-op when
-    // someone forgets to clear the flag.
     const bucketStart = TWENTY_MIN_MS * 100;
-    const before = getPlaceholderTip(bucketStart);
-    const after = getPlaceholderTip(bucketStart + TWENTY_MIN_MS);
-    expect(after).not.toBe(before);
+    // Without the flag these buckets rotate away from the lead tip, so the
+    // pinned assertions below cannot pass by coincidence.
+    expect(tipAt(bucketStart)).not.toBe(PLACEHOLDER_TIPS[0]);
+    expect(tipAt(bucketStart + TWENTY_MIN_MS)).not.toBe(PLACEHOLDER_TIPS[0]);
+
+    (globalThis as StorybookGlobal).__MUX_STORYBOOK__ = true;
+    // Pinned regardless of wall-clock time.
+    expect(tipAt(bucketStart)).toBe(PLACEHOLDER_TIPS[0]);
+    expect(tipAt(bucketStart + TWENTY_MIN_MS)).toBe(PLACEHOLDER_TIPS[0]);
   });
 });

@@ -1,38 +1,64 @@
+import "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as RealClipboardModule from "@/browser/utils/clipboard";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import { useEffect, useState, type ComponentProps } from "react";
+import { useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from "react";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { DiffHunk, Review } from "@/common/types/review";
+import {
+  createTestApiClient,
+  createTestBashResult,
+  type TestApiOverrides,
+  type TestExecuteBashResult,
+} from "@/browser/testUtils";
 
-interface MockApiClient {
-  workspace: {
-    executeBash: (...args: unknown[]) => Promise<{
-      success: true;
-      data: {
-        success: boolean;
-        output: string;
-        exitCode: number;
-        truncated?: { reason: string; totalLines: number };
-      };
-    }>;
-  };
+type ExecuteBashInput = Parameters<APIClient["workspace"]["executeBash"]>[0];
+
+// Typed against the real APIClient: each test swaps in its own executeBash double, and the
+// shared beforeEach default keeps it a bun mock so tests can assert call counts.
+interface ImmersiveReviewApi extends TestApiOverrides<APIClient> {
+  workspace: { executeBash: (input: ExecuteBashInput) => Promise<TestExecuteBashResult> };
 }
 
-let mockApi: MockApiClient;
+let mockApi: ImmersiveReviewApi;
+// Models the backend being unavailable: the real context then carries api: null.
+let apiUnavailable = false;
 let clipboardWrites: string[] = [];
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Later suites must not inherit the clipboard stub (which swallowed clipboard.test.ts's
+// copies when it ran later in the same process).
+restoreModulesAfterSuite([["@/browser/utils/clipboard", { ...RealClipboardModule }]]);
+
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites. The wrapper reads mockApi at
+// render time because beforeEach replaces it; view.rerender() keeps the wrapper.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (apiUnavailable) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
+
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 void mock.module("@/browser/utils/clipboard", () => ({
   copyToClipboard: (text: string) => {
@@ -101,7 +127,7 @@ function renderImmersiveReview(
 ) {
   const hunk = createHunk();
 
-  return render(
+  return renderWithApi(
     <ThemeProvider forcedTheme="dark">
       <ImmersiveReviewView
         workspaceId="workspace-1"
@@ -156,18 +182,10 @@ describe("ImmersiveReviewView", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
 
     clipboardWrites = [];
+    apiUnavailable = false;
     mockApi = {
       workspace: {
-        executeBash: mock(() =>
-          Promise.resolve({
-            success: true as const,
-            data: {
-              success: true,
-              output: "",
-              exitCode: 0,
-            },
-          })
-        ),
+        executeBash: mock(() => Promise.resolve(createTestBashResult({ output: "" }))),
       },
     };
   });
@@ -328,7 +346,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(assistedHunk.id));
+    const view = renderWithApi(renderView(assistedHunk.id));
 
     expect(view.container.querySelector('[data-assisted-banner-slot="true"]')).toBeTruthy();
     const banner = view.getByTestId("immersive-assisted-banner");
@@ -370,13 +388,12 @@ describe("ImmersiveReviewView", () => {
   });
 
   test("defers the compact diff renderer while full-file context is pending", async () => {
-    type ExecuteBashResult = Awaited<ReturnType<MockApiClient["workspace"]["executeBash"]>>;
-    let resolveRead: (result: ExecuteBashResult) => void = () => {
+    let resolveRead: (result: TestExecuteBashResult) => void = () => {
       throw new Error("executeBash was not called");
     };
     mockApi.workspace.executeBash = mock(
       () =>
-        new Promise<ExecuteBashResult>((resolve) => {
+        new Promise<TestExecuteBashResult>((resolve) => {
           resolveRead = resolve;
         })
     );
@@ -389,14 +406,11 @@ describe("ImmersiveReviewView", () => {
     // a hidden render/highlight pass on the compact hunk rows that would be thrown away.
     expect(view.container.textContent ?? "").not.toContain("new line");
 
-    resolveRead({
-      success: true as const,
-      data: {
-        success: true,
+    resolveRead(
+      createTestBashResult({
         output: encodeFileReadOutput("new line\ncontext after selected hunk\n"),
-        exitCode: 0,
-      },
-    });
+      })
+    );
 
     await waitFor(() =>
       expect(view.container.textContent ?? "").toContain("context after selected hunk")
@@ -429,10 +443,7 @@ describe("ImmersiveReviewView", () => {
     let readCount = 0;
     mockApi.workspace.executeBash = mock(() => {
       readCount += 1;
-      return Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(fileBody), exitCode: 0 },
-      });
+      return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileBody) }));
     });
 
     const renderView = (hunks: DiffHunk[], selectedHunkId: string) => (
@@ -455,7 +466,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView([hunkA, hunkB], hunkA.id));
+    const view = renderWithApi(renderView([hunkA, hunkB], hunkA.id));
 
     // Full-file context hydrates and the loading cover clears (file is on screen).
     await waitFor(() => expect(view.container.textContent ?? "").toContain("file line 12"));
@@ -499,10 +510,7 @@ describe("ImmersiveReviewView", () => {
     let readCount = 0;
     mockApi.workspace.executeBash = mock(() => {
       readCount += 1;
-      return Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(fileBody), exitCode: 0 },
-      });
+      return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileBody) }));
     });
 
     const renderView = (hunk: DiffHunk) => (
@@ -525,7 +533,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(baseHunk));
+    const view = renderWithApi(renderView(baseHunk));
     // Full-file context hydrates: a context-only line from the file body is visible.
     await waitFor(() => expect(view.container.textContent ?? "").toContain("file line 12"));
     const readsAfterFirstHydration = readCount;
@@ -574,14 +582,7 @@ describe("ImmersiveReviewView", () => {
       ...Array.from({ length: lineBudget - 2 }, (_, index) => `filler ${index}`),
     ].join("\n")}\n`;
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: {
-          success: true,
-          output: encodeFileReadOutput(fileContent),
-          exitCode: 0,
-        },
-      })
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileContent) }))
     );
 
     const view = renderImmersiveReview();
@@ -598,14 +599,7 @@ describe("ImmersiveReviewView", () => {
     const fileTree = createFileTreeForPaths(allHunks.map((hunk) => hunk.filePath));
     const onSelectHunk = mock((_hunkId: string | null) => undefined);
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: {
-          success: false,
-          output: "",
-          exitCode: 1,
-        },
-      })
+      Promise.resolve(createTestBashResult({ output: "", exitCode: 1 }))
     );
 
     const renderView = (selectedHunkId: string) => (
@@ -628,7 +622,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(firstHunk.id));
+    const view = renderWithApi(renderView(firstHunk.id));
     await waitFor(() => expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1));
 
     view.rerender(renderView(secondHunk.id));
@@ -804,7 +798,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<ParentEchoHarness />);
+    const view = renderWithApi(<ParentEchoHarness />);
 
     const findMarkReadButton = () =>
       view.container.querySelector<HTMLButtonElement>('button[aria-label="Mark hunk as read"]');
@@ -980,7 +974,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(
+    const view = renderWithApi(
       <ThemeProvider forcedTheme="dark">
         <ParentPanelHarness />
       </ThemeProvider>
@@ -1004,20 +998,13 @@ describe("ImmersiveReviewView", () => {
 
     // The full-file display read carries an awk line budget; the copy read must not,
     // so it still yields the whole file when the display falls back to compact hunks.
-    const copyReadCalls: Array<{ script: string; options?: { cwdMode?: string } }> = [];
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const input = args[0] as { script: string; options?: { cwdMode?: string } };
+    const copyReadCalls: ExecuteBashInput[] = [];
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
       if (input.script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
       copyReadCalls.push(input);
-      return Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
-      });
+      return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fullContent) }));
     });
 
     const view = renderImmersiveReview();
@@ -1040,10 +1027,7 @@ describe("ImmersiveReviewView", () => {
     let executeBashCalls = 0;
     mockApi.workspace.executeBash = mock(() => {
       executeBashCalls += 1;
-      return Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
-      });
+      return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fullContent) }));
     });
 
     const view = renderImmersiveReview({ isTouchImmersive: false });
@@ -1066,13 +1050,13 @@ describe("ImmersiveReviewView", () => {
     const fileAHunk = createHunk({ id: "hunk-a", filePath: "src/a.ts" });
     const fileBHunk = createHunk({ id: "hunk-b", filePath: "src/b.ts" });
 
-    let resolveRead: ((value: unknown) => void) | undefined;
+    let resolveRead: ((value: TestExecuteBashResult) => void) | undefined;
     mockApi.workspace.executeBash = mock(
       () =>
-        new Promise((resolve) => {
-          resolveRead = resolve as (value: unknown) => void;
+        new Promise<TestExecuteBashResult>((resolve) => {
+          resolveRead = resolve;
         })
-    ) as unknown as MockApiClient["workspace"]["executeBash"];
+    );
 
     function NavigationHarness() {
       const [selectedHunkId, setSelectedHunkId] = useState<string | null>(fileAHunk.id);
@@ -1097,7 +1081,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<NavigationHarness />);
+    const view = renderWithApi(<NavigationHarness />);
 
     const copyButton = view.container.querySelector<HTMLButtonElement>(
       'button[aria-label="Copy file contents"]'
@@ -1114,10 +1098,7 @@ describe("ImmersiveReviewView", () => {
     fireEvent.click(nextFileButton!);
     await waitFor(() => expect(view.container.textContent ?? "").toContain("b.ts"));
 
-    resolveRead!({
-      success: true as const,
-      data: { success: true, output: encodeFileReadOutput("file A contents"), exitCode: 0 },
-    });
+    resolveRead!(createTestBashResult({ output: encodeFileReadOutput("file A contents") }));
 
     // The stale completion must not reach the clipboard. The handler continuation
     // (including any would-be clipboard write) is a bounded microtask chain after the
@@ -1134,19 +1115,15 @@ describe("ImmersiveReviewView", () => {
     const hunkV1 = createHunk({ content: "-old line\n+new line" });
 
     // Copy reads carry no awk line budget; overlay full-file reads do.
-    const pendingReads: Array<(value: unknown) => void> = [];
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const { script } = args[0] as { script: string };
-      if (script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+    const pendingReads: Array<(value: TestExecuteBashResult) => void> = [];
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
-      return new Promise((resolve) => {
-        pendingReads.push(resolve as (value: unknown) => void);
+      return new Promise<TestExecuteBashResult>((resolve) => {
+        pendingReads.push(resolve);
       });
-    }) as unknown as MockApiClient["workspace"]["executeBash"];
+    });
 
     function InPlaceEditHarness() {
       const [hunks, setHunks] = useState([hunkV1]);
@@ -1178,7 +1155,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<InPlaceEditHarness />);
+    const view = renderWithApi(<InPlaceEditHarness />);
 
     const copyButton = view.container.querySelector<HTMLButtonElement>(
       'button[aria-label="Copy file contents"]'
@@ -1190,10 +1167,7 @@ describe("ImmersiveReviewView", () => {
     // An edit changes the same file's diff content while the read is pending.
     fireEvent.click(view.getByTestId("edit-file"));
 
-    pendingReads[0]({
-      success: true as const,
-      data: { success: true, output: encodeFileReadOutput("pre-edit contents"), exitCode: 0 },
-    });
+    pendingReads[0](createTestBashResult({ output: encodeFileReadOutput("pre-edit contents") }));
     await act(async () => {
       for (let i = 0; i < 10; i += 1) {
         await Promise.resolve();
@@ -1213,19 +1187,15 @@ describe("ImmersiveReviewView", () => {
     const fileBHunk = createHunk({ id: "hunk-b", filePath: "src/b.ts" });
 
     // Copy reads carry no awk line budget; overlay full-file reads do.
-    const pendingReads: Array<(value: unknown) => void> = [];
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const { script } = args[0] as { script: string };
-      if (script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+    const pendingReads: Array<(value: TestExecuteBashResult) => void> = [];
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
-      return new Promise((resolve) => {
-        pendingReads.push(resolve as (value: unknown) => void);
+      return new Promise<TestExecuteBashResult>((resolve) => {
+        pendingReads.push(resolve);
       });
-    }) as unknown as MockApiClient["workspace"]["executeBash"];
+    });
 
     function NavigationHarness() {
       const [selectedHunkId, setSelectedHunkId] = useState<string | null>(fileAHunk.id);
@@ -1250,7 +1220,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<NavigationHarness />);
+    const view = renderWithApi(<NavigationHarness />);
 
     const clickCopy = () => {
       const button = view.container.querySelector<HTMLButtonElement>(
@@ -1277,10 +1247,7 @@ describe("ImmersiveReviewView", () => {
 
     // The stale read for A resolves after returning to A: it must be discarded even
     // though the active path matches again.
-    pendingReads[0]({
-      success: true as const,
-      data: { success: true, output: encodeFileReadOutput("stale A contents"), exitCode: 0 },
-    });
+    pendingReads[0](createTestBashResult({ output: encodeFileReadOutput("stale A contents") }));
     await act(async () => {
       for (let i = 0; i < 10; i += 1) {
         await Promise.resolve();
@@ -1295,15 +1262,12 @@ describe("ImmersiveReviewView", () => {
 
   test("rejects truncated reads instead of copying a partial file", async () => {
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: {
-          success: true,
+      Promise.resolve(
+        createTestBashResult({
           output: encodeFileReadOutput("partial contents"),
-          exitCode: 0,
           truncated: { reason: "too big", totalLines: 1 },
-        },
-      })
+        })
+      )
     );
 
     const view = renderImmersiveReview();
@@ -1327,14 +1291,10 @@ describe("ImmersiveReviewView", () => {
 
   test("multi-project copies anchor containment to the project symlink", async () => {
     const fullContent = "multi project contents";
-    const copyReadCalls: Array<{ script: string; options?: { cwdMode?: string } }> = [];
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const input = args[0] as { script: string; options?: { cwdMode?: string } };
+    const copyReadCalls: ExecuteBashInput[] = [];
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
       copyReadCalls.push(input);
-      return Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
-      });
+      return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fullContent) }));
     });
 
     const view = renderImmersiveReview({ isMultiProjectWorkspace: true });
@@ -1358,20 +1318,16 @@ describe("ImmersiveReviewView", () => {
   test("serializes same-file copies and ignores key repeat", async () => {
     // Copy reads carry no awk line budget; overlay full-file reads do.
     let executeBashCalls = 0;
-    let resolveRead: ((value: unknown) => void) | undefined;
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const { script } = args[0] as { script: string };
-      if (script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+    let resolveRead: ((value: TestExecuteBashResult) => void) | undefined;
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
       executeBashCalls += 1;
-      return new Promise((resolve) => {
-        resolveRead = resolve as (value: unknown) => void;
+      return new Promise<TestExecuteBashResult>((resolve) => {
+        resolveRead = resolve;
       });
-    }) as unknown as MockApiClient["workspace"]["executeBash"];
+    });
 
     renderImmersiveReview({ isTouchImmersive: false });
 
@@ -1384,10 +1340,7 @@ describe("ImmersiveReviewView", () => {
     fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y" });
     expect(executeBashCalls).toBe(1);
 
-    resolveRead!({
-      success: true as const,
-      data: { success: true, output: encodeFileReadOutput("contents"), exitCode: 0 },
-    });
+    resolveRead!(createTestBashResult({ output: encodeFileReadOutput("contents") }));
     await waitFor(() => expect(clipboardWrites).toHaveLength(1));
 
     // After completion the same file can be copied again.
@@ -1397,27 +1350,20 @@ describe("ImmersiveReviewView", () => {
 
   test("clears prior feedback while a new copy is pending", async () => {
     // Copy reads carry no awk line budget; overlay full-file reads do.
-    let resolveRead: ((value: unknown) => void) | undefined;
+    let resolveRead: ((value: TestExecuteBashResult) => void) | undefined;
     let copyReadCount = 0;
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const { script } = args[0] as { script: string };
-      if (script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
       copyReadCount += 1;
       if (copyReadCount === 1) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: true, output: encodeFileReadOutput("contents"), exitCode: 0 },
-        });
+        return Promise.resolve(createTestBashResult({ output: encodeFileReadOutput("contents") }));
       }
-      return new Promise((resolve) => {
-        resolveRead = resolve as (value: unknown) => void;
+      return new Promise<TestExecuteBashResult>((resolve) => {
+        resolveRead = resolve;
       });
-    }) as unknown as MockApiClient["workspace"]["executeBash"];
+    });
 
     const view = renderImmersiveReview();
 
@@ -1440,18 +1386,11 @@ describe("ImmersiveReviewView", () => {
     // Copy reads carry no awk line budget; overlay full-file reads do. The copy read
     // budget itself is exercised behaviorally in fileRead.test.ts; here the backend
     // returns the deterministic too-large exit it produces for oversized files.
-    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
-      const { script } = args[0] as { script: string };
-      if (script.includes("awk 'NR >")) {
-        return Promise.resolve({
-          success: true as const,
-          data: { success: false, output: "", exitCode: 43 },
-        });
+    mockApi.workspace.executeBash = mock((input: ExecuteBashInput) => {
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve(createTestBashResult({ output: "", exitCode: 43 }));
       }
-      return Promise.resolve({
-        success: true as const,
-        data: { success: false, output: "", exitCode: 42 },
-      });
+      return Promise.resolve(createTestBashResult({ output: "", exitCode: 42 }));
     });
 
     const view = renderImmersiveReview();
@@ -1476,7 +1415,7 @@ describe("ImmersiveReviewView", () => {
 
   test("shows a visible failure when the API is unavailable", async () => {
     // APIContext supplies api: null while connecting/reconnecting/errored.
-    mockApi = null as unknown as MockApiClient;
+    apiUnavailable = true;
 
     const view = renderImmersiveReview();
 
@@ -1501,10 +1440,7 @@ describe("ImmersiveReviewView", () => {
     // Simulates base64 dying after stat emitted the size: the script exits nonzero
     // but leaves parseable output that would decode to empty text.
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: { success: false, output: "19\n", exitCode: 1 },
-      })
+      Promise.resolve(createTestBashResult({ output: "19\n", exitCode: 1 }))
     );
 
     const view = renderImmersiveReview();
@@ -1529,10 +1465,7 @@ describe("ImmersiveReviewView", () => {
     // NUL bytes make processFileContents classify the payload as binary.
     const binaryOutput = `4\n${Buffer.from([0x00, 0x01, 0x02, 0x03]).toString("base64")}`;
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: { success: true, output: binaryOutput, exitCode: 0 },
-      })
+      Promise.resolve(createTestBashResult({ output: binaryOutput }))
     );
 
     const view = renderImmersiveReview();
@@ -1601,10 +1534,7 @@ describe("ImmersiveReviewView", () => {
   test("copies SVG markup as text instead of rejecting it as an image", async () => {
     const svgSource = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>';
     mockApi.workspace.executeBash = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: { success: true, output: encodeFileReadOutput(svgSource), exitCode: 0 },
-      })
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(svgSource) }))
     );
 
     const view = renderImmersiveReview();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { BrowserWindow } from "electron";
 import { writeFile } from "node:fs/promises";
 import { Config } from "../../../src/node/config";
 import {
@@ -156,6 +157,7 @@ async function observePopoutCleanup(context: BrowserContext, page: Page) {
         return socket;
       },
     });
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
     const send = NativeWebSocket.prototype.send;
     NativeWebSocket.prototype.send = function (data) {
       send.call(this, data);
@@ -166,6 +168,7 @@ async function observePopoutCleanup(context: BrowserContext, page: Page) {
         : new Uint8Array(data);
       record({ type: "send", bytes: Array.from(bytes) });
     };
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
     const close = NativeWebSocket.prototype.close;
     NativeWebSocket.prototype.close = function (...args) {
       if (new URL(this.url).pathname.endsWith("/desktop/ws")) record({ type: "disconnect" });
@@ -410,7 +413,7 @@ test.describe("Electron desktop", () => {
     const nextChild = await nextChildReady;
     await expectConnectedViewOnly(nextChild);
     const nativeWindow = await app.browserWindow(nextChild);
-    const forced = await nativeWindow.evaluateHandle((window) => {
+    const forced = await nativeWindow.evaluateHandle((window: BrowserWindow) => {
       const observation = { calls: 0 };
       const destroy = window.destroy.bind(window);
       window.destroy = () => {
@@ -423,7 +426,7 @@ test.describe("Electron desktop", () => {
     await screenshot(nextChild, testInfo, "held-input-before-native-close");
     const nextClosed = nextChild.waitForEvent("close");
     // BrowserWindow.close() follows the titlebar path, not the Bring back protocol.
-    await nativeWindow.evaluate((window) => window.close());
+    await nativeWindow.evaluate((window: BrowserWindow) => window.close());
     await nextClosed;
     await expect
       .poll(async () => (await readEvents()).some((event) => event.type === "window-close"))
@@ -497,7 +500,7 @@ test.describe("Electron desktop", () => {
     const child = await opening;
     await expectConnectedViewOnly(child);
     const nativeChild = await app.browserWindow(child);
-    const forced = await nativeChild.evaluateHandle((window) => {
+    const forced = await nativeChild.evaluateHandle((window: BrowserWindow) => {
       const observation = { calls: 0 };
       const destroy = window.destroy.bind(window);
       window.destroy = () => {
@@ -590,6 +593,7 @@ test.describe("Electron desktop", () => {
     // Lose only the readiness packet; the real child, manager, and VNC transport remain intact.
     await app.context().addInitScript(() => {
       if (!window.location.pathname.endsWith("/desktop.html")) return;
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
       const send = BroadcastChannel.prototype.postMessage;
       BroadcastChannel.prototype.postMessage = function (message: unknown) {
         const target = window as RecoveryProbeWindow;
@@ -624,7 +628,7 @@ test.describe("Electron desktop", () => {
     await screenshot(child, testInfo, "electron-lost-ready-recovered-after-parent-reload");
 
     const nativeChild = await app.browserWindow(child);
-    const forceDestroy = await nativeChild.evaluateHandle((window) => {
+    const forceDestroy = await nativeChild.evaluateHandle((window: BrowserWindow) => {
       const observation = { calls: 0 };
       const destroy = window.destroy.bind(window);
       window.destroy = () => {
@@ -639,6 +643,7 @@ test.describe("Electron desktop", () => {
       (window as RecoveryProbeWindow).__desktopRecoveryProbe = probe;
       const observer = new BroadcastChannel(name);
       observer.onmessage = (event: MessageEvent<HandoffEvent>) => probe.events.push(event.data);
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
       const send = BroadcastChannel.prototype.postMessage;
       BroadcastChannel.prototype.postMessage = function (message: unknown) {
         if (
@@ -658,7 +663,9 @@ test.describe("Electron desktop", () => {
     }, probeChannel);
     await child.evaluate((name) => {
       const observer = new BroadcastChannel(name);
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
       const send = WebSocket.prototype.send;
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
       const close = WebSocket.prototype.close;
       WebSocket.prototype.send = function (data) {
         send.call(this, data);
@@ -909,7 +916,9 @@ browserTest.describe("browser desktop", () => {
         const events = (window.opener as Window & { __desktopHandoffEvents?: HandoffEvent[] })
           .__desktopHandoffEvents;
         if (!events) throw new Error("Missing opener handoff recorder");
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
         const originalSend = WebSocket.prototype.send;
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- saved prototype method is re-invoked on the original receiver via call/apply
         const originalClose = WebSocket.prototype.close;
         WebSocket.prototype.send = function (data) {
           originalSend.call(this, data);

@@ -4,11 +4,12 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { createContext, type ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as RealExperimentsModule from "@/browser/hooks/useExperiments";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -66,11 +67,14 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
     listeners: new Set<(event: MemoryChangeEvent) => void>(),
   };
 
-  const api = {
+  const api: TestApiOverrides<APIClient> = {
     memory: {
-      list: (_input: { workspaceId: string }, _opts?: { signal?: AbortSignal }) =>
+      list: (_input: { workspaceId?: string | null }, _opts?: { signal?: AbortSignal }) =>
         Promise.resolve({ success: true as const, data: { files: state.files } }),
-      read: (input: { workspaceId: string; path: string }, _opts?: { signal?: AbortSignal }) => {
+      read: (
+        input: { workspaceId?: string | null; path: string },
+        _opts?: { signal?: AbortSignal }
+      ) => {
         const entry = state.contents.get(input.path);
         return Promise.resolve(
           entry
@@ -79,7 +83,7 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
         );
       },
       save: (input: {
-        workspaceId: string;
+        workspaceId?: string | null;
         path: string;
         content: string;
         expectedSha256: string | null;
@@ -105,30 +109,33 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
           data: { sha256: `sha-${input.content}` },
         });
       },
-      delete: (input: { workspaceId: string; path: string }) => {
+      delete: (input: { workspaceId?: string | null; path: string }) => {
         state.deleteCalls.push(input.path);
         state.files = state.files.filter((file) => file.path !== input.path);
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      setPinned: (input: { workspaceId: string; path: string; pinned: boolean }) => {
+      setPinned: (input: { workspaceId?: string | null; path: string; pinned: boolean }) => {
         state.pinCalls.push({ path: input.path, pinned: input.pinned });
         state.files = state.files.map((file) =>
           file.path === input.path ? { ...file, pinned: input.pinned } : file
         );
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      consolidationStatus: (_input: { workspaceId: string }, _opts?: { signal?: AbortSignal }) => {
+      consolidationStatus: (
+        _input: { workspaceId?: string | null },
+        _opts?: { signal?: AbortSignal }
+      ) => {
         if (state.consolidationStatusFailuresRemaining > 0) {
           state.consolidationStatusFailuresRemaining -= 1;
           return Promise.reject(new Error("status unavailable"));
         }
         return Promise.resolve({ success: true as const, data: state.consolidationStatus });
       },
-      consolidate: (_input: { workspaceId: string }) => {
+      consolidate: (_input: { workspaceId?: string | null }) => {
         state.consolidateCalls += 1;
         return Promise.resolve({ success: true as const, data: state.consolidateRecord });
       },
-      onChange: (_input: { workspaceId: string }, opts?: { signal?: AbortSignal }) => {
+      onChange: (_input: { workspaceId?: string | null }, opts?: { signal?: AbortSignal }) => {
         async function* iterate(): AsyncGenerator<MemoryChangeEvent> {
           const queue: MemoryChangeEvent[] = [];
           let resolveNext: ((event: MemoryChangeEvent) => void) | null = null;
@@ -178,21 +185,9 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
 let fake: ReturnType<typeof createFakeMemoryApi> | null = null;
 
 restoreModulesAfterSuite([
-  ["@/browser/contexts/API", { ...RealAPIModule }],
   ["@/browser/hooks/useExperiments", { ...RealExperimentsModule }],
   ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
 ]);
-
-void mock.module("@/browser/contexts/API", () => ({
-  APIContext: createContext(null),
-  useAPI: () => ({
-    api: fake?.api ?? null,
-    status: fake ? "connected" : "error",
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
   useExperimentValue: (experimentId: string) =>
@@ -216,6 +211,19 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
 }));
 
 import { MemoryTab } from "./MemoryTab";
+
+// Inject the fake client through the real provider: a module mock of contexts/API is
+// process-wide and leaks this partial client into later-evaluated suites.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (!fake) {
+    throw new Error("Test bug: assign `fake` before rendering MemoryTab");
+  }
+  return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
+}
+
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 function fileInfo(overrides: Partial<MemoryFileInfo> = {}): MemoryFileInfo {
   return {
@@ -248,7 +256,7 @@ describe("MemoryTab", () => {
       fileInfo({ path: "/memories/global/prefs.md", scope: "global", description: "likes tea" }),
       fileInfo({ path: "/memories/project/conventions.md", scope: "project" }),
     ]);
-    const { getByText, findByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { getByText, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     await findByText("prefs.md");
     expect(getByText("Global")).toBeTruthy();
@@ -259,13 +267,13 @@ describe("MemoryTab", () => {
 
   test("shows an empty state when there are no memory files", async () => {
     fake = createFakeMemoryApi([]);
-    const { findByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
     await findByText(/No memory files/);
   });
 
   test("manual consolidation does not invent project coverage when status is unavailable", async () => {
     fake = createFakeMemoryApi([], { consolidationStatusFailuresRemaining: 20 });
-    const { findByRole, findByText, getByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByRole, findByText, getByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     await findByText(/No memory files/);
     expect(getByText(/^Project:/).textContent).not.toContain("manual");
@@ -293,7 +301,7 @@ describe("MemoryTab", () => {
         projectAvailable: true,
       },
     });
-    const { findByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     const workspaceLine = await findByText(/^Workspace: .*manual/);
     const statusBlock = workspaceLine.parentElement;
@@ -325,7 +333,7 @@ describe("MemoryTab", () => {
         projectAvailable: true,
       },
     });
-    const { findByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     const workspaceLine = await findByText(/^Workspace: .*manual/);
     const statusBlock = workspaceLine.parentElement;
@@ -355,7 +363,7 @@ describe("MemoryTab", () => {
         },
       },
     });
-    const { findByRole } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     expect((await findByRole("alert")).textContent).toContain(
       "Harvest error: harvest provider failed"
@@ -371,7 +379,7 @@ describe("MemoryTab", () => {
       }),
       fileInfo({ path: "/memories/global/cold.md" }),
     ]);
-    const { findByText, queryAllByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, queryAllByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     await findByText("hot.md");
     await findByText(/Used 3×/);
@@ -381,7 +389,7 @@ describe("MemoryTab", () => {
 
   test("pin toggle calls setPinned with the opposite state", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md", pinned: false })]);
-    const { findByLabelText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     fireEvent.click(await findByLabelText("Pin prefs.md"));
     await waitFor(() => {
@@ -394,7 +402,7 @@ describe("MemoryTab", () => {
   test("opens a file, edits it, and saves with the loaded sha", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     fireEvent.click(await findByText("prefs.md"));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
@@ -417,7 +425,7 @@ describe("MemoryTab", () => {
   test("shows a conflict banner when a save is rejected and reloads on request", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     fireEvent.click(await findByText("prefs.md"));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
@@ -437,7 +445,9 @@ describe("MemoryTab", () => {
 
   test("deletes a file from the list after confirming the modal", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
-    const { findByLabelText, findByText, findByRole } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByLabelText, findByText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
 
     fireEvent.click(await findByLabelText("Delete prefs.md"));
     // The row action only opens the confirmation modal; nothing is deleted yet.
@@ -452,7 +462,7 @@ describe("MemoryTab", () => {
 
   test("cancelling the delete confirmation keeps the file", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
-    const { findByLabelText, findByText, findByRole, queryByRole } = render(
+    const { findByLabelText, findByText, findByRole, queryByRole } = renderWithApi(
       <MemoryTab workspaceId="ws-1" />
     );
 
@@ -468,7 +478,7 @@ describe("MemoryTab", () => {
 
   test("scope sections collapse and expand from their headers", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
-    const { findByText, findByRole, queryByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByRole, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
     await findByText("prefs.md");
 
     const header = await findByRole("button", { name: /global/i });
@@ -487,7 +497,7 @@ describe("MemoryTab", () => {
       fileInfo({ path: "/memories/global/topic/notes.md", scope: "global" }),
       fileInfo({ path: "/memories/global/root.md", scope: "global" }),
     ]);
-    const { findByText, getByText, getByRole, getByLabelText, queryByText } = render(
+    const { findByText, getByText, getByRole, getByLabelText, queryByText } = renderWithApi(
       <MemoryTab workspaceId="ws-1" />
     );
 
@@ -507,7 +517,7 @@ describe("MemoryTab", () => {
 
   test("collapsing a directory hides its files and nested directories", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/a/b/c.md", scope: "global" })]);
-    const { findByText, getByText, queryByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, getByText, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     // Multi-level nesting: a → b → c.md, expanded by default.
     await findByText("c.md");
@@ -526,7 +536,7 @@ describe("MemoryTab", () => {
       fileInfo({ path: "/memories/global/a/x.md", scope: "global" }),
       fileInfo({ path: "/memories/global/a/b/y.md", scope: "global" }),
     ]);
-    const { findByText, getByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, getByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     await findByText("x.md");
     expect(getByText("a").closest("button")!.textContent).toContain("(2)");
@@ -540,7 +550,7 @@ describe("MemoryTab", () => {
       fileInfo({ path: "/memories/global/alpha.md", scope: "global" }),
       fileInfo({ path: "/memories/global/acme/other.md", scope: "global" }),
     ]);
-    const { findByText, getByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, getByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     await findByText("alpha.md");
     const expectBefore = (first: HTMLElement, second: HTMLElement) => {
@@ -554,7 +564,7 @@ describe("MemoryTab", () => {
   test("marks files edited by the agent with a badge until opened", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, queryByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
     await findByText("prefs.md");
     expect(queryByText("agent edited")).toBeNull();
 
@@ -576,7 +586,7 @@ describe("MemoryTab", () => {
 
   test("user-actor change events do not produce the agent badge", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
-    const { findByText, queryByText } = render(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
     await findByText("prefs.md");
 
     fake.emitChange({

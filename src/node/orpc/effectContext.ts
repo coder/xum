@@ -15,25 +15,9 @@
  * - Transitional handlers: `context.memoryMetaService.effects.…` (same
  *   instances, no Effect context required).
  *
- * Tags live in `src/node/services/di/tags.ts`; this module re-exports the ones
- * oRPC handlers use.
+ * Tags live in `src/node/services/di/tags.ts`; handlers import them from there.
  */
-import { Context } from "effect";
-import type { MemoryMetaService } from "@/node/services/memoryMeta";
-import { MemoryMeta, type AppTags } from "@/node/services/di/tags";
-
-export { MemoryMeta };
+import type { AppTags } from "@/node/services/di/tags";
 
 /** Union of all services available to Effect-native oRPC handlers. */
 export type OrpcEffectServices = AppTags;
-
-/**
- * Test helper: build a context holding only the memory metadata service, for
- * handler tests that construct a partial `ORPCContext` by hand
- * (`effectBridge.test.ts`). Production contexts come from the app runtime.
- */
-export function buildOrpcEffectContext(services: {
-  memoryMetaService: MemoryMetaService;
-}): Context.Context<MemoryMeta> {
-  return Context.make(MemoryMeta, services.memoryMetaService);
-}

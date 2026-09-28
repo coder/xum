@@ -2,6 +2,9 @@
  * UI-related constants shared across components
  */
 
+// Bound model menus for large gateway catalogs; filter before applying the cap.
+export const MAX_RENDERED_MODELS = 200;
+
 /**
  * Auto-compaction threshold bounds (percentage)
  * MIN: Allow any value - user can choose aggressive compaction if desired
@@ -14,6 +17,13 @@ export const AUTO_COMPACTION_THRESHOLD_MAX = 90;
  * Stored threshold upper bound. A value of 100 disables auto-compaction.
  */
 export const AUTO_COMPACTION_THRESHOLD_STORAGE_MAX = 100;
+
+/**
+ * Lowest threshold the backend evaluates. Callers clamp the stored slider value to this
+ * floor before syncing it, so token-budget displays (label, marker, chat-input bar) must
+ * use the same effective value or they would advertise a target the backend never uses.
+ */
+export const AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT = 10;
 
 /**
  * Default auto-compaction threshold percentage (50-90 range)
@@ -152,3 +162,29 @@ export function resolveSectionColor(color: string | null | undefined): string {
 
   return DEFAULT_SECTION_COLOR;
 }
+
+/**
+ * Bundle-granular tail-first transcript reveal (ChatPane): the newest rows mount first, the
+ * rest in frame-yielded chunks. A step stops at whichever ceiling it reaches first: the row
+ * count, or the summed row weight (text characters, a proxy for render + layout cost — rows
+ * are wildly heterogeneous: a 50-char prompt versus a 33 KB code block). Every step still
+ * mounts at least one row, and a bundle larger than a step mounts whole (the reveal never
+ * cuts inside one). Measured against the 1000-row fixture (D6): per-step fixed cost is
+ * ~150 ms (React reconciliation of all mounted rows + paint-tree update of the scroller), so
+ * small row ceilings crawl on prompt-heavy histories, while unbounded weight makes a step of
+ * 20 code-block rows a ~900 ms task.
+ */
+export const TRANSCRIPT_REVEAL_TAIL_ROWS = 40;
+export const TRANSCRIPT_REVEAL_CHUNK_ROWS = 60;
+/** Weight ceiling shared by the tail and every chunk (about three 33 KB code-block rows). */
+export const TRANSCRIPT_REVEAL_STEP_CHARS = 128_000;
+/** Weight assumed for rows without a text body (tool cards render collapsed by default). */
+export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
+/**
+ * The automatic reveal pauses once this many rows are mounted; older rows mount on request
+ * (Load older, or a navigation to a row above the boundary). #4869: every step costs O(mounted
+ * rows) and each mounted row holds ~130 KB of heap, so revealing every row of a huge chat kept
+ * the renderer busy for minutes. A rows budget, not a steps budget: the largest perf fixture
+ * (~340 rows of heavy replies, many short steps) must still reveal fully.
+ */
+export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;

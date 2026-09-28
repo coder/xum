@@ -1,22 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>]"
+
+# Exit codes: 0 no unresolved Codex comments; 1 unresolved comments or threads;
+# 10 Codex is still reviewing and nothing else blocks (wait_pr_codex.sh keeps
+# polling on 10 instead of reporting a failure).
+
 if [ $# -eq 0 ]; then
-  echo "Usage: $0 <pr_number>"
+  echo "$USAGE"
   exit 1
 fi
 
 PR_NUMBER=$1
+shift
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "❌ PR number must be numeric. Got: '$PR_NUMBER'" >&2
+  exit 1
+fi
+
+# CI runs this gate on every push, at the same moment Codex starts reviewing that
+# push. Without a wait budget the gate fails on the in-progress summary and nobody
+# re-runs it. The budget only delays the verdict; an unfinished review still fails.
+WAIT_FOR_REVIEW_SECS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wait-for-review)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        echo "❌ --wait-for-review requires a non-negative integer number of seconds" >&2
+        echo "$USAGE" >&2
+        exit 1
+      fi
+      WAIT_FOR_REVIEW_SECS=$2
+      shift 2
+      ;;
+    *)
+      echo "❌ Unknown argument: '$1'" >&2
+      echo "$USAGE" >&2
+      exit 1
+      ;;
+  esac
+done
+
+WAIT_POLL_SECS="${MUX_CODEX_WAIT_POLL_SECS:-30}"
+if ! [[ "$WAIT_POLL_SECS" =~ ^[0-9]+$ ]]; then
+  echo "❌ assertion failed: MUX_CODEX_WAIT_POLL_SECS must be a non-negative integer (got '$WAIT_POLL_SECS')" >&2
   exit 1
 fi
 
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
+PR_HEAD_OID=""
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
+REGULAR_COUNT=0
+UNRESOLVED_COUNT=0
+IN_PROGRESS_COUNT=0
 
 resolve_repo_context() {
   if [[ -n "${MUX_GH_OWNER:-}" || -n "${MUX_GH_REPO:-}" ]]; then
@@ -84,15 +124,43 @@ compute_codex_sets_from_arrays() {
   # JSON goes through stdin, never argv: a long review history exceeds Linux's
   # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
-  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; [
+  local resolved_ids
+  resolved_ids=$(printf '%s' "$threads_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; codex_resolved_discussions($bot)')
+
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" 'include "codex_comments"; [
     .[]
-    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot) | not))
+    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot; $head; $resolved) | not))
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
     .[]
     | select(.isResolved == false and .comments.nodes[0].author.login == $bot)
   ]')
+
+  REGULAR_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq 'length')
+  UNRESOLVED_COUNT=$(printf '%s' "$UNRESOLVED_THREADS" | jq 'length')
+
+  # In-progress summaries are a subset of REGULAR_COMMENTS: they block, but the
+  # wait loop below may give Codex time to finish before the verdict.
+  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" 'include "codex_comments";
+    [.[] | select(codex_review_in_progress($bot; $head; $resolved))] | length')
+}
+
+# The classifier compares Codex's recorded head with the PR head, so a payload
+# without a usable head cannot produce a verdict. Fail closed rather than guess.
+set_pr_head_oid() {
+  PR_HEAD_OID="$1"
+  if ! [[ "$PR_HEAD_OID" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$PR_HEAD_OID'" >&2
+    exit 1
+  fi
+}
+
+# True while the in-progress summary is the sole blocker. Waiting only helps in
+# that state: a review thread or any other Codex comment already fixes the verdict
+# at "unresolved", so waiting for the review to finish would only hold the runner.
+codex_only_in_progress_blocks() {
+  [ "$IN_PROGRESS_COUNT" -gt 0 ] && [ "$((REGULAR_COUNT - IN_PROGRESS_COUNT + UNRESOLVED_COUNT))" -eq 0 ]
 }
 
 load_result_from_cache() {
@@ -149,6 +217,7 @@ load_result_from_cache() {
   local cached_threads
   cached_comments=$(jq -c '.data.repository.pullRequest.comments.nodes // []' "$PR_DATA_FILE")
   cached_threads=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' "$PR_DATA_FILE")
+  set_pr_head_oid "$(jq -r '.data.repository.pullRequest.headRefOid // empty' "$PR_DATA_FILE")"
   compute_codex_sets_from_arrays "$cached_comments" "$cached_threads"
   return 0
 }
@@ -158,6 +227,7 @@ fetch_all_comments_via_api() {
   local graphql_query='query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
+        headRefOid
         comments(first: 100, after: $cursor) {
           pageInfo {
             hasNextPage
@@ -190,6 +260,10 @@ fetch_all_comments_via_api() {
     if [ "$(echo "$page_data" | jq -r '.data.repository.pullRequest == null')" = "true" ]; then
       echo "❌ PR #$PR_NUMBER does not exist in ${OWNER}/${REPO}." >&2
       return 1
+    fi
+
+    if [ "$cursor" = "null" ]; then
+      set_pr_head_oid "$(echo "$page_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')"
     fi
 
     page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
@@ -236,6 +310,7 @@ fetch_all_threads_via_api() {
             comments(first: 1) {
               nodes {
                 id
+                fullDatabaseId
                 author { login }
                 body
                 createdAt
@@ -317,8 +392,20 @@ if [ "$loaded_from_cache" -eq 1 ]; then
   fetch_result_via_api
 fi
 
-REGULAR_COUNT=$(echo "$REGULAR_COMMENTS" | jq 'length')
-UNRESOLVED_COUNT=$(echo "$UNRESOLVED_THREADS" | jq 'length')
+if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && codex_only_in_progress_blocks; then
+  wait_deadline=$(($(date +%s) + WAIT_FOR_REVIEW_SECS))
+  while codex_only_in_progress_blocks; do
+    now=$(date +%s)
+    if [ "$now" -ge "$wait_deadline" ]; then
+      echo "⚠️ Codex review is still running after ${WAIT_FOR_REVIEW_SECS}s; reporting it as unresolved."
+      break
+    fi
+    echo "⏳ Codex review is still running; re-checking in ${WAIT_POLL_SECS}s (gives up in $((wait_deadline - now))s)..."
+    sleep "$WAIT_POLL_SECS"
+    fetch_result_via_api
+  done
+fi
+
 TOTAL_UNRESOLVED=$((REGULAR_COUNT + UNRESOLVED_COUNT))
 
 echo "Found ${REGULAR_COUNT} unminimized regular comment(s) from bot"
@@ -341,6 +428,12 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   fi
 
   echo ""
+  if [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
+    echo "⏳ Codex has not finished reviewing this PR. Re-run this check after the review completes."
+  fi
+  if codex_only_in_progress_blocks; then
+    exit 10
+  fi
   echo "Please address or resolve all Codex comments before merging."
   exit 1
 fi

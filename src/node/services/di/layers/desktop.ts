@@ -47,6 +47,7 @@ import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import { DevToolsService } from "@/node/services/devToolsService";
+import { ReviewStateService } from "@/node/services/reviewStateService";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AgentBrowserSessionDiscovery,
@@ -70,6 +71,7 @@ import {
   DesktopInputCoordinatorTag,
   DesktopTokenManagerTag,
   DevTools,
+  ReviewState,
   Editor,
   Experiments,
   ExtensionMetadata,
@@ -194,6 +196,7 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
       const sessionTimingService = new SessionTimingService(config, telemetryService);
       const analyticsService = new AnalyticsService(config);
       const devToolsService = new DevToolsService(config);
+      const reviewStateService = new ReviewStateService(config);
       // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
       // the persistent config rather than creating a default with an ephemeral one.
       const workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
@@ -204,6 +207,7 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
         Context.add(SessionTiming, sessionTimingService),
         Context.add(Analytics, analyticsService),
         Context.add(DevTools, devToolsService),
+        Context.add(ReviewState, reviewStateService),
         Context.add(WorkspaceMcpOverrides, workspaceMcpOverridesService)
       );
     })

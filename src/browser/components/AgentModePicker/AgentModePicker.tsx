@@ -36,6 +36,9 @@ interface AgentModePickerProps {
 
   /** Called when the picker closes (best-effort). Useful for restoring focus. */
   onComplete?: () => void;
+
+  /** Disables the picker like an agent lock, e.g. while the host has no agent scope. */
+  disabled?: boolean;
 }
 
 interface AgentOption {
@@ -118,11 +121,18 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     currentAgent?.id === normalizedAgentId
       ? currentAgent
       : agents.find((entry) => entry.id === normalizedAgentId);
-  const isAgentLocked = isAgentSelectionLocked;
+  const isAgentLocked = isAgentSelectionLocked || props.disabled === true;
 
   // Derived "effectively open" — hides picker immediately when lock activates,
   // preventing stale event handlers from a hidden-but-open picker.
   const isPickerVisible = isPickerOpen && !isAgentLocked;
+
+  // A lock (or `disabled`, e.g. the VS Code host losing its agent scope) that lands while the
+  // picker is open also closes it, so lifting it later does not pop a stale menu back up.
+  if (isAgentLocked && isPickerOpen) {
+    setIsPickerOpen(false);
+    setHighlightedIndex(-1);
+  }
 
   const activeOption = !normalizedAgentId
     ? null

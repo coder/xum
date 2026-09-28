@@ -41,6 +41,13 @@ interface MessageRendererProps {
   taskReportLinking?: TaskReportLinking;
   /** Navigation info for user messages (backward/forward between user messages) */
   userMessageNavigation?: UserMessageNavigation;
+  /**
+   * Closes an ephemeral row (plan-display). Hosts that keep their own aggregator (the VS Code
+   * webview) pass it because the default path acts on WorkspaceStore's aggregator.
+   */
+  onCloseEphemeral?: (historyId: string) => void;
+  /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
+  onShowAllHistory?: () => void;
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -79,7 +86,7 @@ function getTranscriptQuoteText(message: DisplayedMessage): string | null {
 // Memoized to prevent unnecessary re-renders when parent (AIView) updates
 export const MessageRenderer = React.memo<MessageRendererProps>(
   ({
-    message,
+    message: messageProp,
     className,
     onEditUserMessage,
     workspaceId,
@@ -89,8 +96,10 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     bashOutputGroup,
     taskReportLinking,
     userMessageNavigation,
+    onCloseEphemeral,
+    onShowAllHistory,
   }) => {
-    message = useStreamingMessageDelta(workspaceId, message);
+    const message = useStreamingMessageDelta(workspaceId, messageProp);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type
@@ -105,7 +114,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               summary={
                 message.contextBudgetWarning.final
                   ? "Context window ending: notes flush"
-                  : "Context budget warning"
+                  : message.contextBudgetWarning.handoff
+                    ? "Context handoff requested"
+                    : "Context budget warning"
               }
               icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="context-budget-warning"
@@ -182,7 +193,12 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "history-hidden":
         renderedMessage = (
-          <HistoryHiddenMessage message={message} className={className} workspaceId={workspaceId} />
+          <HistoryHiddenMessage
+            message={message}
+            className={className}
+            workspaceId={workspaceId}
+            onShowAll={onShowAllHistory}
+          />
         );
         break;
       case "workspace-init":
@@ -197,7 +213,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
             path={message.path}
             workspaceId={workspaceId}
             onClose={() => {
-              if (workspaceId) {
+              if (onCloseEphemeral) {
+                onCloseEphemeral(message.historyId);
+              } else if (workspaceId) {
                 removeEphemeralMessage(workspaceId, message.historyId);
               }
             }}

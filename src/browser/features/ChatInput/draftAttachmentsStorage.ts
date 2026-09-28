@@ -1,8 +1,16 @@
 import type { ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 
-/** Attachment drafts above this JSON size stay memory-only (localStorage quota). */
-export const MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS = 4_000_000;
+/**
+ * Attachment drafts above this JSON size stay memory-only (localStorage quota).
+ *
+ * Provider attachments persist as base64 data URLs. The smallest known origin quota is about
+ * 5 MB (Safari), so a single 4M-char draft could nearly fill it and make every later write fail,
+ * including the draft text itself. 1M chars leaves headroom for other drafts, text and UI keys.
+ * Pasted screenshots are already shrunk by resizeImageIfNeeded. Moving drafts to a backend store
+ * removes this cap.
+ */
+export const MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS = 1_000_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

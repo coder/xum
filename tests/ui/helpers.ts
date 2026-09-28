@@ -11,6 +11,16 @@ import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
 
+/**
+ * Open Settings from the titlebar button and scope queries to the Settings dialog. The page
+ * behind the modal stays mounted, so broader queries can match background content too.
+ */
+export async function openSettingsDialog(container: HTMLElement) {
+  fireEvent.click(await within(container).findByTestId("settings-button"));
+  const body = container.ownerDocument.body;
+  return within(await within(body).findByRole("dialog", { name: "Settings" }, { timeout: 10000 }));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // REFRESH BUTTON HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -27,7 +37,7 @@ export function getRefreshIconClass(refreshButton: HTMLElement): string {
  */
 export async function waitForRefreshButtonIdle(
   refreshButton: HTMLElement,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -47,7 +57,7 @@ export async function waitForRefreshButtonIdle(
 export async function assertRefreshButtonHasLastRefreshInfo(
   refreshButton: HTMLElement,
   expectedTrigger: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -142,7 +152,7 @@ export async function openProjectCreationView(
     () => {
       const el = view.container.querySelector(
         `[data-project-path="${projectPath}"][aria-controls]`
-      ) as HTMLElement | null;
+      );
       if (!el) throw new Error("Project not found in sidebar");
       return el;
     },
@@ -255,7 +265,7 @@ export function getWorkspaceDraftIds(projectPath: string): string[] {
 
 export async function waitForLatestDraftId(
   projectPath: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<string> {
   return waitFor(
     () => {
@@ -299,7 +309,7 @@ export function disableTutorial(): void {
 export function setupTestDom(options?: { enableTutorial?: boolean }): () => void {
   // Import here to avoid circular dependency issues
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { installDom } = require("./dom");
+  const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
   if (!options?.enableTutorial) {
@@ -342,7 +352,7 @@ export function getGitStatusFromElement(element: HTMLElement): Partial<GitStatus
 export async function waitForGitStatusElement(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 30_000
+  timeoutMs = 30_000
 ): Promise<HTMLElement> {
   const store = useGitStatusStoreRaw();
 
@@ -391,7 +401,7 @@ async function waitForGitStatus(
 export function waitForDirtyStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !!s.dirty, "dirty status", timeoutMs);
 }
@@ -402,7 +412,7 @@ export function waitForDirtyStatus(
 export function waitForCleanStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !s.dirty, "clean status", timeoutMs);
 }
@@ -414,7 +424,7 @@ export function waitForAheadStatus(
   container: HTMLElement,
   workspaceId: string,
   minAhead: number,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -432,7 +442,7 @@ export function waitForBranchStatus(
   container: HTMLElement,
   workspaceId: string,
   expectedBranch: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -451,7 +461,7 @@ export function waitForIdleGitStatus(
   workspaceId: string,
   predicate: (status: GitStatus) => boolean,
   description: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   const store = useGitStatusStoreRaw();
 

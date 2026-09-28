@@ -4,26 +4,28 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import { createTestHistoryService } from "./testHistoryService";
+import { waitForCondition } from "./testDispatchHelpers";
 
-async function waitForCondition(
-  condition: () => boolean,
-  options?: { timeoutMs?: number; intervalMs?: number }
-): Promise<void> {
-  const timeoutMs = options?.timeoutMs ?? 1_000;
-  const intervalMs = options?.intervalMs ?? 10;
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (condition()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
+/** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
+function planReviewRecordRow(id: string, timestamp: number) {
+  const record = {
+    v: 1 as const,
+    kind: "resolve" as const,
+    recordId: `rec_${id}`,
+    threadId: "thr_1",
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+    timestamp,
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(record),
+  });
 }
 
 describe("IdleCompactionService", () => {
@@ -223,6 +225,63 @@ describe("IdleCompactionService", () => {
       expect(result.reason).toBe("awaiting_response");
     });
 
+    /** Persist rows on top of the answered turn the suite seeds in beforeEach. */
+    async function appendRows(rows: MuxMessage[]): Promise<void> {
+      for (const row of rows) {
+        const result = await historyService.appendToHistory(testWorkspaceId, row);
+        expect(result.success).toBe(true);
+      }
+    }
+
+    test("ignores hidden plan-review record rows when judging an unanswered tail", async () => {
+      // A resolve/reopen appended while idle sits after the assistant's answer; it is not a
+      // prompt awaiting a response, so background compaction must stay eligible.
+      const idleTimestamp = now - 25 * oneHourMs;
+      await appendRows([
+        planReviewRecordRow("3", idleTimestamp),
+        planReviewRecordRow("4", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+
+      // A real unanswered prompt followed by hidden rows keeps its protection.
+      await appendRows([
+        createMuxMessage("5", "user", "Another question?", { timestamp: idleTimestamp }),
+        planReviewRecordRow("6", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+    });
+
+    test("looks past a tail window made only of hidden record rows", async () => {
+      // More hidden rows than the bounded tail read: the window alone cannot tell whether the
+      // last real row is an answered turn or a pending prompt, so the check must consult the
+      // history since the latest boundary rather than guess either way.
+      const idleTimestamp = now - 25 * oneHourMs;
+      const fullSpy = spyOn(historyService, "getHistoryFromLatestBoundary");
+      const hiddenWindow = (prefix: string) =>
+        Array.from({ length: 50 }, (_, i) => planReviewRecordRow(`${prefix}${i}`, idleTimestamp));
+
+      await appendRows(hiddenWindow("h"));
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(1);
+
+      await appendRows([
+        createMuxMessage("pending", "user", "Pending", { timestamp: idleTimestamp }),
+        ...hiddenWindow("p"),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(2);
+    });
+
     test("returns ineligible when messages have no timestamps", async () => {
       // Messages without timestamps - can't determine recency
       spyOn(historyService, "getLastMessages").mockResolvedValueOnce(
@@ -381,23 +440,57 @@ describe("IdleCompactionService", () => {
     });
 
     test("deduplicates queued idle compaction for same workspace", async () => {
+      const sentinelWorkspaceId = "sentinel-workspace";
+      const idleTimestamp = now - 25 * oneHourMs;
+      loadConfigMock.mockImplementation(() => ({
+        projects: new Map([
+          [
+            testProjectPath,
+            {
+              workspaces: [
+                { id: testWorkspaceId, path: "/test/path", name: "test" },
+                { id: sentinelWorkspaceId, path: "/sentinel/path", name: "sentinel" },
+              ],
+              idleCompactionHours: 24,
+            },
+          ],
+        ]),
+      }));
+
       let releaseCompaction: (() => void) | undefined;
       const gate = new Promise<void>((resolve) => {
         releaseCompaction = resolve;
       });
-
-      executeIdleCompactionMock.mockImplementation(async () => {
-        await gate;
+      const executed: string[] = [];
+      executeIdleCompactionMock.mockImplementation(async (workspaceId: string) => {
+        executed.push(workspaceId);
+        if (workspaceId === testWorkspaceId) {
+          await gate;
+        }
       });
 
+      // The sentinel has no history yet, so only the first workspace is eligible.
       await service.checkAllWorkspaces();
+      await waitForCondition(() => executed.length === 1);
+      // Duplicate sweep while the first compaction is still running.
       await service.checkAllWorkspaces();
 
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      // Queue the sentinel behind any duplicate. The queue is FIFO, so once the
+      // sentinel has run, a duplicate entry would already have executed.
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s1", "user", "Hello", { timestamp: idleTimestamp })
+      );
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s2", "assistant", "Hi!", { timestamp: idleTimestamp })
+      );
+      await service.checkAllWorkspaces();
+
       releaseCompaction?.();
+      await waitForCondition(() => executed.includes(sentinelWorkspaceId));
 
-      // Ensure the queue drains without running a duplicate.
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      expect(executed).toEqual([testWorkspaceId, sentinelWorkspaceId]);
     });
   });
 

@@ -198,7 +198,7 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, spoofed)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(spoofed)).toBe(false);
 
-    // A trusted source must fail loudly when Config swallows the target write error.
+    // A trusted source must fail loudly when the target write fails.
     const unwritableRoot = path.join(base, "unwritable-root");
     await fs.writeFile(unwritableRoot, "not a directory\n", "utf-8");
     const unwritableConfig = new Config(unwritableRoot);
@@ -215,9 +215,9 @@ describe("xum trust CLI", () => {
     using tmp = new DisposableTempDir("trust-cli-unwritable");
     const repo = path.join(tmp.path, "repo");
     await fs.mkdir(repo, { recursive: true });
-    // MUX_ROOT pointing at a regular file makes config.json unwritable;
-    // Config.saveConfig swallows the write error, so only the post-write
-    // verification can surface the failure.
+    // MUX_ROOT pointing at a regular file makes config.json unwritable; the
+    // write gate, a rejected save (#4444), or the post-write verification must
+    // surface the failure.
     const muxRootFile = path.join(tmp.path, "mux-root-file");
     await fs.writeFile(muxRootFile, "not a directory\n", "utf-8");
 

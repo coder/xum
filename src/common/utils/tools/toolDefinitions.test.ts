@@ -1,8 +1,7 @@
 import { z } from "zod";
-import { RUNTIME_MODE } from "@/common/types/runtime";
+import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
   buildTaskToolAgentArgsSchema,
-  buildTaskToolDescription,
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
@@ -219,7 +218,6 @@ describe("TOOL_DEFINITIONS", () => {
         action: "archive",
         targets: [{ taskId: "wst_child" }],
         interrupt_active: null,
-        acknowledged_untracked_paths: null,
       }).success
     ).toBe(true);
 
@@ -552,15 +550,6 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
-  it("dispatches task tool description on runtime mode", () => {
-    // Different runtimes give the agent different visibility guidance for whether
-    // sub-agents see uncommitted parent changes, so the function must actually
-    // branch on runtimeMode rather than collapse to a single string.
-    expect(buildTaskToolDescription(RUNTIME_MODE.LOCAL)).not.toBe(
-      buildTaskToolDescription(RUNTIME_MODE.WORKTREE)
-    );
-  });
-
   it("accepts workspace turn queue dispatch mode", () => {
     const parsed = TOOL_DEFINITIONS.task.schema.safeParse({
       kind: "workspace",
@@ -612,31 +601,10 @@ describe("TOOL_DEFINITIONS", () => {
   describe("task tool isolation parameter", () => {
     const validArgs = { agentId: "explore", prompt: "investigate", title: "Investigate" };
 
-    it("only advertises isolation on runtimes that can share the parent checkout", () => {
-      // Worktree/SSH expose `isolation`; the (local) variant strips it so it never reaches the model.
-      const withIsolation = buildTaskToolAgentArgsSchema({ includeIsolation: true });
-      const withoutIsolation = buildTaskToolAgentArgsSchema({ includeIsolation: false });
-
-      expect(withIsolation.safeParse({ ...validArgs, isolation: "none" }).success).toBe(true);
-      // .strict() rejects the unknown key outright on the local variant.
-      expect(withoutIsolation.safeParse({ ...validArgs, isolation: "none" }).success).toBe(false);
-      // Both variants still accept args that omit isolation entirely.
-      expect(withoutIsolation.safeParse(validArgs).success).toBe(true);
-    });
-
     it("rejects unknown isolation modes", () => {
       const schema = buildTaskToolAgentArgsSchema({ includeIsolation: true });
       expect(schema.safeParse({ ...validArgs, isolation: "fork" }).success).toBe(true);
       expect(schema.safeParse({ ...validArgs, isolation: "sandbox" }).success).toBe(false);
-    });
-
-    it("documents the isolation option only for shareable runtimes", () => {
-      for (const mode of [RUNTIME_MODE.WORKTREE, RUNTIME_MODE.SSH]) {
-        expect(buildTaskToolDescription(mode)).toContain('isolation: "none"');
-      }
-      for (const mode of [RUNTIME_MODE.LOCAL, RUNTIME_MODE.DOCKER, RUNTIME_MODE.DEVCONTAINER]) {
-        expect(buildTaskToolDescription(mode)).not.toContain('isolation: "none"');
-      }
     });
   });
 
@@ -691,6 +659,21 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("mux_config_write");
   });
 
+  it("always includes the read-only model catalog, including for sub-agent option sets", () => {
+    expect(getAvailableTools("openai:gpt-4o")).toContain("models_list");
+    expect(
+      getAvailableTools("anthropic:claude-sonnet-5", {
+        enableAgentReport: true,
+        enableReviewPane: false,
+      })
+    ).toContain("models_list");
+    // No parameters: the strict schema rejects anything the model might invent.
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({}).success).toBe(true);
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({ includeHidden: true }).success).toBe(
+      false
+    );
+  });
+
   it("includes skills catalog tools", () => {
     const tools = getAvailableTools("openai:gpt-4o");
 
@@ -705,12 +688,6 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("task_retitle");
     expect(tools).toContain("task_stop");
     expect(tools).toContain("task_remove");
-  });
-
-  it("includes the workspace heartbeat tool", () => {
-    const tools = getAvailableTools("openai:gpt-4o");
-
-    expect(tools).toContain("heartbeat");
   });
 
   it("only includes Review pane tools when enableReviewPane is not disabled", () => {
@@ -808,37 +785,49 @@ describe("TOOL_DEFINITIONS", () => {
     ).toBe(false);
   });
 
-  it("keeps workflow_run launch fields nullable in generated tool schemas", () => {
-    const workflowSchema = z.toJSONSchema(WorkflowRunToolArgsSchema);
-    const properties = workflowSchema.properties;
-    const schemaHasAnyOfEntry = (schema: unknown, expected: Record<string, unknown>) => {
-      if (schema == null || typeof schema !== "object") {
-        return false;
-      }
-      const anyOf = (schema as { anyOf?: unknown }).anyOf;
-      return (
-        Array.isArray(anyOf) &&
-        anyOf.some(
-          (entry) =>
-            entry != null &&
-            typeof entry === "object" &&
-            Object.entries(expected).every(
-              ([key, value]) => (entry as Record<string, unknown>)[key] === value
-            )
-        )
+  // AGENTS.md: optional tool inputs use `.nullish()`, because OpenAI strict mode forces every field
+  // into `required` and expects optional ones to accept null. Convert each schema the way the AI
+  // SDK does and require every non-required property, at any depth, to accept null.
+  it("every optional tool input property accepts null", () => {
+    type JsonSchema = Record<string, unknown>;
+    const acceptsNull = (schema: unknown): boolean => {
+      if (schema == null || typeof schema !== "object") return schema !== false;
+      const node = schema as JsonSchema;
+      if (Object.keys(node).length === 0) return true;
+      if (node.type === "null" || (Array.isArray(node.type) && node.type.includes("null")))
+        return true;
+      return [node.anyOf, node.oneOf].some(
+        (branches) => Array.isArray(branches) && branches.some(acceptsNull)
       );
     };
+    const violations: string[] = [];
+    const visit = (schema: unknown, at: string): void => {
+      // Draft-7 tuples list their member schemas as an `items` array.
+      if (Array.isArray(schema)) {
+        schema.forEach((member, index) => visit(member, `${at}[${index}]`));
+        return;
+      }
+      if (schema == null || typeof schema !== "object") return;
+      const node = schema as JsonSchema;
+      const required = new Set((node.required as string[] | undefined) ?? []);
+      for (const [key, property] of Object.entries((node.properties as JsonSchema) ?? {})) {
+        if (!required.has(key) && !acceptsNull(property)) violations.push(`${at}.${key}`);
+        visit(property, `${at}.${key}`);
+      }
+      for (const branches of [node.anyOf, node.oneOf, node.allOf]) {
+        if (Array.isArray(branches)) for (const branch of branches) visit(branch, at);
+      }
+      visit(node.items, `${at}[]`);
+      visit(node.additionalItems, `${at}[]`);
+      visit(node.additionalProperties, `${at}{}`);
+    };
 
-    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "string", minLength: 1 })).toBe(
-      true
-    );
-    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "null" })).toBe(true);
-    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "string", minLength: 1 })).toBe(
-      true
-    );
-    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "null" })).toBe(true);
-    expect(workflowSchema.required).not.toContain("script_path");
-    expect(workflowSchema.required).not.toContain("script_source");
+    const tools = Object.entries(TOOL_DEFINITIONS);
+    expect(tools.length).toBeGreaterThan(0);
+    for (const [name, definition] of tools) {
+      visit(z.toJSONSchema(definition.schema, { target: "draft-7", io: "input" }), name);
+    }
+    expect(violations).toEqual([]);
   });
 
   it("only includes workflow tools when dynamic workflows are enabled", () => {
@@ -874,6 +863,8 @@ describe("TOOL_DEFINITIONS", () => {
 
   it("exposes xAI native search tools only for frontier Grok", () => {
     for (const modelString of [
+      "xai:grok-4.7",
+      "xai:grok-4.7-latest",
       "xai:grok-4.6",
       "xai:grok-4.6-latest",
       "xai:grok-4.5",
@@ -901,6 +892,66 @@ describe("TOOL_DEFINITIONS", () => {
       advertise: false,
     });
     expect(parsed.success).toBe(false);
+  });
+
+  describe("task_list instance discovery schema", () => {
+    const schema = TOOL_DEFINITIONS.task_list.schema;
+
+    it("accepts scope instance with bounded query/limit/offset paging inputs", () => {
+      expect(
+        schema.safeParse({ scope: "instance", query: "release", limit: 5, offset: 20 }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance" }).success).toBe(true);
+      // Strict-mode providers send null for omitted optional fields; null must mean "absent".
+      expect(
+        schema.safeParse({ scope: "instance", query: null, limit: null, offset: null }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", limit: 1 }).success).toBe(true);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", offset: 0 }).success).toBe(true);
+    });
+
+    it("rejects out-of-range or non-integer paging inputs", () => {
+      expect(schema.safeParse({ scope: "instance", limit: 0 }).success).toBe(false);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT + 1 }).success
+      ).toBe(false);
+      expect(schema.safeParse({ scope: "instance", limit: 2.5 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: -1 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: 1.5 }).success).toBe(false);
+    });
+
+    it("keeps the default and tree scopes parseable without paging inputs", () => {
+      expect(schema.safeParse({}).success).toBe(true);
+      expect(schema.safeParse({ scope: "tree" }).success).toBe(true);
+      expect(schema.safeParse({ scope: "everywhere" }).success).toBe(false);
+    });
+
+    it("result rows carry instance-only fields and the paging cursor", () => {
+      const result = TOOL_DEFINITIONS.task_list.resultSchema;
+      const parsed = result.safeParse({
+        tasks: [
+          {
+            taskId: "ws-other",
+            status: "workspace",
+            relationship: "unrelated",
+            projectPath: "/home/alice/projects/api",
+            activity: "busy",
+            depth: 0,
+          },
+        ],
+        nextOffset: 20,
+      });
+      expect(parsed.success).toBe(true);
+      expect(
+        result.safeParse({
+          tasks: [{ taskId: "ws-other", status: "workspace", activity: "asleep", depth: 0 }],
+        }).success
+      ).toBe(false);
+      expect(result.safeParse({ tasks: [], nextOffset: -1 }).success).toBe(false);
+    });
   });
 
   describe("skills_catalog_read schema", () => {

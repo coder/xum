@@ -672,3 +672,43 @@ describe("token budget history policy", () => {
     );
   });
 });
+
+describe("models_list exposure", () => {
+  // Built-in agents use `tools.add: [".*"]` with explicit removes, so the read-only
+  // catalog must survive every built-in policy, the sub-agent hard-deny and the
+  // depth-limit denial (which covers task* only).
+  test.each([
+    { agentId: "exec", isSubagent: false, disableTaskToolsForDepth: false },
+    { agentId: "plan", isSubagent: false, disableTaskToolsForDepth: false },
+    { agentId: "explore", isSubagent: true, disableTaskToolsForDepth: false },
+    { agentId: "explore", isSubagent: true, disableTaskToolsForDepth: true },
+  ])(
+    "$agentId (subagent=$isSubagent, depthDenied=$disableTaskToolsForDepth) keeps models_list",
+    async ({ agentId, isSubagent, disableTaskToolsForDepth }) => {
+      using tempDir = new DisposableTempDir("models-list-policy");
+      const agent = await resolveAgentFrontmatter(
+        new LocalRuntime(tempDir.path),
+        tempDir.path,
+        agentId
+      );
+      const policy = resolveToolPolicyForAgent({
+        agents: [agent],
+        isSubagent,
+        disableTaskToolsForDepth,
+      });
+      const modelsList = executableTool("List models");
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { models_list: modelsList, ask_user_question: executableTool("Ask") },
+        effectiveToolPolicy: policy,
+        experiments: {},
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(result.models_list).toBe(modelsList);
+      // Sanity: the sub-agent hard-deny is active in the sub-agent rows (exec removes
+      // ask_user_question through its own definition, so only assert where the deny applies).
+      if (isSubagent) {
+        expect(result.ask_user_question).toBeUndefined();
+      }
+    }
+  );
+});

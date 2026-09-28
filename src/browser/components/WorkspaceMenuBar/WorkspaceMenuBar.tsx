@@ -12,6 +12,7 @@ import {
   getNotifyOnResponseAutoEnableKey,
 } from "@/common/constants/storage";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
+import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
@@ -26,7 +27,13 @@ import {
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  isDevcontainerRuntime,
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -76,10 +83,7 @@ interface WorkspaceMenuBarProps {
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
 }
 
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 
 const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
   paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
@@ -131,6 +135,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // Keyed by workspace (same pattern as the timeline dialog below): consent is granted per
+  // recipient workspace, so switching workspaces while the dialog is open must close it
+  // rather than let the switch be flipped against the workspace the user navigated to.
+  const [unrelatedMessagingWorkspaceId, setUnrelatedMessagingWorkspaceId] = useState<string | null>(
+    null
+  );
+  if (unrelatedMessagingWorkspaceId !== null && unrelatedMessagingWorkspaceId !== workspaceId) {
+    setUnrelatedMessagingWorkspaceId(null);
+  }
+  const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
   // workspace" action) implicitly closes the dialog instead of covering the new view.
   const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
@@ -148,12 +162,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
-  // Untracked paths from archive preflight that the user needs to acknowledge.
-  // When set, the confirmation dialog warns about permanent file deletion.
-  const [archiveUntrackedPaths, setArchiveUntrackedPaths] = useState<string[] | null>(null);
-  // Whether the confirmation includes an active-stream interruption warning.
-  const [archiveConfirmIsStreaming, setArchiveConfirmIsStreaming] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -270,6 +278,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
+  // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
+  // worktree runtimes on both endpoints, so remote/container workspaces get no consent switch —
+  // a grant there could never be honoured. The dialog itself stays reachable everywhere because
+  // its hold-until-turn-end preference also covers same-tree senders, which work on any runtime.
+  // An unset config resolves to the same canonical default the backend applies.
+  const unrelatedMessagingRuntime = runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+  const unrelatedMessagingSupported =
+    isLocalProjectRuntime(unrelatedMessagingRuntime) ||
+    isWorktreeRuntime(unrelatedMessagingRuntime);
 
   const getMoreMenuAnchor = useCallback(() => {
     const rect = moreActionsButtonRef.current?.getBoundingClientRect();
@@ -305,77 +322,33 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [workspaceId, namedWorkspacePath, openInEditor, runtimeConfig]);
 
-  // Mirror sidebar archive behavior so the workspace menu bar matches existing actions.
-  /**
-   * Execute the archive call (optionally with acknowledged untracked paths).
-   * Callers are responsible for the isArchiving guard — this function only does the RPC
-   * and error display. Called from handleArchiveChat (no-confirmation path) and from
-   * the confirmation modal's onConfirm.
-   */
-  const executeArchive = useCallback(
-    async (anchorEl?: HTMLElement, acknowledgedUntrackedPaths?: string[]) => {
-      const res = await archiveWorkspace(
-        workspaceId,
-        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+  // Same archive flow as the sidebar rows so the two entry points cannot drift apart.
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace,
+    isArchiving: () => isArchiving,
+    isStreaming: () => isWorking,
+    getDisplayTitle: () => workspaceTitle,
+    showError: (errorWorkspaceId, error, anchorEl) => {
+      const rect = anchorEl?.getBoundingClientRect();
+      archiveError.showError(
+        errorWorkspaceId,
+        error,
+        rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
       );
-      if (res.success && res.data?.kind === "confirm-lossy-untracked-files") {
-        setArchiveUntrackedPaths(res.data.paths);
-        // The retry path already handled any earlier streaming warning. Only surface the
-        // interruption warning again when the archive attempt has not yet been confirmed.
-        setArchiveConfirmIsStreaming(acknowledgedUntrackedPaths == null ? isWorking : false);
-        setArchiveConfirmOpen(true);
-        return;
-      }
-      if (!res.success) {
-        const rect = anchorEl?.getBoundingClientRect();
-        archiveError.showError(
-          workspaceId,
-          res.error ?? "Failed to archive chat",
-          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-        );
-      }
     },
-    [workspaceId, archiveWorkspace, archiveError, isWorking]
-  );
-
-  /**
-   * Entry point for the archive action. Runs a preflight check and either:
-   * - archives immediately (no warnings),
-   * - opens a combined confirmation dialog (streaming / untracked-file warnings), or
-   * - shows an error popover (unexpected backend failures).
-   */
-  const handleArchiveChat = useCallback(
-    async (anchorEl?: HTMLElement) => {
-      if (isArchiving) return;
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        const rect = anchorEl?.getBoundingClientRect();
-        archiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness",
-          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-        );
-        return;
-      }
-
-      const preflightData = preflight.data;
-      const untrackedPaths =
-        preflightData?.kind === "confirm-lossy-untracked-files" ? preflightData.paths : null;
-      const streamingNow = isWorking;
-
-      if (untrackedPaths || streamingNow) {
-        // Show a single combined confirmation dialog for all warnings.
-        setArchiveUntrackedPaths(untrackedPaths);
-        setArchiveConfirmIsStreaming(streamingNow);
-        setArchiveConfirmOpen(true);
-      } else {
-        await executeArchive(anchorEl);
-      }
-    },
-    [workspaceId, preflightArchiveWorkspace, archiveError, isWorking, isArchiving, executeArchive]
-  );
+  });
+  // The menu bar is reused across workspaces. Render-time adjustment (not an effect): a
+  // confirmation for another workspace, including one opened by a preflight that resolved after
+  // navigation, must never show over (or be confirmed from) the workspace now in view.
+  if (
+    archiveFlow.confirmationWorkspaceId !== null &&
+    archiveFlow.confirmationWorkspaceId !== workspaceId
+  ) {
+    archiveFlow.cancel();
+  }
+  const handleArchiveChat = (anchorEl?: HTMLElement) =>
+    archiveFlow.requestArchive(workspaceId, anchorEl);
 
   const handleForkChat = useCallback(
     async (anchorEl: HTMLElement) => {
@@ -523,6 +496,21 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [workspaceHeartbeatsEnabled]);
+
+  // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
+  // a window listener subscribing to an external event source, not derived state). Like the
+  // timeline shortcut, it yields to any modal already open so it cannot stack a consent dialog
+  // over another dialog's focus trap.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (matchesKeybind(e, KEYBINDS.CONFIGURE_UNRELATED_MESSAGING) && !isDialogOpen()) {
+        e.preventDefault();
+        setUnrelatedMessagingWorkspaceId(workspaceId);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [workspaceId]);
 
   useEffect(() => {
     isSkillsMountedRef.current = true;
@@ -821,7 +809,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             side="bottom"
             align="end"
             sideOffset={6}
-            className="w-[240px] !min-w-0 p-1"
+            // Size to the widest row ("Messages from other workspaces" + shortcut
+            // overflowed a fixed 240px), but never wider than the viewport.
+            className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
             onClick={(event: React.MouseEvent<HTMLDivElement>) => {
               event.stopPropagation();
             }}
@@ -832,6 +822,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onConfigureHeartbeat={
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
+              onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
@@ -885,6 +876,32 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onOpenChange={setHeartbeatModalOpen}
         />
       )}
+      <WorkspaceUnrelatedMessagingModal
+        // Remount per workspace: the keyed open state above only closes the dialog, while
+        // the modal's own pending/error state and in-flight request id would otherwise
+        // survive the switch and surface in the next workspace's dialog.
+        key={workspaceId}
+        open={unrelatedMessagingModalOpen}
+        onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
+        consentSupported={unrelatedMessagingSupported}
+        // Read straight from published metadata: the switch moves only after the backend
+        // commits and republishes, never on the local ack alone.
+        enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
+        onSetEnabled={(enabled) =>
+          api
+            ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
+            : Promise.resolve({ success: false as const, error: "Not connected to server" })
+        }
+        holdUntilTurnEnd={workspaceEntry?.agentMessageDispatchMode === "turn-end"}
+        onSetHoldUntilTurnEnd={(hold) =>
+          api
+            ? api.workspace.setAgentMessageDispatchMode({
+                workspaceId,
+                mode: hold ? "turn-end" : "tool-end",
+              })
+            : Promise.resolve({ success: false as const, error: "Not connected to server" })
+        }
+      />
       <WorkspaceMCPModal
         workspaceId={workspaceId}
         projectPath={projectPath}
@@ -902,35 +919,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onOpenChange={setDebugLlmRequestOpen}
       />
       {/* Combined confirmation for archive warnings (streaming + untracked files). */}
-      <ConfirmationModal
-        isOpen={archiveConfirmOpen}
-        title={
-          archiveUntrackedPaths
-            ? "Archive workspace with untracked files?"
-            : workspaceTitle
-              ? `Archive "${workspaceTitle}" while streaming?`
-              : "Archive chat?"
-        }
-        description={buildArchiveConfirmDescription(
-          archiveConfirmIsStreaming,
-          archiveUntrackedPaths
-        )}
-        warning={buildArchiveConfirmWarning(archiveConfirmIsStreaming, archiveUntrackedPaths)}
-        confirmLabel={archiveUntrackedPaths ? "Archive and delete files" : "Archive"}
-        confirmVariant="destructive"
-        onConfirm={() => {
-          const paths = archiveUntrackedPaths;
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-          void executeArchive(undefined, paths ?? undefined);
-        }}
-        onCancel={() => {
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-        }}
-      />
+      <ConfirmationModal {...archiveFlow.modalProps} />
       <PopoverError
         error={stopRuntimeError.error}
         prefix="Failed to stop container"

@@ -1,7 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getPostCompactionStateKey } from "@/common/constants/storage";
 
 interface PostCompactionState {
   planPath: string | null;
@@ -16,12 +14,15 @@ interface CachedPostCompactionData {
   excludedItems: string[];
 }
 
-/** Load state from localStorage cache for a workspace */
+/**
+ * Last fetched state per workspace, used only to seed the hook on remount. The backend owns
+ * this state and the hook refetches it on every mount, so it is kept in memory rather than
+ * localStorage (per-workspace copies there contributed to QuotaExceededError).
+ */
+const postCompactionStateCache = new Map<string, CachedPostCompactionData>();
+
 function loadFromCache(wsId: string) {
-  const cached = readPersistedState<CachedPostCompactionData | null>(
-    getPostCompactionStateKey(wsId),
-    null
-  );
+  const cached = postCompactionStateCache.get(wsId);
   return {
     planPath: cached?.planPath ?? null,
     trackedFilePaths: cached?.trackedFilePaths ?? [],
@@ -31,7 +32,7 @@ function loadFromCache(wsId: string) {
 
 /**
  * Hook to get post-compaction context state for a workspace.
- * Fetches lazily from the backend API and caches in localStorage.
+ * Fetches lazily from the backend API and caches in memory.
  * This avoids the expensive runtime.stat calls during workspace.list().
  *
  * Always enabled: post-compaction context is a stable feature (not an experiment).
@@ -66,7 +67,7 @@ export function usePostCompactionState(workspaceId: string): PostCompactionState
         });
 
         // Cache for next time
-        updatePersistedState<CachedPostCompactionData>(getPostCompactionStateKey(workspaceId), {
+        postCompactionStateCache.set(workspaceId, {
           planPath: result.planPath,
           trackedFilePaths: result.trackedFilePaths,
           excludedItems: result.excludedItems,
@@ -103,7 +104,7 @@ export function usePostCompactionState(workspaceId: string): PostCompactionState
           }
           const newState = { ...prev, excludedItems: newSet };
 
-          updatePersistedState<CachedPostCompactionData>(getPostCompactionStateKey(workspaceId), {
+          postCompactionStateCache.set(workspaceId, {
             planPath: newState.planPath,
             trackedFilePaths: newState.trackedFilePaths,
             excludedItems: Array.from(newSet),

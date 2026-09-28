@@ -1,6 +1,6 @@
+import { installDom } from "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { GlobalWindow } from "happy-dom";
 import {
   useSmoothStreamingText,
   type UseSmoothStreamingTextOptions,
@@ -9,19 +9,13 @@ import {
 const FRAME_MS = 16;
 
 describe("useSmoothStreamingText", () => {
-  let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
-  let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
+  let cleanupDom: (() => void) | undefined;
   let rafHandleCounter = 0;
   let currentTimeMs = 0;
   const rafCallbacks = new Map<number, FrameRequestCallback>();
 
   beforeEach(() => {
-    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.window = domWindow;
-    globalThis.document = domWindow.document;
-
-    originalRequestAnimationFrame = globalThis.requestAnimationFrame;
-    originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+    cleanupDom = installDom();
 
     rafHandleCounter = 0;
     currentTimeMs = 0;
@@ -48,16 +42,9 @@ describe("useSmoothStreamingText", () => {
 
     rafCallbacks.clear();
 
-    globalThis.requestAnimationFrame = originalRequestAnimationFrame;
-    globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
-
-    if (globalThis.window) {
-      globalThis.window.requestAnimationFrame = originalRequestAnimationFrame;
-      globalThis.window.cancelAnimationFrame = originalCancelAnimationFrame;
-    }
-
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    // Preserve the shared DOM so later Bun suites can initialize DOM-dependent modules.
+    cleanupDom?.();
+    cleanupDom = undefined;
   });
 
   function advanceFrames(frameCount: number): void {

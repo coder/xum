@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { computePriorHistoryFingerprint } from "./onChatCursorFingerprint";
+import {
+  computeHistoryRangeFingerprint,
+  computePriorHistoryFingerprint,
+} from "./onChatCursorFingerprint";
 
 function withHistoryMetadata(
   message: MuxMessage,
@@ -52,5 +55,203 @@ describe("computePriorHistoryFingerprint", () => {
     expect(originalFingerprint).toBeDefined();
     expect(rewrittenFingerprint).toBeDefined();
     expect(rewrittenFingerprint).not.toBe(originalFingerprint);
+  });
+});
+
+describe("computeHistoryRangeFingerprint", () => {
+  const row = (id: string, seq: number, text: string, timestamp = 1_000 + seq) =>
+    createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", text, {
+      historySequence: seq,
+      timestamp,
+    });
+  const rows = [
+    row("r0", 0, "zero"),
+    row("r1", 1, "one"),
+    row("r2", 2, "two"),
+    row("r3", 3, "three"),
+  ];
+
+  test("covers exactly the inclusive range and reports its row count", () => {
+    const range = computeHistoryRangeFingerprint(rows, 1, 2);
+    expect(range.rowCount).toBe(2);
+    expect(computeHistoryRangeFingerprint([rows[1], rows[2]], 1, 2)).toEqual(range);
+    // Rows outside the range do not contribute.
+    expect(computeHistoryRangeFingerprint([rows[0], rows[1], rows[2]], 1, 2)).toEqual(range);
+  });
+
+  test("changes when any covered row's parts, role or id changes", () => {
+    const base = computeHistoryRangeFingerprint(rows, 1, 3).fingerprint;
+    const variants = [
+      [rows[0], row("r1", 1, "ONE"), rows[2], rows[3]],
+      [
+        rows[0],
+        createMuxMessage("r1", "user", "one", { historySequence: 1, timestamp: 1_001 }),
+        rows[2],
+        rows[3],
+      ],
+      [rows[0], row("other", 1, "one"), rows[2], rows[3]],
+    ];
+    for (const variant of variants) {
+      expect(computeHistoryRangeFingerprint(variant, 1, 3).fingerprint).not.toBe(base);
+    }
+    // ...but not when a row outside the range changes.
+    expect(
+      computeHistoryRangeFingerprint([row("r0", 0, "changed"), ...rows.slice(1)], 1, 3).fingerprint
+    ).toBe(base);
+  });
+
+  test("is insensitive to what differs between a client-assembled row and its persisted form", () => {
+    // Verified over real IPC: the client keeps per-part timestamps and a stream-derived row
+    // timestamp, and serializes tool-part keys in a different order.
+    const persisted = createMuxMessage(
+      "a1",
+      "assistant",
+      "",
+      { historySequence: 1, timestamp: 10 },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "file_read",
+          input: { filePath: "README.md" },
+          state: "output-available",
+          output: { content: "hello" },
+        },
+        { type: "text", text: "done" },
+      ]
+    );
+    const assembled = createMuxMessage(
+      "a1",
+      "assistant",
+      "",
+      { historySequence: 1, timestamp: 99 },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "file_read",
+          state: "output-available",
+          input: { filePath: "README.md" },
+          timestamp: 12,
+          output: { content: "hello" },
+        },
+        { type: "text", text: "done", timestamp: 13 },
+      ]
+    );
+    expect(computeHistoryRangeFingerprint([assembled], 1, 1)).toEqual(
+      computeHistoryRangeFingerprint([persisted], 1, 1)
+    );
+    // Content changes inside a tool part still change the hash.
+    const toolPart = assembled.parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("fixture must start with a settled tool part");
+    }
+    const changedPart: MuxMessage["parts"][number] = {
+      ...toolPart,
+      output: { content: "changed" },
+    };
+    const changedOutput = createMuxMessage("a1", "assistant", "", { historySequence: 1 }, [
+      changedPart,
+      assembled.parts[1],
+    ]);
+    expect(computeHistoryRangeFingerprint([changedOutput], 1, 1).fingerprint).not.toBe(
+      computeHistoryRangeFingerprint([persisted], 1, 1).fingerprint
+    );
+  });
+
+  test("a missing middle row changes the count and the hash", () => {
+    const full = computeHistoryRangeFingerprint(rows, 0, 3);
+    const gap = computeHistoryRangeFingerprint([rows[0], rows[1], rows[3]], 0, 3);
+    expect(gap.rowCount).toBe(full.rowCount - 1);
+    expect(gap.fingerprint).not.toBe(full.fingerprint);
+  });
+
+  test("fences unsettled assistant rows by identity only", () => {
+    const placeholder = createMuxMessage("a1", "assistant", "", { historySequence: 1 });
+    const streamed = createMuxMessage("a1", "assistant", "streamed text", {
+      historySequence: 1,
+      partial: true,
+    });
+    const committedPartial = createMuxMessage("a1", "assistant", "other streamed text", {
+      historySequence: 1,
+      partial: true,
+    });
+    expect(computeHistoryRangeFingerprint([streamed], 1, 1)).toEqual(
+      computeHistoryRangeFingerprint([placeholder], 1, 1)
+    );
+    expect(computeHistoryRangeFingerprint([committedPartial], 1, 1)).toEqual(
+      computeHistoryRangeFingerprint([placeholder], 1, 1)
+    );
+    // Identity still counts: a different id or sequence at that position is a conflict…
+    expect(
+      computeHistoryRangeFingerprint(
+        [createMuxMessage("a9", "assistant", "", { historySequence: 1 })],
+        1,
+        1
+      ).fingerprint
+    ).not.toBe(computeHistoryRangeFingerprint([placeholder], 1, 1).fingerprint);
+    // …and so is a row the server completed while the client still holds the partial.
+    const completed = createMuxMessage("a1", "assistant", "streamed text", { historySequence: 1 });
+    expect(computeHistoryRangeFingerprint([completed], 1, 1).fingerprint).not.toBe(
+      computeHistoryRangeFingerprint([streamed], 1, 1).fingerprint
+    );
+  });
+
+  test("an empty assistant row completed without parts is settled, not a placeholder", () => {
+    const placeholder = createMuxMessage("a1", "assistant", "", { historySequence: 1 });
+    const placeholderHash = computeHistoryRangeFingerprint([placeholder], 1, 1).fingerprint;
+    // Stream end stamps completion metadata even when the turn produced no parts (refusal,
+    // content filter); any one of them settles the row.
+    for (const completion of [
+      { finishReason: "content-filter" },
+      { usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
+      { duration: 250 },
+    ]) {
+      const completedEmpty = createMuxMessage("a1", "assistant", "", {
+        historySequence: 1,
+        ...completion,
+      });
+      expect(computeHistoryRangeFingerprint([completedEmpty], 1, 1).fingerprint).not.toBe(
+        placeholderHash
+      );
+      // A settled empty row hashes its (empty) content, so two of them agree regardless of
+      // which completion fields they carry.
+      expect(computeHistoryRangeFingerprint([completedEmpty], 1, 1)).toEqual(
+        computeHistoryRangeFingerprint(
+          [createMuxMessage("a1", "assistant", "", { historySequence: 1, duration: 1 })],
+          1,
+          1
+        )
+      );
+    }
+    // An interrupted turn is unsettled by its `partial` flag whatever else it carries.
+    const abortedWithDuration = createMuxMessage("a1", "assistant", "", {
+      historySequence: 1,
+      partial: true,
+      duration: 250,
+    });
+    expect(computeHistoryRangeFingerprint([abortedWithDuration], 1, 1).fingerprint).toBe(
+      placeholderHash
+    );
+  });
+
+  test("ignores rows without a valid historySequence and rejects an inverted range", () => {
+    const withUncommitted = [...rows, createMuxMessage("streaming", "assistant", "…")];
+    expect(computeHistoryRangeFingerprint(withUncommitted, 0, 3)).toEqual(
+      computeHistoryRangeFingerprint(rows, 0, 3)
+    );
+    // The wire schema admits any number: negative and fractional sequences are not evidence.
+    const withMalformed = [
+      ...rows,
+      createMuxMessage("neg", "assistant", "…", { historySequence: -1 }),
+      createMuxMessage("frac", "assistant", "…", { historySequence: 2.5 }),
+      createMuxMessage("nan", "assistant", "…", { historySequence: Number.NaN }),
+    ];
+    expect(computeHistoryRangeFingerprint(withMalformed, 0, 3)).toEqual(
+      computeHistoryRangeFingerprint(rows, 0, 3)
+    );
+    expect(() => computeHistoryRangeFingerprint(rows, 2, 1)).toThrow();
+    expect(() => computeHistoryRangeFingerprint(rows, -1, 1)).toThrow();
+    expect(() => computeHistoryRangeFingerprint(rows, 0, 1.5)).toThrow();
   });
 });

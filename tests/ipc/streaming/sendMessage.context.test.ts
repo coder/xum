@@ -53,7 +53,7 @@ async function sendMessageWithModel(
 }
 
 // Test both providers
-const PROVIDER_CONFIGS: Array<[string, string]> = [
+const PROVIDER_CONFIGS: [string, string][] = [
   ["openai", KNOWN_MODELS.GPT.providerModelId],
   ["anthropic", KNOWN_MODELS.HAIKU.providerModelId],
 ];
@@ -103,7 +103,7 @@ describeIntegration("sendMessage context handling tests", () => {
         // Some provider/model combinations may emit no stream-delta events, and return
         // assistant text only in the final stream-end payload.
         const finalMessage = collector.getFinalMessage() as
-          | { content?: unknown; parts?: Array<{ type?: unknown; text?: unknown }> }
+          | { content?: unknown; parts?: { type?: unknown; text?: unknown }[] }
           | undefined;
 
         const textFromContent =
@@ -173,7 +173,7 @@ describeIntegration("sendMessage context handling tests", () => {
         // Some provider/model combinations may emit no stream-delta events, and return
         // assistant text only in the final stream-end payload.
         const finalMessage = collector.getFinalMessage() as
-          | { content?: unknown; parts?: Array<{ type?: unknown; text?: unknown }> }
+          | { content?: unknown; parts?: { type?: unknown; text?: unknown }[] }
           | undefined;
 
         const textFromContent =

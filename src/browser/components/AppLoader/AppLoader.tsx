@@ -10,6 +10,7 @@ import { useWorkspaceStoreRaw, workspaceStore } from "../../stores/WorkspaceStor
 import { useGitStatusStoreRaw } from "../../stores/GitStatusStore";
 import { useRuntimeStatusStoreRaw } from "../../stores/RuntimeStatusStore";
 import { useBackgroundBashStoreRaw } from "../../stores/BackgroundBashStore";
+import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
@@ -24,6 +25,7 @@ import {
   UserPreferencesProvider,
 } from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
+import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
@@ -79,7 +81,9 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     };
   }, [apiState.api]);
 
-  if (bootstrappedRef.current || ready) {
+  // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
+  // the ref during render would make React Compiler skip this component.
+  if (ready) {
     return <>{props.children}</>;
   }
 
@@ -176,6 +180,15 @@ function AppLoaderInner() {
 
   // Sync stores when metadata finishes loading
   useEffect(() => {
+    // #4662: git/PR probes for a workspace wait for its chat replay to settle. Wire the gate
+    // before setClient/syncWorkspaces below, which can refresh synchronously.
+    const chatReplayGate = {
+      isReplayPending: workspaceStore.isWorkspaceChatReplayPending,
+      subscribeKey: workspaceStore.subscribeKey,
+    };
+    gitStatusStore.setChatReplayGate(chatReplayGate);
+    getPRStatusStoreInstance().setChatReplayGate(chatReplayGate);
+
     // Keep store clients in sync even during backend restarts (api can be null while reconnecting).
     workspaceStoreInstance.setClient(api ?? null);
     gitStatusStore.setClient(api ?? null);
@@ -184,6 +197,7 @@ function AppLoaderInner() {
     getPRStatusStoreInstance().setClient(api ?? null);
     getProvidersConfigStore().setClient(api ?? null);
     getAppConfigStore().setClient(api ?? null);
+    getReviewStateStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {
       workspaceStoreInstance.syncWorkspaces(workspaceContext.workspaceMetadata);
@@ -271,6 +285,7 @@ function AppLoaderInner() {
         >
           <TerminalRouterProvider>
             <App />
+            <UpdateRestartOverlay />
           </TerminalRouterProvider>
         </motion.div>
       )}

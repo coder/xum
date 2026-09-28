@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import * as jsonc from "jsonc-parser";
 import type { z } from "zod";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
   CONFIG_FILE_REGISTRY,

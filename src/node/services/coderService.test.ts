@@ -149,7 +149,6 @@ describe("CoderService", () => {
   });
 
   afterEach(() => {
-    service.clearCache();
     execAsyncSpy?.mockRestore();
     execAsyncSpy = null;
     execFileAsyncSpy?.mockRestore();
@@ -1204,10 +1203,6 @@ describe("deleteWorkspace", () => {
   beforeEach(() => {
     service = new CoderService();
     vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    service.clearCache();
   });
 
   // deleteWorkspace is a thin wrapper around deleteWorkspaceEventually.

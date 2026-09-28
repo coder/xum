@@ -43,17 +43,20 @@ describe("Goal slash command", () => {
       });
 
       await app.chat.typeWithoutSending("/goal this is your new goal,");
-      const textarea = app.view.container.querySelector(
-        'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      const textarea = app.view.container.querySelector('textarea[aria-label="Message Claude"]');
       expect(textarea).not.toBeNull();
       fireEvent.keyDown(textarea!, { key: "Enter" });
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.objective).toBe("this is your new goal,");
-        expect(goal?.status).toBe("active");
-      });
+      // Each poll is a backend round trip, and under CI load one getGoal call can outlast
+      // waitFor's default 1 s budget on its own (#5029). Use the harness's 10 s bound.
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.objective).toBe("this is your new goal,");
+          expect(goal?.status).toBe("active");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -135,9 +138,9 @@ describe("Goal slash command", () => {
 
     try {
       const getTextarea = () =>
-        app.view.container.querySelector(
+        app.view.container.querySelector<HTMLTextAreaElement>(
           'textarea[aria-label="Message Claude"]'
-        ) as HTMLTextAreaElement | null;
+        );
 
       await waitFor(() => {
         const textarea = getTextarea();

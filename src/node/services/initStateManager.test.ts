@@ -1,13 +1,14 @@
 import * as path from "path";
 import * as fs from "fs/promises";
 import * as os from "os";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { Config } from "@/node/config";
 import { InitStateManager } from "./initStateManager";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { workspaceUseLeasesFor } from "./workspaceUseLeases";
 
 describe("InitStateManager", () => {
   let tempDir: string;
@@ -28,6 +29,7 @@ describe("InitStateManager", () => {
   });
 
   afterEach(async () => {
+    mock.restore();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -284,6 +286,58 @@ describe("InitStateManager", () => {
       events.length = 0;
       await manager.replayInit(workspaceId);
       expect(events.map((event) => event.type)).toEqual(["init-start", "init-output", "init-end"]);
+    });
+
+    // #4801, from the other backend's perspective: backend A (manager) runs the init; backend B
+    // (its own Config and InitStateManager on the same root) opens the workspace meanwhile.
+    describe("while another backend on the same root runs the init", () => {
+      const workspaceId = "test-workspace";
+      let managerB: InitStateManager;
+      let configB: Config;
+
+      beforeEach(async () => {
+        configB = new Config(tempDir);
+        managerB = new InitStateManager(configB);
+        manager.startInit(workspaceId, "/path/to/hook");
+        // The running record lands asynchronously.
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await manager.readInitStatus(workspaceId))?.status === "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("running");
+      });
+
+      it("does not mark it failed while that backend holds the init lease", async () => {
+        const ends: WorkspaceInitEvent[] = [];
+        managerB.on("init-end", (event: WorkspaceInitEvent) => ends.push(event));
+        // As runBackgroundInit does for the whole init (#4890).
+        const lease = await workspaceUseLeasesFor(config).hold(workspaceId, "init");
+        try {
+          await managerB.replayInit(workspaceId);
+          expect(ends).toEqual([]);
+          expect((await managerB.readInitStatus(workspaceId))?.status).toBe("running");
+          await manager.endInit(workspaceId, 0);
+        } finally {
+          await lease.release();
+        }
+
+        await managerB.replayInit(workspaceId);
+        expect(ends).toMatchObject([{ type: "init-end", exitCode: 0 }]);
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("success");
+      });
+
+      it("judges an init that finished during its lease probe by the final status", async () => {
+        const leasesB = workspaceUseLeasesFor(configB);
+        const isHeld = leasesB.isHeld.bind(leasesB);
+        // A finishes and releases its lease while B probes it.
+        spyOn(leasesB, "isHeld").mockImplementationOnce(async (id, kind) => {
+          await manager.endInit(workspaceId, 0);
+          return isHeld(id, kind);
+        });
+
+        await managerB.replayInit(workspaceId);
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("success");
+      });
     });
 
     it("should not replay if no state exists", async () => {

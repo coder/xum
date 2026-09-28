@@ -306,7 +306,7 @@ function reviewPrompt(lane, input, context) {
     renderInput(input) +
     "\n\nGit context:\n" +
     JSON.stringify(context, null, 2) +
-    "\n\nReturn only concrete simplification opportunities. Prefer an empty findings array over speculative feedback."
+    "\n\nReport every concrete simplification opportunity you find, each with a severity; the synthesis step deduplicates and filters. Return an empty findings array only when there are none."
   );
 }
 

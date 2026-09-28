@@ -7,6 +7,9 @@
  *
  * For error injection, use the real instance + spyOn:
  *   spyOn(historyService, "appendToHistory").mockRejectedValueOnce(...)
+ *
+ * Test-only: tsconfig.main.json excludes this file by path so it stays out of the
+ * app build (AGENTS.md documents this path, so it keeps its name).
  */
 import { HistoryService } from "@/node/services/historyService";
 import { Config } from "@/node/config";

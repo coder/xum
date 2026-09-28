@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { prepareMessagePayload } from "./prepareMessagePayload";
 
@@ -45,6 +45,55 @@ describe("prepareMessagePayload", () => {
       effectiveModel,
       fileParts,
     ]);
+  });
+
+  it.each([
+    ["a normal send", {}, true],
+    ["a one-shot model command", { messageText: "/opus+high hello", modelOneShot: oneShot }, false],
+    [
+      "a thinking-only one-shot command",
+      {
+        messageText: "/+2 hello",
+        modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
+      },
+      true,
+    ],
+  ])("keeps the Auto routing flag only for %s", (_name, input, expected) => {
+    const result = prepare({
+      ...input,
+      sendMessageOptions: { ...options, autoModelRouting: true },
+    });
+    expect(result.options.autoModelRouting).toBe(expected);
+  });
+
+  it.each([
+    ["a normal send", {}, true],
+    [
+      "a model-only one-shot command",
+      {
+        messageText: "/haiku hello",
+        modelOneShot: {
+          type: "model-oneshot",
+          modelString: "anthropic:claude-haiku-4",
+          message: "hello",
+        } as const,
+      },
+      true,
+    ],
+    [
+      "a thinking-only one-shot command",
+      {
+        messageText: "/+2 hello",
+        modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
+      },
+      false,
+    ],
+  ])("keeps the Auto thinking flag only for %s", (_name, input, expected) => {
+    const result = prepare({
+      ...input,
+      sendMessageOptions: { ...options, autoThinkingLevel: true },
+    });
+    expect(result.options.autoThinkingLevel).toBe(expected);
   });
 
   it.each([
@@ -95,5 +144,24 @@ describe("prepareMessagePayload", () => {
       "turn-end",
       "pause",
     ]);
+  });
+
+  it("fences an edit with its precondition and never attaches one to a plain send", () => {
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "message-1",
+      rangeStartMessageId: "message-1",
+      rangeStartHistorySequence: 4,
+      newestMessageId: "message-3",
+      newestHistorySequence: 6,
+      rangeRowCount: 3,
+      rangeFingerprint: "cafebabe",
+    };
+    const edit = prepare({ editMessageId: "message-1", historyEditPrecondition });
+    expect(edit.options.editMessageId).toBe("message-1");
+    expect(edit.options.historyEditPrecondition).toBe(historyEditPrecondition);
+    // A stale fence from a finished edit must not ride along on a normal send.
+    const plain = prepare({ historyEditPrecondition });
+    expect(plain.options.editMessageId).toBeUndefined();
+    expect("historyEditPrecondition" in plain.options).toBe(false);
   });
 });

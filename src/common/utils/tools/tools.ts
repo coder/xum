@@ -13,6 +13,7 @@ import {
 } from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import type { AvailableModel } from "@/common/utils/ai/selectableModels";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
 import { createAttachFileTool } from "@/node/services/tools/attach_file";
@@ -21,7 +22,6 @@ import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { createBashBackgroundListTool } from "@/node/services/tools/bash_background_list";
 import { createBashBackgroundTerminateTool } from "@/node/services/tools/bash_background_terminate";
 import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit_replace_string";
-// DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
 import { createIntuitionTool } from "@/node/services/tools/intuition";
@@ -57,6 +57,7 @@ import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
 import { createAgentSkillListTool } from "@/node/services/tools/agent_skill_list";
+import { createModelsListTool } from "@/node/services/tools/models_list";
 import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
 import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createSkillsCatalogSearchTool } from "@/node/services/tools/skills_catalog_search";
@@ -91,6 +92,8 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
+import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -215,6 +218,12 @@ export interface ToolConfiguration {
   memoryWritePath?: string;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /**
+   * Hands the exact plan bytes a successful propose_plan read and validated to the session's
+   * plan-review snapshot capture, keyed by the tool call. Backend-owned: tool results can come
+   * from a delegated client, and the plan file can change after the tool read it.
+   */
+  recordProposedPlan?: (toolCallId: string, content: string) => void;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
   onConfigChanged?: () => void;
   /** Best-effort callback for recording tool-initiated model usage in session totals. */
@@ -222,6 +231,13 @@ export interface ToolConfiguration {
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
   workspaceTurnManager?: WorkspaceTurnManager;
+  /**
+   * Catalog for the models_list tool: the models selectable under the current
+   * configuration (same pipeline as the composer picker), in task.model form.
+   * Re-reads live config on every call — no cache. Absent in contexts without a
+   * backend config (tests, refinement), where the tool reports unavailability.
+   */
+  listAvailableModels?: () => AvailableModel[];
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
@@ -282,6 +298,13 @@ export interface ToolConfiguration {
   goalService?: WorkspaceGoalService;
   /** Effective goal defaults for model-created goals in this workspace. */
   goalDefaults?: GoalDefaults;
+  /**
+   * Model running the turn that executes the tools. set_goal forwards it so a
+   * model-created goal is priced against, and kicks off on, the model the user
+   * is actually running — not the workspace's persisted default, which can
+   * differ (one-shot model sends, delegated turns with per-turn overrides).
+   */
+  goalKickoffModel?: string;
   /** Per-request goal tool gates derived from goal status and agent capabilities. */
   enableGoalTools?: {
     setGoal: boolean;
@@ -351,6 +374,9 @@ export interface ToolConfiguration {
     usesThisTurn: number;
     createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
     resolveAgentBody: () => Promise<string | null>;
+    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
+    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
+    evaluationService?: EvaluationService;
     abortSignal: AbortSignal;
   };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
@@ -811,10 +837,10 @@ export async function getToolsForModel(
     agent_skill_read_file: wrap(createAgentSkillReadFileTool(config)),
     file_edit_replace_string: wrap(createFileEditReplaceStringTool(config)),
     file_edit_insert: wrap(createFileEditInsertTool(config)),
-    // DISABLED: file_edit_replace_lines - causes models (particularly GPT-5-Codex)
-    // to leave repository in broken state due to issues with concurrent file modifications
-    // and line number miscalculations. Use file_edit_replace_string instead.
-    // file_edit_replace_lines: wrap(createFileEditReplaceLinesTool(config)),
+    // file_edit_replace_lines was removed: it caused models (particularly GPT-5-Codex)
+    // to leave repositories broken through concurrent edits and line-number
+    // miscalculations. Its TOOL_DEFINITIONS entry and renderers stay so older
+    // transcripts containing it still render.
 
     // Sub-agent task orchestration (child workspaces)
     task: wrap(createTaskTool(config)),
@@ -869,6 +895,7 @@ export async function getToolsForModel(
     mux_agents_read: createXumAgentsReadTool(config),
     mux_agents_write: createXumAgentsWriteTool(config),
     agent_skill_list: createAgentSkillListTool(config),
+    models_list: createModelsListTool(config),
     agent_skill_write: createAgentSkillWriteTool(config),
     agent_skill_delete: createAgentSkillDeleteTool(config),
     mux_config_read: createXumConfigReadTool(config),

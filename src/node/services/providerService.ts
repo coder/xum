@@ -20,6 +20,8 @@
  * plain methods: they compose no async work, so an Effect conversion would
  * add fiber overhead without composition benefit.
  */
+import { discoverProviderModels } from "./providerModelDiscovery";
+import { discoverBedrockModels } from "./bedrockModelDiscovery";
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
 import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
@@ -36,6 +38,7 @@ import type {
   CustomProviderMutationError,
   ProviderConfigInfo,
   ProviderModelEntry,
+  ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
@@ -55,6 +58,7 @@ import {
 import {
   getProviderModelEntryId,
   normalizeProviderModelEntries,
+  userManagedModelEntries,
 } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import {
@@ -62,6 +66,7 @@ import {
   isLegacyOpApiKey,
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
+  resolveCustomProviderCredentials,
 } from "@/node/utils/providerRequirements";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
@@ -71,6 +76,7 @@ import {
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import type { PolicyService } from "@/node/services/policyService";
 import { getErrorMessage } from "@/common/utils/errors";
+import { MODEL_DISCOVERY_BASE_URLS } from "@/constants/modelDiscovery";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 function filterProviderModelsByPolicy(
@@ -406,7 +412,7 @@ export class ProviderService {
         coderOauth?: unknown;
         /** Coder-only: model IDs discovered from the deployment's AI Bridge. */
         discoveredModels?: unknown;
-        /** Coder-only: model IDs the user explicitly removed. */
+        /** Coder-only: legacy routing tombstones (see providersConfig.ts). */
         removedModels?: unknown;
         /** Coder-only: discovered AI Gateway provider instances ({name, type}). */
         discoveredProviders?: unknown;
@@ -579,10 +585,10 @@ export class ProviderService {
         if (additionalProviders.length > 0) {
           providerInfo.additionalProviders = additionalProviders;
         }
-        // Durable user removals gate accessibility even while the discovered
-        // catalog is unknown (see gatewayModelCatalog.ts); the frontend needs
-        // them to mirror the backend's routing decisions. No policy filter:
-        // removals are user intent, not catalog content.
+        // Legacy removal tombstones gate accessibility even while the
+        // discovered catalog is unknown (see gatewayModelCatalog.ts); the
+        // frontend needs them to mirror the backend's routing decisions. No
+        // policy filter: tombstones are user intent, not catalog content.
         if (Array.isArray(config.removedModels)) {
           const removed = config.removedModels.filter((id): id is string => typeof id === "string");
           if (removed.length > 0) {
@@ -673,6 +679,99 @@ export class ProviderService {
     }
 
     return result;
+  }
+
+  public discoverModels(
+    provider: string,
+    signal?: AbortSignal
+  ): Promise<ProviderModelDiscoveryResult> {
+    // Autocomplete must never persist a catalog or change routing/user-managed models.
+    if (provider === "bedrock") {
+      return discoverBedrockModels(() => {
+        const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+        const enforced = this.policyService?.isEnforced() ?? false;
+        return {
+          config,
+          enabled:
+            !isProviderDisabledInConfig(config) &&
+            (!enforced || (this.policyService?.isProviderAllowed(provider) ?? false)),
+          policy: { ...this.getProviderPolicy(provider), enforced },
+        };
+      }, signal);
+    }
+    return discoverProviderModels(() => {
+      const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+      const custom = isCustomProviderConfig(config) ? config.providerType : undefined;
+      const defaultBaseUrl = isBuiltInProvider(provider)
+        ? MODEL_DISCOVERY_BASE_URLS[provider]
+        : undefined;
+      // Legacy shadowed built-ins remain unavailable, never inheriting official environment keys.
+      if (custom ? !validateCustomProviderId(provider).ok : !defaultBaseUrl)
+        return { status: "unsupported" };
+      const enforced = this.policyService?.isEnforced() ?? false;
+      if (
+        isProviderDisabledInConfig(config) ||
+        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
+        (provider === "mux-gateway" &&
+          this.config.loadConfigOrDefault().muxGatewayEnabled === false) ||
+        (enforced && !this.policyService?.isProviderAllowed(provider))
+      )
+        return { status: "not-configured" };
+      const policy = this.getProviderPolicy(provider);
+      let apiKey: string | undefined, baseUrl: string | undefined, organization: string | undefined;
+      if (custom) {
+        const credentials = resolveCustomProviderCredentials(provider, {
+          ...config,
+          ...(policy.forcedBaseUrl && { baseUrl: policy.forcedBaseUrl }),
+        });
+        if (!credentials.ok)
+          return credentials.error.code === "missing_base_url"
+            ? { status: "not-configured" }
+            : { status: "error", reason: "request-failed" };
+        apiKey = credentials.apiKey;
+        baseUrl = credentials.baseURL;
+      } else {
+        if (!isBuiltInProvider(provider)) return { status: "unsupported" };
+        const credentials = resolveProviderCredentials(provider, config);
+        // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
+        if (!credentials.isConfigured) return { status: "not-configured" };
+        apiKey = provider === "mux-gateway" ? credentials.couponCode : credentials.apiKey;
+        baseUrl =
+          policy.forcedBaseUrl ??
+          credentials.baseUrl ??
+          resolveConfigBaseUrl(config) ??
+          defaultBaseUrl;
+        organization = credentials.organization;
+      }
+      if (!baseUrl) return { status: "not-configured" };
+      const format = custom
+        ? custom === "anthropic-messages"
+          ? "anthropic"
+          : "openai"
+        : provider === "mux-gateway"
+          ? "gateway"
+          : provider === "anthropic" ||
+              provider === "google" ||
+              provider === "ollama" ||
+              provider === "openrouter"
+            ? provider
+            : "openai";
+      return Object.freeze({
+        provider,
+        providerType: custom,
+        format,
+        conditional: Boolean(custom) || provider === "zai" || provider === "mux-gateway",
+        baseUrl,
+        apiKey,
+        organization,
+        headers: Object.freeze({ ...config.headers }),
+        policy: Object.freeze({
+          ...policy,
+          enforced,
+          ...(policy.allowedModels && { allowedModels: Object.freeze([...policy.allowedModels]) }),
+        }),
+      });
+    }, signal);
   }
 
   private getProviderPolicy(provider: string): ProviderPolicy {
@@ -1067,6 +1166,16 @@ export class ProviderService {
             }
           }
         }
+
+        // A pinned model of the removed provider would keep a reawakened sub-agent on a
+        // model that no longer resolves; unpin it so current defaults apply again.
+        if (
+          typeof workspace.taskAiPins?.model === "string" &&
+          modelStringStartsWithProvider(workspace.taskAiPins.model, provider)
+        ) {
+          const { model: _removedModel, ...remainingPins } = workspace.taskAiPins;
+          workspace.taskAiPins = remainingPins;
+        }
       }
     }
 
@@ -1180,16 +1289,19 @@ export class ProviderService {
    *   entries the policy hides. Overwriting would carve those out of the
    *   policy-unfiltered persisted list until the next login even after the
    *   policy broadens (policy is applied at exposure/routing, not storage).
-   * - Every deleted entry is recorded in `removedModels` so catalog
-   *   refreshes and re-logins do not resurrect it. Tracking keys off the
-   *   PRIOR persisted list, not just the current `discoveredModels`:
-   *   provenance is lossy (a discovered model with a user-authored object
-   *   override survives a catalog that temporarily omits its ID, but only
-   *   `models` still knows it) — a deletion made in that state must still be
-   *   excluded when a later catalog lists the ID again. The set is
-   *   recomputed from the final list each edit, so re-adding a model clears
-   *   its exclusion; prior exclusions survive edits made while the catalog
-   *   is unknown (discoveredModels absent).
+   * - Legacy `removedModels` tombstones (written while discovery still merged
+   *   the catalog into `models`, when deleting a row was the only way to
+   *   route that model directly) are honored by routing, so re-adding a model
+   *   clears its tombstone. Nothing new is ever recorded: removing a row only
+   *   removes the row (the catalog keeps routing it; the per-model Route
+   *   override steers routing).
+   * - The edit stamps `discoveredModelsUnlisted`: `models` is user-managed
+   *   under the new contract, so an add made before the one-shot migration
+   *   ran must never be stripped by it later. If that migration has not run
+   *   yet (skipped, or failed at startup), Settings shows the legacy merged
+   *   list and the edit resubmits its catalog rows, so the rows the migration
+   *   would strip from the persisted list are separated first; otherwise the
+   *   stamp would keep them forever. Rows new in this edit are kept.
    *
    * Runs under the providers-file lock (called from setModels).
    */
@@ -1209,21 +1321,28 @@ export class ProviderService {
           return !allowedModels.includes(id) && !visibleIds.has(id);
         })
       : [];
-    const finalModels = [...normalizedModels, ...hiddenPreserved];
+    // Same eligibility as the migration: a catalog marker without the flag
+    // means old code merged the persisted list.
+    const legacyCatalogRows = new Set<string>();
+    if (
+      section.discoveredModelsUnlisted !== true &&
+      (Array.isArray(section.discoveredModels) || Array.isArray(section.staleDiscoveredModels))
+    ) {
+      const userManaged = new Set(userManagedModelEntries(section));
+      for (const entry of normalizeProviderModelEntries(section.models)) {
+        // Only plain strings are ever classified as catalog rows.
+        if (typeof entry === "string" && !userManaged.has(entry)) legacyCatalogRows.add(entry);
+      }
+    }
+    const finalModels = [...normalizedModels, ...hiddenPreserved].filter(
+      (entry) => typeof entry !== "string" || !legacyCatalogRows.has(entry)
+    );
     const finalIds = new Set(finalModels.map((entry) => getProviderModelEntryId(entry)));
 
-    const discovered = Array.isArray(section.discoveredModels)
-      ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-      : [];
     const priorRemoved = Array.isArray(section.removedModels)
       ? section.removedModels.filter((id): id is string => typeof id === "string")
       : [];
-    const priorModelIds = normalizeProviderModelEntries(section.models).map((entry) =>
-      getProviderModelEntryId(entry)
-    );
-    const removed = [...new Set([...priorRemoved, ...discovered, ...priorModelIds])].filter(
-      (id) => !finalIds.has(id)
-    );
+    const removed = priorRemoved.filter((id) => !finalIds.has(id));
 
     section.models = finalModels;
     if (removed.length > 0) {
@@ -1231,6 +1350,7 @@ export class ProviderService {
     } else {
       delete section.removedModels;
     }
+    section.discoveredModelsUnlisted = true;
   }
 
   /**
@@ -1749,7 +1869,7 @@ export class ProviderService {
           if (existingModels.length === 0) {
             providerConfig.models = [
               "anthropic/claude-sonnet-5",
-              "anthropic/claude-opus-5",
+              "anthropic/claude-opus-5-5",
               "openai/gpt-5.5",
             ];
           }

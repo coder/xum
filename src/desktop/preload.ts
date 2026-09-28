@@ -64,10 +64,16 @@ const remoteConnection: RemoteConnectionApi = {
   getState: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.getState),
   connect: (url) => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.connect, url),
   disconnect: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.disconnect),
+  openLocalServer: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.openLocalServer),
   onStateChanged: (callback) => {
     const listener = (_event: unknown, state: RemoteConnectionState) => callback(state);
     ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
     return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+  },
+  onOpenServerWindowRequested: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
+    return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
   },
 };
 

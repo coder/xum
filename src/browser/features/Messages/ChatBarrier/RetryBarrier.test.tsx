@@ -1,9 +1,12 @@
+import "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import type * as APIModule from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
@@ -72,7 +75,9 @@ function createDeferred<T>() {
 let resumeStreamResult: ResumeStreamResult = { success: true, data: { started: true } };
 let previousAutoRetryEnabled = false;
 const resumeStream = mock((_input: unknown) => Promise.resolve(resumeStreamResult));
-const interruptStream = mock((_input: unknown) => Promise.resolve({ success: true as const }));
+const interruptStream = mock((_input: unknown) =>
+  Promise.resolve({ success: true as const, data: undefined })
+);
 const setAutoRetryEnabled = mock((input: unknown) => {
   if (
     typeof input === "object" &&
@@ -95,34 +100,23 @@ const setAutoRetryEnabled = mock((input: unknown) => {
   });
 });
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
-
-// Spread the real module: replacing it outright deletes exports like APIContext that
-// later-evaluated test files import statically, crashing them at load (module mocks are
-// process-wide and bun evaluates every test file before running tests).
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPI,
-  useAPI: () => ({
-    api: {
-      workspace: {
-        resumeStream,
-        interruptStream,
-        setAutoRetryEnabled,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = createTestApiClient({
+  workspace: {
+    resumeStream,
+    interruptStream,
+    setAutoRetryEnabled,
+  },
+});
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
+
+// The overlay also changes the store identity, so it must stay local to this suite.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
 
 // Overlay (not replace) the raw store: bun evaluates every test file before running tests
 // and static import bindings freeze at eval time, so this file-scope mock is what any
@@ -144,6 +138,14 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 // CI failures).
 
 import { RetryBarrier } from "./RetryBarrier";
+
+function Barrier() {
+  return (
+    <APIProvider client={apiClient}>
+      <RetryBarrier workspaceId="ws-1" />
+    </APIProvider>
+  );
+}
 
 describe("RetryBarrier", () => {
   beforeEach(() => {
@@ -179,7 +181,7 @@ describe("RetryBarrier", () => {
       ],
     });
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     expect(view.getByText("Response startup is taking longer than expected")).toBeTruthy();
     expect(view.queryByText("Stream interrupted")).toBeNull();
@@ -194,7 +196,7 @@ describe("RetryBarrier", () => {
       },
     };
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -221,7 +223,7 @@ describe("RetryBarrier", () => {
     const resumeDeferred = createDeferred<ResumeStreamResult>();
     resumeStream.mockImplementationOnce((_input: unknown) => resumeDeferred.promise);
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -234,7 +236,7 @@ describe("RetryBarrier", () => {
       isStreamStarting: true,
       canInterrupt: true,
     });
-    view.rerender(<RetryBarrier workspaceId="ws-1" />);
+    view.rerender(<Barrier />);
 
     resumeDeferred.resolve({ success: true, data: { started: true } });
     await waitFor(() => {
@@ -247,7 +249,7 @@ describe("RetryBarrier", () => {
       isStreamStarting: false,
       canInterrupt: false,
     });
-    view.rerender(<RetryBarrier workspaceId="ws-1" />);
+    view.rerender(<Barrier />);
 
     await waitFor(() => {
       expect(setAutoRetryEnabled).toHaveBeenCalledTimes(2);
@@ -270,7 +272,7 @@ describe("RetryBarrier", () => {
     resumeStreamResult = { success: true, data: { started: true } };
     previousAutoRetryEnabled = false;
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -298,7 +300,7 @@ describe("RetryBarrier", () => {
         },
       ],
     });
-    view.rerender(<RetryBarrier workspaceId="ws-1" />);
+    view.rerender(<Barrier />);
 
     await waitFor(() => {
       expect(setAutoRetryEnabled).toHaveBeenCalledTimes(2);
@@ -320,7 +322,7 @@ describe("RetryBarrier", () => {
     resumeStreamResult = { success: true, data: { started: true } };
     previousAutoRetryEnabled = false;
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -351,7 +353,7 @@ describe("RetryBarrier", () => {
     resumeStreamResult = { success: true, data: { started: false } };
     previousAutoRetryEnabled = false;
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -381,7 +383,7 @@ describe("RetryBarrier", () => {
       },
     };
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: "Retry" }));
 
@@ -408,7 +410,7 @@ describe("RetryBarrier", () => {
       },
     });
 
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
+    const view = render(<Barrier />);
 
     fireEvent.click(view.getByRole("button", { name: /^Stop/ }));
 

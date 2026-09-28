@@ -26,18 +26,16 @@ function projectWithNoWorkspaces(path: string): [string, ProjectConfig] {
 }
 
 function getWorkspaceTypeTrigger(container: HTMLElement): HTMLButtonElement | null {
-  const group = container.querySelector(
-    '[data-component="RuntimeTypeGroup"]'
-  ) as HTMLElement | null;
+  const group = container.querySelector('[data-component="RuntimeTypeGroup"]');
   if (!group) {
     return null;
   }
 
-  return group.querySelector('button[aria-label="Workspace type"]') as HTMLButtonElement | null;
+  return group.querySelector('button[aria-label="Workspace type"]');
 }
 
 function findRuntimeOption(label: string): HTMLElement | null {
-  const options = Array.from(document.querySelectorAll('[role="option"]')) as HTMLElement[];
+  const options = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]'));
   return options.find((option) => option.textContent?.includes(label)) ?? null;
 }
 
@@ -108,9 +106,9 @@ describeIntegration("Docker runtime selection (UI)", () => {
       // Docker image input should appear
       const imageInput = await waitFor(
         () => {
-          const input = view.container.querySelector(
+          const input = view.container.querySelector<HTMLInputElement>(
             'input[placeholder="node:20"]'
-          ) as HTMLInputElement | null;
+          );
           if (!input) {
             throw new Error("Docker image input not found");
           }
@@ -133,9 +131,7 @@ describeIntegration("Docker runtime selection (UI)", () => {
 
       await waitFor(
         () => {
-          const input = view.container.querySelector(
-            'input[placeholder="user@host"]'
-          ) as HTMLInputElement | null;
+          const input = view.container.querySelector('input[placeholder="user@host"]');
           if (!input) throw new Error("SSH host input not found");
         },
         { timeout: 2_000 }

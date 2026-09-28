@@ -1,8 +1,11 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
+  AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
   ProjectRefSchema,
+  UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   WorkflowTaskMetadataSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -11,7 +14,7 @@ import {
   WorkspaceAISettingsByAgentSchema,
   WorkspaceAISettingsSchema,
 } from "@/common/orpc/schemas/workspaceAiSettings";
-import { ThinkingLevelSchema } from "@/common/types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
 import { z } from "zod";
 
@@ -54,6 +57,27 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   projects: z.array(WorktreeArchiveSnapshotProjectSchema).min(1).meta({
     description: "Per-project restore metadata for the archived workspace snapshot.",
   }),
+});
+
+/** A backend's in-flight workspace removal (#4478); see WorkspaceConfigSchema.pendingRemoval. */
+export const PendingRemovalSchema = z.object({
+  removalId: z.string(),
+  // The owning WorkspaceService instance and its process, judged by processLiveness's
+  // judgeHolder so a crashed removal's marker can be taken over.
+  instanceId: z.string(),
+  // A pid judgeHolder can probe; anything else is dropped as malformed at load.
+  pid: z.number().int().positive(),
+  // Non-empty or null (#4782): parseProcessIdentity reads "" as unknown, which judgeHolder treats
+  // as an unknown PID domain that never dies, so such a marker is dropped at load instead.
+  identity: z.object({
+    birth: z.string().min(1).nullable(),
+    bootId: z.string().min(1).nullable(),
+    pidNs: z.string().min(1).nullable(),
+    machineId: z.string().min(1).nullable(),
+    platform: z.string().min(1).nullable(),
+    hostname: z.string().min(1).nullable(),
+  }),
+  at: z.string(),
 });
 
 export const WorkspaceConfigSchema = z.object({
@@ -100,6 +124,16 @@ export const WorkspaceConfigSchema = z.object({
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults. Sparse; each null field follows the global `goalDefaults`.",
+  }),
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
+    description:
+      "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:
@@ -153,6 +187,10 @@ export const WorkspaceConfigSchema = z.object({
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
   }),
+  taskCheckoutUnsanitized: z.boolean().optional().meta({
+    description:
+      "The task's launch could not sanitize its checkout's plugin overrides and the checkout was retained. MCP and sends refuse the task until it is removed; persisted so a restart keeps refusing (#4674).",
+  }),
   taskTimeoutFinalizationTokens: z.array(z.string().min(1)).optional().meta({
     description:
       "Idempotency tokens for workflow timeout finalization prompts already sent to this task.",
@@ -170,6 +208,17 @@ export const WorkspaceConfigSchema = z.object({
   taskThinkingLevel: ThinkingLevelSchema.optional().meta({
     description: "Thinking level used for this agent task (used for restart-safe resumptions).",
   }),
+  taskAiPins: z
+    .object({
+      model: z.string().optional(),
+      thinkingLevel: ThinkingLevelSchema.optional(),
+      reasoningMode: OpenAIReasoningModeSchema.optional(),
+    })
+    .optional()
+    .meta({
+      description:
+        "Agent-task AI fields pinned by explicit task arguments or by deliberate user picks sent from the task's chat; cleared at plan-to-exec handoff. Unpinned fields re-resolve from current defaults when an ancestor reawakens the task. Absent on legacy tasks, which keep creation-time settings.",
+    }),
   taskOnRefusal: z.enum(["fail", "fallback"]).optional().meta({
     description:
       "Model-refusal policy for this agent task: 'fail' opts out of configured model-fallback chains so refusals settle terminally (e.g. workflow verifier steps). Default behavior is 'fallback'.",
@@ -255,6 +304,45 @@ export const WorkspaceConfigSchema = z.object({
     .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
     .optional()
     .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
+  // Attempt identity is owned by the backend's task admissions: every admission that can start
+  // a publishing execution (reservation commit, queue launch, reawaken, reactivation, startup
+  // re-drive) rotates it in the same config write. Identity only — no other code branches on it.
+  taskAttemptId: z.string().optional().meta({
+    description:
+      "Opaque identity of the agent task's current execution attempt (att_ + 16 hex). Rotated by every admission and never reused; absent on entries written before attempt identity existed.",
+  }),
+  taskAttemptUnproven: z.literal(true).optional().meta({
+    description:
+      "Set when the attempt's lineage cannot be proven settled (startup re-drive, stale-starting relaunch, pre-upgrade entry, or reawakened from such an attempt). Inherited by every successor; cleared only by a new reservation.",
+  }),
+  taskAttemptRetiredBy: z
+    .object({
+      runId: z.string(),
+      stepId: z.string(),
+      inputHash: z.string(),
+      childTaskId: z.string(),
+      attemptId: z.string(),
+      mode: z.enum(["no-report", "retire-reported"]),
+      at: z.string(),
+      // Single-use publication (G2): a fresh nonce per claim, and the one replacement the claim
+      // published. createMany's publishing commit checks the nonce and sets replacementTaskId in
+      // the same config write; a later claim may re-stamp the nonce only while it is unset.
+      nonce: z.string().optional(),
+      replacementTaskId: z.string().optional(),
+    })
+    .optional()
+    .meta({
+      description:
+        "Monotonic workflow claim that retired this attempt for replacement. Never cleared; every later admission of the task refuses while it is set.",
+    }),
+  pendingRemoval: PendingRemovalSchema.optional().meta({
+    description:
+      "Set by a backend's workspace removal before any destructive effect. Every task admission refuses while it is set; a failed removal clears it, and a removal whose owner process is dead is taken over by the next removal.",
+  }),
+  taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
+    description:
+      "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",
+  }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +

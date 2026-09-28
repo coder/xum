@@ -1,5 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createDisplayUsage, recomputeUsageCosts } from "./displayUsage";
+import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { ChatUsageDisplaySchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 describe("createDisplayUsage", () => {
@@ -275,6 +277,45 @@ describe("createDisplayUsage", () => {
   });
 
   describe("tiered long-context pricing", () => {
+    test.each([
+      ["openai:gpt-6-sol", 2, 0.2, 10],
+      ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
+      // GPT-5.6 Sol promotional base rates (OpenAI pricing page, verified 2026-09-26);
+      // the bare alias routes to Sol and must price identically.
+      ["openai:gpt-5.6-sol", 4, 0.4, 20],
+      ["openai:gpt-5.6", 4, 0.4, 20],
+    ] as const)(
+      "applies %s pricing only above the 272K boundary",
+      (model, input, cached, output) => {
+        for (const tokens of [272000, 272001]) {
+          const longContext = tokens > 272000;
+          // inputTokens is inclusive of cache reads and writes; the tier is chosen from
+          // the whole prompt, so the boundary also moves cache-read and cache-write rates.
+          const result = createDisplayUsage(
+            {
+              inputTokens: tokens,
+              cachedInputTokens: 100000,
+              outputTokens: 1000,
+              totalTokens: tokens + 1000,
+            },
+            model,
+            { anthropic: { cacheCreationInputTokens: 5000 } }
+          );
+          expect(result?.input.cost_usd).toBeCloseTo(
+            (((tokens - 105000) * input) / 1e6) * (longContext ? 2 : 1),
+            12
+          );
+          expect(result?.cached.cost_usd).toBeCloseTo(0.1 * cached * (longContext ? 2 : 1), 12);
+          // Cache writes bill at 1.25x the active input rate.
+          expect(result?.cacheCreate.cost_usd).toBeCloseTo(
+            0.005 * input * 1.25 * (longContext ? 2 : 1),
+            12
+          );
+          expect(result?.output.cost_usd).toBeCloseTo(0.001 * output * (longContext ? 1.5 : 1), 12);
+        }
+      }
+    );
+
     test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 272000,
@@ -542,6 +583,159 @@ describe("createDisplayUsage", () => {
 
       expect(result).toBeDefined();
       expect(result!.cacheCreate.tokens).toBe(1500);
+    });
+  });
+});
+
+describe("OpenAI service-tier pricing (#4352)", () => {
+  const tierMetadata = (tier: string | undefined) =>
+    tier === undefined ? undefined : { openai: { serviceTier: tier } };
+  const display = (model: string, inputTokens: number, tier?: string, outputTokens = 1_000) => {
+    const usage = createDisplayUsage({ inputTokens, outputTokens }, model, tierMetadata(tier));
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const cost = (model: string, inputTokens: number, tier?: string) => {
+    const total = getTotalCost(display(model, inputTokens, tier));
+    if (total === undefined) throw new Error("expected a priced model");
+    return total;
+  };
+
+  test("prices the tier the provider reported, not the base rate", () => {
+    const sol = (tier?: string) => cost("openai:gpt-6-sol", 100_000, tier);
+    // A ramp-downgraded Fast request reports "default" and is billed at Standard.
+    expect(sol("default")).toBe(sol(undefined));
+    expect(sol("auto")).toBe(sol(undefined));
+    expect(sol("priority")).toBe(sol("fast"));
+    expect(sol("fast")).toBeGreaterThan(sol("default"));
+    expect(sol("flex")).toBeLessThan(sol("default"));
+  });
+
+  test("scales long-context Fast from the Standard long rate across the 272K boundary", () => {
+    const ratio = (inputTokens: number) =>
+      cost("openai:gpt-6-sol", inputTokens, "fast") / cost("openai:gpt-6-sol", inputTokens);
+    expect(ratio(272_000)).toBeGreaterThan(1);
+    expect(ratio(272_001)).toBeCloseTo(ratio(272_000), 12);
+  });
+
+  test("charges the highest published rate for an unpublished Fast long-context cell", () => {
+    // gpt-5.5 publishes Fast short-context rates only.
+    const fastShort = display("openai:gpt-5.5", 272_000, "priority");
+    const standardLong = display("openai:gpt-5.5", 272_001);
+    const fastLong = display("openai:gpt-5.5", 272_001, "priority");
+    const perToken = (value: number | undefined, tokens: number) => (value ?? NaN) / tokens;
+    expect(getTotalCost(fastLong)).toBeGreaterThan(getTotalCost(standardLong) ?? Infinity);
+    expect(fastLong.input.cost_usd).toBeCloseTo(
+      272_001 *
+        Math.max(
+          perToken(fastShort.input.cost_usd, 272_000),
+          perToken(standardLong.input.cost_usd, 272_001)
+        ),
+      12
+    );
+    expect(fastLong.output.cost_usd).toBeCloseTo(
+      Math.max(fastShort.output.cost_usd ?? NaN, standardLong.output.cost_usd ?? NaN),
+      12
+    );
+  });
+
+  test("never prices Flex above Standard, including its unpublished long-context cell", () => {
+    // gpt-5.5-pro publishes Flex short-context rates only.
+    expect(cost("openai:gpt-5.5-pro", 100_000, "flex")).toBeLessThan(
+      cost("openai:gpt-5.5-pro", 100_000)
+    );
+    expect(cost("openai:gpt-5.5-pro", 300_000, "flex")).toBe(cost("openai:gpt-5.5-pro", 300_000));
+  });
+
+  test("prices an unknown reported tier at least as high as Fast", () => {
+    const unknown = cost("openai:gpt-6-sol", 100_000, "ultrafast");
+    expect(unknown).toBeGreaterThan(cost("openai:gpt-6-sol", 100_000));
+    expect(unknown).toBeGreaterThanOrEqual(cost("openai:gpt-6-sol", 100_000, "fast"));
+  });
+
+  test("keeps gateway-included costs at zero whatever tier was reported", () => {
+    const usage = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      "openai:gpt-6-sol",
+      {
+        openai: { serviceTier: "priority" },
+        mux: { costsIncluded: true },
+      }
+    );
+    expect(getTotalCost(usage)).toBe(0);
+  });
+
+  test("prices the bare gpt-5.6 catalog alias like gpt-5.6-sol", () => {
+    expect(cost("openai:gpt-5.6", 100_000, "fast")).toBe(
+      cost("openai:gpt-5.6-sol", 100_000, "fast")
+    );
+    expect(cost("openai:gpt-5.6", 100_000, "fast")).toBeGreaterThan(
+      cost("openai:gpt-5.6", 100_000)
+    );
+  });
+
+  test("resolves the same tier rates for dated snapshots and metadata-model overrides", () => {
+    const base = cost("openai:gpt-6-sol", 100_000, "fast");
+    expect(cost("openai:gpt-6-sol-2026-09-01", 100_000, "fast")).toBe(base);
+    const viaOverride = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      "coder:openai/gpt-6-sol",
+      tierMetadata("fast"),
+      "openai:gpt-6-sol"
+    );
+    expect(getTotalCost(viaOverride)).toBe(base);
+  });
+});
+
+describe("repricing keeps the billed service tier (#4787)", () => {
+  // gpt-5-mini has Fast and Flex rates but no long-context tier, so its session
+  // aggregates are repriced rather than preserved.
+  const MODEL = "openai:gpt-5-mini";
+  const priced = (model: string, tier?: string) => {
+    const usage = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      model,
+      tier === undefined ? undefined : { openai: { serviceTier: tier } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const total = (usage: Parameters<typeof getTotalCost>[0]) => {
+    const value = getTotalCost(usage);
+    if (value === undefined) throw new Error("expected a priced total");
+    return value;
+  };
+
+  test("reprices a Fast or Flex request at the tier it was billed at", () => {
+    expect(total(priced("openai:gpt-6-sol", "priority"))).toBeGreaterThan(
+      total(priced("openai:gpt-6-sol"))
+    );
+    for (const tier of ["priority", "flex"]) {
+      const usage = priced("openai:gpt-6-sol", tier);
+      expect(total(recomputeUsageCosts(usage, "openai:gpt-6-sol"))).toBeCloseTo(total(usage), 12);
+    }
+  });
+
+  test("the billed tier survives the session-usage schema", () => {
+    const usage = priced("openai:gpt-6-sol", "priority");
+    const parsed = ChatUsageDisplaySchema.parse(usage);
+    expect(total(recomputeUsageCosts(parsed, "openai:gpt-6-sol"))).toBeCloseTo(total(usage), 12);
+  });
+
+  test("reprices an aggregate of one tier at that tier", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL, "priority")]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    const repriced = recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true });
+    expect(repriced.hasUnknownCosts).toBeUndefined();
+    expect(total(repriced)).toBeCloseTo(total(aggregate), 12);
+  });
+
+  test("keeps the stored costs, marked approximate, of an aggregate that mixes tiers", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL)]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual({
+      ...aggregate,
+      hasUnknownCosts: true,
     });
   });
 });

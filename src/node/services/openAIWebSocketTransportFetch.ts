@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { captureAndStripDevToolsHeader } from "./devToolsHeaderCapture";
+import { captureAndStripDevToolsHeader, resolveDevToolsCaptureBody } from "./devToolsHeaderCapture";
 import { createWebSocketFetch as createOpenAIWebSocketFetch } from "@vercel/ai-sdk-openai-websocket-fetch";
 
 type WebSocketFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & {
@@ -117,7 +117,7 @@ export function createOpenAIWebSocketTransportFetch(
     const headers = new Headers(
       init?.headers ?? (input instanceof Request ? input.headers : undefined)
     );
-    captureAndStripDevToolsHeader(headers);
+    captureAndStripDevToolsHeader(headers, await resolveDevToolsCaptureBody(headers, input, init));
     const response = await activeWebSocketFetch(input, { ...(init ?? {}), headers });
     if (closeRequested) {
       try {

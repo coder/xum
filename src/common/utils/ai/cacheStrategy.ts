@@ -213,12 +213,11 @@ export function createCachedSystemMessage(
 }
 
 /**
- * Whether an official-endpoint host check passes for direct OpenAI explicit
- * prompt caching. Absence of any override means the SDK's official default;
- * any configured value must resolve to the canonical https://api.openai.com
- * endpoint (root or /v1 path, default port, no credentials/query/hash).
+ * Whether a configured base URL is a provider's canonical official endpoint
+ * (https://<hostname>, root or /v1 path, default port, no credentials/query/hash).
+ * Callers treat an absent override as the SDK's official default.
  */
-function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
+export function isOfficialProviderBaseUrl(baseUrl: string, hostname: string): boolean {
   let url: URL;
   try {
     url = new URL(baseUrl);
@@ -228,7 +227,7 @@ function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
 
   return (
     url.protocol === "https:" &&
-    url.hostname === "api.openai.com" &&
+    url.hostname === hostname &&
     url.port === "" &&
     url.username === "" &&
     url.password === "" &&
@@ -305,7 +304,7 @@ export function openaiExplicitPromptCachingAvailable(
   // factory); baseUrlResolved carries the active env value when config is
   // unset. Absence of both means the SDK's official default endpoint.
   const activeBaseUrl = openaiConfig.baseUrl ?? openaiConfig.baseUrlResolved;
-  if (activeBaseUrl != null && !isOfficialOpenAIBaseUrl(activeBaseUrl)) {
+  if (activeBaseUrl != null && !isOfficialProviderBaseUrl(activeBaseUrl, "api.openai.com")) {
     return false;
   }
 

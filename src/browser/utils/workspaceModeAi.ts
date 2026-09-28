@@ -10,6 +10,7 @@ import {
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
 
 export type WorkspaceAISettingsCache = Partial<
   Record<
@@ -38,16 +39,39 @@ export function resolveConfiguredAiDefaults(
   agentId: string,
   agentAiDefaults: AgentAiDefaults,
   agentBaseById?: ReadonlyMap<string, string | undefined>
-): { modelString?: string; thinkingLevel?: ThinkingLevel; reasoningMode?: OpenAIReasoningMode } {
+): {
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+  // Each Auto flag is true only when the nearest config layer deciding that dimension chose Auto.
+  autoModelRouting?: true;
+  autoThinkingLevel?: true;
+} {
   const normalizedAgentId = normalizeAgentId(agentId);
   const descriptorsById = new Map([...(agentBaseById ?? [])].map(([id, base]) => [id, { base }]));
+  const ancestors = collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     agentAiDefaults,
-    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    ancestors,
   });
   const fromConfig = (source: AiSettingSource | undefined) => source?.tier === "config";
+
+  // The nearest declared layer setting Auto or a concrete value decides each dimension.
+  // The implicit exec fallback contributes only reasoningMode.
+  const chainIds = [normalizedAgentId, ...ancestors.map((ancestor) => ancestor.agentId)];
+  const resolveConfiguredAuto = (
+    flag: "autoModelRouting" | "autoThinkingLevel",
+    source: AiSettingSource | undefined
+  ): true | undefined => {
+    for (const id of chainIds) {
+      if (agentAiDefaults[id]?.[flag] === true) return true;
+      if (fromConfig(source) && source?.agentId === id) return undefined;
+    }
+    return undefined;
+  };
+
   return {
     modelString: fromConfig(resolved.sources.model) ? resolved.selected.model : undefined,
     thinkingLevel: fromConfig(resolved.sources.thinkingLevel)
@@ -56,6 +80,70 @@ export function resolveConfiguredAiDefaults(
     reasoningMode: fromConfig(resolved.sources.reasoningMode)
       ? resolved.selected.reasoningMode
       : undefined,
+    autoModelRouting: resolveConfiguredAuto("autoModelRouting", resolved.sources.model),
+    autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
+  };
+}
+
+/** Explicit composer picks per agent: true = Auto, false = a concrete value. */
+export type AutoRoutingChoiceByAgent = Partial<
+  Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
+>;
+
+/** undefined leaves the scope's Auto flag unchanged. */
+export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
+
+/**
+ * Explicit switches prefer workspace picks over configured defaults. Background sync only
+ * enables configured Auto when no pick or per-agent bucket exists, and never disables existing Auto.
+ */
+export function resolveAutoRoutingForAgent(args: {
+  agentId: string;
+  agentAiDefaults: AgentAiDefaults;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
+  explicitSwitch: boolean;
+  experimentEnabled: boolean;
+  routingChoices?: AutoRoutingChoiceByAgent;
+  workspaceByAgent?: WorkspaceAISettingsCache;
+}): AutoRoutingOutcome {
+  if (!args.experimentEnabled) {
+    // Keep per-agent choices stored but inactive while the experiment is off.
+    const outcome = args.explicitSwitch ? false : undefined;
+    return { model: outcome, thinkingLevel: outcome };
+  }
+
+  const normalizedAgentId = normalizeAgentId(args.agentId);
+  const configured = resolveConfiguredAiDefaults(
+    normalizedAgentId,
+    args.agentAiDefaults,
+    args.agentBaseById
+  );
+  const choices = args.routingChoices?.[normalizedAgentId];
+  const bucket = args.workspaceByAgent?.[normalizedAgentId];
+  const bucketModel = typeof bucket?.model === "string" ? bucket.model.trim() : "";
+
+  const resolveDimension = (
+    choice: boolean | undefined,
+    configuredAuto: boolean,
+    hasBucketValue: boolean
+  ): boolean | undefined => {
+    if (args.explicitSwitch) {
+      return choice ?? configuredAuto;
+    }
+    return configuredAuto && choice === undefined && !hasBucketValue ? true : undefined;
+  };
+
+  return {
+    model: resolveDimension(
+      choices?.model,
+      configured.autoModelRouting === true,
+      isValidModelFormat(bucketModel)
+    ),
+    thinkingLevel: resolveDimension(
+      choices?.thinkingLevel,
+      configured.autoThinkingLevel === true,
+      coerceThinkingLevel(bucket?.thinkingLevel) != null
+    ),
   };
 }
 

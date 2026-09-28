@@ -117,6 +117,55 @@ export const WorkflowTaskMetadataSchema = z.object({
   }),
 });
 
+/**
+ * Shared description for the recipient-consent field on persisted config and published metadata.
+ * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
+ * it; the backend compares the generation captured at admission with the current one so an
+ * off→on flip cannot revive work queued under the previous consent. Absent means off. New root
+ * workspaces get a fresh generation once their creation setup is complete (on by default; for
+ * task-delegated targets, once their creating turn settles); the app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * application-level opt-in, not an isolation boundary.
+ */
+export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces start with one (task-delegated targets once their first turn ends, disposable ones never); absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+
+/**
+ * Fail-closed reader for the persisted consent generation. Config entries are loaded without
+ * per-field schema validation, so a corrupted, blank, or whitespace-padded value must read as
+ * "off" rather than as a permissive default — and must never make the workspace unloadable.
+ */
+export function getValidUnrelatedWorkspaceConsent(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  return value.trim() === value ? value : undefined;
+}
+
+/**
+ * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
+ * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
+ * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
+ * the current turn ends, even if the sender asked for tool-end.
+ */
+export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
+
+export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
+export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;
+
+/**
+ * Lenient reader for the persisted delivery preference. Config entries are loaded without
+ * per-field validation, so anything other than a known mode reads as absent (the tool-end default)
+ * rather than making the workspace unloadable.
+ */
+export function getValidAgentMessageDispatchMode(
+  value: unknown
+): AgentMessageDispatchMode | undefined {
+  const parsed = AgentMessageDispatchModeSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 export const WorkspaceMetadataSchema = z.object({
   kind: z.literal("scratch").optional().meta({
     description: "Marks an app-owned project-less scratch chat workspace.",
@@ -165,6 +214,14 @@ export const WorkspaceMetadataSchema = z.object({
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults (budget, turn cap, explicit-budget). Layered on top of the global `goalDefaults` from app config.",
+  }),
+  // Passed through from config so the settings UI reads consent from metadata instead of
+  // keeping a duplicate copy; only a validated (non-blank) generation is published.
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:

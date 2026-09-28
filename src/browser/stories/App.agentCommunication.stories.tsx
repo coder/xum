@@ -1,7 +1,7 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { PhoneSubagentReportDecorator } from "./helpers/subagentReportStory";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
@@ -126,6 +126,132 @@ export const Phone: AppStory = {
       await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
     }
   },
+};
+
+// Replayed kernel history has compact records, not the full streamed nestedCalls.
+function setupCompactedCommunicationStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-compacted-agent-communication",
+    workspaceName: "compacted-communication",
+    projectName: "mux",
+    messages: [
+      createAssistantMessage("compacted-updates", "", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+        toolCalls: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "compacted-execution",
+            toolName: "code_execution",
+            state: "output-available",
+            input: { code: "// Send agent updates" },
+            output: {
+              success: true,
+              duration_ms: 2,
+              consoleOutput: [],
+              toolCalls: [
+                {
+                  toolName: "agent_report",
+                  args: { title: REPORT_TITLE, reportMarkdown: REPORT },
+                  ok: true,
+                  bytes: 32,
+                  duration_ms: 1,
+                },
+                {
+                  toolName: "task_send_message",
+                  args: { task_id: "b3947e259a", message: MESSAGE },
+                  ok: true,
+                  bytes: 64,
+                  duration_ms: 1,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    ],
+  });
+}
+
+export const Compacted: AppStory = {
+  render: () => <AppWithMocks setup={setupCompactedCommunicationStory} />,
+  parameters: Outgoing.parameters,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("button", { name: "Message to agent" });
+    if (toggle.getAttribute("aria-expanded") !== "true") await userEvent.click(toggle);
+    await expect(canvas.getByRole("region", { name: "Message content" })).toHaveTextContent(
+      MESSAGE.replace(/\s+/g, " ")
+    );
+    const cards = canvasElement.querySelectorAll('[data-component="AgentCommunicationCard"]');
+    await expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      const status = within(card as HTMLElement).getByRole("status");
+      await expect(status).not.toHaveClass("text-danger");
+      await expect(status).not.toHaveClass("text-success");
+      await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+    }
+  },
+};
+
+export const CompactedPhone: AppStory = {
+  ...Compacted,
+  globals: Phone.globals,
+  decorators: Phone.decorators,
+  parameters: Phone.parameters,
+};
+
+// Messages queued behind a busy recipient, one per dispatch mode (#4736).
+function setupQueuedCommunicationStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-queued-agent-communication",
+    workspaceName: "queued-communication",
+    projectName: "mux",
+    messages: [
+      createAssistantMessage("queued-messages", "", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+        toolCalls: (["tool-end", "turn-end"] as const).map((queueDispatchMode) => ({
+          type: "dynamic-tool" as const,
+          toolCallId: `queued-${queueDispatchMode}`,
+          toolName: "task_send_message",
+          state: "output-available" as const,
+          input: { task_id: "b3947e259a", message: MESSAGE },
+          output: { status: "queued", taskId: "b3947e259a", queueDispatchMode },
+        })),
+      }),
+    ],
+  });
+}
+
+export const Queued: AppStory = {
+  render: () => <AppWithMocks setup={setupQueuedCommunicationStory} />,
+  // Play-only contract: the Pixel snapshot budget is full, and the label-only change is covered
+  // by the unit test plus this layout check.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Queued until turn end");
+    const cards = canvasElement.querySelectorAll('[data-component="AgentCommunicationCard"]');
+    await expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      // Queued is neither a failure nor a completed delivery.
+      const status = within(card as HTMLElement).getByRole("status");
+      await expect(status).not.toHaveClass("text-danger");
+      await expect(status).not.toHaveClass("text-success");
+      await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+    }
+  },
+};
+
+export const QueuedPhone: AppStory = {
+  ...Queued,
+  globals: Phone.globals,
+  decorators: Phone.decorators,
 };
 
 export const DeliveryFailures: AppStory = {

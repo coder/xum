@@ -134,7 +134,7 @@ jobs:
       - name: Build application
         run: make build
 
-      - name: Pack npm package for smoke test
+      - name: Pack npm package
         id: pack
         run: |
           TARBALL=$(./scripts/pack-npm-package.sh)
@@ -188,15 +188,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Clean up tarball
-        if: always()
-        env:
-          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
-        run: |
-          if [ -n "$PACKAGE_TARBALL" ]; then
-            rm -f "$PACKAGE_TARBALL"
-          fi
-
       - name: Check if version exists
         id: check-exists
         run: |
@@ -213,10 +204,13 @@ jobs:
         env:
           STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
 
+      # Publish the smoke-tested tarball: publishing the checkout would re-pack its manifest,
+      # including the dev-only patchedDependencies that pack-npm-package.sh strips.
       - name: Publish to NPM
         if: steps.check-exists.outputs.exists == 'false'
-        run: npm publish --tag "$STEPS_VERSION_OUTPUTS_TAG"
+        run: npm publish "$PACKAGE_TARBALL" --tag "$STEPS_VERSION_OUTPUTS_TAG"
         env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
 
       - name: Skip (version already exists)
@@ -225,6 +219,15 @@ jobs:
           echo "Version ${STEPS_VERSION_OUTPUTS_VERSION} already exists on npm; skipping publish."
         env:
           STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Clean up tarball
+        if: always()
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          if [ -n "$PACKAGE_TARBALL" ]; then
+            rm -f "$PACKAGE_TARBALL"
+          fi
 
       - name: Verify legacy mux compatibility package
         working-directory: packages/mux-compat

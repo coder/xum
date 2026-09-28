@@ -7,6 +7,7 @@ import {
   useOptionalWorkspaceContext,
 } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { getTimelineFilterKey } from "@/common/constants/storage";
 import {
   pinTimelineRevealTarget,
   useWorkspaceStoreRaw,
@@ -778,7 +779,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
   // listener keeps duplicate mounts in sync: a CSS-hidden sidebar tab and the mobile
   // timeline dialog can both be mounted, sharing this persisted filter.
   const [storedFilter, setStoredFilter] = usePersistedState<string>(
-    `timeline-filter:${props.workspaceId}`,
+    getTimelineFilterKey(props.workspaceId),
     "all",
     { listener: true }
   );

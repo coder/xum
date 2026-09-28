@@ -26,6 +26,19 @@ interface TestWorkspaceService {
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
   getWorkflowContinuationSendOptions: ReturnType<typeof mock>;
   sendMessage: ReturnType<typeof mock>;
+  getWorkflowArchiveRefusal: ReturnType<typeof mock>;
+}
+
+/** The production task adapter refuses a task service that cannot publish replacements (G2). */
+function replacementCapabilities() {
+  return {
+    createMany: mock(async () => {
+      throw new Error("createMany not expected in this test");
+    }),
+    claimRetiredAttempt: mock(async () => {
+      throw new Error("claimRetiredAttempt not expected in this test");
+    }),
+  };
 }
 
 describe("WorkflowService request orchestration", () => {
@@ -71,6 +84,7 @@ describe("WorkflowService request orchestration", () => {
       isWorkflowInvocationCurrent: mock(async () => false),
       getWorkflowContinuationSendOptions: mock(async () => null),
       sendMessage: mock(async () => ({ success: true, data: undefined })),
+      getWorkflowArchiveRefusal: mock(() => null),
     };
     const waitForInit = mock(async () => undefined);
     const context = {
@@ -99,6 +113,7 @@ describe("WorkflowService request orchestration", () => {
       },
       workspaceService,
       taskService: {
+        ...replacementCapabilities(),
         noteWorkflowRunTerminalAttention: mock(() => undefined),
         clearWorkflowRunDowngradeSettlement: mock(async () => undefined),
       },
@@ -146,6 +161,30 @@ describe("WorkflowService request orchestration", () => {
         args: { topic: "direct" },
       })
     ).toMatchObject({ status: "completed", result: { reportMarkdown: "parent:direct" } });
+  });
+
+  test("start refuses through the owning WorkspaceService's archive gate before creating a run", async () => {
+    const { context, workspaceService } = createContext();
+    const refusal =
+      "Workspace is archived: workspace-1. Unarchive it before starting or resuming workflows.";
+    workspaceService.getWorkflowArchiveRefusal = mock(() => refusal);
+
+    let error: unknown;
+    try {
+      await startWorkflowRun(context, {
+        workspaceId: "workspace-1",
+        scriptPath: "./workflows/demo.js",
+        args: { topic: "refused" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(String(error)).toContain(refusal);
+    expect(workspaceService.getWorkflowArchiveRefusal).toHaveBeenCalledWith("workspace-1");
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
+    expect(await runStore.listRuns()).toEqual([]);
   });
 
   test("waits for idle and persists slash invocation inputs before starting", async () => {
@@ -460,6 +499,7 @@ describe("WorkflowService request orchestration", () => {
     const noteWorkflowRunTerminalAttention = mock(() => undefined);
     const { context } = createContext();
     (context as unknown as Record<string, unknown>).taskService = {
+      ...replacementCapabilities(),
       noteWorkflowRunTerminalAttention,
     };
 
@@ -496,6 +536,7 @@ describe("WorkflowService request orchestration", () => {
     const clearWorkflowRunDowngradeSettlement = mock(async () => undefined);
     const { context } = createContext();
     (context as unknown as Record<string, unknown>).taskService = {
+      ...replacementCapabilities(),
       noteWorkflowRunTerminalAttention: mock(() => undefined),
       clearWorkflowRunDowngradeSettlement,
     };

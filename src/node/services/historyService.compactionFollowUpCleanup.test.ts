@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";

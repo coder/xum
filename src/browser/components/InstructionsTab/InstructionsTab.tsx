@@ -25,7 +25,7 @@ interface InstructionsTabProps {
 /**
  * The Instructions panel renders the structured `WorkspaceInstructions` payload
  * returned by `workspace.getInstructions`. The same `InstructionFile` objects
- * the agent sees are rendered here — type-system parity with `buildSystemMessage`
+ * the agent sees are rendered here — type-system parity with `buildSystemMessageFromSources`
  * is enforced by sharing `@/common/types/instructions`.
  */
 export function InstructionsTab(props: InstructionsTabProps) {

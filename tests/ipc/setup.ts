@@ -163,11 +163,16 @@ export { shouldRunIntegrationTests, validateApiKeys, getApiKey };
  * Call this in beforeAll hooks to prevent Jest sandbox race conditions.
  */
 export async function preloadTestModules(): Promise<void> {
-  const [{ loadTokenizerModules }, { preloadAISDKProviders }] = await Promise.all([
+  const [{ loadTokenizerModules }, { PROVIDER_REGISTRY }] = await Promise.all([
     import("../../src/node/utils/main/tokenizer"),
-    import("../../src/node/services/providerModelFactory"),
+    import("../../src/common/constants/providers"),
   ]);
-  await Promise.all([loadTokenizerModules(), preloadAISDKProviders()]);
+  // Production lazy-loads AI SDK providers on first use; load them all up front so
+  // concurrent createModel() calls hit the module cache instead of racing.
+  await Promise.all([
+    loadTokenizerModules(),
+    ...Object.values(PROVIDER_REGISTRY).map((importProvider) => importProvider()),
+  ]);
 }
 
 /**
@@ -199,6 +204,7 @@ export async function setupWorkspace(
   if (provider === "ollama") {
     await setupProviders(env, {
       [provider]: {
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty env var means unset
         baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434/api",
       },
     });
@@ -210,6 +216,7 @@ export async function setupWorkspace(
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the provider name
   const branchName = generateBranchName(branchPrefix || provider);
   const runtimeConfig = options?.runtimeConfig;
   const waitForInit = options?.waitForInit ?? false;
@@ -316,6 +323,7 @@ export async function setupWorkspaceWithoutProvider(branchPrefix?: string): Prom
 
   const env = await createTestEnvironment();
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the default
   const branchName = generateBranchName(branchPrefix || "noapi");
   const createResult = await createWorkspace(env, tempGitRepo, branchName);
 

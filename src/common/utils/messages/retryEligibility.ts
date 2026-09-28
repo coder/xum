@@ -55,6 +55,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
   "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
+  "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
@@ -87,8 +88,10 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "incompatible_workspace": // Workspace from newer mux version - user must upgrade
     case "runtime_not_ready": // Container doesn't exist - user must recreate workspace
     case "policy_denied": // Policy blocks won't resolve automatically
+    case "task_checkout_unsanitized": // Permanent until the task is removed (#4674)
     case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
     case "context_budget_blocked":
+    case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":
@@ -313,35 +316,4 @@ export function getInterruptionContext(
 
   // Other interrupted states (partial messages, user messages) are auto-retryable
   return { hasInterruptedStream: true, isEligibleForAutoRetry: true };
-}
-
-export function hasInterruptedStream(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .hasInterruptedStream;
-}
-
-/**
- * Check if messages are eligible for automatic retry
- *
- * Used by retry status consumers to determine if a stream interruption is auto-retry eligible.
- * Returns false for errors that require user action (authentication, quota, etc.),
- * but still allows manual retry via RetryBarrier UI.
- *
- * This separates auto-retry logic from manual retry UI:
- * - Manual retry: Always available for any error (hasInterruptedStream)
- * - Auto retry: Only for transient errors that might resolve on their own
- */
-export function isEligibleForAutoRetry(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .isEligibleForAutoRetry;
 }

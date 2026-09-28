@@ -1,10 +1,20 @@
+// Real Radix exports must initialize after the DOM, even when this suite runs first.
+import { installDom } from "../../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualModelsModule from "@/browser/hooks/useModelsFromSettings";
+import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
+import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import * as ActualMinThinkingLevelsModule from "@/browser/hooks/useMinThinkingLevels";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
@@ -13,7 +23,6 @@ import {
   type ThinkingLevel,
   type OpenAIReasoningMode,
 } from "@/common/types/thinking";
-import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
 interface MockConfig {
@@ -25,27 +34,21 @@ interface MockConfig {
   advisorMaxOutputTokens: number | null | undefined;
 }
 
-interface SaveConfigInput {
-  taskSettings: TaskSettings;
-  advisorModelString?: string | null;
-  advisorThinkingLevel?: ThinkingLevel | null;
-  advisorReasoningMode?: OpenAIReasoningMode | null;
-  advisorMaxUsesPerTurn?: number | null;
-  advisorMaxOutputTokens?: number | null;
-}
+type SaveConfigInput = Parameters<APIClient["config"]["saveConfig"]>[0];
 
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<MockConfig>;
-    saveConfig: (input: SaveConfigInput) => Promise<void>;
-  };
-}
+// Capture every dependency before mocking: later settings tests mount the real provider stack.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ExperimentsContext", { ...ActualExperimentsModule }],
+  ["@/browser/hooks/useModelsFromSettings", { ...ActualModelsModule }],
+  ["@/browser/components/ModelSelector/ModelSelector", { ...ActualModelSelectorModule }],
+  ["@/browser/hooks/useTelemetry", { ...ActualTelemetryModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
+  ["@/browser/hooks/useMinThinkingLevels", { ...ActualMinThinkingLevelsModule }],
+  ["@/browser/hooks/useRouting", { ...ActualRoutingModule }],
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...ActualSelectPrimitiveModule }],
+]);
 
-// Capture before installing module mocks; mock.restore() does not undo them.
-const actualMinThinkingLevelsModule = { ...ActualMinThinkingLevelsModule };
-const actualRoutingModule = { ...ActualRoutingModule };
-
-let mockApi: MockAPIClient;
+let mockApi: TestApiOverrides<APIClient>;
 let providersConfig: ProvidersConfigMap | null = null;
 let minimumThinkingLevel: ThinkingLevel = THINKING_LEVEL_OFF;
 let experimentValues: Record<string, boolean>;
@@ -53,16 +56,6 @@ let experimentValues: Record<string, boolean>;
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
   createSelectPrimitiveDouble()
 );
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
   useExperiment: (experimentId: string) => [
@@ -130,18 +123,21 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   };
 
   const getConfigMock = mock(() =>
-    Promise.resolve({
-      taskSettings: config.taskSettings,
-      advisorModelString: config.advisorModelString,
-      advisorThinkingLevel: config.advisorThinkingLevel,
-      advisorReasoningMode: config.advisorReasoningMode,
-      advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens: config.advisorMaxOutputTokens,
-    })
+    Promise.resolve(
+      createTestConfig({
+        taskSettings: config.taskSettings,
+        advisorModelString: config.advisorModelString,
+        advisorThinkingLevel: config.advisorThinkingLevel,
+        advisorReasoningMode: config.advisorReasoningMode,
+        advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
+        advisorMaxOutputTokens: config.advisorMaxOutputTokens,
+      })
+    )
   );
 
   const saveConfigMock = mock((input: SaveConfigInput) => {
-    config.taskSettings = input.taskSettings;
+    // The real input makes taskSettings optional; the backend keeps the stored value when omitted.
+    config.taskSettings = input.taskSettings ?? config.taskSettings;
     config.advisorModelString = input.advisorModelString?.trim()
       ? input.advisorModelString.trim()
       : null;
@@ -158,7 +154,7 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
         getConfig: getConfigMock,
         saveConfig: saveConfigMock,
       },
-    },
+    } satisfies TestApiOverrides<APIClient>,
     getConfigMock,
     saveConfigMock,
   };
@@ -166,11 +162,6 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
 
 describe("ExperimentsSection advisor config", () => {
   let cleanupDom: (() => void) | null = null;
-
-  afterAll(async () => {
-    await mock.module("@/browser/hooks/useMinThinkingLevels", () => actualMinThinkingLevelsModule);
-    await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
-  });
 
   beforeEach(() => {
     cleanupDom = installDom();
@@ -183,10 +174,6 @@ describe("ExperimentsSection advisor config", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    void mock.module(
-      "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
-    );
     cleanupDom?.();
     cleanupDom = null;
   });
@@ -204,9 +191,11 @@ describe("ExperimentsSection advisor config", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
-        <ExperimentsSection />
-      </ThemeProvider>
+      <APIProvider client={createTestApiClient(mockApi)}>
+        <ThemeProvider forcedTheme="dark">
+          <ExperimentsSection />
+        </ThemeProvider>
+      </APIProvider>
     );
 
     return { view, getConfigMock, saveConfigMock };
@@ -320,9 +309,11 @@ describe("ExperimentsSection advisor config", () => {
       });
       view.unmount();
       const restored = render(
-        <ThemeProvider forcedTheme="dark">
-          <ExperimentsSection />
-        </ThemeProvider>
+        <APIProvider client={createTestApiClient(mockApi)}>
+          <ThemeProvider forcedTheme="dark">
+            <ExperimentsSection />
+          </ThemeProvider>
+        </APIProvider>
       );
       fireEvent.click(await restored.findByRole("button", { name: "Reasoning" }));
       expect(restored.getByRole("button", { name: /Pro mode/ }).getAttribute("aria-pressed")).toBe(

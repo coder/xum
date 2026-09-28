@@ -14,6 +14,8 @@ import type {
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
+import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
+import { ReviewStateService, type ReviewStateChange } from "@/node/services/reviewStateService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "./context";
@@ -114,6 +116,29 @@ export function subscribeDevTools(
   });
 }
 
+export function subscribeReviewState(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<ReviewStateEvent> {
+  const service = context.reviewStateService;
+  return runtimeSubscription<ReviewStateEvent>(context, {
+    signal,
+    // Every event carries the full snapshot, so only the newest unconsumed one matters.
+    buffer: "latest",
+    subscribe: (emit) => {
+      const eventName = ReviewStateService.changeEventName(workspaceId);
+      const listener = (change: ReviewStateChange) => emit.push({ type: "snapshot", ...change });
+      service.on(eventName, listener);
+      return () => service.off(eventName, listener);
+    },
+    initial: async () => ({
+      type: "snapshot" as const,
+      ...(await service.getSnapshotWithRevision(workspaceId)),
+    }),
+  });
+}
+
 export function subscribeProviderConfig(
   context: ORPCContext,
   signal?: AbortSignal
@@ -150,23 +175,6 @@ export function subscribePolicyChanges(
     buffer: "latest",
     subscribe: (emit) => context.policyService.onPolicyChanged(() => emit.push(undefined)),
   });
-}
-
-/**
- * Deliberately NOT on the Effect Stream bridge: this is a pure timed
- * generator with no event source to attach and no resource to release, so the
- * bridge's acquireRelease lifecycle would add machinery without value.
- */
-export function createTickIterable(
-  count: number,
-  intervalMs: number
-): AsyncGenerator<{ tick: number; timestamp: number }> {
-  return (async function* () {
-    for (let tick = 1; tick <= count; tick++) {
-      yield { tick, timestamp: Date.now() };
-      if (tick < count) await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-  })();
 }
 
 export function subscribeLogs(
@@ -320,6 +328,9 @@ export function subscribeWorkspaceChat(
   return runtimeSubscription<WorkspaceChatMessage>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
+    // Replay can take seconds on large epochs: stream rows as they are produced and keep the
+    // client's stall watchdog fed with heartbeats meanwhile (#4506).
+    progressiveInitialize: true,
     subscribe: (emit) => {
       replayRelay = createReplayBufferedStreamMessageRelay(emit.push);
       return session.onChatEvent(({ message }) => replayRelay.handleSessionMessage(message));

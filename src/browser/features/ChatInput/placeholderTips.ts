@@ -106,26 +106,23 @@ function isStorybookRuntime(): boolean {
 /**
  * Return the tip for the current wall-clock bucket.
  *
- * The bucket index is `floor(now / 20min)` modulo the tip list, so every
- * caller in the same 20-minute window sees the same tip regardless of
- * workspace, tab, or user-message count. `nowMs` is exposed for testing
- * — production callers should let it default to `Date.now()`.
+ * The bucket index is `floor(Date.now() / 20min)` modulo the tip list, so
+ * every caller in the same 20-minute window sees the same tip regardless of
+ * workspace, tab, or user-message count.
  *
- * Non-finite or negative inputs fall back to the lead tip so the carousel
+ * A non-finite or negative clock falls back to the lead tip so the carousel
  * still surfaces a real, discoverable command in degenerate states (clock
  * skew, mocked timers returning weird values, etc.).
  *
- * Under Storybook, default-arg calls return a fixed tip
- * (`STORYBOOK_PINNED_TIP_INDEX`) so visual baselines are insulated from
- * tip-list reordering. Explicit `nowMs` arguments always use rotation, so
- * tests stay meaningful.
+ * Under Storybook the tip is fixed (`STORYBOOK_PINNED_TIP_INDEX`) so visual
+ * baselines are insulated from tip-list reordering.
  */
-export function getPlaceholderTip(nowMs?: number, options?: PlaceholderTipOptions): string {
+export function getPlaceholderTip(options?: PlaceholderTipOptions): string {
   const tips = getPlaceholderTips(options);
-  if (nowMs === undefined && isStorybookRuntime()) {
+  if (isStorybookRuntime()) {
     return tips[STORYBOOK_PINNED_TIP_INDEX];
   }
-  const ts = nowMs ?? Date.now();
+  const ts = Date.now();
   if (!Number.isFinite(ts) || ts < 0) {
     return tips[0];
   }

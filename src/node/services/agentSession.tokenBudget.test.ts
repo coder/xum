@@ -8,13 +8,16 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
+import type { SessionContextController } from "./contextManagement/sessionContextController";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
@@ -26,9 +29,20 @@ import {
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
 import { HistoryService } from "./historyService";
-import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { createTestHistoryService } from "./testHistoryService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
+import {
+  createAgentSessionHarness,
+  seedAutoCompactionThreshold,
+  type AgentSessionHarness,
+} from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
-import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
+import {
+  createContextBudgetWarning,
+  createRolloverPrefix,
+  type ContextWindowRollover,
+} from "./contextWindowRollover";
 import * as rolloverMessages from "./contextWindowRollover";
 import * as contextLimits from "@/common/utils/compaction/contextLimit";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -37,13 +51,16 @@ import { log } from "./log";
 
 const workspaceId = "token-budget-session";
 const model = "openai:gpt-4o";
+/** Persist the slider value (percent) for the test model, as the UI would. */
+const seedThreshold = (h: AgentSessionHarness, fraction: number) =>
+  seedAutoCompactionThreshold(h.config, model, Math.round(fraction * 100));
 const options: SendMessageOptions = {
   model,
   agentId: "exec",
   experiments: { tokenBudget: true },
 };
-// Resume paths re-validate memory writability from the caller's options; the harness has no
-// backend experiment service, so resumes state the Memory experiment explicitly.
+// Dispatch and resume re-validate memory writability from the caller's options; the harness has
+// no backend experiment service, so these paths state the Memory experiment explicitly.
 const resumeOptions: SendMessageOptions = {
   ...options,
   experiments: { tokenBudget: true, memory: true },
@@ -59,6 +76,17 @@ type Request = Parameters<AgentSessionAIService["streamMessage"]>[0];
 function trackedFilePaths(h: AgentSessionHarness): string[] {
   return (h.session as unknown as { fileChangeTracker: { paths: string[] } }).fileChangeTracker
     .paths;
+}
+
+/** Budget state lives on the controller-private token-budget strategy, not the session. */
+function budgetOf(h: AgentSessionHarness) {
+  return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
+    contextBudgetGeneration: number;
+    contextBudgetWarningClaimed: boolean;
+    contextBudgetHandoffClaimed: boolean;
+    contextBudgetFlushClaimed: boolean;
+    contextBudgetHistoryAvailable: boolean;
+  };
 }
 
 function text(row: MuxMessage): string {
@@ -88,6 +116,31 @@ function warningRows(rows: MuxMessage[]): MuxMessage[] {
 function isFinalFlushRow(row: MuxMessage): boolean {
   const meta = row.metadata?.muxMetadata;
   return meta?.type === "context-budget-warning" && meta.final === true;
+}
+
+function isHandoffRow(row: MuxMessage): boolean {
+  const meta = row.metadata?.muxMetadata;
+  return meta?.type === "context-budget-warning" && meta.handoff === true;
+}
+
+/** Per-window advisory claims; set only once a row is durable, never by pending intent. */
+function budgetClaims(h: AgentSessionHarness): { warning: boolean; handoff: boolean } {
+  const budget = budgetOf(h);
+  return {
+    warning: budget.contextBudgetWarningClaimed,
+    handoff: budget.contextBudgetHandoffClaimed,
+  };
+}
+
+async function emitUsageDelta(h: AgentSessionHarness & { requests: unknown[] }) {
+  h.aiEmitter.emit("usage-delta", {
+    type: "usage-delta",
+    workspaceId,
+    messageId: `assistant-${h.requests.length}`,
+    usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+  });
+  // The forwarded handler awaits usage bookkeeping before previewing.
+  for (let i = 0; i < 3; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 async function allRows(h: AgentSessionHarness): Promise<MuxMessage[]> {
@@ -127,14 +180,53 @@ async function seedHistory(h: AgentSessionHarness, inputTokens: number, toolResu
   expect(result.success).toBe(true);
 }
 
+const LEGACY_FLUSH_TRIGGER = "Flush context notes now.";
+
+/**
+ * Rows an older build left behind after offering its final pre-rollover flush: the durable final
+ * warning plus the hidden trigger it dispatched (old context precedes them). New windows never
+ * write these; recovery must still finish them as one bounded step that seals the window.
+ */
+async function seedLegacyFlushTurn(
+  h: AgentSessionHarness,
+  metadata?: Pick<MuxMetadata, "muxMetadata" | "kind" | "goalId">
+) {
+  await seedHistory(h, 110_000);
+  const result = await h.historyService.appendManyToHistory(workspaceId, [
+    createContextBudgetWarning({
+      contextTokens: 110_010,
+      maxTokens: 128_000,
+      // Older builds budgeted the slider's force band, not the usable ceiling.
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+      final: true,
+    }),
+    createMuxMessage("legacy-flush-trigger", "user", LEGACY_FLUSH_TRIGGER, {
+      synthetic: true,
+      uiVisible: false,
+      retrySendOptions: { model, agentId: "exec", agentInitiated: true },
+      ...metadata,
+      muxMetadata: {
+        ...(metadata?.muxMetadata ?? { type: "normal" }),
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      },
+    }),
+  ]);
+  expect(result.success).toBe(true);
+}
+
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
+  const storageCleanups: Array<() => Promise<void>> = [];
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
       await h.session.dispose();
       await h.cleanup();
     }
     harnesses.length = 0;
+    for (const cleanup of storageCleanups.splice(0)) await cleanup();
     mock.restore();
   });
 
@@ -144,7 +236,30 @@ describe("AgentSession token-budget lifecycle", () => {
     failure?: (
       attempt: number
     ) => SendMessageError | undefined | Promise<SendMessageError | undefined>;
+    /** Inject a real goal service (no goal set) whose stream accounting the test observes. */
+    goals?: boolean;
   }) {
+    let storage: Pick<AgentSessionHarness, "historyService" | "config"> | undefined =
+      args?.previous;
+    if (!storage && args?.goals) {
+      const owned = await createTestHistoryService();
+      storageCleanups.push(owned.cleanup);
+      storage = owned;
+    }
+    const workspaceGoalService =
+      args?.goals && storage
+        ? new WorkspaceGoalService(
+            storage.config,
+            storage.historyService,
+            new ExtensionMetadataService(
+              path.join(storage.config.rootDir, "extension-metadata.json")
+            )
+          )
+        : undefined;
+    const goalAccounting = workspaceGoalService && {
+      recordStreamAccounting: spyOn(workspaceGoalService, "recordStreamAccounting"),
+      previewStreamAccounting: spyOn(workspaceGoalService, "previewStreamAccounting"),
+    };
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
     const requestWaiters = new Map<number, ReturnType<typeof Promise.withResolvers<Request>>>();
@@ -186,9 +301,10 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      historyService: args?.previous?.historyService,
-      config: args?.previous?.config,
+      historyService: storage?.historyService,
+      config: storage?.config,
       mcpServerManager: args?.mcpServerManager,
+      workspaceGoalService,
       aiServiceOverrides: {
         streamMessage,
         buildMemorySessionContext: mock(() => Promise.resolve(null)),
@@ -205,7 +321,7 @@ describe("AgentSession token-budget lifecycle", () => {
         runtimeConfig: { type: "local" },
       } as FrontendWorkspaceMetadata)
     );
-    h.session.setAutoCompactionThreshold(0.7);
+    await seedThreshold(h, 0.7);
     const settleStream = (
       index: number,
       metadata?: { finishReason?: string; contextUsage?: { inputTokens: number } }
@@ -238,6 +354,7 @@ describe("AgentSession token-budget lifecycle", () => {
     };
     return {
       ...h,
+      goalAccounting,
       requests,
       completions,
       streamMessage,
@@ -254,11 +371,7 @@ describe("AgentSession token-budget lifecycle", () => {
       (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
     );
     await seedHistory(h, 20_000);
-    const state = h.session as unknown as {
-      contextBudgetGeneration: number;
-      contextBudgetWarningClaimed: boolean;
-      contextBudgetFlushClaimed: boolean;
-    };
+    const state = budgetOf(h);
     state.contextBudgetWarningClaimed = true;
     state.contextBudgetFlushClaimed = true;
     const generation = state.contextBudgetGeneration;
@@ -372,7 +485,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "historical input usage is not a system floor for the next request (%s)",
     async (kind) => {
       const h = await setup();
-      h.session.setAutoCompactionThreshold(1);
+      await seedThreshold(h, 1);
       const previous = createMuxMessage("high-input-answer", "assistant", "Small useful response", {
         model,
         contextUsage: { inputTokens: 125_000, outputTokens: 20, totalTokens: 125_020 },
@@ -463,7 +576,6 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup({ previous: first });
       await h.session.ensureStartupAutoRetryCheck();
       expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-      expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
       expect((await h.session.resumeStream(options)).success).toBe(false);
       expect(h.requests).toHaveLength(0);
       expect((await allRows(h)).filter((row) => previous.some((old) => old.id === row.id))).toEqual(
@@ -476,7 +588,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("single-user token-budget sends use append-only storage even when automatic compaction is off", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 20_000);
     const before = await allRows(h);
     const append = spyOn(h.historyService, "acceptCompactionReplacement");
@@ -535,9 +647,8 @@ describe("AgentSession token-budget lifecycle", () => {
     "uncertified %s middleware blocks rollover before cleanup or provider dispatch",
     async (scope) => {
       const h = await setup();
-      await seedHistory(h, 110_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      await seedHistory(h, 120_000);
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = eventSpine.useBefore(
         "request.assemble",
         (ctx) => {
@@ -576,7 +687,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("middleware explicitly scoped to another workspace does not block rollover", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const unregister = eventSpine.useBefore(
       "request.assemble",
       (ctx) => {
@@ -597,7 +708,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "admitted request snapshot survives registry changes during %s",
     async (phase) => {
       const h = await setup();
-      await seedHistory(h, 110_000);
+      await seedHistory(h, 120_000);
       const unregisters: Array<() => void> = [];
       const admitted = eventSpine.useRequestContext(
         (ctx) => {
@@ -619,9 +730,8 @@ describe("AgentSession token-budget lifecycle", () => {
         );
       };
       if (phase === "cleanup") {
-        const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-        const cleanup = session.applyContextResetSideEffects.bind(session);
-        spyOn(session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
+        const cleanup = h.session.applyContextResetSideEffects.bind(h.session);
+        spyOn(h.session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
           replaceRegistration();
           await cleanup();
         });
@@ -642,7 +752,7 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(ctx.systemMessage).toBe("base admitted");
         await h.session.dispose();
         const next = await setup({ previous: h });
-        await seedHistory(next, 110_000);
+        await seedHistory(next, 120_000);
         expect(await next.session.sendMessage("Next admission", options)).toMatchObject({
           success: false,
           error: { type: "context_budget_blocked" },
@@ -659,7 +769,7 @@ describe("AgentSession token-budget lifecycle", () => {
       failure: (attempt) =>
         attempt === 1 ? { type: "runtime_start_failed", message: "retry startup" } : undefined,
     });
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const admitted = eventSpine.useRequestContext(
       (ctx) => {
         ctx.systemMessage += " admitted";
@@ -667,6 +777,8 @@ describe("AgentSession token-budget lifecycle", () => {
       { workspaceId }
     );
     let removeLive: (() => void) | undefined;
+    // Kept private: the real backoff retry fires ~2 s later on the global clock (these fakes
+    // carry no effectRunner), so the test cancels it and runs the same retry step directly.
     const session = h.session as unknown as {
       retryManager: { cancel(): void };
       retryActiveStream(): Promise<void>;
@@ -693,8 +805,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (blocked) => {
       const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
       await seedHistory(h, 20_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = blocked
         ? eventSpine.useBefore("request.assemble", () => undefined, { workspaceId })
         : eventSpine.useRequestContext(
@@ -729,7 +840,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const large = ("漢".repeat(100) + "\n").repeat(40);
       const getPrompt = mock(() => Promise.resolve({ text: large }));
       const h = await setup({ mcpServerManager: { getPrompt } as unknown as MCPServerManager });
-      if (oldContext) await seedHistory(h, 110_000);
+      if (oldContext) await seedHistory(h, 120_000);
       const original = await allRows(h);
       const contextLimit = spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
       const cleanup = spyOn(h.session, "applyContextResetSideEffects");
@@ -835,7 +946,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const content = ("漢".repeat(100) + "\n").repeat(16);
       const getPrompt = mock(() => Promise.resolve({ text: content }));
       const h = await setup({ mcpServerManager: { getPrompt } as unknown as MCPServerManager });
-      await seedHistory(h, 110_000);
+      await seedHistory(h, 120_000);
       spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
       await fs.writeFile(path.join(h.config.rootDir, "combined.txt"), content);
       const result = await h.session.sendMessage(
@@ -869,7 +980,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "%s during materialized preflight leaves old history and context untouched",
     async (action) => {
       const h = await setup();
-      await seedHistory(h, 110_000);
+      await seedHistory(h, 120_000);
       const before = await allRows(h);
       const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const controller = new AbortController();
@@ -908,9 +1019,9 @@ describe("AgentSession token-budget lifecycle", () => {
   );
 
   test.each([
-    { inputTokens: 110_000, automatic: true },
+    { inputTokens: 120_000, automatic: true },
     { inputTokens: 1_000, automatic: true },
-    { inputTokens: 110_000, automatic: false },
+    { inputTokens: 120_000, automatic: false },
   ])(
     "token-budget send preserves scoped Stop recovery (tokens=$inputTokens, automatic=$automatic)",
     async ({ inputTokens, automatic }) => {
@@ -968,7 +1079,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("fresh automatic rollover replaces fully settled Stop without scoped debt", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     expect(await h.session.interruptStream()).toEqual(Ok(undefined));
     const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
     const stopped = await storage.read();
@@ -991,7 +1102,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const skillDir = path.join(h.config.rootDir, ".xum", "skills", "budget-test");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(
@@ -1047,17 +1158,17 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   });
 
-  test("on-send usage below the force buffer preserves history while warning permissions are unknown", async () => {
+  test("on-send usage in the handoff band preserves history and publishes the handoff", async () => {
     const h = await setup();
+    // Past the handoff target but below the usable ceiling: nothing is forced; the advisory
+    // rides the send itself, with capabilities resolved from the dispatching permissions.
     await seedHistory(h, 95_000);
     expect(
-      (await h.session.sendMessage("Keep working below the force band", options)).success
+      (await h.session.sendMessage("Keep working below the usable ceiling", options)).success
     ).toBe(true);
     const rows = await allRows(h);
     expect(rolloverRows(rows)).toHaveLength(0);
-    expect(
-      rows.filter((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
-    ).toHaveLength(0);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
   });
@@ -1087,7 +1198,7 @@ describe("AgentSession token-budget lifecycle", () => {
         previous: h,
         failure: emergency ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
       });
-      await seedHistory(resumed, emergency ? 20_000 : 110_000);
+      await seedHistory(resumed, emergency ? 20_000 : 120_000);
       expect((await resumed.session.sendMessage("Use it again", skillOptions)).success).toBe(true);
       const rows = await allRows(resumed);
       const snapshots = rows.filter((row) => row.metadata?.agentSkillSnapshot);
@@ -1160,11 +1271,11 @@ describe("AgentSession token-budget lifecycle", () => {
   });
 
   test.each([
-    { name: "input only", usage: { inputTokens: 110_000 }, cacheWrite: 0, rollover: true },
+    { name: "input only", usage: { inputTokens: 120_000 }, cacheWrite: 0, rollover: true },
     {
       name: "cached floor",
-      usage: { inputTokens: 1000, cachedInputTokens: 70_000 },
-      cacheWrite: 40_000,
+      usage: { inputTokens: 1000, cachedInputTokens: 75_000 },
+      cacheWrite: 45_000,
       rollover: true,
     },
     {
@@ -1175,13 +1286,13 @@ describe("AgentSession token-budget lifecycle", () => {
     },
     {
       name: "invalid cache",
-      usage: { inputTokens: 110_000, cachedInputTokens: "bad" },
+      usage: { inputTokens: 120_000, cachedInputTokens: "bad" },
       cacheWrite: {},
       rollover: true,
     },
     {
       name: "invalid input",
-      usage: { inputTokens: "bad", cachedInputTokens: 100_000 },
+      usage: { inputTokens: "bad", cachedInputTokens: 120_000 },
       cacheWrite: 0,
       rollover: true,
     },
@@ -1235,11 +1346,11 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([0, 20_000, 110_000])(
+  test.each([0, 20_000, 120_000])(
     "valid in-memory usage takes precedence over persisted usage (%d tokens)",
     async (inputTokens) => {
       const h = await setup();
-      await seedHistory(h, inputTokens === 110_000 ? 20_000 : 110_000);
+      await seedHistory(h, inputTokens === 120_000 ? 20_000 : 120_000);
       const session = h.session as unknown as {
         updateUsageStateFromModelUsage(
           input: Pick<SettledStepBudget, "model" | "usage"> & { live: boolean }
@@ -1251,7 +1362,7 @@ describe("AgentSession token-budget lifecycle", () => {
         live: false,
       });
       expect((await h.session.sendMessage("Use current counters", options)).success).toBe(true);
-      expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 110_000 ? 1 : 0);
+      expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 120_000 ? 1 : 0);
     }
   );
 
@@ -1288,15 +1399,36 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
+  test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
+    // #4855: provider usage far below the ceiling, but the next step's assembled estimate (what
+    // the per-step preflight enforces) reaches it. Rollover must win before that hard stop.
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      (await h.requests[0].onStepSettled?.(step(50_000, { nextRequestTokens: 119_808 })))?.decision
+    ).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      contextTokens: 119_808,
+      budgetTokens: 119_808,
+    });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+  });
+
   test("a new_context request is ignored while automatic rollover is disabled or history is unavailable", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     expect(
       (await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true })))?.decision
     ).toBe("continue");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    h.session.setAutoCompactionThreshold(0.7);
+    await seedThreshold(h, 0.7);
     expect(
       (
         await h.requests[0].onStepSettled?.(
@@ -1321,11 +1453,12 @@ describe("AgentSession token-budget lifecycle", () => {
       )?.decision
     ).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    // Budget evaluation alone still cannot run without a limit.
+    // Budget evaluation alone still cannot run without a limit: no advisory at any usage.
     expect(
-      (await h.requests[0].onStepSettled?.(step(20_000, { model: "custom:unknown-limit-model" })))
+      (await h.requests[0].onStepSettled?.(step(90_000, { model: "custom:unknown-limit-model" })))
         ?.decision
     ).toBe("continue");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     // The queued continuation seals the window even though no limit is known.
     await h.finishAndDispatch();
     const [reset] = rolloverRows(await allRows(h));
@@ -1333,10 +1466,10 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests[1].messages.some((row) => row.id === reset.id)).toBe(true);
   });
 
-  test("an explicit request wins over the flush offer and over a hard block", async () => {
+  test("an explicit request wins over the handoff advisory and over a hard block", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    // Threshold crossed AND requested: seal directly (no flush pair), attributed to the model.
+    // Handoff target crossed AND requested: seal directly (no advisory), attributed to the model.
     expect(
       (await h.requests[0].onStepSettled?.(step(110_000, { newContextRequested: true })))?.decision
     ).toBe("rollover");
@@ -1350,7 +1483,7 @@ describe("AgentSession token-budget lifecycle", () => {
     // A hard block (only possible with automatic rollover disabled) stays authoritative: the
     // tool is not offered there, and a stray request cannot bypass it.
     const blocked = await setup();
-    blocked.session.setAutoCompactionThreshold(1);
+    await seedThreshold(blocked, 1);
     expect((await blocked.session.sendMessage("Work", options)).success).toBe(true);
     expect(
       (
@@ -1445,7 +1578,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
-    await seedHistory(first, 30_000, 300_000);
+    await seedHistory(first, 30_000, 400_000);
     await first.session.dispose();
     const h = await setup({ previous: first });
     expect((await h.session.sendMessage("Resume after restart", options)).success).toBe(true);
@@ -1480,7 +1613,7 @@ describe("AgentSession token-budget lifecycle", () => {
         toolName: "bash",
         state: "output-available",
         input: {},
-        output: "x".repeat(300_000),
+        output: "x".repeat(400_000),
       },
     ];
     expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
@@ -1507,7 +1640,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "restart after %i prefix rows never writes another boundary",
     async (prefixLength) => {
       const first = await setup();
-      await seedHistory(first, 110_000);
+      await seedHistory(first, 120_000);
       const rollover: ContextWindowRollover = {
         type: "context-window-rollover",
         rolloverId: "crash-rollover",
@@ -1555,7 +1688,7 @@ describe("AgentSession token-budget lifecycle", () => {
         failure:
           mode === "emergency" ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
       });
-      await seedHistory(h, mode === "emergency" ? 20_000 : 110_000);
+      await seedHistory(h, mode === "emergency" ? 20_000 : 120_000);
       const sessionDir = path.join(h.config.sessionsDir, workspaceId);
       const pendingPath = path.join(sessionDir, POST_COMPACTION_STATE_FILENAME);
       const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
@@ -1678,7 +1811,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("failed atomic append preserves history and retry after fail-closed cleanup", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const cleanup = spyOn(h.session, "applyContextResetSideEffects");
     const append = spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
       async () => {
@@ -1702,7 +1835,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("a published rollover is not repeated when its append acknowledgment fails", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
     spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
       async (...args) => {
@@ -1727,7 +1860,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup();
       expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
       h.session.queueMessage("Real queued instruction", { ...options, queueDispatchMode });
-      expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+      expect((await h.requests[0].onStepSettled?.(step(120_000)))?.decision).toBe("rollover");
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
       await h.finishAndDispatch();
       const rows = await allRows(h);
@@ -1738,79 +1871,155 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("restart defers its first warning until settled memory availability is known", async () => {
-    const h = await setup();
-    await seedHistory(h, 85_000);
-    expect((await h.session.sendMessage("Resume work", options)).success).toBe(true);
-    expect(
-      (await allRows(h)).filter(
-        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
-      )
-    ).toHaveLength(0);
-    expect(
-      (await h.requests[0].onStepSettled?.(step(85_000, { memoryWritable: true })))?.decision
-    ).toBe("warn");
-    await h.finishAndDispatch();
-    expect(
-      (await allRows(h)).filter(
-        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
-      )
-    ).toHaveLength(1);
-  });
+  test.each([
+    {
+      label: "warning with full capabilities",
+      usage: 85_000,
+      sendOptions: resumeOptions,
+      expected: {
+        handoff: false,
+        memoryWritable: true,
+        sessionHistoryAvailable: true,
+        newContextAvailable: true,
+      },
+    },
+    {
+      label: "handoff with degraded capabilities",
+      usage: 90_000,
+      sendOptions: {
+        ...resumeOptions,
+        toolPolicy: [{ regex_match: "memory|session_.*", action: "disable" }],
+      } satisfies SendMessageOptions,
+      expected: {
+        handoff: true,
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: true,
+      },
+    },
+  ])(
+    "the first send after a restart publishes the $label through the dispatching permissions",
+    async ({ usage, sendOptions, expected }) => {
+      const first = await setup();
+      await seedHistory(first, usage);
+      await first.session.dispose();
+      // No step has settled in this process, so nothing cached says what the agent can do; the
+      // dispatching agent, policy and experiments are the capability source.
+      const h = await setup({ previous: first });
+      const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+      expect((await h.session.sendMessage("Resume work", sendOptions)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(1);
+      expect(isHandoffRow(warningRows(rows)[0])).toBe(expected.handoff);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(
+        expect.objectContaining({ maxTokens: 128_000, budgetTokens: 119_808, ...expected })
+      );
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
+      expect(budgetClaims(h)).toEqual({ warning: !expected.handoff, handoff: expected.handoff });
+      // A text-only reply never runs the settled-step callback; the next send repeats nothing.
+      h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: usage } });
+      await h.session.waitForIdle();
+      expect((await h.session.sendMessage("Keep going", sendOptions)).success).toBe(true);
+      expect(warningRows(await allRows(h))).toHaveLength(1);
+      expect(h.requests).toHaveLength(2);
+    }
+  );
 
-  test("settled warning is durable once per window and retains delegated continuation attribution", async () => {
-    const h = await setup();
-    expect(
-      (
-        await h.session.sendMessage(
-          "Start delegated work",
-          {
-            ...options,
-            muxMetadata: correlation,
-          },
-          {
-            synthetic: true,
-            agentInitiated: true,
-            goalKind: GOAL_CONTINUATION_KIND,
-            goalId: "goal-budget",
-          }
-        )
-      ).success
-    ).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(85_000)))?.decision).toBe("warn");
-    expect(
-      (await allRows(h)).some((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
-    ).toBe(false);
-    expect(h.session.hasPendingWorkspaceTurnContinuation(correlation)).toBe(true);
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    const warnings = rows.filter(
-      (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
-    );
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0].metadata!.muxMetadata).toMatchObject({ budgetTokens: 96_000 });
-    const continuation = rows.at(-1)!;
-    expect(continuation.metadata).toMatchObject({
-      synthetic: true,
-      uiVisible: false,
-      retrySendOptions: { agentInitiated: true },
-      kind: GOAL_CONTINUATION_KIND,
-      goalId: "goal-budget",
-      muxMetadata: correlation,
-    });
-    expect(warnings[0].metadata!.historySequence!).toBeLessThan(
-      continuation.metadata!.historySequence!
-    );
-    expect((await h.requests[1].onStepSettled?.(step(85_000)))?.decision).toBe("continue");
-    expect(rolloverRows(rows)).toHaveLength(0);
-  });
+  test.each([0.7, 0.9, 1])(
+    "a pending handoff is reclassified at dispatch with threshold %s",
+    async (threshold) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      const state = budgetOf(h);
+      expect(state.contextBudgetHandoffClaimed).toBe(false);
+      await seedThreshold(h, threshold);
+      h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(warningRows(rows)).toHaveLength(threshold === 0.7 ? 1 : 0);
+      expect(state.contextBudgetHandoffClaimed).toBe(threshold === 0.7);
+      if (threshold !== 0.7) return;
+      expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+        handoff: true,
+        budgetTokens: 119_808,
+        handoffTokens: 89_600,
+      });
+      for (const usage of [95_000, 105_000, 115_000]) {
+        expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
+      }
+      expect((await h.requests[1].onStepSettled?.(step(120_000)))?.decision).toBe("rollover");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+      h.settleStream(1, { contextUsage: { inputTokens: 120_000 } });
+      await h.waitForRequest(3);
+      const sealed = await allRows(h);
+      expect(rolloverRows(sealed)).toHaveLength(1);
+      expect(warningRows(sealed).some(isFinalFlushRow)).toBe(false);
+    }
+  );
+
+  test.each([85_000, 90_000])(
+    "a settled advisory at %d tokens is durable once per window and retains delegated continuation attribution",
+    async (usage) => {
+      const h = await setup();
+      expect(
+        (
+          await h.session.sendMessage(
+            "Start delegated work",
+            {
+              ...options,
+              muxMetadata: correlation,
+            },
+            {
+              synthetic: true,
+              agentInitiated: true,
+              goalKind: GOAL_CONTINUATION_KIND,
+              goalId: "goal-budget",
+            }
+          )
+        ).success
+      ).toBe(true);
+      expect((await h.requests[0].onStepSettled?.(step(usage)))?.decision).toBe("warn");
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(h.session.hasPendingWorkspaceTurnContinuation(correlation)).toBe(true);
+      h.settleStream(0, { contextUsage: { inputTokens: usage } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      const warnings = warningRows(rows);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].metadata!.muxMetadata).toMatchObject({
+        budgetTokens: 119_808,
+        handoffTokens: 89_600,
+      });
+      expect(isHandoffRow(warnings[0])).toBe(usage >= 89_600);
+      const continuation = rows.at(-1)!;
+      expect(continuation.metadata).toMatchObject({
+        synthetic: true,
+        uiVisible: false,
+        retrySendOptions: { agentInitiated: true },
+        kind: GOAL_CONTINUATION_KIND,
+        goalId: "goal-budget",
+        muxMetadata: correlation,
+      });
+      expect(warnings[0].metadata!.historySequence!).toBeLessThan(
+        continuation.metadata!.historySequence!
+      );
+      expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
+      expect(rolloverRows(rows)).toHaveLength(0);
+    }
+  );
 
   test.each([
     ["at the hard ceiling", step(127_000), false],
-    ["with read-only memory", step(110_000, { memoryWritable: false }), true],
-    ["without session_history", step(110_000, { sessionHistoryAvailable: false }), true],
+    ["with read-only memory", step(120_000, { memoryWritable: false }), false],
+    ["without session_history", step(120_000, { sessionHistoryAvailable: false }), false],
   ])(
-    "settled rollover %s skips the final flush and preserves continuation correlation",
+    "settled rollover %s seals without a flush and preserves continuation correlation",
     async (_label, settled, flushOpportunity) => {
       const h = await setup();
       expect(
@@ -1831,217 +2040,11 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each(["step-history", "queued"] as const)(
-    "the final flush retains its triggering budget when the threshold changes during %s",
-    async (phase) => {
-      const h = await setup();
-      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-      if (phase === "step-history") {
-        const getHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
-        spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
-          (...args) => {
-            h.session.setAutoCompactionThreshold(0.9);
-            return getHistory(...args);
-          }
-        );
-      }
-      expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-      h.session.setAutoCompactionThreshold(0.9);
-      await h.finishAndDispatch();
-      expect(
-        warningRows(await allRows(h)).find(isFinalFlushRow)?.metadata?.muxMetadata
-      ).toMatchObject({
-        final: true,
-        budgetTokens: 96_000,
-      });
-      // Raising the slider does not cancel the already-promised reset after the flush.
-      h.settleStream(1);
-      await h.waitForRequest(3);
-      expect(rolloverRows(await allRows(h))).toHaveLength(1);
-    }
-  );
-
-  test("settled rollover with headroom offers exactly one final flush step, then seals", async () => {
-    const h = await setup();
-    expect(
-      (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
-    ).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    await h.finishAndDispatch();
-    let rows = await allRows(h);
-    expect(rolloverRows(rows)).toHaveLength(0);
-    const finalRows = warningRows(rows);
-    expect(finalRows).toHaveLength(1);
-    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true, budgetTokens: 96_000 });
-    expect(rows.at(-1)?.metadata).toMatchObject({
-      synthetic: true,
-      uiVisible: false,
-      muxMetadata: { ...correlation, contextBudgetContinuation: true, contextBudgetFlush: true },
-    });
-    const flushTriggerText = text(rows.at(-1)!);
-    // The request builder derives the memory-only toolset, pinned notes path, and disabled
-    // hooks/PTC for the hidden flush turn from this flag (see turnRequestBuilder).
-    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
-    // Its memory-only request reports session_history as unavailable; that must not poison the
-    // recorded availability used by later admissions.
-    expect(
-      (await h.requests[1].onStepSettled?.(step(112_000, { sessionHistoryAvailable: false })))
-        ?.decision
-    ).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(Reflect.get(h.session, "contextBudgetHistoryAvailable")).toBe(true);
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(1);
-    const [reset] = rolloverRows(rows);
-    expect(reset.metadata?.muxMetadata).toMatchObject({
-      reason: "mid-stream",
-      flushOpportunity: true,
-    });
-    expect(finalRows[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
-    expect(rows.at(-1)?.metadata).toMatchObject({
-      synthetic: true,
-      retrySendOptions: { agentInitiated: true },
-      muxMetadata: { ...correlation, contextBudgetContinuation: true },
-    });
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    // Neither the internal trigger text nor its flag reaches the fresh window.
-    expect(
-      sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some(
-        (row) => text(row) === flushTriggerText || row.metadata?.muxMetadata?.contextBudgetFlush
-      )
-    ).toBe(false);
-  });
-
-  test("the flush request uses the bounded cap and lowest thinking; the paired continuation keeps the caller's", async () => {
-    const h = await setup();
-    const sendOptions = { ...options, maxOutputTokens: 300, thinkingLevel: "high" as const };
-    expect((await h.session.sendMessage("Work", sendOptions)).success).toBe(true);
-    expect(h.requests[0].maxOutputTokens).toBe(300);
-    expect(h.requests[0].thinkingLevel).toBe("high");
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // Thinking floor for this model is off, so the cap needs no thinking-budget headroom.
-    expect(h.requests[1].thinkingLevel).toBe("off");
-    expect(h.requests[1].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-    expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
-    expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    expect(h.requests[2].maxOutputTokens).toBe(300);
-    expect(h.requests[2].thinkingLevel).toBe("high");
-  });
-
-  test("the flush ignores the user's thinking floor, which the continuation keeps", async () => {
-    const h = await setup();
-    const loadConfig = h.config.loadConfigOrDefault.bind(h.config);
-    spyOn(h.config, "loadConfigOrDefault").mockImplementation(() => ({
-      ...loadConfig(),
-      minThinkingLevelByModel: { [model]: "high" },
-    }));
-    expect(
-      (await h.session.sendMessage("Work", { ...options, thinkingLevel: "off" })).success
-    ).toBe(true);
-    expect(h.requests[0].thinkingLevel).toBe("high");
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    // Housekeeping runs at the model's inherent minimum, so the cap needs no thinking headroom.
-    expect(h.requests[1].thinkingLevel).toBe("off");
-    expect(h.requests[1].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-    expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    expect(h.requests[2].thinkingLevel).toBe("high");
-  });
-
-  test.each([
-    // gpt-5.2 cannot go below medium thinking: its flush cap must exceed
-    // ANTHROPIC_THINKING_BUDGETS.medium, i.e. it needs room beyond OUTPUT_RESERVE_TOKENS that a
-    // near-ceiling window no longer has.
-    ["openai:gpt-5.2", false, undefined],
-    [model, true, undefined],
-    // A refusal may hand the flush to the fallback, which then needs that same room.
-    [model, false, "openai:gpt-5.2"],
-  ])(
-    "dispatch-time headroom accounts for the flush cap the model's thinking minimum requires (%s, admitted=%p, fallback=%p)",
-    async (sendModel, admitted, fallbackModel) => {
-      const h = await setup();
-      if (fallbackModel !== undefined) {
-        await h.config.editConfig((cfg) => ({
-          ...cfg,
-          modelFallbacks: { [sendModel]: { models: [fallbackModel] } },
-        }));
-      }
-      spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(128_000);
-      expect((await h.session.sendMessage("Work", { ...options, model: sendModel })).success).toBe(
-        true
-      );
-      expect(
-        (await h.requests[0].onStepSettled?.(step(110_000, { model: sendModel })))?.decision
-      ).toBe("rollover");
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-      // Usage reported at stream end drives the dispatch-time admission.
-      h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
-      await h.waitForRequest(2);
-      const rows = await allRows(h);
-      expect(warningRows(rows)).toHaveLength(admitted ? 1 : 0);
-      expect(rolloverRows(rows)).toHaveLength(admitted ? 0 : 1);
-      expect(h.requests[1].muxMetadata?.contextBudgetFlush === true).toBe(admitted);
-    }
-  );
-
-  test("a top-level workspace (no delegated correlation) still flags the flush request", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    // resolveStreamMuxMetadata drops plain attribution; the flush flag must survive anyway so
-    // the request builder applies the memory-only ceiling.
-    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[0].muxMetadata?.contextBudgetFlush).toBeUndefined();
-    expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    expect(h.requests[2].muxMetadata?.contextBudgetFlush).toBeUndefined();
-  });
-
-  test("a text-only flush turn still rolls over at stream end", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
-    expect(rolloverRows(await allRows(h))).toHaveLength(1);
-  });
-
-  test("a queued user message defers the flush and rolls over on its own dispatch", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect(h.session.queueMessage("Later question", options)).not.toBeNull();
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(rolloverRows(rows)).toHaveLength(1);
-    expect(text(rows.at(-1)!)).toBe("Later question");
-  });
-
   test.each([false, true])(
     "separate queued inputs survive their own replacement retirement (reset=%s)",
     async (reset) => {
       const h = await setup();
-      await seedHistory(h, reset ? 110_000 : 20_000);
+      await seedHistory(h, reset ? 120_000 : 20_000);
       const foreign = new CompactionCancellation(
         new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
       );
@@ -2064,7 +2067,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "separate automatic inputs survive settled Stop retirement (reset=%s)",
     async (reset) => {
       const h = await setup();
-      await seedHistory(h, reset ? 110_000 : 20_000);
+      await seedHistory(h, reset ? 120_000 : 20_000);
       const foreign = new CompactionCancellation(
         new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
       );
@@ -2089,7 +2092,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("cancellation before an owned reset receipt releases its automatic caller without publication", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const controller = new AbortController();
     const canceled = mock(() => undefined);
     const failed = mock(() => undefined);
@@ -2120,7 +2123,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "owned rollover cannot reauthorize queued input across a foreign Stop %s its receipt",
     async (phase) => {
       const h = await setup();
-      await seedHistory(h, 110_000);
+      await seedHistory(h, 120_000);
       h.session.queueMessage("Queued before foreign Stop", options);
       const foreign = new CompactionCancellation(
         new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
@@ -2160,141 +2163,436 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("a user message queued behind the flush pair lands in the fresh window", async () => {
+  test.each([
+    { label: "after an advance warning", first: 85_000, warnings: 2 },
+    { label: "on a direct jump into the handoff band", first: 90_000, warnings: 1 },
+  ])(
+    "the handoff is published once $label and suppresses later warnings",
+    async ({ first, warnings }) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      // The external stop type stays "warn"; the published row tells the advisories apart.
+      expect((await h.requests[0].onStepSettled?.(step(first)))?.decision).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: first } });
+      await h.waitForRequest(2);
+      let rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(1);
+      expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+        budgetTokens: 119_808,
+        handoffTokens: 89_600,
+      });
+      expect(isHandoffRow(warningRows(rows)[0])).toBe(first >= 89_600);
+      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: first >= 89_600 });
+      if (first < 89_600) {
+        // A delivered warning does not consume the handoff that follows it.
+        expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+        h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
+        await h.waitForRequest(3);
+        rows = await allRows(h);
+      }
+      expect(warningRows(rows)).toHaveLength(warnings);
+      expect(warningRows(rows).filter(isHandoffRow)).toHaveLength(1);
+      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: true });
+      // Nothing else is advertised in this window until the usable ceiling forces a rollover;
+      // near the ceiling the advisory row itself would no longer fit.
+      const active = h.requests.at(-1)!;
+      for (const usage of [85_000, 95_000, 118_000])
+        expect((await active.onStepSettled?.(step(usage)))?.decision).toBe("continue");
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      expect(rolloverRows(rows)).toHaveLength(0);
+    }
+  );
+
+  test("a pending warning is upgraded by the queued user input that dispatches it", async () => {
     const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect(h.session.queueMessage("Later question", options)).not.toBeNull();
-    await h.finishAndDispatch();
-    expect((await allRows(h)).at(-1)?.metadata?.muxMetadata).toMatchObject({
-      contextBudgetFlush: true,
-    });
-    expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    h.settleStream(2, { finishReason: "stop" });
-    await h.waitForRequest(4);
+    expect((await h.requests[0].onStepSettled?.(step(85_000)))?.decision).toBe("warn");
+    // Real queued input owns the dispatch: no Continue is added behind it.
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    // Usage reported at stream end crossed the handoff target: the pending intent never pins
+    // the advisory to the level it was computed at.
+    h.settleStream(0, { contextUsage: { inputTokens: 92_000 } });
+    await h.waitForRequest(2);
     const rows = await allRows(h);
-    const [reset] = rolloverRows(rows);
-    const later = rows.find((row) => text(row) === "Later question")!;
-    expect(reset.metadata!.historySequence!).toBeLessThan(later.metadata!.historySequence!);
-    const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[3].messages);
-    expect(fresh.find((row) => row.role === "user" && row.metadata?.synthetic !== true)?.id).toBe(
-      later.id
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+    expect(text(rows.at(-1)!)).toBe("Later question");
+    expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
+    expect(warningRows(rows)[0].metadata!.historySequence!).toBeLessThan(
+      rows.at(-1)!.metadata!.historySequence!
     );
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
   });
 
-  test("removing the flush entry lets the rollover entry seal the window directly", async () => {
+  test.each([
+    {
+      label: "caller disables tools",
+      previousEnabled: true,
+      next: {
+        toolPolicy: [{ regex_match: "memory|session_history|new_context", action: "disable" }],
+      },
+      expected: {
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: false,
+      },
+    },
+    {
+      label: "caller restores tools",
+      previousEnabled: false,
+      next: {},
+      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "agent removes tools",
+      previousEnabled: true,
+      next: { agentId: "restricted" },
+      expected: {
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: false,
+      },
+    },
+    {
+      label: "read-only agent",
+      previousEnabled: true,
+      next: { agentId: "observer" },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "Memory experiment disabled",
+      previousEnabled: true,
+      next: { experiments: { tokenBudget: true, memory: false } },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "memory tool disabled",
+      previousEnabled: true,
+      next: { toolPolicy: [{ regex_match: "memory", action: "disable" }] },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+  ] satisfies Array<{
+    label: string;
+    previousEnabled: boolean;
+    next: Partial<SendMessageOptions>;
+    expected: {
+      memoryWritable: boolean;
+      sessionHistoryAvailable: boolean;
+      newContextAvailable: boolean;
+    };
+  }>)(
+    "queued advisories use dispatch permissions: $label",
+    async ({ previousEnabled, next, expected }) => {
+      const h = await setup();
+      const dispatchOptions: SendMessageOptions = { ...resumeOptions, ...next };
+      if (dispatchOptions.agentId === "restricted" || dispatchOptions.agentId === "observer") {
+        const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
+        await fs.mkdir(agentsDir, { recursive: true });
+        await fs.writeFile(
+          path.join(agentsDir, `${dispatchOptions.agentId}.md`),
+          dispatchOptions.agentId === "restricted"
+            ? '---\nname: Restricted\nbase: exec\ntools:\n  remove: ["memory", "session_history", "new_context"]\n---\nRestricted agent.\n'
+            : '---\nname: Observer\ntools:\n  add: ["file_read", "memory", "session_history", "new_context"]\n---\nRead-only agent.\n'
+        );
+      }
+      const previousOptions: SendMessageOptions = {
+        ...resumeOptions,
+        ...(!previousEnabled
+          ? {
+              toolPolicy: [
+                { regex_match: "memory|session_history|new_context", action: "disable" as const },
+              ],
+            }
+          : {}),
+      };
+      const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+      expect((await h.session.sendMessage("Start work", previousOptions)).success).toBe(true);
+      expect(h.session.queueMessage("Next request", dispatchOptions)).not.toBeNull();
+      expect(
+        (
+          await h.requests[0].onStepSettled?.(
+            step(90_000, {
+              memoryWritable: previousEnabled,
+              sessionHistoryAvailable: previousEnabled,
+            })
+          )
+        )?.decision
+      ).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+      await h.waitForRequest(2);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(expect.objectContaining({ handoff: true, ...expected }));
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      expect(text(rows.at(-1)!)).toBe("Next request");
+    }
+  );
+
+  test("unresolved dispatch permissions omit the advisory without consuming its claim", async () => {
     const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+    expect((await h.session.sendMessage("Start work", resumeOptions)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
+    spyOn(
+      budgetOf(h) as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
+      "resolveAgentForBudgetChecks"
+    ).mockResolvedValueOnce(Err(exceeded));
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect(text(h.requests[1].messages.at(-1)!)).toBe("Continue");
+
+    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(3);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(rolloverRows(rows)).toHaveLength(0);
+  });
+
+  test.each(["larger-model", "mode-inactive"] as const)(
+    "a pending handoff is omitted when the dispatching send uses a %s",
+    async (change) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      const nextOptions: SendMessageOptions =
+        change === "larger-model"
+          ? { ...options, model: "openai:gpt-4.1" }
+          : { ...options, experiments: { tokenBudget: false } };
+      expect(h.session.queueMessage("Next request", nextOptions)).not.toBeNull();
+      expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(0);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      if (change === "mode-inactive") {
+        // The ordinary auto-compaction path owns that send; no budget callback is installed.
+        expect(h.requests[1].onStepSettled).toBeUndefined();
+      } else {
+        expect(text(rows.at(-1)!)).toBe("Next request");
+        expect(h.requests[1].modelString).toBe("openai:gpt-4.1");
+      }
+    }
+  );
+
+  test("removing the queued advisory Continue does not lose the advisory itself", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     expect(
       h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
     ).toBe(1);
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(rolloverRows(rows)).toHaveLength(1);
-    expect(text(rows.at(-1)!)).toBe("Continue");
-  });
-
-  test("the flush entry degrades to a plain rollover when dispatch-time headroom is gone", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    // Usage reported at stream end exceeds ceiling - reserve, so the promised write cannot fit.
-    h.settleStream(0, { contextUsage: { inputTokens: 118_500 } });
-    await h.waitForRequest(2);
-    const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(rolloverRows(rows)).toHaveLength(1);
-    const trigger = rows.at(-1)!;
-    expect(text(trigger)).toBe("Continue");
-    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(
-      h.requests[1].messages.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)
-    ).toBe(false);
-  });
-
-  test("disabling automatic rollover before the flush dispatches degrades it to a normal turn", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    h.session.setAutoCompactionThreshold(1);
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(rolloverRows(rows)).toHaveLength(0);
-    const trigger = rows.at(-1)!;
-    expect(text(trigger)).toBe("Continue");
-    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    // The paired rollover entry and the stale claim go with it: re-enabling rollover later
-    // must not seal the window without fresh pressure.
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    h.session.setAutoCompactionThreshold(0.7);
-    expect((await h.requests[1].onStepSettled?.(step(50_000)))?.decision).toBe("continue");
-    h.settleStream(1, { finishReason: "stop" });
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(2);
+    expect(h.requests).toHaveLength(1);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    // The next real send derives the advisory from usage, not from the dropped intent.
     expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    // The undelivered flush did not consume this window's single offer.
-    expect((await h.requests[2].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+    expect(text(rows.at(-1)!)).toBe("Follow-up");
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
   });
 
-  test("a text-only flush that ends after rollover was disabled leaves no stale reset", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    h.session.setAutoCompactionThreshold(1);
-    // No tool step: the settled-step callback never runs; the paired Continue dispatches.
-    h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    h.settleStream(2, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    h.session.setAutoCompactionThreshold(0.7);
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-  });
+  test.each(["stop", "failed-publication", "restart-before", "restart-after"] as const)(
+    "the handoff is published exactly once across a %s",
+    async (interruption) => {
+      let h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      // Intent alone claims nothing; only a durable row does.
+      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      // The committed partial keeps the usage the interrupted stream reached.
+      const persistUsage = () =>
+        h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("stopped-answer", "assistant", "Partial work", {
+            model,
+            contextUsage: { inputTokens: 90_000, outputTokens: 10, totalTokens: 90_010 },
+          })
+        );
+      switch (interruption) {
+        case "stop": {
+          spyOn(h.aiService, "stopStream").mockImplementation(() => {
+            h.aiEmitter.emit("stream-abort", {
+              type: "stream-abort",
+              workspaceId,
+              messageId: "assistant-1",
+              abortReason: "user",
+              metadata: { duration: 1 },
+            });
+            h.completions[0].settle({
+              status: "aborted",
+              abortReason: "user",
+              streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+            });
+            return Promise.resolve(Ok(undefined));
+          });
+          expect((await h.session.interruptStream()).success).toBe(true);
+          await h.session.waitForIdle();
+          expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+          expect((await persistUsage()).success).toBe(true);
+          break;
+        }
+        case "failed-publication": {
+          spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+            (...args) => {
+              const operation = args[2];
+              expect(operation.kind === "append" && warningRows(operation.messages)).toHaveLength(
+                1
+              );
+              return Promise.resolve(Err("disk full"));
+            }
+          );
+          h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+          await h.session.waitForIdle();
+          expect(h.requests).toHaveLength(1);
+          break;
+        }
+        case "restart-before": {
+          expect((await persistUsage()).success).toBe(true);
+          await h.session.dispose();
+          h = await setup({ previous: h });
+          break;
+        }
+        case "restart-after": {
+          h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+          await h.waitForRequest(2);
+          expect(warningRows(await allRows(h)).filter(isHandoffRow)).toHaveLength(1);
+          await h.session.dispose();
+          h = await setup({ previous: h });
+          break;
+        }
+      }
+      if (interruption !== "restart-after") expect(warningRows(await allRows(h))).toHaveLength(0);
+      // Without a durable row the next send publishes the handoff from persisted usage and the
+      // dispatching permissions; with one, it publishes nothing more.
+      expect((await h.session.sendMessage("Resume the work", options)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      const latest = h.requests.at(-1)!;
+      for (const usage of [85_000, 95_000])
+        expect((await latest.onStepSettled?.(step(usage)))?.decision).toBe("continue");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    }
+  );
 
-  test("a flush turn's finish never completes a goal implicitly nor consumes goal accounting", async () => {
-    const h = await setup();
-    const completeGoal = spyOn(
-      h.session as unknown as {
-        maybeAutoCompleteGoalFromSilentContinuation: () => Promise<void>;
-      },
-      "maybeAutoCompleteGoalFromSilentContinuation"
-    );
-    // Minimal goal service: only the stream-end accounting seam is observed.
-    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
-      Promise.resolve(null)
-    );
-    const noop = () => Promise.resolve();
-    const previewStreamAccounting = mock(() => Promise.resolve(null));
-    const usageDelta = async () => {
-      h.aiEmitter.emit("usage-delta", {
-        type: "usage-delta",
-        workspaceId,
-        messageId: `assistant-${h.requests.length}`,
-        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+  test.each([
+    // The real-encoding count leaves no room for an advisory row where the heuristic alone would.
+    { toolResultTokens: 18_500, advisory: false },
+    { toolResultTokens: 1_000, advisory: true },
+  ])(
+    "dispatch screens the pending handoff against the encoded last-step outputs (advisory=$advisory)",
+    async ({ toolResultTokens, advisory }) => {
+      const h = await setup();
+      const stale = "s".repeat(400_000);
+      const settled = "d".repeat(4_000);
+      const toolPart = (toolCallId: string, output: string): MuxMessage["parts"][number] => ({
+        type: "dynamic-tool",
+        toolName: "bash",
+        toolCallId,
+        state: "output-available",
+        input: {},
+        output,
       });
-      // The forwarded handler awaits usage bookkeeping before previewing.
-      for (let i = 0; i < 3; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    };
-    Reflect.set(h.session, "workspaceGoalService", {
-      recordStreamAccounting,
-      previewStreamAccounting,
-      recordStreamStarted: noop,
-      recordUserStoppedStream: noop,
-      applyPendingAfterStreamEnd: noop,
-      requestContinuationAfterStreamEnd: noop,
-      syncGoalModeWithChatTail: noop,
-      getGoal: () => Promise.resolve(null),
-      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
-    });
+      const last = createMuxMessage("old-answer", "assistant", "Ran tools", {
+        model,
+        contextUsage: { inputTokens: 100_000, outputTokens: 10, totalTokens: 100_010 },
+        // Only the last step's outputs are still unaccounted for by the reported usage.
+        stepStartPartIndices: [0, 2],
+      });
+      last.parts.push(toolPart("earlier-step", stale), toolPart("last-step", settled));
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("old-user", "user", "Previous request"),
+            last,
+          ])
+        ).success
+      ).toBe(true);
+      const counted = spyOn(budgetCounting, "estimateToolResultTokensForModel").mockResolvedValue(
+        toolResultTokens
+      );
+      // The send itself is screened against the persisted outputs first.
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect(counted).toHaveBeenCalledWith([settled], expect.anything());
+      expect(
+        counted.mock.calls.some(([outputs]) => Array.isArray(outputs) && outputs.includes(stale))
+      ).toBe(false);
+      let rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(advisory ? 1 : 0);
+      if (!advisory) {
+        // Settlement sees no persisted outputs and asks for the handoff; dispatch screens again.
+        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("warn");
+        h.settleStream(0, { contextUsage: { inputTokens: 100_000 } });
+        await h.waitForRequest(2);
+        rows = await allRows(h);
+        expect(warningRows(rows)).toHaveLength(0);
+        expect(text(rows.at(-1)!)).toBe("Continue");
+      }
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(budgetClaims(h).handoff).toBe(advisory);
+    }
+  );
+
+  test("a text-only completion queues nothing; the next real send carries the advisory once", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(50_000)))?.decision).toBe("continue");
+    // The reply finished without another tool step while usage grew into the handoff band.
+    h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 92_000 } });
+    await h.session.waitForIdle();
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    expect(h.requests).toHaveLength(1);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    expect((await h.session.sendMessage("Next real request", options)).success).toBe(true);
+    let rows = await allRows(h);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+    expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 93_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("And another", options)).success).toBe(true);
+    rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(1);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    expect(h.requests).toHaveLength(3);
+  });
+
+  test("an advisory that overflows at assembly takes the emergency path without a stale claim", async () => {
+    const h = await setup({ failure: (attempt) => (attempt === 2 ? exceeded : undefined) });
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(3);
+    const rows = await allRows(h);
+    const [reset] = rolloverRows(rows);
+    expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
+    const handoff = warningRows(rows);
+    expect(handoff.map(isHandoffRow)).toEqual([true]);
+    expect(handoff[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
+    // The sealed advisory neither travels into the fresh window nor claims it.
+    const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
+    expect(warningRows(fresh)).toHaveLength(0);
+    expect(text(fresh.findLast((row) => row.role === "user")!)).toBe("Continue");
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect((await h.requests[2].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    expect(h.requests).toHaveLength(3);
+  });
+
+  test("a handoff continuation stays ordinary goal work", async () => {
+    const h = await setup({ goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
     expect(
       (
         await h.session.sendMessage("Goal work", options, {
@@ -2305,178 +2603,152 @@ describe("AgentSession token-budget lifecycle", () => {
         })
       ).success
     ).toBe(true);
-    await usageDelta();
+    await emitUsageDelta(h);
     expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
     expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
-    expect(recordStreamAccounting.mock.calls[0][0]).toMatchObject({
-      streamOriginKind: "goal_continuation",
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
+    expect(rows.at(-1)?.metadata).toMatchObject({
+      kind: GOAL_CONTINUATION_KIND,
+      goalId: "goal-budget",
     });
-    // The flush row keeps the goal attribution (a restart re-derives the paired continuation's
-    // goalKind/goalId from it), but the housekeeping stream itself is not goal work.
-    expect((await allRows(h)).at(-1)?.metadata).toMatchObject({ kind: GOAL_CONTINUATION_KIND });
-    // Neither the live preview nor the final accounting sees the flush stream's usage.
-    await usageDelta();
-    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
+    // Unlike the retired hidden flush turn, the continuation's usage is goal usage.
+    await emitUsageDelta(h);
+    expect(previewStreamAccounting).toHaveBeenCalledTimes(2);
     h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
-    expect(completeGoal).not.toHaveBeenCalled();
-    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
-    // The paired continuation is goal work again.
-    h.settleStream(2, { finishReason: "stop" });
     await h.session.waitForIdle();
     expect(recordStreamAccounting).toHaveBeenCalledTimes(2);
-    expect(recordStreamAccounting.mock.calls[1][0]).toMatchObject({
-      streamOriginKind: "goal_continuation",
+    expect(recordStreamAccounting.mock.calls.map(([input]) => input.streamOriginKind)).toEqual([
+      "goal_continuation",
+      "goal_continuation",
+    ]);
+  });
+
+  test("a handoff continuation after a fenced edit still dispatches", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    await h.historyService.appendManyToHistory(workspaceId, [
+      createMuxMessage("edit-target", "user", "Original request"),
+      createMuxMessage("edit-answer", "assistant", "Original answer", { model }),
+    ]);
+    // Fence the edit over the wire projection the client holds, as the UI does.
+    const historyEditPrecondition = buildHistoryEditPrecondition(
+      (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
+      "edit-target"
+    );
+    assert(historyEditPrecondition, "Expected an edit fence");
+    expect(
+      (
+        await h.session.sendMessage("Edited request", {
+          ...options,
+          editMessageId: "edit-target",
+          historyEditPrecondition,
+        })
+      ).success
+    ).toBe(true);
+    await h.waitForRequest(1);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    const continuation = await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(continuation.messages.map(text)).toContain("Edited request");
+    expect(continuation.messages.map(text)).not.toContain("Original request");
+  });
+
+  test("a budget continuation keeps the turn's routing and Chat Instructions state", async () => {
+    const h = await setup();
+    const record: AutoModelRoutingRecord = {
+      requestedFallbackModel: "anthropic:claude-sonnet-4-5",
+      model,
+      status: "routed",
+    };
+    // The record is session-internal; a routed send carries it on its resolved options. The
+    // empty snapshot is the renderer's "Chat Instructions disabled" sentinel.
+    const routed: SendMessageOptions & { autoModelRoutingRecord: AutoModelRoutingRecord } = {
+      ...options,
+      additionalSystemContext: "",
+      autoModelRoutingRecord: record,
+    };
+    expect((await h.session.sendMessage("Routed work", routed)).success).toBe(true);
+    expect(h.requests[0]).toMatchObject({ autoModelRouting: record, additionalSystemContext: "" });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect(await h.waitForRequest(2)).toMatchObject({
+      autoModelRouting: record,
+      additionalSystemContext: "",
     });
   });
 
-  test("disabling rollover while the flush streams drops the pending reset but keeps the Continue", async () => {
-    const h = await setup();
-    expect(
-      (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
-    ).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    h.session.setAutoCompactionThreshold(1);
-    expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    // The paired continuation survives as an ordinary same-turn continuation: the delegated
-    // turn's outcome is the resumed work, never the notes-only flush finish.
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
-    let rows = await allRows(h);
-    expect(rolloverRows(rows)).toHaveLength(0);
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
-    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    h.settleStream(2, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    h.session.setAutoCompactionThreshold(0.7);
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    rows = await allRows(h);
-    expect(rolloverRows(rows)).toHaveLength(0);
-    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-  });
-
-  test("a flush stopped without its settled-step callback while the mode is disabled leaves no stale reset", async () => {
-    const h = await setup();
-    const globalOptions: SendMessageOptions = { model, agentId: "exec" };
-    const experiment = spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
-    );
-    expect((await h.session.sendMessage("Work", globalOptions)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    // Disabled while the flush streams; a `require: memory` success (or a text-only finish)
-    // stops the stream before the settled-step callback runs.
-    experiment.mockImplementation(() => false);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
-    expect(text((await allRows(h)).at(-1)!)).toBe("Continue");
-    h.settleStream(2, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    experiment.mockImplementation((id) => id === EXPERIMENT_IDS.TOKEN_BUDGET);
-    expect((await h.session.sendMessage("Follow-up", globalOptions)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    // Fresh pressure seals normally; the durable final row already used this window's one offer.
-    expect((await h.requests[3].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+  // Older builds offered a hidden notes-flush step before sealing a window. New windows never
+  // write those rows; the durable ones already on disk must still finish as one bounded step.
+  test("a resumed legacy flush stays one bounded step, then seals the window", async () => {
+    const first = await setup();
+    await seedLegacyFlushTurn(first, { muxMetadata: correlation });
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    const sendOptions = { ...resumeOptions, maxOutputTokens: 300, thinkingLevel: "high" as const };
+    expect((await h.session.resumeStream(sendOptions)).success).toBe(true);
+    // The sealing intent is restored up front; the flush itself runs memory-only at the lowest
+    // thinking with the bounded cap, whatever the caller configured.
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-  });
-
-  test("disabling token-budget mode while the flush pair is queued dispatches it as a plain continuation", async () => {
-    const h = await setup();
-    const globalOptions: SendMessageOptions = { model, agentId: "exec", muxMetadata: correlation };
-    const experiment = spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
+    expect(h.requests[0].thinkingLevel).toBe("off");
+    expect(h.requests[0].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
+    expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
+    // Bounded to one step although the resumed step crosses nothing; its memory-only toolset
+    // reports session_history as unavailable, which must not queue a second flush either.
+    const outcome = await h.requests[0].onStepSettled!(
+      step(50_000, { sessionHistoryAvailable: false })
     );
-    expect((await h.session.sendMessage("Work", globalOptions)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-    experiment.mockImplementation(() => false);
-    await h.finishAndDispatch();
-    // Without admission there is no pinned middleware snapshot and nothing to seal, so the hidden
-    // memory-only turn must not run: the entry becomes an ordinary continuation of the work and
-    // its paired continuation is dropped (mirrors the pre-dispatch degrade path).
-    const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
-    expect(rows.at(-1)?.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].onStepSettled).toBeUndefined();
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(2);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-  });
-
-  test("disabling rollover between flush admission and publication degrades the flush", async () => {
-    const h = await setup();
-    expect(
-      (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
-    ).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    // Skill snapshot materialization is one of the awaits between flush admission and the
-    // durable batch append.
-    const session = h.session as unknown as {
-      materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<unknown>;
-    };
-    const materialize = session.materializeAgentSkillSnapshots.bind(h.session);
-    spyOn(session, "materializeAgentSkillSnapshots").mockImplementationOnce(async (...args) => {
-      h.session.setAutoCompactionThreshold(1);
-      return materialize(...args);
-    });
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    // No durable promise of a fresh window that nothing will deliver: plain continuation instead.
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(rows.at(-1)?.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].requestAssemblySnapshot).toBeUndefined();
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    h.session.setAutoCompactionThreshold(0.7);
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-  });
-
-  test("a Stop during flush admission refuses the automatic flush and continuation", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    const capture = h.aiService.captureRequestAssemblySnapshot!.bind(h.aiService);
-    const stopped = Promise.withResolvers<void>();
-    // interruptStream clears the pending reset and its paired continuation while the flush
-    // dispatch is still awaiting its admission checks.
-    spyOn(h.aiService, "captureRequestAssemblySnapshot").mockImplementationOnce(async (id) => {
-      expect((await h.session.interruptStream()).success).toBe(true);
-      stopped.resolve();
-      return capture(id);
-    });
+    expect(outcome.decision).toBe("rollover");
+    expect(outcome.continuationEntryId).toBeDefined();
+    // Legacy flush recovery must still identify the paired rollover as its exact successor.
+    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("pending");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     h.settleStream(0);
-    await stopped.promise;
-    await h.session.waitForIdle();
+    await h.waitForRequest(2);
+    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("streaming");
     const rows = await allRows(h);
-    expect(warningRows(rows)).toHaveLength(0);
-    expect(h.requests).toHaveLength(1);
-    expect(rows.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)).toBe(false);
+    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
+    expect(warningRows(rows)).toHaveLength(1);
+    const [reset] = rolloverRows(rows);
+    // The reset keeps the budget the legacy row promised, not the current ceiling.
+    expect(reset.metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      flushOpportunity: true,
+      budgetTokens: 96_000,
+    });
+    expect(rows.at(-1)?.metadata).toMatchObject({
+      synthetic: true,
+      retrySendOptions: { agentInitiated: true },
+      muxMetadata: { ...correlation, contextBudgetContinuation: true },
+    });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].thinkingLevel).toBe("high");
+    expect(h.requests[1].maxOutputTokens).toBe(300);
+    // Neither the trigger text nor its flag reaches the fresh window, and the legacy claim does
+    // not suppress the fresh window's own advisories.
     expect(
-      await h.historyService.getCompactionCancellationStorage(workspaceId).read()
-    ).not.toBeNull();
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some(
+        (row) =>
+          text(row) === LEGACY_FLUSH_TRIGGER ||
+          row.metadata?.muxMetadata?.contextBudgetFlush === true
+      )
+    ).toBe(false);
+    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
   });
 
-  test("a persisted flush resumed with token-budget mode disabled stays bounded to one step", async () => {
+  test("a persisted legacy flush resumed with token-budget mode disabled stays bounded to one step", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
     const disabled = { ...options, experiments: { tokenBudget: false } };
@@ -2491,16 +2763,15 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { finishReason: "stop" });
     await h.session.waitForIdle();
     expect(h.requests).toHaveLength(1);
-    expect((await h.session.sendMessage("Follow-up", disabled)).success).toBe(true);
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    // Re-enabling the mode later cannot seal the window with the stale legacy intent.
+    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
-  test("a persisted flush resumed with the mode disabled runs tool-less when no chain can be pinned", async () => {
+  test("a persisted legacy flush resumed with the mode disabled runs tool-less when no chain can be pinned", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
     const unregister = eventSpine.useBefore(
@@ -2522,11 +2793,9 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   });
 
-  test("resuming a persisted flush re-validates rollover admission first", async () => {
+  test("resuming a persisted legacy flush re-validates rollover admission first", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
     const unregister = eventSpine.useBefore(
@@ -2548,11 +2817,9 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   });
 
-  test("resuming a flush without a writable memory tool degrades it to a tool-less step", async () => {
+  test("resuming a legacy flush without a writable memory tool degrades it to a tool-less step", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
     // The Memory experiment was turned off before the restart resume.
@@ -2571,70 +2838,68 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
   });
 
-  test("toolset-changing middleware blocks the flush dispatch like the rollover it promises", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      h.settleStream(0);
-      await h.session.waitForIdle();
-      expect(h.requests).toHaveLength(1);
-      const rows = await allRows(h);
-      expect(warningRows(rows)).toHaveLength(0);
-      expect(rolloverRows(rows)).toHaveLength(0);
-      expect(rows.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)).toBe(false);
-      expect(
-        h.events.some(
-          (event) =>
-            event.type === "stream-error" &&
-            (event as { errorType?: string }).errorType === "context_budget_blocked"
-        )
-      ).toBe(true);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("middleware registered during the flush turn cannot block the promised reset", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
-    // The flush request itself runs the admitted chain, so a tool-mutating hook registered
-    // between admission and assembly cannot widen the memory-only turn either.
-    expect(h.requests[1].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect((await h.requests[1].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-      h.settleStream(1);
-      await h.waitForRequest(3);
-      expect(rolloverRows(await allRows(h))).toHaveLength(1);
-      // The reset is pinned to the snapshot admitted with the flush, not the changed registry.
-      expect(h.requests[2].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("a crash after only the flush placeholder keeps the notes-writing step", async () => {
+  test("middleware registered during a resumed legacy flush cannot block the promised reset", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId }
+    );
+    try {
+      expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
+      h.settleStream(0);
+      await h.waitForRequest(2);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+      // The reset is pinned to the snapshot admitted with the resume, not the changed registry.
+      expect(h.requests[1].requestAssemblySnapshot?.preservesToolset).toBe(true);
+    } finally {
+      unregister();
+    }
+  });
+
+  test.each(["settled-step", "text-only"] as const)(
+    "disabling rollover while a resumed legacy flush runs drops the reset but keeps the Continue (%s)",
+    async (ending) => {
+      const first = await setup();
+      await seedLegacyFlushTurn(first, { muxMetadata: correlation });
+      await first.session.dispose();
+      const h = await setup({ previous: first });
+      expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+      await seedThreshold(h, 1);
+      if (ending === "settled-step")
+        expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
+      // The paired continuation survives as an ordinary same-turn continuation: the delegated
+      // turn's outcome is the resumed work, never the notes-only flush finish.
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+      h.settleStream(0, { finishReason: "stop" });
+      await h.waitForRequest(2);
+      let rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(text(rows.at(-1)!)).toBe("Continue");
+      expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
+      expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+      h.settleStream(1, { finishReason: "stop" });
+      await h.session.waitForIdle();
+      await seedThreshold(h, 0.7);
+      expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+      rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      // The window's handoff advisory may still ride this send; no second legacy flush does.
+      expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
+    }
+  );
+
+  test("a crash after only the legacy flush placeholder keeps the notes-writing step", async () => {
+    const first = await setup();
+    await seedLegacyFlushTurn(first);
     // The builder appends an empty assistant placeholder before any output exists.
     const placeholder = createMuxMessage("flush-placeholder", "assistant", "", {
       model,
@@ -2653,17 +2918,16 @@ describe("AgentSession token-budget lifecycle", () => {
     ]);
   });
 
-  test("an emergency rollover during the flush turn sanitizes the flush trigger", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await h.finishAndDispatch();
-    const flushRow = (await allRows(h)).at(-1)!;
-    expect(flushRow.metadata?.muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    const flushTriggerText = text(flushRow);
+  test("an emergency rollover during a resumed legacy flush sanitizes the flush trigger", async () => {
+    const first = await setup();
+    await seedLegacyFlushTurn(first);
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     const streamError = {
       workspaceId,
-      messageId: "assistant-2",
+      messageId: "assistant-1",
       error: "context limit",
       errorType: "context_exceeded" as const,
       contextBudgetExceeded: {
@@ -2674,11 +2938,11 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     };
     h.aiEmitter.emit("error", streamError);
-    h.completions[1].settle({ status: "failed", streamError });
-    expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-2")).toBe(
+    h.completions[0].settle({ status: "failed", streamError });
+    expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-1")).toBe(
       "retry-started"
     );
-    await h.waitForRequest(3);
+    await h.waitForRequest(2);
     const rows = await allRows(h);
     const [reset] = rolloverRows(rows);
     expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
@@ -2686,47 +2950,18 @@ describe("AgentSession token-budget lifecycle", () => {
     const trigger = fresh.findLast((row) => row.role === "user")!;
     expect(text(trigger)).toBe("Continue");
     expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    // The sanitized retry carries neither the internal trigger text nor its flag.
+    // The sanitized retry carries neither the internal trigger text nor its flag, so the request
+    // builder applies the ordinary toolset again.
     const leaked = (row: MuxMessage) =>
-      text(row) === flushTriggerText || row.metadata?.muxMetadata?.contextBudgetFlush === true;
+      text(row) === LEGACY_FLUSH_TRIGGER || row.metadata?.muxMetadata?.contextBudgetFlush === true;
     expect(fresh.some(leaked)).toBe(false);
-    expect(h.requests[2].messages.some(leaked)).toBe(false);
-    // Without the flag the request builder applies the ordinary toolset to the retry.
-    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].messages.some(leaked)).toBe(false);
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
   });
 
-  test("a resumed final-flush turn keeps the once-per-window flush claim", async () => {
+  test("a legacy flush whose step already completed before a crash gets no second memory call", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
-    await first.session.dispose();
-    // Startup retry resumes the persisted flush turn through history, not a fresh send.
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    // The sealing intent is restored with the resumed turn: the rollover continuation is
-    // queued up front, and the flush stays bounded to one step even though the resumed step
-    // no longer crosses the threshold.
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect((await h.requests[0].onStepSettled?.(step(50_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    h.settleStream(0);
-    await h.waitForRequest(2);
-    const rows = await allRows(h);
-    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    expect(rolloverRows(rows)).toHaveLength(1);
-    expect(rolloverRows(rows)[0].metadata?.muxMetadata).toMatchObject({
-      reason: "mid-stream",
-      flushOpportunity: true,
-    });
-  });
-
-  test("a flush whose step already completed before a crash gets no second memory call", async () => {
-    const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
+    await seedLegacyFlushTurn(first);
     // The flush step's memory call settled into the partial before the crash. StreamManager
     // first persists an assistant placeholder to reserve its history sequence.
     const partial = createMuxMessage("flush-partial", "assistant", "", {
@@ -2760,25 +2995,28 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
   });
 
-  test("the final flush is offered once per window, including after a restart", async () => {
+  test("a resumed legacy flush stream is exempt from goal accounting; its continuation is not", async () => {
     const first = await setup();
-    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await first.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    await first.finishAndDispatch();
-    expect(warningRows(await allRows(first)).filter(isFinalFlushRow)).toHaveLength(1);
+    await seedLegacyFlushTurn(first);
     await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.sendMessage("Resume after restart", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    await h.finishAndDispatch();
-    const rows = await allRows(h);
-    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    expect(rolloverRows(rows)).toHaveLength(1);
-    // A later window starts with a fresh claim.
-    expect((await h.requests[1].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    const h = await setup({ previous: first, goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
+    await emitUsageDelta(h);
+    expect(previewStreamAccounting).not.toHaveBeenCalled();
+    h.settleStream(0, { finishReason: "stop" });
+    await h.waitForRequest(2);
+    expect(recordStreamAccounting).not.toHaveBeenCalled();
+    // The paired continuation is an ordinary stream again.
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    await emitUsageDelta(h);
+    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
   });
 
   const exceeded: SendMessageError = {
@@ -3054,7 +3292,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("a primary on-send rollover followed by fresh preflight overflow is blocked without a second reset", async () => {
     const h = await setup({ failure: () => exceeded });
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     const result = await h.session.sendMessage("Still too big after assembly", options);
     expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
     expect(h.requests).toHaveLength(1);
@@ -3178,6 +3416,116 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  /**
+   * Records the recovery path's preparation fence and the protected calls it guards. Each
+   * valid fence check queues a microtask; protected work that starts before that microtask
+   * runs proves the session did not yield between the check and the call.
+   *
+   * The marker is a real promise reaction, not `queueMicrotask`: another suite in the shared
+   * Bun process replaces the global with a synchronous stub, which would record the marker
+   * inside the fence check itself and fail this witness for the wrong reason.
+   */
+  function armRecoveryFenceWitness(h: Awaited<ReturnType<typeof setup>>) {
+    const controller = Reflect.get(h.session, "contextController") as SessionContextController;
+    const session = h.session as unknown as {
+      applyContextResetSideEffects(...args: unknown[]): Promise<void>;
+      appendContextRolloverRows(...args: unknown[]): Promise<Result<void>>;
+    };
+    const order: string[] = [];
+    let validated = 0;
+    const validate = controller.validatePreparation.bind(controller);
+    const validateSpy = spyOn(controller, "validatePreparation").mockImplementation((receipt) => {
+      const valid = validate(receipt);
+      if (valid) {
+        const tag = ++validated;
+        order.push(`validate:${tag}`);
+        void Promise.resolve().then(() => order.push(`microtask:${tag}`));
+      }
+      return valid;
+    });
+    const apply = session.applyContextResetSideEffects.bind(session);
+    const applySpy = spyOn(session, "applyContextResetSideEffects").mockImplementation(
+      (...args) => {
+        order.push(`apply:${validated}`);
+        return apply(...args);
+      }
+    );
+    const append = session.appendContextRolloverRows.bind(session);
+    const appendSpy = spyOn(session, "appendContextRolloverRows").mockImplementation((...args) => {
+      order.push(`append:${validated}`);
+      return append(...args);
+    });
+    const failFirstRequest = async () => {
+      const streamError = {
+        workspaceId,
+        messageId: "assistant-1",
+        error: "context limit",
+        errorType: "context_exceeded" as const,
+      };
+      h.aiEmitter.emit("error", streamError);
+      h.completions[0].settle({ status: "failed", streamError });
+      return h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId);
+    };
+    return { controller, order, validateSpy, applySpy, appendSpy, failFirstRequest };
+  }
+
+  test("recovery starts each protected publication step synchronously after its fence check", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const witness = armRecoveryFenceWitness(h);
+    const generation = budgetOf(h).contextBudgetGeneration;
+    expect(await witness.failFirstRequest()).toBe("retry-started");
+    expect(h.requests).toHaveLength(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    expect(witness.applySpy).toHaveBeenCalledTimes(1);
+    expect(witness.appendSpy).toHaveBeenCalledTimes(1);
+    // The recovery clears budget state exactly once, after the rows are durable.
+    expect(budgetOf(h).contextBudgetGeneration).toBe(generation + 1);
+    // Both protected calls must directly follow a valid fence check, ahead of the microtask
+    // that check queued. An intervening await would let the microtask run first.
+    for (const kind of ["apply", "append"] as const) {
+      const entry = witness.order.find((item) => item.startsWith(`${kind}:`));
+      assert(entry, `${kind} must have been recorded`);
+      const index = witness.order.indexOf(entry);
+      const tag = entry.slice(kind.length + 1);
+      expect({ kind, before: witness.order[index - 1] }).toEqual({
+        kind,
+        before: `validate:${tag}`,
+      });
+      expect({ kind, microtaskAfter: witness.order.indexOf(`microtask:${tag}`) > index }).toEqual({
+        kind,
+        microtaskAfter: true,
+      });
+    }
+    // The earlier fence checks yield to awaited work; only the final checkpoints are no-await.
+    expect(witness.order.slice(0, 2)).toEqual(["validate:1", "microtask:1"]);
+  });
+
+  test("budget invalidation before the fence check aborts recovery without replacement", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const before = await allRows(h);
+    const witness = armRecoveryFenceWitness(h);
+    // Invalidate right before the checkpoint that guards cleanup: the prepared candidate is
+    // complete, but the fence must reject it instead of sealing the old window.
+    let checks = 0;
+    const validate = witness.validateSpy.getMockImplementation()!;
+    witness.validateSpy.mockImplementation((receipt) => {
+      if (++checks === 2) witness.controller.clearBudgetState();
+      return validate(receipt);
+    });
+    expect(await witness.failFirstRequest()).toBe("terminal");
+    expect(checks).toBeGreaterThanOrEqual(2);
+    expect(witness.applySpy).not.toHaveBeenCalled();
+    expect(witness.appendSpy).not.toHaveBeenCalled();
+    expect(h.requests).toHaveLength(1);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    // Only the rejected request is quarantined; nothing else was appended or replaced.
+    expect((await allRows(h)).map((row) => row.id)).toEqual(before.map((row) => row.id));
+  });
+
   test.each([
     "auto-off",
     "history-disabled",
@@ -3188,7 +3536,7 @@ describe("AgentSession token-budget lifecycle", () => {
   ])("async terminal overflow rejects only unstarted budget requests (%s)", async (mode) => {
     const h = await setup();
     await seedHistory(h, 20_000);
-    if (mode === "auto-off" || mode === "assembled") h.session.setAutoCompactionThreshold(1);
+    if (mode === "auto-off" || mode === "assembled") await seedThreshold(h, 1);
     const sendOptions: SendMessageOptions = {
       ...options,
       ...(mode === "experiment-off" ? { experiments: { tokenBudget: false } } : {}),
@@ -3255,9 +3603,9 @@ describe("AgentSession token-budget lifecycle", () => {
     async (action) => {
       const h = await setup();
       expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-      expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+      expect((await h.requests[0].onStepSettled?.(step(120_000)))?.decision).toBe("rollover");
       expect(h.session.hasPendingManualFollowUp()).toBe(true);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
       expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
       if (action === "manual-reset") {
         h.session.clearUsageState();
@@ -3388,7 +3736,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "explicit %s disable blocks rollover before a stream starts",
     async (regex_match) => {
       const h = await setup();
-      await seedHistory(h, 110_000);
+      await seedHistory(h, 120_000);
       const result = await h.session.sendMessage("Keep my transcript reachable", {
         ...options,
         toolPolicy: [{ regex_match, action: "disable" }],
@@ -3407,7 +3755,7 @@ describe("AgentSession token-budget lifecycle", () => {
     };
     expect((await h.session.sendMessage("Start", disabled)).success).toBe(true);
     expect(
-      (await h.requests[0].onStepSettled?.(step(110_000, { sessionHistoryAvailable: false })))
+      (await h.requests[0].onStepSettled?.(step(120_000, { sessionHistoryAvailable: false })))
         ?.decision
     ).toBe("rollover");
     const blocked = Promise.withResolvers<void>();
@@ -3443,7 +3791,7 @@ describe("AgentSession token-budget lifecycle", () => {
           path.join(agentsDir, "restricted.md"),
           `---\nname: Restricted\nbase: exec\ntools:\n  remove: ["${pattern}"]\n---\nRestricted agent.\n`
         );
-        await seedHistory(h, emergency ? 20_000 : 110_000);
+        await seedHistory(h, emergency ? 20_000 : 120_000);
         const result = await h.session.sendMessage("Preserve access", {
           ...options,
           agentId: "restricted",
@@ -3471,7 +3819,7 @@ describe("AgentSession token-budget lifecycle", () => {
         path.join(agentsDir, "restricted.md"),
         `---\nname: Restricted\ntools:\n  add: ${JSON.stringify(add)}\n---\nRestricted agent.\n`
       );
-      await seedHistory(h, emergency ? 20_000 : 110_000);
+      await seedHistory(h, emergency ? 20_000 : 120_000);
       const result = await h.session.sendMessage("Preserve access", {
         ...options,
         agentId: "restricted",
@@ -3519,7 +3867,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "a rejected oversized input stays display-only after a shorter send (%s)",
     async (mode) => {
       const h = await setup();
-      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
+      if (mode === "auto-off") await seedThreshold(h, 1);
       const sendOptions: SendMessageOptions =
         mode === "history-disabled"
           ? { ...options, toolPolicy: [{ regex_match: "session_.*", action: "disable" }] }
@@ -3562,8 +3910,8 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup({
         failure: (attempt) => (attempt <= (mode === "retry" ? 2 : 1) ? exceeded : undefined),
       });
-      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
-      if (mode !== "fresh") await seedHistory(h, mode === "on-send" ? 110_000 : 20_000);
+      if (mode === "auto-off") await seedThreshold(h, 1);
+      if (mode !== "fresh") await seedHistory(h, mode === "on-send" ? 120_000 : 20_000);
       const sendOptions: SendMessageOptions =
         mode === "history-disabled"
           ? { ...options, toolPolicy: [{ regex_match: "session_.*", action: "disable" }] }
@@ -3601,7 +3949,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (retry) => {
       const h = await setup({ failure: () => exceeded });
       if (retry) await seedHistory(h, 20_000);
-      else h.session.setAutoCompactionThreshold(1);
+      else await seedThreshold(h, 1);
       await fs.writeFile(path.join(h.config.rootDir, "rejected.txt"), "Rejected file payload");
       const skillDir = path.join(h.config.rootDir, ".xum", "skills", "rejected-skill");
       await fs.mkdir(skillDir, { recursive: true });
@@ -3900,7 +4248,7 @@ describe("AgentSession token-budget lifecycle", () => {
     const mentioned = path.join(h.config.rootDir, "mentioned.txt");
     await fs.writeFile(mentioned, "initial content\n");
     await fs.utimes(mentioned, new Date(1_000), new Date(1_000));
-    await seedHistory(h, 110_000);
+    await seedHistory(h, 120_000);
     expect((await h.session.sendMessage("Inspect @mentioned.txt", options)).success).toBe(true);
     expect(trackedFilePaths(h)).toContain(mentioned);
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
@@ -3923,33 +4271,52 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(true);
   });
 
-  test("warnings receive the settled tool availability instead of promising disabled recovery", async () => {
-    const h = await setup();
-    const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
-    const denied: SendMessageOptions = {
-      ...options,
-      toolPolicy: [{ regex_match: "session_.*", action: "disable" }],
-    };
-    expect((await h.session.sendMessage("Start without history", denied)).success).toBe(true);
-    expect(
-      (
-        await h.requests[0].onStepSettled?.(
-          step(85_000, {
-            memoryWritable: false,
-            sessionHistoryAvailable: false,
-          })
-        )
-      )?.decision
-    ).toBe("warn");
-    await h.finishAndDispatch();
-    expect(warning).toHaveBeenCalledWith(
-      expect.objectContaining({
-        maxTokens: 128_000,
+  test.each([
+    {
+      label: "degraded recovery",
+      usage: 85_000,
+      toolPolicy: [
+        { regex_match: "memory|session_.*", action: "disable" },
+      ] satisfies SendMessageOptions["toolPolicy"],
+      settled: { memoryWritable: false, sessionHistoryAvailable: false },
+      expected: {
+        handoff: false,
         memoryWritable: false,
         sessionHistoryAvailable: false,
-      })
-    );
-  });
+        newContextAvailable: true,
+      },
+    },
+    {
+      label: "a disabled new_context tool",
+      usage: 90_000,
+      toolPolicy: [
+        { regex_match: "new_context", action: "disable" },
+      ] satisfies SendMessageOptions["toolPolicy"],
+      settled: {},
+      expected: {
+        handoff: true,
+        memoryWritable: true,
+        sessionHistoryAvailable: true,
+        newContextAvailable: false,
+      },
+    },
+  ])(
+    "advisories receive the current tool permissions under $label",
+    async ({ usage, toolPolicy, settled, expected }) => {
+      const h = await setup();
+      const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+      expect((await h.session.sendMessage("Start", { ...resumeOptions, toolPolicy })).success).toBe(
+        true
+      );
+      expect((await h.requests[0].onStepSettled?.(step(usage, settled)))?.decision).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: usage } });
+      await h.waitForRequest(2);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(
+        expect.objectContaining({ maxTokens: 128_000, budgetTokens: 119_808, ...expected })
+      );
+    }
+  );
 
   test.each([4096, 8192])(
     "a small %s-token window admits a fitting first message",
@@ -3964,7 +4331,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled budget never warns or rolls over", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 110_000);
     expect((await h.session.sendMessage("Manual only", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("continue");
@@ -3977,7 +4344,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled settled hard block creates no warning, reset, or queued continuation", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     expect((await h.session.sendMessage("Start this task", options)).success).toBe(true);
     expect(
       (
@@ -3998,7 +4365,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "token-dense fresh input is blocked before provider dispatch and a fitting follow-up remains usable",
     async (input) => {
       const h = await setup();
-      h.session.setAutoCompactionThreshold(1);
+      await seedThreshold(h, 1);
       expect(await h.session.sendMessage(input, options)).toMatchObject({
         success: false,
         error: { type: "context_budget_blocked" },
@@ -4014,7 +4381,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled still reports the hard preflight guard without resetting or retrying", async () => {
     const h = await setup({ failure: () => exceeded });
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 20_000);
     expect(await h.session.sendMessage("Hard guard remains enabled", options)).toMatchObject({
       success: false,

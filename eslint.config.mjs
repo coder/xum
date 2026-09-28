@@ -7,6 +7,8 @@ import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import tailwindcss from "eslint-plugin-tailwindcss";
 import tseslint from "typescript-eslint";
+import ts from "typescript";
+import path from "node:path";
 
 /**
  * Shared helpers for the rules ported from anti-slop
@@ -271,6 +273,95 @@ function functionBoundary(node) {
  */
 const localPlugin = {
   rules: {
+    "no-required-member-typeof-guard": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            'Disallow `typeof x.member === "function"` guards on members the type declares as required methods',
+        },
+        messages: {
+          required:
+            "`{{member}}` is a required method of `{{owner}}`, so this typeof guard can only fire for an incomplete test double. Complete the double (or make the member optional in the interface if it really is optional).",
+        },
+      },
+      create(context) {
+        // Production code gets real instances through DI; a typeof guard on a member the type
+        // requires is dead there and hides wiring bugs by silently skipping work. Such guards
+        // kept reappearing to tolerate partial test doubles (#4531, #4557).
+        const services = context.sourceCode.parserServices;
+        if (services?.program == null || services.esTreeNodeToTSNodeMap == null) {
+          return {};
+        }
+        const checker = services.program.getTypeChecker();
+        const isAlwaysCallable = (type) => {
+          const parts = type.isUnion() ? type.types : [type];
+          return parts.every(
+            (part) =>
+              (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) ===
+                0 && part.getCallSignatures().length > 0
+          );
+        };
+        return {
+          BinaryExpression(node) {
+            if (!["===", "!==", "==", "!="].includes(node.operator)) return;
+            const typeofSide = node.left.type === "UnaryExpression" ? node.left : node.right;
+            const literalSide = typeofSide === node.left ? node.right : node.left;
+            if (typeofSide.type !== "UnaryExpression" || typeofSide.operator !== "typeof") return;
+            if (literalSide.type !== "Literal" || literalSide.value !== "function") return;
+            const member = typeofSide.argument;
+            if (
+              member.type !== "MemberExpression" ||
+              member.computed ||
+              member.optional ||
+              member.property.type !== "Identifier"
+            ) {
+              return;
+            }
+            // Only injected dependencies (`this.<dep>[.<dep>...].<method>`): feature detection on
+            // runtime/library objects (timers, fetch, streams) stays legitimate.
+            // Also covers the widening-cast alias `const maybe = this.<dep> as Dep & { m?: ... }`.
+            const isThisRooted = (expression) => {
+              let current = expression;
+              while (current.type === "MemberExpression" && !current.computed) {
+                current = current.object;
+              }
+              return current.type === "ThisExpression" && expression.type !== "ThisExpression";
+            };
+            let receiverRooted = isThisRooted(member.object);
+            if (!receiverRooted && member.object.type === "Identifier") {
+              const variable = context.sourceCode
+                .getScope(node)
+                .references.concat(context.sourceCode.getScope(node).through)
+                .find((reference) => reference.identifier === member.object)?.resolved;
+              const init = variable?.defs[0]?.node?.init;
+              receiverRooted = init?.type === "TSAsExpression" && isThisRooted(init.expression);
+            }
+            if (!receiverRooted) return;
+            const objectType = checker.getTypeAtLocation(
+              services.esTreeNodeToTSNodeMap.get(member.object)
+            );
+            // Untyped or loose receivers (any/unknown/index signatures) make the check meaningful.
+            if (objectType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return;
+            const symbol = checker.getPropertyOfType(objectType, member.property.name);
+            if (symbol == null || (symbol.flags & ts.SymbolFlags.Optional) !== 0) return;
+            const memberType = checker.getTypeOfSymbolAtLocation(
+              symbol,
+              services.esTreeNodeToTSNodeMap.get(member.property)
+            );
+            if (!isAlwaysCallable(memberType)) return;
+            context.report({
+              node,
+              messageId: "required",
+              data: {
+                member: member.property.name,
+                owner: checker.typeToString(objectType),
+              },
+            });
+          },
+        };
+      },
+    },
     "no-unsafe-child-process": {
       meta: {
         type: "problem",
@@ -449,6 +540,553 @@ const localPlugin = {
         };
       },
     },
+    "require-module-mock-restore": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Require every bun `mock.module` registration in a test to be restored after the suite",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative test path -> specifiers whose mock may stay unrestored.
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          unrestored:
+            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module. Restores that may not run (conditional, in helpers passed as values, in `afterEach` of an all-skipped suite) or come from a mutated list do not count.',
+          dynamicSpecifier:
+            "mock.module needs a statically known specifier (a string literal, a `const` string, or a loop over a `const` array of them) so its restore can be verified.",
+        },
+      },
+      create(context) {
+        // bun registers mock.module process-wide and never unregisters it, so a mock silently
+        // replaces the module for every test file that runs later in the same shard, whether it
+        // was registered at file scope, from a hook, a test body or a helper. That made
+        // unrelated suites fail only for certain CI shard orders (#4524, #3359, #4639).
+        //
+        // A registration is a restore when it runs only from teardown: inside an
+        // `afterAll`/`afterEach` callback, or inside a same-file function whose every use is a
+        // call from teardown code (or its registration as the hook callback itself). A helper
+        // that setup code also calls is an installer. `restoreModulesAfterSuite` entries are
+        // restores too. A restore covers installs in the `describe` block (or file) its hook
+        // runs in, including nested blocks; load-time installs run before every test, so any
+        // restore that runs covers them. Skipped suites and never-called helpers do not run.
+        // This is a flow-insensitive lint heuristic for the repo's idioms, not a proof, so it
+        // errs in one direction (#4660): installs over-approximate and restores
+        // under-approximate (a restore that may not run, or may not cover a specifier, counts
+        // as none).
+        const allowed = new Set(
+          context.options[0]?.allow?.[
+            path.relative(context.cwd, context.filename).split(path.sep).join("/")
+          ] ?? []
+        );
+        const RESTORE_HOOKS = new Set(["afterAll", "afterEach"]);
+        const { sourceCode } = context;
+        const mockCalls = [];
+        const restoreListCalls = [];
+        const allCalls = [];
+        const exitStatements = [];
+
+        const isFunctionNode = (node) =>
+          node?.type === "ArrowFunctionExpression" ||
+          node?.type === "FunctionExpression" ||
+          node?.type === "FunctionDeclaration";
+        const isMockModuleCall = (node) =>
+          node.callee.type === "MemberExpression" &&
+          !node.callee.computed &&
+          node.callee.object.type === "Identifier" &&
+          node.callee.object.name === "mock" &&
+          node.callee.property.type === "Identifier" &&
+          node.callee.property.name === "module";
+        const unwrapTypeAssertions = (node) => {
+          let current = node;
+          while (current?.type === "TSAsExpression" || current?.type === "TSSatisfiesExpression") {
+            current = current.expression;
+          }
+          return current;
+        };
+        const findVariable = (identifier) => {
+          for (let scope = sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (variable) {
+              return variable;
+            }
+          }
+          return null;
+        };
+        // Only the real helper registers an afterAll; a local look-alike does not.
+        const isRestoreListHelper = (callee) => {
+          const def = callee.type === "Identifier" ? findVariable(callee)?.defs[0] : null;
+          return (
+            callee.name === "restoreModulesAfterSuite" &&
+            def?.type === "ImportBinding" &&
+            String(def.parent.source.value).endsWith("/moduleMocks")
+          );
+        };
+        // A loop leaves the elements alone when it destructures each one
+        // (`for (const [p, real] of entries)`) or never reaches into or hands off its variable
+        // except to mock.module; `for (const entry of entries) entry[0] = "b"` rewrites the list.
+        const loopKeepsElements = (loop) => {
+          const declarator =
+            loop.left.type === "VariableDeclaration" ? loop.left.declarations[0] : null;
+          if (declarator?.id.type === "ArrayPattern") {
+            return declarator.id.elements.every((e) => e == null || e.type === "Identifier");
+          }
+          return (
+            declarator?.id.type === "Identifier" &&
+            sourceCode.getDeclaredVariables(declarator)[0].references.every(({ identifier }) => {
+              const parent = identifier.parent;
+              return parent.type === "CallExpression" || parent.type === "NewExpression"
+                ? isMockModuleCall(parent) && parent.arguments[0] === identifier
+                : !(parent.type === "MemberExpression" && parent.object === identifier);
+            })
+          );
+        };
+        // A `const` array still holds its literal elements only when every use reads it
+        // whole: looping over it, spreading it into a copy, or handing it to
+        // restoreModulesAfterSuite. Any other use (`entries.length = 0`, `.push`, passing it
+        // elsewhere, exporting it) may change what it holds by the time it is read.
+        const isSealedArray = (variable) =>
+          variable.defs[0].parent.parent?.type !== "ExportNamedDeclaration" &&
+          variable.references.every((reference) => {
+            if (reference.init) {
+              return true;
+            }
+            let node = reference.identifier;
+            while (
+              node.parent.type === "TSAsExpression" ||
+              node.parent.type === "TSSatisfiesExpression" ||
+              node.parent.type === "TSNonNullExpression"
+            ) {
+              node = node.parent;
+            }
+            const parent = node.parent;
+            return (
+              (parent.type === "ForOfStatement" &&
+                parent.right === node &&
+                loopKeepsElements(parent)) ||
+              (parent.type === "SpreadElement" && parent.parent.type === "ArrayExpression") ||
+              (parent.type === "CallExpression" &&
+                parent.arguments[0] === node &&
+                isRestoreListHelper(parent.callee))
+            );
+          });
+        // Element nodes of a statically known array: an array literal (spreads of other known
+        // arrays included) or a sealed `const` bound to one.
+        const resolveArrayElements = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Identifier") {
+            const variable = findVariable(node);
+            const def = variable?.defs[0];
+            return def?.type === "Variable" &&
+              def.parent.kind === "const" &&
+              isSealedArray(variable)
+              ? resolveArrayElements(def.node.init, depth + 1)
+              : null;
+          }
+          if (node.type !== "ArrayExpression") {
+            return null;
+          }
+          const elements = [];
+          for (const element of node.elements) {
+            if (element?.type === "SpreadElement") {
+              const spread = resolveArrayElements(element.argument, depth + 1);
+              if (spread == null) {
+                return null;
+              }
+              elements.push(...spread);
+            } else if (element != null) {
+              elements.push(element);
+            }
+          }
+          return elements;
+        };
+        // Every specifier string an expression can evaluate to, or null when not static. Covers
+        // literals, `const` strings, and loop variables over known arrays (`for (const p of
+        // PATHS)`, `for (const [p, exports] of realModules)`), so looped installs and restores
+        // stay checkable.
+        const resolveSpecifiers = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Literal") {
+            return typeof node.value === "string" ? [node.value] : null;
+          }
+          if (node.type === "TemplateLiteral") {
+            return node.expressions.length === 0 ? [node.quasis[0].value.cooked] : null;
+          }
+          if (node.type !== "Identifier") {
+            return null;
+          }
+          const def = findVariable(node)?.defs[0];
+          if (def?.type !== "Variable") {
+            return null;
+          }
+          const declarator = def.node;
+          const declaration = def.parent;
+          if (
+            declaration.parent?.type === "ForOfStatement" &&
+            declaration.parent.left === declaration
+          ) {
+            const elements = resolveArrayElements(declaration.parent.right, depth + 1);
+            if (elements == null) {
+              return null;
+            }
+            let pick;
+            if (declarator.id.type === "Identifier") {
+              pick = (element) => element;
+            } else if (
+              declarator.id.type === "ArrayPattern" &&
+              declarator.id.elements[0]?.type === "Identifier" &&
+              declarator.id.elements[0].name === node.name
+            ) {
+              pick = (element) => (element.type === "ArrayExpression" ? element.elements[0] : null);
+            } else {
+              return null;
+            }
+            const specifiers = [];
+            for (const element of elements) {
+              const resolved = resolveSpecifiers(pick(element), depth + 1);
+              if (resolved == null) {
+                return null;
+              }
+              specifiers.push(...resolved);
+            }
+            return specifiers;
+          }
+          return declaration.kind === "const" && declarator.id.type === "Identifier"
+            ? resolveSpecifiers(declarator.init, depth + 1)
+            : null;
+        };
+        const getCalleeRootName = (callee) => {
+          let current = callee;
+          while (current.type === "MemberExpression" || current.type === "CallExpression") {
+            current = current.type === "MemberExpression" ? current.object : current.callee;
+          }
+          return current.type === "Identifier" ? current.name : null;
+        };
+        const SUITE_CALLS = new Set(["describe", "xdescribe"]);
+        const HOOK_CALLS = new Set(["beforeAll", "beforeEach", "afterAll", "afterEach"]);
+        const TEST_CALLS = new Set(["test", "it", "xtest", "xit"]);
+        // Whether the callee chain uses one of `names`, e.g. `test.skip.each(rows)(...)`.
+        const calleeUses = (call, names) => {
+          for (
+            let callee = call.callee;
+            callee.type === "MemberExpression" || callee.type === "CallExpression";
+            callee = callee.type === "MemberExpression" ? callee.object : callee.callee
+          ) {
+            if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              callee.property.type === "Identifier" &&
+              names.has(callee.property.name)
+            ) {
+              return true;
+            }
+          }
+          return false;
+        };
+        const SKIP_MODIFIERS = new Set(["skip", "todo"]);
+        const CONDITIONAL_MODIFIERS = new Set(["if", "skipIf", "todoIf"]);
+        // `describe.skip(...)`, `test.todo(...)`, `xit(...)`: the callback never runs.
+        const isSkippedCall = (call) =>
+          getCalleeRootName(call.callee)?.startsWith("x") || calleeUses(call, SKIP_MODIFIERS);
+        const isFunctionContext = (node) => isFunctionNode(node) || node.type === "Program";
+        const enclosingContext = (node) =>
+          sourceCode.getAncestors(node).findLast((ancestor) => isFunctionContext(ancestor));
+        // The function a variable names: `function f() {}` or `const f = () => {}`.
+        const functionOfVariable = (variable) => {
+          const def = variable?.defs[0];
+          if (def?.type === "FunctionName") {
+            return def.node;
+          }
+          return def?.type === "Variable" && isFunctionNode(def.node.init) ? def.node.init : null;
+        };
+        const variableOfFunction = (fn) => {
+          const id =
+            fn.type === "FunctionDeclaration"
+              ? fn.id
+              : fn.parent?.type === "VariableDeclarator"
+                ? fn.parent.id
+                : null;
+          return id?.type === "Identifier" ? findVariable(id) : null;
+        };
+        const suiteIsWithin = (inner, outer) =>
+          outer === null ||
+          (inner !== null && outer.range[0] <= inner.range[0] && inner.range[1] <= outer.range[1]);
+        const LOOPS = new Set([
+          "ForStatement",
+          "ForInStatement",
+          "ForOfStatement",
+          "WhileStatement",
+          "DoWhileStatement",
+        ]);
+        // Whether `node` can be skipped while its enclosing function runs: it sits in a branch
+        // (`if (p === "a") mock.module(p, ...)` in a loop), a return/throw precedes it, or a
+        // return/throw/break/continue sits in a loop around it.
+        const runsConditionally = (node) => {
+          const fn = enclosingContext(node);
+          const loops = [];
+          for (let child = node; child !== fn; child = child.parent) {
+            const parent = child.parent;
+            if (
+              (parent.type === "IfStatement" && parent.test !== child) ||
+              (parent.type === "ConditionalExpression" && parent.test !== child) ||
+              (parent.type === "LogicalExpression" && parent.right === child) ||
+              (parent.type === "SwitchCase" && parent.test !== child) ||
+              parent.type === "CatchClause"
+            ) {
+              return true;
+            }
+            if (LOOPS.has(parent.type)) {
+              loops.push(parent);
+            }
+          }
+          return exitStatements.some(
+            (exit) =>
+              enclosingContext(exit) === fn &&
+              (loops.some((loop) => suiteIsWithin(exit, loop)) ||
+                ((exit.type === "ReturnStatement" || exit.type === "ThrowStatement") &&
+                  exit.range[0] < node.range[0]))
+          );
+        };
+
+        // Whether bun surely skips every test of `suite` (a describe callback, or null for the
+        // file), so its `afterEach` hooks never run: its body registers at least one test and
+        // every test it registers is skip/todo (or `.each([])`), counting inline nested suites.
+        // Anything the rule cannot see (other calls that may register tests, describe callbacks
+        // passed by name, aliased test functions) means tests may run.
+        const isEmptyEach = (call) =>
+          (call.callee.type === "MemberExpression" &&
+            !call.callee.computed &&
+            call.callee.property.name === "each" &&
+            call.arguments[0]?.type === "ArrayExpression" &&
+            call.arguments[0].elements.length === 0) ||
+          (call.callee.type === "CallExpression" && isEmptyEach(call.callee));
+        const allTestsSkipped = (suite) => {
+          const body = suite ?? sourceCode.ast;
+          let sawTest = false;
+          for (const call of allCalls) {
+            if (enclosingContext(call) !== body) {
+              continue;
+            }
+            const root = getCalleeRootName(call.callee);
+            if (TEST_CALLS.has(root)) {
+              if (!isSkippedCall(call) && !isEmptyEach(call)) {
+                return false;
+              }
+              sawTest = true;
+            } else if (SUITE_CALLS.has(root)) {
+              const callback = call.arguments.find((argument) => isFunctionNode(argument));
+              if (!isSkippedCall(call) && (callback == null || !allTestsSkipped(callback))) {
+                return false;
+              }
+            } else if (!HOOK_CALLS.has(root) && root !== "mock") {
+              return false;
+            }
+          }
+          return sawTest;
+        };
+
+        // Where a function (or the Program) runs:
+        // - suites: the `describe` callbacks (null = the whole file) whose tests execute it; empty
+        //   when it never runs (skipped suites, dead helpers). Hooks registered here join them;
+        // - atLoad: it runs while the file evaluates, before any test;
+        // - scoped: the suites whose hooks or tests run it (installs there need a restore in
+        //   that suite or an enclosing one);
+        // - teardown: it runs only from `afterAll`/`afterEach`;
+        // - sure: the suites it surely runs in, so restores there count. Conditional call
+        //   sites, values passed around, and `afterEach` of an all-skipped suite add none.
+        // Named helpers take the union over their call sites, resolved by binding, so a helper
+        // that setup code also calls is not teardown and its installs belong to every suite and
+        // context that calls it. Restoring once suffices, so any sure site makes it sure.
+        const contextInfo = new Map();
+        const NEVER = {
+          suites: new Set(),
+          atLoad: false,
+          scoped: new Set(),
+          teardown: false,
+          sure: new Set(),
+        };
+        const infoOf = (fn) => {
+          const known = contextInfo.get(fn);
+          if (known) {
+            return known;
+          }
+          contextInfo.set(fn, NEVER); // cycle guard
+          const info = computeInfo(fn);
+          contextInfo.set(fn, info);
+          return info;
+        };
+        const sureAt = (node, info) => (runsConditionally(node) ? new Set() : info.sure);
+        // `fn` registered as the callback of a describe/hook/test `call`.
+        const callbackInfo = (call, fn) => {
+          const owner = getCalleeRootName(call.callee);
+          const outer = infoOf(enclosingContext(call));
+          if (isSkippedCall(call) || outer.suites.size === 0) {
+            return NEVER;
+          }
+          const sure = calleeUses(call, CONDITIONAL_MODIFIERS) ? new Set() : sureAt(call, outer);
+          if (SUITE_CALLS.has(owner)) {
+            return {
+              ...NEVER,
+              suites: new Set([fn]),
+              atLoad: true,
+              sure: new Set(sure.size ? [fn] : []),
+            };
+          }
+          return {
+            ...NEVER,
+            suites: outer.suites,
+            scoped: outer.suites,
+            teardown: RESTORE_HOOKS.has(owner),
+            sure: new Set(
+              [...sure].filter((suite) => owner !== "afterEach" || !allTestsSkipped(suite))
+            ),
+          };
+        };
+        const isCallbackOf = (call, node) =>
+          call?.type === "CallExpression" &&
+          call.arguments.includes(node) &&
+          [SUITE_CALLS, HOOK_CALLS, TEST_CALLS].some((calls) =>
+            calls.has(getCalleeRootName(call.callee))
+          );
+        const computeInfo = (fn) => {
+          if (fn.type === "Program") {
+            return { ...NEVER, suites: new Set([null]), atLoad: true, sure: new Set([null]) };
+          }
+          if (isCallbackOf(fn.parent, fn)) {
+            return callbackInfo(fn.parent, fn);
+          }
+          const variable = variableOfFunction(fn);
+          const reads = variable?.references.filter((reference) => reference.isRead()) ?? [];
+          if (reads.length === 0) {
+            // Anonymous callbacks and IIFEs run wherever their enclosing code runs; an unused
+            // named function never runs.
+            if (variable) {
+              return NEVER;
+            }
+            const enclosing = infoOf(enclosingContext(fn));
+            return { ...enclosing, sure: sureAt(fn, enclosing) };
+          }
+          const info = {
+            ...NEVER,
+            suites: new Set(),
+            scoped: new Set(),
+            teardown: true,
+            sure: new Set(),
+          };
+          for (const reference of reads) {
+            const identifier = reference.identifier;
+            const parent = identifier.parent;
+            let site;
+            if (parent.type === "CallExpression" && parent.callee === identifier) {
+              const caller = infoOf(enclosingContext(parent));
+              site = { ...caller, sure: sureAt(parent, caller) };
+            } else if (isCallbackOf(parent, identifier)) {
+              // `beforeEach(install)` / `afterEach(restore)` / `describe("x", suiteBody)`.
+              site = callbackInfo(parent, fn);
+            } else if (infoOf(enclosingContext(identifier)).suites.size === 0) {
+              site = NEVER; // referenced only from code that never runs
+            } else {
+              // Stored or passed to another API: it may run anywhere, even after a suite's
+              // restore, so only a file-scope restore covers its installs.
+              site = { ...NEVER, suites: new Set([null]), scoped: new Set([null]) };
+            }
+            site.suites.forEach((suite) => info.suites.add(suite));
+            site.scoped.forEach((suite) => info.scoped.add(suite));
+            site.sure.forEach((suite) => info.sure.add(suite));
+            info.atLoad ||= site.atLoad;
+            info.teardown &&= site.teardown;
+          }
+          return info;
+        };
+
+        return {
+          CallExpression(node) {
+            allCalls.push(node);
+            if (
+              node.callee.type === "Identifier" &&
+              node.callee.name === "restoreModulesAfterSuite"
+            ) {
+              if (isRestoreListHelper(node.callee)) {
+                restoreListCalls.push(node);
+              }
+              return;
+            }
+            if (isMockModuleCall(node)) {
+              mockCalls.push(node);
+            }
+          },
+          "ReturnStatement, ThrowStatement, BreakStatement, ContinueStatement"(node) {
+            exitStatements.push(node);
+          },
+          "Program:exit"() {
+            const restores = [];
+            for (const node of restoreListCalls) {
+              const specifiers = new Set();
+              for (const entry of resolveArrayElements(node.arguments[0]) ?? []) {
+                if (entry.type === "ArrayExpression") {
+                  (resolveSpecifiers(entry.elements[0]) ?? []).forEach((s) => specifiers.add(s));
+                }
+              }
+              // It registers an `afterAll` in each suite its call surely runs in.
+              restores.push({ specifiers, suites: sureAt(node, infoOf(enclosingContext(node))) });
+            }
+            const installs = [];
+            for (const node of mockCalls) {
+              const info = infoOf(enclosingContext(node));
+              const specifiers = resolveSpecifiers(node.arguments[0]);
+              if (info.teardown) {
+                restores.push({
+                  specifiers: new Set(specifiers ?? []),
+                  suites: sureAt(node, info),
+                });
+              } else if (info.suites.size === 0) {
+                // Never runs (skipped suite, uncalled helper): nothing to restore or resolve.
+              } else if (specifiers == null) {
+                context.report({ node, messageId: "dynamicSpecifier" });
+              } else {
+                installs.push({ node, specifiers, info });
+              }
+            }
+            for (const { node, specifiers, info } of installs) {
+              for (const specifier of specifiers) {
+                const matching = restores.filter(
+                  (restore) => restore.specifiers.has(specifier) && restore.suites.size > 0
+                );
+                // A load-time install precedes every test, so any restore that runs covers it.
+                // Each suite whose hooks or tests install needs a restore in it or an enclosing
+                // suite. A helper called from both contexts must satisfy both.
+                const covered =
+                  (!info.atLoad || matching.length > 0) &&
+                  [...info.scoped].every((suite) =>
+                    matching.some((restore) =>
+                      [...restore.suites].some((outer) => suiteIsWithin(suite, outer))
+                    )
+                  );
+                if (!covered && !allowed.has(specifier)) {
+                  context.report({ node, messageId: "unrestored", data: { specifier } });
+                }
+              }
+            }
+          },
+        };
+      },
+    },
     "no-native-interactive-tooltips": {
       meta: {
         type: "problem",
@@ -585,6 +1223,62 @@ const localPlugin = {
                 node: titleAttribute,
                 messageId: "useTooltip",
               });
+            }
+          },
+        };
+      },
+    },
+    // Casting an API double to APIClient in tests hides typos and wrong return types: the
+    // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
+    // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
+    // type-checks the partial double instead.
+    "no-cast-to-api-client": {
+      meta: {
+        type: "problem",
+        docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
+        messages: {
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
+        },
+      },
+      create(context) {
+        // Whether a type name refers to APIClient, including an aliased import
+        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
+        const isApiClientName = (identifier, depth = 0) => {
+          if (identifier.name === "APIClient") {
+            return true;
+          }
+          if (depth > 5) {
+            return false;
+          }
+          for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (!variable) {
+              continue;
+            }
+            const def = variable.defs[0];
+            if (def?.type === "ImportBinding") {
+              return (
+                def.node.type === "ImportSpecifier" &&
+                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
+              );
+            }
+            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            return (
+              aliased?.type === "TSTypeReference" &&
+              aliased.typeName.type === "Identifier" &&
+              isApiClientName(aliased.typeName, depth + 1)
+            );
+          }
+          return false;
+        };
+        return {
+          // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
+          // (one report per chain, since the inner `as unknown` does not target APIClient).
+          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
+            node
+          ) {
+            if (isApiClientName(node.typeAnnotation.typeName)) {
+              context.report({ node, messageId: "cast" });
             }
           },
         };
@@ -1485,6 +2179,15 @@ export default defineConfig([
     },
   },
   {
+    // Backend production code: required-member typeof guards only exist to tolerate partial
+    // test doubles; tests must complete the doubles instead (see the rule's docs).
+    files: ["src/node/services/**/*.ts"],
+    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    rules: {
+      "local/no-required-member-typeof-guard": "error",
+    },
+  },
+  {
     // Temporarily allow sync fs methods in files with existing usage
     // TODO: Gradually migrate these to async operations
     files: [
@@ -1553,6 +2256,16 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
+          // Lives here, not in the src/** block above: this later block replaces that block's
+          // no-restricted-imports options for every file it matches.
+          paths: [
+            {
+              name: "ai-tokenizer/encoding",
+              allowTypeImports: true,
+              message:
+                "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
+            },
+          ],
           patterns: [
             {
               group: ["shiki"],
@@ -1746,8 +2459,72 @@ export default defineConfig([
     },
   },
   {
+    // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
+    // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
+    files: ["tests/**/*.{ts,tsx}"],
+    // Registered so repo-wide test rules (e.g. local/no-cast-to-api-client on
+    // **/*.test.ts) resolve here too.
+    plugins: {
+      local: localPlugin,
+    },
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Harness doubles implement async interfaces with synchronous or empty bodies
+      // (`async () => {}` stubs for services, windows, and IPC handlers).
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+      // Same options as src/: a leading underscore marks an intentionally unused binding
+      // (mock signatures, destructured tuple slots). The base default flags those too.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
+    rules: {
+      "local/no-cast-to-api-client": "error",
+      "local/require-module-mock-restore": [
+        "error",
+        {
+          allow: {
+            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
+            // .../util/browser.js is unsupported`), so there are no real exports to restore and
+            // no later suite can observe the stub.
+            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
+          },
+        },
+      ],
+    },
     languageOptions: {
       globals: {
         describe: "readonly",

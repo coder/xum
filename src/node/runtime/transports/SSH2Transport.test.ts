@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { PassThrough, Readable } from "stream";
+import { isRuntimeTransportError } from "../Runtime";
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import { SSH2Transport } from "./SSH2Transport";
 
@@ -53,7 +54,7 @@ class FakeClientChannel extends EventEmitter {
 }
 
 function createFakeClient(channel: FakeClientChannel) {
-  return {
+  return Object.assign(new EventEmitter(), {
     exec(
       _command: string,
       optionsOrCallback:
@@ -64,7 +65,7 @@ function createFakeClient(channel: FakeClientChannel) {
       const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
       callback?.(undefined, channel);
     },
-  };
+  });
 }
 
 function rejectAfter(timeoutMs: number): Promise<never> {
@@ -112,11 +113,12 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
 
   test("aborts while waiting for ssh2 exec channel", async () => {
     acquireConnectionSpy.mockResolvedValue({
-      client: {
+      client: Object.assign(new EventEmitter(), {
         exec() {
           // Simulate ssh2 never invoking the exec callback.
         },
-      },
+      }),
+      openChannels: 0,
     } as never);
 
     const reportFailureSpy = spyOn(ssh2ConnectionPool, "reportFailure");
@@ -134,15 +136,38 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toContain("Operation aborted");
+      expect(isRuntimeTransportError(error)).toBe(false);
     }
     expect(reportFailureSpy).not.toHaveBeenCalled();
     reportFailureSpy.mockRestore();
+  });
+
+  test("an abort while acquiring the connection is not a transport failure", async () => {
+    // e.g. the user presses Stop while the pool waits out a backoff (#4835).
+    const controller = new AbortController();
+    acquireConnectionSpy.mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(new Error("Operation aborted"));
+    });
+    const transport = new SSH2Transport({ host: "remote.example.com" });
+    const aborted: unknown = await transport
+      .spawnRemoteProcess("echo ok", { abortSignal: controller.signal })
+      .catch((e: unknown) => e);
+    expect(aborted).toBeInstanceOf(Error);
+    expect(isRuntimeTransportError(aborted)).toBe(false);
+
+    acquireConnectionSpy.mockRejectedValue(new Error("connect ECONNREFUSED"));
+    const refused: unknown = await transport
+      .spawnRemoteProcess("echo ok", {})
+      .catch((e: unknown) => e);
+    expect(isRuntimeTransportError(refused)).toBe(true);
   });
 
   test("forcePTY closes the synthetic stderr stream when ssh2 omits channel.stderr", async () => {
     const channel = new FakeClientChannel();
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });
@@ -160,6 +185,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     const channel = new FakeClientChannel({ includeStderr: true });
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });
@@ -170,5 +196,80 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     channel.finish(7);
 
     expect(await stderrPromise).toBe("err\n");
+  });
+});
+
+describe("SSH2 pool channel tracking (#4876)", () => {
+  // ssh2 parses a whole TCP chunk synchronously: for an instant command the
+  // open callback and the channel's close can both fire before an `await`
+  // continuation runs. Tracking must already be attached, or the pooled
+  // connection counts a channel that never closes and is never idle-closed.
+  test("counts a channel that closes right after its open callback as closed", async () => {
+    const execChannel = new FakeClientChannel();
+    const shellChannel = new FakeClientChannel();
+    const entry = {
+      openChannels: 0,
+      client: Object.assign(new EventEmitter(), {
+        exec(_command: string, callback: (err?: Error, stream?: FakeClientChannel) => void) {
+          callback(undefined, execChannel);
+          execChannel.emit("close", 0, null);
+        },
+        shell(_options: unknown, callback: (err?: Error, stream?: FakeClientChannel) => void) {
+          callback(undefined, shellChannel);
+          shellChannel.emit("close");
+        },
+      }),
+    };
+    const spy = spyOn(ssh2ConnectionPool, "acquireConnection").mockResolvedValue(entry as never);
+    try {
+      const transport = new SSH2Transport({ host: "remote.example.com" });
+      await transport.spawnRemoteProcess("true", {});
+      expect(entry.openChannels).toBe(0);
+      await transport.createPtySession({ workspacePath: "/remote", cols: 80, rows: 24 });
+      expect(entry.openChannels).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("SSH2Transport.acquireConnection failures (#4438)", () => {
+  test("surface as transport failures, but aborts pass through", async () => {
+    const transport = new SSH2Transport({ host: "example.test" });
+    const backoff = new Error("SSH connection to example.test is in backoff for 2s.");
+    const spy = spyOn(ssh2ConnectionPool, "acquireConnection").mockRejectedValue(backoff);
+    try {
+      const failure: unknown = await transport.acquireConnection().catch((e: unknown) => e);
+      expect(failure).toMatchObject({ type: "network", message: backoff.message });
+
+      const controller = new AbortController();
+      controller.abort();
+      const aborted: unknown = await transport
+        .acquireConnection({ abortSignal: controller.signal })
+        .catch((e: unknown) => e);
+      expect(aborted).toBe(backoff);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("SSH2Transport exec deadline during backoff (#4830)", () => {
+  test("stops waiting out the pool's backoff at the exec deadline", async () => {
+    // A host deep in backoff (~10 s): an exec with a short deadline, such as
+    // the one read retry, must fail by that deadline instead of waiting out
+    // the pool's default two-minute budget.
+    const config = { host: "ws4830-backoff.invalid" };
+    for (let i = 0; i < 5; i++) ssh2ConnectionPool.reportFailure(config, "Connection reset");
+    try {
+      const started = Date.now();
+      const failure: unknown = await new SSH2Transport(config)
+        .spawnRemoteProcess("true", { timeout: 1, deadlineMs: Date.now() + 200 })
+        .catch((e: unknown) => e);
+      expect(isRuntimeTransportError(failure)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      ssh2ConnectionPool.clearAllHealthForTests();
+    }
   });
 });

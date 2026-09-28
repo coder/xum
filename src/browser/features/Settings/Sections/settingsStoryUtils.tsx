@@ -21,6 +21,7 @@ import {
   type ExperimentId,
 } from "@/common/constants/experiments";
 import {
+  LAST_CUSTOM_MODEL_PROVIDER_KEY,
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
   TERMINAL_BADGE_CONFIG_KEY,
@@ -59,6 +60,10 @@ export function resetStorybookPersistedStateForStory(): void {
     // Terminal badge stories seed an enabled badge config; clear it so the
     // default GeneralSection story snapshots the disabled (collapsed) rows.
     localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
+
+    // The Coder catalog ModelsSection stories seed the add row's provider;
+    // clear it so the other ModelsSection stories snapshot their default.
+    localStorage.removeItem(LAST_CUSTOM_MODEL_PROVIDER_KEY);
   }
 }
 
@@ -144,6 +149,8 @@ interface SetupSettingsStoryOptions {
       baseUrlResolved?: string;
       serviceTier?: ServiceTier;
       models?: string[];
+      coderOauthSet?: boolean;
+      discoveredModels?: string[];
     }
   >;
   providersList?: string[];

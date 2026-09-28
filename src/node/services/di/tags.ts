@@ -22,6 +22,7 @@ import type {
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
 import type { AIService } from "@/node/services/aiService";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { BackupService } from "@/node/services/backup/backupService";
@@ -34,12 +35,15 @@ import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CoderService } from "@/node/services/coderService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
+import type { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { EditorService } from "@/node/services/editorService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { HeartbeatService } from "@/node/services/heartbeatService";
@@ -131,6 +135,14 @@ export class IdleDispatcherTag extends Context.Service<IdleDispatcherTag, IdleDi
   "xum/IdleDispatcher"
 ) {}
 export class AI extends Context.Service<AI, AIService>()("xum/AI") {}
+export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, AutoModelRouter>()(
+  "xum/AutoModelRouter"
+) {}
+
+/** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+export class Evaluation extends Context.Service<Evaluation, EvaluationService>()(
+  "xum/Evaluation"
+) {}
 export class StreamManagerTag extends Context.Service<StreamManagerTag, StreamManager>()(
   "xum/StreamManager"
 ) {}
@@ -181,6 +193,9 @@ export class SessionTiming extends Context.Service<SessionTiming, SessionTimingS
 ) {}
 export class Analytics extends Context.Service<Analytics, AnalyticsService>()("xum/Analytics") {}
 export class DevTools extends Context.Service<DevTools, DevToolsService>()("xum/DevTools") {}
+export class ReviewState extends Context.Service<ReviewState, ReviewStateService>()(
+  "xum/ReviewState"
+) {}
 export class WorkspaceMcpOverrides extends Context.Service<
   WorkspaceMcpOverrides,
   WorkspaceMcpOverridesService
@@ -276,6 +291,11 @@ export class CoderOauth extends Context.Service<CoderOauth, CoderOauthService>()
 export class CopilotOauth extends Context.Service<CopilotOauth, CopilotOauthService>()(
   "xum/CopilotOauth"
 ) {}
+export class ContextManagement extends Context.Service<
+  ContextManagement,
+  ContextManagementService
+>()("xum/ContextManagement") {}
+
 // Clock-driven workers and the timeline/refine pair they record into.
 export class IdleCompaction extends Context.Service<IdleCompaction, IdleCompactionService>()(
   "xum/IdleCompaction"
@@ -306,14 +326,17 @@ export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
  * field plus the graph-internal `TerminalAttentionStore`.
  */
 export type CoreTags =
+  | ContextManagement
   | History
   | InitStateManagerTag
   | Provider
+  | AutoModelRouterTag
   | BackgroundProcessManagerTag
   | SessionUsage
   | WorkspaceGoal
   | IdleDispatcherTag
   | AI
+  | Evaluation
   | StreamManagerTag
   | MCPConfig
   | MCPServerManagerTag
@@ -347,6 +370,7 @@ export type CrossCuttingTags =
   | SessionTiming
   | Analytics
   | DevTools
+  | ReviewState
   | WorkspaceMcpOverrides;
 
 /** The desktop-only services provided by the `DesktopLive` group layers, by group. */

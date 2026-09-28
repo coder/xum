@@ -184,6 +184,8 @@ export const HyperExpandedBundle: AppStory = {
     await waitFor(() => getRequiredStoryElement(canvasElement, "operational-bundle"), {
       timeout: 15_000,
     });
+    // Density snapshot, not a focus one: headless Chromium treats scripted focus as :focus-visible.
+    workBundle.blur();
   },
 };
 

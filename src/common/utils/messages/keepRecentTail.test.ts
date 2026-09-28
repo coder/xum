@@ -125,6 +125,31 @@ describe("selectKeepRecentTailStartIndex", () => {
     expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(2);
   });
 
+  it("treats plan-review record rows like snapshot rows: never a boundary, part of the cluster", () => {
+    // Hidden record rows are user-role synthetic UI state. They must neither become a safe
+    // boundary themselves nor split a real user row from the snapshot cluster above it.
+    const record = createMuxMessage("plan-review-1", "user", "<mux_plan_review>...", {
+      historySequence: 2,
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+    });
+    const snapshot = createMuxMessage("snap-1", "user", "snapshot: file contents", {
+      historySequence: 3,
+      synthetic: true,
+      fileAtMentionSnapshot: ["src/foo.ts"],
+    });
+    const messages = [
+      userMessage("u0", "x".repeat(40_000), 0),
+      assistantMessage("a0", "big reply", 1),
+      record,
+      snapshot,
+      userMessage("u1", "@src/foo.ts what does this do?", 4),
+      assistantMessage("a1", "it does things", 5),
+    ];
+
+    expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(2);
+  });
+
   it("counts the snapshot cluster against the floor", () => {
     const bigSnapshot = createMuxMessage("snap-1", "user", "x".repeat(40_000), {
       historySequence: 2,

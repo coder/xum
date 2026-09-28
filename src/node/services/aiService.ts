@@ -17,7 +17,6 @@ import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
   type TurnRequestBuilderBindings,
-  resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type StreamMessageOptions,
   type PreparedStreamMessage,
@@ -95,8 +94,6 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import { ProviderModelFactory } from "./providerModelFactory";
-
-export { resolveMuxProjectRootForHostFs };
 
 interface ToolExecutionContext {
   toolCallId?: string;
@@ -624,6 +621,13 @@ export class AIService extends EventEmitter {
     opts?: Parameters<ProviderModelFactory["createModelWithPinnedOptions"]>[1]
   ): ReturnType<ProviderModelFactory["createModelWithPinnedOptions"]> {
     return this.providerModelFactory.createModelWithPinnedOptions(modelString, opts);
+  }
+
+  /** Evaluation model for the workflow `evaluate()` primitive (see ProviderModelFactory). */
+  createEvaluationModel(
+    modelString: string
+  ): ReturnType<ProviderModelFactory["createEvaluationModel"]> {
+    return this.providerModelFactory.createEvaluationModel(modelString);
   }
 
   private wrapToolsForDelegation(

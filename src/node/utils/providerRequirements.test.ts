@@ -126,6 +126,22 @@ describe("hasAnyConfiguredProvider", () => {
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
 
+  it("ignores the TypeSafe classifier key, which cannot serve chat models", () => {
+    const providers: ProvidersConfig = {
+      typesafe: { apiKey: "ts-classifier-key" },
+    };
+
+    expect(hasAnyConfiguredProvider(providers)).toBe(false);
+  });
+
+  it("still counts a legacy custom chat provider stored under the typesafe id", () => {
+    const providers: ProvidersConfig = {
+      typesafe: { providerType: "openai-compatible", baseUrl: "http://localhost:8000/v1" },
+    };
+
+    expect(hasAnyConfiguredProvider(providers)).toBe(true);
+  });
+
   it("returns false for disabled custom OpenAI-compatible providers", () => {
     const providers: ProvidersConfig = {
       "local-vllm": {

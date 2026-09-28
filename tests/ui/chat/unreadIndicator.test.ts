@@ -17,9 +17,10 @@ import { fireEvent, waitFor } from "@testing-library/react";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSettingsDialog } from "../helpers";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getWorkspaceLastReadKey } from "@/common/constants/storage";
+import { getNotifyOnResponseKey, getWorkspaceLastReadKey } from "@/common/constants/storage";
 import { detectDefaultTrunkBranch } from "@/node/git";
 
 /**
@@ -38,6 +39,46 @@ function getWorkspaceUnreadState(workspaceId: string): {
 }
 
 /**
+ * Send a gated message, open the settings modal over the still-mounted chat, then let the
+ * response stream to completion underneath it.
+ */
+async function sendGatedMessageUnderSettings(app: AppHarness, text: string): Promise<void> {
+  const message = `[mock:wait-start] ${text}`;
+  await app.chat.send(message);
+  await openSettingsDialog(app.view.container);
+  expect(app.view.container.querySelector('[data-testid="message-window"]') !== null).toBe(true);
+
+  app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+  // Wait for the response itself: before the gated stream starts, expectStreamComplete
+  // already sees an idle workspace.
+  await app.chat.expectTranscriptContains(`Mock response: ${message}`);
+  await app.chat.expectStreamComplete();
+}
+
+function captureBrowserNotifications(): { titles: string[]; restore: () => void } {
+  const titles: string[] = [];
+  const target = window as { Notification?: unknown };
+  const original = target.Notification;
+  class MockNotification {
+    onclick: (() => void) | null = null;
+    constructor(title: string) {
+      titles.push(title);
+    }
+    close() {}
+  }
+  target.Notification = Object.assign(MockNotification, {
+    permission: "granted",
+    requestPermission: () => Promise.resolve("granted"),
+  });
+  return {
+    titles,
+    restore: () => {
+      target.Notification = original;
+    },
+  };
+}
+
+/**
  * Get the lastReadTimestamp from persisted state.
  */
 function getLastReadTimestamp(workspaceId: string): number {
@@ -51,16 +92,12 @@ function getWorkspaceUnreadIndicator(
   container: HTMLElement,
   workspaceId: string
 ): { element: HTMLElement; hasUnreadBar: boolean } | null {
-  const workspaceEl = container.querySelector(
-    `[data-workspace-id="${workspaceId}"]`
-  ) as HTMLElement | null;
+  const workspaceEl = container.querySelector<HTMLElement>(`[data-workspace-id="${workspaceId}"]`);
 
   if (!workspaceEl) return null;
 
   // The unread indicator is a StatusDot span with the idle/unread styling
-  const statusDot = workspaceEl.querySelector(
-    'span[class*="bg-surface-invert-secondary"]'
-  ) as HTMLElement | null;
+  const statusDot = workspaceEl.querySelector('span[class*="bg-surface-invert-secondary"]');
 
   return {
     element: workspaceEl,
@@ -236,88 +273,37 @@ describe("Unread indicator (mock AI router)", () => {
       expect(isUnread(pastTime)).toBe(true);
     });
 
-    test("stream completion does NOT mark read when settings page is active", async () => {
-      // Regression: stream completion should not advance lastRead when the user
-      // is on a non-chat route (e.g. settings). The workspace remains "selected"
-      // but the chat content is not visible.
+    test("stream completion while the settings modal covers the chat stays unread and notifies", async () => {
+      // Regression: settings covers the chat without changing the route's workspace, so a
+      // completion must neither mark it read nor be suppressed as "already viewing".
+      updatePersistedState(getNotifyOnResponseKey(app.workspaceId), true);
+      const notifications = captureBrowserNotifications();
+      try {
+        await sendGatedMessageUnderSettings(app, "completion while in settings");
 
-      // Send a gated message so the stream stays pending while we navigate away.
-      await app.chat.send("[mock:wait-start] completion while in settings");
-      const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
-
-      // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
-      expect(settingsButton).not.toBeNull();
-      fireEvent.click(settingsButton);
-
-      // Verify chat view is no longer rendered.
-      await waitFor(() => {
-        const messageWindow = app.view.container.querySelector('[data-testid="message-window"]');
-        if (messageWindow) {
-          throw new Error("Expected settings to replace AIView");
-        }
-      });
-
-      // Release the stream gate so the stream completes while settings are active.
-      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
-      await app.chat.expectStreamComplete();
-
-      // lastRead should NOT have advanced — the user wasn't looking at chat.
-      const lastReadAfterComplete = getLastReadTimestamp(app.workspaceId);
-      expect(lastReadAfterComplete).toBe(lastReadAfterSend);
-
-      // The workspace should show as unread (recency > lastRead).
-      await waitFor(() => {
         const { recencyTimestamp, isUnread } = getWorkspaceUnreadState(app.workspaceId);
         expect(recencyTimestamp).not.toBeNull();
-        expect(isUnread(lastReadAfterComplete)).toBe(true);
-      });
+        expect(isUnread(getLastReadTimestamp(app.workspaceId))).toBe(true);
+        await waitFor(() => {
+          expect(
+            getWorkspaceUnreadIndicator(app.view.container, app.workspaceId)?.hasUnreadBar
+          ).toBe(true);
+        });
+        await waitFor(() => expect(notifications.titles).toHaveLength(1));
+      } finally {
+        notifications.restore();
+      }
     }, 60_000);
 
-    test("focus while on settings does NOT mark read", async () => {
-      // Regression: window focus should not advance lastRead when the user
-      // is on a non-chat route, even if a workspace is selected.
+    test("focus while the settings modal is open does NOT mark read", async () => {
+      await sendGatedMessageUnderSettings(app, "focus bypass test");
 
-      // Send a gated message so the stream stays pending while we navigate away.
-      await app.chat.send("[mock:wait-start] focus bypass test");
-      const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
-
-      // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
-      expect(settingsButton).not.toBeNull();
-      fireEvent.click(settingsButton);
-
-      // Verify chat view is no longer rendered.
-      await waitFor(() => {
-        const messageWindow = app.view.container.querySelector('[data-testid="message-window"]');
-        if (messageWindow) {
-          throw new Error("Expected settings to replace AIView");
-        }
-      });
-
-      // Release the stream gate so the stream completes while settings are active.
-      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
-      await app.chat.expectStreamComplete();
-
-      // Simulate the user alt-tabbing back (window regains focus while still on settings).
-      const lastReadAfterComplete = getLastReadTimestamp(app.workspaceId);
-      expect(lastReadAfterComplete).toBe(lastReadAfterSend);
+      // Simulate the user alt-tabbing back while settings still covers the chat.
+      const lastReadBeforeFocus = getLastReadTimestamp(app.workspaceId);
       window.dispatchEvent(new Event("focus"));
 
-      // lastRead should NOT have advanced — the user still isn't looking at chat.
-      const lastReadAfterFocus = getLastReadTimestamp(app.workspaceId);
-      expect(lastReadAfterFocus).toBe(lastReadAfterComplete);
-
-      // The workspace should show as unread (recency > lastRead).
-      await waitFor(() => {
-        const { recencyTimestamp, isUnread } = getWorkspaceUnreadState(app.workspaceId);
-        expect(recencyTimestamp).not.toBeNull();
-        expect(isUnread(lastReadAfterFocus)).toBe(true);
-      });
+      expect(getLastReadTimestamp(app.workspaceId)).toBe(lastReadBeforeFocus);
+      expect(getWorkspaceUnreadState(app.workspaceId).isUnread(lastReadBeforeFocus)).toBe(true);
     }, 60_000);
     test("expectStreamComplete does not resolve before stream-start in gated flows", async () => {
       // Regression: expectStreamComplete() used to check only canInterrupt,
@@ -389,7 +375,7 @@ describe("Unread indicator (mock AI router)", () => {
     let createdWorkspaceIds: string[];
 
     function queryMenuItem(label: string): HTMLButtonElement | null {
-      const menuButtons = Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
+      const menuButtons = Array.from(document.querySelectorAll("button"));
       return menuButtons.find((button) => button.textContent?.includes(label)) ?? null;
     }
 
@@ -398,7 +384,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const button = app.view.container.querySelector(
             `button[aria-label="Workspace actions for ${displayTitle}"]`
-          ) as HTMLButtonElement | null;
+          );
           if (!button) {
             throw new Error(`Workspace actions button not found for ${displayTitle}`);
           }
@@ -442,7 +428,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const workspaceRow = app.view.container.querySelector(
             `[data-workspace-id="${createdWorkspace.id}"]`
-          ) as HTMLElement | null;
+          );
           if (!workspaceRow) {
             throw new Error("Created workspace row not visible yet");
           }
@@ -470,14 +456,12 @@ describe("Unread indicator (mock AI router)", () => {
       workspaceId: string,
       displayTitle: string
     ): HTMLSpanElement | null {
-      const workspaceRow = app.view.container.querySelector(
-        `[data-workspace-id="${workspaceId}"]`
-      ) as HTMLElement | null;
+      const workspaceRow = app.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!workspaceRow) {
         return null;
       }
 
-      const textSpans = Array.from(workspaceRow.querySelectorAll("span")) as HTMLSpanElement[];
+      const textSpans = Array.from(workspaceRow.querySelectorAll("span"));
       return textSpans.find((span) => span.textContent?.trim() === displayTitle) ?? null;
     }
 
@@ -608,7 +592,7 @@ describe("Unread indicator (mock AI router)", () => {
       await waitFor(() => {
         const selectedRow = app.view.container.querySelector(
           `[data-workspace-id="${app.workspaceId}"]`
-        ) as HTMLElement | null;
+        );
         if (!selectedRow) {
           throw new Error("Selected workspace row not found");
         }

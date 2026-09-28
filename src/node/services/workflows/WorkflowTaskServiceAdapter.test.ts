@@ -16,6 +16,7 @@ const patchToolConfig: TaskGitPatchApplyConfig = {
   runtimeTempDir: "/tmp",
 };
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
@@ -351,6 +352,75 @@ describe("WorkflowTaskServiceAdapter", () => {
     expect(createMany.mock.calls[0]?.[0]).toMatchObject([
       { workflowTask: { runId: "wfr_123", stepId: "first", workflowName: "sidebar-demo" } },
     ]);
+  });
+
+  test("publishes a replacement only through createMany's retires claim, never create()", async () => {
+    const claim = { taskId: "retired_1", attemptId: "att_00000000000000c1", nonce: "n1" };
+    const create = mock(async (_args: unknown) =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const createMany = mock(async (args: unknown[], _options?: unknown) =>
+      Ok(args.map(() => ({ taskId: "task_r", kind: "agent" as const, status: "queued" as const })))
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
+    const adapterFor = (
+      taskService: ConstructorParameters<typeof WorkflowTaskServiceAdapter>[0]["taskService"]
+    ) =>
+      new WorkflowTaskServiceAdapter({
+        taskService,
+        parentWorkspaceId: "parent_1",
+        workflowRunId: "wfr_123",
+        defaultAgentId: "explore",
+      });
+
+    await adapterFor({ create, createMany, waitForAgentReport }).createAgentTasks(
+      [{ id: "step", prompt: "Redo" }],
+      { retires: [claim] }
+    );
+    expect(createMany.mock.calls[0]?.[1]).toMatchObject({ retires: [claim] });
+
+    // Without createMany there is no single-use commit: the fallback refuses before creating.
+    const fallback = adapterFor({ create, waitForAgentReport });
+    let caught: unknown;
+    try {
+      await fallback.createAgentTasks([{ id: "step", prompt: "Redo" }], { retires: [claim] });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  test("the production adapter refuses a task service that cannot retire attempts", () => {
+    const base = {
+      create: mock(async (_args: unknown) =>
+        Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+      ),
+      createMany: mock(async (_args: unknown[]) => Ok([])),
+      waitForAgentReport: mock(async () => ({ reportMarkdown: "child report" })),
+    };
+    const options = {
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    };
+    const claimRetiredAttempt = mock(async () => Ok({ nonce: "n1" }));
+    expect(() => createProductionWorkflowTaskAdapter({ ...options, taskService: base })).toThrow(
+      /claimRetiredAttempt/
+    );
+    const { createMany: _createMany, ...withoutCreateMany } = base;
+    expect(() =>
+      createProductionWorkflowTaskAdapter({
+        ...options,
+        taskService: { ...withoutCreateMany, claimRetiredAttempt },
+      })
+    ).toThrow(/createMany/);
+    expect(
+      createProductionWorkflowTaskAdapter({
+        ...options,
+        taskService: { ...base, claimRetiredAttempt },
+      }).claimRetiredAttempt
+    ).toBeDefined();
   });
 
   test("forwards run-end lifecycle hooks to the task service", async () => {

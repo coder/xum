@@ -54,7 +54,7 @@ function isPathInsideDir(dirPath: string, filePath: string): boolean {
   );
 }
 
-function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
+export function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
   const matchingProjectName = projects
     ?.find((project) => project.projectPath.trim() === projectPath.trim())
     ?.projectName?.trim();
@@ -142,7 +142,7 @@ async function resolveAgentEditingCapability(args: {
       };
 }
 
-function buildTaskBaseCommitShaByProjectPath(params: {
+export function buildTaskBaseCommitShaByProjectPath(params: {
   projectPath: string;
   projects?: ProjectRef[];
   taskBaseCommitSha?: string;

@@ -110,6 +110,9 @@ export function sendMessageCommand(
 
   if (editMessageId) {
     options.editMessageId = editMessageId;
+    // The debug CLI has no client view of the transcript to fence the edit with; it opts out
+    // of the content precondition explicitly (UI edits always carry one).
+    options.unfencedEdit = true;
   }
 
   console.log(`\n⚠️  This command currently only displays information.`);

@@ -1,8 +1,14 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import type { ReactNode } from "react";
+import { APIProvider } from "@/browser/contexts/API";
+import * as RealGhosttyModule from "ghostty-web";
+import * as RealTerminalRouterContextModule from "@/browser/terminal/TerminalRouterContext";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
@@ -96,24 +102,15 @@ class MockFitAddon {
   proposeDimensions = mock(() => ({ cols: 80, rows: 24 }));
 }
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["ghostty-web", { ...RealGhosttyModule }],
+  ["@/browser/terminal/TerminalRouterContext", { ...RealTerminalRouterContextModule }],
+]);
 void mock.module("ghostty-web", () => ({
   init: initMock,
   Terminal: MockTerminal,
   FitAddon: MockFitAddon,
-}));
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      terminal: {
-        onExit: terminalOnExitMock,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
 }));
 
 void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
@@ -142,6 +139,18 @@ function createRouter(): MockRouter {
   };
 }
 
+// Inject the client through the real provider; mocking the API module leaks process-wide
+// into later suites.
+const apiClient = createTestApiClient({
+  terminal: {
+    onExit: terminalOnExitMock,
+  },
+});
+
+function APIWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
+}
+
 function renderTerminal(onExit: (exitCode: number) => void) {
   return render(
     <TerminalView
@@ -151,7 +160,8 @@ function renderTerminal(onExit: (exitCode: number) => void) {
       setDocumentTitle={false}
       autoFocus={false}
       onExit={onExit}
-    />
+    />,
+    { wrapper: APIWrapper }
   );
 }
 
@@ -227,7 +237,8 @@ describe("TerminalView", () => {
         workspaceName="my-feature"
         projectName="xum"
         tabName="Terminal 2"
-      />
+      />,
+      { wrapper: APIWrapper }
     );
 
     await waitFor(() => {
@@ -246,7 +257,8 @@ describe("TerminalView", () => {
         workspaceName="my-feature"
         projectName="xum"
         tabName="Terminal 2"
-      />
+      />,
+      { wrapper: APIWrapper }
     );
 
     await waitFor(() => {

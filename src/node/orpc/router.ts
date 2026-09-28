@@ -18,7 +18,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * uninterruptible in the service pipeline (see asAtomicMutation in
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
-import { os } from "@orpc/server";
+import { ORPCError, os } from "@orpc/server";
+import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -79,6 +80,8 @@ import {
 } from "@/node/services/workspaceOperations";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
@@ -93,9 +96,9 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 
 import {
   attachTerminal,
-  createTickIterable,
   subscribeConfigChanges,
   subscribeDevTools,
+  subscribeReviewState,
   subscribeLogs,
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
@@ -344,6 +347,79 @@ export const router = (authToken?: string) => {
           })
         ),
 
+      updateAutoModelRouting: t
+        .input(schemas.config.updateAutoModelRouting.input)
+        .output(schemas.config.updateAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAutoModelRouting(input.autoModelRouting)
+            );
+          })
+        ),
+
+      getAutoModelRoutingEvaluationStatus: t
+        .input(schemas.config.getAutoModelRoutingEvaluationStatus.input)
+        .output(schemas.config.getAutoModelRoutingEvaluationStatus.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            const router = yield* AutoModelRouterTag;
+            return router.getEvaluationStatus(
+              // Unsaved Settings edits preview their own evaluator; otherwise the saved one.
+              input?.evaluationModel ??
+                normalizeAutoModelRoutingConfig(
+                  context.config.loadConfigOrDefault().autoModelRouting
+                ).evaluationModel
+            );
+          })
+        ),
+
+      previewAutoModelRouting: t
+        .input(schemas.config.previewAutoModelRouting.input)
+        .output(schemas.config.previewAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            // Refuse before spending: the evaluator is billed to this workspace's ledger, and a
+            // stale selection (a workspace removed since) has nowhere to record it.
+            if (context.config.findWorkspace(input.workspaceId) == null) {
+              return Err(
+                "Preview usage is recorded under a workspace; open a workspace and try again."
+              );
+            }
+            const router = yield* AutoModelRouterTag;
+            const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
+              input.config ?? context.config.loadConfigOrDefault().autoModelRouting
+            );
+            const decision = yield* router.classifyEffect({
+              prompt: input.prompt,
+              tiers,
+              evaluationModel,
+            });
+            // Billed like the send path's evaluation (AgentSession), and before the tier is
+            // mapped: an unmapped verdict cost the same tokens, and so did a rejected one (#4774).
+            const billed = decision.success ? decision.data : decision.error;
+            if (decision.success || billed.usage != null) {
+              yield* atomicPromise(() =>
+                context.sessionUsageService.recordHeadlessUsage(
+                  input.workspaceId,
+                  evaluationModel,
+                  billed.usage,
+                  billed.providerMetadata,
+                  { analyticsSource: "auto_model_routing_preview" }
+                )
+              );
+            }
+            if (!decision.success) return Err(decision.error.reason);
+            const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+            return Ok({
+              ...decision.data,
+              tierLabel: chosen?.label ?? decision.data.tierId,
+              ...(chosen?.model != null ? { model: chosen.model } : {}),
+              ...(chosen?.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+            });
+          })
+        ),
+
       updateModelPreferences: t
         .input(schemas.config.updateModelPreferences.input)
         .output(schemas.config.updateModelPreferences.output)
@@ -400,6 +476,14 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateLlmDebugLogs(input.enabled));
           })
         ),
+      updateKeepScreenAwake: t
+        .input(schemas.config.updateKeepScreenAwake.input)
+        .output(schemas.config.updateKeepScreenAwake.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateKeepScreenAwake(input.enabled));
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
@@ -426,6 +510,14 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* atomicPromise(async () => context.config.updateGoalDefaults(input.goalDefaults));
+          })
+        ),
+      updateEvaluationDefaults: t
+        .input(schemas.config.updateEvaluationDefaults.input)
+        .output(schemas.config.updateEvaluationDefaults.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateEvaluationDefaults(input));
           })
         ),
       unenrollMuxGovernor: t
@@ -599,6 +691,12 @@ export const router = (authToken?: string) => {
         ),
     },
     providers: {
+      discoverModels: t
+        .input(schemas.providers.discoverModels.input)
+        .output(schemas.providers.discoverModels.output)
+        .handler(({ context, input, signal }) =>
+          context.providerService.discoverModels(input.provider, signal)
+        ),
       list: t
         .input(schemas.providers.list.input)
         .output(schemas.providers.list.output)
@@ -893,10 +991,6 @@ export const router = (authToken?: string) => {
         .input(schemas.general.ping.input)
         .output(schemas.general.ping.output)
         .handler(({ input }) => `Pong: ${input}`),
-      tick: t
-        .input(schemas.general.tick.input)
-        .output(schemas.general.tick.output)
-        .handler(({ input }) => createTickIterable(input.count, input.intervalMs)),
       getLogPath: t
         .input(schemas.general.getLogPath.input)
         .output(schemas.general.getLogPath.output)
@@ -1016,6 +1110,15 @@ export const router = (authToken?: string) => {
         .input(schemas.mcp.test.input)
         .output(schemas.mcp.test.output)
         .handler(({ context, input }) => context.mcpServerManager.testForApi(input)),
+
+      icon: t
+        .input(schemas.mcp.icon.input)
+        .output(schemas.mcp.icon.output)
+        .handler(({ context, input }) => context.mcpServerManager.getIcon(input.iconRef)),
+      icons: t
+        .input(schemas.mcp.icons.input)
+        .output(schemas.mcp.icons.output)
+        .handler(({ context, input }) => context.mcpServerManager.getIcons(input.iconRefs)),
 
       setEnabled: t
         .input(schemas.mcp.setEnabled.input)
@@ -1712,17 +1815,17 @@ export const router = (authToken?: string) => {
             input.persist ?? true
           )
         ),
-      getStartupAutoRetryModel: t
-        .input(schemas.workspace.getStartupAutoRetryModel.input)
-        .output(schemas.workspace.getStartupAutoRetryModel.output)
+      setUnrelatedWorkspaceConsent: t
+        .input(schemas.workspace.setUnrelatedWorkspaceConsent.input)
+        .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
         .handler(({ context, input }) =>
-          context.workspaceService.getStartupAutoRetryModel(input.workspaceId)
+          context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
         ),
-      setAutoCompactionThreshold: t
-        .input(schemas.workspace.setAutoCompactionThreshold.input)
-        .output(schemas.workspace.setAutoCompactionThreshold.output)
+      setAgentMessageDispatchMode: t
+        .input(schemas.workspace.setAgentMessageDispatchMode.input)
+        .output(schemas.workspace.setAgentMessageDispatchMode.output)
         .handler(({ context, input }) =>
-          context.workspaceService.setAutoCompactionThreshold(input.workspaceId, input.threshold)
+          context.workspaceService.setAgentMessageDispatchMode(input.workspaceId, input.mode)
         ),
       interruptStream: t
         .input(schemas.workspace.interruptStream.input)
@@ -1734,6 +1837,18 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.clearQueue.input)
         .output(schemas.workspace.clearQueue.output)
         .handler(({ context, input }) => context.workspaceService.clearQueue(input.workspaceId)),
+      sendHeldInput: t
+        .input(schemas.workspace.sendHeldInput.input)
+        .output(schemas.workspace.sendHeldInput.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.sendHeldInput(input.workspaceId, input.heldInputId)
+        ),
+      discardHeldInput: t
+        .input(schemas.workspace.discardHeldInput.input)
+        .output(schemas.workspace.discardHeldInput.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.discardHeldInput(input.workspaceId, input.heldInputId)
+        ),
       setQueuedMessageDispatchMode: t
         .input(schemas.workspace.setQueuedMessageDispatchMode.input)
         .output(schemas.workspace.setQueuedMessageDispatchMode.output)
@@ -1753,6 +1868,45 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.resetContext.input)
         .output(schemas.workspace.resetContext.output)
         .handler(({ context, input }) => context.workspaceService.resetContext(input.workspaceId)),
+      planReview: {
+        getState: t
+          .input(schemas.workspace.planReview.getState.input)
+          .output(schemas.workspace.planReview.getState.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewGetState(input.workspaceId)
+          ),
+        ensureSnapshot: t
+          .input(schemas.workspace.planReview.ensureSnapshot.input)
+          .output(schemas.workspace.planReview.ensureSnapshot.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewEnsureSnapshot(
+              input.workspaceId,
+              input.proposalToolCallId ?? undefined
+            )
+          ),
+        setThreadResolved: t
+          .input(schemas.workspace.planReview.setThreadResolved.input)
+          .output(schemas.workspace.planReview.setThreadResolved.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewSetThreadResolved(
+              input.workspaceId,
+              input.threadId,
+              input.resolved
+            )
+          ),
+        submitFeedback: t
+          .input(schemas.workspace.planReview.submitFeedback.input)
+          .output(schemas.workspace.planReview.submitFeedback.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewSubmitFeedback(input.workspaceId, {
+              snapshotId: input.snapshotId,
+              summary: input.summary ?? undefined,
+              comments: input.comments,
+              replies: input.replies,
+              options: input.options,
+            })
+          ),
+      },
       replaceChatHistory: t
         .input(schemas.workspace.replaceChatHistory.input)
         .output(schemas.workspace.replaceChatHistory.output)
@@ -1971,6 +2125,26 @@ export const router = (authToken?: string) => {
             input.enabled
           )
         ),
+      reviewState: {
+        subscribe: t
+          .input(schemas.workspace.reviewState.subscribe.input)
+          .output(schemas.workspace.reviewState.subscribe.output)
+          .handler(({ context, input, signal }) =>
+            subscribeReviewState(context, input.workspaceId, signal)
+          ),
+        update: t
+          .input(schemas.workspace.reviewState.update.input)
+          .output(schemas.workspace.reviewState.update.output)
+          .handler(({ context, input }) =>
+            context.reviewStateService.applyDelta(input.workspaceId, input.delta)
+          ),
+        importLegacy: t
+          .input(schemas.workspace.reviewState.importLegacy.input)
+          .output(schemas.workspace.reviewState.importLegacy.output)
+          .handler(({ context, input }) =>
+            context.reviewStateService.importLegacy(input.workspaceId, input.sections)
+          ),
+      },
       stats: {
         subscribe: t
           .input(schemas.workspace.stats.subscribe.input)
@@ -2038,7 +2212,18 @@ export const router = (authToken?: string) => {
       create: t
         .input(schemas.terminal.create.input)
         .output(schemas.terminal.create.output)
-        .handler(async ({ context, input }) => context.terminalService.create(input)),
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.terminalService.create(input);
+          } catch (error) {
+            // #4476: a rename/removal in another backend refuses the shell. Transports mask plain
+            // errors as "Internal Server Error", so pass this one on with its message.
+            if (error instanceof WorkspaceMutationInProgressError) {
+              throw new ORPCError("CONFLICT", { message: error.message });
+            }
+            throw error;
+          }
+        }),
       close: t
         .input(schemas.terminal.close.input)
         .output(schemas.terminal.close.output)
@@ -2090,9 +2275,17 @@ export const router = (authToken?: string) => {
       openNative: t
         .input(schemas.terminal.openNative.input)
         .output(schemas.terminal.openNative.output)
-        .handler(async ({ context, input }) =>
-          context.terminalService.openNative(input.workspaceId)
-        ),
+        .handler(async ({ context, input }) => {
+          try {
+            await context.terminalService.openNative(input.workspaceId);
+          } catch (error) {
+            // Another backend is renaming or removing the workspace (#4883), as for terminal.create.
+            if (error instanceof WorkspaceMutationInProgressError) {
+              throw new ORPCError("CONFLICT", { message: error.message });
+            }
+            throw error;
+          }
+        }),
       activity: {
         subscribe: t
           .input(schemas.terminal.activity.subscribe.input)
@@ -2220,14 +2413,6 @@ export const router = (authToken?: string) => {
             await context.mcpConfigService.claudeDesign.getStatus();
           }
         }),
-    },
-    debug: {
-      triggerStreamError: t
-        .input(schemas.debug.triggerStreamError.input)
-        .output(schemas.debug.triggerStreamError.output)
-        .handler(({ context, input }) =>
-          context.workspaceService.debugTriggerStreamError(input.workspaceId, input.errorMessage)
-        ),
     },
     telemetry: {
       track: t

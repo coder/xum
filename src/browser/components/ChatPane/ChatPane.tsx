@@ -55,6 +55,7 @@ import {
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
+import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
@@ -66,15 +67,18 @@ import {
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
+import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { HeldInput } from "@/browser/features/Messages/HeldInput";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
+import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -86,6 +90,13 @@ import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import { useAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
+import { EDIT_NOT_HELD_MESSAGE } from "@/constants/transcriptBarrier";
+import {
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+  TRANSCRIPT_REPLAY_FAILED_BANNER,
+} from "@/constants/transcriptBarrier";
 import {
   ChatDockColumnProvider,
   ChatDockSurface,
@@ -110,9 +121,13 @@ import {
 import {
   computeOperationalBundleInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
+import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import {
   CUSTOM_EVENTS,
   type CustomEventType,
@@ -187,6 +202,8 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // layout by a frame and tear. The dock must never be a scroll-anchoring
 // candidate: while locked the sentinel owns anchoring, and while released the
 // browser must anchor to a transcript row, not the sticky dock.
+const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
+const NO_HELD_INPUTS: readonly HeldInputData[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
 
 function findTranscriptMessageElement(
@@ -379,19 +396,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     pendingModel
   );
 
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    // Keep backend session threshold in sync with the persisted per-model slider value.
-    const normalizedThreshold = Math.max(0.1, Math.min(1, autoCompactionThreshold / 100));
-    void api.workspace.setAutoCompactionThreshold({
-      workspaceId,
-      threshold: normalizedThreshold,
-    });
-  }, [api, workspaceId, autoCompactionThreshold]);
-
   const [queuedActionErrorState, setQueuedActionErrorState] = useState<{
     workspaceId: string;
     messageId: string;
@@ -411,13 +415,41 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     editingState.workspaceId === workspaceId ? editingState.message : undefined;
   const setEditingMessage = useCallback(
     (message: EditingMessageState | undefined) => {
+      // Any change of edit target ends the conflict recovery of the previous edit (no-op
+      // when none is pending); only the composer's own updater keeps a request alive.
+      storeRaw.cancelTranscriptRefresh(workspaceId);
       setEditingState({
         workspaceId,
         message: transcriptOnly ? undefined : message,
       });
     },
-    [workspaceId, transcriptOnly]
+    [storeRaw, workspaceId, transcriptOnly]
   );
+  const updateEditingMessage = (update: (current: EditingMessageState) => EditingMessageState) => {
+    setEditingState((previous) =>
+      previous.workspaceId === workspaceId && previous.message
+        ? { ...previous, message: update(previous.message) }
+        : previous
+    );
+  };
+  /**
+   * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
+   * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
+   */
+  const beginEditingMessage = (message: EditingMessageState): boolean => {
+    const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
+    if (!precondition) {
+      publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
+      return false;
+    }
+    setEditingMessage({ ...message, precondition });
+    return true;
+  };
+  // Cancelling a compaction edits its request row; the fence is captured before the interrupt,
+  // so rows the interruption settles inside the range surface as an explicit conflict.
+  const startEditingMessage = (message: EditingMessageState) => {
+    beginEditingMessage(message);
+  };
 
   // Transcript-only workspaces swap the composer for a read-only notice, so clear any
   // stale edit state instead of leaving the transcript stuck at an edit cutoff.
@@ -429,6 +461,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   // Track which bash_output groups are expanded (keyed by first message ID)
   const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
+
+  // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
+  // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
+  // DOM instead of a one-shot requestAnimationFrame that would find nothing.
+  const [pendingScrollTarget, setPendingScrollTarget] = useState<{
+    workspaceId: string;
+    historyId: string;
+  } | null>(null);
 
   const [workBundleExpansionOverrides, setWorkBundleExpansionOverrides] = useState<
     Map<string, boolean>
@@ -454,13 +494,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     loading,
     isHydratingTranscript,
     isTranscriptCaughtUp,
+    transcriptReplayFailed,
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
-  const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();
   const loadOlderMessagesShortcutLabel = formatKeybind(KEYBINDS.LOAD_OLDER_MESSAGES);
 
   const {
@@ -545,6 +585,73 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [canInterrupt, deferredMessages, isStreamStarting, transcriptDensity]
   );
 
+  // Tail-first rendering: projections above are computed over the full array; only the
+  // mounted range starts at `revealFromIndex`. A cut is safe when the row is not inside a
+  // bundle or group (a head counts as safe), so bundles always mount whole.
+  const isSafeRevealCut = (index: number): boolean => {
+    const bashOutputGroup = bashOutputGroupInfos[index];
+    if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
+    const workBundle = workBundleInfos?.[index];
+    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    const operationalBundle = operationalBundleInfos?.[index];
+    return operationalBundle === undefined || operationalBundle.position === "head";
+  };
+  // Keep rendering cached transcript rows during incremental (since) catch-up so workspace
+  // switches feel stable, even when they are known to be missing backend content: the server
+  // verified every row up to the cursor, and rows after it are swapped for the server's
+  // copies at caught-up, so the missing content mostly appends. Stale rows
+  // under a full replay hide behind the skeleton instead. The stream/monitor barrier
+  // lives in the composer dock, so it never vetoes the skeleton. The skeleton
+  // additionally holds until decoration data sources are known so the transcript and all
+  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
+  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
+    computeChatViewReveal({
+      isHydratingTranscript,
+      chatViewDataReady,
+      hasRenderableMessages: deferredMessages.length > 0,
+      isTranscriptStale: workspaceState.isTranscriptStale,
+      isIncrementalCatchUp: workspaceState.isIncrementalCatchUp,
+    });
+  // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
+  // it: it would otherwise mount the whole transcript in the one commit that replaces the
+  // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
+  const {
+    fromIndex: revealFromIndex,
+    isFullyRevealed,
+    isRevealPaused,
+    revealMore,
+    revealThrough,
+  } = useBoundedTranscriptReveal({
+    workspaceId,
+    messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
+    isSafeCut: isSafeRevealCut,
+    rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+  });
+  const revealedMessages =
+    revealFromIndex === 0 ? deferredMessages : deferredMessages.slice(revealFromIndex);
+  const hasCommittedTranscriptRow =
+    !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
+  // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
+  // before the store activates the workspace can hold cached rows that a synchronous re-render
+  // replaces with the skeleton before paint; the next-frame check drops those.
+  useEffect(() => {
+    if (!hasCommittedTranscriptRow) return;
+    return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
+  }, [workspaceId, hasCommittedTranscriptRow]);
+  // Settled: every row is mounted, or the automatic reveal paused at its rows budget (#4869;
+  // older rows then mount only on request) — either way no chunk is still mounting.
+  const revealSettled = isFullyRevealed || isRevealPaused;
+  // Streaming rows render synchronously while older chunks still mount (see
+  // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
+  // flips the value, which would re-render every mounted markdown row once the reveal ends.
+  const isTranscriptBackfillingDuringStream = canInterrupt && !revealSettled;
+  // A paused reveal offers its unmounted rows first. Older server pages prepend above rows the
+  // reveal has not reached yet; offer them once it has.
+  const shouldRenderLoadOlderMessagesButton =
+    (isRevealPaused || (hasOlderHistory && isFullyRevealed)) && !isPixelSnapshotEnvironment();
+  // The server-page loading state never applies to mounting already-loaded rows.
+  const isLoadingOlderHistoryPage = loadingOlderHistory && !isRevealPaused;
+
   // A tail propose_plan usually means the agent paused for user review; reveal only the
   // containing hyper-density bundles by default so historical plans stay collapsed.
   const tailProposePlanToolId =
@@ -560,17 +667,23 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? null
       : (operationalBundleInfos?.[tailProposePlanIndex]?.key ?? null);
 
+  // Rollover mode evaluates the clamped threshold, so the chat-input bar's visibility and
+  // text must use the same effective value the slider label advertises.
+  const effectiveAutoCompactionThreshold = getEffectiveThreshold({
+    threshold: autoCompactionThreshold,
+    rolloverEnabled,
+  });
   const autoCompactionResult = useMemo(
     () =>
       checkAutoCompaction(
         workspaceUsage,
         pendingModel,
         use1M,
-        autoCompactionThreshold / 100,
+        effectiveAutoCompactionThreshold / 100,
         undefined,
         providersConfig
       ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, autoCompactionThreshold]
+    [workspaceUsage, pendingModel, use1M, providersConfig, effectiveAutoCompactionThreshold]
   );
 
   // Show warning when: shouldShowWarning flag is true AND not currently compacting.
@@ -624,7 +737,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!pendingTimelineReveal) {
       return;
     }
-    if (pendingTimelineReveal.workspaceId !== workspaceId) {
+    // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
+    if (pendingTimelineReveal.workspaceId !== workspaceId || autoScroll) {
       setPendingTimelineReveal(null);
       return;
     }
@@ -660,6 +774,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
+    // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
+    // The automatic reveal may have paused above the target, so ask it to reach the target.
+    if (targetIndex < revealFromIndex) {
+      revealThrough(targetIndex);
+      return;
+    }
+
     const scrollContainer = contentRef.current;
     const targetElement = scrollContainer
       ? findTranscriptRevealElement(scrollContainer, pendingTimelineReveal)
@@ -677,6 +798,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
     setPendingTimelineReveal(null);
   }, [
+    autoScroll,
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
@@ -684,6 +806,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
     pendingTimelineReveal,
+    revealFromIndex,
+    revealThrough,
     workBundleExpansionOverrides,
     workBundleInfos,
     workspaceId,
@@ -737,17 +861,50 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     (historyId: string) => {
       // Disable auto-scroll so the navigation isn't undone by streaming content
       disableAutoScroll();
-      requestAnimationFrame(() => {
-        const scrollContainer = contentRef.current;
-        if (!scrollContainer) return;
-        findTranscriptMessageElement(scrollContainer, historyId)?.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
-      });
+      setPendingScrollTarget({ workspaceId, historyId });
     },
-    [contentRef, disableAutoScroll]
+    [disableAutoScroll, workspaceId]
   );
+
+  useEffect(() => {
+    if (pendingScrollTarget === null) return;
+    // Navigation disables auto-scroll first; the tail being pinned again (jump to bottom, a
+    // send, dismissing an edit, scrolling back down) supersedes a navigation still waiting
+    // for its row to mount, so the chunk mounting later cannot scroll away from the tail.
+    if (pendingScrollTarget.workspaceId !== workspaceId || autoScroll) {
+      setPendingScrollTarget(null);
+      return;
+    }
+    const scrollContainer = contentRef.current;
+    const target = scrollContainer
+      ? findTranscriptMessageElement(scrollContainer, pendingScrollTarget.historyId)
+      : undefined;
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingScrollTarget(null);
+      return;
+    }
+    // Not in the DOM: keep waiting only while the row exists below the reveal boundary, and
+    // ask the reveal to reach it (the automatic reveal may have paused above it). A row that
+    // is gone, or eligible but hidden inside a collapsed bundle, is dropped (the pre-reveal
+    // behavior for an unmounted target was a silent no-op too).
+    const targetIndex = deferredMessages.findIndex(
+      (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
+    );
+    if (targetIndex === -1 || targetIndex >= revealFromIndex) {
+      setPendingScrollTarget(null);
+      return;
+    }
+    revealThrough(targetIndex);
+  }, [
+    autoScroll,
+    contentRef,
+    deferredMessages,
+    pendingScrollTarget,
+    revealFromIndex,
+    revealThrough,
+    workspaceId,
+  ]);
 
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
@@ -825,8 +982,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       for (const id of ids) {
         checkReview(id);
       }
+      // These notes were just sent: persist them as checked now rather than after the store's
+      // flush debounce, so a crash right after the send cannot bring them back as attached.
+      getReviewStateStore()
+        .flush(workspaceId)
+        .catch((error: unknown) => {
+          console.warn("Failed to persist sent review notes; the store keeps retrying:", error);
+        });
     },
-    [checkReview]
+    [checkReview, workspaceId]
   );
   const handleReviewNote = useCallback(
     (data: ReviewNoteData) => {
@@ -837,12 +1001,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 
   // Handlers for editing messages
-  const handleEditUserMessage = useCallback(
-    (message: EditingMessageState) => {
-      setEditingMessage(message);
-    },
-    [setEditingMessage]
-  );
+  const handleEditUserMessage = (message: EditingMessageState) => {
+    // Rows hide their Edit affordance while hydrating; this covers a click racing catch-up
+    // being lost (workspace switch, reconnect) so the composer never enters edit mode
+    // against a transcript that is not a verified copy of history.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
+    beginEditingMessage(message);
+  };
 
   const restoreQueuedDraft = useCallback(
     async (queuedMessage: QueuedMessageData) => {
@@ -855,12 +1020,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [api, workspaceId]
   );
 
-  const handleEditQueuedMessage = useCallback(async () => {
+  const handleEditQueuedMessage = async () => {
     const queuedMessage = workspaceState?.queuedMessage;
     if (!queuedMessage) return;
 
     await restoreQueuedDraft(queuedMessage);
-  }, [restoreQueuedDraft, workspaceState?.queuedMessage]);
+  };
 
   const sendQueuedImmediatelyInFlightRef = useRef<string | null>(null);
 
@@ -886,7 +1051,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   };
 
   // Handler for sending queued message immediately (interrupt + send)
-  const handleSendQueuedImmediately = useCallback(async () => {
+  const handleSendQueuedImmediately = async () => {
     const queuedMessage = workspaceState?.queuedMessage;
     if (
       !api ||
@@ -906,22 +1071,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         sendQueuedImmediatelyInFlightRef.current = null;
       }
     };
-    try {
-      // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
-      storeRaw.setInterrupting(workspaceId);
-      const interruptResult = await api.workspace.interruptStream({
-        workspaceId,
-        options: { sendQueuedImmediately: true },
-      });
-      if (!interruptResult.success) {
+    const interruptResult = await runWithCatch(
+      () => {
+        // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
+        storeRaw.setInterrupting(workspaceId);
+        return api.workspace.interruptStream({
+          workspaceId,
+          options: { sendQueuedImmediately: true },
+        });
+      },
+      (error) => {
         clearInFlightGuardIfCurrent();
-        throw new Error(interruptResult.error);
+        throw error;
       }
-    } catch (error) {
+    );
+    if (!interruptResult.success) {
       clearInFlightGuardIfCurrent();
-      throw error;
+      throw new Error(interruptResult.error);
     }
-  }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
+  };
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
@@ -940,15 +1108,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   };
 
-  const handleCancelCompactionFromBarrier = useCallback(() => {
+  const handleCancelCompactionFromBarrier = () => {
     if (!api || !aggregator) {
       return;
     }
 
-    void cancelCompaction(api, workspaceId, aggregator, setEditingMessage);
-  }, [api, workspaceId, aggregator, setEditingMessage]);
+    void cancelCompaction(api, workspaceId, aggregator, startEditingMessage);
+  };
 
-  const handleEditLastUserMessage = useCallback(async () => {
+  const handleEditLastUserMessage = async () => {
     if (transcriptOnly) return;
 
     const current = workspaceStateRef.current;
@@ -959,7 +1127,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    // Otherwise, edit last user message
+    // Otherwise, edit last user message. `current.messages` may be a cached/provisional view
+    // while the replay is still running, so ArrowUp must not enter edit mode until caught up.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
     const transformedMessages = mergeConsecutiveStreamErrors(current.messages);
     const lastUserMessage = [...transformedMessages]
       .reverse()
@@ -972,23 +1142,16 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    setEditingMessage(buildEditingStateFromDisplayed(lastUserMessage));
+    if (!beginEditingMessage(buildEditingStateFromDisplayed(lastUserMessage))) return;
     disableAutoScroll(); // Show jump-to-bottom indicator
 
-    // Scroll to the message being edited
-    requestAnimationFrame(() => {
-      const scrollContainer = contentRef.current;
-      if (!scrollContainer) return;
-      findTranscriptMessageElement(scrollContainer, lastUserMessage.historyId)?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
-    });
-  }, [restoreQueuedDraft, contentRef, disableAutoScroll, setEditingMessage, transcriptOnly]);
+    // Scroll to the message being edited once it is mounted (see pendingScrollTarget).
+    setPendingScrollTarget({ workspaceId, historyId: lastUserMessage.historyId });
+  };
 
-  const handleEditLastUserMessageClick = useCallback(() => {
+  const handleEditLastUserMessageClick = () => {
     void handleEditLastUserMessage();
-  }, [handleEditLastUserMessage]);
+  };
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessage(undefined);
@@ -996,8 +1159,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // on the edited message. Dismissing the edit hands scroll ownership back to
     // the transcript tail; without this the view stays scrolled up until the
     // user manually returns to the bottom.
-    jumpToBottom();
-  }, [jumpToBottom, setEditingMessage]);
+    handleJumpToBottom();
+  }, [handleJumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
@@ -1025,6 +1188,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
+      // Clearing acts on the transcript the user sees. The only caller is the /clear slash
+      // command, whose phase already turns thrown errors into a restore + error toast.
+      if (!isTranscriptMutationAllowed(workspaceId)) {
+        throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      }
       // Re-arm the tail before clearing so the empty/starting state owns the bottom.
       handleJumpToBottom();
 
@@ -1042,6 +1210,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 
   const handleResetContext = useCallback(async (): Promise<"reset" | "noop"> => {
+    // Same contract as handleClearHistory: the /reset (soft clear) phase surfaces the throw.
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+    }
     handleJumpToBottom();
 
     const result = await api?.workspace.resetContext({ workspaceId });
@@ -1088,19 +1260,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
   // show its "waiting on monitor" state instead of the chat looking idle.
   const shouldMountStreamingBarrier = shouldShowStreamingBarrier || activeBashMonitorCount > 0;
-  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
-  // workspace switches feel stable; rows known to be missing backend content hide behind
-  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
-  // renders in the tail lane below the skeleton, so it never vetoes it. The skeleton
-  // additionally holds until decoration data sources are known so the transcript and all
-  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
-  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
-    computeChatViewReveal({
-      isHydratingTranscript,
-      chatViewDataReady,
-      hasRenderableMessages: deferredMessages.length > 0,
-      isTranscriptStale: workspaceState.isTranscriptStale,
-    });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
@@ -1160,26 +1319,23 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     !showRetryBarrierUI &&
     lastRetryCandidateMessage != null &&
     interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
+  // Live status belongs beside the input, below async decorations: neither history
+  // reveal nor banners arriving should bump the label and Stop across the screen.
+  const turnStatus = shouldMountStreamingBarrier ? (
+    <ChatDockSurface>
+      <StreamingBarrier
+        workspaceId={workspaceId}
+        vimEnabled={vimEnabled}
+        onCancelCompaction={handleCancelCompactionFromBarrier}
+      />
+    </ChatDockSurface>
+  ) : null;
   const transcriptTailItems: TranscriptTailStackItem[] = [];
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
         key: "retry-barrier",
         node: <RetryBarrier workspaceId={workspaceId} visible={showRetryBarrierUI} />,
-      })
-    );
-  }
-  if (shouldMountStreamingBarrier) {
-    transcriptTailItems.push(
-      createTranscriptTailStackItem({
-        key: "streaming-barrier",
-        node: (
-          <StreamingBarrier
-            workspaceId={workspaceId}
-            vimEnabled={vimEnabled}
-            onCancelCompaction={handleCancelCompactionFromBarrier}
-          />
-        ),
       })
     );
   }
@@ -1205,15 +1361,81 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       })
     );
   }
+  // Rows a paused reveal mounts on request land above the reading position (#4869). Native
+  // scroll anchoring keeps that position only while scrollTop > 0, and the Load-older button
+  // sits at scrollTop 0, so the first mounted row's viewport offset is pinned explicitly from
+  // the request until the reveal settles again. Offsets are viewport-relative and measured after
+  // layout, so a native anchoring adjustment is never applied twice.
+  const loadOlderAnchorRef = useRef<{
+    element: HTMLElement;
+    top: number;
+    /** scrollTop after the last correction; a scroll away from it moves `top` (see below). */
+    scrollTop: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const anchor = loadOlderAnchorRef.current;
+    const scrollContainer = contentRef.current;
+    if (anchor === null || scrollContainer === null) return;
+    if (anchor.element.isConnected) {
+      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
+      if (delta !== 0) scrollContainer.scrollTop += delta;
+      anchor.scrollTop = scrollContainer.scrollTop;
+    }
+    if (revealSettled || !anchor.element.isConnected) loadOlderAnchorRef.current = null;
+  }, [contentRef, revealFromIndex, revealSettled, shouldRenderLoadOlderMessagesButton]);
+  const handleTranscriptScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    handleScroll(event);
+    // The reader scrolling while the requested rows mount moves the position to keep, so the
+    // next correction never undoes it. Shifted by the scroll distance rather than re-measured,
+    // so a correction's sub-pixel rounding never accumulates across chunks.
+    const anchor = loadOlderAnchorRef.current;
+    if (anchor !== null) {
+      const scrollTop = event.currentTarget.scrollTop;
+      anchor.top -= scrollTop - anchor.scrollTop;
+      anchor.scrollTop = scrollTop;
+    }
+  };
+
   const handleLoadOlderHistory = useCallback(() => {
-    if (!shouldRenderLoadOlderMessagesButton || loadingOlderHistory) {
+    if (!shouldRenderLoadOlderMessagesButton) {
+      return;
+    }
+    // Already-loaded rows above a paused reveal mount before any older server page is fetched.
+    // Requests made while those rows mount are ignored (the button is gone until the reveal
+    // pauses again), like presses while a server page loads.
+    if (isRevealPaused) {
+      // While locked to the bottom the sentinel keeps the tail in place instead.
+      const firstRow = autoScroll
+        ? null
+        : contentRef.current?.querySelector<HTMLElement>("[data-message-id]");
+      loadOlderAnchorRef.current =
+        firstRow && contentRef.current
+          ? {
+              element: firstRow,
+              top: firstRow.getBoundingClientRect().top,
+              scrollTop: contentRef.current.scrollTop,
+            }
+          : null;
+      revealMore();
+      return;
+    }
+    if (loadingOlderHistory) {
       return;
     }
 
     storeRaw.loadOlderHistory(workspaceId).catch((error) => {
       console.warn(`[ChatPane] Failed to load older history for ${workspaceId}:`, error);
     });
-  }, [loadingOlderHistory, shouldRenderLoadOlderMessagesButton, storeRaw, workspaceId]);
+  }, [
+    autoScroll,
+    contentRef,
+    isRevealPaused,
+    loadingOlderHistory,
+    revealMore,
+    shouldRenderLoadOlderMessagesButton,
+    storeRaw,
+    workspaceId,
+  ]);
 
   // Handle keyboard shortcuts (using optional refs that are safe even if not initialized)
   useAIViewKeybinds({
@@ -1228,7 +1450,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleOpenTerminal: onOpenTerminal,
     handleOpenInEditor,
     aggregator,
-    setEditingMessage,
+    setEditingMessage: startEditingMessage,
     vimEnabled,
     canResumeInterruptedStream: interruptedTailResumable,
     resumeInterruptedStream,
@@ -1238,6 +1460,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
+    // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
+    // a pre-window range discards cached pages); the refresh outcome decides whether the
+    // edited row is gone, not the transient absence of its row.
+    if (editingMessage.preconditionInvalidated === true) return;
 
     const transformedMessages = mergeConsecutiveStreamErrors(workspaceState.messages);
     const editCutoffHistoryId = transformedMessages.find(
@@ -1334,7 +1560,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const messageNode = (
       <MessageRenderer
         message={message}
-        onEditUserMessage={transcriptOnly ? undefined : handleEditUserMessage}
+        // No onEdit → UserMessage omits its Edit button; provisional (not caught-up) rows
+        // must not offer an edit whose truncation point the backend may not agree with.
+        onEditUserMessage={
+          transcriptOnly || !isTranscriptCaughtUp ? undefined : handleEditUserMessage
+        }
         workspaceId={workspaceId}
         isCompacting={isCompacting}
         onReviewNote={handleReviewNote}
@@ -1392,14 +1622,16 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onMouseUp={handleScrollContainerMouseUp}
             onTouchMove={handleTranscriptTouchMove}
             onKeyDown={handleTranscriptKeyDown}
-            onScroll={handleScroll}
+            onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
             tabIndex={0}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
-            // decoration data readiness so waiting on it observes the chat
-            // view's final (post-reveal) layout.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady}
+            // decoration data readiness AND the tail-first reveal having settled
+            // (fully revealed or paused at the automatic budget), so waiting on it
+            // observes the chat view's final layout rather than a tail whose
+            // earlier chunks are still committing.
+            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && revealSettled}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:
@@ -1419,7 +1651,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
-              aria-live={canInterrupt ? "polite" : "off"}
+              // Live only once the historical reveal has settled: chunks of replayed history
+              // mounting during a stream would otherwise be announced as fresh output.
+              aria-live={canInterrupt && revealSettled ? "polite" : "off"}
               aria-busy={canInterrupt || isHydratingTranscript}
               aria-label="Conversation transcript"
               className={cn(
@@ -1441,7 +1675,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
-                <TranscriptHydrationSkeleton />
+                <TranscriptHydrationSkeleton workspaceId={workspaceId} />
               ) : showEmptyTranscriptPlaceholder ? (
                 <div className="text-placeholder flex h-full flex-1 flex-col items-center justify-center text-center [&_h3]:m-0 [&_h3]:mb-2.5 [&_h3]:text-base [&_h3]:font-medium [&_p]:m-0 [&_p]:text-[13px]">
                   <h3>No Messages Yet</h3>
@@ -1463,7 +1697,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 </div>
               ) : (
                 <BashCollapsedSummaryModeProvider>
-                  <MessageListProvider value={messageListContextValue}>
+                  <MessageListProvider
+                    value={messageListContextValue}
+                    isTranscriptBackfilling={isTranscriptBackfillingDuringStream}
+                  >
                     {shouldRenderLoadOlderMessagesButton && (
                       <div className="flex justify-center py-3">
                         <TooltipIfPresent
@@ -1473,15 +1710,16 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                           <button
                             type="button"
                             onClick={handleLoadOlderHistory}
-                            disabled={loadingOlderHistory}
+                            disabled={isLoadingOlderHistoryPage}
                             className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors disabled:opacity-50"
                           >
-                            {loadingOlderHistory ? "Loading..." : "Load older messages"}
+                            {isLoadingOlderHistoryPage ? "Loading..." : "Load older messages"}
                           </button>
                         </TooltipIfPresent>
                       </div>
                     )}
-                    {deferredMessages.map((msg, index) => {
+                    {revealedMessages.map((msg, revealOffset) => {
+                      const index = revealFromIndex + revealOffset;
                       const workBundle = workBundleInfos?.[index];
                       const operationalBundle = workBundle
                         ? undefined
@@ -1697,9 +1935,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
                     // composer surface is replaced with a single read-only notice.
-                    <TranscriptOnlyNoticePane />
+                    <>
+                      {turnStatus}
+                      <TranscriptOnlyNoticePane />
+                    </>
                   ) : (
                     <ChatInputPane
+                      turnStatus={turnStatus}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1707,6 +1949,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
+                      transcriptReplayFailed={transcriptReplayFailed}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
                       preStreamAgentTaskStatus={
@@ -1729,9 +1972,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onTruncateHistory={handleClearHistory}
                       editingMessage={editingMessage}
                       onCancelEdit={handleCancelEdit}
+                      onEditingMessageChange={updateEditingMessage}
                       onEditLastUserMessage={handleEditLastUserMessageClick}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
+                      heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
                       onEditQueuedMessage={() => void handleEditQueuedMessage()}
                       onSendQueuedImmediately={
                         workspaceState?.canInterrupt ? handleSendQueuedImmediately : undefined
@@ -1772,6 +2017,7 @@ const TranscriptOnlyNoticePane: React.FC = () => {
 };
 
 interface ChatInputPaneProps {
+  turnStatus: React.ReactNode;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
@@ -1788,6 +2034,8 @@ interface ChatInputPaneProps {
   isCompacting: boolean;
   isStreamStarting: boolean;
   isTranscriptCaughtUp: boolean;
+  /** Last history replay failed; the store keeps cached rows and retries with backoff. */
+  transcriptReplayFailed: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
   canInterrupt: boolean;
@@ -1804,9 +2052,11 @@ interface ChatInputPaneProps {
   onTruncateHistory: (percentage?: number) => Promise<void>;
   editingMessage: EditingMessageState | undefined;
   onCancelEdit: () => void;
+  onEditingMessageChange: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage: () => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
+  heldInputs: readonly HeldInputData[];
   onEditQueuedMessage: () => void;
   onSendQueuedImmediately: (() => Promise<void>) | undefined;
   onQueuedDispatchModeChange: (mode: QueueDispatchMode) => Promise<void>;
@@ -1819,6 +2069,7 @@ interface ChatInputPaneProps {
 
 const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   const { reviews } = props;
+  const storeRaw = useWorkspaceStoreRaw();
 
   // Keep optional banners/warnings on one shared lane so the seam right above the textarea is
   // owned by a single component boundary. That lets hydration reserve only the volatile
@@ -1847,6 +2098,42 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             onActionStart={props.onClearQueuedActionError}
             onSendImmediately={props.onSendQueuedImmediately}
           />
+        ),
+      })
+    );
+  }
+  // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
+  // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
+  for (const [index, heldInput] of props.heldInputs.entries()) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: `held-input-${heldInput.id}`,
+        revealBeforeReady: true,
+        node: (
+          <HeldInput
+            workspaceId={props.workspaceId}
+            heldInput={heldInput}
+            // The composer's held-input shortcuts act on the oldest one (see ChatInput).
+            isShortcutTarget={index === 0}
+          />
+        ),
+      })
+    );
+  }
+  if (props.transcriptReplayFailed) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: "transcript-replay-failed",
+        // Hydration never completes while replays keep failing, so this must bypass the
+        // decoration reveal gate like the queued message does. Plain text: the shimmer above
+        // already signals activity, and the closed send barrier explains itself on dispatch.
+        revealBeforeReady: true,
+        node: (
+          <ChatDockSurface>
+            <p role="status" className="text-muted py-1 text-xs">
+              {TRANSCRIPT_REPLAY_FAILED_BANNER}
+            </p>
+          </ChatDockSurface>
         ),
       })
     );
@@ -1935,6 +2222,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       <ChatInputDecorationStackLane
         items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
       />
+      {props.turnStatus}
       <ChatInput
         key={props.workspaceId}
         variant="workspace"
@@ -1959,14 +2247,20 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}
+        onEditingMessageChange={props.onEditingMessageChange}
         onEditLastUserMessage={props.onEditLastUserMessage}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}
         onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}
         onQueuedActionError={props.onQueuedActionError}
         onSendQueuedImmediately={props.onSendQueuedImmediately}
+        heldInputId={props.heldInputs[0]?.id}
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
+        onAddReview={reviews.addReview}
+        onAcceptRestoredHeldInputs={(heldInputIds) =>
+          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds)
+        }
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}
         onCheckReview={reviews.checkReview}

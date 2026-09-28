@@ -16,6 +16,11 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
+import {
+  isTranscriptMutationAllowed,
+  useTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import React, { useState } from "react";
 import { CompactingMessageContent } from "./CompactingMessageContent";
@@ -24,7 +29,9 @@ import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
 import { ModelDisplay } from "./ModelDisplay";
 import { ModelFallbackBadge } from "./ModelFallbackBadge";
+import { AutoModelRoutingBadge } from "./AutoModelRoutingBadge";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
 
 interface AssistantMessageProps {
   message: DisplayedMessage & { type: "assistant" };
@@ -73,6 +80,11 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     icon: copied ? <ClipboardCheck /> : <Clipboard />,
   };
 
+  // A response fork names this row's history id as the branch point, so it must not run
+  // against a provisional transcript (the row may be stale or already removed): the action
+  // follows the barrier like Start Here does, rendered disabled and re-checked on dispatch.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
+
   const handleForkFromResponse = async () => {
     if (!workspaceId) {
       forkError.showError(message.historyId, "Workspace ID unavailable");
@@ -84,22 +96,30 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       return;
     }
 
-    try {
-      // Response-level forks branch from this assistant turn instead of cloning the entire
-      // transcript, so users can explore alternatives without carrying over later replies.
-      const result = await forkWorkspace({
-        client: api,
-        sourceWorkspaceId: workspaceId,
-        sourceMessageId: message.historyId,
-      });
-
-      if (!result.success) {
-        forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
-      }
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : "Failed to fork chat";
-      forkError.showError(message.historyId, messageText);
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      forkError.showError(message.historyId, TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      return;
     }
+
+    await runWithCatch(
+      async () => {
+        // Response-level forks branch from this assistant turn instead of cloning the entire
+        // transcript, so users can explore alternatives without carrying over later replies.
+        const result = await forkWorkspace({
+          client: api,
+          sourceWorkspaceId: workspaceId,
+          sourceMessageId: message.historyId,
+        });
+
+        if (!result.success) {
+          forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
+        }
+      },
+      (error) => {
+        const messageText = error instanceof Error ? error.message : "Failed to fork chat";
+        forkError.showError(message.historyId, messageText);
+      }
+    );
   };
 
   // Scratch chats cannot be forked (the backend rejects it), so hide the
@@ -124,7 +144,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       buttons.push({
         label: "Fork",
         onClick: () => void handleForkFromResponse(),
-        disabled: !workspaceId || !api,
+        disabled: !workspaceId || !api || !transcriptMutationAllowed,
         tooltip: "Fork a new workspace from this response",
         icon: <GitBranch />,
       });
@@ -213,6 +233,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
         {message.modelFallback && (
           <ModelFallbackBadge modelFallback={message.modelFallback} effectiveModel={modelName} />
         )}
+        {message.autoModelRouting && <AutoModelRoutingBadge record={message.autoModelRouting} />}
         {isCompacted && (
           <span className="text-plan-mode bg-plan-mode/10 inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
             {isIdleCompacted ? (

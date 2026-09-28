@@ -10,6 +10,7 @@ import { Config } from "@/node/config";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
 export class TestTempDir implements Disposable {
   public readonly path: string;
@@ -380,6 +381,16 @@ export function createIsolatedAgentSkillsRoots(root: string) {
   };
 }
 
+/**
+ * Typed partial WorkspaceTurnManager for tool tests. Only the methods a test passes exist;
+ * calling any other method throws, so an unexpected workspace-turn call fails loudly.
+ */
+export function createFakeWorkspaceTurnManager(
+  methods: Partial<WorkspaceTurnManager> = {}
+): WorkspaceTurnManager {
+  return methods as WorkspaceTurnManager;
+}
+
 export function createTestToolConfig(
   tempDir: string,
   options?: {
@@ -399,6 +410,9 @@ export function createTestToolConfig(
       type: "global",
       xumHome: tempDir,
     },
+    // Production always wires a WorkspaceTurnManager next to TaskService; task tools require
+    // it up front. Tests that exercise workspace turns override this with the methods they use.
+    workspaceTurnManager: createFakeWorkspaceTurnManager(),
   };
 }
 

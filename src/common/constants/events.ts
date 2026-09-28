@@ -29,6 +29,20 @@ export const CUSTOM_EVENTS = {
   CLEAR_CHAT_COMPOSER: "mux:clearChatComposer",
 
   /**
+   * Event asking a held-input banner to run its Send or Discard action (keyboard shortcut from
+   * the composer), so the shortcut shares the banner's in-flight guard and error display.
+   * Detail: { workspaceId: string; heldInputId: string; action: "send" | "discard" }
+   */
+  HELD_INPUT_ACTION: "mux:heldInputAction",
+
+  /**
+   * Event asking the workspace's latest plan card to run its primary action (Implement, or
+   * Continue in Auto) from the command palette. The card sets `handled` when it started it.
+   * Detail: { workspaceId: string; handled: boolean }
+   */
+  RUN_LATEST_PLAN_ACTION: "mux:runLatestPlanAction",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -143,14 +157,27 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.UPDATE_CHAT_INPUT]: {
     text: string;
-    mode?: "replace" | "append";
+    /** "restore": put a returned queued message in front of the current draft (never replaces it). */
+    mode?: "replace" | "append" | "restore";
     fileParts?: FilePart[];
     reviews?: ReviewNoteDataForDisplay[];
     /** When set, only the matching workspace composer may apply this update. */
     workspaceId?: string;
+    /** "restore" only: backend held inputs to acknowledge once the composer applied it (#4448). */
+    heldInputIds?: string[];
   };
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;
+  };
+  [CUSTOM_EVENTS.HELD_INPUT_ACTION]: {
+    workspaceId: string;
+    heldInputId: string;
+    action: "send" | "discard";
+  };
+  [CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION]: {
+    workspaceId: string;
+    /** Set synchronously by the plan card that started the action. */
+    handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload

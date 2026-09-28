@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { Worker } from "node:worker_threads";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { toUtcDateString } from "@/node/services/analytics/dateUtils";
 import type {
   AgentCostRow,

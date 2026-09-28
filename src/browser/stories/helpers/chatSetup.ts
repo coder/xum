@@ -16,7 +16,11 @@ import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
-import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import {
+  createMockORPCClient,
+  type MockORPCClientOptions,
+  type MockSessionUsage,
+} from "@/browser/stories/mocks/orpc";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -34,7 +38,9 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
     }
     // Default: emit caught-up immediately. Modern backends include hasOlderHistory
     // on full replays; default to false in stories to avoid phantom pagination UI.
-    queueMicrotask(() => emit({ type: "caught-up", hasOlderHistory: false }));
+    queueMicrotask(() =>
+      emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false })
+    );
     return undefined;
   };
 }
@@ -45,6 +51,8 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
 export type BackgroundProcessFixture = BackgroundProcessInfo;
 
 export interface SimpleChatSetupOptions {
+  /** Session icon registry for mcp.icon (iconRef -> PNG data URL). */
+  mcpIcons?: Map<string, string>;
   workspaceId?: string;
   workspaceName?: string;
   projectName?: string;
@@ -96,6 +104,8 @@ export interface SimpleChatSetupOptions {
   chatTranscriptFullWidth?: boolean;
   /** Timeline events served by the mock workspace.timeline endpoints. */
   timelineEvents?: TimelineEvent[];
+  /** Admin policy served by policy.get (defaults to no policy). */
+  policyResponse?: MockORPCClientOptions["policyResponse"];
 }
 
 /**
@@ -188,6 +198,8 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
     timelineEvents: opts.timelineEvents,
+    mcpIcons: opts.mcpIcons,
+    policyResponse: opts.policyResponse,
   });
 }
 

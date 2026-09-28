@@ -37,7 +37,13 @@ export interface ChatUsageDisplay {
   // billing (providerMetadata.mux.costsIncluded). These entries should not be
   // repriced when model mappings change.
   costsIncluded?: boolean;
+
+  // OpenAI service tier the costs were priced at, so repricing keeps a Fast or Flex
+  // premium (#4787). Absent means Standard; "mixed" marks a sum across tiers.
+  serviceTier?: ChatUsageServiceTier;
 }
+
+export type ChatUsageServiceTier = "flex" | "fast" | "unknown" | "mixed";
 
 /**
  * Sum multiple ChatUsageDisplay objects into a single cumulative display
@@ -53,6 +59,7 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   // repriced during mapping changes — we can't separate which tokens were billed
   // by the gateway vs. which were priced from model metadata.
   let anyCostsIncluded = false;
+  const serviceTiers = new Set<ChatUsageServiceTier | "standard">();
 
   const sum: ChatUsageDisplay = {
     input: { tokens: 0, cost_usd: 0 },
@@ -65,6 +72,7 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   for (const usage of usageHistory) {
     if (usage.costsIncluded) anyCostsIncluded = true;
     if (usage.hasUnknownCosts) hasIncompleteCosts = true;
+    serviceTiers.add(usage.serviceTier ?? "standard");
     // Iterate over each component and sum tokens and costs
     const componentKeys: Array<"input" | "cached" | "cacheCreate" | "output" | "reasoning"> = [
       "input",
@@ -92,6 +100,12 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   // because we can't separate which tokens were billed by the gateway.
   if (anyCostsIncluded) {
     sum.costsIncluded = true;
+  }
+  // One tier across the sum keeps it repriceable at that tier; several cannot be separated.
+  const [onlyTier] = serviceTiers;
+  const serviceTier = serviceTiers.size > 1 ? "mixed" : onlyTier;
+  if (serviceTier !== undefined && serviceTier !== "standard") {
+    sum.serviceTier = serviceTier;
   }
 
   return sum;

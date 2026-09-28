@@ -18,7 +18,7 @@ test.describe("review refresh", () => {
 
     // Capture any pre-existing timestamp (from mount-time auto-refresh or empty)
     const tsBefore = Number(
-      (await refreshButton.getAttribute("data-last-refresh-timestamp")) || "0"
+      (await refreshButton.getAttribute("data-last-refresh-timestamp")) ?? "0"
     );
 
     // First manual refresh.

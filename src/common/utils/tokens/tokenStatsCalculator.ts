@@ -17,6 +17,8 @@ import {
   type Tokenizer,
 } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import assert from "@/common/utils/assert";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { createDisplayUsage } from "./displayUsage";
 import type { ChatUsageDisplay } from "./usageAggregator";
 
@@ -162,11 +164,39 @@ export interface TokenCountJob {
 /**
  * Creates all token counting jobs from messages
  * Jobs are executed immediately (promises start running)
+ *
+ * `counts` resolves to every job's count in job order and rejects if any job rejects.
  */
-function createTokenCountingJobs(messages: MuxMessage[], tokenizer: Tokenizer): TokenCountJob[] {
+async function createTokenCountingJobs(
+  messages: MuxMessage[],
+  tokenizer: Tokenizer
+): Promise<{ jobs: TokenCountJob[]; counts: Promise<number[]> }> {
   const jobs: TokenCountJob[] = [];
+  // Each job hashes its text and posts it to the tokenizer worker. A 1.24M-row epoch made this
+  // one synchronous loop of ~10 s that froze the whole server (pings, onChat heartbeats, every
+  // other subscription) right after the chat loaded (#4643), so give the event loop turns.
+  const yielder = new EventLoopYielder();
+  // Counts are collected per yield slice rather than with one Promise.all over every job at the
+  // end: once counting is fast, nearly all ~1M counts have settled by then and a single
+  // Promise.all runs all their reactions in one ~1 s task (#4653). Per-slice collection, created
+  // while the slice's jobs are still pending, bounds each burst to one slice.
+  const sliceCounts: Array<Promise<number[]>> = [];
+  let observedJobs = 0;
+  const closeSlice = () => {
+    const slice = Promise.all(jobs.slice(observedJobs).map((job) => job.promise));
+    // A job can reject while we yield (dead worker, malformed part). Server mode crashes on an
+    // unhandled rejection, so observe the slice right away; `counts` still carries the failure
+    // to calculateTokenStats, which surfaces it to its caller.
+    void slice.catch(() => undefined);
+    sliceCounts.push(slice);
+    observedJobs = jobs.length;
+  };
 
   for (const message of messages) {
+    if (yielder.isDue()) {
+      closeSlice();
+      await yielder.yield();
+    }
     if (message.role === "user") {
       // User message text - batch all text parts together
       const textParts = message.parts.filter((p) => p.type === "text");
@@ -223,8 +253,15 @@ function createTokenCountingJobs(messages: MuxMessage[], tokenizer: Tokenizer): 
       }
     }
   }
+  closeSlice();
 
-  return jobs;
+  // Slices are sequential and flat() concatenates them in order, so counts line up with jobs.
+  const counts = Promise.all(sliceCounts).then((slices) => {
+    const flat = slices.flat();
+    assert(flat.length === jobs.length, "token count slices must cover every job exactly once");
+    return flat;
+  });
+  return { jobs, counts };
 }
 
 /**
@@ -442,10 +479,10 @@ export async function calculateTokenStats(
   );
 
   // Phase 3: Create all token counting jobs (promises start immediately)
-  const jobs = createTokenCountingJobs(messages, tokenizer);
+  const { jobs, counts } = await createTokenCountingJobs(messages, tokenizer);
 
-  // Phase 4: Execute all jobs in parallel (second await point)
-  const results = await Promise.all(jobs.map((j) => j.promise));
+  // Phase 4: Wait for every job's count (second await point)
+  const results = await counts;
 
   // Phase 5: Merge results (no awaits)
   const consumerMap = mergeResults(jobs, results, toolDefinitions, systemMessageTokens);

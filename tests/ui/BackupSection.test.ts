@@ -1,8 +1,10 @@
 import "./dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -11,24 +13,35 @@ import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup"
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
 
-function backupSectionTree(client: MockClient) {
+function backupSectionTree(client: MockClient, inSettingsDialog = false) {
+  const section = React.createElement(BackupSection);
+  const children = inSettingsDialog
+    ? React.createElement(
+        Dialog,
+        { open: true },
+        React.createElement(
+          DialogContent,
+          { "aria-describedby": undefined },
+          React.createElement(DialogTitle, null, "Settings"),
+          section
+        )
+      )
+    : section;
   return React.createElement(
     ThemeProvider,
     null,
     React.createElement(
       TooltipProvider,
       null,
-      React.createElement(APIProvider, {
-        client,
-        children: React.createElement(BackupSection),
-      })
+      React.createElement(APIProvider, { client, children })
     )
   );
 }
 
 function renderBackupSection(
   overrides: Partial<NonNullable<MockOptions>> = {},
-  setupClient?: (client: MockClient) => void
+  setupClient?: (client: MockClient) => void,
+  inSettingsDialog = false
 ) {
   const client = createMockORPCClient({
     backupSettings: {
@@ -67,11 +80,11 @@ function renderBackupSection(
 
   setupClient?.(client);
 
-  const view = render(backupSectionTree(client));
+  const view = render(backupSectionTree(client, inSettingsDialog));
 
   return { client, view };
 }
-async function confirmRestore(canvas: ReturnType<typeof within>): Promise<void> {
+async function confirmRestore(canvas: BoundFunctions<typeof queries>): Promise<void> {
   fireEvent.click(canvas.getByRole("button", { name: /^Restore$/ }));
   const dialog = await within(document.body).findByRole("dialog");
   fireEvent.click(within(dialog).getByRole("button", { name: /Restore settings/i }));
@@ -174,6 +187,40 @@ describe("BackupSection", () => {
         includeProjects: true,
       })
     );
+  });
+
+  test("keeps shortcuts working inside the settings dialog that hosts the section", async () => {
+    renderBackupSection({}, undefined, true);
+    const settings = await within(document.body).findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+
+    fireEvent.keyDown(settings, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+  });
+
+  test("re-arms shortcuts in the settings dialog after a nested confirm closes", async () => {
+    renderBackupSection({}, undefined, true);
+    const body = within(document.body);
+    const settings = await body.findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const restore = canvas.getByRole("button", { name: /^Restore$/ });
+    await waitFor(() => expect(restore.hasAttribute("disabled")).toBe(false));
+
+    fireEvent.click(restore);
+    const confirm = await body.findByRole("dialog", { name: "Restore settings backup?" });
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(within(confirm).getByRole("button", { name: /Cancel/ }));
+    await waitFor(() =>
+      expect(body.queryByRole("dialog", { name: "Restore settings backup?" }) === null).toBe(true)
+    );
+    // The confirm has no trigger to return focus to, so closing it leaves focus on the body.
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
   });
 
   test("refreshes backup settings changed by another window", async () => {
@@ -770,7 +817,7 @@ describe("BackupSection", () => {
     const restore = jest.spyOn(client.backup, "restore");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
     const targetInputs = canvas.getAllByLabelText("Local project directory");
-    fireEvent.change(targetInputs[0]!, { target: { value: "/home/other/rocket" } });
+    fireEvent.change(targetInputs[0], { target: { value: "/home/other/rocket" } });
     await confirmRestore(canvas);
 
     await waitFor(() =>
@@ -832,7 +879,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -919,7 +966,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -930,7 +977,7 @@ describe("BackupSection", () => {
     ).toBeTruthy();
 
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);

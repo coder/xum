@@ -17,10 +17,11 @@ import {
 } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import type { AgentSession } from "./agentSession";
+import type { AgentSession, AgentSessionStreamManager } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  seedAutoCompactionThreshold,
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
@@ -29,6 +30,8 @@ import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
+import { eventSpine } from "./events/eventSpine";
+import { waitForCondition } from "./testDispatchHelpers";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -38,18 +41,11 @@ const sendOptions: SendMessageOptions = {
   experiments: { continuousCompaction: true },
 };
 
-interface SessionInternals {
-  interruptForCompaction(): Promise<void>;
-  coordinator: TurnCoordinator;
+interface ContinuousStrategyInternals {
+  continuousCompactor: ContinuousCompactor;
   runContinuousCompactionObservation<T>(
     observe: (token: CompactionToken) => Promise<T>
   ): Promise<T | undefined>;
-  continuousCompactor: ContinuousCompactor;
-  activeStreamContext?: {
-    modelString: string;
-    options?: SendMessageOptions;
-    providersConfig: ProvidersConfigMap | null;
-  };
   finishContinuousCompaction: (
     applied: boolean,
     context: NonNullable<SessionInternals["activeStreamContext"]>,
@@ -58,10 +54,29 @@ interface SessionInternals {
   interruptForContinuousCompaction: (
     apply: (followUp?: CompactionFollowUpRequest) => Promise<boolean>
   ) => Promise<boolean>;
+  observeContinuousCompactionAtStreamEnd(model: string, options: SendMessageOptions): Promise<void>;
+}
+
+interface SessionInternals {
+  coordinator: TurnCoordinator;
+  contextController: {
+    continuous: ContinuousStrategyInternals;
+    summarize: { interruptForCompaction(): Promise<void> };
+    compactionHandler: CompactionHandler;
+  };
+  activeStreamContext?: {
+    modelString: string;
+    options?: SendMessageOptions;
+    providersConfig: ProvidersConfigMap | null;
+  };
 }
 
 function internals(session: AgentSession): SessionInternals {
   return session as unknown as SessionInternals;
+}
+
+function continuous(session: AgentSession): ContinuousStrategyInternals {
+  return internals(session).contextController.continuous;
 }
 
 async function applyThenFinish(
@@ -71,9 +86,10 @@ async function applyThenFinish(
   const state = internals(session);
   const context = state.activeStreamContext;
   if (!context) throw new Error("Expected active stream context");
-  const result = await state.runContinuousCompactionObservation(async (token) => {
-    const applied = await state.interruptForContinuousCompaction(apply);
-    await state.finishContinuousCompaction(applied, context, token);
+  const strategy = continuous(session);
+  const result = await strategy.runContinuousCompactionObservation(async (token) => {
+    const applied = await strategy.interruptForContinuousCompaction(apply);
+    await strategy.finishContinuousCompaction(applied, context, token);
     return applied;
   });
   assert(result != null, "Expected the observation to complete");
@@ -90,16 +106,17 @@ function deferred<T>() {
 
 describe("AgentSession continuous compaction wiring", () => {
   let harness: AgentSessionHarness | undefined;
+  const unregisterHooks: Array<() => void> = [];
   afterEach(async () => {
+    for (const unregister of unregisterHooks.splice(0)) unregister();
     await harness?.session.dispose();
     await harness?.cleanup();
     harness = undefined;
     mock.restore();
   });
 
-  async function setup(usagePercent = 0) {
-    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true });
-    harness.session.setAutoCompactionThreshold(0.7);
+  async function setup(usagePercent = 0, streamManager?: AgentSessionStreamManager) {
+    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
         workspaceId,
@@ -124,6 +141,44 @@ describe("AgentSession continuous compaction wiring", () => {
     const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
     return history.data;
+  }
+
+  /**
+   * Routes the session's real continuous-compaction collaborators to scripted inputs: the
+   * eager `compaction.prepare` hook point runs `prepare`, and the real summarizer streams from a
+   * mock pinned model once `beforeSummary` settles.
+   */
+  function scriptContinuousWork(
+    h: AgentSessionHarness,
+    work: { prepare?: () => Promise<void>; beforeSummary?: () => Promise<void> } = {}
+  ) {
+    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "continuous-test",
+        projectPath: h.config.rootDir,
+        runtimeConfig: { type: "local" },
+      })
+    );
+    const sdkModel = new MockLanguageModelV3({
+      doStream: async () => {
+        await work.beforeSummary?.();
+        return { stream: simulateReadableStream({ chunks: modelChunks() }) };
+      },
+    });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, model))
+    );
+    unregisterHooks.push(
+      eventSpine.useBefore(
+        "compaction.prepare",
+        async (ctx) => {
+          if (ctx.reason === "continuous-eager") await work.prepare?.();
+        },
+        { workspaceId }
+      )
+    );
   }
 
   async function appendBoundary(
@@ -153,10 +208,7 @@ describe("AgentSession continuous compaction wiring", () => {
       ]) {
         expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
       }
-      const compactor = internals(h.session).continuousCompactor;
-      const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
-        typeof ContinuousCompactor
-      >[0];
+      const compactor = continuous(h.session).continuousCompactor;
       const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
       const enterExecution = coordinator.enterExecution.bind(coordinator);
       const releases: Array<ReturnType<typeof mock<() => void>>> = [];
@@ -167,9 +219,12 @@ describe("AgentSession continuous compaction wiring", () => {
         releases.push(release);
         return { [Symbol.dispose]: release };
       });
-      deps.prepare = () => Promise.resolve();
-      deps.estimateAttachmentTokens = () => Promise.resolve(0);
-      deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+      // Each test scripts the real eager work: the prepare hook point and the summary model.
+      const work: { prepare?: () => Promise<void>; beforeSummary?: () => Promise<void> } = {};
+      scriptContinuousWork(h, {
+        prepare: () => work.prepare?.() ?? Promise.resolve(),
+        beforeSummary: () => work.beforeSummary?.() ?? Promise.resolve(),
+      });
       async function start() {
         await compactor.observe(60, {
           enabled: true,
@@ -181,14 +236,14 @@ describe("AgentSession continuous compaction wiring", () => {
         const job = Reflect.get(compactor, "job") as { done: Promise<void> };
         return { done: job.done };
       }
-      return { h, compactor, deps, coordinator, releases, start };
+      return { h, compactor, work, coordinator, releases, start };
     }
 
     for (const phase of ["prepare", "summarize"] as const) {
       test.each(["complete", "reject", "reset", "shutdown", "dispose"] as const)(
         `retains eager ${phase} execution until the original Promise settles: %s`,
         async (outcome) => {
-          const { h, compactor, deps, coordinator, releases, start } = await setupEager();
+          const { h, compactor, work: scripted, coordinator, releases, start } = await setupEager();
           const entered = deferred<void>();
           const release = deferred<void>();
           async function work() {
@@ -196,12 +251,8 @@ describe("AgentSession continuous compaction wiring", () => {
             await release.promise;
             if (outcome === "reject") throw new Error("eager work failed");
           }
-          if (phase === "prepare") deps.prepare = work;
-          else
-            deps.summarize = async () => {
-              await work();
-              return { text: "Earlier work summarized", model };
-            };
+          if (phase === "prepare") scripted.prepare = work;
+          else scripted.beforeSummary = work;
           const job = await start();
           let shutdown: Promise<void> | undefined;
           try {
@@ -212,7 +263,9 @@ describe("AgentSession continuous compaction wiring", () => {
             // Physical ownership must leave normal turn admission and semantic idle intact.
             expect(coordinator.phase).toBe("idle");
             expect(coordinator.admissionBlocked).toBe(false);
-            if (outcome === "reset") h.session.setAutoCompactionThreshold(0.8);
+            // These jobs bypass the session's context builder, so trigger the reset the
+            // persisted-threshold listener would issue.
+            if (outcome === "reset") compactor.reset("threshold-changed");
             if (outcome === "shutdown") {
               h.session.beginShutdown();
               shutdown = h.session.finishShutdown();
@@ -247,13 +300,13 @@ describe("AgentSession continuous compaction wiring", () => {
     }
 
     test("reset permits replacement work without releasing either job's physical ownership", async () => {
-      const { h, deps, releases, start } = await setupEager();
+      const { h, compactor, work, releases, start } = await setupEager();
       const first = deferred<void>();
       const second = deferred<void>();
       let preparations = 0;
-      deps.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
+      work.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
       const original = await start();
-      h.session.setAutoCompactionThreshold(0.8);
+      compactor.reset("threshold-changed");
       const replacement = await start();
       try {
         expect(releases).toHaveLength(2);
@@ -284,7 +337,30 @@ describe("AgentSession continuous compaction wiring", () => {
     "failed-consumed-apply",
     "dispose-during-finalization",
   ] as const)("%s commits a consumed journal before retry or new work", async (mode) => {
-    const h = await setup();
+    // The session's stream manager (and so the compactor's) sees the live source stream once
+    // the source row exists.
+    let streaming = false;
+    let swap: ContinuousPrefixSwap | undefined;
+    const h = await setup(0, {
+      isStreaming: () => streaming,
+      getStreamInfo: () =>
+        streaming
+          ? {
+              messageId: source.id,
+              parts: source.parts,
+              stepStartIndices: [0, 1, 2],
+              currentStepStartIndex: 2,
+              toolCompletionTimestamps: new Map(),
+            }
+          : undefined,
+      setPrefixSwap: (_id, value) => {
+        swap = value;
+        return true;
+      },
+      getPrefixSwapState: () => (streaming ? (swap?.consumed ? "consumed" : "pending") : "none"),
+      stopStream: () => Promise.resolve(Ok(undefined)),
+      replayStream: () => Promise.resolve(),
+    });
     const source = createMuxMessage("live-answer", "assistant", "", {
       partial: true,
       stepStartPartIndices: [0, 1, 2],
@@ -309,32 +385,14 @@ describe("AgentSession continuous compaction wiring", () => {
     ]) {
       expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
     }
-    const compactor = internals(h.session).continuousCompactor;
+    streaming = true;
+    const compactor = continuous(h.session).continuousCompactor;
+    scriptContinuousWork(h);
     const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
       typeof ContinuousCompactor
     >[0];
-    let streaming = true;
-    let swap: ContinuousPrefixSwap | undefined;
-    deps.streamManager = {
-      isStreaming: () => streaming,
-      getStreamInfo: () =>
-        streaming
-          ? {
-              messageId: source.id,
-              parts: source.parts,
-              stepStartIndices: [0, 1, 2],
-              currentStepStartIndex: 2,
-            }
-          : undefined,
-      setPrefixSwap: (_id, value) => {
-        swap = value;
-        return true;
-      },
-      getPrefixSwapState: () => (streaming ? (swap?.consumed ? "consumed" : "pending") : "none"),
-    };
-    deps.prepare = () => Promise.resolve();
-    deps.estimateAttachmentTokens = () => Promise.resolve(0);
-    deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+    // Kept private: the real prepareSwap reads the live turn's captured send options, and this
+    // scenario has no session turn (a real one would take the terminal paths driven below).
     deps.prepareSwap = () =>
       Promise.resolve({
         preparation: {
@@ -364,9 +422,11 @@ describe("AgentSession continuous compaction wiring", () => {
     const journal = await store.write(swap.journal, swap.prefix, () => true);
     assert(journal, "Expected durable swap journal");
     swap.consumed = true;
-    if (mode === "threshold-terminal") h.session.setAutoCompactionThreshold(1);
+    if (mode === "threshold-terminal") compactor.reset("threshold-changed");
     if (mode === "disabled-terminal") compactor.reset("disabled");
     if (mode === "disabled-usage-terminal") {
+      // Kept private: a real send here would be queued behind the live source stream, so the
+      // disabled usage observation needs the turn context seeded directly (cleared below).
       internals(h.session).activeStreamContext = {
         modelString: model,
         providersConfig: null,
@@ -405,7 +465,7 @@ describe("AgentSession continuous compaction wiring", () => {
           return persist(...args);
         }
       );
-      const finalizing = internals(h.session).runContinuousCompactionObservation(() =>
+      const finalizing = continuous(h.session).runContinuousCompactionObservation(() =>
         compactor.observe(0, { ...context, enabled: false, phase: "stream-end" })
       );
       let disposing: Promise<void> | undefined;
@@ -428,10 +488,6 @@ describe("AgentSession continuous compaction wiring", () => {
           historyService: h.historyService,
         });
         try {
-          // Recovery must precede retry; this fixture has no provider engine to resume.
-          Reflect.set(restarted.session, "scheduleStartupAutoRetryIfNeeded", () =>
-            Promise.resolve("completed")
-          );
           await restarted.session.runStartupRecovery();
           expect((await rows(restarted))[0].id).toBe(journal.boundary.id);
           expect(await store.read()).toBeNull();
@@ -456,7 +512,7 @@ describe("AgentSession continuous compaction wiring", () => {
       assert(token != null, "Expected compaction observation");
       coordinator.setCompactionStage(token, "stopped");
       const reset = spyOn(compactor, "reset");
-      await internals(h.session).finishContinuousCompaction(
+      await continuous(h.session).finishContinuousCompaction(
         false,
         { modelString: model, options: sendOptions, providersConfig: null },
         token
@@ -466,21 +522,18 @@ describe("AgentSession continuous compaction wiring", () => {
       coordinator.finishCompactionObservation(token);
     }
     if (mode !== "startup") {
-      const terminal = Reflect.get(h.session, "observeContinuousCompactionAtStreamEnd") as (
-        model: string,
-        options: SendMessageOptions
-      ) => Promise<void>;
+      const strategy = continuous(h.session);
       const options = { ...sendOptions, experiments: { continuousCompaction: false } };
       if (mode === "terminal-error") {
         spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(() =>
           Promise.reject(new Error("temporary terminal history failure"))
         );
-        await terminal.call(h.session, model, options);
+        await strategy.observeContinuousCompactionAtStreamEnd(model, options);
         expect(await store.read()).not.toBeNull();
         expect(compactor.hasConsumedSwap()).toBe(true);
       }
-      await terminal.call(h.session, model, options);
-      await terminal.call(h.session, model, options);
+      await strategy.observeContinuousCompactionAtStreamEnd(model, options);
+      await strategy.observeContinuousCompactionAtStreamEnd(model, options);
       const history = await rows(h);
       expect(history[0].id).toBe(journal.boundary.id);
       expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
@@ -499,17 +552,31 @@ describe("AgentSession continuous compaction wiring", () => {
       order.push("journal");
       return read();
     });
-    let retryChecks = 0;
-    Reflect.set(h.session, "scheduleStartupAutoRetryIfNeeded", async () => {
-      const history = await rows(h);
-      expect(history[0].id).toBe(journal.boundary.id);
-      expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
-      retryChecks++;
-      return "completed";
+    // The real startup retry resumes the recovered (still partial) live tail; the history it
+    // schedules against must already be the folded one.
+    // Read history when the retry is scheduled, but await the read from the test body so a
+    // failed read fails the test instead of leaving the deferred pending.
+    const retryScheduled = deferred<void>();
+    let historyAtRetry: Promise<MuxMessage[]> | undefined;
+    h.session.onChatEvent(({ message }) => {
+      if ("type" in message && message.type === "auto-retry-scheduled") {
+        order.push("retry");
+        historyAtRetry = rows(h);
+        // Marked handled here; the await below still rethrows a rejection.
+        historyAtRetry.catch(() => undefined);
+        retryScheduled.resolve();
+      }
     });
     await h.session.runStartupRecovery();
+    await retryScheduled.promise;
+    if (historyAtRetry === undefined) throw new Error("auto-retry-scheduled never fired");
+    const history = await historyAtRetry;
+    expect(history[0].id).toBe(journal.boundary.id);
+    expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
     expect(order.slice(0, 2)).toEqual(["commit", "journal"]);
-    expect(retryChecks).toBe(1);
+    expect(order.filter((step) => step === "retry")).toHaveLength(1);
+    expect(order.indexOf("retry")).toBeGreaterThan(order.indexOf("journal"));
+    expect(h.session.hasPendingAutoRetry()).toBe(true);
     expect(await store.read()).toBeNull();
   });
 
@@ -517,6 +584,15 @@ describe("AgentSession continuous compaction wiring", () => {
     "consumed swaps do not bypass the mid-stream %s guard",
     async (guard) => {
       const h = await setup();
+      if (guard === "compaction-request") {
+        // A real compaction turn owns the stream (its request stays active until stream end).
+        const compacting = await h.session.sendMessage("Summarize the conversation", {
+          model,
+          agentId: "compact",
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        });
+        expect(compacting.success).toBe(true);
+      }
       const state = internals(h.session);
       state.activeStreamContext = {
         modelString: model,
@@ -526,12 +602,10 @@ describe("AgentSession continuous compaction wiring", () => {
           experiments: { continuousCompaction: false, tokenBudget: guard === "token-budget" },
         },
       };
-      if (guard === "compaction-request") {
-        Reflect.set(h.session, "activeCompactionRequest", { id: "manual-compact" });
-      }
-      spyOn(state.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
-      const observation = spyOn(state, "runContinuousCompactionObservation");
-      const reset = spyOn(state.continuousCompactor, "reset");
+      const strategy = continuous(h.session);
+      spyOn(strategy.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
+      const observation = spyOn(strategy, "runContinuousCompactionObservation");
+      const reset = spyOn(strategy.continuousCompactor, "reset");
       const accounting = deferred<void>();
       const preview = h.session as unknown as { previewGoalAccountingFromUsage(): Promise<void> };
       spyOn(preview, "previewGoalAccountingFromUsage").mockReturnValue(accounting.promise);
@@ -553,21 +627,43 @@ describe("AgentSession continuous compaction wiring", () => {
   );
 
   test("does not activate a prefix without the captured options required by fast-stop fallback", async () => {
-    const h = await setup();
-    internals(h.session).activeStreamContext = { modelString: model, providersConfig: null };
+    // The stream manager always has a preparation, so only the captured send options gate it.
+    const h = await setup(0, {
+      isStreaming: () => false,
+      getStreamInfo: () => undefined,
+      getPrefixSwapPreparation: () => ({
+        requestProviderOptions: undefined,
+        preparation: {
+          modelString: model,
+          providerForMessages: "openai",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: [],
+          anthropicCacheTtl: undefined,
+        },
+        systemPrefix: [],
+        cacheEnabled: false,
+      }),
+      stopStream: () => Promise.resolve(Ok(undefined)),
+      replayStream: () => Promise.resolve(),
+    });
     const deps = Reflect.get(
-      internals(h.session).continuousCompactor,
+      continuous(h.session).continuousCompactor,
       "deps"
     ) as ConstructorParameters<typeof ContinuousCompactor>[0];
     assert(deps.prepareSwap !== undefined, "Expected session prefix preparation");
+    // No turn has captured send options yet.
     expect(await deps.prepareSwap([])).toBeNull();
+    // A real send captures them for its live turn.
+    expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+    expect(await deps.prepareSwap([])).toMatchObject({ attachments: [], cacheEnabled: false });
   });
 
   test("resumeless continuous fold cannot divert a later legacy compaction's saved follow-up", async () => {
     const h = await setup();
     const retained = createMuxMessage("retained-user", "user", "Earlier task");
     await h.historyService.appendToHistory(workspaceId, retained);
-    const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+    const handler = internals(h.session).contextController.compactionHandler;
     const preparation = handler.beginPreparation(() => true);
     const source = await rows(h);
     expect(
@@ -588,22 +684,23 @@ describe("AgentSession continuous compaction wiring", () => {
         shouldPersist: () => true,
       })
     ).toBe(true);
-    await h.historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("legacy-request", "user", "Please compact", {
-        muxMetadata: {
-          type: "compaction-request",
-          rawCommand: "/compact",
-          parsed: { followUpContent: { text: "Current saved follow-up", model, agentId: "exec" } },
-        },
-      })
-    );
-    Reflect.set(h.session, "activeCompactionRequest", { id: "legacy-request", modelString: model });
-    const completion = h.session.waitForPendingCompactionCompletionDecision("legacy-summary");
+    // A later legacy /compact turn, sent for real, owns the active compaction request.
+    const compacting = await h.session.sendMessage("Please compact", {
+      model,
+      agentId: "compact",
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: { followUpContent: { text: "Current saved follow-up", model, agentId: "exec" } },
+      },
+    });
+    expect(compacting.success).toBe(true);
+    const summaryId = "test-assistant-message";
+    const completion = h.session.waitForPendingCompactionCompletionDecision(summaryId);
     void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
       workspaceId,
-      messageId: "legacy-summary",
+      messageId: summaryId,
       metadata: { model, agentId: "compact", finishReason: "stop" },
       parts: [{ type: "text", text: "Legacy summary" }],
     });
@@ -620,7 +717,7 @@ describe("AgentSession continuous compaction wiring", () => {
     const stream = spyOn(h.aiService, "streamMessage");
     const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
     expect(await journal.exists()).toBe(false);
-    const compactor = internals(h.session).continuousCompactor;
+    const compactor = continuous(h.session).continuousCompactor;
     const recover = compactor.recover.bind(compactor);
     const recovering = spyOn(compactor, "recover").mockImplementation(async () => {
       // Contend at the recovery probe, then release before the send's actual history writes.
@@ -654,7 +751,7 @@ describe("AgentSession continuous compaction wiring", () => {
     "on-send apply preserves the new user turn (token budget enabled: %s)",
     async (tokenBudget) => {
       const h = await setup(72);
-      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
         async (_percent, context) => {
           expect(context.phase).toBe("on-send");
           await appendBoundary(h);
@@ -687,7 +784,7 @@ describe("AgentSession continuous compaction wiring", () => {
       const h = await setup(percent);
       // Isolate trigger policy from model latency; the engine reports fallback only
       // when pressure reaches force, regardless of an in-flight background job.
-      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue(
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue(
         percent >= 75 ? "fallback" : "none"
       );
       expect((await h.session.sendMessage("New work", sendOptions)).success).toBe(true);
@@ -707,7 +804,7 @@ describe("AgentSession continuous compaction wiring", () => {
     spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
       (id) => id === EXPERIMENT_IDS.CONTINUOUS_COMPACTION
     );
-    const observe = spyOn(internals(h.session).continuousCompactor, "observe");
+    const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
     expect(
       (
         await h.session.sendMessage("New work", {
@@ -724,8 +821,8 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("threshold 100 disables both automatic strategies even above the context limit", async () => {
     const h = await setup(110);
-    h.session.setAutoCompactionThreshold(1);
-    const observe = spyOn(internals(h.session).continuousCompactor, "observe");
+    await seedAutoCompactionThreshold(h.config, model, 100);
+    const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
     expect((await h.session.sendMessage("New work", sendOptions)).success).toBe(true);
     expect(observe).not.toHaveBeenCalled();
     expect(
@@ -733,13 +830,26 @@ describe("AgentSession continuous compaction wiring", () => {
     ).toBe(false);
   });
 
-  test("resyncing an unchanged threshold preserves staged work", async () => {
+  test("a persisted threshold change resets the compactor only for its model", async () => {
     const h = await setup();
-    const reset = spyOn(internals(h.session).continuousCompactor, "reset");
-    h.session.setAutoCompactionThreshold(0.7);
+    // The send builds the continuous-compaction context, which pins the model the listener
+    // compares against.
+    expect((await h.session.sendMessage("New work", sendOptions)).success).toBe(true);
+    const reset = spyOn(continuous(h.session).continuousCompactor, "reset");
+    // Unchanged value re-saved: the fold stays staged.
+    await seedAutoCompactionThreshold(h.config, model, 70);
     expect(reset).not.toHaveBeenCalled();
-    h.session.setAutoCompactionThreshold(0.8);
+    // Another model's slider: unrelated to this compactor.
+    await seedAutoCompactionThreshold(h.config, "anthropic:claude-sonnet-4-5", 40);
+    expect(reset).not.toHaveBeenCalled();
+    await seedAutoCompactionThreshold(h.config, model, 80);
     expect(reset).toHaveBeenCalledTimes(1);
+    expect(reset).toHaveBeenLastCalledWith("threshold-changed");
+    // The listener is detached on dispose: later config writes no longer reach the compactor.
+    await h.session.dispose();
+    reset.mockClear();
+    await seedAutoCompactionThreshold(h.config, model, 90);
+    expect(reset).not.toHaveBeenCalledWith("threshold-changed");
   });
 
   function startStream(h: AgentSessionHarness) {
@@ -751,6 +861,15 @@ describe("AgentSession continuous compaction wiring", () => {
       historySequence: 1,
       startTime: Date.now(),
     });
+  }
+
+  /** Starts a real turn through sendMessage; its provider stream stays live until stopped. */
+  async function startLiveTurn(h: AgentSessionHarness) {
+    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      startStream(h);
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+    });
+    expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
   }
 
   function endStream(h: AgentSessionHarness) {
@@ -778,7 +897,7 @@ describe("AgentSession continuous compaction wiring", () => {
       if (starts === 2) queuedStarted.resolve();
       return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
     });
-    spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+    spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
       async (_percent, context) => {
         if (context.phase !== "stream-end") return "none";
         expect(internals(h.session).activeStreamContext).toBeUndefined();
@@ -804,25 +923,22 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("invalidation contains an initial wait rejection and safely stops the blocked stream", async () => {
     const h = await setup();
-    const compactor = internals(h.session).continuousCompactor;
+    const compactor = continuous(h.session).continuousCompactor;
     const unhandled: unknown[] = [];
     const onUnhandled = (error: unknown) => {
       unhandled.push(error);
     };
     process.on("unhandledRejection", onUnhandled);
     let streaming = true;
-    internals(h.session).activeStreamContext = {
-      modelString: model,
-      options: sendOptions,
-      providersConfig: null,
-    };
+    await startLiveTurn(h);
     spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
     spyOn(h.aiService, "getStreamInfo").mockReturnValue({
       messageId: "live-assistant",
       parts: [],
       toolCompletionTimestamps: new Map(),
     });
-    Reflect.set(Reflect.get(h.session, "streamManager"), "getPrefixSwapState", () => "invalidated");
+    // The harness injects aiService as the session's stream manager; give it the swap probe.
+    Object.assign(h.aiService, { getPrefixSwapState: () => "invalidated" as const });
     spyOn(compactor, "waitForIdle").mockImplementationOnce(() =>
       Promise.reject(new Error("apply wait failed"))
     );
@@ -840,7 +956,6 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(undefined));
     });
     try {
-      startStream(h);
       h.aiEmitter.emit("prefix-swap-invalidated", {
         type: "prefix-swap-invalidated",
         workspaceId,
@@ -862,11 +977,7 @@ describe("AgentSession continuous compaction wiring", () => {
   test("duplicate invalidations wait for the owner and never clear another observation's flags", async () => {
     const h = await setup();
     let streaming = true;
-    internals(h.session).activeStreamContext = {
-      modelString: model,
-      options: sendOptions,
-      providersConfig: null,
-    };
+    await startLiveTurn(h);
     spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
     spyOn(h.aiService, "getStreamInfo").mockReturnValue({
       messageId: "live-assistant",
@@ -876,14 +987,13 @@ describe("AgentSession continuous compaction wiring", () => {
     const release = deferred<void>();
     const invoked = deferred<void>();
     const drain = spyOn(h.session, "drainQueuedMessagesIfIdle").mockImplementation(() => undefined);
-    const first = internals(h.session).runContinuousCompactionObservation(async (token) => {
+    const first = continuous(h.session).runContinuousCompactionObservation(async (token) => {
       internals(h.session).coordinator.setCompactionStage(token, "stopping");
       await release.promise;
     });
-    const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+    const observe = spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
       () => {
         streaming = false;
-        internals(h.session).activeStreamContext = undefined;
         invoked.resolve();
         return Promise.resolve("none");
       }
@@ -892,8 +1002,8 @@ describe("AgentSession continuous compaction wiring", () => {
     h.aiEmitter.emit("prefix-swap-invalidated", event);
     h.aiEmitter.emit("prefix-swap-invalidated", event);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(true);
-    expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(true);
+    expect(internals(h.session).coordinator.compactionIntent.observation?.kind).toBe("continuous");
+    expect(internals(h.session).coordinator.midStreamCompactionPending).toBe(true);
     expect(drain).not.toHaveBeenCalled();
     expect(observe).not.toHaveBeenCalled();
     release.resolve();
@@ -902,8 +1012,10 @@ describe("AgentSession continuous compaction wiring", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(observe).toHaveBeenCalledTimes(1);
     expect(drain).toHaveBeenCalledTimes(2);
-    expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(false);
-    expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(false);
+    expect(internals(h.session).coordinator.compactionIntent.observation?.kind).not.toBe(
+      "continuous"
+    );
+    expect(internals(h.session).coordinator.midStreamCompactionPending).toBe(false);
   });
 
   test.each(["usage-delta", "prefix-swap-invalidated"] as const)(
@@ -951,11 +1063,11 @@ describe("AgentSession continuous compaction wiring", () => {
         }
         return read(id);
       });
-      const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
-      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      const handler = internals(h.session).contextController.compactionHandler;
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
         async (_usage, context) => {
           if (context.phase !== "mid-stream") return "none";
-          const applied = await internals(h.session).interruptForContinuousCompaction(
+          const applied = await continuous(h.session).interruptForContinuousCompaction(
             async (followUp) => {
               const preparation = handler.beginPreparation(() => true);
               const history = await rows(h);
@@ -1003,8 +1115,10 @@ describe("AgentSession continuous compaction wiring", () => {
         await new Promise<void>((resolve) => setImmediate(resolve));
         expect(unhandled).toEqual([]);
         expect(h.session.isBusy()).toBe(false);
-        expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(false);
-        expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(false);
+        expect(internals(h.session).coordinator.compactionIntent.observation?.kind).not.toBe(
+          "continuous"
+        );
+        expect(internals(h.session).coordinator.midStreamCompactionPending).toBe(false);
         const boundary = (await rows(h))[0];
         expect(Reflect.get(h.session, "pendingCompactionFollowUpSummaryId")).toBe(boundary.id);
         expect(boundary.metadata?.muxMetadata?.type).toBe("compaction-summary");
@@ -1058,10 +1172,10 @@ describe("AgentSession continuous compaction wiring", () => {
       });
       let observedMidstream = false;
       let applying = false;
-      spyOn(internals(h.session).continuousCompactor, "isApplying").mockImplementation(
+      spyOn(continuous(h.session).continuousCompactor, "isApplying").mockImplementation(
         () => applying
       );
-      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
         async (_percent, context) => {
           // Resumed on-send observation is allowed, but only after the mid-stream
           // apply latch has been released.
@@ -1070,7 +1184,7 @@ describe("AgentSession continuous compaction wiring", () => {
           expect(observedMidstream).toBe(false);
           observedMidstream = true;
           applying = true;
-          const applied = await internals(h.session).interruptForContinuousCompaction(
+          const applied = await continuous(h.session).interruptForContinuousCompaction(
             async (followUp) => {
               expect(h.session.isBusy()).toBe(false);
               expect(internals(h.session).activeStreamContext).toBeUndefined();
@@ -1117,7 +1231,7 @@ describe("AgentSession continuous compaction wiring", () => {
           parts: [],
           toolCompletionTimestamps: new Map(),
         });
-        spyOn(internals(h.session).continuousCompactor, "waitForIdle").mockReturnValueOnce(
+        spyOn(continuous(h.session).continuousCompactor, "waitForIdle").mockReturnValueOnce(
           observationFinished.promise
         );
         observationToken = internals(h.session).coordinator.beginCompactionObservation(
@@ -1156,7 +1270,7 @@ describe("AgentSession continuous compaction wiring", () => {
     "a failed post-stop apply recovers the interrupted turn at %s%%",
     async (percent) => {
       const h = await setup(percent);
-      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue("none");
       let starts = 0;
       spyOn(h.aiService, "streamMessage").mockImplementation(() => {
         starts++;
@@ -1187,12 +1301,95 @@ describe("AgentSession continuous compaction wiring", () => {
     }
   );
 
+  // #4796: the failed-fast-apply fallback compaction follows the #4421 no-relief guard, so a
+  // provider that keeps reporting high usage cannot loop fallback compactions.
+  test.each(["user turn", "usage drop"] as const)(
+    "a failed fast apply under constant pressure compacts once until a %s releases the guard",
+    async (release) => {
+      const h = await setup(76);
+      const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
+      observe.mockResolvedValue("none");
+      // 76% of gpt-4o's window: past the 75% force level of the default 70% threshold.
+      const highUsage = { inputTokens: 76 * 1_280, outputTokens: 1, totalTokens: 76 * 1_280 + 1 };
+      let streams = 0;
+      let compactions = 0;
+      let active = "";
+      spyOn(h.aiService, "streamMessage").mockImplementation((request) => {
+        streams++;
+        active = `assistant-${streams}`;
+        if (request.messages.at(-1)?.metadata?.muxMetadata?.type === "compaction-request")
+          compactions++;
+        h.aiEmitter.emit("stream-start", {
+          type: "stream-start",
+          workspaceId,
+          messageId: active,
+          model,
+          historySequence: streams,
+          startTime: Date.now(),
+        });
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+      });
+      // The provider reports the same high usage when the fast-apply stop aborts the stream.
+      spyOn(h.aiService, "stopStream").mockImplementation(() => {
+        void runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-abort",
+          workspaceId,
+          messageId: active,
+          abortReason: "system",
+          metadata: { contextUsage: highUsage },
+        });
+        return Promise.resolve(Ok(undefined));
+      });
+      const endActiveStream = (text: string) =>
+        runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-end",
+          workspaceId,
+          messageId: active,
+          parts: [{ type: "text", text }],
+          metadata: { model, agentId: "exec", finishReason: "stop", contextUsage: highUsage },
+        });
+      const lastText = async () =>
+        (await rows(h)).at(-1)?.parts.find((part) => part.type === "text");
+
+      expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect(compactions).toBe(1);
+      // The fallback compaction completes; its follow-up resumes the turn.
+      await endActiveStream("Summary");
+      await waitForCondition(() => streams === 3, { timeoutMs: 5_000 });
+
+      // Pressure stays high and the next fast apply fails again: no second compaction.
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect({ compactions, streams }).toEqual({ compactions: 1, streams: 4 });
+      expect(await lastText()).toMatchObject({ text: "Continue" });
+
+      if (release === "user turn") {
+        await endActiveStream("Done");
+        expect((await h.session.sendMessage("Next", sendOptions)).success).toBe(true);
+        expect(streams).toBe(5);
+      } else {
+        // A live reading under the level that triggered the compaction proves it helped.
+        const observed = observe.mock.calls.length;
+        h.aiEmitter.emit("usage-delta", {
+          type: "usage-delta",
+          workspaceId,
+          messageId: active,
+          usage: { inputTokens: 10 * 1_280, outputTokens: 1, totalTokens: 10 * 1_280 + 1 },
+        });
+        await waitForCondition(() => observe.mock.calls.length > observed);
+      }
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect(compactions).toBe(2);
+      mock.restore();
+    }
+  );
+
   test.each(["legacy", "continuous resume", "continuous compact"] as const)(
     "%s cannot adopt a foreign settled Stop while stopping its source stream",
     async (route) => {
       const h = await setup(route === "continuous resume" ? 72 : 76);
       const state = internals(h.session);
-      spyOn(state.continuousCompactor, "observe").mockResolvedValue("none");
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue("none");
       const starts = mockAbortableStream(h);
       expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
       const before = await rows(h);
@@ -1208,7 +1405,7 @@ describe("AgentSession continuous compaction wiring", () => {
         stopped = await storage.read();
         return result;
       });
-      if (route === "legacy") await state.interruptForCompaction();
+      if (route === "legacy") await state.contextController.summarize.interruptForCompaction();
       else expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
       assert(stopped, "Expected the foreign Stop to settle before continuation");
       expect(stopped.version).toBe(2);
@@ -1251,7 +1448,7 @@ describe("AgentSession continuous compaction wiring", () => {
     "pending compaction waits and queued input outlast held follow-up %s",
     async (phase) => {
       const h = await setup();
-      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+      spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue("none");
       const streamMessage = mockAbortableStream(h);
       expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
       const entered = deferred<void>();
@@ -1320,7 +1517,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("abandon during fast apply cannot resume the abandoned turn", async () => {
     const h = await setup();
-    spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+    spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue("none");
     const streamMessage = mockAbortableStream(h);
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
     const applied = await applyThenFinish(h.session, async () => {
@@ -1334,7 +1531,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("abandon after the boundary commit preserves the fold but clears durable resume intent", async () => {
     const h = await setup();
-    spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+    spyOn(continuous(h.session).continuousCompactor, "observe").mockResolvedValue("none");
     const streamMessage = mockAbortableStream(h);
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
     const applied = await applyThenFinish(h.session, async (followUp) => {
@@ -1354,7 +1551,7 @@ describe("AgentSession continuous compaction wiring", () => {
     "%s compaction requests invalidate staged automatic work",
     async (source) => {
       const h = await setup();
-      const reset = spyOn(internals(h.session).continuousCompactor, "reset");
+      const reset = spyOn(continuous(h.session).continuousCompactor, "reset");
       expect(
         (
           await h.session.sendMessage("Summarize", {
@@ -1632,7 +1829,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("context mutations and teardown synchronously invalidate staged work", async () => {
     const h = await setup();
-    const reset = spyOn(internals(h.session).continuousCompactor, "reset");
+    const reset = spyOn(continuous(h.session).continuousCompactor, "reset");
     using _admission = h.session.holdTurnAdmission();
     expect(reset).toHaveBeenCalled();
     reset.mockClear();

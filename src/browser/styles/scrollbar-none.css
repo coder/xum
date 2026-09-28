@@ -1,0 +1,14 @@
+/* Shared by src/browser/styles/globals.css (desktop) and vscode/src/webview/webview.css (VS Code webview). */
+/*
+ * Override for Tailwind's scrollbar-none utility.
+ * Keep this as a defensive Chromium/Electron fallback for full hiding.
+ */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Keep `.scrollbar-none` fully hidden even with global Firefox scrollbar theming. */
+.scrollbar-none {
+  scrollbar-width: none;
+  scrollbar-color: auto;
+}

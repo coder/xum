@@ -1,9 +1,17 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { buildSystemMessage, extractToolInstructions, readToolInstructions } from "./systemMessage";
+import {
+  buildSystemMessageFromSources,
+  extractToolInstructions,
+  extractToolInstructionsFromSources,
+  loadWorkspaceInstructionSources,
+  type BuildSystemMessageFromSourcesOptions,
+} from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
+import type { MCPServerMap } from "@/common/types/mcp";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 
 const extractTagContent = (message: string, tagName: string): string | null => {
@@ -15,6 +23,58 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from 
 import { randomUUID } from "node:crypto";
 import * as markdown from "@/node/utils/main/markdown";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+
+// Stream startup loads one instruction-source snapshot (turnContextAssembler) and shares it
+// between the prompt and tool-instruction extraction (turnRequestBuilder). These helpers run
+// that same load-then-derive sequence so each test reads real files through the runtime.
+async function buildSystemMessage(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  additionalSystemInstructions?: string,
+  modelString?: string,
+  mcpServers?: MCPServerMap,
+  options?: BuildSystemMessageFromSourcesOptions & {
+    projectConfigs?: Map<string, ProjectConfig>;
+    claudeSkillsCompatEnabled?: boolean;
+  }
+): Promise<string> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    options?.projectConfigs,
+    options?.claudeSkillsCompatEnabled
+  );
+  return buildSystemMessageFromSources(
+    metadata,
+    sources,
+    workspacePath,
+    additionalSystemInstructions,
+    modelString,
+    mcpServers,
+    options
+  );
+}
+
+async function readToolInstructions(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  modelString: string,
+  agentInstructions?: readonly string[],
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
+): Promise<Record<string, string>> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    projectConfigs,
+    claudeSkillsCompatEnabled
+  );
+  return extractToolInstructionsFromSources(sources, modelString, metadata, agentInstructions);
+}
 
 // Note: in this file we avoid tests that are merely tautological assertions of constants. Only
 // tests that verify branching logic should be here.

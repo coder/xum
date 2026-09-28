@@ -3,6 +3,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  seedAutoCompactionThreshold,
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import { Ok } from "@/common/types/result";
@@ -23,6 +24,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   harnesses.push(continuous);
   const budget = await createAgentSessionHarness({
     workspaceId: "budget",
+    contextManagement: continuous.contextManagement,
     config: continuous.config,
     historyService: continuous.historyService,
     aiService: continuous.aiService,
@@ -46,14 +48,15 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
     );
   });
   const continuousState = continuous.session as unknown as {
-    continuousCompactor: ContinuousCompactor;
+    contextController: { continuous: { continuousCompactor: ContinuousCompactor } };
   };
-  const budgetState = budget.session as unknown as {
+  const budgetState = Reflect.get(
+    Reflect.get(budget.session, "contextController") as object,
+    "tokenBudget"
+  ) as {
     contextBudgetGeneration: number;
-    contextBudgetWarningClaimed: boolean;
+    pendingBudgetPrompt?: "warn" | "handoff";
   };
-  continuous.session.setAutoCompactionThreshold(0.6);
-  budget.session.setAutoCompactionThreshold(0.7);
   const model = "openai:gpt-4o";
   expect(
     (
@@ -87,20 +90,26 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
       memoryWritable: true,
     })
   ).toMatchObject({ decision: "warn" });
-  expect(budgetState.contextBudgetWarningClaimed).toBe(true);
+  // Settlement queues intent; only durable publication claims an advisory. Another
+  // workspace changing its compaction threshold must leave this pending intent intact.
+  expect(budgetState.pendingBudgetPrompt).toBe("warn");
 
   const budgetGeneration = budgetState.contextBudgetGeneration;
-  continuous.session.setAutoCompactionThreshold(0.8);
+  // The threshold is a per-model user preference in the shared config, not session state:
+  // this change reaches both sessions, but only the continuous compactor has anything to reset.
+  await seedAutoCompactionThreshold(continuous.config, model, 80);
   expect(budgetState.contextBudgetGeneration).toBe(budgetGeneration);
-  expect(budgetState.contextBudgetWarningClaimed).toBe(true);
+  expect(budgetState.pendingBudgetPrompt).toBe("warn");
   const continuousGeneration: unknown = Reflect.get(
-    continuousState.continuousCompactor,
+    continuousState.contextController.continuous.continuousCompactor,
     "generation"
   );
   assert(typeof continuousGeneration === "number", "The compactor must have a generation fence");
   expect((await budget.session.interruptStream({ abandonPartial: true })).success).toBe(true);
-  expect(budgetState.contextBudgetWarningClaimed).toBe(false);
-  expect(Reflect.get(continuousState.continuousCompactor, "generation")).toBe(continuousGeneration);
+  expect(budgetState.pendingBudgetPrompt).toBeUndefined();
+  expect(
+    Reflect.get(continuousState.contextController.continuous.continuousCompactor, "generation")
+  ).toBe(continuousGeneration);
 
   for (const id of ["continuous", "budget"]) {
     const history = await continuous.historyService.getHistoryFromLatestBoundary(id);

@@ -15,6 +15,7 @@ import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
@@ -422,6 +423,46 @@ export const ProjectSettingsWithToolAllowlist: Story = {
     await canvas.findByText("mux");
     await canvas.findByText(/3\/8/);
   },
+};
+
+// #4300: small help text must meet WCAG AA (4.5:1) in both themes, and the
+// Tools disclosure must show a focus ring on keyboard focus (global CSS
+// removes the browser's default outline).
+const helpTextAccessibilityPlay: Story["play"] = async ({ canvasElement }) => {
+  const canvas = within(canvasElement);
+  const disclosure = await canvas.findByRole("button", { name: /Tools: 3\/8/ });
+  const helpTexts = [
+    await canvas.findByText(/Configure global MCP servers/),
+    within(disclosure).getByText(/Tools: 3\/8/),
+    within(disclosure).getByText(/^\(.+\)$/),
+  ];
+  for (const helpText of helpTexts) {
+    await expect(textContrast(helpText)).toBeGreaterThanOrEqual(4.5);
+  }
+
+  disclosure.focus();
+  // Precondition: the runner reports script focus as keyboard-visible focus.
+  await expect(disclosure.matches(":focus-visible")).toBe(true);
+  const shadow = getComputedStyle(disclosure).boxShadow;
+  await expect(shadow.replaceAll("rgba(0, 0, 0, 0)", "")).toMatch(/rgb|oklch|oklab|color\(/);
+};
+
+export const HelpTextAccessibilityLight: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "light" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
+};
+
+export const HelpTextAccessibilityDark: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "dark" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
 };
 
 export const ProjectSettingsOAuthNotLoggedIn: Story = {

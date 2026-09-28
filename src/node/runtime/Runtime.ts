@@ -159,6 +159,30 @@ export interface FileStat {
 }
 
 /**
+ * Optional constraints for Runtime.readFile. Absent ⇒ every runtime reads exactly as before
+ * (FIFOs, devices and sockets stream with their native semantics).
+ */
+export interface ReadFileOptions {
+  /**
+   * Refuse anything that is not a regular file (or a symlink to one) with a `file_io`
+   * RuntimeError whose message contains "not a regular file".
+   *
+   * Why: a plain open() of a FIFO with no writer blocks in the kernel; in Node that parks a
+   * libuv threadpool worker, and a handful of such reads (plan-file readers all hit the same
+   * path) exhaust the pool so unrelated fs/DNS/zlib work stalls process-wide. An abort signal
+   * cannot settle a kernel-blocked open — only a nonblocking acquisition can. The check is done
+   * on the ACQUIRED descriptor (fstat / `/dev/fd/N`), never as a stat-then-open pre-check, so a
+   * path swapped between check and read cannot change what is streamed.
+   *
+   * Acquisition: on POSIX, local runtimes open with O_NONBLOCK, so a FIFO cannot block it.
+   * Exec-backed runtimes open inside the exec's shell after an advisory precheck: a path replaced
+   * by a writer-less FIFO between precheck and open can still block that shell, as the plain
+   * `cat` did for any FIFO (cleanup bounds: see buildRegularFileReadCommand).
+   */
+  requireRegularFile?: boolean;
+}
+
+/**
  * Logger for streaming workspace initialization events to frontend.
  * Used to report progress during workspace creation and init hook execution.
  */
@@ -238,6 +262,8 @@ export interface WorkspaceCreationResult {
   error?: string;
   /** Set when deferMaterialization left populating the checkout to materializeWorkspace(). */
   pendingMaterialization?: PendingMaterialization;
+  /** This creation made the branch, so undoing the creation may delete it (#4745). */
+  createdBranch?: boolean;
 }
 
 /**
@@ -307,6 +333,8 @@ export interface WorkspaceForkResult {
   workspacePath?: string;
   /** Branch that was forked from */
   sourceBranch?: string;
+  /** This fork made the new branch, so undoing the fork may delete it (#4775). */
+  createdBranch?: boolean;
   /** Error message (if failed) */
   error?: string;
   /** Runtime config for the forked workspace (if different from source) */
@@ -412,10 +440,15 @@ export interface Runtime {
    * Read file contents as a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
+   * @param options Optional read constraints (see ReadFileOptions)
    * @returns Readable stream of file contents
    * @throws RuntimeError if file cannot be read
    */
-  readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
+  readFile(
+    path: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array>;
 
   /**
    * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.
@@ -590,6 +623,8 @@ export interface Runtime {
    * @param oldName Current workspace name
    * @param newName New workspace name
    * @param abortSignal Optional abort signal for cancellation
+   * @param options.renameBranch Undoing an earlier rename (#4779): rename the tracked branch back
+   *   exactly when that rename reported `branchRenamed`, instead of re-deriving it from names.
    * @returns Promise resolving to Result with old/new paths on success, or error message
    */
   renameWorkspace(
@@ -597,9 +632,11 @@ export interface Runtime {
     oldName: string,
     newName: string,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   >;
 
   /**
@@ -623,8 +660,21 @@ export interface Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }>;
+    trusted?: boolean,
+    /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
+    options?: { keepBranch?: boolean }
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | {
+        success: false;
+        error: string;
+        /**
+         * Set by a runtime that deletes several paths (MultiProjectRuntime): the disposable ones it
+         * could not delete, so a rollback can name them (#4936).
+         */
+        leftoverPaths?: string[];
+      }
+  >;
 
   /**
    * Ensure the runtime is ready for operations.
@@ -674,10 +724,22 @@ export interface Runtime {
    * Returns empty record for runtimes that don't need env forwarding (local, ssh).
    */
   getContainerEnv?(): Record<string, string>;
+
+  /**
+   * Whether a failed exec's exit came from the transport itself (host
+   * unreachable) rather than the command, e.g. OpenSSH exit 255. Callers that
+   * build their own exec probes use it so an unreachable host never reads as
+   * "absent" (#4438). Runtimes without such a transport omit it.
+   */
+  isTransportFailureExit?(exitCode: number, stderr: string): boolean;
 }
 
 /**
- * Error thrown by runtime implementations
+ * Error thrown by runtime implementations.
+ *
+ * `type: "network"` means a transport failure: the remote host could not be
+ * reached or the channel failed, so the state of the file or command is
+ * unknown. Callers must never read it as "file missing" (#4438).
  */
 export class RuntimeError extends Error {
   constructor(
@@ -695,4 +757,60 @@ export class RuntimeError extends Error {
     super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
+}
+
+/**
+ * True when a runtime operation failed in transport (see RuntimeError), so a
+ * fallback chain must stop instead of treating the target as absent.
+ *
+ * Callers that own an abort signal still check it first, as they already do
+ * for missing-candidate fallbacks: an abort can race a real transport failure.
+ */
+export function isRuntimeTransportError(error: unknown): error is RuntimeError {
+  return error instanceof RuntimeError && error.type === "network";
+}
+
+const ABSENT_PATH_CODES: ReadonlySet<unknown> = new Set(["ENOENT", "ENOTDIR"]);
+
+function errorCode(value: unknown): unknown {
+  return value != null && typeof value === "object" && "code" in value ? value.code : undefined;
+}
+
+/**
+ * True when a runtime read or stat failed because the path positively does not
+ * exist (ENOENT/ENOTDIR). Local runtimes carry the fs error as `cause`;
+ * exec-backed runtimes attach the same code when the tool's own diagnostic says
+ * so (see execFileIO).
+ */
+export function isRuntimePathAbsentError(error: unknown): boolean {
+  if (ABSENT_PATH_CODES.has(errorCode(error))) return true;
+  // No `instanceof Error` check: fs errors can come from another realm (see RuntimeError).
+  const cause = error != null && typeof error === "object" && "cause" in error ? error.cause : null;
+  return ABSENT_PATH_CODES.has(errorCode(cause));
+}
+
+/**
+ * True when a runtime read failed for any reason other than positively
+ * identified absence: transport, permission denied, I/O error, not a regular
+ * file. A fallback chain that picks the next file when one is "missing" must
+ * stop on it instead of silently serving a lower-priority file (#4827).
+ * Errors that are not RuntimeErrors (parse and validation errors) are out of
+ * scope and keep their callers' fallback.
+ *
+ * Callers that own an abort signal check it first: an aborted read also fails.
+ */
+export function isRuntimeReadFailure(error: unknown): error is RuntimeError {
+  if (isRuntimeTransportError(error)) return true;
+  return (
+    error instanceof RuntimeError && error.type === "file_io" && !isRuntimePathAbsentError(error)
+  );
+}
+
+/**
+ * Caller-facing text for a transport failure that ends an operation early. It
+ * says the host was unreachable and the operation can be retried, so a model or
+ * user does not read it as a missing agent or a bad argument.
+ */
+export function formatRuntimeUnreachableError(operation: string, error: RuntimeError): string {
+  return `${operation}: the workspace runtime is unreachable (${error.message.trim()}); retry once it is reachable`;
 }

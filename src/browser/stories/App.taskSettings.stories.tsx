@@ -1,5 +1,6 @@
 import { expect, userEvent, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 
@@ -22,8 +23,7 @@ function setupTaskSettings() {
 }
 
 async function exerciseInheritance(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const canvas = within(await openSettingsDialog(canvasElement));
   await userEvent.click(await canvas.findByRole("button", { name: "Agents" }));
   const card = await canvas.findByRole("group", { name: "Exec defaults" });
   const controls = within(card);

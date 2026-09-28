@@ -4,25 +4,38 @@ import { GlobalWindow } from "happy-dom";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 
-import type { DisplayedMessage } from "@/common/types/message";
+import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displayedMessageBuilder";
+import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
+import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
+import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
 
+// Restore the real modules after this suite so the partial stubs cannot leak into later
+// suites that render the real components (e.g. AgentContext.test uses the real provider).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
+  ["@/browser/features/Tools/SubagentTranscriptDialog", { ...RealSubagentTranscriptDialogModule }],
+  ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
+]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
   toWorkspaceSelection: (workspace: FrontendWorkspaceMetadata) => workspace,
 }));
 
-void mock.module("./SubagentTranscriptDialog", () => ({
+void mock.module("@/browser/features/Tools/SubagentTranscriptDialog", () => ({
   SubagentTranscriptDialog: () => null,
 }));
 
-void mock.module("./Shared/ElapsedTimeDisplay", () => ({
+void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
   ElapsedTimeDisplay: ({
     startedAt,
     isActive,
@@ -53,7 +66,7 @@ const workspaceTaskArgs = {
   title: "Workspace investigation",
   run_in_background: true,
 };
-const TaskToolCall = getToolComponent("task", workspaceTaskArgs);
+const TaskToolCall = getToolComponent("task", workspaceTaskArgs, undefined);
 
 function createWorkspaceMetadata(
   overrides: Partial<FrontendWorkspaceMetadata> = {}
@@ -70,7 +83,7 @@ function createWorkspaceMetadata(
 }
 
 const taskAwaitArgs = { task_ids: ["task-1"], timeout_secs: 70 };
-const TaskAwaitToolCall = getToolComponent("task_await", taskAwaitArgs);
+const TaskAwaitToolCall = getToolComponent("task_await", taskAwaitArgs, undefined);
 
 function createToolMessage(overrides: {
   toolName: string;
@@ -124,12 +137,16 @@ describe("TaskToolCall", () => {
 
   test("renders legacy variants task calls generically", () => {
     expect(
-      getToolComponent("task", {
-        subagent_type: "explore",
-        prompt: "Review ${variant}",
-        title: "Split review",
-        variants: ["frontend", "backend"],
-      })
+      getToolComponent(
+        "task",
+        {
+          subagent_type: "explore",
+          prompt: "Review ${variant}",
+          title: "Split review",
+          variants: ["frontend", "backend"],
+        },
+        undefined
+      )
     ).toBe(GenericToolCall);
   });
 
@@ -187,7 +204,7 @@ describe("TaskToolCall", () => {
       title: "Plan task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -223,7 +240,7 @@ describe("TaskToolCall", () => {
       title: "Plan task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -272,7 +289,7 @@ describe("TaskToolCall", () => {
       title: "Explore task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -642,7 +659,7 @@ describe("TaskAwaitToolCall", () => {
 });
 
 const taskListArgs = { statuses: ["reported" as const, "interrupted" as const] };
-const TaskListToolCall = getToolComponent("task_list", taskListArgs);
+const TaskListToolCall = getToolComponent("task_list", taskListArgs, undefined);
 
 describe("TaskListToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -674,10 +691,116 @@ describe("TaskListToolCall", () => {
     fireEvent.click(view.getByText("task_list"));
     expect(view.getByText(note)).toBeDefined();
   });
+
+  test("instance rows show the project basename and activity; other rows are unchanged", () => {
+    const instanceArgs = { scope: "instance" as const };
+    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <InstanceTaskListToolCall
+          args={instanceArgs}
+          status="completed"
+          result={{
+            tasks: [
+              {
+                taskId: "ws-release",
+                status: "workspace",
+                title: "Release cut",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/release-tooling",
+                activity: "busy",
+                depth: 0,
+              },
+              {
+                taskId: "ws-self",
+                status: "workspace",
+                title: "Coordinator",
+                relationship: "self",
+                projectPath: "C:\\Users\\alice\\projects\\mux\\",
+                activity: "idle",
+                depth: 0,
+              },
+              // A tree-scope row: no project/activity fields, so no extra text may appear.
+              {
+                taskId: "task-sib",
+                status: "running",
+                title: "Reviewer",
+                relationship: "sibling",
+                depth: 1,
+              },
+            ],
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task_list"));
+    // Only the last path segment is shown; the full path is noise in a compact row.
+    expect(view.getByText("release-tooling")).toBeDefined();
+    expect(view.queryByText("/home/alice/projects/release-tooling")).toBeNull();
+    // Windows separators and trailing separators still resolve to the project directory.
+    expect(view.getByText("mux")).toBeDefined();
+    expect(view.getByText("busy")).toBeDefined();
+    expect(view.getByText("idle")).toBeDefined();
+    expect(view.getAllByText("workspace")).toHaveLength(2);
+    expect(view.getByText("running")).toBeDefined();
+    expect(view.getByText("sibling")).toBeDefined();
+    expect(view.getByText("depth: 1")).toBeDefined();
+  });
+
+  test("untitled instance rows fall back to the workspace name; titled and tree rows do not", () => {
+    const instanceArgs = { scope: "instance" as const };
+    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <InstanceTaskListToolCall
+          args={instanceArgs}
+          status="completed"
+          result={{
+            tasks: [
+              {
+                taskId: "ws-untitled",
+                status: "workspace",
+                workspaceName: "feature-login",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/app",
+                activity: "idle",
+                depth: 0,
+              },
+              {
+                taskId: "ws-titled",
+                status: "workspace",
+                workspaceName: "release-branch",
+                title: "Release cut",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/app",
+                activity: "busy",
+                depth: 0,
+              },
+              // Not an instance row (no projectPath): the fallback must not apply.
+              {
+                taskId: "task-child",
+                status: "running",
+                workspaceName: "explore_child",
+                relationship: "descendant",
+                depth: 1,
+              },
+            ],
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task_list"));
+    expect(view.getByText("feature-login")).toBeDefined();
+    expect(view.getByText("Release cut")).toBeDefined();
+    expect(view.queryByText("release-branch")).toBeNull();
+    expect(view.queryByText("explore_child")).toBeNull();
+  });
 });
 
 const taskRetitleArgs = { task_id: "child-task", title: "Simplicity Auditor" };
-const TaskRetitleToolCall = getToolComponent("task_retitle", taskRetitleArgs);
+const TaskRetitleToolCall = getToolComponent("task_retitle", taskRetitleArgs, undefined);
 
 describe("TaskRetitleToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -719,7 +842,11 @@ const taskSendMessageArgs = {
   task_id: "child-task",
   message: "Use the corrected API shape.",
 };
-const TaskSendMessageToolCall = getToolComponent("task_send_message", taskSendMessageArgs);
+const TaskSendMessageToolCall = getToolComponent(
+  "task_send_message",
+  taskSendMessageArgs,
+  undefined
+);
 
 describe("TaskSendMessageToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -739,6 +866,29 @@ describe("TaskSendMessageToolCall", () => {
     globalThis.document = originalDocument;
   });
 
+  // The card renders only the send-time result, so a queued label must say when the message
+  // dispatches instead of reading as still pending after delivery (#4736).
+  test.each([
+    ["tool-end", "Queued for next step"],
+    ["turn-end", "Queued until turn end"],
+    [undefined, "Queued for delivery"],
+  ] as const)("labels a queued send by its dispatch mode: %s", (queueDispatchMode, label) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            status: "queued",
+            taskId: "child-task",
+            ...(queueDispatchMode != null ? { queueDispatchMode } : {}),
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").textContent).toBe(label);
+  });
+
   test("shows the guidance and target when expanded", () => {
     const view = render(
       <TooltipProvider>
@@ -750,7 +900,6 @@ describe("TaskSendMessageToolCall", () => {
       </TooltipProvider>
     );
 
-    expect(view.getByRole("status").textContent).toBe("Queued");
     fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText("child-task")).toBeDefined();
     expect(view.getByText("Use the corrected API shape.")).toBeDefined();
@@ -865,47 +1014,67 @@ describe("TaskSendMessageToolCall", () => {
     expect(view.getByRole("alert").textContent).toBe("Connection lost");
   });
 
-  test.each(["accepted", "queued", "reactivated"] as const)(
-    "preserves hooked delivery outcome: %s",
-    (status) => {
+  test.each([
+    { ok: true, expectedStatus: "redacted" },
+    { ok: false, expectedStatus: "failed" },
+  ] as const)(
+    "renders compacted communication history without inventing delivery: $ok",
+    ({ ok, expectedStatus }) => {
+      const message = createMuxMessage("compacted", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "execution",
+          toolName: "code_execution",
+          input: { code: "// Send updates" },
+          state: "output-available",
+          output: {
+            success: true,
+            toolCalls: [
+              {
+                toolName: "task_send_message",
+                args: taskSendMessageArgs,
+                ok,
+                bytes: 64,
+                duration_ms: 1,
+              },
+              {
+                toolName: "agent_report",
+                args: { reportMarkdown: "Preserved findings" },
+                ok,
+                bytes: 32,
+                duration_ms: 1,
+              },
+            ],
+          },
+        },
+      ]);
+      const row = buildDisplayedMessagesForMessage({
+        message,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      }).find((part) => part.type === "tool");
+      if (row?.type !== "tool" || !row.nestedCalls) throw new Error("Expected nested tool calls");
       const view = render(
         <TooltipProvider>
-          <TaskSendMessageToolCall
-            args={taskSendMessageArgs}
-            status="completed"
-            result={Object.freeze({
-              status,
-              taskId: "child-task",
-              hook_output: "Post hook finished",
-              hook_duration_ms: 20,
-              hook_path: ".xum/tool_post",
-            })}
+          <NestedToolsContainer
+            calls={row.nestedCalls.map((call) => ({ ...call, input: call.input }))}
           />
         </TooltipProvider>
       );
-      expect(view.getByRole("status").className).toContain(
-        status === "queued" ? "text-backgrounded" : "text-success"
+      const statuses = view.getAllByRole("status");
+      expect(statuses).toHaveLength(2);
+      for (const status of statuses) {
+        expect(status.className).not.toContain("text-success");
+        expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
+        expect(status.textContent).not.toContain("Result unavailable");
+      }
+      expect(view.getByText("Preserved findings")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
+      expect(view.getByRole("region", { name: "Message content" }).textContent).toBe(
+        taskSendMessageArgs.message
       );
     }
   );
-
-  test("shows bare pre-hook errors alongside their metadata", () => {
-    const view = render(
-      <TooltipProvider>
-        <TaskSendMessageToolCall
-          args={taskSendMessageArgs}
-          status="completed"
-          result={{
-            error: "Blocked by project hook",
-            hook_output: "Policy refused",
-            hook_path: ".xum/tool_pre",
-          }}
-        />
-      </TooltipProvider>
-    );
-    expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
-    expect(view.getByRole("status").className).toContain("text-danger");
-  });
 
   test.each([null, undefined, { type: "json", value: null }].map((result) => ({ result })))(
     "does not claim delivery for a missing completed result: %j",
@@ -934,27 +1103,6 @@ describe("TaskSendMessageToolCall", () => {
     expect(view.getByRole("status").textContent).toBe(label);
   });
 
-  test("accepts SDK-wrapped results with inner and outer hook metadata", () => {
-    const view = render(
-      <TooltipProvider>
-        <TaskSendMessageToolCall
-          args={taskSendMessageArgs}
-          status="completed"
-          result={Object.freeze({
-            type: "json",
-            value: Object.freeze({
-              ...{ status: "accepted", taskId: "child-task" },
-              hook_output: "Inner hook",
-            }),
-            hook_output: "Outer hook",
-            hook_path: ".xum/tool_post",
-          })}
-        />
-      </TooltipProvider>
-    );
-    expect(view.getByRole("status").className).toContain("text-success");
-  });
-
   test("shows SDK-wrapped blocking errors", () => {
     const view = render(
       <TooltipProvider>
@@ -968,12 +1116,14 @@ describe("TaskSendMessageToolCall", () => {
         />
       </TooltipProvider>
     );
+    // Normalization (toolUtils.test.ts) maps the wrapped bare error; the card must use it.
     expect(view.getByRole("alert").textContent).toBe("Wrapped blocking error");
+    expect(view.getByRole("status").className).toContain("text-danger");
   });
 });
 
 const taskTerminateArgs = { task_ids: ["wfr_x"] };
-const TaskTerminateToolCall = getToolComponent("task_terminate", taskTerminateArgs);
+const TaskTerminateToolCall = getToolComponent("task_terminate", taskTerminateArgs, undefined);
 
 describe("TaskTerminateToolCall", () => {
   let originalWindow: typeof globalThis.window;

@@ -12,10 +12,17 @@ import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
   assemblePromptPayload,
@@ -96,6 +103,7 @@ async function buildSystemContextForTest(args: {
   workspaceMemoryWritable?: boolean;
   hotMemoriesBlock?: string;
   intuitionToolAvailable?: boolean;
+  instructionSources?: Parameters<typeof buildStreamSystemContext>[0]["instructionSources"];
 }) {
   return buildStreamSystemContext({
     runtime: args.runtime,
@@ -118,6 +126,7 @@ async function buildSystemContextForTest(args: {
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     hotMemoriesBlock: args.hotMemoriesBlock,
     intuitionToolAvailable: args.intuitionToolAvailable,
+    instructionSources: args.instructionSources,
   });
 }
 
@@ -264,6 +273,78 @@ describe("prepareProviderRequestMessages", () => {
       "workflow-result",
       "next-user",
     ]);
+  });
+
+  test("drops hidden plan-review record rows but keeps authentic feedback rows", () => {
+    const snapshotRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec1",
+      snapshotId: "s1",
+      planPath: "/plans/p.md",
+      contentHash: "a".repeat(64),
+      content: "# Secret plan\n",
+    };
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec2",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const snapshot = createMuxMessage(
+      "plan-review-snapshot",
+      "user",
+      formatPlanReviewEnvelope(snapshotRecord),
+      { historySequence: 1, synthetic: true, muxMetadata: buildPlanReviewMetadata(snapshotRecord) }
+    );
+    const feedback = createMuxMessage(
+      "plan-review-feedback",
+      "user",
+      formatPlanReviewEnvelope(feedbackRecord),
+      { historySequence: 2, muxMetadata: buildPlanReviewMetadata(feedbackRecord) }
+    );
+    const answer = createMuxMessage("answer", "assistant", "revised", { historySequence: 3 });
+    const resolve = createMuxMessage("plan-review-resolve", "user", "<mux_plan_review>…", {
+      historySequence: 4,
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
+    });
+    // A hidden snapshot whose metadata kind was corrupted to "feedback" must stay hidden: only
+    // an authentic feedback envelope is provider-visible, never a bare kind claim.
+    const corruptedKind = createMuxMessage(
+      "plan-review-corrupted",
+      "user",
+      formatPlanReviewEnvelope({ ...snapshotRecord, recordId: "rec4", snapshotId: "s2" }),
+      {
+        historySequence: 5,
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "feedback", recordId: "rec4", snapshotId: "s2" },
+      }
+    );
+    const nextUser = createMuxMessage("next-user", "user", "continue", { historySequence: 6 });
+
+    const prepared = prepareProviderRequestMessages(
+      [snapshot, feedback, answer, resolve, corruptedKind, nextUser],
+      "openai",
+      "off"
+    );
+
+    expect(prepared.activeContextMessages.map((message) => message.id)).toEqual([
+      "plan-review-feedback",
+      "answer",
+      "next-user",
+    ]);
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "plan-review-feedback",
+      "answer",
+      "next-user",
+    ]);
+    // Hidden rows are ordinary content filtering, not a boundary/keep-recent removal.
+    expect(prepared.contextBoundarySlicedCount).toBe(0);
   });
 
   test("excludes the stamped keep-recent tail from RLM compaction summarization requests", () => {
@@ -465,6 +546,56 @@ describe("assemblePromptPayload", () => {
 });
 
 describe("buildPlanInstructions", () => {
+  test("fails instead of dropping the plan handoff when the last agent is unreadable", async () => {
+    using tempRoot = new DisposableTempDir("turn-context-plan-handoff-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata: WorkspaceMetadata = {
+      id: "ws-handoff",
+      name: "workspace-handoff",
+      projectName: "project-handoff",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, "The approved plan.");
+
+    // #4438: an unreachable host while resolving the previous (plan) agent must not
+    // silently send exec without the plan.
+    class DroppedAgentsRuntime extends TestRuntime {
+      override stat(filePath: string, abortSignal?: AbortSignal) {
+        if (filePath.includes(`${path.sep}agents${path.sep}`)) {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.stat(filePath, abortSignal);
+      }
+    }
+    const runtime = new DroppedAgentsRuntime(projectPath, xumHome);
+
+    const outcome = await buildPlanInstructions({
+      runtime,
+      metadata,
+      workspaceId: metadata.id,
+      workspacePath: projectPath,
+      effectiveMode: "exec",
+      effectiveAgentId: "exec",
+      agentIsPlanLike: false,
+      agentDiscoveryRuntime: runtime,
+      agentDiscoveryPath: projectPath,
+      additionalSystemInstructions: undefined,
+      shouldDisableTaskToolsForDepth: false,
+      taskDepth: 0,
+      taskSettings: DEFAULT_TASK_SETTINGS,
+      requestPayloadMessages: [
+        createMuxMessage("a1", "assistant", "Here is the plan.", { agentId: "plan" }),
+        createMuxMessage("u1", "user", "implement it"),
+      ],
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
   test("prepends runtime plan file guidance ahead of caller additional instructions", async () => {
     using tempRoot = new DisposableTempDir("turn-context-assembler");
 
@@ -623,6 +754,161 @@ class RestrictedTestRuntime extends TestRuntime {
 }
 
 describe("buildStreamSystemContext", () => {
+  test("shares one instruction snapshot between the prompt, tool instructions, and rebuilds", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-instruction-snapshot");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+    const agentsPath = path.join(projectPath, "AGENTS.md");
+    const writeAgents = (version: string) =>
+      fs.writeFile(
+        agentsPath,
+        [`Prompt guidance ${version}.`, "", "## Tool: bash", `Bash guidance ${version}.`, ""].join(
+          "\n"
+        )
+      );
+    await writeAgents("v1");
+
+    const metadata = createWorkspaceMetadata({
+      id: "instruction-snapshot-ws",
+      name: "instruction-snapshot-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const buildArgs = {
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    };
+
+    const first = await buildSystemContextForTest(buildArgs);
+    expect(first.systemMessage).toContain("Prompt guidance v1.");
+    const toolInstructions = extractToolInstructionsFromSources(
+      first.instructionSources,
+      "openai:gpt-5.2",
+      metadata,
+      first.agentSystemPromptSections
+    );
+    expect(toolInstructions.bash).toContain("Bash guidance v1.");
+
+    // A rebuild within the same turn reuses the snapshot even if the file
+    // changed meanwhile, so the prompt cannot disagree with tool descriptions.
+    await writeAgents("v2");
+    const rebuilt = await buildSystemContextForTest({
+      ...buildArgs,
+      instructionSources: first.instructionSources,
+    });
+    expect(rebuilt.instructionSources).toBe(first.instructionSources);
+    expect(rebuilt.systemMessage).toContain("Prompt guidance v1.");
+    expect(rebuilt.systemMessage).not.toContain("Prompt guidance v2.");
+
+    // A new turn (no snapshot) reads the files again: nothing is cached across turns.
+    const nextTurn = await buildSystemContextForTest(buildArgs);
+    expect(nextTurn.systemMessage).toContain("Prompt guidance v2.");
+  });
+
+  test("fails instead of dropping the skills index when skill discovery fails in transport", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-skills-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+
+    // #4438: an unreachable host must fail the turn, not silently list no skills.
+    class DroppedSkillsRuntime extends TestRuntime {
+      override resolvePath(filePath: string): Promise<string> {
+        if (path.basename(filePath) === "skills") {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.resolvePath(filePath);
+      }
+    }
+
+    const metadata = createWorkspaceMetadata({
+      id: "skills-transport-ws",
+      name: "skills-transport-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const outcome = await buildSystemContextForTest({
+      runtime: new DroppedSkillsRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("reads instruction files while agent discovery is still in flight", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-parallel-reads");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+    await fs.writeFile(path.join(projectPath, "AGENTS.md"), "Project guidance.\n");
+
+    const events: string[] = [];
+    let markInstructionRead!: () => void;
+    const instructionRead = new Promise<void>((resolve) => {
+      markInstructionRead = resolve;
+    });
+    // Agent-root resolution waits (bounded) for an AGENTS.md read. Sequential
+    // assembly only reads instructions after discovery finishes, so it hits
+    // the fallback and records the read after the release.
+    class OrderingRuntime extends TestRuntime {
+      override async resolvePath(filePath: string): Promise<string> {
+        if (path.basename(filePath) === "agents") {
+          events.push("agent-scan");
+          await Promise.race([instructionRead, new Promise((resolve) => setTimeout(resolve, 250))]);
+          events.push("agent-scan-released");
+        }
+        return super.resolvePath(filePath);
+      }
+
+      override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+        if (filePath === path.join(projectPath, "AGENTS.md")) {
+          events.push("instruction-read");
+          markInstructionRead();
+        }
+        return super.readFile(filePath, abortSignal);
+      }
+    }
+
+    const metadata = createWorkspaceMetadata({
+      id: "parallel-reads-ws",
+      name: "parallel-reads-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const result = await buildSystemContextForTest({
+      runtime: new OrderingRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    });
+
+    expect(result.systemMessage).toContain("Project guidance.");
+    expect(events).toContain("agent-scan");
+    expect(events.indexOf("instruction-read")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("instruction-read")).toBeLessThan(events.indexOf("agent-scan-released"));
+  });
+
   test("includes proactive memory guidance only when the memory tool is available", async () => {
     using tempRoot = new DisposableTempDir("stream-system-context-memory-guidance");
 

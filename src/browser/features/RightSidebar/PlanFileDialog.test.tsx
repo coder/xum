@@ -1,31 +1,26 @@
 import * as RealMarkdownCore from "../Messages/MarkdownCore";
 import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
-import * as RealAPI from "@/browser/contexts/API";
-import type { ReactNode } from "react";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
+import type { ReactElement, ReactNode } from "react";
 import { PlanFileDialog } from "./PlanFileDialog";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
   | { success: false; error: string };
 
-interface MockApiClient {
-  workspace: {
-    getPlanContent: () => Promise<GetPlanContentResult>;
-  };
-}
-
-let mockApi: MockApiClient | null = null;
+let mockApi: TestApiOverrides<APIClient> | null = null;
 
 // Scope module mocks to each test so renderer assertions use the real pipeline.
 const realModules: Array<[string, Record<string, unknown>]> = [
   ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
   ["@/browser/features/Messages/MarkdownCore", { ...RealMarkdownCore }],
   ["@/browser/features/Messages/MarkdownRenderer", { ...RealMarkdownRenderer }],
-  ["@/browser/contexts/API", { ...RealAPI }],
 ];
 
 async function installModuleMocks() {
@@ -52,16 +47,31 @@ async function installModuleMocks() {
       <div data-testid="plan-markdown-container">{props.children}</div>
     ),
   }));
+}
 
-  await mock.module("@/browser/contexts/API", () => ({
-    useAPI: () => ({
-      api: mockApi,
-      status: mockApi ? "connected" : "error",
-      error: mockApi ? null : "API unavailable",
-      authenticate: () => undefined,
-      retry: () => undefined,
-    }),
-  }));
+// Inject the client through the real provider (a module mock of contexts/API is process-wide).
+// The wrapper reads mockApi at render time; a null mockApi models an unavailable backend.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (mockApi === null) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "error",
+          api: null,
+          error: "API unavailable",
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
+
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
 }
 
 async function restoreModuleMocks() {
@@ -107,7 +117,7 @@ describe("PlanFileDialog", () => {
     };
 
     const onOpenChange = () => undefined;
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open={false} onOpenChange={onOpenChange} workspaceId="workspace-1" />
     );
 
@@ -140,7 +150,7 @@ describe("PlanFileDialog", () => {
       },
     };
 
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open onOpenChange={() => undefined} workspaceId="workspace-2" />
     );
 
@@ -158,7 +168,7 @@ describe("PlanFileDialog", () => {
   test("renders API-unavailable state when not connected", async () => {
     mockApi = null;
 
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open onOpenChange={() => undefined} workspaceId="workspace-3" />
     );
 

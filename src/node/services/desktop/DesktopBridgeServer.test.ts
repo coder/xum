@@ -13,6 +13,7 @@ import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import { DesktopSessionManager } from "./DesktopSessionManager";
 import { WebSocket, type RawData } from "ws";
+import { log } from "@/node/services/log";
 import { DesktopBridgeServer } from "./DesktopBridgeServer";
 import { DesktopTokenManager } from "./DesktopTokenManager";
 
@@ -498,6 +499,33 @@ async function expectEcho(ws: WebSocket): Promise<void> {
 }
 
 describe("DesktopBridgeServer", () => {
+  test("does not log the token of an upgrade rejected while stopping", async () => {
+    const bridgeServer = createBridgeServer({});
+    const socket = { write: mock(() => true), destroy: mock(() => undefined) };
+    const debugSpy = spyOn(log, "debug");
+
+    try {
+      // stop() sets the stopping flag synchronously, before its first await.
+      const stopPromise = bridgeServer.stop();
+      bridgeServer.handleUpgrade(
+        { url: `/desktop/ws?token=${VALID_TOKEN}` } as http.IncomingMessage,
+        socket as never,
+        Buffer.alloc(0)
+      );
+      await stopPromise;
+
+      // The upgrade URL carries the desktop token; the rejection log must not (#4853).
+      expect(socket.destroy).toHaveBeenCalled();
+      expect(debugSpy).toHaveBeenCalledWith(
+        "DesktopBridgeServer: rejecting upgrade while stopping",
+        { path: "/desktop/ws" }
+      );
+      expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(VALID_TOKEN);
+    } finally {
+      debugSpy.mockRestore();
+    }
+  });
+
   for (const closingWorkspaceId of ["child", "owner"]) {
     test(`closing ${closingWorkspaceId} revokes established affected bridges only`, async () => {
       await withSharedBridge(async ({ manager, connect }) => {
@@ -962,15 +990,23 @@ describe("DesktopBridgeServer", () => {
       getLiveSessionConnection: mock(() => null),
     });
     const upgradeHarness = await listenUpgradeServer(bridgeServer);
+    const warnSpy = spyOn(log, "warn");
 
     try {
-      for (const suffix of ["", "/?token=bad-token"]) {
+      // An empty first `token` hides a real one from searchParams.get (#4853).
+      for (const suffix of ["", "/?token=bad-token", "/?token=&token=SECRET-dup"]) {
         const ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}${suffix}`);
         const closeEvent = await waitForWebSocketClose(ws);
         expect(closeEvent.code).toBe(4001);
         expect(closeEvent.reason).toBe("invalid token");
       }
+      expect(warnSpy).toHaveBeenCalledWith(
+        "DesktopBridgeServer: rejecting upgrade with missing token",
+        { path: "/" }
+      );
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain("SECRET-dup");
     } finally {
+      warnSpy.mockRestore();
       await upgradeHarness.close();
       await bridgeServer.stop();
     }

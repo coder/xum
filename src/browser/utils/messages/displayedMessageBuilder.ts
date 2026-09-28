@@ -19,6 +19,7 @@ import {
   getValidAgentPeerMessageMeta,
   getValidAgentPeerTriggerMeta,
   parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
@@ -30,6 +31,7 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 
 /**
@@ -289,6 +291,23 @@ function getValidAgentPeerMessage(
   return meta;
 }
 
+/**
+ * Validated attribution of a peer-message wake trigger row, or null. SECURITY/self-healing:
+ * requires synthetic provenance AND validated attribution — a corrupted human user row wearing
+ * peer metadata must keep ordinary rendering, not be disguised as (or folded into) a machine
+ * notification. When the recipient is executing a delegated workspace turn, the trigger carries
+ * that turn's correlation metadata with the attribution nested on it.
+ */
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
+  const muxMeta = message.metadata.muxMetadata;
+  if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
+  if (muxMeta?.type === "workspace-turn-task") {
+    return getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger);
+  }
+  return null;
+}
+
 function getRawCommand(muxMetadata: unknown): string | undefined {
   if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
     return undefined;
@@ -319,6 +338,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -386,6 +406,8 @@ function buildUserDisplayedMessages(options: {
       contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
+      isPlanReviewFeedback:
+        getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
       mcpPromptRefs,
@@ -406,22 +428,18 @@ function buildUserDisplayedMessages(options: {
               contextTokens: muxMeta.contextTokens,
               maxTokens: muxMeta.maxTokens,
               final: muxMeta.final === true,
+              handoff: muxMeta.handoff === true,
             }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
-      // navigation skips it (the envelope payload itself is a separate assistant row). When the
-      // recipient is executing a delegated workspace turn, the trigger carries that turn's
-      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
-      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
-      // human user row wearing peer metadata must fall back to ordinary rendering, not be
-      // disguised as a machine notification hidden from prompt navigation.
-      agentPeerMessageTrigger:
-        message.metadata?.synthetic === true &&
-        (muxMeta?.type === "agent-peer-message"
-          ? getValidAgentPeerMessageMeta(muxMeta) != null
-          : muxMeta?.type === "workspace-turn-task" &&
-            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
-          ? true
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
           : undefined,
     },
   ];
@@ -523,6 +541,7 @@ function appendAssistantTextRow(
       message.metadata?.routedThroughGateway
     ),
     modelFallback: message.metadata?.modelFallback,
+    autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
     agentId: message.metadata?.agentId ?? message.metadata?.mode,
     timestamp: part.timestamp ?? options.baseTimestamp,
@@ -600,7 +619,15 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       input: record.args,
       output,
       ...(kernelFailure ? { failed: true } : {}),
-      state: "output-available",
+      // Compaction deliberately omits results. Reuse the neutral redacted state
+      // instead of making communication cards report a missing-result failure.
+      // ok:true only means the tool ran, not that a message was delivered.
+      state:
+        output === undefined &&
+        typeof record.ok === "boolean" &&
+        (record.toolName === "task_send_message" || record.toolName === "agent_report")
+          ? "output-redacted"
+          : "output-available",
       timestamp: part.timestamp,
     });
   }
@@ -640,6 +667,7 @@ function appendToolRows(
     historySequence: options.historySequence,
     isLastPartOfMessage: options.isLastPartOfMessage,
     ...(part.workflowRun != null ? { workflowRun: part.workflowRun } : {}),
+    ...(part.mcpServer != null ? { mcpServer: part.mcpServer } : {}),
     timestamp: part.timestamp ?? options.baseTimestamp,
     ...(part.executionStartedAt != null ? { executionStartedAt: part.executionStartedAt } : {}),
     nestedCalls,

@@ -46,6 +46,7 @@ async function countBudgetInput(
     assert(Number.isSafeInteger(count) && count >= 0, "Invalid encoded budget count");
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
+    // This early exit returns a lower bound, not an exact request size.
     if (ceiling != null && encoded + input.fixedTokens + framing > ceiling) return ceiling + 1;
     start = end;
   }
@@ -75,13 +76,18 @@ export function estimateToolResultTokensForModel(
   return countBudgetInput(prepareBudgetTokenCount(output), model, REQUEST_FRAMING_TOKENS);
 }
 
-export async function checkAssembledRequestBudgetForModel(
+/**
+ * The assembled-request estimate the per-step preflight enforces. Above the hard ceiling the
+ * count stops early and returns a lower bound (ceiling + 1), not the exact request size.
+ * Undefined when the model has no usable context limit.
+ */
+export async function estimateAssembledRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & {
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   }
-): Promise<ContextBudgetExceeded | undefined> {
+): Promise<{ estimate: number; hardCeiling: number } | undefined> {
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
   const hardCeiling = getContextBudgetHardCeiling(limit);
@@ -102,7 +108,18 @@ export async function checkAssembledRequestBudgetForModel(
     framing,
     hardCeiling
   );
-  return estimate > hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, estimate, hardCeiling }
+  return { estimate, hardCeiling };
+}
+
+export async function checkAssembledRequestBudgetForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  }
+): Promise<ContextBudgetExceeded | undefined> {
+  const counted = await estimateAssembledRequestTokensForModel(payload, options);
+  return counted != null && counted.estimate > counted.hardCeiling
+    ? { type: "context_budget_exceeded", model: options.model, ...counted }
     : undefined;
 }

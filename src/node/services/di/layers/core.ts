@@ -20,14 +20,19 @@ import {
   createAgentPluginsMcpProvider,
 } from "@/node/services/agentPlugins/mcpConfig";
 import { AIService } from "@/node/services/aiService";
+import { AutoModelRouter } from "@/node/services/autoModelRouter";
+import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AI,
+  AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
+  ContextManagement,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -56,6 +61,7 @@ import {
   type CoreTags,
   type StoreTags,
 } from "@/node/services/di/tags";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
@@ -69,6 +75,7 @@ import { MemoryService, type MemoryChangeEvent } from "@/node/services/memorySer
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
+import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -98,6 +105,11 @@ import { StoresFromCoreOptionsLive } from "./stores";
  * body's setter/listener wiring is replayed, in its original order, by
  * `CoreWiringLive` once every service exists.
  */
+
+class ToolCallDisplayRegistryTag extends Context.Service<
+  ToolCallDisplayRegistryTag,
+  ToolCallDisplayRegistry
+>()("xum/ToolCallDisplayRegistry") {}
 
 /** The core graph's inputs other than the stores (`CoreOptions` in coreServices.ts). */
 export class CoreOptionsTag extends Context.Service<CoreOptionsTag, CoreOptions>()(
@@ -178,10 +190,27 @@ export const ProviderLive = Layer.effect(
   })
 );
 
+// Auto model routing (auto-model-routing experiment): prompts are third-party egress,
+// so the evaluation model is gated by the same provider policy as chat models.
+export const AutoModelRouterLive = Layer.effect(
+  AutoModelRouterTag,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    return new AutoModelRouter({
+      providersConfigStore: yield* ProvidersConfigStoreTag,
+      policyService: opts.policyService,
+    });
+  })
+);
+
 export const BackgroundProcessManagerLive = Layer.sync(
   BackgroundProcessManagerTag,
   () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
 );
+
+// Headless evaluation (workflow `evaluate()`): no dependencies — the caller
+// supplies the resolved evaluation model per call (see evaluationService.ts).
+export const EvaluationLive = Layer.sync(Evaluation, () => makeEvaluationService());
 
 export const ExtensionMetadataLive = Layer.effect(
   ExtensionMetadata,
@@ -270,7 +299,8 @@ export const StreamManagerLive = Layer.effect(
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
       // in-flight stream (StreamManager.superviseEngine).
-      yield* AppFiberScopeTag
+      yield* AppFiberScopeTag,
+      yield* ToolCallDisplayRegistryTag
     );
   })
 );
@@ -406,6 +436,10 @@ export const MCPServerManagerLive = Layer.effect(
             workspaceMcpOverridesService.acquireExclusiveLock(options),
         },
         ...opts.mcpServerManagerOptions,
+        // After the spread: the registry is a shared dependency the core graph
+        // owns (the stream manager consumes what the MCP manager publishes), so
+        // a caller-supplied instance must not silently split the two.
+        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
       },
       opts.policyService
     );
@@ -413,7 +447,24 @@ export const MCPServerManagerLive = Layer.effect(
 );
 
 // ---------------------------------------------------------------------------
-// S6 — WorkspaceService. Its constructor needs nothing beyond S3 (the MCP
+// Context management owns app dependencies; controllers are opened synchronously per session.
+export const ContextManagementLive = Layer.effect(
+  ContextManagement,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    return new ContextManagementService({
+      config: yield* ConfigTag,
+      historyService: yield* History,
+      aiService: yield* AI,
+      sessionUsageService: yield* SessionUsage,
+      // Telemetry is optional in headless roots, unlike the desktop-only Telemetry tag.
+      telemetryService: opts.telemetryService,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S6 — WorkspaceService. Its constructor needs S4's ContextManagement (the MCP
 // manager and memory consolidation collaborators arrive through setters in
 // CoreWiringLive); it is staged after MCPServerManager only to keep the former
 // body's construction order, not because of a dependency.
@@ -430,6 +481,7 @@ export const WorkspaceLive = Layer.effect(
       yield* ConfigTag,
       yield* History,
       yield* AI,
+      yield* ContextManagement,
       yield* InitStateManagerTag,
       yield* ExtensionMetadata,
       yield* BackgroundProcessManagerTag,
@@ -443,7 +495,8 @@ export const WorkspaceLive = Layer.effect(
       yield* ProvidersConfigStoreTag,
       yield* DesktopInputCoordinatorTag,
       yield* EffectRunnerTag,
-      yield* AppFiberScopeTag
+      yield* AppFiberScopeTag,
+      yield* AutoModelRouterTag
     );
   })
 );
@@ -584,6 +637,14 @@ export const CoreWiringLive: Layer.Layer<
     turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
+    turnRequestBuilderBindings.workflowArchiveAdmission = workspaceService;
+    // Tool-started workflows resolve/dispatch `evaluate()` through the same
+    // service as ORPC-started ones; the ingest hook mirrors the headless usage
+    // sidecar wiring in the desktop layer.
+    turnRequestBuilderBindings.evaluationService = yield* Evaluation;
+    turnRequestBuilderBindings.requestAnalyticsIngest = (workspaceId) => {
+      workspaceService.emit("analyticsIngest", { workspaceId });
+    };
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
     workspaceService.setSharedWorkspaceMemoryStore(memoryService);
     // Workspace-scope change events carry the memory OWNER (task-tree root);
@@ -660,10 +721,13 @@ export const CoreWiringLive: Layer.Layer<
 // ---------------------------------------------------------------------------
 
 const S1 = Layer.mergeAll(
+  Layer.sync(ToolCallDisplayRegistryTag, () => new ToolCallDisplayRegistry()),
   HistoryLive,
   InitStateManagerLive,
   ProviderLive,
+  AutoModelRouterLive,
   BackgroundProcessManagerLive,
+  EvaluationLive,
   ExtensionMetadataLive,
   MemoryLive,
   TerminalAttentionStoreLive,
@@ -674,7 +738,9 @@ const S1 = Layer.mergeAll(
 const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
-const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive).pipe(Layer.provideMerge(S3));
+const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(
+  Layer.provideMerge(S3)
+);
 const S5 = MCPServerManagerLive.pipe(Layer.provideMerge(S4));
 const S6 = WorkspaceLive.pipe(Layer.provideMerge(S5));
 const S7 = TaskLive.pipe(Layer.provideMerge(S6));
@@ -694,14 +760,17 @@ export const CoreLive: Layer.Layer<
 /** Tagged context → the plain `CoreServices` object the roots hand out. */
 export function coreServicesFromContext(context: Context.Context<CoreTags>): CoreServices {
   return {
+    contextManagement: Context.get(context, ContextManagement),
     historyService: Context.get(context, History),
     initStateManager: Context.get(context, InitStateManagerTag),
     providerService: Context.get(context, Provider),
+    autoModelRouter: Context.get(context, AutoModelRouterTag),
     backgroundProcessManager: Context.get(context, BackgroundProcessManagerTag),
     sessionUsageService: Context.get(context, SessionUsage),
     workspaceGoalService: Context.get(context, WorkspaceGoal),
     idleDispatcher: Context.get(context, IdleDispatcherTag),
     aiService: Context.get(context, AI),
+    evaluationService: Context.get(context, Evaluation),
     streamManager: Context.get(context, StreamManagerTag),
     mcpConfigService: Context.get(context, MCPConfig),
     mcpServerManager: Context.get(context, MCPServerManagerTag),

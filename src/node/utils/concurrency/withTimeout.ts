@@ -7,10 +7,6 @@ export async function raceWithAbortAndTimeout<T>(
   promise: Promise<T>,
   options: { signal?: AbortSignal; timeoutMs?: number }
 ): Promise<AbortAndTimeoutResult<T>> {
-  if (options.signal?.aborted) {
-    return { kind: "aborted" };
-  }
-
   return await new Promise<AbortAndTimeoutResult<T>>((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -31,9 +27,8 @@ export async function raceWithAbortAndTimeout<T>(
     };
     const onAbort = () => settle({ kind: "aborted" });
 
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    // Register settlement before arming the timer so an already-settled
-    // promise wins over a simultaneous timeout.
+    // The caller has already started this work. Observe its rejection even when
+    // cancellation won before we were called, so late failures cannot go unhandled.
     promise.then(
       (value) => settle({ kind: "ok", value }),
       (error: unknown) => {
@@ -45,6 +40,13 @@ export async function raceWithAbortAndTimeout<T>(
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     );
+    if (options.signal?.aborted) {
+      settle({ kind: "aborted" });
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    // Register settlement before arming the timer so an already-settled
+    // promise wins over a simultaneous timeout.
     if (options.timeoutMs != null) {
       timer = setTimeout(() => settle({ kind: "timeout" }), options.timeoutMs);
       timer.unref?.();

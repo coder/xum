@@ -1,26 +1,40 @@
 import * as path from "path";
+import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { EventEmitter } from "node:events";
 import { mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 
 import {
   Config,
+  SecretsStore,
   type ProjectConfig,
   type ProjectsConfig,
   type Workspace as WorkspaceConfigEntry,
+  type WorkspaceMetadataOptions,
 } from "@/node/config";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import type { TurnAdmissionToken, WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUtils";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { TaskService } from "@/node/services/taskService";
+import { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
-import type { StreamEndEvent } from "@/common/types/stream";
+import { HistoryService } from "@/node/services/historyService";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import type {
+  TaskHandleStore,
+  WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
+import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import type { MuxMessageMetadata } from "@/common/types/message";
 
 export function initGitRepo(projectPath: string): void {
@@ -47,8 +61,11 @@ export function createMockInitStateManager(): InitStateManager {
     appendOutput: mock(() => undefined),
     reportProgress: mock(() => undefined),
     endInit: mock(() => Promise.resolve()),
+    clearInMemoryState: mock(() => undefined),
     getInitState: mock(() => undefined),
     readInitStatus: mock(() => Promise.resolve(null)),
+    markCheckoutUnsanitized: mock(() => undefined),
+    getUnsanitizedCheckoutError: mock(() => undefined),
   } as unknown as InitStateManager;
 }
 
@@ -138,6 +155,20 @@ export async function saveWorkspaces(
   );
 }
 
+/**
+ * saveWorkspaces plus a real checkout marker (`<path>/.git`) for each workspace: message delivery
+ * probes the recipient's worktree checkout and refuses a missing one before anything is persisted
+ * (#4305, #4824).
+ */
+export async function saveWorkspacesWithCheckouts(
+  ...args: Parameters<typeof saveWorkspaces>
+): Promise<void> {
+  await saveWorkspaces(...args);
+  for (const workspace of args[2]) {
+    await fsPromises.mkdir(path.join(workspace.path, ".git"), { recursive: true });
+  }
+}
+
 export function mergeTestAgentAiDefaults(
   agentAiDefaults?: AgentAiDefaults,
   subagentAiDefaults?: Record<string, AgentAiSubagentProfile>
@@ -223,6 +254,11 @@ export function stubStableIds(config: Config, ids: string[], fallbackId = "fffff
   configWithStableId.generateStableId = () => ids[nextIdIndex++] ?? fallbackId;
 }
 
+/** Emitters behind createAIServiceMocks' on/off, keyed by the mock AIService they serve. */
+const aiServiceEvents = new WeakMap<AIService, EventEmitter>();
+/** The AIService event source each createTaskServiceStack TaskService subscribed to. */
+const taskServiceStreamEvents = new WeakMap<TaskService, EventEmitter>();
+
 export function createAIServiceMocks(
   config: Config,
   overrides?: Partial<{
@@ -245,15 +281,21 @@ export function createAIServiceMocks(
   getProvidersConfig: ReturnType<typeof mock>;
   on: ReturnType<typeof mock>;
   off: ReturnType<typeof mock>;
+  events: EventEmitter;
 } {
   const isStreaming = overrides?.isStreaming ?? mock(() => false);
   const getWorkspaceMetadata =
     overrides?.getWorkspaceMetadata ??
-    mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-      const all = await config.getAllWorkspaceMetadata();
-      const found = all.find((m) => m.id === workspaceId);
-      return found ? Ok(found) : Err("not found");
-    });
+    mock(
+      async (
+        workspaceId: string,
+        options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+      ): Promise<Result<WorkspaceMetadata>> => {
+        // Match AIService: canceled preparation reads must not start migration writes.
+        const found = await config.getWorkspaceMetadataById(workspaceId, options);
+        return found ? Ok(found) : Err("not found");
+      }
+    );
 
   const stopStream =
     overrides?.stopStream ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -264,22 +306,36 @@ export function createAIServiceMocks(
   const getProvidersConfig = overrides?.getProvidersConfig ?? mock(() => null);
   const replayStream = mock(() => Promise.resolve());
 
-  const on = overrides?.on ?? mock(() => undefined);
-  const off = overrides?.off ?? mock(() => undefined);
+  // A real emitter behind on/off so TaskService's stream listeners run exactly as in production
+  // (see streamEnd below); tests that script their own subscription override on/off.
+  const events = new EventEmitter();
+  const on =
+    overrides?.on ??
+    mock((event: string, listener: (...args: unknown[]) => void) => {
+      events.on(event, listener);
+    });
+  const off =
+    overrides?.off ??
+    mock((event: string, listener: (...args: unknown[]) => void) => {
+      events.off(event, listener);
+    });
 
+  const aiService = {
+    isStreaming,
+    getWorkspaceMetadata,
+    stopStream,
+    createModel,
+    getStreamInfo,
+    getProvidersConfig,
+    replayStream,
+    acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
+    on,
+    off,
+  } as unknown as AIService;
+  aiServiceEvents.set(aiService, events);
   return {
-    aiService: {
-      isStreaming,
-      getWorkspaceMetadata,
-      stopStream,
-      createModel,
-      getStreamInfo,
-      getProvidersConfig,
-      replayStream,
-      acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
-      on,
-      off,
-    } as unknown as AIService,
+    aiService,
+    events,
     isStreaming,
     getWorkspaceMetadata,
     stopStream,
@@ -293,7 +349,42 @@ export function createAIServiceMocks(
 
 type WorkspaceHostMockOverrides = Partial<{
   [K in keyof WorkspaceHost]: ReturnType<typeof mock>;
-}> & { unarchive?: ReturnType<typeof mock> };
+}>;
+
+/**
+ * Task-tree lifecycle holds active in the current async context. TaskService stacks built by
+ * createTaskServiceStack (and the WorkspaceTurnManager test host) record their holds here, so
+ * the fake WorkspaceHost can tell whether ITS caller holds the lock; an unrelated concurrent
+ * holder does not count. A hold is marked released when its operation settles, so work the
+ * holder detached keeps no stale claim.
+ */
+const taskTreeHolds = new AsyncLocalStorage<ReadonlyArray<{ released: boolean }>>();
+
+export async function runWithTaskTreeHold<T>(operation: () => Promise<T>): Promise<T> {
+  const hold = { released: false };
+  try {
+    return await taskTreeHolds.run([...(taskTreeHolds.getStore() ?? []), hold], operation);
+  } finally {
+    hold.released = true;
+  }
+}
+
+function holdsTaskTreeLock(): boolean {
+  return (taskTreeHolds.getStore() ?? []).some((hold) => !hold.released);
+}
+
+function withoutTaskTreeLock<A extends unknown[], R>(
+  name: string,
+  sink: (...args: A) => R
+): (...args: A) => R {
+  return (...args: A) => {
+    assert(
+      !holdsTaskTreeLock(),
+      `workspaceService.${name} takes the task-tree lock itself; calling it under the lock deadlocks (use ${name}WhileTaskTreeLocked)`
+    );
+    return sink(...args);
+  };
+}
 
 export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
   const isWorkflowInvocationCurrent =
@@ -313,7 +404,6 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
     getQueueCutCutter: overrides.getQueueCutCutter ?? mock(() => undefined),
     remove:
       overrides.remove ??
-      overrides.removeWhileTaskTreeLocked ??
       mock(
         async (
           _workspaceId: string,
@@ -325,16 +415,20 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
           return Ok(undefined);
         }
       ),
+    removeWhileTaskTreeLocked:
+      overrides.removeWhileTaskTreeLocked ??
+      mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     updateTitle:
       overrides.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     emitChatEvent: overrides.emitChatEvent ?? mock(() => undefined),
     emit: overrides.emit ?? mock(() => true),
     archive:
       overrides.archive ??
+      mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))),
+    archiveWhileTaskTreeLocked:
       overrides.archiveWhileTaskTreeLocked ??
       mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))),
-    unarchive:
-      overrides.unarchive ??
+    unarchiveWhileTaskTreeLocked:
       overrides.unarchiveWhileTaskTreeLocked ??
       mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     isWorkflowInvocationCurrent,
@@ -360,18 +454,46 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
     discardExtensionMetadataEntry:
       overrides.discardExtensionMetadataEntry ?? mock(() => Promise.resolve()),
   };
-  const { unarchive, ...hostMocks } = mocks;
-  // Same mocks for the locked sinks: the lifecycle path holds the (real) task-tree lock and
-  // calls the WhileTaskTreeLocked variants; assertions target one archive/remove surface.
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
-    ...hostMocks,
-    archiveWhileTaskTreeLocked: mocks.archive,
-    unarchiveWhileTaskTreeLocked: unarchive,
-    removeWhileTaskTreeLocked: mocks.remove,
+    ...mocks,
+    // The fake host has no session, so no turn can ever exist for a send it accepts: a
+    // TurnAdmissionToken the send carried is disposed once the mock settled unless the test's
+    // own mock already reported admission (a real WorkspaceService fires exactly one of these
+    // at its seams; leaving the token pending would retain every stop latch forever).
+    sendMessage: ((...args: Parameters<WorkspaceHost["sendMessage"]>) =>
+      disposeTokenAfter(
+        mocks.sendMessage(...args),
+        args[3]?.turnAdmission
+      )) as WorkspaceHost["sendMessage"],
+    resumeStream: ((...args: Parameters<WorkspaceHost["resumeStream"]>) =>
+      disposeTokenAfter(
+        mocks.resumeStream(...args),
+        args[2]?.turnAdmission
+      )) as WorkspaceHost["resumeStream"],
+    // Each lifecycle sink has its own mock. The unlocked variants acquire the (non-reentrant)
+    // task-tree lock themselves in the real WorkspaceService, so a caller already holding it
+    // would deadlock: they assert the caller holds no task-tree lock, and a call site that
+    // swaps in the unlocked variant under the lock fails here instead of passing against a
+    // shared mock. The WhileTaskTreeLocked variants take no lock and have callers that
+    // deliberately bypass it (see createWorkspaceTurn's owner-archived cleanup), so they are
+    // only kept separate.
+    remove: withoutTaskTreeLock("remove", mocks.remove) as WorkspaceHost["remove"],
+    archive: withoutTaskTreeLock("archive", mocks.archive) as WorkspaceHost["archive"],
   });
 
   return { workspaceService, ...mocks };
+}
+
+async function disposeTokenAfter<T>(
+  result: Promise<T> | T,
+  token: TurnAdmissionToken | undefined
+): Promise<T> {
+  try {
+    return await result;
+  } finally {
+    token?.onDisposed("no-work");
+  }
 }
 
 export function workspaceTurnManagerFor(
@@ -381,6 +503,21 @@ export function workspaceTurnManagerFor(
   return (
     service as unknown as { getWorkspaceTurnManager(): WorkspaceTurnManager }
   ).getWorkspaceTurnManager();
+}
+
+/**
+ * Private WorkspaceTurnManager state for tests that seed or spy on it. Production registers live
+ * handles only inside createWorkspaceTurn/reawakening, so tests that seed that state (or spy on
+ * the exact TaskHandleStore instance the manager uses) must reach the owner's private fields.
+ */
+export function workspaceTurnManagerInternals(service: TaskService | WorkspaceTurnManager) {
+  return workspaceTurnManagerFor(service) as unknown as {
+    taskHandleStore: TaskHandleStore;
+    activeWorkspaceTurnHandleByWorkspaceId: Map<
+      string,
+      NonNullable<ReturnType<WorkspaceTurnManager["getLiveWorkspaceTurnRegistration"]>>
+    >;
+  };
 }
 
 export function workspaceTurnRecord(
@@ -480,4 +617,185 @@ export function workspaceTurnSnapshot(
   handleId = "wst_handle"
 ) {
   return workspaceTurnManagerFor(service).getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
+}
+
+/**
+ * The production TaskService + WorkspaceTurnManager wiring (see di/layers/core.ts), shared by every
+ * TaskService suite. The default AIService is createAIServiceMocks' emitter-backed mock, so
+ * streamEnd() drives the real stream-end listener. Suites with their own AIService pass its event
+ * source as `aiEvents` when they want streamEnd().
+ */
+export function createTaskServiceStack(
+  config: Config,
+  overrides: {
+    historyService?: HistoryService;
+    aiService?: AIService;
+    aiEvents?: EventEmitter;
+    workspaceService?: WorkspaceHost;
+    initStateManager?: InitStateManager;
+    sessionUsageService?: SessionUsageService;
+    workspaceGoalService?: WorkspaceGoalService;
+    desktopInputCoordinator?: DesktopInputCoordinator;
+    terminalAttentionStore?: TerminalAttentionStore;
+  } = {}
+) {
+  const historyService = overrides.historyService ?? new HistoryService(config);
+  const aiService = overrides.aiService ?? createAIServiceMocks(config).aiService;
+  const workspaceService =
+    overrides.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
+  const initStateManager = overrides.initStateManager ?? createMockInitStateManager();
+  const terminalAttentionStore =
+    overrides.terminalAttentionStore ?? new TerminalAttentionStore(config);
+  const taskService = new TaskService(
+    config,
+    historyService,
+    aiService,
+    workspaceService,
+    initStateManager,
+    overrides.sessionUsageService,
+    overrides.workspaceGoalService,
+    new SecretsStore(config.rootDir),
+    terminalAttentionStore,
+    overrides.desktopInputCoordinator
+  );
+  const workspaceTurnManager = new WorkspaceTurnManager(
+    config,
+    historyService,
+    aiService,
+    workspaceService,
+    initStateManager,
+    taskService,
+    terminalAttentionStore,
+    aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7],
+    overrides.desktopInputCoordinator
+  );
+  taskService.setWorkspaceTurnManager(workspaceTurnManager);
+  trackTaskTreeHolds(taskService);
+  recordTerminalAttentionDrainFailures(taskService);
+  const events = overrides.aiEvents ?? aiServiceEvents.get(aiService);
+  if (events != null) {
+    taskServiceStreamEvents.set(taskService, events);
+    recordHandlerFailures(taskService, "handleStreamEnd");
+    recordHandlerFailures(taskService, "handleStreamAbort");
+    recordHandlerFailures(taskService, "handleTaskStreamError");
+  }
+  return {
+    historyService,
+    taskService,
+    workspaceTurnManager,
+    aiService,
+    workspaceService,
+    initStateManager,
+    terminalAttentionStore,
+  };
+}
+
+/** Record every task-tree hold this TaskService takes (see taskTreeHolds). */
+function trackTaskTreeHolds(taskService: TaskService): void {
+  const target = taskService as unknown as {
+    withTaskTreeLifecycleLocks: (
+      ids: readonly string[],
+      operation: () => Promise<unknown>
+    ) => Promise<unknown>;
+  };
+  const original = target.withTaskTreeLifecycleLocks.bind(taskService);
+  target.withTaskTreeLifecycleLocks = (ids, operation) =>
+    original(ids, () => runWithTaskTreeHold(operation));
+}
+
+/** Terminal-attention drain rejections not yet taken, per TaskService (see flushTerminalAttentionDrains). */
+const terminalAttentionDrainFailures = new WeakMap<TaskService, unknown[]>();
+
+/**
+ * Observe (never alter) the private drain: scheduleTerminalAttentionDrain only logs a rejection,
+ * so a negative-only test ("nothing was sent") would still pass if the drain threw before
+ * deciding anything. Record each rejection so the flush helper can rethrow it.
+ */
+function recordTerminalAttentionDrainFailures(taskService: TaskService): void {
+  const target = taskService as unknown as {
+    drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+  };
+  const original = target.drainTerminalAttention.bind(taskService);
+  const failures: unknown[] = [];
+  terminalAttentionDrainFailures.set(taskService, failures);
+  target.drainTerminalAttention = async (ownerWorkspaceId) => {
+    try {
+      await original(ownerWorkspaceId);
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  };
+}
+
+/** Remove and return the drain rejections recorded since the last call. */
+export function takeTerminalAttentionDrainFailures(taskService: TaskService): unknown[] {
+  const failures = terminalAttentionDrainFailures.get(taskService);
+  assert(
+    failures,
+    "drain failures are recorded only for a TaskService built by createTaskServiceStack"
+  );
+  return failures.splice(0);
+}
+
+/** Handler rejections keyed by the event object the listener handed to the handler. */
+const handlerFailures = new WeakMap<object, unknown>();
+
+/**
+ * Observe (never alter) a private stream handler: its listener only logs a rejection, so record it
+ * against the exact event, which keeps overlapping deliveries apart without a global logger spy.
+ */
+function recordHandlerFailures(
+  taskService: TaskService,
+  handler: "handleStreamEnd" | "handleStreamAbort" | "handleTaskStreamError"
+): void {
+  const target = taskService as unknown as Record<
+    typeof handler,
+    (event: object, ...rest: unknown[]) => Promise<void>
+  >;
+  const original = target[handler].bind(taskService);
+  target[handler] = async (event, ...rest) => {
+    try {
+      await original(event, ...rest);
+    } catch (error) {
+      handlerFailures.set(event, error);
+      throw error;
+    }
+  };
+}
+
+/**
+ * Deliver a stream event the way StreamManager does: emit it on the AIService TaskService
+ * subscribed to, so the production listener captures its event-time state (queue-cut snapshot,
+ * attempt origin) in the event's own tick, registers the stream-end decision and serializes on the
+ * workspace event lock. Resolves once that lock drained, and rethrows this event's handler failure,
+ * which the listener only logs.
+ */
+async function deliverStreamEvent(
+  taskService: TaskService,
+  name: "stream-end" | "stream-abort" | "error",
+  event: StreamEndEvent | StreamAbortEvent | ErrorEvent
+): Promise<void> {
+  const events = taskServiceStreamEvents.get(taskService);
+  assert(events, "stream events need a TaskService built by createTaskServiceStack");
+  assert(events.listenerCount(name) > 0, `TaskService is not subscribed to ${name}`);
+  // Draining needs the lock itself: the listener's chained handler is not otherwise observable.
+  // The handler (and its failure record) finishes inside the lock, before this wait resolves.
+  const locks = (taskService as unknown as { workspaceEventLocks: MutexMap<string> })
+    .workspaceEventLocks;
+  events.emit(name, event);
+  await locks.withLock(event.workspaceId, () => Promise.resolve());
+  if (handlerFailures.has(event)) throw handlerFailures.get(event);
+}
+
+export function streamEnd(taskService: TaskService, event: StreamEndEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "stream-end", event);
+}
+
+export function streamAbort(taskService: TaskService, event: StreamAbortEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "stream-abort", event);
+}
+
+export function streamError(taskService: TaskService, event: ErrorEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "error", event);
 }

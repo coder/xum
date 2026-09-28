@@ -55,8 +55,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message Claude"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -80,9 +80,9 @@ async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLText
         throw new Error("Chat composer dock not found");
       }
 
-      const textarea = dock.querySelector(
+      const textarea = dock.querySelector<HTMLTextAreaElement>(
         'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      );
       if (!textarea) {
         throw new Error("Composer textarea not found");
       }
@@ -107,8 +107,8 @@ async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLB
   return waitFor(
     () => {
       const buttons = Array.from(
-        container.querySelectorAll('button[aria-label="Send message"]')
-      ) as HTMLButtonElement[];
+        container.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')
+      );
       const trigger = [...buttons]
         .reverse()
         .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);
@@ -188,10 +188,14 @@ describe("Send dispatch modes (mock AI router)", () => {
       fireEvent.click(sendAfterTurnRow);
       await app.chat.expectStreamComplete();
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("paused");
-      });
+      // Backend round trip per poll: waitFor's default 1 s is too short under CI load (#5029).
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.status).toBe("paused");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }

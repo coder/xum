@@ -1,9 +1,10 @@
+// Bootstrap before API imports Radix components that choose browser effects at module load.
+import { installDom } from "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
 
 import { APIContext } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
-import { installDom } from "../../../../../tests/ui/dom";
 import { getWorkflowRunRerunScriptPath, WorkflowRunHeader } from "./WorkflowRunHeader";
 import { projectWorkflowRun } from "./projectWorkflowRun";
 

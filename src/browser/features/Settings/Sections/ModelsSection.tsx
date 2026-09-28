@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowRight, Info, Loader2, Plus, ShieldCheck } from "lucide-react";
+import { useCallback, useEffect, useMemo, useId, useRef, useState } from "react";
+import { ArrowRight, ChevronDown, Info, Loader2, Plus, ShieldCheck } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelFallbacksEditor } from "./ModelFallbacksEditor";
@@ -29,13 +29,20 @@ import {
 } from "@/common/utils/ai/models";
 import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
-import type { ProviderModelEntry } from "@/common/orpc/types";
+import type {
+  EffectivePolicy,
+  ProviderModelDiscoveryResult,
+  ProviderModelEntry,
+  ProvidersConfigMap,
+} from "@/common/orpc/types";
 import {
   getProviderModelEntryContextWindowTokens,
   getProviderModelEntryId,
   getProviderModelEntryMappedTo,
 } from "@/common/utils/providers/modelEntries";
 import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { ModelRow } from "./ModelRow";
 
 // Providers to exclude from the custom models UI (handled specially or internal)
@@ -137,6 +144,25 @@ export function ModelsSection() {
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
   const [newModelId, setNewModelId] = useState("");
+  // Each opening owns its reply: closing and reopening must not resurrect an old catalog.
+  const [suggestionsSession, setSuggestionsSession] = useState<object | null>(null);
+  const [discovery, setDiscovery] = useState<{
+    session: object;
+    api: object;
+    provider: string;
+    config: ProvidersConfigMap;
+    policy: EffectivePolicy | null;
+    result: ProviderModelDiscoveryResult;
+  } | null>(null);
+  const [highlightedModel, setHighlightedModel] = useState<{
+    modelId: string;
+    api: object | null;
+    provider: string;
+    config: ProvidersConfigMap | null;
+    policy: EffectivePolicy | null;
+  } | null>(null);
+  const modelInputRef = useRef<HTMLInputElement>(null);
+  const suggestionsId = useId();
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -191,35 +217,117 @@ export function ModelsSection() {
     [config]
   );
 
-  const handleAddModel = useCallback(() => {
-    if (!config || !lastProvider || !newModelId.trim()) return;
+  // Shared by typed IDs and discovered suggestions.
+  // Returns whether the model was added so the text path only clears its
+  // input on success (a rejected duplicate keeps the typed ID visible).
+  const addModel = (provider: string, modelId: string): boolean => {
+    if (!config) return false;
 
     // mux-gateway is a routing layer, not a provider users should add models under.
-    if (HIDDEN_PROVIDERS.has(lastProvider)) {
+    if (HIDDEN_PROVIDERS.has(provider)) {
       setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
-      return;
+      return false;
     }
-    const trimmedModelId = newModelId.trim();
 
     // Check for duplicates
-    if (modelExists(lastProvider, trimmedModelId)) {
-      setError(`Model "${trimmedModelId}" already exists for this provider`);
-      return;
+    if (modelExists(provider, modelId)) {
+      setError(`Model "${modelId}" already exists for this provider`);
+      return false;
     }
 
-    if (!api) return;
+    if (!api) return false;
     setError(null);
 
     // Optimistic update - returns new models array for API call
-    const updatedModels = updateModelsOptimistically(lastProvider, (models) => [
-      ...models,
-      trimmedModelId,
-    ]);
-    setNewModelId("");
+    const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
 
     // Save in background
-    void api.providers.setModels({ provider: lastProvider, models: updatedModels });
-  }, [api, lastProvider, newModelId, config, modelExists, updateModelsOptimistically]);
+    void api.providers.setModels({ provider, models: updatedModels });
+    return true;
+  };
+
+  const handleAddModel = (modelId = newModelId) => {
+    const trimmedModelId = modelId.trim();
+    if (!lastProvider || !trimmedModelId) return;
+
+    if (addModel(lastProvider, trimmedModelId)) {
+      setNewModelId("");
+      setSuggestionsSession(null);
+      setHighlightedModel(null);
+    }
+  };
+
+  useEffect(() => {
+    // Coder already publishes its routing catalog; discovery must not invoke its writers.
+    if (!suggestionsSession || !lastProvider || lastProvider === "coder" || !api || !config) {
+      return;
+    }
+    const controller = new AbortController();
+    const publish = (result: ProviderModelDiscoveryResult) => {
+      if (!controller.signal.aborted) {
+        setDiscovery({
+          session: suggestionsSession,
+          api,
+          provider: lastProvider,
+          config,
+          policy: effectivePolicy,
+          result,
+        });
+      }
+    };
+    api.providers
+      .discoverModels({ provider: lastProvider }, { signal: controller.signal })
+      .then(publish, () => publish({ status: "error", reason: "request-failed" }));
+    return () => controller.abort();
+  }, [api, suggestionsSession, lastProvider, config, effectivePolicy]);
+
+  // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
+  // well as replies by the config object itself, before effect cleanup gets to run.
+  // Policy events are independent of config refreshes and also revoke completed catalogs.
+  // A disconnect or reconnect replaces the API client, which revokes them too.
+  const discoveryResult =
+    discovery?.session === suggestionsSession &&
+    discovery?.api === api &&
+    discovery?.provider === lastProvider &&
+    discovery?.config === config &&
+    discovery?.policy === effectivePolicy
+      ? discovery.result
+      : null;
+  const discoveredModels =
+    lastProvider === "coder"
+      ? (config?.coder?.discoveredModels ?? [])
+      : discoveryResult?.status === "ok"
+        ? discoveryResult.modelIds
+        : [];
+  const discoveryMessage =
+    suggestionsSession && lastProvider && lastProvider !== "coder" && api && config
+      ? !discoveryResult
+        ? "Loading models… You can still enter a model ID."
+        : discoveryResult.status !== "ok"
+          ? "Suggestions unavailable. Enter a model ID manually."
+          : discoveryResult.modelIds.length === 0
+            ? "No models found. Enter a model ID manually."
+            : null
+      : null;
+
+  // One editable field handles both manual IDs and policy-filtered discovery.
+  // Suggestions never replace a typed ID unless the user explicitly chooses one.
+  const discoveredUnconfigured = discoveredModels.filter(
+    (modelId) => !modelExists(lastProvider, modelId)
+  );
+  const matchingModels = discoveredUnconfigured.filter((modelId) =>
+    modelId.toLowerCase().includes(newModelId.trim().toLowerCase())
+  );
+  const suggestions = matchingModels.slice(0, MAX_RENDERED_MODELS);
+  const showSuggestions = suggestionsSession !== null && suggestions.length > 0;
+  const highlightedIndex =
+    showSuggestions &&
+    highlightedModel?.api === api &&
+    highlightedModel?.config === config &&
+    highlightedModel?.provider === lastProvider &&
+    highlightedModel?.policy === effectivePolicy
+      ? suggestions.indexOf(highlightedModel.modelId)
+      : -1;
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
@@ -425,10 +533,20 @@ export function ModelsSection() {
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Custom Models</div>
 
         {/* Add new model form - styled to match table */}
-        <div className="border-border-medium overflow-hidden rounded-md border">
+        <div className="border-border-medium rounded-md border">
           <div className="border-border-medium bg-background-secondary/50 flex flex-wrap items-center gap-1.5 border-b px-2 py-1.5 md:px-3">
-            <Select value={lastProvider} onValueChange={setLastProvider}>
-              <SelectTrigger className="bg-background border-border-medium focus:border-accent h-7 w-auto shrink-0 rounded border px-2 text-xs">
+            <Select
+              value={lastProvider}
+              onValueChange={(provider) => {
+                setLastProvider(provider);
+                setSuggestionsSession(null);
+                setHighlightedModel(null);
+              }}
+            >
+              <SelectTrigger
+                aria-label="Provider"
+                className="bg-background border-border-medium focus:border-accent h-7 w-auto shrink-0 rounded border px-2 text-xs"
+              >
                 <SelectValue placeholder="Provider" />
               </SelectTrigger>
               <SelectContent>
@@ -442,20 +560,116 @@ export function ModelsSection() {
                 ))}
               </SelectContent>
             </Select>
-            <input
-              type="text"
-              value={newModelId}
-              onChange={(e) => setNewModelId(e.target.value)}
-              placeholder="model-id"
-              className="bg-background border-border-medium focus:border-accent min-w-0 flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void handleAddModel();
+            <div
+              className="relative min-w-[8rem] flex-1"
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget)) {
+                  setSuggestionsSession(null);
+                  setHighlightedModel(null);
+                }
               }}
-            />
+            >
+              <input
+                ref={modelInputRef}
+                type="text"
+                role="combobox"
+                aria-label="Model ID"
+                aria-autocomplete="list"
+                aria-describedby={discoveryMessage ? `${suggestionsId}-status` : undefined}
+                aria-expanded={showSuggestions}
+                aria-controls={showSuggestions ? suggestionsId : undefined}
+                aria-activedescendant={
+                  highlightedIndex >= 0 ? `${suggestionsId}-${highlightedIndex}` : undefined
+                }
+                autoComplete="off"
+                value={newModelId}
+                onChange={(e) => {
+                  setNewModelId(e.target.value);
+                  setHighlightedModel(null);
+                  setSuggestionsSession((session) => session ?? {});
+                }}
+                onFocus={() => setSuggestionsSession((session) => session ?? {})}
+                onClick={() => setSuggestionsSession((session) => session ?? {})}
+                placeholder="model-id"
+                className="bg-background border-border-medium focus:border-accent h-7 w-full rounded border py-1 pr-6 pl-2 font-mono text-xs focus:outline-none"
+                onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing) return;
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setSuggestionsSession((session) => session ?? {});
+                    const next =
+                      e.key === "ArrowDown"
+                        ? Math.min(highlightedIndex + 1, suggestions.length - 1)
+                        : highlightedIndex < 0
+                          ? suggestions.length - 1
+                          : Math.max(highlightedIndex - 1, 0);
+                    const modelId = suggestions[next];
+                    setHighlightedModel(
+                      modelId
+                        ? { modelId, api, provider: lastProvider, config, policy: effectivePolicy }
+                        : null
+                    );
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleAddModel(
+                      highlightedIndex >= 0 ? suggestions[highlightedIndex] : newModelId
+                    );
+                  } else if (e.key === "Escape" && suggestionsSession) {
+                    e.preventDefault();
+                    stopKeyboardPropagation(e);
+                    setSuggestionsSession(null);
+                    setHighlightedModel(null);
+                  }
+                }}
+              />
+              {discoveredUnconfigured.length > 0 && (
+                <ChevronDown
+                  aria-hidden
+                  className="text-muted pointer-events-none absolute top-2 right-2 h-3 w-3"
+                />
+              )}
+              {showSuggestions && (
+                <div
+                  id={suggestionsId}
+                  role="listbox"
+                  aria-label="Discovered models"
+                  className="bg-background border-border-medium absolute top-full z-50 mt-1 max-h-48 w-full overflow-y-auto rounded border p-1 shadow-md"
+                >
+                  {suggestions.map((modelId, index) => (
+                    <button
+                      key={modelId}
+                      id={`${suggestionsId}-${index}`}
+                      type="button"
+                      role="option"
+                      aria-selected={index === highlightedIndex}
+                      tabIndex={-1}
+                      ref={(element) => {
+                        if (index === highlightedIndex)
+                          element?.scrollIntoView({ block: "nearest" });
+                      }}
+                      // Keep mouse selection in the input; do not cancel touch scrolling.
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        modelInputRef.current?.focus();
+                        handleAddModel(modelId);
+                      }}
+                      className={`hover:bg-hover block w-full truncate rounded-sm px-2 py-1 text-left font-mono text-xs ${index === highlightedIndex ? "bg-hover" : ""}`}
+                    >
+                      {modelId}
+                    </button>
+                  ))}
+                  {matchingModels.length > suggestions.length && (
+                    <div className="text-muted px-2 py-1 text-xs">
+                      Keep typing to narrow the list
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
             <Button
               type="button"
               size="sm"
-              onClick={handleAddModel}
+              onClick={() => handleAddModel()}
               disabled={!lastProvider || !newModelId.trim()}
               className="h-7 shrink-0 gap-1 px-2 text-xs"
             >
@@ -463,6 +677,15 @@ export function ModelsSection() {
               Add
             </Button>
           </div>
+          {discoveryMessage && (
+            <div
+              id={`${suggestionsId}-status`}
+              role="status"
+              className="text-muted px-2 py-1.5 text-xs md:px-3"
+            >
+              {discoveryMessage}
+            </div>
+          )}
           {error && !editing && (
             <div className="text-error px-2 py-1.5 text-xs md:px-3">{error}</div>
           )}

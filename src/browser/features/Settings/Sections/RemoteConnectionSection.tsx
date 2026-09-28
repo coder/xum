@@ -34,6 +34,7 @@ export function RemoteConnectionSection() {
   const [error, setError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [openingLocal, setOpeningLocal] = useState(false);
 
   useEffect(() => {
     if (!bridge) return;
@@ -98,6 +99,19 @@ export function RemoteConnectionSection() {
     }
   }
 
+  async function handleOpenLocalServer() {
+    if (!bridge || openingLocal) return;
+    setError(null);
+    setOpeningLocal(true);
+    try {
+      // An unavailable result explains itself through the bridge state (no server, another
+      // server's window, or a failed load), which the subscription above shows.
+      await bridge.openLocalServer();
+    } finally {
+      setOpeningLocal(false);
+    }
+  }
+
   async function handleDisconnect() {
     if (!bridge || !canDisconnect) return;
     setError(null);
@@ -116,6 +130,23 @@ export function RemoteConnectionSection() {
         <p className="text-muted mt-1 text-xs">
           Open a remote Xum server in a separate window. Your local workspaces and tasks keep
           running.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={() => {
+            handleOpenLocalServer().catch((cause: unknown) => setError(getErrorMessage(cause)));
+          }}
+          disabled={openingLocal || isConnecting || disconnecting}
+        >
+          {openingLocal ? "Opening…" : "Open local xum server"}
+        </Button>
+        <p className="text-muted text-xs">
+          Opens the <code>xum server</code> running on this Xum root and signs in with its token.
         </p>
       </div>
 
@@ -205,8 +236,11 @@ export function RemoteConnectionSection() {
         </p>
       )}
       <p className="text-muted text-xs">
-        Close the remote window to return here.
-        <span className="hidden md:inline"> You can also disconnect with {returnShortcut}.</span>
+        Close the remote window to disconnect.
+        <span className="hidden md:inline">
+          {" "}
+          In the remote window, {returnShortcut} also disconnects.
+        </span>
       </p>
     </section>
   );

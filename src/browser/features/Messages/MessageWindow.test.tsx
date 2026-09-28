@@ -3,14 +3,25 @@ import { afterEach, beforeEach, describe, expect, test, mock } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import type { MuxMessage } from "@/common/types/message";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealChatHostContextModule from "@/browser/contexts/ChatHostContext";
+import * as RealTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { MessageWindow } from "./MessageWindow";
 
+// The ChatHostContext stub is process-wide too; restore the real exports so
+// later suites keep their host UI support.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ChatHostContext", { ...RealChatHostContextModule }],
+]);
 void mock.module("@/browser/contexts/ChatHostContext", () => ({
   useChatHostContext: () => ({
     uiSupport: { jsonRawView: "unsupported" as const },
   }),
 }));
 
+// Bun module mocks are process-wide; the null content stub must not hide
+// tooltip content in later suites.
+restoreModulesAfterSuite([["@/browser/components/Tooltip/Tooltip", { ...RealTooltipModule }]]);
 void mock.module("@/browser/components/Tooltip/Tooltip", () => ({
   Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,

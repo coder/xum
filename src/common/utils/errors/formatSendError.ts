@@ -5,6 +5,7 @@
 
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import type { SendMessageError } from "@/common/types/errors";
+import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -80,6 +81,7 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
       };
 
     case "policy_denied":
+    case "task_checkout_unsanitized":
       return {
         message: error.message,
       };
@@ -89,9 +91,15 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
 
     case "context_budget_exceeded":
       return {
-        message: `Request for ${error.model} exceeds its usable context budget (${error.estimate} estimated tokens; ${error.hardCeiling} available).`,
+        message: `Estimated request for ${error.model} exceeds its usable context budget of ${error.hardCeiling} tokens.`,
         resolutionHint: "Shorten the request or choose a larger-context model.",
       };
+
+    case "history-changed":
+      return { message: EDIT_HISTORY_CHANGED_MESSAGE };
+
+    case "plan_review_feedback_edit_blocked":
+      return { message: error.message };
 
     case "unknown": {
       const raw = typeof error.raw === "string" ? error.raw.trim() : "";

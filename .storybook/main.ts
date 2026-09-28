@@ -1,6 +1,20 @@
 import type { StorybookConfig } from "@storybook/react-vite";
 import { mergeConfig } from "vite";
+import { readFileSync } from "fs";
 import path from "path";
+
+// The boot loader's CSS is inlined in index.html so the pre-JS placeholder paints styled, and
+// LoadingScreen (plus the update restart overlay built on it) reuses those classes. Lift the same
+// rules into the preview so stories render them faithfully without a second copy of the CSS.
+function bootLoaderStyles(): string {
+  const html = readFileSync(path.join(process.cwd(), "index.html"), "utf8");
+  const start = html.indexOf(".boot-loader {");
+  const end = html.indexOf("</style>", start);
+  if (start === -1 || end === -1) {
+    throw new Error("index.html no longer contains the inline .boot-loader styles");
+  }
+  return html.slice(start, end);
+}
 
 const config: StorybookConfig = {
   stories: [
@@ -9,6 +23,7 @@ const config: StorybookConfig = {
     "../src/browser/features/**/*.stories.@(ts|tsx)",
   ],
   addons: ["@storybook/addon-links", "@storybook/addon-docs"],
+  previewHead: (head) => `${head ?? ""}<style>${bootLoaderStyles()}</style>`,
   framework: {
     name: "@storybook/react-vite",
     options: {},

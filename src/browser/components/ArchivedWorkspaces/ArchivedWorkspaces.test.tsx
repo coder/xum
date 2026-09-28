@@ -12,7 +12,6 @@ import {
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as TooltipModule from "@/browser/components/Tooltip/Tooltip";
 import * as ForceDeleteModalModule from "@/browser/components/ForceDeleteModal/ForceDeleteModal";
@@ -35,18 +34,8 @@ import {
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
-
-function installTestDoubles() {
-  // Re-register the full WorkspaceStore mock before each test to avoid Bun's global mock leakage.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
-
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import type { Result } from "@/common/types/result";
 
 function stubPageChrome() {
   spyOn(AgentContextModule, "AgentProvider").mockImplementation((props) => <>{props.children}</>);
@@ -66,17 +55,25 @@ function stubPageChrome() {
   }));
 }
 
-function stubPageApi(list: APIClient["workspace"]["list"], getSessionUsageBatch: unknown) {
-  const api = {
+function stubPageApi(
+  list: APIClient["workspace"]["list"],
+  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"]
+) {
+  const api = createTestApiClient({
     workspace: {
       list,
       getSessionUsageBatch,
-      onMetadata: async function* () {
-        yield* await Promise.resolve([]);
-      },
+      onMetadata: () =>
+        Promise.resolve(
+          (async function* () {
+            yield* await Promise.resolve([]);
+          })()
+        ),
     },
-    projects: { listBranches: () => Promise.resolve({ branches: ["main"] }) },
-  } as unknown as APIClient;
+    projects: {
+      listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
+    },
+  });
   spyOn(APIModule, "useAPI").mockImplementation(() => ({
     api,
     status: "connected",
@@ -109,7 +106,9 @@ function createWorkspace(overrides: Partial<FrontendWorkspaceMetadata>): Fronten
 let cleanupDom: (() => void) | null = null;
 
 describe("ArchivedWorkspaces", () => {
-  const deleteWorktreeMock = mock(() => Promise.resolve({ success: true }));
+  const deleteWorktreeMock = mock(
+    (): Promise<Result<void>> => Promise.resolve({ success: true, data: undefined })
+  );
   const getSessionUsageBatchMock = mock(() => Promise.resolve({}));
   const unarchiveWorkspaceMock = mock(() => Promise.resolve({ success: true }));
   const removeWorkspaceMock = mock(
@@ -124,7 +123,6 @@ describe("ArchivedWorkspaces", () => {
 
   beforeEach(() => {
     modalProps = undefined;
-    installTestDoubles();
     cleanupDom = installDom();
     deleteWorktreeMock.mockClear();
     getSessionUsageBatchMock.mockClear();
@@ -135,12 +133,12 @@ describe("ArchivedWorkspaces", () => {
     localStorage.clear();
 
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
-      api: {
+      api: createTestApiClient({
         workspace: {
           deleteWorktree: deleteWorktreeMock,
           getSessionUsageBatch: getSessionUsageBatchMock,
         },
-      } as unknown as APIClient,
+      }),
       status: "connected",
       error: null,
       authenticate: () => undefined,
@@ -429,9 +427,12 @@ describe("ArchivedWorkspaces", () => {
     expect(removeWorkspaceMock.mock.calls.every((call) => call[1]?.force === true)).toBe(true);
   });
 
-  test("Shift-click requires descendant confirmation and forwards retry results", async () => {
+  test("Shift-click acknowledges reported descendants without a confirmation", async () => {
     const workspace = createWorkspace({ id: "parent", name: "parent" });
-    const descendants = [{ workspaceId: "child", title: "Child", active: false }];
+    const descendants = [
+      { workspaceId: "grandchild", title: "Grandchild", active: false },
+      { workspaceId: "child", title: "Child", active: false },
+    ];
     removeWorkspaceMock.mockResolvedValueOnce({
       success: false,
       error: "Confirm children",
@@ -449,24 +450,56 @@ describe("ArchivedWorkspaces", () => {
     fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
       shiftKey: true,
     });
-    await waitFor(() => expect(modalProps?.descendants).toEqual(descendants));
-    expect(removeWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id);
-    expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
-    if (!modalProps) throw new Error("Expected deletion confirmation");
+    await waitFor(() => expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1));
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(2);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(1, workspace.id);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, {
+      force: true,
+      acknowledgedDescendantIds: ["grandchild", "child"],
+    });
+    expect(modalProps).toBeUndefined();
+  });
+
+  test("Shift-click falls back to the modal when the acknowledged retry fails", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    const descendants = [{ workspaceId: "child", title: "Child", active: false }];
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Confirm children",
+      descendants,
+    });
     const retryFailure = {
       success: false,
       error: "Child starts running",
       descendants: [{ ...descendants[0], active: true }],
     };
     removeWorkspaceMock.mockResolvedValueOnce(retryFailure);
-    expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual(retryFailure);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+    await waitFor(() => expect(modalProps?.descendants).toEqual(retryFailure.descendants));
+    expect(modalProps?.error).toBe(retryFailure.error);
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(2);
     expect(removeWorkspaceMock).toHaveBeenLastCalledWith(workspace.id, {
       force: true,
       acknowledgedDescendantIds: ["child"],
     });
     expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
+    if (!modalProps) throw new Error("Expected deletion confirmation");
     expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual({ success: true });
+    expect(removeWorkspaceMock).toHaveBeenLastCalledWith(workspace.id, {
+      force: true,
+      acknowledgedDescendantIds: ["child"],
+    });
     expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
   });
 

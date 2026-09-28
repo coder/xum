@@ -1,6 +1,6 @@
 /**
- * Loop protection for intra-tree agent peer messaging: task_send_message sends whose target is
- * NOT the sender's descendant (siblings/cousins and ancestors, including the root workspace).
+ * Loop protection for instance-wide agent peer messaging: task_send_message sends whose target is
+ * NOT the sender's descendant (siblings/cousins, ancestors, or unrelated workspaces).
  * Parent→descendant guidance is unthrottled and unaffected by these constants.
  *
  * All counters live in-memory on TaskService (mirroring consecutiveAutoResumes): a restart clears
@@ -74,16 +74,58 @@ export function taskRecoveryPromptDedupeKey(taskId: string, kind: TaskRecoveryPr
 }
 
 /**
- * Max peer messages admitted for a target without any user-authored input or parent guidance in
- * between; at the cap the target is deemed to need user attention. Charged when a send is
- * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.
- */
-export const MAX_CONSECUTIVE_PEER_WAKES = 3;
-
-/**
  * Single retryable refusal for every admission path (direct/automatic sends, queued dispatch,
  * task resume, recovery, queued launch) while a stop cascade holds a workspace's latch. The
  * latch drops once the stopped execution has settled; callers may simply retry afterwards.
  */
 export const WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE =
   "A stop is in progress for this workspace; retry once it has settled.";
+
+/**
+ * Refusal for a send that would continue an agent-task attempt whose settlement has begun or
+ * completed (idle stop, terminal failure, launch failure). Not retryable as a continuation: an
+ * intentional resume is a new attempt (user resume, task_send_message reawaken), which mints a
+ * fresh attempt id and is admitted on its own.
+ */
+export const TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE =
+  "This sub-agent's current attempt has settled; resume it explicitly to start a new attempt.";
+
+/**
+ * Stable refusal for every admission of an attempt a workflow retired (taskAttemptRetiredBy):
+ * reawaken, reactivation, startup re-drive and queue launch all surface exactly this text.
+ */
+export function retiredAttemptMessage(claim: { runId: string; stepId: string }): string {
+  return `This sub-agent's attempt was retired by workflow run ${claim.runId} (step ${claim.stepId}); start a new task instead.`;
+}
+
+/** Refusal for every task admission while a backend is removing the workspace (pendingRemoval). */
+export function pendingRemovalAdmissionMessage(marker: { pid: number }): string {
+  return `This workspace is being removed (by Xum process ${marker.pid}); nothing was sent.`;
+}
+
+/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
+export const SEND_ADMISSION_STALE_MESSAGE =
+  "Send refused: the target was stopped or interrupted while the message was being admitted.";
+
+/**
+ * A manual send whose reawaken of a stopped or reported sub-agent lost its identity CAS: another
+ * send (another backend's resume) reawakened it first. Nothing was sent.
+ */
+export const TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE =
+  "Send refused: this sub-agent was resumed by another send at the same time; nothing was sent. Try again.";
+
+/**
+ * A message queued into a sub-agent while its last turn streamed, refused at dispatch because
+ * that turn turned out to be the task's terminal report. The session keeps it as held input;
+ * sending it again is a new, normally admitted send that starts a fresh attempt.
+ */
+export const TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE =
+  "The sub-agent completed its report before this queued message could run; it was not sent and is kept as an unsent message.";
+
+/** As above, when the report's outcome could not be established (handler failure, partial artifact). */
+export const TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE =
+  "The sub-agent's report outcome could not be determined; this queued message was not sent and is kept as an unsent message.";
+
+/** Bound on-demand instance discovery without growing the default task list. */
+export const INSTANCE_DISCOVERY_DEFAULT_LIMIT = 20;
+export const INSTANCE_DISCOVERY_MAX_LIMIT = 100;

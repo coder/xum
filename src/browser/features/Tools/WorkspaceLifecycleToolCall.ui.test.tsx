@@ -99,7 +99,11 @@ describe("WorkspaceLifecycleToolCall", () => {
       <WorkspaceLifecycleToolCall
         args={{
           action: "archive",
-          targets: [{ workspaceId: "ws-confirm" }, { workspaceId: "ws-active" }],
+          targets: [
+            { workspaceId: "ws-confirm" },
+            { workspaceId: "ws-active" },
+            { workspaceId: "ws-refused" },
+          ],
         }}
         status="completed"
         defaultExpanded
@@ -117,14 +121,23 @@ describe("WorkspaceLifecycleToolCall", () => {
               workspaceId: "ws-active",
               activeTaskIds: ["wst_running01"],
             },
+            {
+              status: "error",
+              action: "archive",
+              workspaceId: "ws-refused",
+              paths: ["notes/draft.md"],
+              error: "lossy snapshot archive refused",
+            },
           ],
         }}
       />
     );
-    // Conditional detail branches: the untracked path and the active turn id (both data,
-    // not copy) render only because the rows have those fields.
+    // Conditional detail branches: the untracked paths and the active turn id (all data,
+    // not copy) render only because the rows have those fields; the lossy-archive refusal
+    // (an "error" row) must still show the files that block the archive.
     expect(view.queryByText("src/scratch.local.ts")).not.toBeNull();
     expect(view.queryByText("wst_running01")).not.toBeNull();
+    expect(view.queryByText("notes/draft.md")).not.toBeNull();
   });
 
   test("renders captured workspace display name while keeping identifiers visible", () => {

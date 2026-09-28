@@ -22,6 +22,7 @@ import {
   TurnRequestBuilder,
   assembleBudgetCheckedPromptPayload,
   prepareProviderRequestMessages,
+  resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type PrepareModelAttemptOptions,
 } from "./turnRequestBuilder";
@@ -566,5 +567,66 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     } finally {
       await harness.cleanup();
     }
+  });
+});
+
+describe("resolveMuxProjectRootForHostFs", () => {
+  const projectPath = "/home/user/projects/my-app";
+  const workspacePath = "/home/user/.mux/src/my-app/feature-branch";
+
+  function createMetadata(runtimeConfig: WorkspaceMetadata["runtimeConfig"]): WorkspaceMetadata {
+    return {
+      id: "workspace-id",
+      name: "feature-branch",
+      projectName: "my-app",
+      projectPath,
+      runtimeConfig,
+    };
+  }
+
+  it("returns workspacePath for local runtime", () => {
+    expect(resolveMuxProjectRootForHostFs(createMetadata({ type: "local" }), workspacePath)).toBe(
+      workspacePath
+    );
+  });
+
+  it("returns workspacePath for worktree runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "worktree", srcBaseDir: "/home/user/.mux/src" }),
+        workspacePath
+      )
+    ).toBe(workspacePath);
+  });
+
+  it("returns workspacePath for devcontainer runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "devcontainer", configPath: ".devcontainer/devcontainer.json" }),
+        workspacePath
+      )
+    ).toBe(workspacePath);
+  });
+
+  it("returns projectPath for ssh runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({
+          type: "ssh",
+          host: "remote",
+          srcBaseDir: "/home/remote/.mux/src",
+        }),
+        "/remote/workspace/path"
+      )
+    ).toBe(projectPath);
+  });
+
+  it("returns projectPath for docker runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "docker", image: "ubuntu:22.04" }),
+        "/src"
+      )
+    ).toBe(projectPath);
   });
 });

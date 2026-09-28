@@ -1,8 +1,8 @@
-import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { createActivityFeed } from "./mocks/activityFeed";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
 import type { ProjectConfig } from "@/common/types/project";
@@ -115,50 +115,6 @@ async function finishReplayWithoutLayoutShift(
   await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
 }
 
-type ActivitySubscribe = ReturnType<
-  typeof createMockORPCClient
->["workspace"]["activity"]["subscribe"];
-interface ActivityEvent {
-  type: "activity";
-  workspaceId: string;
-  activity: WorkspaceActivitySnapshot | null;
-}
-
-// Background activity snapshots (the always-on per-workspace subscription) queue through
-// `emit` and stay deliverable until the store aborts; client swaps between stories must
-// release the previous subscription, so the iterator also ends on abort.
-function createActivityFeed(): {
-  subscribe: ActivitySubscribe;
-  emit: (workspaceId: string, activity: WorkspaceActivitySnapshot) => void;
-} {
-  const queued: ActivityEvent[] = [];
-  let wake: (() => void) | null = null;
-  const subscribe: ActivitySubscribe = (_input, options) => {
-    async function* iterate() {
-      while (!options?.signal?.aborted) {
-        const next = queued.shift();
-        if (next) {
-          yield next;
-          continue;
-        }
-        await new Promise<void>((resolve) => {
-          wake = resolve;
-          options?.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-        wake = null;
-      }
-    }
-    return Promise.resolve(wrapAsyncIterator(iterate(), {}));
-  };
-  return {
-    subscribe,
-    emit: (workspaceId, activity) => {
-      queued.push({ type: "activity", workspaceId, activity });
-      wake?.();
-    },
-  };
-}
-
 function createHydrationStory(workspaceId: string): AppStory {
   const workspace = createWorkspace({
     id: workspaceId,
@@ -232,6 +188,7 @@ function createHydrationStory(workspaceId: string): AppStory {
             emit(history);
             emit({
               type: "caught-up",
+              historyReplayStatus: "complete",
               hasOlderHistory: false,
               cursor: { history: { messageId: history.id, historySequence: 1 } },
             });
@@ -242,7 +199,7 @@ function createHydrationStory(workspaceId: string): AppStory {
               historySequence: 1,
             })
           );
-          emit({ type: "caught-up", hasOlderHistory: false });
+          emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
         }
       },
     });
@@ -268,7 +225,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         hadAnyOutput: false,
       });
       // An active turn does not mean history has loaded: the skeleton keeps holding the
-      // empty transcript while the barrier renders below it, and the dock shimmer only
+      // empty transcript while the barrier stays docked, and the dock shimmer only
       // appears when the skeleton is absent.
       await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
       await checkTranscriptLayout(canvasElement);
@@ -299,6 +256,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       emitChat(history);
       emitChat({
         type: "caught-up",
+        historyReplayStatus: "complete",
         hasOlderHistory: false,
         cursor: { history: { messageId: history.id, historySequence: 1 } },
       });
@@ -339,6 +297,7 @@ function createHydrationStory(workspaceId: string): AppStory {
           emitChat(history);
           emitChat({
             type: "caught-up",
+            historyReplayStatus: "complete",
             replay: "since",
             hasOlderHistory: false,
             cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -397,6 +356,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       emitChat(history);
       emitChat({
         type: "caught-up",
+        historyReplayStatus: "complete",
         replay: "since",
         hasOlderHistory: false,
         cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -428,7 +388,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier renders below the replay skeleton", async () => {
+    await step("A monitor barrier stays docked beside the replay skeleton", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
@@ -457,6 +417,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         emitTranscript(history);
         emitTranscript({
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "since",
           hasOlderHistory: false,
           cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -467,14 +428,15 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
-      "Switching back to a workspace that streamed in the background shows the skeleton, not cached rows",
+      "Switching back to a workspace that streamed in the background keeps cached rows painted during the since replay",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
         await expect(
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         // A new turn started while this workspace was unsubscribed from onChat: the cached
-        // rows are missing that content, so they must not paint and then jump on caught-up.
+        // rows are missing that content, but the since replay mostly appends after the
+        // server-verified cursor, so they stay painted with the dock shimmer (#4505).
         emitActivity(workspace.id, {
           recency: STABLE_TIMESTAMP + 1,
           streaming: true,
@@ -486,12 +448,13 @@ function createHydrationStory(workspaceId: string): AppStory {
         await waitFor(() => expect(subscriptions).toBe(4));
         await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
         await checkTranscriptLayout(canvasElement);
-        await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
-        await expect(canvas.queryByText("Previously loaded response.")).toBeNull();
-        await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.getByTestId("transcript-loading-status")).toBeVisible();
         emitChat(history);
         emitChat({
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "since",
           hasOlderHistory: false,
           cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -594,6 +557,143 @@ export const InitialLoadingPhone: AppStory = {
   },
 };
 
+// Live controls must not follow the skeleton's arbitrary height, short history, or
+// streaming growth. Compare real screen coordinates, including every reveal frame.
+function createStreamingHydrationStory(workspaceId: string): AppStory {
+  const workspace = createWorkspace({
+    id: workspaceId,
+    name: "streaming-replay",
+    projectName: "xum",
+  });
+  let emitChat: (event: WorkspaceChatMessage) => void;
+  function setup() {
+    selectWorkspace(workspace);
+    collapseLeftSidebar();
+    collapseRightSidebar();
+    return createMockORPCClient({
+      projects: groupWorkspacesByProject([workspace]),
+      workspaces: [workspace],
+      onChat: (_workspaceId, emit) => {
+        emitChat = emit;
+      },
+    });
+  }
+  return {
+    render: () => <AppWithMocks setup={setup} />,
+    play: async ({ canvasElement, step }) => {
+      const canvas = within(canvasElement);
+      await waitFor(() => expect(typeof emitChat).toBe("function"));
+      await checkTranscriptLayout(canvasElement);
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      emitChat({ type: "stream-lifecycle", workspaceId, phase: "preparing", hadAnyOutput: false });
+      const stop = await canvas.findByRole("button", { name: "Stop streaming" });
+      const status = await canvas.findByText(/starting\.\.\./);
+      const scrollport = canvas.getByTestId("message-window");
+      const position = () => ({
+        statusLeft: status.getBoundingClientRect().left,
+        statusTop: status.getBoundingClientRect().top,
+        stopRight: stop.getBoundingClientRect().right,
+        stopTop: stop.getBoundingClientRect().top,
+      });
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      );
+      const before = position();
+      const checkPosition = async () => {
+        await expect(position()).toEqual(before);
+        await expect(stop.getBoundingClientRect().right).toBeLessThanOrEqual(
+          scrollport.getBoundingClientRect().right
+        );
+        await expect(status.getBoundingClientRect().left).toBeGreaterThanOrEqual(
+          scrollport.getBoundingClientRect().left
+        );
+        await expect(stop.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+          scrollport.getBoundingClientRect().bottom
+        );
+      };
+      await step("Skeleton and short history share the same live-control position", async () => {
+        await checkPosition();
+        const frames: Array<ReturnType<typeof position>> = [];
+        let frame = 0;
+        const sample = () => {
+          frames.push(position());
+          frame = requestAnimationFrame(sample);
+        };
+        frame = requestAnimationFrame(sample);
+        try {
+          emitChat(createAssistantMessage("history", "Replayed response.", { historySequence: 1 }));
+          emitChat({
+            type: "stream-start",
+            workspaceId,
+            messageId: "stream",
+            model: DEFAULT_MODEL,
+            historySequence: 2,
+            startTime: STABLE_TIMESTAMP,
+          });
+          emitChat({ type: "caught-up", hasOlderHistory: false, historyReplayStatus: "complete" });
+          await expect(await canvas.findByText("Replayed response.")).toBeVisible();
+          await waitFor(() => expect(scrollport).toHaveAttribute("data-loaded", "true"));
+          await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+          );
+          await checkPosition();
+          for (const sample of frames) await expect(sample).toEqual(before);
+        } finally {
+          cancelAnimationFrame(frame);
+        }
+      });
+      await step("Growing output and scrolling history leave Stop in place", async () => {
+        emitChat({
+          type: "stream-delta",
+          workspaceId,
+          messageId: "stream",
+          delta: Array.from({ length: 30 }, (_, i) => "Streaming paragraph " + (i + 1) + ".").join(
+            "\n\n"
+          ),
+          tokens: 10000,
+          timestamp: STABLE_TIMESTAMP,
+        });
+        await expect(
+          await canvas.findByText(/Streaming paragraph 30\./, {}, { timeout: 10000 })
+        ).toBeVisible();
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        );
+        await checkPosition();
+        scrollport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+        scrollport.scrollTop = 0;
+        scrollport.dispatchEvent(new Event("scroll"));
+        await expect(await canvas.findByRole("button", { name: /Jump to bottom/ })).toBeVisible();
+        await checkPosition();
+        await userEvent.click(canvas.getByRole("button", { name: /Jump to bottom/ }));
+      });
+    },
+  };
+}
+
+export const StreamingHydration: AppStory = {
+  ...createStreamingHydrationStory("ws-streaming-hydration"),
+  globals: { viewport: { value: "laptop", isRotated: false } },
+  parameters: {
+    ...Replay.parameters,
+    viewport: {
+      options: {
+        laptop: { name: "Laptop", styles: { width: "1200px", height: "900px" }, type: "desktop" },
+      },
+    },
+  },
+};
+
+const phoneStreamingHydration = createStreamingHydrationStory("ws-streaming-hydration-phone");
+export const StreamingHydrationPhone: AppStory = {
+  ...Phone,
+  ...phoneStreamingHydration,
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await phoneStreamingHydration.play!(context);
+  },
+};
+
 // Sending the first message shows nothing on the project page beyond a locked composer; the new
 // workspace opens with the message and the creation card and keeps both until the backend
 // persists them.
@@ -643,7 +743,12 @@ function createCreationPendingStory(): AppStory {
           isError: false,
           timestamp: STABLE_TIMESTAMP,
         });
-        emit({ type: "caught-up", replay: "full", hasOlderHistory: false });
+        emit({
+          type: "caught-up",
+          historyReplayStatus: "complete",
+          replay: "full",
+          hasOlderHistory: false,
+        });
       },
     });
     client.nameGeneration.generate = async () => {

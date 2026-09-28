@@ -82,20 +82,36 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
   coderOauth: z.record(z.string(), z.unknown()).optional(),
   /**
    * Model IDs discovered from the deployment's AI Bridge catalogs (written by
-   * coderOauthService only). Doubles as the authoritative-catalog marker for
-   * gateway routing (see gatewayModelCatalog.ts) and as the bookkeeping that
-   * separates discovered entries from manually added ones in `models`, so
-   * user-managed entries survive re-logins and catalog refreshes.
+   * coderOauthService only). The ONLY place the catalog is persisted, and the
+   * authoritative-catalog marker for gateway routing (see
+   * gatewayModelCatalog.ts): present = known, absent = unknown (fail open).
+   * Discovery never copies these into `models`; Settings offers them in an
+   * "add model" dropdown so the user adds the few they want.
    */
   discoveredModels: z.array(z.string()).optional(),
   /**
-   * Model IDs the user removed from the model list (discovered or not —
-   * catalog provenance is lossy across re-logins, so every deletion is
-   * recorded). User-managed exclusions: catalog refreshes and re-logins must
-   * not resurrect them (maintained by ProviderService.setModels, honored by
-   * discovery merges).
+   * Legacy routing tombstones: model IDs the user deleted from the model
+   * list while discovery still merged the catalog into `models`. Deleting a
+   * merged catalog model was the only way to route it directly, so routing
+   * keeps honoring these (see gatewayModelCatalog.ts). Never written anymore;
+   * re-adding a model under Settings → Models clears its tombstone
+   * (ProviderService.applyCoderModelEdit).
    */
   removedModels: z.array(z.string()).optional(),
+  /**
+   * Marks that `models` holds only user-managed entries. Set by every
+   * new-code writer of the section's model bookkeeping (catalog refresh —
+   * conclusive or inconclusive —, login commit, disconnect, Settings → Models
+   * edits) and by the one-shot startup migration
+   * (coderOauthService.separateDiscoveredModelsOnce).
+   * Before this flag existed, discovery merged the catalog into `models`.
+   * Invariant that keeps explicit adds safe: a catalog marker
+   * (`discoveredModels`/`staleDiscoveredModels`) WITHOUT this flag can only
+   * have been written by old code, whose `models` list is a merge by
+   * construction — so the migration strips catalog-derived plain entries
+   * exactly once and can never strip an entry the user added afterwards.
+   */
+  discoveredModelsUnlisted: z.boolean().optional(),
   /**
    * AI Gateway provider instances discovered from the deployment (written by
    * coderOauthService only). `name` is the gateway route segment and model ID

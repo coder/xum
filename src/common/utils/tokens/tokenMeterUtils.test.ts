@@ -100,8 +100,8 @@ describe("calculateTokenMeterData", () => {
       },
     });
 
-    expect(result.maxTokens).toBe(372_000);
-    expect(result.totalPercentage).toBeCloseTo((11_000 / 372_000) * 100);
+    expect(result.maxTokens).toBe(272_000);
+    expect(result.totalPercentage).toBeCloseTo((11_000 / 272_000) * 100);
   });
 
   test("uses Claude Sonnet 4.6's native 1M context even when the beta toggle is off", () => {

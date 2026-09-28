@@ -1,9 +1,9 @@
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
-import CRC32 from "crc-32";
+import { createHash, hash } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import { getAvailableTools, getToolSchemas } from "@/common/utils/tools/toolDefinitions";
-import type { CountTokensInput } from "./tokenizer.worker";
+import type { CountTokensBatchInput, EncodingName } from "./tokenizer.worker";
 import { models, type ModelName } from "ai-tokenizer";
 import { run } from "./workerPool";
 import { TOKENIZER_MODEL_OVERRIDES, DEFAULT_WARM_MODELS } from "@/common/constants/knownModels";
@@ -119,10 +119,18 @@ function resolveModelName(modelString: string): ModelName {
   return modelName;
 }
 
+// Each encoding has its own worker, so requests are routed by the model's encoding.
+function encodingOf(modelName: ModelName): EncodingName {
+  const model = models[modelName];
+  assert(model, `Unknown tokenizer model '${modelName}'`);
+  return model.encoding;
+}
+
 function resolveEncoding(modelName: ModelName): Promise<string> {
   let promise = encodingPromises.get(modelName);
   if (!promise) {
-    promise = run<string>("encodingName", modelName)
+    // run() spawns the encoding's worker on first use; "ready" answers once the encoding is loaded.
+    promise = run<string>(encodingOf(modelName), "ready", modelName)
       .then((result: unknown) => {
         assert(
           typeof result === "string" && result.length > 0,
@@ -139,9 +147,107 @@ function resolveEncoding(modelName: ModelName): Promise<string> {
   return promise;
 }
 
+// ES2024 String method; the repo's TS lib (ES2023) does not declare it, but Node and Bun ship it.
+type MaybeWellFormedString = string & { isWellFormed(): boolean };
+
+// One-shot crypto.hash was measured faster than CRC32 (#4654) but only exists from Node 20.12;
+// the headless CLI still accepts any Node 20, so fall back to the streaming API there.
+const sha256Base64: (data: string | Buffer) => string =
+  typeof hash === "function"
+    ? (data) => hash("sha256", data, "base64")
+    : (data) => createHash("sha256").update(data).digest("base64");
+
 function buildCacheKey(modelName: ModelName, text: string): string {
-  const checksum = CRC32.str(text);
-  return `${modelName}:${checksum}:${text.length}`;
+  // The old `CRC32:length` key collided for distinct texts of equal length (17 in a 1.24M-row
+  // chat), so a text could reuse another text's count, and which one won depended on timing
+  // (#4654). A SHA-256 digest is collision-resistant, keeps each of the 250k LRU keys at a
+  // fixed 44 chars (keying by the text itself would retain whole chat contents), and the
+  // native one-shot hash measured faster than the JS CRC32 on that chat.
+  // crypto.hash UTF-8-encodes strings, which maps every lone surrogate to U+FFFD. Hash the
+  // raw UTF-16 code units for such (rare) texts so they cannot share a key with other texts.
+  const digest = (text as MaybeWellFormedString).isWellFormed()
+    ? sha256Base64(text)
+    : `u16:${sha256Base64(Buffer.from(text, "utf16le"))}`;
+  return `${modelName}:${digest}`;
+}
+
+// Uncached texts are sent to the worker in batches, because one message per text cost a
+// postMessage round trip plus a reply handler each, which dominated counting on a 1.24M-row chat
+// (#4653). A batch flushes at 64 texts or 64K chars, or at the next microtask so a lone count is
+// not delayed. A 512-text cap lost worker pipelining on ordinary chats (+11/+19 ms at p50/p90 of
+// real sessions); 64 texts / 64K chars kept those at the noise floor and was as fast on the huge
+// chat, since the worker starts counting the first batch while later ones are still being built.
+const MAX_BATCH_TEXTS = 64;
+const MAX_BATCH_CHARS = 64 * 1024;
+
+interface OpenBatch {
+  modelName: ModelName;
+  inputs: string[];
+  pending: Array<{ key: string; resolve: (count: number) => void; reject: (e: unknown) => void }>;
+  chars: number;
+}
+
+let openBatch: OpenBatch | null = null;
+
+function flushOpenBatch(): void {
+  const batch = openBatch;
+  assert(batch !== null && batch.inputs.length > 0, "flushOpenBatch requires a non-empty batch");
+  openBatch = null;
+
+  const payload: CountTokensBatchInput = { modelName: batch.modelName, inputs: batch.inputs };
+  // The chain ends in a handler that settles every text, so it can never reject unhandled.
+  run<number[]>(encodingOf(batch.modelName), "countTokensBatch", payload)
+    .then((counts: unknown) => {
+      // Validate every count before settling any, so a bad reply rejects the whole batch.
+      assert(
+        Array.isArray(counts) && counts.length === batch.pending.length,
+        "Tokenizer worker must return one count per batched input"
+      );
+      for (const count of counts) {
+        assert(
+          typeof count === "number" && Number.isInteger(count) && count >= 0,
+          "Tokenizer must return a non-negative integer token count"
+        );
+      }
+      batch.pending.forEach((entry, index) => {
+        const count = counts[index] as number;
+        tokenCountCache.set(entry.key, count);
+        inFlightCounts.delete(entry.key);
+        entry.resolve(count);
+      });
+    })
+    .catch((error: unknown) => {
+      // Drop in-flight entries so a failed batch does not poison later counts of the same text.
+      for (const entry of batch.pending) {
+        inFlightCounts.delete(entry.key);
+        entry.reject(error);
+      }
+    });
+}
+
+function enqueueCount(modelName: ModelName, key: string, text: string): Promise<number> {
+  if (openBatch !== null && openBatch.modelName !== modelName) {
+    flushOpenBatch();
+  }
+  if (openBatch === null) {
+    const batch: OpenBatch = { modelName, inputs: [], pending: [], chars: 0 };
+    openBatch = batch;
+    queueMicrotask(() => {
+      if (openBatch === batch) {
+        flushOpenBatch();
+      }
+    });
+  }
+  const batch = openBatch;
+  const promise = new Promise<number>((resolve, reject) => {
+    batch.pending.push({ key, resolve, reject });
+  });
+  batch.inputs.push(text);
+  batch.chars += text.length;
+  if (batch.inputs.length >= MAX_BATCH_TEXTS || batch.chars >= MAX_BATCH_CHARS) {
+    flushOpenBatch();
+  }
+  return promise;
 }
 
 async function countTokensInternal(modelName: ModelName, text: string): Promise<number> {
@@ -158,47 +264,30 @@ async function countTokensInternal(modelName: ModelName, text: string): Promise<
 
   let pending = inFlightCounts.get(key);
   if (!pending) {
-    const payload: CountTokensInput = { modelName, input: text };
-    pending = run<number>("countTokens", payload)
-      .then((value: unknown) => {
-        assert(
-          typeof value === "number" && Number.isFinite(value) && value >= 0,
-          "Tokenizer must return a non-negative finite token count"
-        );
-        tokenCountCache.set(key, value);
-        inFlightCounts.delete(key);
-        return value;
-      })
-      .catch((error) => {
-        inFlightCounts.delete(key);
-        throw error;
-      });
+    pending = enqueueCount(modelName, key, text);
     inFlightCounts.set(key, pending);
   }
   return pending;
 }
 
-export function loadTokenizerModules(
+export async function loadTokenizerModules(
   modelsToWarm: string[] = Array.from(DEFAULT_WARM_MODELS)
 ): Promise<Array<PromiseSettledResult<string>>> {
-  if (shouldUseApproxTokenizer()) {
-    const fulfilled: Array<PromiseFulfilledResult<string>> = modelsToWarm.map(() => ({
-      status: "fulfilled",
-      value: APPROX_ENCODING,
-    }));
-    return Promise.resolve(fulfilled);
-  }
-
-  return Promise.allSettled(
-    modelsToWarm.map((modelString) => {
-      const modelName = normalizeModelKey(modelString);
-      // Skip unknown models during warmup
-      if (!modelName) {
-        return Promise.reject(new Error(`Unknown model: ${modelString}`));
-      }
-      return resolveEncoding(modelName);
-    })
+  const startTime = Date.now();
+  // Same resolution as counting (overrides, provider fallbacks), so warm-up builds exactly the
+  // tokenizer the first real count will use. Distinct encodings load in parallel workers.
+  // The async wrapper turns a synchronous resolution assertion (e.g. an empty id) into a
+  // rejection of that entry only.
+  const results = await Promise.allSettled(
+    modelsToWarm.map(async (model) => (await getTokenizerForModel(model)).encoding)
   );
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      log.warn(`Failed to warm tokenizer for '${modelsToWarm[index]}':`, result.reason);
+    }
+  });
+  log.debug(`Warmed ${modelsToWarm.length} tokenizer model(s) in ${Date.now() - startTime}ms`);
+  return results;
 }
 
 export async function getTokenizerForModel(

@@ -2,12 +2,11 @@ import type { TurnStreamHandle } from "./streamManager";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
-import { AgentSession } from "./agentSession";
+import type { AgentSession, AgentSessionAIService } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { createMuxMessage } from "@/common/types/message";
@@ -21,7 +20,12 @@ import {
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
-import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionAIServiceFake,
+  createAgentSessionHarness,
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+} from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
 const SEND_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o", agentId: "exec" };
@@ -31,7 +35,7 @@ interface SessionHarness {
   session: AgentSession;
   goalService: WorkspaceGoalService;
   extensionMetadata: ExtensionMetadataService;
-  aiService: AIService & EventEmitter;
+  aiService: AgentSessionAIService & EventEmitter;
   analytics: { recordGoalLifecycleEvent: ReturnType<typeof mock> };
   cleanup: () => Promise<void>;
 }
@@ -51,32 +55,31 @@ async function setGoalOk(
 function createAiService(
   workspaceId: string,
   getClosingSignal: () => AbortSignal
-): AIService & EventEmitter {
-  const aiEmitter = new EventEmitter();
-  return Object.assign(aiEmitter, {
-    isStreaming: mock((_workspaceId: string) => false),
-    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) =>
-      Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
-    ),
-    getStreamInfo: mock((_workspaceId: string) => null),
-    getProvidersConfig: mock(() => null),
-    getWorkspaceMetadata: mock((_workspaceId: string) =>
-      Promise.resolve(
-        Ok({
-          id: workspaceId,
-          name: workspaceId,
-          projectName: "project",
-          projectPath: PROJECT_PATH,
-          runtimeConfig: { type: "local" },
-        })
-      )
-    ),
-    replayStream: mock((_workspaceId: string) => Promise.resolve()),
-  }) as unknown as AIService & EventEmitter;
+): AgentSessionAIService & EventEmitter {
+  return createAgentSessionAIServiceFake({
+    overrides: {
+      streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
+      ),
+      getWorkspaceMetadata: mock((_workspaceId: string) =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: workspaceId,
+            projectName: "project",
+            projectPath: PROJECT_PATH,
+            runtimeConfig: { type: "local" as const },
+          })
+        )
+      ),
+    },
+  });
 }
 
-async function createSessionHarness(workspaceId: string): Promise<SessionHarness> {
+async function createSessionHarness(
+  workspaceId: string,
+  options?: { hasExternalSendPreflight?: () => boolean }
+): Promise<SessionHarness> {
   const { historyService, config, cleanup } = await createTestHistoryService();
   await config.addWorkspace(PROJECT_PATH, {
     id: workspaceId,
@@ -105,7 +108,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
   } as unknown as BackgroundProcessManager;
 
   const aiService = createAiService(workspaceId, () => session.closingSignal);
-  const session = new AgentSession({
+  const { session } = await createAgentSessionHarness({
     workspaceId,
     config,
     historyService,
@@ -113,6 +116,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,
+    hasExternalSendPreflight: options?.hasExternalSendPreflight,
   });
 
   return { historyService, session, goalService, extensionMetadata, aiService, analytics, cleanup };
@@ -342,9 +346,7 @@ describe("AgentSession goal safety hooks", () => {
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     sendSpy.mockRestore();
 
     // Vetoed: nothing dispatched, and the stale follow-up was cleared so it
@@ -399,9 +401,7 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     buildSpy.mockRestore();
 
     expect(dispatched).toBe(false);
@@ -428,8 +428,11 @@ describe("AgentSession goal safety hooks", () => {
     // counted in preflight without queueing or holding the turn phase. The
     // entry idle check must consult the injected probe.
     const workspaceId = "compaction-followup-service-preflight";
-    const { session, goalService, historyService, cleanup } =
-      await createSessionHarness(workspaceId);
+    let preflightActive = false;
+    const { session, goalService, historyService, cleanup } = await createSessionHarness(
+      workspaceId,
+      { hasExternalSendPreflight: () => preflightActive }
+    );
     cleanups.push(cleanup);
     const created = await setGoalOk(goalService, { workspaceId, objective: "Preflight race" });
     const summary = createMuxMessage(
@@ -450,15 +453,12 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
     expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
-    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
-      () => true;
+    preflightActive = true;
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(false);
     expect(sendSpy).not.toHaveBeenCalled();
@@ -477,8 +477,11 @@ describe("AgentSession goal safety hooks", () => {
     // the entry sample, during the awaited goal read — the live probe carried
     // through the send-admission gates must observe it.
     const workspaceId = "compaction-followup-preflight-mid-read";
-    const { session, goalService, historyService, cleanup } =
-      await createSessionHarness(workspaceId);
+    let preflightActive = false;
+    const { session, goalService, historyService, cleanup } = await createSessionHarness(
+      workspaceId,
+      { hasExternalSendPreflight: () => preflightActive }
+    );
     cleanups.push(cleanup);
     const created = await setGoalOk(goalService, { workspaceId, objective: "Late preflight" });
     const summary = createMuxMessage(
@@ -500,9 +503,6 @@ describe("AgentSession goal safety hooks", () => {
     );
     expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
 
-    let preflightActive = false;
-    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
-      () => preflightActive;
     const realBuild = goalService.buildGoalRedispatchAdmission.bind(goalService);
     const buildSpy = spyOn(goalService, "buildGoalRedispatchAdmission").mockImplementationOnce(
       async (...args: Parameters<typeof realBuild>) => {
@@ -512,9 +512,7 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     buildSpy.mockRestore();
 
     expect(dispatched).toBe(false);
@@ -578,9 +576,7 @@ describe("AgentSession goal safety hooks", () => {
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(true);
     expect(sendSpy).toHaveBeenCalledTimes(1);
@@ -620,9 +616,7 @@ describe("AgentSession goal safety hooks", () => {
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(false);
     expect(sendSpy).not.toHaveBeenCalled();
@@ -732,9 +726,7 @@ describe("AgentSession goal safety hooks", () => {
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     sendSpy.mockRestore();
 
     expect(dispatched).toBe(false);
@@ -1042,7 +1034,7 @@ describe("AgentSession goal safety hooks", () => {
       goal: { costCents: 0, budgetCents: 1_000 },
     });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       aiService.emit("stream-start", {
         type: "stream-start",
         workspaceId,
@@ -1061,7 +1053,7 @@ describe("AgentSession goal safety hooks", () => {
           createFailedTurnHandle("assistant-stream-error", { error: "boom", errorType: "unknown" })
         )
       );
-    }) as unknown as AIService["streamMessage"];
+    });
     const eventTypes: string[] = [];
     session.onChatEvent((event) => {
       eventTypes.push(event.message.type);
@@ -1206,7 +1198,7 @@ describe("AgentSession goal safety hooks", () => {
   // or cooldown gates intervene.
 
   function emitStreamEnd(
-    aiService: AIService & EventEmitter,
+    aiService: AgentSessionAIService & EventEmitter,
     workspaceId: string,
     messageId: string,
     parts: StreamEndEvent["parts"],
@@ -1245,12 +1237,12 @@ describe("AgentSession goal safety hooks", () => {
     cleanups.push(cleanup);
     await setGoalOk(goalService, { workspaceId, objective: "Wrap things up" });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const handle = emitStreamEnd(aiService, workspaceId, "assistant-silent", [
         { type: "text", text: "I believe everything is done already." },
       ]);
       return Promise.resolve(Ok(handle));
-    }) as unknown as AIService["streamMessage"];
+    });
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
       synthetic: true,
@@ -1284,7 +1276,7 @@ describe("AgentSession goal safety hooks", () => {
     cleanups.push(cleanup);
     await setGoalOk(goalService, { workspaceId, objective: "Keep working" });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const handle = emitStreamEnd(aiService, workspaceId, "assistant-acted", [
         { type: "text", text: "Let me check the file first." },
         {
@@ -1297,7 +1289,7 @@ describe("AgentSession goal safety hooks", () => {
         },
       ]);
       return Promise.resolve(Ok(handle));
-    }) as unknown as AIService["streamMessage"];
+    });
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
       synthetic: true,
@@ -1317,12 +1309,12 @@ describe("AgentSession goal safety hooks", () => {
     cleanups.push(cleanup);
     await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const handle = emitStreamEnd(aiService, workspaceId, "assistant-text-only", [
         { type: "text", text: "Just thinking out loud." },
       ]);
       return Promise.resolve(Ok(handle));
-    }) as unknown as AIService["streamMessage"];
+    });
 
     // Manual user messages now pause active goals because the goal mode is
     // locked to the latest user message kind. The point of this test is that
@@ -1351,7 +1343,7 @@ describe("AgentSession goal safety hooks", () => {
     cleanups.push(cleanup);
     await setGoalOk(goalService, { workspaceId, objective: "Keep working" });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const handle = emitStreamEnd(
         aiService,
         workspaceId,
@@ -1360,7 +1352,7 @@ describe("AgentSession goal safety hooks", () => {
         { finishReason: "length" }
       );
       return Promise.resolve(Ok(handle));
-    }) as unknown as AIService["streamMessage"];
+    });
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
       synthetic: true,
@@ -1387,12 +1379,12 @@ describe("AgentSession goal safety hooks", () => {
       expectedGoalId: seeded.goalId,
     });
 
-    aiService.streamMessage = mock(() => {
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const handle = emitStreamEnd(aiService, workspaceId, "assistant-paused-silent", [
         { type: "text", text: "All wrapped up." },
       ]);
       return Promise.resolve(Ok(handle));
-    }) as unknown as AIService["streamMessage"];
+    });
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
       synthetic: true,

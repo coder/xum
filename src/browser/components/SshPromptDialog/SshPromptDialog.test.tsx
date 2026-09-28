@@ -5,12 +5,15 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import {
   createControllableAsyncIterable,
+  createTestApiClient,
   type ControllableAsyncIterable,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 
 restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 
@@ -45,28 +48,40 @@ function createMockIterableSubscription<T>(): ControlledSubscription<T> {
   };
 }
 
-interface SshPromptApi {
-  ssh: {
-    prompt: {
-      subscribe: (
-        _input?: undefined,
-        _options?: { signal?: AbortSignal }
-      ) => Promise<AsyncIterable<SshPromptEvent>>;
-      respond: (input: { requestId: string; response: string }) => Promise<void>;
-    };
-  };
-}
-
 let cleanupDom: (() => void) | null = null;
-let api: SshPromptApi | null = null;
+let api: TestApiOverrides<APIClient> | null = null;
 let respondMock: ReturnType<typeof mock>;
 let subscribeMock: ReturnType<typeof mock>;
 let mockSubscription: ControlledSubscription<SshPromptEvent>;
 
-// mock.module is hoisted by bun — the mock is active before static imports resolve.
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api }),
-}));
+// Inject the current `api` through the real context instead of mocking the API module
+// (module mocks leak across suites). The wrapper reads `api` on every render, so a test
+// that sets it to null and rerenders sees a disconnected backend without remounting.
+function MutableAPIWrapper(props: { children: ReactNode }) {
+  const authenticate = () => undefined;
+  const retry = () => undefined;
+  return (
+    <APIContext.Provider
+      value={
+        api
+          ? {
+              status: "connected",
+              api: createTestApiClient(api),
+              error: null,
+              authenticate,
+              retry,
+            }
+          : { status: "reconnecting", api: null, error: null, attempt: 1, authenticate, retry }
+      }
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
+function renderDialog() {
+  return render(<SshPromptDialog />, { wrapper: MutableAPIWrapper });
+}
 
 const MOCK_REQUEST: SshPromptRequest = {
   requestId: "req-1",
@@ -102,7 +117,7 @@ describe("SshPromptDialog", () => {
     cleanupDom = installDom();
 
     mockSubscription = createMockIterableSubscription<SshPromptEvent>();
-    respondMock = mock(() => Promise.resolve());
+    respondMock = mock(() => Promise.resolve({ success: true, data: undefined }));
     subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
 
     api = {
@@ -125,7 +140,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("dequeues request on successful respond", async () => {
-    const { getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -145,7 +160,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("renders credential prompt with input field", async () => {
-    const { container, getByRole, getByText } = render(<SshPromptDialog />);
+    const { container, getByRole, getByText } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -160,7 +175,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("credential submit sends typed response", async () => {
-    const { container, getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { container, getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -216,7 +231,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("credential cancel sends empty response", async () => {
-    const { getByRole } = render(<SshPromptDialog />);
+    const { getByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -243,7 +258,7 @@ describe("SshPromptDialog", () => {
       },
     };
 
-    const { getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -268,6 +283,90 @@ describe("SshPromptDialog", () => {
     expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
   });
 
+  it("keeps request visible and shows the error when respond returns an error result", async () => {
+    respondMock = mock(() => Promise.resolve({ success: false, error: "Prompt expired" }));
+    subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
+    api = {
+      ssh: {
+        prompt: {
+          subscribe: subscribeMock,
+          respond: respondMock,
+        },
+      },
+    };
+
+    const { getByRole, queryByRole, queryByText } = renderDialog();
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_REQUEST);
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Reject" }));
+      await flushReactWork();
+    });
+    await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(1));
+
+    // An error Result is not an answer: the prompt stays open and announces the reason.
+    await waitFor(() => expect(getByRole("alert").textContent).toContain("Prompt expired"));
+    expect(queryByRole("button", { name: "Reject" })).not.toBeNull();
+
+    // Retry succeeds: the error clears with the dequeued prompt.
+    respondMock.mockImplementation(() => Promise.resolve({ success: true, data: undefined }));
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Reject" }));
+      await flushReactWork();
+    });
+    await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(queryByRole("button", { name: "Reject" })).toBeNull());
+    expect(queryByText("Prompt expired")).toBeNull();
+    expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
+  });
+
+  it("does not show a late error result on the next queued prompt", async () => {
+    let resolveRespond: ((result: { success: false; error: string }) => void) | null = null;
+    respondMock = mock(
+      () =>
+        new Promise((resolve) => {
+          resolveRespond = resolve;
+        })
+    );
+    api = {
+      ssh: {
+        prompt: {
+          subscribe: subscribeMock,
+          respond: respondMock,
+        },
+      },
+    };
+
+    const { getByRole, queryByText } = renderDialog();
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_REQUEST);
+    await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Reject" }));
+      await flushReactWork();
+    });
+    await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(1));
+
+    // The backend finalizes the first prompt while its answer is still in flight.
+    await act(async () => {
+      mockSubscription.push({ type: "removed", requestId: MOCK_REQUEST.requestId });
+      await flushReactWork();
+    });
+    await waitFor(() => expect(queryByText(MOCK_CREDENTIAL_REQUEST.prompt)).not.toBeNull());
+
+    await act(async () => {
+      resolveRespond?.({ success: false, error: "Prompt expired" });
+      await flushReactWork();
+    });
+
+    // The stale failure belongs to the removed prompt, not the credential prompt now shown.
+    expect(queryByText("Prompt expired")).toBeNull();
+  });
+
   it("closes late iterator when cleanup runs before subscribe resolves", async () => {
     let resolveSubscribe: ((iterable: AsyncIterable<SshPromptEvent>) => void) | null = null;
     subscribeMock = mock(
@@ -285,7 +384,7 @@ describe("SshPromptDialog", () => {
       },
     };
 
-    const { unmount } = render(<SshPromptDialog />);
+    const { unmount } = renderDialog();
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
 
     // Cleanup fires while subscribe() is still pending — iteratorRef is undefined.
@@ -302,7 +401,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("does not double-close iterator on normal cleanup", async () => {
-    const { unmount } = render(<SshPromptDialog />);
+    const { unmount } = renderDialog();
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
 
@@ -318,7 +417,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("clears pending queue when api becomes null", async () => {
-    const { queryByRole, rerender } = render(<SshPromptDialog />);
+    const { queryByRole, rerender } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);

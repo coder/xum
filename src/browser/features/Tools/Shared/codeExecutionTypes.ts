@@ -1,3 +1,4 @@
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { WorkflowRunToolAttachment } from "@/common/orpc/schemas/message";
 
 export type {
@@ -16,4 +17,6 @@ export interface NestedToolCall {
   timestamp?: number;
   /** Durable run identity persisted for nested workflow tool calls. */
   workflowRun?: WorkflowRunToolAttachment;
+  /** Frozen MCP identity captured for this nested call (display only). */
+  mcpServer?: MCPToolCallDisplay;
 }

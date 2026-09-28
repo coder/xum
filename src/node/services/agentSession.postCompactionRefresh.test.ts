@@ -1,10 +1,9 @@
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, test, mock, afterEach } from "bun:test";
-import { AgentSession } from "./agentSession";
-import type { Config } from "@/node/config";
-import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
+import type { AgentSessionAIService } from "./agentSession";
+import { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { Err } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
@@ -173,51 +172,45 @@ describe("AgentSession post-compaction refresh trigger", () => {
   test("triggers callback on file_edit_* tool-call-end", async () => {
     const handlers = new Map<string, (...args: unknown[]) => void>();
 
-    const aiService: AIService = {
+    const modelUnavailable = () =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      );
+    const aiService: AgentSessionAIService = {
       ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        handlers.set(String(eventName), listener);
-        return this;
+      on(eventName: string, listener: (...args: unknown[]) => void) {
+        handlers.set(eventName, listener);
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
+      off(_eventName: string, _listener: (...args: unknown[]) => void) {
+        return undefined;
       },
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    } as unknown as AIService;
+      createModelWithPinnedOptions: mock(modelUnavailable),
+      createModelWithPinnedMetadata: mock(modelUnavailable),
+      getWorkspaceMetadata: mock((workspaceId: string) =>
+        Promise.resolve(Err(`Workspace ${workspaceId} not found`))
+      ),
+      getProvidersConfig: mock(() => null),
+      isExperimentEnabled: mock(() => false),
+      streamMessage: mock(() =>
+        Promise.resolve(Err({ type: "unknown" as const, raw: "no stream in this test" }))
+      ),
+    };
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
-
-    const initStateManager: InitStateManager = {
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
 
     const onPostCompactionStateChange = mock(() => undefined);
 
-    const session = new AgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
       aiService,
-      initStateManager,
-      backgroundProcessManager,
+      initStateManager: new InitStateManager(config),
+      backgroundProcessManager: {
+        setMessageQueued: mock(() => undefined),
+        cleanup: mock(() => Promise.resolve()),
+      } as unknown as BackgroundProcessManager,
       onPostCompactionStateChange,
     });
 

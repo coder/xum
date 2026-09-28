@@ -90,40 +90,6 @@ function hasGetUserMedia(): boolean {
 }
 
 // =============================================================================
-// Global Key State Tracking
-// =============================================================================
-
-/**
- * Track whether space is currently pressed at the module level.
- * This runs outside React's render cycle, so it captures key state
- * accurately even during async operations like microphone access.
- */
-let isSpaceCurrentlyHeld = false;
-
-if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-  window.addEventListener(
-    "keydown",
-    (e) => {
-      if (isDesktopViewportFocused(e.target)) return;
-      if (e.key === " ") isSpaceCurrentlyHeld = true;
-    },
-    true
-  );
-  window.addEventListener(
-    "keyup",
-    (e) => {
-      if (isDesktopViewportFocused(e.target)) return;
-      if (e.key === " ") isSpaceCurrentlyHeld = false;
-    },
-    true
-  );
-  // Also reset on blur (user switches window while holding space)
-  window.addEventListener("blur", () => {
-    isSpaceCurrentlyHeld = false;
-  });
-}
-
-// =============================================================================
 // Hook
 // =============================================================================
 
@@ -146,6 +112,34 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
 
   // Track recording start time for duration telemetry
   const recordingStartTimeRef = useRef<number>(0);
+
+  // Track whether Space is held outside React's render cycle, so a recording that starts after
+  // async microphone access still knows the key was already down. Listeners attach to the
+  // current window on mount (not at module load), so each mounted hook tracks the window it
+  // actually runs in.
+  const isSpaceHeldRef = useRef(false);
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
+      if (e.key === " ") isSpaceHeldRef.current = true;
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
+      if (e.key === " ") isSpaceHeldRef.current = false;
+    };
+    // Also reset on blur (user switches window while holding space).
+    const handleBlur = () => {
+      isSpaceHeldRef.current = false;
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
 
   // Keep callbacks fresh without recreating functions
   const callbacksRef = useRef(options);
@@ -417,7 +411,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     }
 
     // Use global key state instead of assuming - handles async mic access delay
-    spaceHeldAtStartRef.current = isSpaceCurrentlyHeld;
+    spaceHeldAtStartRef.current = isSpaceHeldRef.current;
 
     const handleKeyUp = (e: KeyboardEvent) => {
       if (isDesktopViewportFocused(e.target)) return;

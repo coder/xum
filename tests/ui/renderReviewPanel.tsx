@@ -76,9 +76,9 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
       await waitFor(
         () => {
           // Find tab button by role and name
-          const tabButton = result.container.querySelector(
+          const tabButton = result.container.querySelector<HTMLElement>(
             `[role="tab"][aria-controls*="${tab}"]`
-          ) as HTMLElement | null;
+          );
           if (!tabButton) {
             throw new Error(`Tab "${tab}" not found`);
           }

@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import cjsFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
 import { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
@@ -159,6 +160,22 @@ async function writeWorkspaceBranchMap(
     `${JSON.stringify(branchMap, null, 2)}\n`,
     "utf-8"
   );
+}
+
+/** Makes config saves reject by failing the atomic rename onto config.json. */
+function failConfigPublish() {
+  const realRename = cjsFs.rename.bind(cjsFs);
+  return spyOn(cjsFs, "rename").mockImplementation(((
+    from: cjsFs.PathLike,
+    to: cjsFs.PathLike,
+    callback: cjsFs.NoParamCallback
+  ) => {
+    if (path.basename(String(to)) === "config.json") {
+      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      return;
+    }
+    realRename(from, to, callback);
+  }) as typeof cjsFs.rename);
 }
 
 describe("WorktreeArchiveSnapshotService", () => {
@@ -885,7 +902,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(await pathExists(fixture.workspacePath)).toBe(false);
   });
 
-  test("preserves snapshot metadata when artifact cleanup fails after a successful restore", async () => {
+  test("clears snapshot metadata and orphans the artifacts when artifact cleanup fails after a successful restore", async () => {
     await makeWorkspaceDirty(fixture);
 
     const captureResult = await fixture.service.captureSnapshotForArchive({
@@ -930,7 +947,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       expect(
         fixture.config.loadConfigOrDefault().projects.get(fixture.projectPath)?.workspaces[0]
           ?.worktreeArchiveSnapshot
-      ).toEqual(captureResult.data);
+      ).toBeUndefined();
       expect(
         await pathExists(
           path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
@@ -1008,7 +1025,9 @@ describe("WorktreeArchiveSnapshotService", () => {
     ).toBeUndefined();
   });
 
-  test("keeps the restored worktree when snapshot-state writeback fails", async () => {
+  // #4746: the pointer is cleared before the artifacts are deleted, so a failed write
+  // keeps both and config never points at a deleted snapshot.
+  test("keeps the restored worktree and the snapshot artifacts when snapshot-state writeback fails", async () => {
     await makeWorkspaceDirty(fixture);
 
     const captureResult = await fixture.service.captureSnapshotForArchive({
@@ -1031,10 +1050,7 @@ describe("WorktreeArchiveSnapshotService", () => {
 
     runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
 
-    const originalEditConfig = fixture.config.editConfig.bind(fixture.config);
-    const editConfigSpy = spyOn(fixture.config, "editConfig").mockImplementation((_mutate) =>
-      Promise.reject(new Error("config writeback failed"))
-    );
+    const renameSpy = failConfigPublish();
 
     try {
       const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
@@ -1051,10 +1067,9 @@ describe("WorktreeArchiveSnapshotService", () => {
         await pathExists(
           path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
-      ).toBe(false);
+      ).toBe(true);
     } finally {
-      editConfigSpy.mockRestore();
-      fixture.config.editConfig = originalEditConfig;
+      renameSpy.mockRestore();
     }
   });
 
@@ -1137,6 +1152,66 @@ describe("WorktreeArchiveSnapshotService", () => {
     if (result.success) {
       expect(result.data).toEqual(["a-file.txt", "cache-dir/", "z-file.txt"]);
     }
+  });
+
+  // #4895: staging dirs are git-ignored, and git omits them entirely when the repo tracks files
+  // under `.xum/` or `.mux/`, so staged uploads without a session-dir mirror copy were lost with
+  // no warning.
+  test("getUnsupportedUntrackedPaths lists staged attachments without a valid mirror entry", async () => {
+    const ws = fixture.workspacePath;
+    const excludePath = path.resolve(ws, runGit(ws, ["rev-parse", "--git-path", "info/exclude"]));
+    await fs.mkdir(path.dirname(excludePath), { recursive: true });
+    await fs.appendFile(excludePath, "\n.xum/user-attachments/\n.mux/user-attachments/\n");
+    for (const tracked of [".xum/settings.json", ".mux/legacy.json"]) {
+      await fs.mkdir(path.dirname(path.join(ws, tracked)), { recursive: true });
+      await fs.writeFile(path.join(ws, tracked), "{}\n");
+    }
+    runGit(ws, ["add", ".xum/settings.json", ".mux/legacy.json"]);
+    runGit(ws, ["commit", "-m", "track metadata dirs"]);
+
+    const mirroredId = "11111111-1111-4111-8111-111111111111";
+    const unmirroredId = "22222222-2222-4222-8222-222222222222";
+    const mismatchId = "33333333-3333-4333-8333-333333333333";
+    const legacyId = "44444444-4444-4444-8444-444444444444";
+    const staleId = "55555555-5555-4555-8555-555555555555";
+    const stage = async (dir: string, id: string, name: string, mirror?: string) => {
+      await fs.mkdir(path.join(ws, dir, id), { recursive: true });
+      await fs.writeFile(path.join(ws, dir, id, name), "image-bytes");
+      if (mirror === undefined) return;
+      const mirrorDir = path.join(
+        fixture.config.sessionsDir,
+        fixture.workspaceId,
+        "staged-attachments",
+        id
+      );
+      await fs.mkdir(mirrorDir, { recursive: true });
+      await fs.writeFile(path.join(mirrorDir, name), mirror);
+    };
+    await stage(".xum/user-attachments", mirroredId, "kept.png", "image-bytes");
+    await stage(".xum/user-attachments", unmirroredId, "lost.png");
+    await stage(".xum/user-attachments", mismatchId, "partial.png", "image");
+    // Same length, different bytes: the checkout copy was replaced after mirroring.
+    await stage(".xum/user-attachments", staleId, "stale.png", "IMAGE-BYTES");
+    await stage(".mux/user-attachments", legacyId, "legacy.png");
+    // Staging never nests deeper than <uuid>/<name>: a deeper directory is listed, not walked.
+    await fs.mkdir(path.join(ws, ".xum/user-attachments", mirroredId, "nested", "deep"), {
+      recursive: true,
+    });
+
+    const result = await fixture.service.getUnsupportedUntrackedPaths({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+
+    expect(result).toEqual(
+      Ok([
+        `.mux/user-attachments/${legacyId}/legacy.png`,
+        `.xum/user-attachments/${mirroredId}/nested/`,
+        `.xum/user-attachments/${unmirroredId}/lost.png`,
+        `.xum/user-attachments/${mismatchId}/partial.png`,
+        `.xum/user-attachments/${staleId}/stale.png`,
+      ])
+    );
   });
 
   test("captureSnapshotForArchive succeeds with matching acknowledgedUntrackedPaths", async () => {

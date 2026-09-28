@@ -13,10 +13,12 @@ import type {
   EnsureReadyResult,
   EnsureReadyOptions,
   FileStat,
+  ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
 import { shescape, streamToString } from "./streamUtils";
 import {
@@ -38,7 +40,10 @@ import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import {
+  buildRegularFileReadCommand,
+  CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
+  readAttemptTimeoutSecs,
   readFileViaExec,
   statViaExec,
   writeFileViaExec,
@@ -564,21 +569,34 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     });
   }
 
-  override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  override readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     const hostPath = this.resolveHostPathForMounted(filePath);
     if (hostPath) {
-      return super.readFile(hostPath, abortSignal);
+      return super.readFile(hostPath, abortSignal, options);
     }
     return readFileViaExec(
       filePath,
-      (signal) =>
-        this.exec(`cat "$${FILE_PATH_ENV}"`, {
-          cwd: this.getContainerBasePath(),
-          pathEnv: { [FILE_PATH_ENV]: filePath },
-          timeout: 300,
-          abortSignal: signal,
-        }),
-      abortSignal
+      (signal, attempt) =>
+        // Unmounted paths only exist inside the container, so the regular-file
+        // check must run there too (env-var quoting as for the plain cat). The
+        // retry reads only a regular file: see readFileViaExec's StartReadExec.
+        this.exec(
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
+            : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`,
+          {
+            cwd: this.getContainerBasePath(),
+            pathEnv: { [FILE_PATH_ENV]: filePath },
+            timeout: readAttemptTimeoutSecs(attempt, 300),
+            abortSignal: signal,
+          }
+        ),
+      abortSignal,
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
   }
 
@@ -611,14 +629,23 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.stat(hostPath, abortSignal);
     }
-    return statViaExec(filePath, () =>
-      this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
-        cwd: this.getContainerBasePath(),
-        pathEnv: { [FILE_PATH_ENV]: filePath },
-        timeout: 10,
-        abortSignal,
-      })
+    return statViaExec(
+      filePath,
+      (attempt) =>
+        this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
+          cwd: this.getContainerBasePath(),
+          pathEnv: { [FILE_PATH_ENV]: filePath },
+          timeout: readAttemptTimeoutSecs(attempt, 10),
+          abortSignal,
+        }),
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
     );
+  }
+
+  /** See Runtime.isTransportFailureExit: a stopped or missing container is not a missing file. */
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
   }
 
   override ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
@@ -765,9 +792,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     oldName: string,
     newName: string,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   > {
     // Stop container before rename (container labels reference old path)
     const oldPath = this.getWorkspacePath(projectPath, oldName);
@@ -778,7 +807,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       projectPath,
       oldName,
       newName,
-      trusted
+      trusted,
+      options
     );
 
     if (result.success) {
@@ -796,7 +826,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     workspaceName: string,
     force: boolean,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
@@ -808,7 +839,33 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
 
     // Delete worktree on host
-    return this.worktreeManager.deleteWorkspace(projectPath, workspaceName, force, trusted);
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
+  }
+
+  /**
+   * Remove only the host worktree, without `devcontainer down`. For a creation rollback before
+   * init: no container exists yet, and `devcontainer down` matches containers by path (#4775).
+   */
+  deleteHostWorktree(
+    projectPath: string,
+    workspaceName: string,
+    force: boolean,
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {

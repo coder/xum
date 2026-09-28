@@ -2,7 +2,12 @@ import { VERSION } from "@/version";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient } from "@/browser/testUtils";
+import * as RealOrpcClientModule from "@/common/orpc/client";
+import * as RealWebSocketLinkModule from "@orpc/client/websocket";
+import * as RealMessagePortLinkModule from "@orpc/client/message-port";
+import * as RealAuthTokenModalModule from "@/browser/components/AuthTokenModal/AuthTokenModal";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
 // Mock WebSocket that we can control
 class MockWebSocket {
@@ -71,6 +76,14 @@ const clearStoredAuthTokenMock = mock(() => {
   storedAuthToken = null;
 });
 
+// Restore the real modules after this suite so the transport and auth stubs below cannot
+// leak into later files.
+restoreModulesAfterSuite([
+  ["@/common/orpc/client", { ...RealOrpcClientModule }],
+  ["@orpc/client/websocket", { ...RealWebSocketLinkModule }],
+  ["@orpc/client/message-port", { ...RealMessagePortLinkModule }],
+  ["@/browser/components/AuthTokenModal/AuthTokenModal", { ...RealAuthTokenModalModule }],
+]);
 void mock.module("@/common/orpc/client", () => ({
   createClient: () => ({
     general: {
@@ -97,11 +110,7 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
 }));
 
 // Import the real API module types (not the mocked version)
-import type {
-  APIClient as _APIClient,
-  UseAPIResult as _UseAPIResult,
-  APIProvider as APIProviderType,
-} from "./API";
+import type { UseAPIResult as _UseAPIResult, APIProvider as APIProviderType } from "./API";
 
 // IMPORTANT: Other test files mock @/browser/contexts/API with a fake APIProvider.
 // Module mocks leak between test files in bun (https://github.com/oven-sh/bun/issues/12823).
@@ -114,7 +123,6 @@ const RealAPIModule: {
 } = require("./API?real=1");
 /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
 const { APIProvider, useAPI, useConnectionLatencyMs } = RealAPIModule;
-type APIClient = _APIClient;
 type UseAPIResult = _UseAPIResult;
 
 // Each observation carries the API context value by reference (apiState) plus the latency
@@ -186,10 +194,10 @@ describe("API reconnection", () => {
   test("injected clients skip internal auth token setup", async () => {
     window.location.href = "https://mux.example.com/?token=injected-token";
     const states: string[] = [];
-    const injectedClient: RecursivePartial<APIClient> = { general: {} };
+    const injectedClient = createTestApiClient({ general: {} });
 
     render(
-      <APIProvider client={injectedClient as APIClient}>
+      <APIProvider client={injectedClient}>
         <APIStateObserver onState={(s) => states.push(s.status)} />
       </APIProvider>
     );
@@ -208,10 +216,10 @@ describe("API reconnection", () => {
   test("injected clients keep internal connection controls disabled", async () => {
     const states: string[] = [];
     let latestState: UseAPIResult | null = null;
-    const injectedClient: RecursivePartial<APIClient> = { general: {} };
+    const injectedClient = createTestApiClient({ general: {} });
 
     render(
-      <APIProvider client={injectedClient as APIClient}>
+      <APIProvider client={injectedClient}>
         <APIStateObserver
           onState={(state) => {
             latestState = state.apiState;

@@ -3,25 +3,30 @@
  */
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
 import { describe, test, expect, mock } from "bun:test";
+import * as RealLogModule from "@/node/services/log";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { openaiDirectProviderOptionsAvailable } from "./openaiProviderOptionsAvailability";
 import {
   buildProviderOptions,
   buildRequestHeaders,
   isAnthropic1MEffectivelyEnabled,
   openaiProModeAvailable,
-  preserveAnthropic1MContextForFollowUp,
   resolveProviderOptionsNamespaceKey,
   ANTHROPIC_1M_CONTEXT_HEADER,
   MUX_WORKSPACE_ID_HEADER,
 } from "./providerOptions";
 
-// Mock the log module to avoid console noise
+// Mock the log module to avoid console noise. The stub covers only what this file
+// needs, so restore the real logger once the suite ends: bun keeps module mocks for
+// every later file in the process, which then crashed on log.withFields/debug_obj.
+restoreModulesAfterSuite([["@/node/services/log", { ...RealLogModule }]]);
 void mock.module("@/node/services/log", () => ({
   log: {
     debug: (): void => undefined,
@@ -208,6 +213,154 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
+      // Opus 5.5 rejects disabled thinking too (breaking change from Opus 5, which
+      // keeps `{ type: "disabled" }` in the native-xhigh loop above).
+      expect(buildProviderOptions("anthropic:claude-opus-5-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(
+        anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
+      ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
+    });
+  });
+
+  describe("thinking block binding", () => {
+    const dropBlock = { prefixMismatchBehavior: "drop_block" };
+    const directConfig = (
+      overrides: Partial<NonNullable<ProvidersConfigMap["anthropic"]>> = {}
+    ): ProvidersConfigMap => ({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, ...overrides },
+    });
+    const thinkingFor = (
+      model: string,
+      options: {
+        config?: ProvidersConfigMap | null;
+        route?: Parameters<typeof buildProviderOptions>[8];
+        disableBetaFeatures?: boolean;
+      } = {}
+    ): Record<string, unknown> =>
+      anthropicProviderOptions(
+        buildProviderOptions(
+          model,
+          "high",
+          undefined,
+          undefined,
+          options.disableBetaFeatures ? { anthropic: { disableBetaFeatures: true } } : undefined,
+          undefined,
+          undefined,
+          options.config === undefined ? directConfig() : options.config,
+          "route" in options ? options.route : "anthropic"
+        )
+      ).thinking as Record<string, unknown>;
+
+    test("drops invalidated blocks for prefix-binding models on the direct Anthropic API", () => {
+      for (const model of ["claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"]) {
+        expect(thinkingFor(`anthropic:${model}`)).toEqual({
+          type: "adaptive",
+          display: "summarized",
+          blockBinding: dropBlock,
+        });
+      }
+      expect(
+        thinkingFor("anthropic:claude-opus-5-5", {
+          config: directConfig({ baseUrl: "https://api.anthropic.com/v1" }),
+        })
+      ).toMatchObject({ blockBinding: dropBlock });
+    });
+
+    test("leaves models that do not bind thinking to the prefix unchanged", () => {
+      for (const model of ["claude-opus-5", "claude-fable-5"]) {
+        expect(thinkingFor(`anthropic:${model}`)).not.toHaveProperty("blockBinding");
+      }
+    });
+
+    test("fails closed on routes that may not forward the beta header", () => {
+      const cases: Array<[string, Parameters<typeof thinkingFor>[1]]> = [
+        ["no resolved route", { route: undefined }],
+        ["gateway route", { route: "mux-gateway" }],
+        ["no providers config", { config: null }],
+        ["config base URL", { config: directConfig({ baseUrl: "https://llm.example.com/v1" }) }],
+        [
+          "env base URL",
+          {
+            config: directConfig({
+              baseUrlSource: "env",
+              baseUrlResolved: "https://llm.example.com",
+            }),
+          },
+        ],
+        ["config beta opt-out", { config: directConfig({ disableBetaFeatures: true }) }],
+        ["request beta opt-out", { disableBetaFeatures: true }],
+      ];
+      for (const [label, options] of cases) {
+        const thinking = thinkingFor("anthropic:claude-opus-5-5", options);
+        expect({ label, thinking }).toEqual({
+          label,
+          thinking: { type: "adaptive", display: "summarized" },
+        });
+      }
+      expect(
+        thinkingFor("mux-gateway:anthropic/claude-opus-5-5", { route: "mux-gateway" })
+      ).not.toHaveProperty("blockBinding");
+    });
+
+    test("the SDK sends block_binding with its beta header only when eligible", async () => {
+      const captured: Array<{ body: Record<string, unknown>; beta: string | null }> = [];
+      const captureFetch = Object.assign(
+        (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (typeof init?.body !== "string") {
+            throw new Error("Expected a JSON request body");
+          }
+          captured.push({
+            body: JSON.parse(init.body) as Record<string, unknown>,
+            beta: new Headers(init.headers).get("anthropic-beta"),
+          });
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "msg_test",
+                type: "message",
+                role: "assistant",
+                model: "claude-opus-5-5",
+                content: [{ type: "text", text: "ok" }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const model = createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-opus-5-5");
+      for (const route of ["anthropic", "mux-gateway"] as const) {
+        await generateText({
+          model,
+          prompt: "Return ok.",
+          providerOptions: buildProviderOptions(
+            "anthropic:claude-opus-5-5",
+            "high",
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            directConfig(),
+            route
+          ) as Parameters<typeof generateText>[0]["providerOptions"],
+          maxRetries: 0,
+        });
+      }
+
+      expect(captured).toHaveLength(2);
+      expect(captured[0].body.thinking).toMatchObject({
+        type: "adaptive",
+        block_binding: { prefix_mismatch_behavior: "drop_block" },
+      });
+      expect(captured[0].beta).toContain("thinking-binding-controls-2026-08-01");
+      expect(captured[1].body.thinking).not.toHaveProperty("block_binding");
+      expect(captured[1].beta ?? "").not.toContain("thinking-binding-controls");
     });
   });
 
@@ -515,6 +668,221 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     expect(headers).toBeUndefined();
   });
 
+  describe("bedrock-typed instance serving OpenAI-namespaced models", () => {
+    // Mantle keeps openai.<model> on the wire, so the SDK cannot classify the
+    // model as reasoning from its ID and Mantle only accepts summary "auto".
+    const mantleConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: "bedrock-mantle-us-east-1", type: "bedrock" }],
+      },
+    };
+    const build = (modelString: string, level: "off" | "high" | "max") =>
+      buildProviderOptions(
+        modelString,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder"
+      ) as { openai?: Record<string, unknown> };
+
+    test("forces the reasoning classification and Mantle's summary mode", () => {
+      const options = build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "high");
+      expect(options.openai).toMatchObject({
+        forceReasoning: true,
+        reasoningEffort: "high",
+        reasoningSummary: "auto",
+      });
+    });
+
+    test("resolves GPT-5.6 effort semantics from the metadata identity", () => {
+      // The wire identity (openai:openai.gpt-5.6-sol) misses the GPT-5.6 family
+      // matchers: "off" would be omitted (Mantle defaults to medium) and "max"
+      // downgraded to xhigh.
+      expect(
+        build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "off").openai
+      ).toMatchObject({ forceReasoning: true, reasoningEffort: "none" });
+      expect(
+        build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "max").openai
+      ).toMatchObject({ reasoningEffort: "max" });
+    });
+
+    test("openai-typed instances keep the default classification and summary", () => {
+      const options = buildProviderOptions(
+        "coder:openai/gpt-5.6-sol",
+        "high",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder"
+      ) as { openai?: Record<string, unknown> };
+      expect(options.openai).not.toHaveProperty("forceReasoning");
+      expect(options.openai).toMatchObject({ reasoningSummary: "detailed" });
+    });
+  });
+
+  // A Mantle deployment can also be registered as an OPENAI-typed instance
+  // (it speaks OpenAI Responses natively). The wire model ID stays in
+  // Bedrock's openai.<model> namespace, so the SDK's reasoning-model
+  // detection misses it exactly like on the bedrock-typed instance above.
+  describe("openai-typed instance serving Bedrock Mantle OpenAI-namespaced models", () => {
+    const instance = "bedrock-mantle-us-west-2";
+    const wireModelId = "openai.gpt-6-astra";
+    const modelString = `coder:${instance}/${wireModelId}`;
+    const mantleConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: instance, type: "openai" }],
+        // Capability alias: the openai-typed metadata identity
+        // (openai:openai.gpt-6-astra) misses the Astra matchers on its own.
+        models: [{ id: `${instance}/${wireModelId}`, mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    const build = (
+      level: Parameters<typeof buildProviderOptions>[1],
+      reasoningMode: Parameters<typeof buildProviderOptions>[10]
+    ) =>
+      buildProviderOptions(
+        modelString,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder",
+        undefined,
+        reasoningMode
+      );
+    const openaiOptions = (
+      level: Parameters<typeof buildProviderOptions>[1],
+      reasoningMode: Parameters<typeof buildProviderOptions>[10]
+    ): OpenAIResponsesProviderOptions | undefined => {
+      const result = build(level, reasoningMode);
+      return "openai" in result ? result.openai : undefined;
+    };
+
+    test("forces the reasoning classification and Mantle's summary mode", () => {
+      expect(openaiOptions("high", undefined)).toMatchObject({
+        forceReasoning: true,
+        reasoningEffort: "high",
+        reasoningSummary: "auto",
+      });
+    });
+
+    // The actual defect surfaced at the SDK boundary: without forceReasoning
+    // @ai-sdk/openai omits the ENTIRE reasoning object for openai.<model> IDs,
+    // silently dropping effort AND pro mode while the options looked correct.
+    test.each([
+      ["max", "pro", { effort: "max", summary: "auto", mode: "pro" }],
+      ["xhigh", "standard", { effort: "xhigh", summary: "auto" }],
+    ] as const)(
+      "serializes %s/%s to the Responses wire with the AWS model ID",
+      async (level, reasoningMode, expectedReasoning) => {
+        const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
+        const captureFetch = Object.assign(
+          (
+            input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1]
+          ): Promise<Response> => {
+            if (typeof init?.body !== "string") {
+              throw new Error("Expected the OpenAI provider to send a JSON string body");
+            }
+            const url =
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : input.url;
+            captured.push({
+              path: new URL(url).pathname,
+              body: JSON.parse(init.body) as Record<string, unknown>,
+            });
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  id: "resp_test",
+                  model: wireModelId,
+                  output: [],
+                  usage: { input_tokens: 1, output_tokens: 0 },
+                }),
+                { status: 200, headers: { "content-type": "application/json" } }
+              )
+            );
+          },
+          { preconnect: fetch.preconnect.bind(fetch) }
+        );
+        // Mirrors providerModelFactory's Coder handler: an openai-typed
+        // instance is served by createOpenAI(...).responses(<wire model ID>).
+        const openai = createOpenAI({
+          apiKey: "coder",
+          baseURL: "https://coder.example.test/api/v2/aibridge/bedrock-mantle-us-west-2/v1",
+          fetch: captureFetch,
+        });
+        const options = openaiOptions(level, reasoningMode);
+        if (!options) {
+          throw new Error("Expected OpenAI Responses provider options");
+        }
+
+        await generateText({
+          model: openai.responses(wireModelId),
+          prompt: "Return ok.",
+          providerOptions: { openai: options },
+          maxRetries: 0,
+        });
+
+        expect(captured).toHaveLength(1);
+        expect(captured[0].path).toBe("/api/v2/aibridge/bedrock-mantle-us-west-2/v1/responses");
+        expect(captured[0].body.model).toBe(wireModelId);
+        expect(captured[0].body.reasoning).toEqual(expectedReasoning);
+      }
+    );
+
+    test("keeps effort and pro independent", () => {
+      expect(openaiOptions("xhigh", "pro")).toMatchObject({
+        reasoningEffort: "xhigh",
+        reasoningMode: "pro",
+      });
+      const standardMax = openaiOptions("max", "standard");
+      expect(standardMax).toMatchObject({ reasoningEffort: "max" });
+      expect(standardMax).not.toHaveProperty("reasoningMode");
+    });
+
+    test("does not force the classification for the real OpenAI upstream on an openai-typed instance", () => {
+      const options = buildProviderOptions(
+        "coder:openai/gpt-6-astra",
+        "max",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder",
+        undefined,
+        "pro"
+      ) as { openai?: Record<string, unknown> };
+      expect(options.openai).not.toHaveProperty("forceReasoning");
+      expect(options.openai).toMatchObject({
+        reasoningEffort: "max",
+        reasoningMode: "pro",
+        reasoningSummary: "detailed",
+      });
+    });
+  });
+
   // Discovered metadata must win over the instance NAME: a valid instance can
   // use a canonical route name with a different type, and normalizing the name
   // before consulting metadata would emit options for the wrong wire.
@@ -660,41 +1028,6 @@ describe("isAnthropic1MEffectivelyEnabled", () => {
 
   test("returns false when provider options are missing", () => {
     expect(isAnthropic1MEffectivelyEnabled("anthropic:claude-sonnet-4-5")).toBe(false);
-  });
-});
-
-describe("preserveAnthropic1MContextForFollowUp", () => {
-  test("preserves beta 1M for alias source model when providersConfig resolves to a beta-only model", () => {
-    const providersConfig = createMockProvidersConfig({
-      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-5-20250929",
-    });
-
-    const result = preserveAnthropic1MContextForFollowUp(
-      "anthropic:claude/sonnet",
-      "anthropic:claude-sonnet-4-5",
-      {
-        anthropic: {
-          use1MContextModels: ["anthropic:claude/sonnet"],
-        },
-      },
-      providersConfig
-    );
-
-    expect(result?.anthropic?.use1MContext).toBe(true);
-  });
-
-  test("does not preserve beta 1M for alias source model without providersConfig", () => {
-    const result = preserveAnthropic1MContextForFollowUp(
-      "anthropic:claude/sonnet",
-      "anthropic:claude-sonnet-4-5",
-      {
-        anthropic: {
-          use1MContextModels: ["anthropic:claude/sonnet"],
-        },
-      }
-    );
-
-    expect(result?.anthropic?.use1MContext).not.toBe(true);
   });
 });
 
@@ -1579,6 +1912,32 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai?.reasoningEffort).toBe("max");
       expect(openai?.reasoningMode).toBe("pro");
     });
+
+    test.each(["openai:gpt-6-sol", "openai:gpt-6-luna"])(
+      "preserves none/max and gates pro by wire format for %s",
+      (model) => {
+        expect(buildWithMode(model, "standard")?.reasoningEffort).toBe("none");
+        const options = buildWithMode(model, "pro", { thinkingLevel: "max" });
+        expect(options?.reasoningEffort).toBe("max");
+        expect(options?.reasoningMode).toBe("pro");
+        expect(buildWithMode(model, "standard")?.reasoningMode).toBeUndefined();
+        expect(
+          buildWithMode(model, "pro", {
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+          })?.reasoningMode
+        ).toBeUndefined();
+        expect(buildWithMode(`${model}-mini`, "pro")?.reasoningMode).toBeUndefined();
+        for (const id of [model, `${model}-2026-09-22`, "openai:team-model"]) {
+          const chatOptions = buildWithMode(id, "pro", {
+            thinkingLevel: "max",
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+            providersConfig: createMockProvidersConfig({ "openai:team-model": model }),
+          });
+          expect(chatOptions?.reasoningEffort).toBe("none");
+          expect(chatOptions?.reasoningMode).toBeUndefined();
+        }
+      }
+    );
 
     test("supports pro mode across the GPT-5.6 family", () => {
       for (const model of [
@@ -2504,7 +2863,13 @@ describe("buildProviderOptions - xAI", () => {
     });
   });
 
-  test("passes native xhigh through for Grok 4.6 while Grok 4.5 clamps to high", () => {
+  test("passes native xhigh through for Grok 4.6/4.7 while Grok 4.5 clamps to high", () => {
+    expect(buildProviderOptions("xai:grok-4.7", "xhigh")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.7", "max")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
     expect(buildProviderOptions("xai:grok-4.6", "xhigh")).toEqual({
       xai: { reasoningEffort: "xhigh", store: false },
     });

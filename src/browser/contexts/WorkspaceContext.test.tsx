@@ -24,18 +24,22 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import {
   readPersistedState,
   syncPersistedStateFromBackend,
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 // Helper to create test workspace metadata with default runtime config
 const createWorkspaceMetadata = (
@@ -301,10 +305,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() =>
       expect(
-        workspaceApi.onChat.mock.calls.some(
-          ([{ workspaceId }]: [{ workspaceId: string }, ...unknown[]]) =>
-            workspaceId === "ws-sync-load"
-        )
+        workspaceApi.onChat.mock.calls.some(([input]) => input?.workspaceId === "ws-sync-load")
       ).toBe(true)
     );
   });
@@ -855,6 +856,48 @@ describe("WorkspaceContext", () => {
     );
   });
 
+  test.each([
+    { name: "keeps a pending Exec pick", pickAgent: "exec", expectedModel: "openai:gpt-5.2" },
+    {
+      name: "reseeds over a Plan-scoped pick",
+      pickAgent: "plan",
+      expectedModel: "anthropic:claude-opus-4-6",
+    },
+  ])("child metadata reseed $name", async (row) => {
+    const workspaceId = "ws-pick-child";
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              parentWorkspaceId: "ws-parent",
+              agentId: "exec",
+              aiSettingsByAgent: {
+                exec: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+              },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify(row.pickAgent),
+        [getModelKey(workspaceId)]: JSON.stringify("openai:gpt-5.2"),
+        [getThinkingLevelKey(workspaceId)]: JSON.stringify("low"),
+      },
+    });
+    // A deliberate, not yet sent pick made while the child's active agent was row.pickAgent.
+    resetAiSelectionIntentForTests();
+    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(row.expectedModel);
+    // Fields without a pending pick always follow the backend.
+    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
+    resetAiSelectionIntentForTests();
+  });
+
   test("loads workspace metadata on mount", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
       createProjectWorkspaceMetadata("ws-1", "/alpha"),
@@ -1387,6 +1430,31 @@ describe("WorkspaceContext", () => {
 
     expect(ctx().selectedWorkspace).toBeNull();
     expect(ctx().pendingNewWorkspaceProject).toBe("/new/project");
+  });
+
+  // The project creation header lists Scratch as a switch target and routes
+  // it through the same call as a real project path.
+  test("beginWorkspaceCreation routes the scratch key to the scratch creation page", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: "/workspace/ws-existing",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace).toBeTruthy());
+
+    act(() => {
+      ctx().beginWorkspaceCreation(SCRATCH_PROJECT_CONFIG_KEY);
+    });
+
+    expect(ctx().selectedWorkspace).toBeNull();
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
   });
 
   test("reacts to metadata update events (new workspace)", async () => {
@@ -2136,7 +2204,7 @@ async function setupWithProjectContext() {
   }
 
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -2148,7 +2216,7 @@ async function setupWithProjectContext() {
   );
 
   // Inject client immediately to handle race conditions where effects run before store update.
-  getWorkspaceStoreRaw().setClient(currentClientMock as APIClient);
+  getWorkspaceStoreRaw().setClient(createTestApiClient(currentClientMock));
   await waitFor(() => expect(workspaceRef.current).toBeTruthy());
   await waitFor(() => expect(projectRef.current).toBeTruthy());
 
@@ -2156,9 +2224,9 @@ async function setupWithProjectContext() {
 }
 
 interface MockAPIOptions {
-  workspace?: RecursivePartial<APIClient["workspace"]>;
-  projects?: RecursivePartial<APIClient["projects"]>;
-  server?: RecursivePartial<APIClient["server"]>;
+  workspace?: TestApiOverrides<APIClient["workspace"]>;
+  projects?: TestApiOverrides<APIClient["projects"]>;
+  server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
   locationHash?: string;
   locationPath?: string;

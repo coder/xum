@@ -7,6 +7,8 @@ export const CHAT_UI_FEATURE_IDS = [
   "reviewAnnotations",
   "bashForegroundControls",
   "jsonRawView",
+  // Replacing the chat history with a message (Start Here, plan implement with replacement).
+  "chatHistoryReplacement",
 ] as const;
 
 export type ChatUiFeatureId = (typeof CHAT_UI_FEATURE_IDS)[number];

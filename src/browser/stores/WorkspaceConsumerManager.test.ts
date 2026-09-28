@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
-import type { APIClient } from "@/browser/contexts/API";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { ChatStats } from "@/common/types/chatStats";
 import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const STATS: ChatStats = {
   consumers: [{ name: "User", tokens: 5, percentage: 100 }],
@@ -46,9 +46,9 @@ describe("WorkspaceConsumerManager", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     calculateStats = mock((_input: unknown) => Promise.resolve(STATS));
-    window.__ORPC_CLIENT__ = {
+    window.__ORPC_CLIENT__ = createTestApiClient({
       tokenizer: { calculateStats },
-    } as unknown as APIClient;
+    });
     manager = new WorkspaceConsumerManager(
       () => undefined,
       () => 1

@@ -16,7 +16,7 @@ help: ## Show this help message
 
 # Sentinel file to track when dependencies are installed
 # Only installs devDependencies (esbuild, vsce, etc.) - no runtime deps needed
-node_modules/.installed: package.json
+node_modules/.installed: package.json bun.lock
 	@echo "Extension dependencies out of date or missing, running bun install..."
 	@bun install
 	@touch node_modules/.installed

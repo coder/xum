@@ -1,6 +1,7 @@
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import { getStorageChangeEvent } from "@/common/constants/events";
+import { getPersistedKeyKind } from "@/common/constants/storage";
 
 type SetValue<T> = T | ((prev: T) => T);
 
@@ -62,6 +63,79 @@ function notifySubscribers(key: string, origin?: string, includeNonListeners = f
       if (!origin || origin !== sub.componentId) continue;
     }
     sub.callback();
+  }
+}
+
+function isQuotaExceededError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  // Chromium/WebKit throw "QuotaExceededError" (legacy code 22); Firefox uses its own name/code.
+  return (
+    name === "QuotaExceededError" ||
+    name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+    code === 22 ||
+    code === 1014
+  );
+}
+
+// A failing key fails on every keystroke; one warning per key per session keeps the console usable.
+const keysWithReportedWriteFailures = new Set<string>();
+
+function reportWriteFailureOnce(key: string, error: unknown): void {
+  if (keysWithReportedWriteFailures.has(key)) return;
+  keysWithReportedWriteFailures.add(key);
+  console.warn(
+    `Error writing to localStorage key "${key}" (further failures for this key are not logged):`,
+    error
+  );
+}
+
+/**
+ * Free space by removing registry `cache` keys (refetchable data such as LRU cache entries and
+ * cached plan content). Drafts, review data and preferences are never evicted: losing them is the
+ * failure this eviction exists to prevent. Returns how many keys were removed.
+ */
+function evictCacheKeys(storage: Storage): number {
+  const cacheKeys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key !== null && getPersistedKeyKind(key) === "cache") cacheKeys.push(key);
+  }
+  for (const key of cacheKeys) {
+    storage.removeItem(key);
+  }
+  return cacheKeys.length;
+}
+
+/**
+ * The single low-level localStorage write for persisted state. null/undefined remove the key.
+ * On QuotaExceededError it evicts cache keys and retries once. Returns false when the value could
+ * not be stored; callers skip change notifications then, because nothing changed on disk.
+ */
+function writePersistedValue(key: string, newValue: unknown): boolean {
+  const storage = window.localStorage;
+  if (newValue === undefined || newValue === null) {
+    storage.removeItem(key);
+    return true;
+  }
+
+  const serialized = JSON.stringify(newValue);
+  try {
+    storage.setItem(key, serialized);
+    return true;
+  } catch (error) {
+    if (!isQuotaExceededError(error) || evictCacheKeys(storage) === 0) {
+      reportWriteFailureOnce(key, error);
+      return false;
+    }
+  }
+
+  try {
+    storage.setItem(key, serialized);
+    return true;
+  } catch (retryError) {
+    reportWriteFailureOnce(key, retryError);
+    return false;
   }
 }
 
@@ -137,6 +211,27 @@ export function readPersistedString(key: string): string | undefined {
 }
 
 /**
+ * List persisted-state keys that start with any of the given prefixes.
+ * localStorage has no prefix query, so this is one pass over every key. Returns a snapshot,
+ * so callers may remove the returned keys without skipping any (index iteration would shift).
+ */
+export function listPersistedStateKeys(prefixes: readonly string[]): string[] {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+
+  const storage = window.localStorage;
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key !== null && prefixes.some((prefix) => key.startsWith(prefix))) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/**
  * Update a persisted state value from outside the hook.
  * This is useful when you need to update state from a different component/context
  * that doesn't have access to the setter (e.g., command palette updating workspace state).
@@ -146,14 +241,15 @@ export function readPersistedString(key: string): string | undefined {
  * @param key - The same localStorage key used in usePersistedState
  * @param value - The new value to set, or a functional updater
  * @param defaultValue - Optional default value when reading existing state for functional updates
+ * @returns false when the value could not be stored (e.g. quota exceeded even after evicting caches)
  */
 export function updatePersistedState<T>(
   key: string,
   value: T | ((prev: T) => T),
   defaultValue?: T
-): void {
+): boolean {
   if (typeof window === "undefined" || !window.localStorage) {
-    return;
+    return false;
   }
 
   try {
@@ -162,10 +258,8 @@ export function updatePersistedState<T>(
         ? (value as (prev: T) => T)(readPersistedState(key, defaultValue as T))
         : value;
 
-    if (newValue === undefined || newValue === null) {
-      window.localStorage.removeItem(key);
-    } else {
-      window.localStorage.setItem(key, JSON.stringify(newValue));
+    if (!writePersistedValue(key, newValue)) {
+      return false;
     }
 
     notifyWriteListeners({ key, newValue, source: "local" });
@@ -179,8 +273,10 @@ export function updatePersistedState<T>(
       detail: { key, newValue },
     });
     window.dispatchEvent(customEvent);
+    return true;
   } catch (error) {
-    console.warn(`Error writing to localStorage key "${key}":`, error);
+    reportWriteFailureOnce(key, error);
+    return false;
   }
 }
 
@@ -190,10 +286,8 @@ export function syncPersistedStateFromBackend(key: string, newValue: unknown): v
   }
 
   try {
-    if (newValue === undefined || newValue === null) {
-      window.localStorage.removeItem(key);
-    } else {
-      window.localStorage.setItem(key, JSON.stringify(newValue));
+    if (!writePersistedValue(key, newValue)) {
+      return;
     }
 
     notifyWriteListeners({ key, newValue, source: "backend" });
@@ -204,7 +298,7 @@ export function syncPersistedStateFromBackend(key: string, newValue: unknown): v
     });
     window.dispatchEvent(customEvent);
   } catch (error) {
-    console.warn(`Error writing backend preference cache key "${key}":`, error);
+    reportWriteFailureOnce(key, error);
   }
 }
 
@@ -302,10 +396,8 @@ export function usePersistedState<T>(
         const prevState = readPersistedState<T>(key, initialValueRef.current);
         const newValue = value instanceof Function ? value(prevState) : value;
 
-        if (newValue === undefined || newValue === null) {
-          window.localStorage.removeItem(key);
-        } else {
-          window.localStorage.setItem(key, JSON.stringify(newValue));
+        if (!writePersistedValue(key, newValue)) {
+          return;
         }
 
         notifyWriteListeners({ key, newValue, source: "local" });
@@ -319,7 +411,7 @@ export function usePersistedState<T>(
         });
         window.dispatchEvent(customEvent);
       } catch (error) {
-        console.warn(`Error writing to localStorage key "${key}":`, error);
+        reportWriteFailureOnce(key, error);
       }
     },
     [key]

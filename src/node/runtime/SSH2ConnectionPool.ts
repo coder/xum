@@ -7,6 +7,7 @@
  * - Singleflighting concurrent connection attempts
  */
 
+import { assert } from "@/common/utils/assert";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -45,21 +46,14 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
  */
 const IDLE_TIMEOUT_MS = 60 * 1000;
 
-export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOptions {
-  /**
-   * Test seam.
-   *
-   * If provided, this is used for sleeping between wait cycles.
-   */
-  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
-}
-
 interface SSH2ConnectionEntry {
   client: Client;
   resolvedConfig: ResolvedSSHConfig;
   proxyProcess?: ChildProcess;
   lastActivityAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** Exec/shell channels still open on this connection (see trackChannel). */
+  openChannels: number;
 }
 
 function waitForAbortable<T>(promise: Promise<T>, abortSignal?: AbortSignal): Promise<T> {
@@ -306,14 +300,14 @@ export class SSH2ConnectionPool {
   private health = new Map<string, ConnectionHealth>();
   private inflight = new Map<string, Promise<SSH2ConnectionEntry>>();
   private connections = new Map<string, SSH2ConnectionEntry>();
+  private idleTimeoutMs = IDLE_TIMEOUT_MS;
 
   async acquireConnection(
     config: SSHConnectionConfig,
-    options: AcquireConnectionOptions = {}
+    options: BaseSshAcquireConnectionOptions = {}
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     const timeoutMs = options.timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    const sleep = options.sleep ?? sleepWithAbort;
     const maxWaitMs = options.maxWaitMs ?? DEFAULT_SSH_MAX_WAIT_MS;
     const shouldWait = maxWaitMs > 0;
     const startTime = Date.now();
@@ -353,7 +347,7 @@ export class SSH2ConnectionPool {
 
         const waitMs = Math.min(remainingMs, budgetMs);
         options.onWait?.(waitMs);
-        await sleep(waitMs, options.abortSignal);
+        await sleepWithAbort(waitMs, options.abortSignal);
         continue;
       }
 
@@ -418,9 +412,14 @@ export class SSH2ConnectionPool {
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.
    */
-  clearAllHealth(): void {
+  clearAllHealthForTests(): void {
     this.health.clear();
     this.inflight.clear();
+  }
+
+  /** Shorten the idle window in tests (undefined restores the default). */
+  setIdleTimeoutMsForTests(ms: number | undefined): void {
+    this.idleTimeoutMs = ms ?? IDLE_TIMEOUT_MS;
   }
 
   /**
@@ -437,7 +436,28 @@ export class SSH2ConnectionPool {
 
     entry.idleTimer = setTimeout(() => {
       this.closeIdleConnection(key, entry);
-    }, IDLE_TIMEOUT_MS);
+    }, this.idleTimeoutMs);
+  }
+
+  /**
+   * Keep `entry`'s connection open while `channel` runs. The idle timer only
+   * counts acquires, so without this a command or terminal that outlived the
+   * idle window was cut off mid-run (#4876). The idle window restarts when the
+   * last open channel closes.
+   */
+  trackChannel(
+    config: SSHConnectionConfig,
+    entry: SSH2ConnectionEntry,
+    channel: Pick<NodeJS.EventEmitter, "once">
+  ): void {
+    entry.openChannels++;
+    channel.once("close", () => {
+      entry.openChannels--;
+      assert(entry.openChannels >= 0, "SSH2 open channel count went negative");
+      if (entry.openChannels === 0) {
+        this.touchConnection(entry, makeConnectionKey(config));
+      }
+    });
   }
 
   /**
@@ -446,6 +466,12 @@ export class SSH2ConnectionPool {
   private closeIdleConnection(key: string, entry: SSH2ConnectionEntry): void {
     // Verify this is still the active connection for this key
     if (this.connections.get(key) !== entry) {
+      return;
+    }
+
+    // Busy, not idle: re-arm instead of killing running channels (#4876).
+    if (entry.openChannels > 0) {
+      this.touchConnection(entry, key);
       return;
     }
 
@@ -536,6 +562,7 @@ export class SSH2ConnectionPool {
             resolvedConfig: resolvedConfigWithIdentities,
             proxyProcess: proxy?.process,
             lastActivityAt: Date.now(),
+            openChannels: 0,
           };
 
           const cleanupProxy = () => {
@@ -689,7 +716,7 @@ export class SSH2ConnectionPool {
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);
-          }, IDLE_TIMEOUT_MS);
+          }, this.idleTimeoutMs);
           return entry;
         };
 

@@ -1,15 +1,19 @@
 import assert from "@/common/utils/assert";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
+  HeldInput,
+  HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
   WorkspaceStatsSnapshot,
   OnChatMode,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type { TodoItem } from "@/common/types/tools";
@@ -43,7 +47,8 @@ import {
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
 import {
   isCaughtUpMessage,
   isStreamAbort,
@@ -60,6 +65,7 @@ import {
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
   isMuxMessage,
+  isHeldInputsChanged,
   isQueuedMessageChanged,
   isRestoreToInput,
   isRuntimeStatus,
@@ -91,21 +97,20 @@ import type { z } from "zod";
 import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
-  appendLiveBashOutputChunk,
+  applyLiveBashOutputEvent,
   type LiveBashOutputInternal,
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getAutoCompactionThresholdKey,
-  getAutoRetryKey,
-  getPinnedTodoExpandedKey,
-} from "@/common/constants/storage";
-import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
+import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
+import {
+  markChatSwitchMilestone,
+  markChatSwitchStart,
+} from "@/browser/utils/perf/chatSwitchTiming";
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
@@ -185,23 +190,51 @@ export type AutoRetryStatus = Extract<
   | { type: "auto-retry-abandoned" }
 >;
 
+function isAutoRetryStatusEvent(msg: WorkspaceChatMessage): msg is AutoRetryStatus {
+  const type = (msg as { type?: string }).type;
+  return (
+    type === "auto-retry-scheduled" ||
+    type === "auto-retry-starting" ||
+    type === "auto-retry-abandoned"
+  );
+}
+
 export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 
 export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
   messages: DisplayedMessage[];
   queuedMessage: QueuedMessage | null;
+  /** Manual queued messages refused at dispatch, kept by the backend until sent or discarded. */
+  heldInputs: readonly HeldInput[];
   canInterrupt: boolean;
   isCompacting: boolean;
   isStreamStarting: boolean;
   awaitingUserQuestion: boolean;
   loading: boolean;
   isTranscriptCaughtUp: boolean;
+  /**
+   * The last replay attempt reported a failed history read. Cached rows stay visible as a
+   * provisional view, the mutation barrier stays closed, and the subscription keeps retrying
+   * with backoff until a complete replay lands.
+   */
+  transcriptReplayFailed: boolean;
   isHydratingTranscript: boolean;
   // Cached rows are known to be missing backend content that arrived while this
-  // workspace was not subscribed to onChat. Hydration must hide them behind the
-  // skeleton instead of painting them and jumping when caught-up lands.
+  // workspace was not subscribed to onChat. Hydration hides them behind the skeleton
+  // only when the catch-up is not incremental (see isIncrementalCatchUp).
   isTranscriptStale: boolean;
+  /**
+   * Hydration is (or is about to be) a since replay: the server verifies every row up to
+   * the history cursor, and caught-up replaces the rows after it (the ones that arrived
+   * live since the last caught-up, e.g. the prompt and the in-flight reply) with the
+   * server's copies. Those change only by growing, or when edited or deleted elsewhere while
+   * unsubscribed, which caught-up swaps in one commit. Stale cached rows may therefore stay
+   * painted while it catches up; hiding them would also hide the rows after the cursor.
+   * A server downgrade to full swaps rows atomically at caught-up; a full replay or a
+   * reset clears the cursor, so this goes false and the skeleton returns.
+   */
+  isIncrementalCatchUp: boolean;
   hasOlderHistory: boolean;
   loadingOlderHistory: boolean;
   muxMessages: MuxMessage[];
@@ -287,6 +320,9 @@ export interface WorkspaceSidebarState {
  */
 type DerivedState = Record<string, number>;
 
+/** Stable empty held-input list, so an unchanged empty list keeps its identity across renders. */
+const NO_HELD_INPUTS: readonly HeldInput[] = [];
+
 /**
  * Per-attempt context for an onChat subscription. Carries the since-mode anchor the
  * attempt's cursor requested (so caught-up reconciliation only ever sees its own
@@ -295,11 +331,48 @@ type DerivedState = Record<string, number>;
  */
 interface OnChatAttemptContext {
   abort: () => void;
+  /** Signal of the subscription loop that started this attempt. */
+  loopSignal: AbortSignal;
   since?: {
     requestedAnchorSequence: number;
     localActiveStreamMessageId: string | undefined;
   };
+  /**
+   * The transcript refresh request pending when this attempt started. Only a `complete`
+   * caught-up from an owned attempt can settle it; a caught-up from an attempt that began
+   * before the request was made proves nothing about the rows the request must re-read.
+   */
+  refreshRequest?: TranscriptRefreshRequest;
 }
+
+/**
+ * Terminal result of {@link WorkspaceStore.requestTranscriptRefresh}. Exactly one is
+ * delivered per request; see the method doc for when each is produced.
+ */
+export type TranscriptRefreshOutcome =
+  | { kind: "refreshed"; candidate: HistoryEditPrecondition }
+  | { kind: "target-not-found" }
+  | { kind: "failed"; error: string }
+  | { kind: "superseded" }
+  | { kind: "cancelled" };
+
+interface TranscriptRefreshRequest {
+  workspaceId: string;
+  /** Range start of the invalidated precondition; the refresh must re-read down to it. */
+  throughSequence: number;
+  editMessageId: string;
+  /** Signal of the onChat loop the request was made under; its exit without a baseline fails the request. */
+  loopSignal: AbortSignal;
+  settled: boolean;
+  /** Identity of the paging pass started by the latest owned caught-up; older passes yield to it. */
+  pass: object | null;
+  resolve: (outcome: TranscriptRefreshOutcome) => void;
+}
+
+const TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR =
+  "The transcript subscription ended before the history could be re-read.";
+const TRANSCRIPT_REFRESH_PAGE_READ_ERROR = "Older history could not be re-read.";
+const TRANSCRIPT_REFRESH_PAGE_BUSY_ERROR = "Older history is still loading; retry the refresh.";
 
 /**
  * Usage metadata extracted from API responses (no tokenization).
@@ -367,7 +440,16 @@ export interface WorkflowToolLiveRunState {
 }
 
 interface WorkspaceChatTransientState {
+  /** The current attempt delivered its caught-up: live events now flow to the aggregator. */
   caughtUp: boolean;
+  /**
+   * The current attempt's caught-up closed a complete full/since history replay, so the
+   * aggregator rows are a verified copy of backend history. Only this opens the transcript
+   * mutation barrier; a live caught-up (no history read) never does.
+   */
+  historyVerified: boolean;
+  /** The last caught-up closed a failed history replay; cleared by the next complete one. */
+  replayFailed: boolean;
   isHydratingTranscript: boolean;
   /** Aggregator rows are missing transcript content that landed while unsubscribed from onChat. */
   cachedTranscriptStale: boolean;
@@ -381,6 +463,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
+  heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -417,6 +500,17 @@ function areHistoryPaginationCursorsEqual(
     a.beforeHistorySequence === b.beforeHistorySequence &&
     (a.beforeMessageId ?? null) === (b.beforeMessageId ?? null)
   );
+}
+
+/**
+ * The onChat replay mode the next subscription attempt requests. Shared by the subscription
+ * and the WorkspaceState selector so they can never disagree about whether catch-up is a
+ * since replay.
+ */
+function getOnChatReplayMode(aggregator: StreamingMessageAggregator): OnChatMode | undefined {
+  const cursor = aggregator.getOnChatCursor();
+  if (!cursor?.history) return undefined;
+  return { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
 }
 
 function createInitialHistoryPaginationState(): WorkspaceHistoryPaginationState {
@@ -463,6 +557,21 @@ function getBufferedActiveStreamStart(
   };
 }
 
+/**
+ * Message whose content the buffered stream replay rebuilds: the server replays stream-start
+ * (replay: true) and then the parts after the stream cursor, or every part when it applied no
+ * cursor. A replayed history row for the same message must not seed that rebuild.
+ */
+function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): string | undefined {
+  let messageId: string | undefined;
+  for (const event of events) {
+    if ("type" in event && event.type === "stream-start" && event.replay === true) {
+      messageId = event.messageId;
+    }
+  }
+  return messageId;
+}
+
 function appendAdvisorLiveText(
   liveTextByToolCallId: Map<string, AdvisorLiveTextState>,
   toolCallId: string,
@@ -498,6 +607,8 @@ export interface WorkspaceStoreOptions {
 function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
+    historyVerified: false,
+    replayFailed: false,
     isHydratingTranscript: false,
     cachedTranscriptStale: false,
     onChatIteratorOpen: false,
@@ -507,6 +618,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     pendingStreamEvents: [],
     replayingHistory: false,
     queuedMessage: null,
+    heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
     liveAdvisorReasoning: new Map(),
@@ -789,6 +901,15 @@ export class WorkspaceStore {
 
   // Workspace currently owning the live onChat subscription.
   private activeOnChatWorkspaceId: string | null = null;
+  // Workspaces whose first onChat replay since activation has not settled yet (#4662).
+  // Kept outside chatTransientState because full-replay resets replace transient objects.
+  private chatReplayPendingWorkspaces = new Set<string>();
+  // Loop signal of that subscription, so a refresh request can bind to the loop it was made under.
+  private activeOnChatSignal: AbortSignal | null = null;
+  // The in-flight onChat attempt per workspace (set in subscribe, cleared when the attempt finishes).
+  private currentOnChatAttempts = new Map<string, OnChatAttemptContext>();
+  // At most one pending transcript refresh request per workspace (see requestTranscriptRefresh).
+  private transcriptRefreshRequests = new Map<string, TranscriptRefreshRequest>();
 
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
@@ -834,6 +955,23 @@ export class WorkspaceStore {
 
   // Per-workspace ephemeral chat state (buffering, queued message, live bash output, etc.)
   private chatTransientState = new Map<string, WorkspaceChatTransientState>();
+
+  /**
+   * Held inputs a composer took from a restore (#4448), per workspace, until the backend's held
+   * list drops them. Hidden from the banner list meanwhile, so input already in the composer never
+   * also shows as "Not sent". Kept outside chatTransientState: a replay reset before the backend's
+   * removal must not resurface them. Each change replaces the Set (visibleHeldInputs caches on
+   * its identity).
+   */
+  private readonly acceptedRestoreHeldInputs = new Map<string, ReadonlySet<string>>();
+  private readonly visibleHeldInputsCache = new Map<
+    string,
+    {
+      raw: readonly HeldInput[];
+      accepted: ReadonlySet<string>;
+      visible: readonly HeldInput[];
+    }
+  >();
 
   // Per-workspace transcript pagination state for loading prior compaction epochs.
   private historyPagination = new Map<string, WorkspaceHistoryPaginationState>();
@@ -1051,11 +1189,12 @@ export class WorkspaceStore {
 
       // Cleanup live bash output once the real tool result contains output.
       // If output is missing (e.g. tmpfile overflow), keep the tail buffer so the UI still shows something.
-      if (toolCallEnd.toolName === "bash" && transient) {
-        const output = (toolCallEnd.result as { output?: unknown } | undefined)?.output;
-        if (typeof output === "string") {
-          transient.liveBashOutput.delete(toolCallEnd.toolCallId);
-        }
+      if (transient) {
+        applyLiveBashOutputEvent(
+          transient.liveBashOutput,
+          toolCallEnd,
+          BASH_TRUNCATE_MAX_TOTAL_BYTES
+        );
       }
 
       // Cleanup ephemeral advisor/task state once the actual tool result is available.
@@ -1198,19 +1337,38 @@ export class WorkspaceStore {
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
     },
+    "held-inputs-changed": (workspaceId, _aggregator, data) => {
+      if (!isHeldInputsChanged(data)) return;
+      this.assertChatTransientState(workspaceId).heldInputs =
+        data.heldInputs.length > 0 ? data.heldInputs : NO_HELD_INPUTS;
+      // The backend no longer holds these: they need no hiding any more.
+      const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+      if (accepted) {
+        const stillHeld = new Set(data.heldInputs.map((input) => input.id));
+        const kept = [...accepted].filter((id) => stillHeld.has(id));
+        if (kept.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+        else if (kept.length !== accepted.size) {
+          this.acceptedRestoreHeldInputs.set(workspaceId, new Set(kept));
+        }
+      }
+      this.states.bump(workspaceId);
+    },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
 
-      // Use UPDATE_CHAT_INPUT event with mode="replace"
+      // mode="restore", not "replace": a newer draft typed while the message was queued must
+      // survive (#4431).
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
           text: data.text,
-          mode: "replace",
+          mode: "restore",
           fileParts: data.fileParts,
           reviews: data.reviews,
           // Restore events can arrive for a background workspace; never let them
           // overwrite the composer currently mounted for another workspace.
           workspaceId: data.workspaceId,
+          // The composer that applies the restore acknowledges these (acceptRestoredHeldInputs).
+          heldInputIds: data.heldInputIds,
         })
       );
     },
@@ -1496,6 +1654,10 @@ export class WorkspaceStore {
 
     const previousActiveId = this.activeWorkspaceId;
     this.activeWorkspaceId = workspaceId;
+    if (workspaceId) {
+      // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
+      markChatSwitchStart(workspaceId);
+    }
     this.ensureActiveOnChatSubscription();
 
     // Re-hydrate persisted session usage so cost totals reflect any
@@ -1585,6 +1747,7 @@ export class WorkspaceStore {
       transient.cachedTranscriptStale = true;
     }
     transient.caughtUp = false;
+    transient.historyVerified = false;
     transient.replayingHistory = false;
     transient.historicalMessages.length = 0;
     transient.pendingStreamEvents.length = 0;
@@ -1666,19 +1829,24 @@ export class WorkspaceStore {
       // Clear replay buffers before aborting so a fast workspace switch/reopen
       // cannot replay stale buffered rows from the previous subscription attempt.
       this.clearReplayBuffers(previousActiveWorkspaceId);
+      // Navigation settles a pending refresh synchronously; the composer that asked is gone.
+      this.settleTranscriptRefresh(previousActiveWorkspaceId, { kind: "cancelled" });
 
       const unsubscribe = this.ipcUnsubscribers.get(previousActiveWorkspaceId);
       if (unsubscribe) {
         unsubscribe();
       }
       this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
+      this.chatReplayPendingWorkspaces.delete(previousActiveWorkspaceId);
       this.activeOnChatWorkspaceId = null;
+      this.activeOnChatSignal = null;
     }
 
     if (targetWorkspaceId) {
       const transient = this.chatTransientState.get(targetWorkspaceId);
       if (transient) {
         transient.caughtUp = false;
+        transient.historyVerified = false;
         // Only show transcript hydration once we can actually establish onChat.
         // When the ORPC client is unavailable, avoid pinning the pane in loading.
         transient.isHydratingTranscript = this.client !== null;
@@ -1686,7 +1854,11 @@ export class WorkspaceStore {
 
       const controller = new AbortController();
       this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
+      // Set even without a client: probes cannot run without one either, and the replay
+      // starts once the client arrives.
+      this.chatReplayPendingWorkspaces.add(targetWorkspaceId);
       this.activeOnChatWorkspaceId = targetWorkspaceId;
+      this.activeOnChatSignal = controller.signal;
       void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
     }
 
@@ -2380,6 +2552,10 @@ export class WorkspaceStore {
         displayedMessages.length > 0 &&
         !transient.staleSkeletonExpired &&
         (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+      const isIncrementalCatchUp =
+        isHydratingTranscript &&
+        !transient.fullReplayInFlight &&
+        getOnChatReplayMode(aggregator)?.type === "since";
       const aggregatorTodos = aggregator.getCurrentTodos();
       // Sidebar status precedence, split into four tiers so each signal
       // wins exactly when it should. Active and inactive workspaces draw
@@ -2424,14 +2600,17 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
+        heldInputs: this.visibleHeldInputs(workspaceId, transient.heldInputs),
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
         awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
         loading: !hasMessages && !hasRunningInitMessage && !transient.caughtUp,
-        isTranscriptCaughtUp: transient.caughtUp,
+        isTranscriptCaughtUp: transient.caughtUp && transient.historyVerified,
+        transcriptReplayFailed: transient.replayFailed,
         isHydratingTranscript,
         isTranscriptStale,
+        isIncrementalCatchUp,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
         muxMessages: messages,
@@ -2587,6 +2766,63 @@ export class WorkspaceStore {
     this.sidebarStateCache.set(workspaceId, newState);
     this.sidebarStateSourceState.set(workspaceId, fullState);
     return newState;
+  }
+
+  /**
+   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
+   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
+   * what the composer holds is recoverable, a hidden held copy is not.
+   */
+  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+    assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
+    assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
+    this.acceptedRestoreHeldInputs.set(
+      workspaceId,
+      new Set([...(this.acceptedRestoreHeldInputs.get(workspaceId) ?? []), ...heldInputIds])
+    );
+    this.states.bump(workspaceId);
+
+    const client = this.client;
+    for (const heldInputId of heldInputIds) {
+      if (!client) {
+        this.showRestoredHeldInputAgain(workspaceId, heldInputId, "no ORPC client");
+        continue;
+      }
+      client.workspace.discardHeldInput({ workspaceId, heldInputId }).then(
+        (result) => {
+          if (!result.success) {
+            this.showRestoredHeldInputAgain(workspaceId, heldInputId, result.error);
+          }
+        },
+        (error: unknown) => this.showRestoredHeldInputAgain(workspaceId, heldInputId, error)
+      );
+    }
+  }
+
+  private showRestoredHeldInputAgain(workspaceId: string, heldInputId: string, reason: unknown) {
+    console.warn(
+      `[WorkspaceStore] Could not release held input ${heldInputId} for ${workspaceId}:`,
+      reason
+    );
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (!accepted?.has(heldInputId)) return;
+    const remaining = [...accepted].filter((id) => id !== heldInputId);
+    if (remaining.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+    else this.acceptedRestoreHeldInputs.set(workspaceId, new Set(remaining));
+    this.states.bump(workspaceId);
+  }
+
+  /** The backend's held inputs minus those a composer took (stable array per input). */
+  private visibleHeldInputs(workspaceId: string, raw: readonly HeldInput[]): readonly HeldInput[] {
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (accepted === undefined || raw.length === 0) return raw;
+    const cached = this.visibleHeldInputsCache.get(workspaceId);
+    if (cached?.raw === raw && cached.accepted === accepted) return cached.visible;
+    const filtered = raw.filter((input) => !accepted.has(input.id));
+    const visible =
+      filtered.length === raw.length ? raw : filtered.length > 0 ? filtered : NO_HELD_INPUTS;
+    this.visibleHeldInputsCache.set(workspaceId, { raw, accepted, visible });
+    return visible;
   }
 
   /**
@@ -2787,6 +3023,214 @@ export class WorkspaceStore {
   }
 
   /**
+   * Content evidence for editing `editMessageId`: the shared truncation rule and range
+   * fingerprint (`buildHistoryEditPrecondition`) over the committed rows this client holds.
+   * The active stream's row is evidence fenced by identity only (its persisted form is the
+   * placeholder the edit's interruption deletes — see `getHistoryEvidenceMessages`); a row the
+   * aggregator fabricated locally (a pre-stream error's synthetic assistant row has no
+   * persisted counterpart) is not. Committed rows keep their `partial` flag on both sides, so
+   * they stay in. Returns undefined when the edited row is not held: the edit cannot be fenced
+   * and must not start.
+   */
+  captureHistoryEditPrecondition(
+    workspaceId: string,
+    editMessageId: string
+  ): HistoryEditPrecondition | undefined {
+    assert(
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "captureHistoryEditPrecondition requires a non-empty workspaceId"
+    );
+    assert(
+      typeof editMessageId === "string" && editMessageId.length > 0,
+      "captureHistoryEditPrecondition requires a non-empty editMessageId"
+    );
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      return undefined;
+    }
+    return buildHistoryEditPrecondition(aggregator.getHistoryEvidenceMessages(), editMessageId);
+  }
+
+  /**
+   * Re-read the transcript after the backend refused an edit with `history-changed`, so the
+   * composer can offer a fresh precondition for an explicit re-send. One logical request per
+   * workspace; a newer request supersedes the pending one.
+   *
+   * Lifecycle: aborts the in-flight onChat attempt so the loop re-subscribes (since cursor →
+   * validated or downgraded to full) and owns every retry attempt the loop makes until it
+   * settles — a `failed` caught-up keeps the request pending through the loop's backoff. Once
+   * an owned attempt lands a `complete` full/since caught-up, rows below the server replay
+   * window are discarded and re-paged with fresh reads until a page holds a sequence at or
+   * below `throughSequence - 1` (one predecessor row so the snapshot rule can be re-evaluated)
+   * or history is exhausted. Exactly one outcome is delivered:
+   * - `refreshed`: baseline + pages landed and the edited row is held (candidate captured
+   *   from that snapshot);
+   * - `target-not-found`: fresh reads covered every sequence the edited row could have and it
+   *   is gone (only a successful exhaustive read yields this);
+   * - `failed`: an older-page read failed/was unavailable, or the subscription loop ended
+   *   without delivering a baseline (retryable replay failures are not terminal);
+   * - `superseded`: a newer request for the workspace replaced it;
+   * - `cancelled`: workspace switch, `cancelTranscriptRefresh`, or disposal — settled
+   *   synchronously so no waiter outlives the composer that asked.
+   */
+  requestTranscriptRefresh(
+    workspaceId: string,
+    options: { throughSequence: number; editMessageId: string }
+  ): Promise<TranscriptRefreshOutcome> {
+    assert(
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "requestTranscriptRefresh requires a non-empty workspaceId"
+    );
+    assert(
+      typeof options.editMessageId === "string" && options.editMessageId.length > 0,
+      "requestTranscriptRefresh requires a non-empty editMessageId"
+    );
+    assert(
+      Number.isInteger(options.throughSequence) && options.throughSequence >= 0,
+      "requestTranscriptRefresh requires a non-negative integer throughSequence"
+    );
+
+    // Exactly one pending request per workspace: the newer one wins.
+    this.settleTranscriptRefresh(workspaceId, { kind: "superseded" });
+    assert(
+      !this.transcriptRefreshRequests.has(workspaceId),
+      "a superseded refresh request must leave the workspace slot empty"
+    );
+
+    const { promise, resolve } = Promise.withResolvers<TranscriptRefreshOutcome>();
+    const loopSignal =
+      this.activeOnChatWorkspaceId === workspaceId ? this.activeOnChatSignal : null;
+    if (!loopSignal) {
+      // Not subscribed: the composer that asked is no longer looking at this workspace.
+      resolve({ kind: "cancelled" });
+      return promise;
+    }
+    const request: TranscriptRefreshRequest = {
+      workspaceId,
+      throughSequence: options.throughSequence,
+      editMessageId: options.editMessageId,
+      loopSignal,
+      settled: false,
+      pass: null,
+      resolve,
+    };
+    this.transcriptRefreshRequests.set(workspaceId, request);
+    // Force a fresh attempt; the loop's next subscribe tags it as owned by this request.
+    // Between attempts (backoff) there is nothing to abort and the next attempt is owned.
+    this.currentOnChatAttempts.get(workspaceId)?.abort();
+    return promise;
+  }
+
+  /** Settle a pending refresh request as `cancelled` (editing cancelled). No-op without one. */
+  cancelTranscriptRefresh(workspaceId: string): void {
+    assert(
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "cancelTranscriptRefresh requires a non-empty workspaceId"
+    );
+    this.settleTranscriptRefresh(workspaceId, { kind: "cancelled" });
+  }
+
+  private settleTranscriptRefresh(workspaceId: string, outcome: TranscriptRefreshOutcome): void {
+    const request = this.transcriptRefreshRequests.get(workspaceId);
+    if (!request) {
+      return;
+    }
+    assert(!request.settled, "a pending refresh request is settled exactly once");
+    request.settled = true;
+    request.pass = null;
+    this.transcriptRefreshRequests.delete(workspaceId);
+    request.resolve(outcome);
+  }
+
+  /**
+   * Runs after an owned attempt's complete caught-up: re-pages any pre-window range with fresh
+   * reads, then settles the request from the resulting snapshot. A later owned caught-up
+   * (the attempt died mid-pass and the loop recovered) starts a new pass; the older pass
+   * yields at its next check.
+   */
+  private async runTranscriptRefreshPass(request: TranscriptRefreshRequest): Promise<void> {
+    const { workspaceId, throughSequence } = request;
+    const pass = {};
+    request.pass = pass;
+    const isCurrentPass = () =>
+      !request.settled &&
+      request.pass === pass &&
+      this.transcriptRefreshRequests.get(workspaceId) === request;
+
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      this.settleTranscriptRefresh(workspaceId, {
+        kind: "failed",
+        error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
+      });
+      return;
+    }
+
+    const floor = aggregator.getEstablishedOldestHistorySequence();
+    if (floor !== null && throughSequence < floor) {
+      // The range starts in an earlier compaction epoch. A since replay verifies rows at and
+      // above the window floor only; the paginated rows below it are cached copies, so drop
+      // them and re-read from the floor down. Discarded rows prove older history exists even
+      // when the cached pagination state had already reached the start.
+      const discarded = aggregator.discardMessagesBelowSequence(floor);
+      const previousPagination =
+        this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
+      this.historyPagination.set(
+        workspaceId,
+        this.deriveHistoryPaginationState(aggregator, previousPagination.hasOlder || discarded > 0)
+      );
+      if (discarded > 0) {
+        this.states.bump(workspaceId);
+      }
+
+      const lookbackSequence = throughSequence - 1;
+      // Coverage is proven by a committed row (valid sequence) at or below the lookback: a
+      // malformed sequence is not evidence here either, or it could end paging early and
+      // report an existing target as gone.
+      const hasLookbackRow = () =>
+        aggregator.getAllMessages().some((message) => {
+          const historySequence = message.metadata?.historySequence;
+          return isNonNegativeInteger(historySequence) && historySequence <= lookbackSequence;
+        });
+      while (!hasLookbackRow()) {
+        const result = await this.loadOlderHistory(workspaceId);
+        if (!isCurrentPass()) return;
+        if (result === "exhausted") break;
+        if (result === "loaded") continue;
+        if (result === "busy") {
+          // Our own load lost to a pagination reset by a dying attempt: the loop is
+          // retrying and the next owned caught-up starts a fresh pass. Otherwise another
+          // caller's load is in flight; report it rather than guess when it ends.
+          const transient = this.chatTransientState.get(workspaceId);
+          if (!transient?.caughtUp) return;
+          this.settleTranscriptRefresh(workspaceId, {
+            kind: "failed",
+            error: TRANSCRIPT_REFRESH_PAGE_BUSY_ERROR,
+          });
+          return;
+        }
+        // "failed" | "unavailable": a failure is never read as exhausted history.
+        this.settleTranscriptRefresh(workspaceId, {
+          kind: "failed",
+          error: TRANSCRIPT_REFRESH_PAGE_READ_ERROR,
+        });
+        return;
+      }
+    }
+
+    if (!isCurrentPass()) return;
+    const candidate = this.captureHistoryEditPrecondition(workspaceId, request.editMessageId);
+    if (candidate) {
+      this.settleTranscriptRefresh(workspaceId, { kind: "refreshed", candidate });
+      return;
+    }
+    // Every sequence the edited row could occupy was freshly read: the replay window covers
+    // `throughSequence` when it is at/above the floor, and the pages above either reached
+    // the predecessor row or the start of history. Only that successful coverage says gone.
+    this.settleTranscriptRefresh(workspaceId, { kind: "target-not-found" });
+  }
+
+  /**
    * Mark the current active stream as "interrupting" (transient state).
    * Call this before invoking interruptStream so the UI shows "interrupting..."
    * immediately, avoiding a visual flash when the backend confirmation arrives.
@@ -2833,7 +3277,23 @@ export class WorkspaceStore {
    * intentionally empty persisted transcript state.
    */
   isWorkspaceTranscriptCaughtUp(workspaceId: string): boolean {
-    return this.chatTransientState.get(workspaceId)?.caughtUp ?? false;
+    const transient = this.chatTransientState.get(workspaceId);
+    return transient !== undefined && transient.caughtUp && transient.historyVerified;
+  }
+
+  /**
+   * Whether the active workspace is still waiting for its first onChat replay since it was
+   * activated. Workspace-open git/PR probes wait for this (#4662) so their process spawns
+   * and result renders do not compete with the replay's history read and transcript paint.
+   * The gate opens on caught-up (complete or failed replay), when an attempt ends without
+   * caught-up (transport error, stall watchdog), or when the workspace stops being active.
+   * Subscribers of {@link subscribeKey} are notified when it opens.
+   */
+  isWorkspaceChatReplayPending(workspaceId: string): boolean {
+    return (
+      this.activeOnChatWorkspaceId === workspaceId &&
+      this.chatReplayPendingWorkspaces.has(workspaceId)
+    );
   }
 
   getWorkspaceHistoryEpoch(workspaceId: string): number {
@@ -3902,6 +4362,10 @@ export class WorkspaceStore {
     if (previousTransient?.isHydratingTranscript) {
       nextTransient.isHydratingTranscript = true;
     }
+    // A retry after a failed replay keeps the banner until a complete caught-up clears it.
+    if (previousTransient?.replayFailed) {
+      nextTransient.replayFailed = true;
+    }
 
     this.chatTransientState.set(workspaceId, nextTransient);
 
@@ -3912,75 +4376,6 @@ export class WorkspaceStore {
     this.checkAndBumpRecencyIfChanged();
   }
 
-  private getStartupAutoCompactionThreshold(
-    workspaceId: string,
-    retryModelHint?: string | null
-  ): number {
-    const metadata = this.workspaceMetadata.get(workspaceId);
-    const modelFromActiveAgent = metadata?.agentId
-      ? metadata.aiSettingsByAgent?.[metadata.agentId]?.model
-      : undefined;
-    const pendingModel =
-      retryModelHint ??
-      modelFromActiveAgent ??
-      metadata?.aiSettingsByAgent?.exec?.model ??
-      metadata?.aiSettings?.model;
-    const thresholdKey = getAutoCompactionThresholdKey(pendingModel ?? "default");
-    const persistedThreshold = readPersistedState<unknown>(
-      thresholdKey,
-      DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT
-    );
-    const thresholdPercent =
-      typeof persistedThreshold === "number" && Number.isFinite(persistedThreshold)
-        ? persistedThreshold
-        : DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT;
-
-    if (thresholdPercent !== persistedThreshold) {
-      // Self-heal malformed localStorage so future startup syncs remain valid.
-      updatePersistedState<number>(thresholdKey, DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT);
-    }
-
-    return Math.max(0.1, Math.min(1, thresholdPercent / 100));
-  }
-
-  /**
-   * Best-effort startup threshold sync so backend recovery uses the user's persisted
-   * per-model threshold before AgentSession startup recovery kicks in.
-   */
-  private async syncAutoCompactionThresholdAtStartup(
-    client: RouterClient<AppRouter>,
-    workspaceId: string
-  ): Promise<void> {
-    try {
-      // Startup auto-retry can resume a turn with a model different from the current
-      // workspace selector. Ask backend for that retry-turn model first so threshold
-      // sync uses the matching per-model localStorage key.
-      const startupRetryModelResult = await client.workspace.getStartupAutoRetryModel?.({
-        workspaceId,
-      });
-      const startupRetryModel = startupRetryModelResult?.success
-        ? startupRetryModelResult.data
-        : null;
-
-      // Defensive: in some test environments the orpc client mock can be incomplete.
-      // Treat a missing method as a no-op so a single missing mock entry can't cascade
-      // into unrelated test failures.
-      if (typeof client.workspace?.setAutoCompactionThreshold !== "function") {
-        return;
-      }
-
-      await client.workspace.setAutoCompactionThreshold({
-        workspaceId,
-        threshold: this.getStartupAutoCompactionThreshold(workspaceId, startupRetryModel),
-      });
-    } catch (error) {
-      console.warn(
-        `[WorkspaceStore] Failed to sync startup auto-compaction threshold for ${workspaceId}:`,
-        error
-      );
-    }
-  }
-
   /**
    * Subscribe to workspace chat events (history replay + live streaming).
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
@@ -3989,12 +4384,17 @@ export class WorkspaceStore {
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
       signal,
+      // A failed replay still delivers queue snapshots and a caught-up; only a complete
+      // replay proves the attempt worked, so only that resets the retry backoff.
+      isSuccessEvent: (event: WorkspaceChatMessage) =>
+        isCaughtUpMessage(event) && event.historyReplayStatus === "complete",
       getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
       subscribe: async (client, attemptSignal, abortAttempt) => {
         const transient = this.chatTransientState.get(workspaceId);
         if (transient) {
           transient.caughtUp = false;
+          transient.historyVerified = false;
           // Every attempt replays, including retries that keep the same client and cached rows.
           if (!transient.isHydratingTranscript) {
             transient.isHydratingTranscript = true;
@@ -4006,18 +4406,21 @@ export class WorkspaceStore {
         }
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
-        const attemptContext: OnChatAttemptContext = { abort: abortAttempt };
+        const attemptContext: OnChatAttemptContext = { abort: abortAttempt, loopSignal: signal };
+        // A refresh request pending at attempt start owns this attempt (and every retry the
+        // loop makes until it settles); its caught-up is the request's fresh baseline.
+        const refreshRequest = this.transcriptRefreshRequests.get(workspaceId);
+        if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
+        this.currentOnChatAttempts.set(workspaceId, attemptContext);
         if (aggregator) {
-          const cursor = aggregator.getOnChatCursor();
-          if (cursor?.history) {
-            mode = { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
+          mode = getOnChatReplayMode(aggregator);
+          if (mode?.type === "since") {
             attemptContext.since = {
-              requestedAnchorSequence: cursor.history.historySequence,
-              localActiveStreamMessageId: cursor.stream?.messageId,
+              requestedAnchorSequence: mode.cursor.history.historySequence,
+              localActiveStreamMessageId: mode.cursor.stream?.messageId,
             };
           }
         }
-        await this.syncAutoCompactionThresholdAtStartup(client, workspaceId);
         const autoRetryKey = getAutoRetryKey(workspaceId);
         const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
         const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
@@ -4077,12 +4480,23 @@ export class WorkspaceStore {
           );
       },
       onAttemptFinished: () => {
+        // The transport withholds this callback once the loop signal is aborted, so the entry
+        // is this loop's own attempt; the guard keeps that true by construction should a
+        // replacement loop (switch away and back) ever register first.
+        if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
+          this.currentOnChatAttempts.delete(workspaceId);
+        }
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
+        // An attempt that ended without caught-up (transport error, stall watchdog) opens
+        // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
+        const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
         const transient = this.chatTransientState.get(workspaceId);
         if (transient) {
           // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
           transient.isHydratingTranscript = true;
+        }
+        if (transient || openedReplayGate) {
           this.states.bump(workspaceId);
         }
         if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
@@ -4092,6 +4506,19 @@ export class WorkspaceStore {
         this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
       },
     });
+    // The loop is over (signal aborted, client gone, or a stop from onError): no attempt of
+    // this loop can deliver a baseline anymore. Switch/dispose already settled `cancelled`;
+    // anything still pending under this loop's signal fails. A request bound to a newer loop
+    // for the same workspace (switch away and back) is untouched.
+    if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
+      this.currentOnChatAttempts.delete(workspaceId);
+    }
+    if (this.transcriptRefreshRequests.get(workspaceId)?.loopSignal === signal) {
+      this.settleTranscriptRefresh(workspaceId, {
+        kind: "failed",
+        error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
+      });
+    }
   }
 
   /**
@@ -4262,7 +4689,15 @@ export class WorkspaceStore {
     }
     if (this.activeOnChatWorkspaceId === workspaceId) {
       this.activeOnChatWorkspaceId = null;
+      this.activeOnChatSignal = null;
     }
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
+    this.currentOnChatAttempts.delete(workspaceId);
+    // A pending refresh can never get its baseline from a removed workspace.
+    this.settleTranscriptRefresh(workspaceId, {
+      kind: "failed",
+      error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
+    });
 
     this.pendingReplayReset.delete(workspaceId);
 
@@ -4273,6 +4708,8 @@ export class WorkspaceStore {
     this.aggregators.delete(workspaceId);
     this.resetStaleSkeletonDeadline(workspaceId);
     this.chatTransientState.delete(workspaceId);
+    this.acceptedRestoreHeldInputs.delete(workspaceId);
+    this.visibleHeldInputsCache.delete(workspaceId);
     this.workspaceMetadata.delete(workspaceId);
     this.derived.bump("workspaces");
     this.workspaceActivity.delete(workspaceId);
@@ -4349,6 +4786,12 @@ export class WorkspaceStore {
     }
     this.timelineUnsubscribers.clear();
 
+    // Release every refresh waiter before the loops observe their aborted signals.
+    for (const workspaceId of Array.from(this.transcriptRefreshRequests.keys())) {
+      this.settleTranscriptRefresh(workspaceId, { kind: "cancelled" });
+    }
+    this.currentOnChatAttempts.clear();
+
     for (const unsubscribe of this.ipcUnsubscribers.values()) {
       unsubscribe();
     }
@@ -4370,6 +4813,8 @@ export class WorkspaceStore {
 
     this.activeWorkspaceId = null;
     this.activeOnChatWorkspaceId = null;
+    this.activeOnChatSignal = null;
+    this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
     this.derived.clear();
@@ -4528,6 +4973,39 @@ export class WorkspaceStore {
     if (isCaughtUpMessage(data)) {
       const replay = data.replay ?? "full";
 
+      if (data.historyReplayStatus === "failed") {
+        // The server could not read/emit history but still closed the attempt (caught-up is
+        // sent from a `finally`). Nothing here is authoritative: drop this attempt's buffered
+        // rows, keep the aggregator rows and the last good cursor as a provisional view, apply
+        // only the queue/retry snapshots (Stop and queue state stay current), keep the barrier
+        // closed, and abort the attempt so the loop retries with increasing backoff.
+        assert(!transient.caughtUp, "a failed caught-up must not arrive after catch-up");
+        transient.historicalMessages.length = 0;
+        // The retry snapshot is only replayed while a retry is scheduled, so its absence is
+        // authoritative: a retry that resolved while disconnected must not keep its banner
+        // (and Stop) alive through the outage.
+        transient.autoRetryStatus = null;
+        // Held inputs are replayed only while non-empty (like the retry snapshot).
+        transient.heldInputs = NO_HELD_INPUTS;
+        for (const event of transient.pendingStreamEvents) {
+          if (
+            isQueuedMessageChanged(event) ||
+            isHeldInputsChanged(event) ||
+            isAutoRetryStatusEvent(event)
+          ) {
+            this.processStreamEvent(workspaceId, aggregator, event);
+          }
+        }
+        transient.pendingStreamEvents.length = 0;
+        transient.replayFailed = true;
+        console.warn(
+          `[WorkspaceStore] onChat history replay failed for ${workspaceId}; keeping cached rows and retrying`
+        );
+        this.states.bump(workspaceId);
+        attemptContext?.abort();
+        return;
+      }
+
       if (data.downgradeReason !== undefined) {
         // Dev observability: a requested since reconnect was downgraded to a full
         // replay server-side. Silent downgrades previously hid full re-transfers.
@@ -4556,6 +5034,20 @@ export class WorkspaceStore {
       // Check if there's an active stream in buffered events (reconnection scenario).
       const pendingEvents = transient.pendingStreamEvents;
       const hasActiveStream = getBufferedActiveStreamStart(pendingEvents) !== null;
+
+      // StreamManager persists the finalized row before it leaves STREAMING and emits
+      // stream-end, so a replay in that window carries both the finalized row and a stream
+      // replay of the same message. The stream replay's parts start after the stream cursor
+      // (the local assembly) or from nothing (no cursor applied), never after the finalized
+      // row: seeding the rebuild with that row showed the reply's tail twice (#4505 UAT).
+      // Drop the row; the replayed parts plus the buffered stream-end rebuild the message.
+      const replayedStreamMessageId = getBufferedReplayedStreamMessageId(pendingEvents);
+      const replayedHistoryMessages =
+        replayedStreamMessageId === undefined
+          ? transient.historicalMessages
+          : transient.historicalMessages.filter(
+              (message) => message.id !== replayedStreamMessageId
+            );
 
       const serverActiveStreamMessageId = data.cursor?.stream?.messageId;
       const localActiveStreamMessageId = aggregator.getActiveStreamMessageId();
@@ -4590,6 +5082,10 @@ export class WorkspaceStore {
       if (serverActiveStreamMessageId === undefined) {
         aggregator.clearPendingStreamStartIfNotOptimistic();
       }
+
+      // Every replay (full or since) re-sends the held-input list while it is non-empty, buffered
+      // until after this reset, so a list emptied while disconnected cannot linger.
+      transient.heldInputs = NO_HELD_INPUTS;
 
       if (replay === "full") {
         // Full replay replaces backend-derived history state. Reset transient UI-only
@@ -4634,29 +5130,32 @@ export class WorkspaceStore {
         // the active stream only when the server-confirmed stream matches the local
         // stream the attempt's cursor was built from; otherwise replayed rows plus
         // subsequently replayed stream events rebuild the stream message (stale local
-        // contexts were already cleared above).
+        // contexts were already cleared above). A replayed stream-start for the local stream
+        // also confirms the match: the server applied this attempt's stream cursor, and the
+        // stream may have ended before caught-up (so the caught-up carries no stream cursor).
+        const localStreamMessageId = sinceContext.localActiveStreamMessageId;
         const preservedActiveStreamMessageId =
-          serverActiveStreamMessageId !== undefined &&
-          serverActiveStreamMessageId === sinceContext.localActiveStreamMessageId
-            ? serverActiveStreamMessageId
+          localStreamMessageId !== undefined &&
+          (serverActiveStreamMessageId === localStreamMessageId ||
+            replayedStreamMessageId === localStreamMessageId)
+            ? localStreamMessageId
             : undefined;
         aggregator.reconcileSinceReplay({
           requestedAnchorSequence: sinceContext.requestedAnchorSequence,
-          messages: transient.historicalMessages,
+          messages: replayedHistoryMessages,
           preservedActiveStreamMessageId,
           hasActiveStream,
         });
-        transient.historicalMessages.length = 0;
-      } else if (transient.historicalMessages.length > 0) {
+      } else if (replayedHistoryMessages.length > 0) {
         const loadMode = replay === "full" ? "replace" : "append";
-        aggregator.loadHistoricalMessages(transient.historicalMessages, hasActiveStream, {
+        aggregator.loadHistoricalMessages(replayedHistoryMessages, hasActiveStream, {
           mode: loadMode,
         });
-        transient.historicalMessages.length = 0;
       } else if (replay === "full") {
         // Full replay can legitimately contain zero messages (e.g. compacted to empty).
         aggregator.loadHistoricalMessages([], hasActiveStream, { mode: "replace" });
       }
+      transient.historicalMessages.length = 0;
 
       // Store the server-issued cursor for the next reconnect (full and since replays
       // both refresh it). A caught-up without a cursor means the server could not
@@ -4688,14 +5187,21 @@ export class WorkspaceStore {
           this.deriveHistoryPaginationState(aggregator, data.hasOlderHistory)
         );
       }
-      // Mark as caught up
+      // Mark as caught up. Only a complete full/since replay verifies the transcript: the
+      // store never requests live mode (it replays no history), so a live caught-up lets
+      // events flow but leaves the mutation barrier closed.
       transient.caughtUp = true;
+      this.chatReplayPendingWorkspaces.delete(workspaceId);
+      transient.historyVerified = replay !== "live";
+      transient.replayFailed = false;
       transient.isHydratingTranscript = false;
       transient.cachedTranscriptStale = false;
       transient.fullReplayInFlight = false;
       this.resetStaleSkeletonDeadline(workspaceId);
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
+      // No-op unless this is the workspace the latest switch targeted.
+      markChatSwitchMilestone(workspaceId, "caught-up", { replay });
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
       // Replay resets clear the aggregator before history is rebuilt. Drop the temporary
@@ -4714,6 +5220,26 @@ export class WorkspaceStore {
       // it hit the hard fallback above instead of reconciling against a stale anchor.
       if (attemptContext) {
         attemptContext.since = undefined;
+      }
+
+      // A verified caught-up from an attempt the pending refresh request owns is its fresh
+      // baseline; the paging pass below re-reads any pre-window range and settles it.
+      const refreshRequest = attemptContext?.refreshRequest;
+      if (
+        refreshRequest &&
+        transient.historyVerified &&
+        this.transcriptRefreshRequests.get(workspaceId) === refreshRequest
+      ) {
+        this.runTranscriptRefreshPass(refreshRequest).catch((error: unknown) => {
+          console.error(
+            `[WorkspaceStore] Transcript refresh pass failed for ${workspaceId}:`,
+            error
+          );
+          this.settleTranscriptRefresh(workspaceId, {
+            kind: "failed",
+            error: error instanceof Error ? error.message : TRANSCRIPT_REFRESH_PAGE_READ_ERROR,
+          });
+        });
       }
 
       return;
@@ -4832,17 +5358,12 @@ export class WorkspaceStore {
 
       const transient = this.assertChatTransientState(workspaceId);
 
-      const prev = transient.liveBashOutput.get(data.toolCallId);
-      const next = appendLiveBashOutputChunk(
-        prev,
-        { text: data.text, isError: data.isError },
-        BASH_TRUNCATE_MAX_TOTAL_BYTES
-      );
-
       // Avoid unnecessary re-renders if this event didn't change the stored state.
-      if (next === prev) return;
-
-      transient.liveBashOutput.set(data.toolCallId, next);
+      if (
+        !applyLiveBashOutputEvent(transient.liveBashOutput, data, BASH_TRUNCATE_MAX_TOTAL_BYTES)
+      ) {
+        return;
+      }
 
       // High-frequency: throttle UI updates like other delta-style events.
       this.scheduleIdleStateBump(workspaceId);
@@ -5025,6 +5546,27 @@ export const workspaceStore = {
   getWorkspaceSidebarState: (workspaceId: string) =>
     getStoreInstance().getWorkspaceSidebarState(workspaceId),
   /**
+   * Whether the active subscription has delivered a complete history replay for the
+   * workspace. Read by the transcript mutation barrier at dispatch time.
+   */
+  isWorkspaceTranscriptCaughtUp: (workspaceId: string) =>
+    getStoreInstance().isWorkspaceTranscriptCaughtUp(workspaceId),
+  isWorkspaceChatReplayPending: (workspaceId: string) =>
+    getStoreInstance().isWorkspaceChatReplayPending(workspaceId),
+  /** Per-workspace change notifications, so barrier-derived disabled states can subscribe. */
+  subscribeKey: (workspaceId: string, listener: () => void) =>
+    getStoreInstance().subscribeKey(workspaceId, listener),
+  /** Content evidence for an edit over the rows this client holds (see the store method). */
+  captureHistoryEditPrecondition: (workspaceId: string, editMessageId: string) =>
+    getStoreInstance().captureHistoryEditPrecondition(workspaceId, editMessageId),
+  /** Re-read the transcript after a `history-changed` refusal (see the store method). */
+  requestTranscriptRefresh: (
+    workspaceId: string,
+    options: { throughSequence: number; editMessageId: string }
+  ) => getStoreInstance().requestTranscriptRefresh(workspaceId, options),
+  cancelTranscriptRefresh: (workspaceId: string) =>
+    getStoreInstance().cancelTranscriptRefresh(workspaceId),
+  /**
    * Register a workspace in the store (idempotent).
    * Exposed for test helpers that need to ensure workspace registration
    * before setting it as active.
@@ -5199,14 +5741,18 @@ export function useBashToolLiveOutput(
   toolCallId: string | undefined
 ): LiveBashOutputView | null {
   const store = getStoreInstance();
+  // A host that does not feed WorkspaceStore (VS Code webview) supplies its own source (#4750).
+  const hostSource = useContext(LiveBashOutputSourceContext);
 
   return useSyncExternalStore(
     (listener) => {
       if (!workspaceId) return () => undefined;
+      if (hostSource) return hostSource.subscribe(workspaceId, listener);
       return store.subscribeKey(workspaceId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
+      if (hostSource) return hostSource.get(workspaceId, toolCallId);
       return store.getBashToolLiveOutput(workspaceId, toolCallId);
     }
   );
@@ -5416,7 +5962,7 @@ export function addEphemeralMessage(workspaceId: string, message: MuxMessage): v
   const store = getStoreInstance();
   const aggregator = store.getAggregator(workspaceId);
   if (aggregator) {
-    aggregator.addMessage(message);
+    aggregator.addEphemeralMessage(message);
     store.bumpState(workspaceId);
   }
 }

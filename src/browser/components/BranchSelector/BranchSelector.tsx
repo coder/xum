@@ -7,13 +7,14 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { clearGitStatus, invalidateGitStatus, useGitStatus } from "@/browser/stores/GitStatusStore";
 import { createLRUCache } from "@/browser/utils/lruCache";
+import { BRANCH_CACHE_ENTRY_PREFIX, BRANCH_CACHE_INDEX_KEY } from "@/common/constants/storage";
 import { buildCheckoutCommand, buildRemoteBranchListCommand } from "./branchCommands";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 
 // LRU cache for persisting branch names across app restarts
 const branchCache = createLRUCache<string>({
-  entryPrefix: "branch:",
-  indexKey: "branchIndex",
+  entryPrefix: BRANCH_CACHE_ENTRY_PREFIX,
+  indexKey: BRANCH_CACHE_INDEX_KEY,
   maxEntries: 100,
   // No TTL - cached branch info seeds the selector until passive git status refreshes arrive.
 });

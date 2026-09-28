@@ -5,8 +5,10 @@ import {
   ProvidersConfigMapSchema,
   config,
   agentPlugins,
+  mcp,
   workspace,
 } from "./api";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
 /**
@@ -289,6 +291,32 @@ describe("config.saveConfig schema", () => {
     });
 
     expect(result.success).toBe(true);
+  });
+});
+
+describe("mcp.icons schema", () => {
+  it("accepts a bounded list of well-formed refs and rejects oversized or malformed input", () => {
+    const ref = (n: number) => n.toString(16).padStart(32, "0");
+    const refs = (count: number) => Array.from({ length: count }, (_, i) => ref(i));
+    expect(mcp.icons.input.safeParse({ iconRefs: [] }).success).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries) }).success
+    ).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries + 1) }).success
+    ).toBe(false);
+    expect(mcp.icons.input.safeParse({ iconRefs: ["not-a-ref"] }).success).toBe(false);
+    // Output carries one answer per requested ref; unknown refs are null.
+    expect(
+      mcp.icons.output.safeParse({
+        [ref(1)]:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFOcAAAAASUVORK5CYII=",
+        [ref(2)]: null,
+      }).success
+    ).toBe(true);
+    expect(mcp.icons.output.safeParse({ [ref(1)]: "https://example.com/icon.png" }).success).toBe(
+      false
+    );
   });
 });
 

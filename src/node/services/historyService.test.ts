@@ -14,7 +14,8 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import * as atomicWrite from "write-file-atomic";
+import { readFileSync } from "node:fs";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
@@ -351,6 +352,66 @@ describe("HistoryService", () => {
 
       expect(result.success).toBe(true);
       expect(result.success && result.data).toBe("tail-mismatch");
+    });
+  });
+
+  describe("appendToHistoryIf", () => {
+    // #4414 case 5: the guard runs under the cross-process write lock, right before the append.
+    it("appends only while the guard admits, deciding while this process holds the write lock", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      const lockPath = historyWriteLockPath(config.rootDir, workspaceId);
+      const holders: string[] = [];
+      const guard = (admit: boolean) => () => {
+        holders.push(readFileSync(lockPath, "utf-8").split(":")[0]);
+        return admit;
+      };
+
+      const refused = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("refused-row", "assistant", "Refused"),
+        guard(false)
+      );
+      expect(refused.success && refused.data).toBe("refused");
+      const admitted = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("admitted-row", "assistant", "Admitted"),
+        guard(true)
+      );
+      expect(admitted.success && admitted.data).toBe("appended");
+
+      expect(holders).toEqual([String(process.pid), String(process.pid)]);
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "admitted-row"]);
+    });
+
+    it("a foreign backend's writer that arrives during the guard waits for the append", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      const chatPath = path.join(config.sessionsDir, workspaceId, "chat.jsonl");
+      let foreign: Promise<boolean> | undefined;
+      const result = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("guarded-row", "assistant", "Boundary"),
+        () => {
+          // A foreign backend's history write starts after the check has decided.
+          foreign = fileLock
+            .acquireProcessFileLock({
+              lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+              timeoutMs: 5_000,
+              label: "test foreign backend",
+            })
+            .then(async (lock) => {
+              const guardedRowWritten = readFileSync(chatPath, "utf-8").includes("guarded-row");
+              await lock[Symbol.asyncDispose]();
+              return guardedRowWritten;
+            });
+          return true;
+        }
+      );
+      expect(result.success && result.data).toBe("appended");
+      // The foreign writer acquired the lock only once the guarded row was durable.
+      expect(await foreign).toBe(true);
     });
   });
 
@@ -1570,6 +1631,19 @@ describe("HistoryService", () => {
             changed: false,
           };
         }),
+        {
+          // #4551: an oversized compaction boundary still seals what precedes it.
+          name: "active sealed reasoning behind an oversized boundary",
+          archive: [],
+          chat: [
+            {
+              ...createMuxMessage("target", "assistant", ""),
+              parts: [{ type: "reasoning" as const, text: "Sealed reasoning" }],
+            },
+            { ...boundary(), padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES) },
+          ],
+          changed: false,
+        },
         ...[
           {
             name: "ordinary oversized row",
@@ -2850,6 +2924,43 @@ describe("HistoryService", () => {
       }
     });
 
+    it("reports the lock acquisition and only the active epoch's bytes to a read observer", async () => {
+      // onChat replay timing (#4504) logs these; counting the whole file (or the archive)
+      // would overstate the replay cost of compacted workspaces.
+      const workspaceId = "ws-read-observer";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      const lines = [
+        createMuxMessage("pre-user", "user", "x".repeat(500), { historySequence: 0 }),
+        createMuxMessage("boundary", "assistant", "Summary", {
+          historySequence: 1,
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+        }),
+        createMuxMessage("post-user", "user", "after", { historySequence: 2 }),
+      ].map((message) => JSON.stringify({ ...message, workspaceId }));
+      await fs.writeFile(path.join(workspaceDir, "chat.jsonl"), lines.join("\n") + "\n");
+
+      let lockAcquiredCount = 0;
+      let bytesRead = 0;
+      const result = await service.getHistoryFromLatestBoundary(workspaceId, 0, {
+        onLockAcquired: () => {
+          lockAcquiredCount += 1;
+        },
+        onBytesRead: (bytes) => {
+          bytesRead += bytes;
+        },
+      });
+
+      expect(result.success && result.data.map((message) => message.id)).toEqual([
+        "boundary",
+        "post-user",
+      ]);
+      expect(lockAcquiredCount).toBe(1);
+      expect(bytesRead).toBe(Buffer.byteLength(lines.slice(1).join("\n") + "\n"));
+    });
+
     it("should skip malformed lines in boundary region", async () => {
       const workspaceId = "ws-malformed";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);
@@ -2950,6 +3061,142 @@ describe("HistoryService", () => {
         expect(secondWindow.data.messages.map((message) => message.id)).toEqual(["e1-user"]);
         expect(secondWindow.data.hasOlder).toBe(false);
       }
+    });
+  });
+
+  describe("hasHistoryBeforeSequence", () => {
+    // Existence check over chat-archive.jsonl ∪ chat.jsonl, independent of read order.
+    const workspaceId = "ws-has-older";
+    const row = (id: string, historySequence?: number) =>
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+    const malformed = "{not json";
+
+    it.each<{
+      name: string;
+      bound: number;
+      archive: string[] | null;
+      chat: string[];
+      expected: boolean;
+    }>([
+      {
+        name: "bound 0 is false even with sequence-0 and unsequenced rows in both files",
+        bound: 0,
+        archive: [row("a0", 0), row("a-unsequenced")],
+        chat: [row("c0", 0), row("c-unsequenced"), row("c1", 1)],
+        expected: false,
+      },
+      {
+        name: "older row only in the archive",
+        bound: 5,
+        archive: [row("a1", 1)],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "older row only in chat.jsonl without an archive file",
+        bound: 5,
+        archive: null,
+        chat: [row("c3", 3), row("c5", 5)],
+        expected: true,
+      },
+      {
+        name: "archive holds no smaller sequence, so chat.jsonl is still checked",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced"), malformed, row("a7", 7)],
+        chat: [row("c4", 4), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "no smaller sequence anywhere (equal sequences do not count)",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced")],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows are ignored",
+        bound: 5,
+        archive: null,
+        chat: [malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows newer than an older row do not stop the walk",
+        bound: 5,
+        archive: [row("a-unsequenced"), malformed],
+        chat: [row("c2", 2), malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: true,
+      },
+    ])("$name", async ({ bound, archive, chat, expected }) => {
+      await writeHistoryLines(config, workspaceId, chat);
+      if (archive) {
+        await fs.writeFile(
+          path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"),
+          archive.join("\n") + "\n"
+        );
+      }
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, bound)).toBe(expected);
+    });
+  });
+
+  describe("hasHistoryBeforeSequence during a concurrent rotation", () => {
+    it("finds an older row that moves from chat.jsonl into the archive between the reads", async () => {
+      const workspaceId = "ws-has-older-rotating";
+      const row = (id: string, historySequence: number) =>
+        messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      const archivePath = path.join(workspaceDir, "chat-archive.jsonl");
+      const chatPath = path.join(workspaceDir, "chat.jsonl");
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.writeFile(archivePath, `${row("a7", 7)}\n`);
+
+      // Simulate another backend's rotation right after the archive was read: append the
+      // sealed row to the archive first, then rewrite chat.jsonl without it (rotation order).
+      const stat = fs.stat;
+      let archiveReads = 0;
+      const spy = spyOn(fs, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fs.stat>
+      ) => {
+        if (args[0] === archivePath) archiveReads++;
+        if (args[0] === chatPath && archiveReads === 1) {
+          await fs.appendFile(archivePath, `${row("c3", 3)}\n`);
+          await fs.writeFile(chatPath, `${row("c5", 5)}\n`);
+        }
+        return stat(...args);
+      }) as typeof fs.stat);
+      try {
+        expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  describe("hasHistoryBeforeSequence with an unreadable archive", () => {
+    // A directory in place of chat-archive.jsonl makes every archive read fail (EISDIR).
+    const workspaceId = "ws-has-older-bad-archive";
+    const row = (id: string, historySequence: number) =>
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+
+    it("still answers from chat.jsonl when it holds an older row", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+    });
+
+    it("fails when chat.jsonl cannot answer without the archive", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c5", 5), row("c6", 6)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      let rejected = false;
+      try {
+        await service.hasHistoryBeforeSequence(workspaceId, 5);
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
     });
   });
 
@@ -4097,14 +4344,16 @@ describe("HistoryService", () => {
           })
         );
       }
+      // truncateHistory(0.5) must cut exactly after this row, so it has to outweigh the 13 sealed
+      // rows under every tokenizer. A repeated single character only did so under the approximate
+      // tokenizer from tests/setup.ts: the real one (bun test without the bunfig preload, e.g. run
+      // from src/node/services, or XUM_FORCE_REAL_TOKENIZER=1) packs it into few tokens (#4910).
+      const displayFiller = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
       await service.appendToHistory(
         wsId,
-        createMuxMessage(
-          "workflow-display",
-          "user",
-          `workflow trigger display ${"x".repeat(2_000)}`,
-          { muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run-1" } }
-        )
+        createMuxMessage("workflow-display", "user", `workflow trigger display ${displayFiller}`, {
+          muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run-1" },
+        })
       );
       await service.appendToHistory(wsId, createMuxMessage("user-active", "user", "prompt"));
       await service.appendToHistory(

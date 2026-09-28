@@ -3,7 +3,6 @@ import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
 import {
   transformModelMessages,
   validateAnthropicCompliance,
-  getAnthropicThinkingDisableReason,
   addInterruptedSentinel,
   injectAgentTransition,
   filterEmptyAssistantMessages,
@@ -153,8 +152,10 @@ describe("modelMessageTransform", () => {
       });
 
       expect(result).toHaveLength(2);
-      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({ type: "reasoning" });
-      expect(getAnthropicThinkingDisableReason(result)).toBeUndefined();
+      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({
+        type: "reasoning",
+        providerOptions: { anthropic: { signature: "sig" } },
+      });
     });
 
     it("should insert empty reasoning for final assistant message when Anthropic thinking is enabled", () => {
@@ -388,81 +389,6 @@ describe("modelMessageTransform", () => {
 
       const result = transformModelMessages(messages, "anthropic");
       expect(validateAnthropicCompliance(result).valid).toBe(true);
-    });
-  });
-
-  describe("getAnthropicThinkingDisableReason", () => {
-    it("returns a reason when tool-call message lacks signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [{ type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} }],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
-    });
-
-    it("returns undefined when tool-call message starts with signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          {
-            type: "reasoning",
-            text: "...",
-            providerOptions: { anthropic: { signature: "sig" } },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any,
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      expect(getAnthropicThinkingDisableReason([assistantMsg, toolMsg])).toBeUndefined();
-    });
-
-    it("treats unsigned reasoning as absent", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          { type: "reasoning", text: "..." },
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
     });
   });
 

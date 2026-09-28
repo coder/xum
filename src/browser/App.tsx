@@ -16,7 +16,8 @@ import {
   readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
-import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { openServerWindow } from "./utils/openServerWindow";
 import { applyFastModeServiceTierChange, getFastModeProvider } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
@@ -115,6 +116,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -123,10 +125,13 @@ import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
+import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
+import { usePopoverError } from "@/browser/hooks/usePopoverError";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -172,13 +177,8 @@ function AppInner() {
     createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
-  const {
-    currentWorkspaceId,
-    currentSettingsSection,
-    isAnalyticsOpen,
-    navigateToAnalytics,
-    navigateFromAnalytics,
-  } = useRouter();
+  const { currentWorkspaceId, isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics } =
+    useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
   const { open: openAboutDialog } = useAboutDialog();
@@ -234,6 +234,7 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -341,9 +342,14 @@ function AppInner() {
   // Ref for selectedWorkspace to access in callbacks without stale closures
   const selectedWorkspaceRef = useRef(selectedWorkspace);
   selectedWorkspaceRef.current = selectedWorkspace;
-  // Ref for route-level workspace visibility to avoid stale closure in response callbacks
-  const currentWorkspaceIdRef = useRef(currentWorkspaceId);
-  currentWorkspaceIdRef.current = currentWorkspaceId;
+  const isSettingsOpenRef = useRef(isSettingsOpen);
+  isSettingsOpenRef.current = isSettingsOpen;
+  // The settings modal covers the chat, so a workspace behind it is selected but not visible:
+  // keep lastRead from advancing and keep its completion notifications.
+  const visibleChatWorkspaceId = isSettingsOpen ? null : currentWorkspaceId;
+  // Ref for chat visibility to avoid stale closure in response callbacks
+  const visibleChatWorkspaceIdRef = useRef(visibleChatWorkspaceId);
+  visibleChatWorkspaceIdRef.current = visibleChatWorkspaceId;
   useEffect(() => {
     const prev = prevWorkspaceRef.current;
     if (prev && selectedWorkspace && prev.workspaceId !== selectedWorkspace.workspaceId) {
@@ -353,8 +359,8 @@ function AppInner() {
   }, [selectedWorkspace, telemetry]);
 
   // Track last-read timestamps for unread indicators.
-  // Read-marking is gated on chat-route visibility (currentWorkspaceId).
-  useUnreadTracking(selectedWorkspace, currentWorkspaceId);
+  // Read-marking is gated on chat visibility.
+  useUnreadTracking(selectedWorkspace, visibleChatWorkspaceId);
 
   const workspaceMetadataRef = useRef(workspaceMetadata);
   useEffect(() => {
@@ -571,6 +577,9 @@ function AppInner() {
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
+      markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
+      // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
+      setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<
@@ -628,6 +637,7 @@ function AppInner() {
       const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
 
       updatePersistedState(getReasoningModeKey(workspaceId), next);
+      markAiSelectionIntent(workspaceId, "reasoningMode", next);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<
@@ -893,9 +903,18 @@ function AppInner() {
     [setSelectedWorkspace]
   );
 
+  // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
+  // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
+  const paletteRemoveError = usePopoverError();
   const removeWorkspaceFromPalette = useCallback(
-    async (workspaceId: string) => removeWorkspace(workspaceId),
-    [removeWorkspace]
+    async (workspaceId: string) => {
+      const result = await removeWorkspace(workspaceId);
+      if (!result.success) {
+        paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
+      }
+      return result;
+    },
+    [removeWorkspace, paletteRemoveError]
   );
 
   const updateTitleFromPalette = useCallback(
@@ -966,6 +985,13 @@ function AppInner() {
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
+    autoModelRoutingEnabled,
+    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // in the picker rows the way a row click does.
+    getAutoRouting: (scopeId, dimension) =>
+      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    onSetAutoRouting: (scopeId, dimension, active) =>
+      setAutoRoutingChoice(scopeId, dimension, active),
     getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,
@@ -996,6 +1022,7 @@ function AppInner() {
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
     onOpenAbout: openAboutDialog,
+    remoteConnection: window.api?.remoteConnection,
     supportedUpdateChannels,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
@@ -1069,7 +1096,7 @@ function AppInner() {
         e.preventDefault();
         if (isCommandPaletteOpen) {
           closeCommandPalette();
-        } else {
+        } else if (!isDialogOpen()) {
           // Alternate palette shortcut opens in command mode (with ">") while the
           // primary Ctrl/Cmd+Shift+P shortcut opens default workspace-switch mode.
           const initialQuery = matchesKeybind(e, KEYBINDS.OPEN_COMMAND_PALETTE_ACTIONS)
@@ -1079,13 +1106,20 @@ function AppInner() {
         }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
-        toggleFastMode().catch(() => undefined);
+        // Modals trap focus and hide the page behind them; don't change hidden page UI.
+        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
-        setSidebarCollapsed((prev) => !prev);
+        if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
+        // An open palette would stay behind the settings modal and swallow its first Escape.
+        closeCommandPalette();
         openSettings();
+      } else if (matchesKeybind(e, KEYBINDS.OPEN_SERVER_WINDOW) && window.api?.remoteConnection) {
+        // Desktop-only: browser mode and server windows have no remote connection bridge.
+        e.preventDefault();
+        openServerWindow(window.api.remoteConnection, openSettings).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_ANALYTICS)) {
         e.preventDefault();
         if (isAnalyticsOpen) {
@@ -1118,6 +1152,15 @@ function AppInner() {
     navigateFromAnalytics,
     navigate,
   ]);
+  // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
+  useEffect(() => {
+    const bridge = window.api?.remoteConnection;
+    if (!bridge) return;
+    return bridge.onOpenServerWindowRequested(() => {
+      openServerWindow(bridge, openSettings).catch(() => undefined);
+    });
+  }, [openSettings]);
+
   // Mouse back/forward buttons (buttons 3 and 4)
   useEffect(() => {
     const handleMouseNavigation = (e: MouseEvent) => {
@@ -1191,6 +1234,7 @@ function AppInner() {
         const iterator = await api.menu.onOpenSettings(undefined, { signal });
         for await (const _ of iterator) {
           if (signal.aborted) break;
+          closeCommandPalette();
           openSettings();
         }
       } catch {
@@ -1199,7 +1243,7 @@ function AppInner() {
     })();
 
     return () => abortController.abort();
-  }, [api, openSettings]);
+  }, [api, openSettings, closeCommandPalette]);
 
   // Handle workspace fork switch event
   useEffect(() => {
@@ -1274,11 +1318,10 @@ function AppInner() {
       }
 
       // Only mark read when the user is actively viewing this workspace's chat.
-      // Checking currentWorkspaceIdRef ensures we don't advance lastRead when
-      // a non-chat route (e.g. /settings) is active — the workspace remains
-      // "selected" but the chat content is not visible.
+      // A non-chat route or the settings modal hides the chat even though the
+      // workspace remains "selected".
       const isChatVisible =
-        document.hasFocus() && currentWorkspaceIdRef.current === event.workspaceId;
+        document.hasFocus() && visibleChatWorkspaceIdRef.current === event.workspaceId;
       if (event.completedAt != null && isChatVisible) {
         updatePersistedState(getWorkspaceLastReadKey(event.workspaceId), event.completedAt);
       }
@@ -1288,9 +1331,11 @@ function AppInner() {
       }
 
       // Skip notification if the selected workspace is focused (Slack-like behavior).
-      // Notification suppression intentionally follows selection state, not chat-route visibility.
+      // Notification suppression follows selection state, except that settings covers the chat.
       const isWorkspaceFocused =
-        document.hasFocus() && selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
+        document.hasFocus() &&
+        !isSettingsOpenRef.current &&
+        selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
       if (isWorkspaceFocused) {
         return;
       }
@@ -1356,14 +1401,10 @@ function AppInner() {
           <WindowsToolchainBanner />
           <RosettaBanner />
           <div className="mobile-layout flex flex-1 overflow-hidden">
-            {/* Route-driven settings and analytics render in the main pane so project/workspace navigation stays visible. */}
+            {/* Route-driven analytics renders in the main pane so project/workspace navigation stays
+                visible. Settings is a modal over whatever page it was opened from. */}
             {isAnalyticsOpen ? (
               <AnalyticsDashboard
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
-            ) : currentSettingsSection ? (
-              <SettingsPage
                 leftSidebarCollapsed={sidebarCollapsed}
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
@@ -1454,6 +1495,12 @@ function AppInner() {
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <SettingsPage />
+        <PopoverError
+          error={paletteRemoveError.error}
+          prefix="Failed to remove workspace"
+          onDismiss={paletteRemoveError.clearError}
+        />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
           isOpen={isProjectCreateModalOpen}

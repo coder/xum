@@ -4,7 +4,6 @@ import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   boundTailContent,
-  computeTailStartOffset,
   parseSpawnRecordMeta,
   type BackgroundProcess,
   type BackgroundProcessMeta,
@@ -149,21 +148,6 @@ describe("BackgroundProcessManager", () => {
       .catch(() => undefined);
   });
 
-  describe("computeTailStartOffset", () => {
-    it("should return 0 when tailBytes exceeds file size", () => {
-      expect(computeTailStartOffset(10, 64_000)).toBe(0);
-    });
-
-    it("should return fileSize - tailBytes when fileSize is larger", () => {
-      expect(computeTailStartOffset(100, 10)).toBe(90);
-    });
-
-    it("should throw on invalid inputs", () => {
-      expect(() => computeTailStartOffset(-1, 10)).toThrow();
-      expect(() => computeTailStartOffset(10, 0)).toThrow();
-    });
-  });
-
   describe("spawn", () => {
     it("should spawn a background process and return process ID and outputDir", async () => {
       const displayName = `test-${Date.now()}`;
@@ -180,6 +164,113 @@ describe("BackgroundProcessManager", () => {
         expect(result.outputDir).toContain("mux-bashes");
         expect(result.outputDir).toContain(testWorkspaceId);
         expect(result.outputDir).toContain(result.processId);
+      }
+    });
+
+    it("gives concurrent same-name spawns from two backends distinct record directories", async () => {
+      // Two backends (desktop + `xum server` on one XUM_ROOT) each have their own manager
+      // with separate in-memory reservations, but share the host records root.
+      const otherBackend = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const [first, second] = await Promise.all(
+          [manager, otherBackend].map((m) =>
+            m.spawn(runtime, testWorkspaceId, "sleep 30", {
+              cwd: process.cwd(),
+              displayName: "dev server",
+            })
+          )
+        );
+        expect(first.success).toBe(true);
+        expect(second.success).toBe(true);
+        if (!first.success || !second.success) return;
+        expect(first.outputDir).not.toBe(second.outputDir);
+        // Each record describes its own process (no shared meta.json).
+        const metaPids = await Promise.all(
+          [first, second].map(async (r) => {
+            const raw = await fs.readFile(path.join(r.outputDir, "meta.json"), "utf-8");
+            return (JSON.parse(raw) as BackgroundProcessMeta).pid;
+          })
+        );
+        expect(metaPids).toEqual([first.pid, second.pid]);
+      } finally {
+        await otherBackend.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("does not reuse a record directory whose exited process another backend still tracks", async () => {
+      // #4882: backend A's command exits (writes exit_code) while A still tracks it. Backend B
+      // cannot see A's in-memory map, so reusing the settled directory would make A's later
+      // output and status reads describe B's command.
+      const otherBackend = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const first = await manager.spawn(runtime, testWorkspaceId, "echo from-a", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(first.success).toBe(true);
+        if (!first.success) return;
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(path.join(first.outputDir, "exit_code"));
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        }
+        await fs.access(path.join(first.outputDir, "exit_code"));
+
+        const second = await otherBackend.spawn(runtime, testWorkspaceId, "sleep 30", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(second.success).toBe(true);
+        if (!second.success) return;
+        expect(second.outputDir).not.toBe(first.outputDir);
+        const output = await manager.getOutput(first.processId);
+        expect(output.success).toBe(true);
+        if (!output.success) return;
+        expect(output.status).toBe("exited");
+        expect(output.output).toContain("from-a");
+      } finally {
+        await otherBackend.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("does not prune a recently settled record another backend tracks", async () => {
+      // #4893: A has observed its command's exit (meta.json reads exited), so only the age
+      // threshold protects A's record from B's pruning. It must still get a fresh directory.
+      const otherBackend = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const first = await manager.spawn(runtime, testWorkspaceId, "echo from-a", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(first.success).toBe(true);
+        if (!first.success) return;
+        const deadline = Date.now() + 5000;
+        while ((await manager.getProcess(first.processId))?.status === "running") {
+          expect(Date.now()).toBeLessThan(deadline);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const meta = JSON.parse(
+          await fs.readFile(path.join(first.outputDir, "meta.json"), "utf-8")
+        ) as BackgroundProcessMeta;
+        expect(meta.status).toBe("exited");
+
+        const second = await otherBackend.spawn(runtime, testWorkspaceId, "sleep 30", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(second.success).toBe(true);
+        if (!second.success) return;
+        expect(second.processId).toBe("job (2)");
+        const output = await manager.getOutput(first.processId);
+        expect(output.success).toBe(true);
+        if (!output.success) return;
+        expect(output.output).toContain("from-a");
+      } finally {
+        await otherBackend.cleanup(testWorkspaceId);
       }
     });
 
@@ -3033,25 +3124,6 @@ describe("BackgroundProcessManager", () => {
       expect(output.output).toContain("error message");
     });
 
-    it("should include elapsed_ms in response", async () => {
-      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 0.2; echo done", {
-        cwd: process.cwd(),
-        displayName: "test",
-      });
-
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-
-      // Wait with timeout to ensure blocking
-      const output = await manager.getOutput(result.processId, undefined, undefined, 1);
-      expect(output.success).toBe(true);
-      if (!output.success) return;
-
-      // elapsed_ms should be present and reflect the wait time
-      expect(typeof output.elapsed_ms).toBe("number");
-      expect(output.elapsed_ms).toBeGreaterThanOrEqual(0);
-    });
-
     it("should return error for non-existent process", async () => {
       const output = await manager.getOutput("bash_nonexistent");
       expect(output.success).toBe(false);
@@ -3809,11 +3881,12 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
     });
 
-    it("clears a stale exit_code file when a restart reuses the process directory", async () => {
+    it("does not reuse a settled record directory from a previous session", async () => {
       // Process IDs are display-name based and deduplicated only in memory, so after a
-      // restart a new spawn can land in a prior session's directory whose exit trap already
-      // wrote exit_code. That stale marker must not survive the new spawn: it would flip the
-      // live process to "exited" and let crash-orphan gating treat it as exited too.
+      // restart a new spawn could land in a prior session's directory whose exit trap already
+      // wrote exit_code. Settled directories are never reused (the other backend may still
+      // track them, #4882), so the new process gets a fresh directory and the stale marker
+      // can neither flip it to "exited" nor hide it from crash-orphan gating.
       const displayName = "reused-name";
       const processDir = path.join(workspaceDir, displayName);
       await fs.mkdir(processDir, { recursive: true });
@@ -3824,16 +3897,101 @@ describe("BackgroundProcessManager", () => {
         displayName,
       });
       expect(result.success).toBe(true);
-
-      let staleMarkerExists = true;
-      try {
-        await fs.access(path.join(processDir, "exit_code"));
-      } catch {
-        staleMarkerExists = false;
-      }
-      expect(staleMarkerExists).toBe(false);
+      if (!result.success) return;
+      expect(result.outputDir).not.toBe(processDir);
+      expect(await fs.readFile(path.join(processDir, "exit_code"), "utf-8")).toBe("0");
       const processes = await manager.list(orphanWorkspaceId);
-      expect(processes.find((p) => p.id === displayName)?.status).toBe("running");
+      expect(processes.find((p) => p.id === result.processId)?.status).toBe("running");
+    });
+
+    // #4893: records settled long enough ago are pruned so reused names stop growing suffixes.
+    const settledLongAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+
+    it("reuses the name of a record settled more than a day ago", async () => {
+      const processDir = path.join(workspaceDir, "dev");
+      await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
+      await fs.writeFile(path.join(processDir, "output.log"), "old output\n");
+      for (const file of ["exit_code", "meta.json"]) {
+        await fs.utimes(path.join(processDir, file), settledLongAgo, settledLongAgo);
+      }
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "dev",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("dev");
+      expect(result.outputDir).toBe(processDir);
+      const processes = await manager.list(orphanWorkspaceId);
+      expect(processes.find((p) => p.id === "dev")?.status).toBe("running");
+      expect(await fs.readFile(path.join(processDir, "output.log"), "utf-8")).not.toContain(
+        "old output"
+      );
+    });
+
+    it("keeps a record whose old exit its owner has only just observed", async () => {
+      // The owner rewrites meta.json when it observes the exit (possibly long after exit_code
+      // was written) and then reads the output, so the recent meta.json write protects it.
+      await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
+      const markerPath = path.join(workspaceDir, "dev", "exit_code");
+      await fs.utimes(markerPath, settledLongAgo, settledLongAgo);
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "dev",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("dev (2)");
+      expect(await fs.readFile(markerPath, "utf-8")).toBe("0");
+    });
+
+    it("keeps a record whose owner records the exit while the probe reads meta.json", async () => {
+      await writeSpawnRecord("dev", { pid: 999_999, status: "running" }, { exitCode: "0" });
+      const metaPath = path.join(workspaceDir, "dev", "meta.json");
+      for (const file of ["exit_code", "meta.json"]) {
+        await fs.utimes(path.join(workspaceDir, "dev", file), settledLongAgo, settledLongAgo);
+      }
+      // The owner observes the old exit and rewrites meta.json right as the probe reads it.
+      const realReadFile = fs.readFile;
+      const readSpy = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fs.readFile>
+      ) => {
+        if (args[0] === metaPath) {
+          await fs.writeFile(metaPath, JSON.stringify({ pid: 999_999, status: "exited" }));
+        }
+        return realReadFile(...args);
+      }) as typeof fs.readFile);
+      try {
+        const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+          cwd: process.cwd(),
+          displayName: "dev",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.processId).toBe("dev (2)");
+      } finally {
+        readSpy.mockRestore();
+      }
+    });
+
+    it("keeps an old settled record whose meta.json still reads running", async () => {
+      // The exit marker is there, but the owning backend has not observed the exit yet (its
+      // in-memory status is still running), so its later terminate() would write exit_code
+      // and meta.json into the directory. Reusing it would stamp the new process as exited.
+      await writeSpawnRecord("dev", { pid: 999_999, status: "running" }, { exitCode: "0" });
+      const markerPath = path.join(workspaceDir, "dev", "exit_code");
+      await fs.utimes(markerPath, settledLongAgo, settledLongAgo);
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "dev",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("dev (2)");
+      expect(await fs.readFile(markerPath, "utf-8")).toBe("0");
     });
 
     it("skips processes the manager still tracks", async () => {

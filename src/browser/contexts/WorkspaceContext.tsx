@@ -71,8 +71,13 @@ import { useRouter } from "@/browser/contexts/RouterContext";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import {
+  hasPendingAiSelectionIntent,
+  type AiSelectionField,
+} from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
@@ -174,9 +179,15 @@ function migrateLocalGatewayPrefsToBackend(
  *
  * This keeps a workspace's model/thinking consistent across devices/browsers.
  */
-function seedWorkspaceLocalStorageFromBackend(
-  metadata: FrontendWorkspaceMetadata,
-  previous?: FrontendWorkspaceMetadata
+/** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
+export type WorkspaceAiSeedSource = Pick<
+  FrontendWorkspaceMetadata,
+  "id" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
+>;
+
+export function seedWorkspaceLocalStorageFromBackend(
+  metadata: WorkspaceAiSeedSource,
+  previous?: WorkspaceAiSeedSource
 ): void {
   // Snapshot all main-workspace choices on client load, not on navigation.
   // Later metadata must not overwrite unsent choices; reload to restore backend settings.
@@ -216,6 +227,17 @@ function seedWorkspaceLocalStorageFromBackend(
     return;
   }
 
+  const activeAgentId = readPersistedState<string>(
+    getAgentIdKey(workspaceId),
+    WORKSPACE_DEFAULTS.agentId
+  );
+  // Sub-agent metadata can arrive (e.g. after a reawakening) between a deliberate pick and
+  // the send that pins it; keep the unsent pick instead of reseeding over it. Picks are
+  // scoped to the active agent, so a pending Plan pick never blocks Exec reseeding.
+  const keepsUnsentPick = (field: AiSelectionField, localValue: string | undefined) =>
+    metadata.parentWorkspaceId != null &&
+    hasPendingAiSelectionIntent(workspaceId, activeAgentId, field, localValue);
+
   // Merge backend values into a per-workspace per-agent cache.
   const byAgentKey = getWorkspaceAISettingsByAgentKey(workspaceId);
   const existingByAgent = readPersistedState<WorkspaceAISettingsByAgentCache>(byAgentKey, {});
@@ -225,10 +247,19 @@ function seedWorkspaceLocalStorageFromBackend(
     if (!entry) continue;
     if (typeof entry.model !== "string" || entry.model.length === 0) continue;
 
+    const existing = agentKey === activeAgentId ? existingByAgent[agentKey] : undefined;
+    const reasoningMode =
+      existing != null && keepsUnsentPick("reasoningMode", existing.reasoningMode)
+        ? existing.reasoningMode
+        : entry.reasoningMode;
     nextByAgent[agentKey] = {
-      model: entry.model,
-      thinkingLevel: entry.thinkingLevel,
-      ...(entry.reasoningMode != null ? { reasoningMode: entry.reasoningMode } : {}),
+      model:
+        existing != null && keepsUnsentPick("model", existing.model) ? existing.model : entry.model,
+      thinkingLevel:
+        existing != null && keepsUnsentPick("thinkingLevel", existing.thinkingLevel)
+          ? existing.thinkingLevel
+          : entry.thinkingLevel,
+      ...(reasoningMode != null ? { reasoningMode } : {}),
     };
   }
 
@@ -237,10 +268,6 @@ function seedWorkspaceLocalStorageFromBackend(
   }
 
   // Seed the active agent into the existing keys to avoid UI flash.
-  const activeAgentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
   const active = nextByAgent[activeAgentId] ?? nextByAgent.exec ?? nextByAgent.plan;
   if (!active) {
     return;
@@ -248,13 +275,16 @@ function seedWorkspaceLocalStorageFromBackend(
 
   const modelKey = getModelKey(workspaceId);
   const existingModel = readPersistedState<string | undefined>(modelKey, undefined);
-  if (existingModel !== active.model) {
+  if (existingModel !== active.model && !keepsUnsentPick("model", existingModel)) {
     setWorkspaceModelWithOrigin(workspaceId, active.model, "sync");
   }
 
   const thinkingKey = getThinkingLevelKey(workspaceId);
   const existingThinking = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
-  if (existingThinking !== active.thinkingLevel) {
+  if (
+    existingThinking !== active.thinkingLevel &&
+    !keepsUnsentPick("thinkingLevel", existingThinking)
+  ) {
     updatePersistedState(thinkingKey, active.thinkingLevel);
   }
 
@@ -267,7 +297,7 @@ function seedWorkspaceLocalStorageFromBackend(
     reasoningKey,
     undefined
   );
-  if (existingReasoning !== nextReasoning) {
+  if (existingReasoning !== nextReasoning && !keepsUnsentPick("reasoningMode", existingReasoning)) {
     updatePersistedState(reasoningKey, nextReasoning);
   }
 }
@@ -740,16 +770,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const workspaceStore = useWorkspaceStoreRaw();
 
   useLayoutEffect(() => {
-    // When the user navigates to settings, currentWorkspaceId becomes null
-    // (URL is /settings/...). Preserve the active workspace subscription so
-    // chat messages aren't cleared. Only null it out when truly leaving a
-    // workspace context (for example, via the compatibility root route).
+    // Settings keeps the workspace it was opened over in currentWorkspaceId. Analytics and cold
+    // settings links carry none, but should still preserve the active workspace subscription
+    // so chat messages aren't cleared.
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);
     } else if (!currentSettingsSection && !isAnalyticsOpen) {
       // Only null out the active workspace when truly leaving a workspace
-      // context (for example, via the compatibility root route). Settings and
-      // analytics pages should preserve the subscription so chat messages aren't cleared.
+      // context (for example, via the compatibility root route).
       workspaceStore.setActiveWorkspaceId(null);
     }
   }, [workspaceStore, currentWorkspaceId, currentSettingsSection, isAnalyticsOpen]);
@@ -1351,6 +1379,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // 2. THEN handle side effects (cleanup, navigation) - these can't break data updates
           if (meta === null) {
             deleteWorkspaceStorage(event.workspaceId);
+            getReviewStateStore().removeWorkspace(event.workspaceId);
 
             // Navigate away only if the deleted workspace was selected
             const currentSelection = selectedWorkspaceRef.current;
@@ -1476,6 +1505,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (result.success) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
+          getReviewStateStore().removeWorkspace(workspaceId);
 
           // Optimistically remove from the local metadata map so the sidebar updates immediately.
           // Relying on the metadata subscription can leave the item visible until the next refresh.
@@ -2180,6 +2210,14 @@ export function useWorkspaceMetadata(): WorkspaceMetadataContextValue {
     throw new Error("useWorkspaceMetadata must be used within WorkspaceProvider");
   }
   return context;
+}
+
+/**
+ * Like useWorkspaceMetadata, but returns null outside WorkspaceProvider. For hosts that render
+ * chat components without the full workspace shell (the VS Code webview).
+ */
+export function useOptionalWorkspaceMetadata(): WorkspaceMetadataContextValue | null {
+  return useContext(WorkspaceMetadataContext) ?? null;
 }
 
 /**

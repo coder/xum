@@ -8,11 +8,11 @@ import * as path from "node:path";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
-import type { AIService } from "./aiService";
+import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
 import {
@@ -142,6 +142,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
         expect(
           h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
         ).toEqual([phase === "failed flush" ? "later input" : "first input\nlater input"]);
+        // #4448: exactly the restored input is held until a composer takes it. A send whose
+        // bytes survived the failed flush is not held: Send would deliver it twice.
+        expect(h.session.getHeldInputs().map((held) => [held.reason, held.send.message])).toEqual(
+          phase === "failed flush"
+            ? [["interrupted", "later input"]]
+            : [
+                ["interrupted", "first input"],
+                ["interrupted", "later input"],
+              ]
+        );
         const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
         expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
           phase === "failed flush" ? 1 : 0
@@ -510,7 +520,19 @@ describe("AgentSession queued message tool-call dispatch", () => {
             text: `${restoreAt === "raw command" ? "/init" : "first\nsecond"}\nlater input`,
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
+            heldInputIds: h.session.getHeldInputs().map((held) => held.id),
           },
+        ]);
+        // The dequeued send and the later entry are each held with their own send (#4448).
+        expect(
+          h.session.getHeldInputs().map((held) => ({
+            reason: held.reason,
+            message: held.send.message,
+            fileParts: held.send.options.fileParts,
+          }))
+        ).toEqual([
+          { reason: "interrupted", message: "first\nsecond", fileParts },
+          { reason: "interrupted", message: "later input", fileParts: laterFileParts },
         ]);
         expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
         expect(stream).not.toHaveBeenCalled();
@@ -524,6 +546,51 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     }
   );
+
+  // #4448: restore-to-input is a one-shot event the composer may not take (edit mode, not
+  // mounted, not subscribed), so the backend keeps the input until a composer acknowledges it.
+  test("a restore keeps the user's input as held input until a composer releases it", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-restore-held",
+      captureEvents: true,
+    });
+    try {
+      h.session.queueMessage("queued follow-up", { model: TEST_MODEL, agentId: "exec" });
+      h.session.queueMessage(
+        "background wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, acceptanceOrigin: "automatic" }
+      );
+      const firstNewEvent = h.events.length;
+
+      h.session.restoreQueueToInput();
+
+      const held = h.session.getHeldInputs();
+      expect(held.map((input) => [input.reason, input.send.displayText])).toEqual([
+        ["interrupted", "queued follow-up"],
+      ]);
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      // The restore names the held input and precedes the held list, so a composer that takes it
+      // hides it before the renderer would show a banner; the queue clear comes first of all.
+      const events = h.events.slice(firstNewEvent);
+      expect(events.map((event) => event.type)).toEqual([
+        "queued-message-changed",
+        "restore-to-input",
+        "held-inputs-changed",
+      ]);
+      expect(events[1]).toMatchObject({ text: "queued follow-up", heldInputIds: [held[0].id] });
+      expect(events[2]).toMatchObject({
+        heldInputs: [{ id: held[0].id, reason: "interrupted", displayText: "queued follow-up" }],
+      });
+      expect(h.session.hasPendingUserInput()).toBe(true);
+
+      expect(h.session.discardHeldInput(held[0].id)).toBe("discarded");
+      expect(h.session.hasPendingUserInput()).toBe(false);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
 
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
@@ -745,7 +812,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-preparing-predecessor",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     sessionHolder.current = session;
@@ -1063,6 +1130,208 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(queuedSignals).toEqual([true, false]);
     } finally {
       stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  // Peer-message triggers (TaskService.sendTreeMessage) enter the queue as hidden, sealed,
+  // synthetic entries with a caller admission probe and a payload row. The queue-boundary
+  // contract (turn-end never cuts a tool boundary; tool-end cuts the next one; a stale probe
+  // withdraws the entry at dispatch) is proven here through the real session and queue, not by
+  // asserting the options TaskService forwards.
+  const peerTriggerInternal = (
+    dedupeKey: string
+  ): NonNullable<Parameters<AgentSession["queueMessage"]>[2]> => ({
+    acceptanceOrigin: "automatic",
+    synthetic: true,
+    agentInitiated: true,
+    dedupeKey,
+    removableDedupeKey: true,
+    preTurnMessages: [
+      createMuxMessage(`${dedupeKey}-payload`, "assistant", "<mux_agent_message>…", {
+        timestamp: 0,
+        synthetic: true,
+      }),
+    ],
+  });
+
+  test("a synthetic turn-end entry never cuts a tool boundary and drains at stream-end", async () => {
+    const workspaceId = "queue-dispatch-synthetic-turn-end";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
+      () => undefined
+    );
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
+        peerTriggerInternal("agent-msg:sender:turn-end")
+      );
+      expect(mode).toBe("turn-end");
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+      // StreamManager's step-boundary stop policy consults these two probes for locally
+      // executed tools; a turn-end entry must satisfy neither.
+      expect(session.getQueuedInputStopCause()).toBeUndefined();
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      // bash_output early-return signal stays off for turn-end entries.
+      expect(queuedSignals).toEqual([false]);
+
+      // Provider-executed and local tool results both pass without a soft stop.
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolCallId: "tool-call-2",
+      });
+      expect(stopStream).not.toHaveBeenCalled();
+      expect(sendQueuedMessages).not.toHaveBeenCalled();
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+
+      void runSessionTerminalPolicy(session, aiEmitter, {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        parts: [],
+        metadata: {
+          model: TEST_MODEL,
+          contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          providerMetadata: {},
+          finishReason: "tool-calls",
+        },
+      });
+
+      const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
+      expect(didDispatch).toBe(true);
+      expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
+    } finally {
+      sendQueuedMessages.mockRestore();
+      stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a synthetic tool-end entry cuts the next tool boundary and dispatches after the abort", async () => {
+    const workspaceId = "queue-dispatch-synthetic-tool-end";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
+      () => undefined
+    );
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        peerTriggerInternal("agent-msg:sender:tool-end")
+      );
+      expect(mode).toBe("tool-end");
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+      // Local tool boundaries stop through the queued-input cause (StreamManager stopWhen).
+      expect(session.getQueuedInputStopCause()).toMatchObject({ kind: "queued-input" });
+      expect(queuedSignals).toEqual([true]);
+
+      // Provider-executed boundaries soft-stop the stream and dispatch once it aborts.
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledWith(workspaceId, {
+        soft: true,
+        abortReason: "system",
+      });
+
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
+      const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
+      expect(didDispatch).toBe(true);
+      expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
+      expect(sendQueuedMessages).toHaveBeenCalledWith("provider-tool");
+    } finally {
+      sendQueuedMessages.mockRestore();
+      stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a queued synthetic entry whose admission probe went stale is withdrawn at dispatch", async () => {
+    const workspaceId = "queue-dispatch-stale-probe-withdrawal";
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+
+    try {
+      // Stands in for the recipient-state recheck TaskService threads through the peer send
+      // (target archived/stopped or a delegated turn started while the entry waited).
+      let stale = false;
+      let accepted = 0;
+      let preStreamFailures = 0;
+      let canceled = 0;
+      const dedupeKey = "agent-msg:sender:stale-probe";
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
+        {
+          ...peerTriggerInternal(dedupeKey),
+          admissionStale: () => stale,
+          onAccepted: () => {
+            accepted += 1;
+          },
+          onAcceptedPreStreamFailure: () => {
+            preStreamFailures += 1;
+          },
+          onCanceled: () => {
+            canceled += 1;
+          },
+        }
+      );
+      expect(mode).toBe("turn-end");
+      expect(session.hasQueuedDedupeKey(dedupeKey)).toBe(true);
+
+      stale = true;
+      session.sendQueuedMessages();
+      await session.waitForIdle();
+
+      // Refused before acceptance: no turn, no payload or trigger row, and the queued-dispatch
+      // failure callback fires exactly once.
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(accepted).toBe(0);
+      expect(preStreamFailures).toBe(1);
+      expect(canceled).toBe(0);
+      expect(session.isBusy()).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(session.hasQueuedDedupeKey(dedupeKey)).toBe(false);
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+    } finally {
       await session.dispose();
       await cleanup();
     }
@@ -1820,10 +2089,10 @@ describe("AgentSession queued message tool-call dispatch", () => {
       aiServiceOverrides: { streamMessage },
     });
     const internals = session as unknown as {
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
       getAutoRetryPreferencePath(): string;
     };
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: () => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -1832,8 +2101,10 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }),
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
-      setThreshold: () => undefined,
-      getThreshold: () => 0.85,
+      noteUserTurn: () => undefined,
+      noteAutoCompactionRequested: () => undefined,
+      noteAutoCompactionCompleted: () => undefined,
+      suppressRepeatedAutoCompaction: () => false,
     } as unknown as CompactionMonitor;
 
     try {
@@ -2035,9 +2306,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
-
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      // Await the policy itself: it decides the queued dispatch synchronously before resolving,
+      // and a detached run would keep holding the history write lock past cleanup (#4572).
+      await runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
@@ -2059,9 +2330,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
         {
           acceptanceOrigin: "automatic",
           synthetic: true,
-          // Peer sends refund their family-message reservation through this hook; a dispatch
-          // that REJECTS (throws) instead of returning Err must reach it just like the
-          // returned-error branch, or the reservation is stranded until restart.
+          // A dispatch that REJECTS (throws) instead of returning Err must reach this hook just
+          // like the returned-error branch, or the caller never learns the send failed.
           onAcceptedPreStreamFailure: (error) => {
             failures.push(error.type === "unknown" ? error.raw : error.type);
           },

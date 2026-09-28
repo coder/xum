@@ -67,6 +67,36 @@ function workflowChild(
 }
 
 describe("computeSidebarTaskGroups", () => {
+  test("keeps a reported workflow worker active until its Bash monitor retires", () => {
+    const child = workflowChild("watcher", "wfr_monitor", {
+      taskStatus: "reported",
+      taskExecutionStatus: "completed",
+    });
+    const rows = [parent, child];
+    let monitorActive = true;
+    const options = { hasActiveBashMonitor: (id: string) => id === child.id && monitorActive };
+    const key = "workflow:parent:wfr_monitor";
+    const active = computeSidebarTaskGroups({
+      rows,
+      allRows: rows,
+      ...options,
+    }).groupsByStorageKey.get(key);
+    expect(active?.runningCount).toBe(1);
+    expect(active?.completedCount).toBe(0);
+    expect(active?.displayMembers.map((member) => member.id)).toEqual([child.id]);
+    expect(collectActiveWorkflowGroupKeys(rows, options).has(key)).toBe(true);
+
+    monitorActive = false;
+    const retired = computeSidebarTaskGroups({
+      rows,
+      allRows: rows,
+      ...options,
+    }).groupsByStorageKey.get(key);
+    expect(retired?.runningCount).toBe(0);
+    expect(retired?.displayMembers).toEqual([]);
+    expect(collectActiveWorkflowGroupKeys(rows, options).has(key)).toBe(false);
+  });
+
   test("groups workflow tasks per runId from the first member, separating concurrent runs", () => {
     const a1 = workflowChild("a1", "wfr_alpha", { workflowName: "review-pipeline" });
     const b1 = workflowChild("b1", "wfr_beta");

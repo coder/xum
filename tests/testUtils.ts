@@ -17,9 +17,6 @@ config({ path: path.resolve(__dirname, "../.env"), quiet: true });
 /**
  * Default provider-backed integration coverage to Haiku so the suite runs faster
  * and cheaper unless a test explicitly pins a larger or provider-specific model.
- *
- * Keep this as a literal string: the CommonJS shim (`tests/testUtils.js`) is loaded
- * directly by Jest/Node and cannot import TypeScript-only source files.
  */
 export const INTEGRATION_TEST_MODEL = "anthropic:claude-haiku-4-5";
 

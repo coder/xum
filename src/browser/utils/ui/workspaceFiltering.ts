@@ -1,3 +1,4 @@
+import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -122,8 +123,35 @@ export interface WorkspaceDelegatedActivity {
   workflowQueuedCount: number;
 }
 
-interface DelegatedActivityOptions {
+export interface DelegatedActivityOptions {
+  hasActiveBashMonitor?: (workspaceId: string) => boolean;
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
+}
+
+/**
+ * The sidebar's "working" reading of a workspace's live store state, used as the
+ * `isWorkspaceLiveActive` hint above. Shared so the composer tray and the sidebar
+ * cannot drift on what counts as live activity.
+ */
+export function isWorkspaceSidebarStateWorking(
+  state: Pick<
+    WorkspaceSidebarState,
+    | "canInterrupt"
+    | "isStarting"
+    | "activeWorkflowRunCount"
+    | "activeBashMonitorCount"
+    | "awaitingUserQuestion"
+  >
+): boolean {
+  return (
+    (state.canInterrupt ||
+      state.isStarting ||
+      state.activeWorkflowRunCount > 0 ||
+      // An armed background bash monitor keeps the workspace "working" so collapsed
+      // project/parent rows don't look idle while it waits to be woken.
+      state.activeBashMonitorCount > 0) &&
+    !state.awaitingUserQuestion
+  );
 }
 
 function createEmptyDelegatedActivity(): WorkspaceDelegatedActivity {
@@ -157,14 +185,9 @@ export function isSidebarSubAgentRunning(
     workspace.taskExecutionStatus === "starting" ||
     workspace.taskExecutionStatus === "running" ||
     isRunningOrStartingTaskStatus(workspace.taskStatus) ||
+    options.hasActiveBashMonitor?.(workspace.id) === true ||
     getIsWorkspaceLiveActive(workspace.id, options)
   );
-}
-
-export function isActionableTaskExecutionStatus(
-  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
-): boolean {
-  return status === "queued" || status === "starting" || status === "running";
 }
 
 export function isActiveOrStartingTaskStatus(
@@ -212,6 +235,11 @@ export function isWorkspaceDelegatedActivityActive(
     workspace.taskExecutionStatus === "running" ||
     isActiveOrStartingTaskStatus(workspace.taskStatus)
   ) {
+    return true;
+  }
+  // A report ends the agent turn, not its armed background monitors. Keep these
+  // children visible while they wait for a wake, without trusting stale stream state.
+  if (options.hasActiveBashMonitor?.(workspace.id) === true) {
     return true;
   }
   if (hasCompletedAgentReport(workspace)) {
@@ -286,7 +314,12 @@ export function computeDelegatedActivityByWorkspaceId(
 
     for (const child of childrenByParentId.get(workspace.id) ?? []) {
       const childWorkflowOwned = ownWorkflowOwned || child.workflowTask != null;
-      if (isWorkspaceDelegatedActivityActive(child, { isWorkspaceLiveActive: getIsLiveActive })) {
+      if (
+        isWorkspaceDelegatedActivityActive(child, {
+          ...options,
+          isWorkspaceLiveActive: getIsLiveActive,
+        })
+      ) {
         descendantActivity.activeCount += 1;
         if (childWorkflowOwned) {
           descendantActivity.workflowActiveCount += 1;
@@ -1016,6 +1049,32 @@ export function buildSortedWorkspacesFlat(
   const rows = [...workspaces];
   sortWorkspaceRows(rows, workspaceRecency);
   return flattenWorkspaceTree(rows);
+}
+
+/**
+ * Newest workspace by createdAt. Recency breaks ties because legacy rows share
+ * one default createdAt.
+ */
+export function findMostRecentlyCreatedWorkspace(
+  workspaces: readonly FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): FrontendWorkspaceMetadata | undefined {
+  let newest: FrontendWorkspaceMetadata | undefined;
+  for (const workspace of workspaces) {
+    if (!newest) {
+      newest = workspace;
+      continue;
+    }
+    const createdDiff = parseTimestampMs(workspace.createdAt) - parseTimestampMs(newest.createdAt);
+    if (
+      createdDiff > 0 ||
+      (createdDiff === 0 &&
+        (workspaceRecency[workspace.id] ?? 0) > (workspaceRecency[newest.id] ?? 0))
+    ) {
+      newest = workspace;
+    }
+  }
+  return newest;
 }
 
 /**

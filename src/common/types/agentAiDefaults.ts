@@ -67,7 +67,16 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
     const advisorEnabled =
       typeof entry.advisorEnabled === "boolean" ? entry.advisorEnabled : undefined;
 
-    const normalized: AgentAiDefaultsEntry = { ...base, enabled, advisorEnabled };
+    const autoModelRouting = entry.autoModelRouting === true ? true : undefined;
+    const autoThinkingLevel = entry.autoThinkingLevel === true ? true : undefined;
+
+    const normalized: AgentAiDefaultsEntry = {
+      ...base,
+      autoModelRouting,
+      autoThinkingLevel,
+      enabled,
+      advisorEnabled,
+    };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
       const profile = normalizeProfileFields(entry.subagent as Record<string, unknown>);
@@ -83,6 +92,8 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
 
     if (
       isEmptyProfile(normalized) &&
+      autoModelRouting === undefined &&
+      autoThinkingLevel === undefined &&
       enabled === undefined &&
       advisorEnabled === undefined &&
       normalized.subagent === undefined

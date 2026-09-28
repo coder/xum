@@ -10,10 +10,10 @@ import {
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_ADVANCE_MIN_TOKENS,
+  WARNING_RESERVE_TOKENS,
   FLUSH_RESERVE_TOKENS,
   FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
-import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ANTHROPIC_THINKING_BUDGETS, type ThinkingLevel } from "@/common/types/thinking";
@@ -64,31 +64,14 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
-/** Share the usable rollover budget so warnings do not promise the model's unreachable full window. */
-export function getContextBudgetRolloverPoint(
-  modelContextLimit: number,
-  threshold: number
-): number {
-  assert(threshold > 0 && threshold < 1, "Rollover point requires an enabled fractional threshold");
-  return Math.min(
-    getContextBudgetHardCeiling(modelContextLimit),
-    Math.floor((modelContextLimit * (threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT)) / 100)
+/** The slider is an agent handoff target, not a second forced-rollover ceiling. */
+export function getContextBudgetHandoffPoint(modelContextLimit: number, threshold: number): number {
+  assert(
+    Number.isFinite(modelContextLimit) && modelContextLimit > 0,
+    "Handoff requires a finite positive model context limit"
   );
-}
-
-/** Heuristic-only check. Provider dispatch uses the node real-encoding adapter.
- * Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
-export function checkAssembledRequestBudget(
-  payload: Parameters<typeof estimateAssembledRequestTokens>[0],
-  options: { model: string; modelContextLimit: number | null | undefined }
-): ContextBudgetExceeded | undefined {
-  const limit = options.modelContextLimit;
-  if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
-  const hardCeiling = getContextBudgetHardCeiling(limit);
-  const estimate = estimateAssembledRequestTokens(payload);
-  return estimate > hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, estimate, hardCeiling }
-    : undefined;
+  assert(threshold > 0 && threshold < 1, "Handoff point requires an enabled fractional threshold");
+  return Math.floor(modelContextLimit * threshold);
 }
 
 export interface StepBudgetInput {
@@ -98,13 +81,19 @@ export interface StepBudgetInput {
   imageParts: number;
   /** Real-encoding tool-output count, including media allowances, when available. */
   toolResultTokens?: number;
+  /**
+   * Assembled estimate of the next provider request (the measure the per-step preflight
+   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   */
+  nextRequestTokens?: number;
   modelContextLimit: number | null | undefined;
   threshold: number;
   warningEmitted: boolean;
+  handoffRequested: boolean;
 }
 
 export interface StepBudgetEvaluation {
-  decision: "continue" | "warn" | "rollover" | "block";
+  decision: "continue" | "warn" | "handoff" | "rollover" | "block";
   flushOpportunity: boolean;
   projected: number;
   /** Undefined means unknown, not unlimited. The caller should log that limitation. */
@@ -119,6 +108,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.imageParts,
     input.threshold,
     input.toolResultTokens ?? 0,
+    input.nextRequestTokens ?? 0,
   ]) {
     assert(
       Number.isFinite(value) && value >= 0,
@@ -130,9 +120,12 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.outputTokens +
     Math.ceil(input.toolResultChars / 4) +
     IMAGE_TOKEN_ESTIMATE * input.imageParts;
+  // Provider usage can sit ~10% below the assembled estimate the next step's preflight enforces
+  // (#4855). Using the stricter of the two keeps the forced rollover ahead of that hard stop.
   const hardProjected = Math.max(
     projected,
-    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0)
+    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0),
+    input.nextRequestTokens ?? 0
   );
   const limit = input.modelContextLimit;
   const hardCeiling =
@@ -155,28 +148,24 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     };
   }
   if (input.threshold >= 1) return result;
-  // A flush opportunity means one more notes-writing step fits below the hard ceiling.
-  // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
   const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
-  const rolloverAt = getContextBudgetRolloverPoint(limit, input.threshold);
-  if (projected >= rolloverAt) {
-    return { ...result, decision: "rollover", flushOpportunity: safeFlush };
+  // Advisories are best-effort. Skip stages without headroom rather than forcing an early
+  // rollover; the final assembled-payload preflight remains authoritative before dispatch.
+  if (input.handoffRequested || hardProjected + WARNING_RESERVE_TOKENS >= hardCeiling)
+    return result;
+  const handoffAt = getContextBudgetHandoffPoint(limit, input.threshold);
+  if (projected >= handoffAt) {
+    return { ...result, decision: "handoff", flushOpportunity: safeFlush };
   }
-  // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
-  // window really ends; anchor the absolute advance floor there. Whatever the threshold, at
-  // least half of the usable window stays warning-free instead of warning on the first request.
   const warnAt = Math.max(
-    rolloverAt / 2,
+    handoffAt / 2,
     Math.min(
       limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
-      rolloverAt - WARNING_ADVANCE_MIN_TOKENS
+      handoffAt - WARNING_ADVANCE_MIN_TOKENS
     )
   );
   if (!input.warningEmitted && projected >= warnAt) {
-    // Never spend the last usable context tokens telling the agent to flush notes.
-    return safeFlush
-      ? { ...result, decision: "warn", flushOpportunity: true }
-      : { ...result, decision: "rollover" };
+    return { ...result, decision: "warn", flushOpportunity: safeFlush };
   }
   return result;
 }
@@ -203,7 +192,17 @@ function measureBudgetContent(
   const stack: Array<{
     value: unknown;
     leave?: boolean;
-    kind?: "json" | "messages" | "message" | "parts" | "part" | "output";
+    kind?:
+      | "json"
+      | "messages"
+      | "message"
+      | "parts"
+      | "part"
+      | "assistant-parts"
+      | "assistant-part"
+      | "reasoning-options"
+      | "openai-reasoning-options"
+      | "output";
   }> = [{ value: result, kind }];
   while (stack.length > 0) {
     const entry = stack.pop()!;
@@ -243,7 +242,14 @@ function measureBudgetContent(
       for (const child of value)
         stack.push({
           value: child,
-          kind: entry.kind === "messages" ? "message" : entry.kind === "parts" ? "part" : "json",
+          kind:
+            entry.kind === "messages"
+              ? "message"
+              : entry.kind === "assistant-parts"
+                ? "assistant-part"
+                : entry.kind === "parts"
+                  ? "part"
+                  : "json",
         });
       toolResultChars += value.length;
       continue;
@@ -254,21 +260,17 @@ function measureBudgetContent(
     // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
     // attachment parts get SDK media semantics; canonical tool wrappers are also
     // safe because the shared attachment sanitizer removes their data recursively.
-    const image = entry.kind === "part" && record.type === "image" && "image" in record;
+    const isPart = entry.kind === "part" || entry.kind === "assistant-part";
+    const image = isPart && record.type === "image" && "image" in record;
     const inlineText =
       typeof record.data === "object" &&
       record.data !== null &&
       "type" in record.data &&
       record.data.type === "text";
     const file =
-      entry.kind === "part" &&
-      record.type === "file" &&
-      !inlineText &&
-      ("data" in record || "url" in record);
-    const dataMedia =
-      entry.kind === "part" && (record.type === "image-data" || record.type === "file-data");
-    const urlMedia =
-      entry.kind === "part" && (record.type === "image-url" || record.type === "file-url");
+      isPart && record.type === "file" && !inlineText && ("data" in record || "url" in record);
+    const dataMedia = isPart && (record.type === "image-data" || record.type === "file-data");
+    const urlMedia = isPart && (record.type === "image-url" || record.type === "file-url");
     if (toolMedia || image || file || dataMedia || urlMedia) imageParts += 1;
     for (const [key, child] of Object.entries(record)) {
       if (
@@ -279,21 +281,34 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
+      // Ciphertext length does not measure reasoning tokens. Provider usage tracks the underlying reasoning.
+      // Exclude only the SDK replay field; identical keys in user/tool JSON must still count.
+      if (
+        entry.kind === "openai-reasoning-options" &&
+        key === "reasoningEncryptedContent" &&
+        typeof child === "string"
+      )
+        continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
-      stack.push({
-        value: child,
-        kind:
-          entry.kind === "message" &&
-          key === "content" &&
-          (record.role === "user" || record.role === "assistant" || record.role === "tool")
-            ? "parts"
-            : entry.kind === "part" && record.type === "tool-result" && key === "output"
-              ? "output"
-              : entry.kind === "output" && record.type === "content" && key === "value"
-                ? "parts"
-                : "json",
-      });
+      let childKind: typeof entry.kind = "json";
+      if (entry.kind === "message" && key === "content") {
+        if (record.role === "assistant") childKind = "assistant-parts";
+        else if (record.role === "user" || record.role === "tool") childKind = "parts";
+      } else if (isPart && record.type === "tool-result" && key === "output") {
+        childKind = "output";
+      } else if (entry.kind === "output" && record.type === "content" && key === "value") {
+        childKind = "parts";
+      } else if (
+        entry.kind === "assistant-part" &&
+        record.type === "reasoning" &&
+        key === "providerOptions"
+      ) {
+        childKind = "reasoning-options";
+      } else if (entry.kind === "reasoning-options" && key === "openai") {
+        childKind = "openai-reasoning-options";
+      }
+      stack.push({ value: child, kind: childKind });
     }
   }
   return { toolResultChars, imageParts };
@@ -375,10 +390,6 @@ export function prepareFreshRequestTokenCount(
   };
 }
 
-export function estimateFreshRequestTokens(input: FreshRequestBudgetInput): number {
-  return prepareFreshRequestTokenCount(input).heuristicTokens;
-}
-
 export interface AssembledRequestBudgetInput {
   system?: unknown;
   tools?: Record<string, unknown>;
@@ -404,8 +415,4 @@ export function prepareAssembledRequestTokenCount(
     tokens += Math.ceil(schemaText.length / 3.5);
   }
   return { text: textParts.join("\n"), fixedTokens: content.fixedTokens, heuristicTokens: tokens };
-}
-
-export function estimateAssembledRequestTokens(payload: AssembledRequestBudgetInput): number {
-  return prepareAssembledRequestTokenCount(payload).heuristicTokens;
 }

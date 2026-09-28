@@ -8,20 +8,20 @@ type WorkspaceInfo = NonNullable<Awaited<ReturnType<ORPCClient["workspace"]["get
 
 interface Harness {
   agent: MuxAgent;
-  sendMessageCalls: Array<{
+  sendMessageCalls: {
     workspaceId: string;
     message: string;
     options: Record<string, unknown>;
-  }>;
-  delegatedToolAnswers: Array<{
+  }[];
+  delegatedToolAnswers: {
     workspaceId: string;
     toolCallId: string;
     result: unknown;
-  }>;
-  interruptCalls: Array<{
+  }[];
+  interruptCalls: {
     workspaceId: string;
     options?: Record<string, unknown>;
-  }>;
+  }[];
   pushChatEvent: (event: WorkspaceChatMessage) => void;
   closeConnection: () => void;
   connectionClosed: Promise<void>;
@@ -292,21 +292,24 @@ interface HarnessOptions {
 function createHarness(options?: HarnessOptions): Harness {
   const workspacesById = new Map<string, WorkspaceInfo>();
   let workspaceIdCounter = 0;
-  const sendMessageCalls: Array<{
+  const sendMessageCalls: {
     workspaceId: string;
     message: string;
     options: Record<string, unknown>;
-  }> = [];
-  const delegatedToolAnswers: Array<{
+  }[] = [];
+  const delegatedToolAnswers: {
     workspaceId: string;
     toolCallId: string;
     result: unknown;
-  }> = [];
-  const interruptCalls: Array<{
+  }[] = [];
+  const interruptCalls: {
     workspaceId: string;
     options?: Record<string, unknown>;
-  }> = [];
+  }[] = [];
   const chatStream = createControlledChatStream();
+  // Every full-mode replay closes with a caught-up (the backend emits it in `finally`); a prompt
+  // waits for that first one before dispatching so a failed replay is refused, not raced.
+  chatStream.push({ type: "caught-up", replay: "full", historyReplayStatus: "complete" });
 
   const client = {
     config: {
@@ -448,7 +451,7 @@ function getLastMuxMetadata(harness: Harness): Record<string, unknown> {
     throw new Error("Expected prompt send call before reading muxMetadata");
   }
 
-  const muxMetadata = lastSend.options["muxMetadata"];
+  const muxMetadata = lastSend.options.muxMetadata;
   if (!isRecord(muxMetadata)) {
     throw new Error("Expected prompt send options to include muxMetadata record");
   }
@@ -457,7 +460,7 @@ function getLastMuxMetadata(harness: Harness): Record<string, unknown> {
 }
 
 function getPromptCorrelationId(harness: Harness): string {
-  const promptCorrelationId = getLastMuxMetadata(harness)["acpPromptId"];
+  const promptCorrelationId = getLastMuxMetadata(harness).acpPromptId;
   if (typeof promptCorrelationId !== "string") {
     throw new Error("Expected prompt send options to include acpPromptId");
   }
@@ -1004,7 +1007,7 @@ describe("ACP prompt stream correlation", () => {
 
     const muxMetadata = getLastMuxMetadata(harness);
 
-    expect(muxMetadata["acpDelegatedTools"]).toEqual([
+    expect(muxMetadata.acpDelegatedTools).toEqual([
       "file_read",
       "file_write",
       "file_edit_replace_string",
@@ -1129,6 +1132,13 @@ describe("ACP prompt stream correlation", () => {
           await firstInterruptGate;
         }
         return { success: true, data: undefined };
+      },
+      // Two sessions: each gets its own replayed subscription (as in production), so both
+      // observe the caught-up a prompt waits for.
+      onChat: async () => {
+        const stream = createControlledChatStream();
+        stream.push({ type: "caught-up", replay: "full", historyReplayStatus: "complete" });
+        return stream.stream;
       },
     });
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -1277,7 +1287,10 @@ describe("ACP prompt stream correlation", () => {
       throw new Error("Expected prompt to reject when chat stream ends before terminal events");
     }
 
-    expect(promptResult.message).toContain("Chat stream ended unexpectedly");
+    // The stream ended before its replay reported, so nothing was verified: the prompt is
+    // refused (fail closed) rather than sent and then rejected by the dropped stream.
+    expect(promptResult.message).toContain("history could not be read");
+    expect(harness.sendMessageCalls).toHaveLength(0);
 
     harness.closeConnection();
     await harness.connectionClosed;

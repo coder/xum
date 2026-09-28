@@ -19,8 +19,11 @@ import type {
   AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
+import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
+import type { PlanReviewRecordKind } from "@/common/utils/planReview/planReviewRecord";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 export type { ModelMessage };
 
@@ -230,6 +233,11 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * AgentSession.inheritOpenWorkspaceTurnMetadata).
    */
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Auto routing decision made for the diverted send. The redispatched turn
+   * persists it instead of classifying (and billing) again.
+   */
+  autoModelRouting?: AutoModelRoutingRecord;
 }
 
 /**
@@ -640,6 +648,9 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         budgetTokens: number;
         /** Final pre-rollover flush prompt (absent on the advance warning). */
         final?: true;
+        /** Agent-led handoff request; old builds can still display it as a warning. */
+        handoff?: true;
+        handoffTokens?: number;
       }
     | {
         type: "compaction-request";
@@ -703,6 +714,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "bash-monitor-wake";
         /** One entry per wake record in the prompt, in prompt order. */
         records: BashMonitorWakeDisplayRecord[];
+        /**
+         * Present when the wake reactivates an inactive sub-agent (reported or interrupted,
+         * no live continuation): the fresh parent-owned continuation the woken turn runs
+         * under. The row keeps its wake type, which the wake reconciler reads as proof of
+         * delivery, so the turn correlation rides here instead of on a separate
+         * workspace-turn-task row.
+         */
+        workspaceTurn?: WorkspaceTurnTaskCorrelation;
       }
     | {
         type: "goal-pause-boundary";
@@ -811,6 +830,20 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         fromTitle?: string;
         /** The sender's relationship to the recipient (mirrors the envelope enum). */
         relationship: AgentMessageRelationship;
+        /** Trigger rows only: history ID of the payload row (see AgentPeerMessageMeta). */
+        payloadMessageId?: string;
+      }
+    | {
+        // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
+        // envelope stays in the message text; this metadata mirrors the record identity so
+        // filters and the UI never re-parse it. `feedback` rows are real user messages the
+        // model receives; every other kind is hidden UI state (see isPlanReviewRecordMessage).
+        type: "plan-review";
+        kind: PlanReviewRecordKind;
+        recordId: string;
+        snapshotId?: string;
+        threadId?: string;
+        feedbackId?: string;
       }
   );
 
@@ -842,9 +875,10 @@ export interface WorkspaceTurnTaskCorrelation {
 /**
  * Parse untyped muxMetadata (from persisted history or live stream info) into a
  * workspace-turn correlation. Returns null unless the value is a well-formed
- * "workspace-turn-task" marker — callers use this to attribute a workspace's active
- * stream to a specific delegated turn (e.g. archive interruption must not stop a user
- * stream that replaced an ended delegated stream).
+ * "workspace-turn-task" marker, or a "bash-monitor-wake" marker carrying one (a wake
+ * that reactivated an inactive sub-agent). Callers use this to attribute a workspace's
+ * active stream to a specific delegated turn (e.g. archive interruption must not stop a
+ * user stream that replaced an ended delegated stream).
  */
 export function parseWorkspaceTurnTaskCorrelation(
   muxMetadata: unknown
@@ -852,10 +886,17 @@ export function parseWorkspaceTurnTaskCorrelation(
   if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
     return null;
   }
-  const data = muxMetadata as Record<string, unknown>;
-  if (data.type !== "workspace-turn-task") {
+  const marker = muxMetadata as Record<string, unknown>;
+  const source =
+    marker.type === "workspace-turn-task"
+      ? marker
+      : marker.type === "bash-monitor-wake"
+        ? marker.workspaceTurn
+        : null;
+  if (typeof source !== "object" || source == null || Array.isArray(source)) {
     return null;
   }
+  const data = source as Record<string, unknown>;
   const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
   const ownerWorkspaceId =
     typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";
@@ -1003,6 +1044,8 @@ export interface MuxMetadata {
    * order. Refused-attempt token usage is attributed via toolModelUsages.
    */
   modelFallback?: ModelFallbackRecord;
+  /** Present when the composer's Auto entry classified this turn's difficulty. */
+  autoModelRouting?: AutoModelRoutingRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
@@ -1221,6 +1264,12 @@ export type DisplayedMessage =
       isGoalContinuation?: boolean;
       /** True for the one-shot wrap-up turn after a goal continuation exhausts its budget. */
       isBudgetLimitWrapup?: boolean;
+      /**
+       * True for an authentic plan-review feedback row. Generic editing is disabled for it: an edit
+       * resends only the envelope text, which is neutralized as an untrusted lookalike, so the
+       * threads this feedback opened would silently vanish from review state.
+       */
+      isPlanReviewFeedback?: true;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
       /** Present when this message invoked an agent skill or MCP prompt via slash command. */
@@ -1262,12 +1311,19 @@ export type DisplayedMessage =
        * payload itself is a separate assistant row). Excluded from human-prompt navigation.
        */
       agentPeerMessageTrigger?: true;
+      /**
+       * Trigger rows that name their payload row: lets the transcript fold this notification
+       * into the payload's agent-message card once that card is actually rendered.
+       */
+      agentPeerTriggerPayload?: { payloadMessageId: string; fromWorkspaceId: string };
       /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
       contextBudgetWarning?: {
         contextTokens: number;
         maxTokens: number;
         /** Final pre-rollover flush prompt rather than the advance warning. */
         final: boolean;
+        /** Agent-led handoff request rather than the advance warning. */
+        handoff: boolean;
       };
     }
   | {
@@ -1288,6 +1344,8 @@ export type DisplayedMessage =
       routeProvider?: string;
       /** Present when a fallback model answered after the requested model refused. */
       modelFallback?: ModelFallbackRecord;
+      /** Present when the composer's Auto entry routed this turn by difficulty. */
+      autoModelRouting?: AutoModelRoutingRecord;
       agentId?: string; // Agent id active when this message was sent (assistant messages only)
       /** @deprecated Legacy base mode derived from agent definition. */
       mode?: AgentMode;
@@ -1328,6 +1386,8 @@ export type DisplayedMessage =
       executionStartedAt?: number;
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
+      /** Host-authored MCP identity frozen for this call (display only, never relabeled). */
+      mcpServer?: MuxToolPart["mcpServer"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
       // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
       // persist without an input key.
@@ -1341,6 +1401,8 @@ export type DisplayedMessage =
         timestamp?: number;
         /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
         workflowRun?: MuxToolPart["workflowRun"];
+        /** Frozen MCP identity captured for this nested call (see NestedToolCallSchema). */
+        mcpServer?: MuxToolPart["mcpServer"];
       }>;
     }
   | {
@@ -1441,11 +1503,17 @@ export interface QueuedMessage {
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */
 export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    message.metadata?.synthetic === true &&
-    (message.metadata.fileAtMentionSnapshot !== undefined ||
-      message.metadata.agentSkillSnapshot !== undefined ||
-      message.metadata.mcpPromptSnapshot !== undefined)
+    (message.role === "user" &&
+      message.metadata?.synthetic === true &&
+      (message.metadata.fileAtMentionSnapshot !== undefined ||
+        message.metadata.agentSkillSnapshot !== undefined ||
+        message.metadata.mcpPromptSnapshot !== undefined)) ||
+    // Plan-review record rows are hidden UI state, not human turns: rolling cut,
+    // keep-recent-tail, retry eligibility and goal reconciliation must all skip them through
+    // this one predicate instead of mistaking them for a user prompt. Edit truncation skips
+    // them too but never cuts them (see getEditTruncateTargetFromMessages): unlike request
+    // preludes they are independent durable mutations.
+    isPlanReviewRecordMessage(message)
   );
 }
 

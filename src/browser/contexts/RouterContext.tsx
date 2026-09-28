@@ -7,7 +7,7 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import { MemoryRouter, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   prependInitialAppProxyBasePath,
@@ -36,7 +36,7 @@ export interface RouterContext {
   navigateFromAnalytics: () => void;
   currentWorkspaceId: string | null;
 
-  /** Settings section from URL (null when not on settings page). */
+  /** Settings section from URL (null when settings is closed). */
   currentSettingsSection: string | null;
 
   /** Project identifier from URL (does not include full filesystem path). */
@@ -243,10 +243,13 @@ function getInitialRoute(): string {
   return "/";
 }
 
+const EMBEDDED_INITIAL_ROUTE = "/";
+
 /** Sync router state to browser URL (dev server) and persist the desktop route. */
-function useUrlSync(): void {
+function useUrlSync(enabled: boolean): void {
   const location = useLocation();
   useEffect(() => {
+    if (!enabled) return;
     const url = location.pathname + location.search + location.hash;
 
     // The dedicated Xum home page is gone. Keep "/" as a transient compatibility
@@ -266,10 +269,34 @@ function useUrlSync(): void {
     if (browserUrl !== window.location.pathname + window.location.search + window.location.hash) {
       window.history.replaceState(null, "", browserUrl);
     }
-  }, [location.pathname, location.search, location.hash]);
+  }, [enabled, location.pathname, location.search, location.hash]);
 }
 
-function RouterContextInner(props: { children: ReactNode }) {
+interface SettingsBackgroundLocation {
+  pathname: string;
+  search: string;
+  state: unknown;
+}
+
+const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
+
+// location.state is untyped and can come from older history entries, so malformed values are
+// treated as "no background" (the settings modal then sits over the root shell).
+function getSettingsBackground(state: unknown): SettingsBackgroundLocation | null {
+  if (!state || typeof state !== "object" || !("settingsBackground" in state)) return null;
+  const background = state.settingsBackground;
+  if (!background || typeof background !== "object") return null;
+  const { pathname, search, state: backgroundState } = background as Record<string, unknown>;
+  if (typeof pathname !== "string" || !pathname.startsWith("/")) return null;
+  if (SETTINGS_ROUTE_PATTERN.test(pathname)) return null;
+  return {
+    pathname,
+    search: typeof search === "string" ? search : "",
+    state: backgroundState ?? null,
+  };
+}
+
+function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   function getProjectPathFromLocationState(state: unknown): string | null {
     if (!state || typeof state !== "object") return null;
     if (!("projectPath" in state)) return null;
@@ -284,50 +311,50 @@ function RouterContextInner(props: { children: ReactNode }) {
   }, [navigate]);
 
   const location = useLocation();
-  const [searchParams] = useSearchParams();
-  useUrlSync();
+  const locationState: unknown = location.state;
+  useUrlSync(!props.embedded);
+  const initialRoute = props.embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute();
 
-  const workspaceMatch = /^\/workspace\/(.+)$/.exec(location.pathname);
-  const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
-  const currentProjectId =
-    location.pathname === "/project"
-      ? (searchParams.get("project") ?? searchParams.get("path"))
-      : null;
-  const currentProjectPathFromState =
-    location.pathname === "/project" ? getProjectPathFromLocationState(location.state) : null;
-  const settingsMatch = /^\/settings\/([^/]+)$/.exec(location.pathname);
+  const settingsMatch = SETTINGS_ROUTE_PATTERN.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
-  const isAnalyticsOpen = location.pathname === "/analytics";
 
-  interface NonSettingsLocationSnapshot {
+  // Settings renders as a modal over the page it was opened from, so page-level route state
+  // (workspace, project, draft, analytics) comes from that background location. Cold settings
+  // links have no background and sit over the root shell.
+  const effectiveLocation: SettingsBackgroundLocation = settingsMatch
+    ? (getSettingsBackground(locationState) ?? { pathname: "/", search: "", state: null })
+    : location;
+  const effectiveSearchParams = new URLSearchParams(effectiveLocation.search);
+  const isProjectRoute = effectiveLocation.pathname === "/project";
+
+  const workspaceMatch = /^\/workspace\/(.+)$/.exec(effectiveLocation.pathname);
+  const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
+  const currentProjectId = isProjectRoute
+    ? (effectiveSearchParams.get("project") ?? effectiveSearchParams.get("path"))
+    : null;
+  const currentProjectPathFromState = isProjectRoute
+    ? getProjectPathFromLocationState(effectiveLocation.state)
+    : null;
+  const isAnalyticsOpen = effectiveLocation.pathname === "/analytics";
+  const pendingDraftId = isProjectRoute ? effectiveSearchParams.get("draft") : null;
+
+  interface LocationSnapshot {
     url: string;
     state: unknown;
   }
 
-  // When leaving settings, we need to restore the *full* previous location including
-  // any in-memory navigation state (e.g. /project relies on { projectPath } state, and
-  // the legacy ?path= deep link rewrite stores that path in location.state).
-  // Include /analytics so Settings opened from Analytics can close back to Analytics.
-  const lastNonSettingsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
-    state: null,
-  });
-  // Keep a separate "close analytics" snapshot that intentionally excludes /analytics so
-  // closing analytics still returns to the last non-analytics route.
-  const lastNonAnalyticsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
+  // Closing analytics returns to the last non-analytics, non-settings route, including its
+  // in-memory state (/project relies on { projectPath }).
+  const lastNonAnalyticsLocationRef = useRef<LocationSnapshot>({
+    url: initialRoute,
     state: null,
   });
   useEffect(() => {
-    if (!location.pathname.startsWith("/settings")) {
-      const locationSnapshot: NonSettingsLocationSnapshot = {
+    if (!location.pathname.startsWith("/settings") && location.pathname !== "/analytics") {
+      lastNonAnalyticsLocationRef.current = {
         url: location.pathname + location.search,
         state: location.state,
       };
-      lastNonSettingsLocationRef.current = locationSnapshot;
-      if (location.pathname !== "/analytics") {
-        lastNonAnalyticsLocationRef.current = locationSnapshot;
-      }
     }
   }, [location.pathname, location.search, location.state]);
 
@@ -351,8 +378,6 @@ function RouterContextInner(props: { children: ReactNode }) {
       void navigateRef.current(url, { replace: true, state: { projectPath: legacyPath } });
     }
   }, [location.pathname, location.search]);
-  const pendingDraftId = location.pathname === "/project" ? searchParams.get("draft") : null;
-
   // Navigation defaults to push so back/forward keeps working as expected.
   // Callers can opt into replace for compatibility-root redirects that should not
   // add a disposable "/" history entry.
@@ -381,21 +406,40 @@ function RouterContextInner(props: { children: ReactNode }) {
     void navigateRef.current("/");
   }, []);
 
-  const navigateToSettings = useCallback((section?: string, options?: { replace?: boolean }) => {
-    const nextSection = section ?? "general";
-    void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
-      replace: options?.replace === true,
-    });
-  }, []);
+  // These close over the rendered location (not a ref updated in an effect): settings redirect
+  // effects run in children before this provider's effects, so a ref could still be stale.
+  const navigateToSettings = useCallback(
+    (section?: string, options?: { replace?: boolean }) => {
+      const nextSection = section ?? "general";
+      // Section switches and redirects inside settings keep the original background.
+      const state = SETTINGS_ROUTE_PATTERN.test(location.pathname)
+        ? locationState
+        : {
+            settingsBackground: {
+              pathname: location.pathname,
+              search: location.search,
+              state: locationState,
+            } satisfies SettingsBackgroundLocation,
+          };
+      void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
+        replace: options?.replace === true,
+        state,
+      });
+    },
+    [location.pathname, location.search, locationState]
+  );
 
   const navigateFromSettings = useCallback(() => {
-    const lastLocation = lastNonSettingsLocationRef.current;
-    if (!lastLocation.url || lastLocation.url.startsWith("/settings")) {
+    if (!SETTINGS_ROUTE_PATTERN.test(location.pathname)) return;
+    const background = getSettingsBackground(locationState);
+    if (!background) {
       void navigateRef.current("/");
       return;
     }
-    void navigateRef.current(lastLocation.url, { state: lastLocation.state });
-  }, []);
+    void navigateRef.current(background.pathname + background.search, {
+      state: background.state,
+    });
+  }, [location.pathname, locationState]);
 
   const navigateToAnalytics = useCallback(() => {
     void navigateRef.current("/analytics");
@@ -455,10 +499,18 @@ function RouterContextInner(props: { children: ReactNode }) {
 // Without this, React processes navigation at transition (lower) priority,
 // causing a flash of stale UI between normal-priority updates (e.g.
 // setIsSending(false)) and the deferred route change.
-export function RouterProvider(props: { children: ReactNode }) {
+//
+// `embedded` is for hosts whose document URL is not an app route (the VS Code webview): start at
+// "/" and keep navigation in memory only — never rewrite the host URL or persist a route for the
+// desktop app's relaunch restore.
+export function RouterProvider(props: { children: ReactNode; embedded?: boolean }) {
+  const embedded = props.embedded === true;
   return (
-    <MemoryRouter initialEntries={[getInitialRoute()]} unstable_useTransitions={false}>
-      <RouterContextInner>{props.children}</RouterContextInner>
+    <MemoryRouter
+      initialEntries={[embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute()]}
+      unstable_useTransitions={false}
+    >
+      <RouterContextInner embedded={embedded}>{props.children}</RouterContextInner>
     </MemoryRouter>
   );
 }

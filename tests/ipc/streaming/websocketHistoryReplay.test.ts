@@ -41,31 +41,27 @@ describe("WebSocket history replay", () => {
     try {
       const tempGitRepo = await createTempGitRepo();
 
-      try {
-        const branchName = generateBranchName("ws-history-ipc-test");
-        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+      const branchName = generateBranchName("ws-history-ipc-test");
+      const createResult = await createWorkspace(env, tempGitRepo, branchName);
 
-        if (!createResult.success) {
-          throw new Error(`Workspace creation failed: ${createResult.error}`);
-        }
-
-        const workspaceId = createResult.metadata.id;
-
-        const historyService = new HistoryService(env.config);
-        const testMessage = createMuxMessage("test-msg-2", "user", "Test message for getHistory");
-        await historyService.appendToHistory(workspaceId, testMessage);
-
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        const messages = await collectFullHistory(historyService, workspaceId);
-
-        expect(messages.length).toBeGreaterThan(0);
-        console.log(`iterateFullHistory returned ${messages.length} messages`);
-
-        await cleanupTempGitRepo(tempGitRepo);
-      } catch (error) {
-        throw error;
+      if (!createResult.success) {
+        throw new Error(`Workspace creation failed: ${createResult.error}`);
       }
+
+      const workspaceId = createResult.metadata.id;
+
+      const historyService = new HistoryService(env.config);
+      const testMessage = createMuxMessage("test-msg-2", "user", "Test message for getHistory");
+      await historyService.appendToHistory(workspaceId, testMessage);
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const messages = await collectFullHistory(historyService, workspaceId);
+
+      expect(messages.length).toBeGreaterThan(0);
+      console.log(`iterateFullHistory returned ${messages.length} messages`);
+
+      await cleanupTempGitRepo(tempGitRepo);
     } finally {
       await cleanupTestEnvironment(env);
     }

@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { ensurePrivateDir } from "@/node/utils/fs";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { log } from "./log";
 
 export const HISTORY_APPEND_PROVENANCE_FILE = "history-append-provenance.json";

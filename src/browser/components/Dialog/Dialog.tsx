@@ -4,6 +4,7 @@ import * as VisuallyHiddenPrimitive from "@radix-ui/react-visually-hidden";
 import { X } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
+import { isEditableElement, MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
 
 /**
  * VisuallyHidden component for accessibility - hides content visually but keeps it available to screen readers.
@@ -25,6 +26,10 @@ const DialogOverlay = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
+    // Lets isDialogOpen() recognise this modal: Radix mounts the overlay only for modal roots
+    // (with data-state) and never sets aria-modal on the content, so the content alone is
+    // indistinguishable from a non-modal dialog.
+    {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }}
     className={cn(
       // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
       // sampler ignores this fixed overlay (it samples background-color/backdrop-filter
@@ -46,6 +51,11 @@ const DialogContent = React.forwardRef<
     maxWidth?: string;
     /** Maximum height of the dialog */
     maxHeight?: string;
+    /**
+     * Let Escape pressed in an input/textarea/contentEditable reach that element (for example to
+     * cancel an inline edit) instead of dismissing the dialog.
+     */
+    allowEditableEscape?: boolean;
   }
 >(
   (
@@ -55,6 +65,7 @@ const DialogContent = React.forwardRef<
       showCloseButton = true,
       maxWidth,
       maxHeight,
+      allowEditableEscape = false,
       style,
       onEscapeKeyDown,
       ...props
@@ -66,6 +77,12 @@ const DialogContent = React.forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         onEscapeKeyDown={(e) => {
+          if (allowEditableEscape && isEditableElement(e.target)) {
+            // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
+            // own onKeyDown run. Global Escape handlers already ignore editable targets.
+            e.preventDefault();
+            return;
+          }
           // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
           // Radix uses capture phase for Escape, so we must use onEscapeKeyDown (not onKeyDown).
           e.stopPropagation();

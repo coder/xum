@@ -1,16 +1,33 @@
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { buildEditingStateFromDisplayed } from "@/browser/utils/chatEditing";
 import {
-  hasInterruptedStream,
-  isEligibleForAutoRetry,
+  getInterruptionContext,
   isPreTokenInterruptedUserTurn,
 } from "@/common/utils/messages/retryEligibility";
 import { describe, expect, test } from "bun:test";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage } from "@/common/types/message";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 
 const CREATED_AT = "2026-01-01T00:00:00.000Z";
+
+// Enable the "show synthetic messages" debug flag for the duration of fn.
+function withDebugLlmRequestEnabled<T>(fn: () => T): T {
+  const globalWithWindow = globalThis as unknown as { window?: { api?: WindowApi } };
+  const previousWindow = globalWithWindow.window;
+  globalWithWindow.window = {
+    ...previousWindow,
+    api: { ...(previousWindow?.api ?? { platform: process.platform, versions: {} }) },
+  };
+  globalWithWindow.window.api!.debugLlmRequest = true;
+  try {
+    return fn();
+  } finally {
+    if (previousWindow) globalWithWindow.window = previousWindow;
+    else delete globalWithWindow.window;
+  }
+}
 
 describe("token-budget replay", () => {
   test("retains old windows and machine warnings while hiding the provider lead-in", () => {
@@ -24,11 +41,31 @@ describe("token-budget replay", () => {
           type: "context-budget-warning",
           contextTokens: 800,
           maxTokens: 1000,
-          budgetTokens: 750,
+          budgetTokens: 991,
+          handoffTokens: 900,
         },
       }),
+      createMuxMessage(
+        "handoff",
+        "user",
+        "Finish the current unit, checkpoint, then new_context.",
+        {
+          historySequence: 3,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 900,
+            maxTokens: 1000,
+            budgetTokens: 991,
+            handoff: true,
+            handoffTokens: 900,
+          },
+        }
+      ),
+      // Legacy final-flush row: no longer produced, but persisted histories still replay it.
       createMuxMessage("final-flush", "user", "Write workspace notes now; the window is ending.", {
-        historySequence: 3,
+        historySequence: 4,
         synthetic: true,
         uiVisible: true,
         muxMetadata: {
@@ -40,7 +77,7 @@ describe("token-budget replay", () => {
         },
       }),
       createMuxMessage("reset", "assistant", "", {
-        historySequence: 4,
+        historySequence: 5,
         contextBoundaryKind: "reset",
         muxMetadata: {
           type: "context-window-rollover",
@@ -53,17 +90,17 @@ describe("token-budget replay", () => {
         },
       }),
       createMuxMessage("lead-in", "user", "Model-only retrieval instructions", {
-        historySequence: 5,
+        historySequence: 6,
         synthetic: true,
         muxMetadata: { type: "context-window-lead-in", rolloverId: "reset" },
       }),
-      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 6 }),
+      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 7 }),
       createMuxMessage("manual-reset", "assistant", "", {
-        historySequence: 7,
+        historySequence: 8,
         contextBoundaryKind: "reset",
       }),
       createMuxMessage("budget-continue", "user", "Continue", {
-        historySequence: 8,
+        historySequence: 9,
         synthetic: true,
         uiVisible: false,
         muxMetadata: { type: "normal", contextBudgetContinuation: true },
@@ -79,18 +116,22 @@ describe("token-budget replay", () => {
       "user",
       "user",
       "user",
+      "user",
       "compaction-boundary",
       "user",
       "compaction-boundary",
     ]);
     expect(displayed[1]).toMatchObject({
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false, handoff: false },
     });
     expect(displayed[2]).toMatchObject({
-      contextBudgetWarning: { contextTokens: 850, maxTokens: 1000, final: true },
+      contextBudgetWarning: { contextTokens: 900, maxTokens: 1000, final: false, handoff: true },
     });
-    expect(displayed[3]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
-    expect(displayed[5]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
+    expect(displayed[3]).toMatchObject({
+      contextBudgetWarning: { contextTokens: 850, maxTokens: 1000, final: true, handoff: false },
+    });
+    expect(displayed[4]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
+    expect(displayed[6]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
   });
 
@@ -146,8 +187,8 @@ describe("token-budget replay", () => {
       });
       if (capsule)
         expect(aggregator.getAllMessages().at(-1)).toMatchObject({ role: "assistant", parts: [] });
-      expect(hasInterruptedStream(displayed)).toBe(false);
-      expect(isEligibleForAutoRetry(displayed)).toBe(false);
+      expect(getInterruptionContext(displayed).hasInterruptedStream).toBe(false);
+      expect(getInterruptionContext(displayed).isEligibleForAutoRetry).toBe(false);
       expect(isPreTokenInterruptedUserTurn(tail, { reason: "startup", at: 1 })).toBe(false);
       aggregator.loadHistoricalMessages(
         [
@@ -157,7 +198,9 @@ describe("token-budget replay", () => {
         ],
         false
       );
-      expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(true);
+      expect(getInterruptionContext(aggregator.getDisplayedMessages()).hasInterruptedStream).toBe(
+        true
+      );
     }
   );
 
@@ -195,13 +238,138 @@ describe("token-budget replay", () => {
       id: original.id,
       pending: { content: "Editable input", fileParts: [{ filename: "image.png" }] },
     });
-    expect(hasInterruptedStream(displayed)).toBe(false);
+    expect(getInterruptionContext(displayed).hasInterruptedStream).toBe(false);
     expect(aggregator.getAllMessages().every((message) => message.parts.length === 0)).toBe(true);
     // An older duplicate cannot undo the authoritative quarantine.
     aggregator.addMessage(original);
-    expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(false);
+    expect(getInterruptionContext(aggregator.getDisplayedMessages()).hasInterruptedStream).toBe(
+      false
+    );
     expect(aggregator.getAllMessages().at(-1)?.parts).toEqual([]);
   });
+
+  test.each([false, true])(
+    "final flush turn rows stay out of the transcript (debug=%s)",
+    (debug) => {
+      const flushTurn = {
+        type: "normal",
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      } as const;
+      const messages = [
+        createMuxMessage("user", "user", "Investigate the failing test", { historySequence: 1 }),
+        createMuxMessage("answer", "assistant", "Looking into it.", { historySequence: 2 }),
+        createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+          historySequence: 3,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: flushTurn,
+        }),
+        // A crash-recovered partial and a settled flush answer both carry the turn flag.
+        createMuxMessage("flush-answer", "assistant", "Wrote notes; window can close.", {
+          historySequence: 4,
+          partial: true,
+          muxMetadata: flushTurn,
+        }),
+        createMuxMessage("continue", "user", "Continue", {
+          historySequence: 5,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+        createMuxMessage("next-answer", "assistant", "Back to the fix.", {
+          historySequence: 6,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+      ].map((message) => MuxMessageSchema.parse(message));
+      const aggregator = new StreamingMessageAggregator(CREATED_AT);
+      aggregator.loadHistoricalMessages(messages, false);
+      const displayedIds = () =>
+        aggregator
+          .getDisplayedMessages()
+          .map((row) => ("historyId" in row ? row.historyId : row.id));
+      if (debug) {
+        // Debug mode keeps showing every machine row, including the flush turn.
+        expect(withDebugLlmRequestEnabled(displayedIds)).toEqual(
+          messages.map((message) => message.id)
+        );
+        return;
+      }
+      expect(displayedIds()).toEqual(["user", "answer", "next-answer"]);
+    }
+  );
+
+  test("a failed flush turn stays visible so its error explains the stop", () => {
+    const flushTurn = { type: "normal", contextBudgetFlush: true } as const;
+    const messages = [
+      createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+        historySequence: 1,
+        synthetic: true,
+        uiVisible: false,
+        muxMetadata: flushTurn,
+      }),
+      createMuxMessage("flush-answer", "assistant", "Writing notes", {
+        historySequence: 2,
+        partial: true,
+        error: "Provider returned 500",
+        errorType: "unknown",
+        muxMetadata: flushTurn,
+      }),
+    ].map((message) => MuxMessageSchema.parse(message));
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages(messages, false);
+    const flushRows = aggregator
+      .getDisplayedMessages()
+      .filter((row) => "historyId" in row && row.historyId === "flush-answer");
+    expect(flushRows.map((row) => row.type)).toContain("stream-error");
+    // The trigger remains a hidden synthetic row.
+    expect(
+      aggregator
+        .getDisplayedMessages()
+        .some((row) => "historyId" in row && row.historyId === "flush-trigger")
+    ).toBe(false);
+  });
+
+  test.each([true, false])(
+    "response notifications and unread recency for a live turn follow the flush flag (flush=%s)",
+    (flush) => {
+      const workspaceId = "workspace-flush-notify";
+      const aggregator = new StreamingMessageAggregator(CREATED_AT, workspaceId);
+      const recencyBefore = aggregator.getRecencyTimestamp();
+      let completion: Parameters<typeof shouldNotifyOnResponseComplete>[0];
+      aggregator.onResponseComplete = (event) => {
+        completion = event.completion;
+      };
+      const muxMetadata = flush
+        ? ({ type: "normal", contextBudgetFlush: true } as const)
+        : ({ type: "normal" } as const);
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId,
+        messageId: "flush-stream",
+        historySequence: 1,
+        model: "anthropic:claude-opus-5",
+        startTime: Date.now(),
+        muxMetadata,
+      });
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId,
+        messageId: "flush-stream",
+        metadata: {
+          historySequence: 1,
+          timestamp: Date.now(),
+          model: "anthropic:claude-opus-5",
+          muxMetadata,
+        },
+        parts: [{ type: "text", text: "Wrote notes" }],
+      });
+      // A resumed flush with no continuation must not notify with output the transcript hides,
+      // nor bump recency (which would mark the workspace unread with nothing new to read).
+      expect(shouldNotifyOnResponseComplete(completion)).toBe(!flush);
+      expect(aggregator.getRecencyTimestamp() === recencyBefore).toBe(flush);
+    }
+  );
 
   test.each([false, true])(
     "does not collapse human or malformed warning rows (synthetic=%s)",

@@ -1,8 +1,5 @@
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import {
-  DEFAULT_AUTO_COMPACTION_THRESHOLD,
-  FORCE_COMPACTION_BUFFER_PERCENT,
-} from "@/common/constants/ui";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import {
@@ -12,6 +9,7 @@ import {
 } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import { log } from "./log";
 
 export type CompactionStatusEvent =
   | {
@@ -26,6 +24,8 @@ export type CompactionStatusEvent =
 
 interface CheckBeforeSendParams {
   model: string | null;
+  /** Threshold fraction resolved by the caller for this decision (`1` = disabled). */
+  threshold: number;
   usage: AutoCompactionUsageState | undefined;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
@@ -35,6 +35,8 @@ interface CheckBeforeSendParams {
 
 interface CheckMidStreamParams {
   model: string;
+  /** Threshold fraction resolved by the caller for this decision (`1` = disabled). */
+  threshold: number;
   usage: LanguageModelV2Usage;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
@@ -44,10 +46,25 @@ interface CheckMidStreamParams {
 
 /**
  * Tracks context-window pressure and decides when auto-compaction should trigger.
+ *
+ * The monitor holds no threshold of its own: the caller resolves it from the persisted user
+ * preferences once per decision (see `resolveAutoCompactionThreshold`) so a slider change is
+ * honored by the next decision without any RPC push or per-session cache.
  */
 export class CompactionMonitor {
-  private threshold = DEFAULT_AUTO_COMPACTION_THRESHOLD;
   private hasTriggeredForCurrentStream = false;
+  /**
+   * Usage percent a live reading must fall under to prove the last auto-compaction helped: the
+   * level that triggered it. `null` when no unrelieved auto-compaction is pending. While set,
+   * pressure that stays high does not auto-compact again: when compaction cannot bring usage
+   * under its trigger (a huge system prompt, or a provider reporting constant usage), every
+   * follow-up would otherwise compact again in a loop (#4421). A user turn also clears it.
+   * Clearing on relief, not only on a user turn, keeps long autonomous runs (sub-agents never
+   * get user turns) able to compact again.
+   */
+  private reliefBelowPercent: number | null = null;
+  /** Trigger level of the auto-compaction in flight; it arms the guard only once it completes. */
+  private requestedTriggerPercent: number | null = null;
 
   constructor(
     private readonly workspaceId: string,
@@ -69,12 +86,13 @@ export class CompactionMonitor {
       params !== null && params !== undefined,
       "CompactionMonitor.checkBeforeSend requires params"
     );
+    this.assertThreshold(params.threshold);
 
     return checkAutoCompaction(
       params.usage,
       params.model,
       params.use1MContext,
-      this.threshold,
+      params.threshold,
       undefined,
       params.providersConfig,
       { openaiWireFormat: params.openaiWireFormat }
@@ -94,13 +112,14 @@ export class CompactionMonitor {
       params.model.trim().length > 0,
       "CompactionMonitor.checkMidStream requires a non-empty model"
     );
+    this.assertThreshold(params.threshold);
 
     if (this.hasTriggeredForCurrentStream) {
       return false;
     }
 
     // Threshold 1.0 means auto-compaction is disabled.
-    if (this.threshold >= 1) {
+    if (params.threshold >= 1) {
       return false;
     }
 
@@ -126,13 +145,17 @@ export class CompactionMonitor {
     );
 
     const usagePercent = (usageTokens / contextLimit) * 100;
-    const forceThresholdPercent = this.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    const forceThresholdPercent = params.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    this.noteLiveUsage(usagePercent);
 
     if (usagePercent < forceThresholdPercent) {
       return false;
     }
 
     this.hasTriggeredForCurrentStream = true;
+    if (this.suppressRepeatedAutoCompaction("mid-stream", usagePercent)) {
+      return false;
+    }
     this.onStatusChange({
       type: "auto-compaction-triggered",
       reason: "mid-stream",
@@ -145,7 +168,57 @@ export class CompactionMonitor {
     this.hasTriggeredForCurrentStream = false;
   }
 
-  setThreshold(threshold: number): void {
+  /**
+   * A live provider reading under the level that triggered the last auto-compaction proves it
+   * helped and lifts the guard. Relief counts only from a live reading of the prompt: the on-send
+   * usage state right after a compaction is an estimate (the summary's size), not a reading.
+   */
+  noteLiveUsage(usagePercent: number): void {
+    if (this.reliefBelowPercent !== null && usagePercent < this.reliefBelowPercent) {
+      this.reliefBelowPercent = null;
+    }
+  }
+
+  /** A real user turn re-arms auto-compaction even while pressure stays high. */
+  noteUserTurn(): void {
+    this.reliefBelowPercent = null;
+  }
+
+  /** Records the level that triggered an auto-compaction; it does not arm the guard yet. */
+  noteAutoCompactionRequested(triggerPercent: number): void {
+    assert(
+      Number.isFinite(triggerPercent),
+      "noteAutoCompactionRequested requires a finite percent"
+    );
+    this.requestedTriggerPercent = triggerPercent;
+  }
+
+  /**
+   * Arms the guard when an auto-compaction boundary was published. Arming here, not at the
+   * decision, means a request that was refused, cancelled or failed never suppresses the next one.
+   */
+  noteAutoCompactionCompleted(): void {
+    if (this.requestedTriggerPercent === null) return;
+    this.reliefBelowPercent = this.requestedTriggerPercent;
+    this.requestedTriggerPercent = null;
+  }
+
+  /**
+   * Returns true, and logs, when an auto-compaction must be skipped because the previous one
+   * brought no relief and no user turn happened since.
+   */
+  suppressRepeatedAutoCompaction(reason: "on-send" | "mid-stream", usagePercent: number): boolean {
+    if (this.reliefBelowPercent !== null) {
+      log.warn(
+        "Skipping auto-compaction: the previous auto-compaction did not bring usage under the threshold and no user turn happened since",
+        { workspaceId: this.workspaceId, reason, usagePercent: Math.round(usagePercent) }
+      );
+      return true;
+    }
+    return false;
+  }
+
+  private assertThreshold(threshold: number): void {
     assert(
       Number.isFinite(threshold),
       `CompactionMonitor(${this.workspaceId}): threshold must be finite`
@@ -154,10 +227,5 @@ export class CompactionMonitor {
       threshold > 0 && threshold <= 1,
       `CompactionMonitor(${this.workspaceId}): invalid threshold ${threshold}`
     );
-    this.threshold = threshold;
-  }
-
-  getThreshold(): number {
-    return this.threshold;
   }
 }

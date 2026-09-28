@@ -34,6 +34,8 @@ describe("custom provider id validation", () => {
       "prototype",
       "constructor",
       "hasOwnProperty",
+      // Reserved for the auto-model-routing classifier key.
+      "typesafe",
     ];
 
     for (const id of invalidIds) {

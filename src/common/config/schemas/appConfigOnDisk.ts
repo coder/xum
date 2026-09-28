@@ -24,7 +24,6 @@ export {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
-  AgentPluginInstallsSchema,
 } from "./agentPluginInstalls";
 export type {
   AgentPluginGitSource,
@@ -49,6 +48,9 @@ export const AgentAiDefaultsEntrySchema = z.object({
   // Sparse like the other fields: only explicit "pro" is persisted; absent
   // inherits the workspace's current reasoning mode.
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  // Auto routing is interactive-only; only `true` persists, while concrete values remain fallbacks.
+  autoModelRouting: z.boolean().optional(),
+  autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
   advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
@@ -106,6 +108,22 @@ export const ModelFallbackEntrySchema = z.object({
 /** Per-model fallback chains, keyed by canonical source model. */
 export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchema);
 
+/**
+ * Settings → Tasks & Workflows → Evaluation model: the default for workflow
+ * `evaluate()` steps that do not pass `model` themselves (a `provider:model`
+ * string). Absent means "no default" — the step fails with
+ * `invalid-input/no-model`; it is never inferred from the chat model.
+ *
+ * Deliberately separate from `autoModelRouting.evaluationModel` below: that one
+ * selects the prompt-difficulty classifier for automatic chat model routing
+ * (defaulting to TypeSafe's Jev), whereas this one selects an explicit,
+ * author-invoked workflow evaluator with its own admission and billing
+ * semantics. Neither falls back to the other.
+ */
+export const EvaluationDefaultsSchema = z.object({
+  model: z.string().min(1).optional(),
+});
+
 export const AppConfigMigrationsSchema = z
   .object({
     /**
@@ -154,6 +172,8 @@ export const AppConfigOnDiskSchema = z
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
+    /** Desktop only: hold a display-sleep blocker while any local agent is working. */
+    keepScreenAwake: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()
@@ -162,6 +182,7 @@ export const AppConfigOnDiskSchema = z
       .max(HEARTBEAT_MAX_INTERVAL_MS)
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
+    evaluationDefaults: EvaluationDefaultsSchema.optional(),
     muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
@@ -179,6 +200,18 @@ export const AppConfigOnDiskSchema = z
      * runtime sanitization rules (drop self, de-dupe, cap length).
      */
     modelFallbacks: ModelFallbacksSchema.optional(),
+    /**
+     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized on read
+     * (see normalizeAutoModelRoutingConfig), which heals each tier and field on its own;
+     * absent means the defaults. The document therefore only requires the block's shape:
+     * a hand-edited tier must neither fail the whole document (this schema also validates
+     * unrelated config-tool writes) nor take the valid tiers and evaluator down with it.
+     * `.catch`: anything that is not an object degrades to absent.
+     */
+    autoModelRouting: z
+      .object({ tiers: z.array(z.unknown()).optional(), evaluationModel: z.unknown().optional() })
+      .optional()
+      .catch(undefined),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
@@ -225,6 +258,7 @@ export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
 export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
+export type EvaluationDefaults = z.infer<typeof EvaluationDefaultsSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 
 export type AppConfigOnDisk = z.infer<typeof AppConfigOnDiskSchema>;
