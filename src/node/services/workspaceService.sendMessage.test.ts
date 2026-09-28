@@ -200,6 +200,46 @@ describe("WorkspaceService sendMessage status clearing", () => {
     );
   });
 
+  // #4804: agent-message senders resolve the recipient's hold preference before this method's
+  // preflight awaits; a hold turned on inside them must still apply at the enqueue point.
+  test.each([
+    { label: "an agent message is queued turn-end", honorRecipientHold: true, queued: "turn-end" },
+    {
+      label: "a send not marked as an agent message keeps tool-end",
+      honorRecipientHold: false,
+      queued: "tool-end",
+    },
+  ])("hold turned on during preflight: $label", async ({ honorRecipientHold, queued }) => {
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: mock(async () => {
+        const held = await workspaceService.setAgentMessageDispatchMode(
+          "test-workspace",
+          "turn-end"
+        );
+        expect(held.success).toBe(true);
+        return Ok(undefined);
+      }),
+      getPendingGoalSnapshot: mock(() => null),
+    } as unknown as WorkspaceGoalService);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "peer message",
+      { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "tool-end" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        ...(honorRecipientHold ? { honorRecipientHold } : {}),
+      }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.queueMessage.mock.calls[0]?.[1]).toMatchObject({
+      queueDispatchMode: queued,
+    });
+  });
+
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
     // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
     // later send admitted against the idle snapshot would start a competing stream that

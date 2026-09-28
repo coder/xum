@@ -1123,7 +1123,8 @@ describe("TaskService", () => {
       parentWorkspaceId,
       expect.any(String),
       expect.objectContaining({ queueDispatchMode: "turn-end" }),
-      expect.anything()
+      // Re-applied at the enqueue point for a hold turned on during the send's awaits (#4804).
+      expect.objectContaining({ honorRecipientHold: true })
     );
   });
 

@@ -757,8 +757,12 @@ describe("TaskService", () => {
       ).toEqual(
         Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: expected })
       );
-      const [, , options] = sendMessage.mock.calls[0] as Parameters<WorkspaceHost["sendMessage"]>;
+      const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
+        WorkspaceHost["sendMessage"]
+      >;
       expect(options?.queueDispatchMode).toBe(expected);
+      // Re-applied at the enqueue point for a hold turned on during the send's awaits (#4804).
+      expect(internal?.honorRecipientHold).toBe(true);
     }
   );
 

@@ -8983,6 +8983,8 @@ export class TaskService implements AgentTaskIntegration {
           {
             ...guidance,
             workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+            // Sibling messages are agent messages; parent guidance is not (#4804).
+            ...(sender === "sibling" ? { honorRecipientHold: true } : {}),
             onCanceled: (reason) => settleFailure("interrupted", reason),
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
@@ -9259,10 +9261,8 @@ export class TaskService implements AgentTaskIntegration {
           parentWorkspaceId: targetWorkspaceId,
           parentEntry,
           content: prepared.triggerContent,
-          queueDispatchMode: this.resolveRecipientDispatchMode(
-            targetWorkspaceId,
-            spec.queueDispatchMode
-          ),
+          queueDispatchMode: spec.queueDispatchMode,
+          resolveRecipientHold: true,
           preTurnMessages: [payloadRow],
         });
         if (!wakeResult.success) {
@@ -9901,6 +9901,8 @@ export class TaskService implements AgentTaskIntegration {
       const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
         acceptanceOrigin: "automatic",
         admissionStale,
+        // Re-read at the enqueue point, after sendMessage's own awaits (#4804).
+        honorRecipientHold: true,
         synthetic: true,
         agentInitiated: true,
         startStreamInBackground: true,
@@ -12818,7 +12820,8 @@ export class TaskService implements AgentTaskIntegration {
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /**
      * Apply the parent's agent-message hold preference to queueDispatchMode, read after this
-     * helper's awaits so a preference acknowledged meanwhile still applies.
+     * helper's awaits so a preference acknowledged meanwhile still applies, and again at the
+     * send's enqueue point (#4804).
      */
     resolveRecipientHold?: boolean;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
@@ -12897,6 +12900,7 @@ export class TaskService implements AgentTaskIntegration {
         agentInitiated: true,
         startStreamInBackground: true,
         workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+        ...(params.resolveRecipientHold === true ? { honorRecipientHold: true } : {}),
         ...(params.preTurnMessages != null ? { preTurnMessages: params.preTurnMessages } : {}),
         ...(params.onAccepted != null ? { onAccepted: params.onAccepted } : {}),
         ...(params.queueDedupeKey != null

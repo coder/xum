@@ -440,6 +440,12 @@ export interface SendMessageInternalOptions {
    * gates, like the other preflight-yielding sends.
    */
   yieldToPreflightSends?: boolean;
+  /**
+   * An agent message (#4804): apply the target's agent-message hold preference at the
+   * synchronous enqueue point, so a hold turned on during this method's awaits still makes the
+   * queued entry turn-end. Callers resolve the preference before sending as well.
+   */
+  honorRecipientHold?: boolean;
 }
 
 export interface WorkspaceTurnHost {

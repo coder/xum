@@ -14273,22 +14273,24 @@ export class WorkspaceService
       // A promoted tool-end send (sub-agent progress) overtakes trailing hidden turn-end entries
       // such as a queued heartbeat, so they must not count as superseding predecessors here — or
       // the report would be stripped of the correlation it then dispatches ahead of them with.
-      const promotesAheadOfHiddenTurnEnd =
+      // Set at the enqueue point when the target holds agent messages (#4804); a turn-end entry
+      // is never promoted, so promotion follows the effective mode.
+      let heldQueueOptions: typeof normalizedOptions | undefined;
+      const promotesAheadOfHiddenTurnEnd = () =>
         internal?.promoteAheadOfHiddenTurnEnd === true &&
-        (normalizedOptions.queueDispatchMode ?? "tool-end") === "tool-end";
+        ((heldQueueOptions ?? normalizedOptions).queueDispatchMode ?? "tool-end") === "tool-end";
       const getContinuationSendState = () => {
+        const sendOptions = heldQueueOptions ?? normalizedOptions;
         const preserveCorrelation =
           !isWorkspaceTurnContinuation ||
           !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata, {
-            promoteAheadOfHiddenTurnEnd: promotesAheadOfHiddenTurnEnd,
+            promoteAheadOfHiddenTurnEnd: promotesAheadOfHiddenTurnEnd(),
           });
         // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
         // (its onCanceled settles the owner's handle, which the superseded entry no longer
         // represents).
         return {
-          options: preserveCorrelation
-            ? normalizedOptions
-            : stripWorkspaceTurnCorrelation(normalizedOptions),
+          options: preserveCorrelation ? sendOptions : stripWorkspaceTurnCorrelation(sendOptions),
           onCanceled: preserveCorrelation ? internal?.onCanceled : undefined,
           onAcceptedPreStreamFailure: preserveCorrelation
             ? internal?.onAcceptedPreStreamFailure
@@ -14502,6 +14504,17 @@ export class WorkspaceService
           return Ok(undefined);
         }
 
+        // #4804: the caller resolved the target's hold preference before this method's awaits;
+        // re-read it here, in the synchronous enqueue block, so a hold turned on meanwhile applies.
+        if (
+          internal?.honorRecipientHold === true &&
+          getValidAgentMessageDispatchMode(
+            findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+              .agentMessageDispatchMode
+          ) === "turn-end"
+        ) {
+          heldQueueOptions = { ...normalizedOptions, queueDispatchMode: "turn-end" };
+        }
         // Background any foreground task waits so the queued message can dispatch promptly.
         // This must happen after queueMessage succeeds — if enqueue fails (throws),
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
