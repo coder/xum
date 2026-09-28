@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -2657,6 +2658,25 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(text(rows.at(-1)!)).toBe("Continue");
     expect(continuation.messages.map(text)).toContain("Edited request");
     expect(continuation.messages.map(text)).not.toContain("Original request");
+  });
+
+  test("a budget continuation stays the same Auto-routed turn", async () => {
+    const h = await setup();
+    const record: AutoModelRoutingRecord = {
+      requestedFallbackModel: "anthropic:claude-sonnet-4-5",
+      model,
+      status: "routed",
+    };
+    // The record is session-internal; a routed send carries it on its resolved options.
+    const routed: SendMessageOptions & { autoModelRoutingRecord: AutoModelRoutingRecord } = {
+      ...options,
+      autoModelRoutingRecord: record,
+    };
+    expect((await h.session.sendMessage("Routed work", routed)).success).toBe(true);
+    expect(h.requests[0].autoModelRouting).toEqual(record);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect((await h.waitForRequest(2)).autoModelRouting).toEqual(record);
   });
 
   // Older builds offered a hidden notes-flush step before sealing a window. New windows never

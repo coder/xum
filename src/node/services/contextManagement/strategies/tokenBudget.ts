@@ -777,6 +777,7 @@ export class TokenBudgetStrategy {
           ...(context.workspaceTurnMetadata ?? { type: "normal" }),
           contextBudgetContinuation: true,
         },
+        autoModelRouting: context.autoModelRouting,
         goalKind: context.goalKind,
         goalId: context.goalId,
       };
@@ -813,7 +814,14 @@ export class TokenBudgetStrategy {
   ):
     | Result<RestoredContextStream | undefined, SendMessageError>
     | Promise<Result<RestoredContextStream | undefined, SendMessageError>> {
-    const { options, model: modelString, admissionCapture, goalKind, goalId } = input;
+    const {
+      options,
+      model: modelString,
+      autoModelRouting,
+      admissionCapture,
+      goalKind,
+      goalId,
+    } = input;
     let resumedFlushCannotWrite = false;
     // A resumed flush runs the middleware chain admitted for its promised reset (see
     // prepareContextBudgetSend), never the live registry.
@@ -904,6 +912,7 @@ export class TokenBudgetStrategy {
                   options,
                   model: modelString,
                   muxMetadata: continuationMetadata,
+                  autoModelRouting,
                   goalKind,
                   goalId,
                 },

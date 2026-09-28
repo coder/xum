@@ -6067,40 +6067,38 @@ export class AgentSession {
     options: SendMessageOptions;
     model: string;
     muxMetadata: MuxMessageMetadata;
+    autoModelRouting?: AutoModelRoutingRecord;
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
   }): string | undefined {
-    const queued = this.messageQueue.addOnce(
-      args.text,
-      {
-        // A continuation is a fresh send: it keeps the turn's configuration, never the
-        // triggering message's payload. A replayed editMessageId made sendMessage refuse the
-        // Continue as a stale edit and drop it silently; attachments would be re-sent. ACP
-        // fields stay dropped: the ACP prompt resolves at the first stream-end, so nothing
-        // correlates the continuation or answers its delegated tool calls (they would hang).
-        ...pickStartupRetrySendOptions(args.options),
-        model: args.model,
-        queueDispatchMode: "tool-end",
-        muxMetadata: args.muxMetadata,
-      },
-      args.dedupeKey,
-      {
-        acceptanceOrigin: "automatic",
-        // This is continuation of the admitted stream, not newly authored input.
-        readCompactionAdmission: () =>
-          Promise.resolve(
-            args.admissionCapture
-              ? Ok(args.admissionCapture)
-              : Err("Continuation has no original admission frontier.")
-          ),
-        synthetic: true,
-        agentInitiated: true,
-        sealed: true,
-        removableDedupeKey: true,
-        goalKind: args.goalKind,
-        goalId: args.goalId,
-      }
-    );
+    const options: ResolvedSendMessageOptions = {
+      // A continuation is a fresh send: it keeps the turn's configuration, never the
+      // triggering message's payload. A replayed editMessageId made sendMessage refuse the
+      // Continue as a stale edit and drop it silently; attachments would be re-sent. ACP
+      // fields stay dropped: the ACP prompt resolves at the first stream-end, so nothing
+      // correlates the continuation or answers its delegated tool calls (they would hang).
+      ...pickStartupRetrySendOptions(args.options),
+      ...(args.autoModelRouting != null ? { autoModelRoutingRecord: args.autoModelRouting } : {}),
+      model: args.model,
+      queueDispatchMode: "tool-end",
+      muxMetadata: args.muxMetadata,
+    };
+    const queued = this.messageQueue.addOnce(args.text, options, args.dedupeKey, {
+      acceptanceOrigin: "automatic",
+      // This is continuation of the admitted stream, not newly authored input.
+      readCompactionAdmission: () =>
+        Promise.resolve(
+          args.admissionCapture
+            ? Ok(args.admissionCapture)
+            : Err("Continuation has no original admission frontier.")
+        ),
+      synthetic: true,
+      agentInitiated: true,
+      sealed: true,
+      removableDedupeKey: true,
+      goalKind: args.goalKind,
+      goalId: args.goalId,
+    });
     // addOnce keys are unique in the queue, so this resolves the exact entry just added.
     return queued ? this.messageQueue.getEntryIdByDedupeKey(args.dedupeKey) : undefined;
   }
@@ -7598,6 +7596,7 @@ export class AgentSession {
         userMessage: lastUserMessage,
         options,
         model: modelString,
+        autoModelRouting: options?.autoModelRoutingRecord,
         admissionCapture,
         goalKind,
         goalId,

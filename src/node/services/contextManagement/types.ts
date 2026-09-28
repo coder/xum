@@ -99,6 +99,8 @@ export interface ContinuationEntry {
   options: SendMessageOptions;
   model: string;
   muxMetadata: MuxMessageMetadata;
+  /** Stream provenance, not payload: the continuation stays the same Auto-routed turn. */
+  autoModelRouting?: AutoModelRoutingRecord;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
 }
@@ -108,6 +110,7 @@ export interface RestoreContextStreamInput {
   userMessage?: MuxMessage;
   options?: SendMessageOptions;
   model: string;
+  autoModelRouting?: AutoModelRoutingRecord;
   admissionCapture?: CompactionReplacementCapture;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
