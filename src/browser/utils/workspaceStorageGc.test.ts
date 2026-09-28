@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 
+import { subscribePersistedStateWrites } from "@/browser/hooks/usePersistedState";
 import {
   collectOrphanedWorkspaceStorage,
   resetWorkspaceStorageGcForTests,
@@ -21,8 +22,9 @@ import {
 
 const KNOWN_ID = "0123456789";
 const ORPHAN_ID = "deadbeef00";
-const LIVE_DRAFT = getDraftScopeId("/repo/with/slashes", "draft-live");
-const STALE_DRAFT = getDraftScopeId("/repo/with/slashes", "draft-stale");
+const MAPPED_DRAFT = getDraftScopeId("/repo/with/slashes", "draft-live");
+// Absent from the drafts map, e.g. a routed draft id whose map entry another tab removed.
+const UNMAPPED_DRAFT = getDraftScopeId("/repo/with/slashes", "draft-unmapped");
 
 function seed(keys: readonly string[]): void {
   for (const key of keys) localStorage.setItem(key, JSON.stringify("value"));
@@ -55,18 +57,19 @@ describe("collectOrphanedWorkspaceStorage", () => {
     globalThis.localStorage = undefined as unknown as Storage;
   });
 
-  test("removes only keys of unknown stable workspace ids and stale creation drafts", async () => {
+  test("removes only keys of unknown stable workspace ids", async () => {
     const orphaned = [
       getInputKey(ORPHAN_ID),
       getReviewStateKey(ORPHAN_ID),
       getTerminalTitlesKey(ORPHAN_ID),
       getMCPTestResultsKey("/repo", ORPHAN_ID),
-      getInputKey(STALE_DRAFT),
     ];
     const kept = [
       getInputKey(KNOWN_ID),
       getMCPTestResultsKey("/repo", KNOWN_ID),
-      getInputKey(LIVE_DRAFT),
+      // The drafts map is not authoritative, so creation-draft keys are never collected.
+      getInputKey(MAPPED_DRAFT),
+      getInputKey(UNMAPPED_DRAFT),
       getInputKey(getPendingScopeId("/repo")),
       getThinkingLevelKey(getProjectScopeId("/repo")),
       getThinkingLevelKey(GLOBAL_SCOPE_ID),
@@ -92,21 +95,32 @@ describe("collectOrphanedWorkspaceStorage", () => {
     expect(remaining(kept)).toEqual(kept);
   });
 
-  test("keeps every draft key when the drafts map is missing", async () => {
-    seed([getInputKey(STALE_DRAFT)]);
+  // Mounted usePersistedState consumers must observe the removal, or they would keep showing
+  // (and could write back) the deleted value.
+  test("notifies persisted-state write listeners for every removed key", async () => {
+    seed([getInputKey(ORPHAN_ID), getInputKey(KNOWN_ID)]);
+    const removedKeys: string[] = [];
+    const unsubscribe = subscribePersistedStateWrites((event) => {
+      if (event.newValue == null) removedKeys.push(event.key);
+    });
 
-    await collectOrphanedWorkspaceStorage({ listKnownWorkspaceIds: () => Promise.resolve([]) });
+    try {
+      await collectOrphanedWorkspaceStorage({
+        listKnownWorkspaceIds: () => Promise.resolve([KNOWN_ID]),
+      });
+    } finally {
+      unsubscribe();
+    }
 
-    expect(remaining([getInputKey(STALE_DRAFT)])).toEqual([getInputKey(STALE_DRAFT)]);
+    expect(removedKeys).toEqual([getInputKey(ORPHAN_ID)]);
   });
 
   test.each([
     ["rejects", () => Promise.reject(new Error("config unreadable"))],
     ["resolves a malformed list", () => Promise.resolve(undefined as unknown as string[])],
   ])("removes nothing when the known-id endpoint %s", async (_name, listKnownWorkspaceIds) => {
-    const keys = [getInputKey(ORPHAN_ID), getInputKey(STALE_DRAFT)];
+    const keys = [getInputKey(ORPHAN_ID), getMCPTestResultsKey("/repo", ORPHAN_ID)];
     seed(keys);
-    seedDraftsMap();
 
     let failed = false;
     await collectOrphanedWorkspaceStorage({ listKnownWorkspaceIds }).catch(() => {

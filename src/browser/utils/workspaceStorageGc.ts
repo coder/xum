@@ -16,18 +16,20 @@
  * - Candidate keys are snapshotted before the endpoint call. Workspace keys are only written after
  *   the backend returns a new id, i.e. after its config entry is persisted, so a workspace created
  *   after the snapshot either has no candidate keys or is in the backend set.
- * - Only stable-format workspace ids and exact creation-draft scopes are ever collected (see
- *   findOrphanedWorkspaceStorageKeys).
+ * - Only keys of stable-format workspace ids are ever collected (see
+ *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected: the drafts map is
+ *   not authoritative (a routed draft id can be in use without a map entry, and a malformed or
+ *   newer-format bucket hides live drafts), and drafts move to the backend in a follow-up.
+ * - Keys are removed through updatePersistedState so mounted usePersistedState consumers and
+ *   write listeners observe the removal instead of writing a stale value back.
  *
  * Known limitation: localStorage is per origin. Two XUM roots served on the same origin over time
  * (e.g. dev servers reusing a port) share it, so GC under one root removes the other root's
  * workspace keys. Desktop remote windows use per-URL partitions and are unaffected.
  */
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   findOrphanedWorkspaceStorageKeys,
-  getDraftScopeId,
   listWorkspaceStorageGcCandidateKeys,
 } from "@/common/constants/storage";
 
@@ -35,26 +37,6 @@ let gcStarted = false;
 
 export function resetWorkspaceStorageGcForTests(): void {
   gcStarted = false;
-}
-
-/**
- * Draft scope ids of every draft in the persisted drafts map, or null when the map is missing or
- * unreadable (then draft keys are never collected). Entries are read leniently: any entry with a
- * string draftId protects its keys, even if the rest of the entry is malformed.
- */
-function readLiveDraftScopeIds(): Set<string> | null {
-  const stored = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
-  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) return null;
-
-  const scopeIds = new Set<string>();
-  for (const [projectPath, drafts] of Object.entries(stored as Record<string, unknown>)) {
-    if (!Array.isArray(drafts)) continue;
-    for (const draft of drafts as unknown[]) {
-      const draftId = (draft as { draftId?: unknown } | null)?.draftId;
-      if (typeof draftId === "string") scopeIds.add(getDraftScopeId(projectPath, draftId));
-    }
-  }
-  return scopeIds;
 }
 
 export interface CollectOrphanedWorkspaceStorageInput {
@@ -81,16 +63,12 @@ export async function collectOrphanedWorkspaceStorage(
     throw new Error("Malformed known workspace id list; skipping workspace storage GC");
   }
 
-  // Read drafts and remove in one synchronous pass: a draft created meanwhile writes its keys in
-  // the same synchronous update that adds it to the drafts map, so no await may sit between
-  // reading the map and removing keys.
   const orphans = findOrphanedWorkspaceStorageKeys(
     candidateKeys,
-    new Set(knownWorkspaceIds as string[]),
-    readLiveDraftScopeIds()
+    new Set(knownWorkspaceIds as string[])
   );
   for (const key of orphans) {
-    localStorage.removeItem(key);
+    updatePersistedState(key, null);
   }
   return orphans;
 }
