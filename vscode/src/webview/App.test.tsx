@@ -489,22 +489,29 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
       },
     });
 
-  test("Stop interrupts the stream through the host and shows interrupting", async () => {
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge);
-    await startStream(bridge);
+  // Stop and Esc share one interrupt path; both must reach the host and mark the stream.
+  const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
+    ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
+    ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
+  ];
+  for (const [name, trigger] of interruptTriggers) {
+    test(`${name} interrupts the stream through the host and shows interrupting`, async () => {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge);
+      await startStream(bridge);
 
-    await act(async () => {
-      fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
-      await Promise.resolve();
+      await act(async () => {
+        trigger(view);
+        await Promise.resolve();
+      });
+
+      const calls = bridge.orpcCalls("workspace.interruptStream");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].input).toEqual({ workspaceId: WORKSPACE.id });
+      expect(view.container.textContent).toContain("interrupting...");
     });
-
-    const calls = bridge.orpcCalls("workspace.interruptStream");
-    expect(calls).toHaveLength(1);
-    expect(calls[0].input).toEqual({ workspaceId: WORKSPACE.id });
-    expect(view.container.textContent).toContain("interrupting...");
-  });
+  }
 
   test("an armed monitor with no stream shows the waiting status until it disarms or the workspace changes", async () => {
     const bridge = new TestBridge();
