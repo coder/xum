@@ -15,7 +15,6 @@ import { ChatInstructionsChatDecoration } from "@/browser/components/Instruction
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
-import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
 import { InterruptedBarrier } from "@/browser/features/Messages/ChatBarrier/InterruptedBarrier";
 import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
@@ -26,6 +25,12 @@ import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutS
 import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
 import { TranscriptBundleRows, useTranscriptBundles } from "./TranscriptBundles";
+import {
+  findTranscriptMessageElement,
+  getTranscriptRowProps,
+  useTranscriptRowDerivations,
+  useUserMessageNavigation,
+} from "./transcriptRowDerivations";
 import {
   createChatInputDecorationStackItem,
   createTranscriptTailStackItem,
@@ -39,10 +44,8 @@ import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
   shouldShowInterruptedBarrier,
   mergeConsecutiveStreamErrors,
-  computeBashOutputGroupInfos,
   shouldBypassDeferredMessages,
 } from "@/browser/utils/messages/messageUtils";
-import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashCollapsedSummaryModeContext";
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
 import {
@@ -188,15 +191,6 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
 const NO_HELD_INPUTS: readonly HeldInputData[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
-
-function findTranscriptMessageElement(
-  scrollContainer: HTMLElement,
-  historyId: string
-): HTMLElement | undefined {
-  return Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-message-id]")).find(
-    (element) => element.getAttribute("data-message-id") === historyId
-  );
-}
 
 const TIMELINE_REVEAL_HIGHLIGHT_CLASS = "timeline-reveal-highlight";
 
@@ -442,9 +436,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }, [editingMessage, transcriptOnly, workspaceId]);
 
-  // Track which bash_output groups are expanded (keyed by first message ID)
-  const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
-
   // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
   // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
   // DOM instead of a one-shot requestAnimationFrame that would find nothing.
@@ -535,16 +526,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
-  const taskReportLinking = useMemo(
-    () => computeTaskReportLinking(deferredMessages),
-    [deferredMessages]
-  );
-
-  // Precompute bash_output grouping once per message snapshot so row rendering stays O(n).
-  const bashOutputGroupInfos = useMemo(
-    () => computeBashOutputGroupInfos(deferredMessages),
-    [deferredMessages]
-  );
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId,
+    messages: deferredMessages,
+  });
+  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
 
   const transcriptBundles = useTranscriptBundles({
     workspaceId,
@@ -714,7 +700,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? deferredMessages[bashOutputGroup.firstIndex]?.id
       : undefined;
     if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
-      setExpandedBashGroups((current) => new Set(current).add(bashGroupKey));
+      expandBashGroup(bashGroupKey);
       return;
     }
 
@@ -761,6 +747,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
+    expandBashGroup,
     expandedBashGroups,
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
@@ -867,39 +854,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceId,
   ]);
 
-  // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
-  // references across non-message updates (usage bumps, stats updates, etc.).
-  const userMessageNavigationByHistoryId = useMemo(() => {
-    const userHistoryIds: string[] = [];
-    for (const message of deferredMessages) {
-      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
-      if (
-        message.type === "user" &&
-        message.isPendingSend == null &&
-        message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null &&
-        message.contextBudgetWarning == null
-      ) {
-        userHistoryIds.push(message.historyId);
-      }
-    }
-
-    if (userHistoryIds.length < 2) {
-      return null;
-    }
-
-    const navigationByHistoryId = new Map<string, UserMessageNavigation>();
-    for (let index = 0; index < userHistoryIds.length; index++) {
-      navigationByHistoryId.set(userHistoryIds[index], {
-        prevUserMessageId: index > 0 ? userHistoryIds[index - 1] : undefined,
-        nextUserMessageId:
-          index < userHistoryIds.length - 1 ? userHistoryIds[index + 1] : undefined,
-        onNavigate: handleNavigateToMessage,
-      });
-    }
-
-    return navigationByHistoryId;
-  }, [deferredMessages, handleNavigateToMessage]);
+  const userMessageNavigationByHistoryId = useUserMessageNavigation({
+    messages: deferredMessages,
+    onNavigateToMessage: handleNavigateToMessage,
+  });
 
   // ChatInput API for focus management
   const chatInputAPI = useRef<ChatInputAPI | null>(null);
@@ -924,7 +882,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   useEffect(() => {
     setEditingState({ workspaceId, message: undefined });
-    setExpandedBashGroups(new Set());
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
@@ -1471,28 +1428,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }
 
-  const toggleBashOutputGroup = (groupKey: string) => {
-    setExpandedBashGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
-      }
-      return next;
-    });
-  };
-
   const renderMessageAtIndex = (
     message: DisplayedMessage,
     index: number,
     options: { key: string; className?: string }
   ): React.ReactNode => {
-    const bashOutputGroup = bashOutputGroupInfos[index];
-    const groupKey = bashOutputGroup ? deferredMessages[bashOutputGroup.firstIndex]?.id : undefined;
-    const isGroupExpanded = groupKey ? expandedBashGroups.has(groupKey) : false;
+    const rowProps = getTranscriptRowProps({
+      derivations: transcriptRowDerivations,
+      userMessageNavigationByHistoryId,
+      messages: deferredMessages,
+      message,
+      index,
+    });
+    const { bashOutputGroup, bashGroupKey } = rowProps;
 
-    if (bashOutputGroup?.position === "middle" && !isGroupExpanded) {
+    if (rowProps.hidden) {
       return null;
     }
 
@@ -1502,11 +1452,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       message.type !== "workspace-init" &&
       message.type !== "compaction-boundary" &&
       message.historyId === editCutoffHistoryId;
-
-    const taskReportLinkingForMessage =
-      message.type === "tool" && (message.toolName === "task" || message.toolName === "task_await")
-        ? taskReportLinking
-        : undefined;
 
     const messageNode = (
       <MessageRenderer
@@ -1525,24 +1470,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
           message.id === latestProposePlanId
         }
         bashOutputGroup={bashOutputGroup}
-        taskReportLinking={taskReportLinkingForMessage}
-        userMessageNavigation={
-          message.type === "user"
-            ? userMessageNavigationByHistoryId?.get(message.historyId)
-            : undefined
-        }
+        taskReportLinking={rowProps.taskReportLinking}
+        userMessageNavigation={rowProps.userMessageNavigation}
       />
     );
 
     return (
       <React.Fragment key={options.key}>
         {options.className ? <div className={options.className}>{messageNode}</div> : messageNode}
-        {bashOutputGroup?.position === "first" && groupKey && (
+        {bashOutputGroup?.position === "first" && bashGroupKey && (
           <BashOutputCollapsedIndicator
             processId={bashOutputGroup.processId}
             collapsedCount={bashOutputGroup.collapsedCount}
-            isExpanded={isGroupExpanded}
-            onToggle={() => toggleBashOutputGroup(groupKey)}
+            isExpanded={rowProps.isBashGroupExpanded}
+            onToggle={() => transcriptRowDerivations.toggleBashOutputGroup(bashGroupKey)}
           />
         )}
         {isAtCutoff && <EditCutoffBarrier />}
