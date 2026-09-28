@@ -2798,6 +2798,24 @@ exit 1
       expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
     });
 
+    it("deletes a removed sub-project's creation drafts", async () => {
+      const parentPath = "/fake/parent";
+      const childPath = "/fake/parent/packages/child";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(parentPath, { workspaces: [] });
+      cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+      await config.editConfig(() => cfg);
+      const draftService = new DraftService(config);
+      service.setDraftCleaner(draftService);
+      const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
+      await draftService.update({ scope: draftScope, text: "unsent" });
+
+      const result = await service.remove(childPath);
+
+      expect(result.success).toBe(true);
+      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
+    });
+
     it("returns project_not_found for unknown project", async () => {
       const result = await service.remove("/no/such/project");
 

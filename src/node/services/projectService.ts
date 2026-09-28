@@ -1427,6 +1427,12 @@ export class ProjectService {
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
+        // Same best-effort draft cleanup as a top-level removal (below).
+        try {
+          await this.draftCleaner?.deleteProjectDrafts(normalizedPath);
+        } catch (error) {
+          log.error(`Failed to clean up drafts for sub-project ${normalizedPath}:`, error);
+        }
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
         return Ok(undefined);
       }

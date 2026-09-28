@@ -213,11 +213,21 @@ describe("DraftService", () => {
     });
     expect((await service.list()).map(({ text }) => text).sort()).toEqual(["creation", "scratch"]);
 
+    // Removal: the config write lands first, then the cleanup runs.
+    const projectEntry = config.loadConfigOrDefault().projects.get(projectPath)!;
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
     await service.deleteProjectDrafts(projectPath);
     expect((await service.get(creation)).text).toBe("");
     expect(events.at(-1)).toMatchObject({ type: "deleted", scope: creation });
 
     // GC: a project removed while this build was not running loses its drafts; scratch stays.
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, projectEntry);
+      return current;
+    });
     await service.update({ scope: creation, text: "again" });
     await config.editConfig((current) => {
       current.projects.delete(projectPath);
@@ -240,6 +250,10 @@ describe("DraftService", () => {
     const [projectDirName] = await fs.readdir(draftsRoot);
     const projectDir = path.join(draftsRoot, projectDirName);
     await fs.writeFile(path.join(projectDir, "draft-b.json"), "{truncated");
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
 
     await service.deleteProjectDrafts(projectPath);
     expect(await exists(projectDir)).toBe(false);
@@ -306,6 +320,39 @@ describe("DraftService", () => {
       }
     );
     await gc;
+
+    expect((await new DraftService(config).get(creation)).text).toBe("keep me");
+  });
+
+  it("project removal keeps the drafts of a project registered again before the cleanup", async () => {
+    using tempDir = new TestTempDir("drafts-removal-readd");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const creation: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.update({ scope: creation, text: "keep me" });
+    const projectEntry = config.loadConfigOrDefault().projects.get(projectPath);
+    expect(projectEntry).toBeDefined();
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [projectDirName] = await fs.readdir(draftsRoot);
+
+    let cleanup: Promise<void> | undefined;
+    // The removal's cleanup runs after its config write; the path is registered again first.
+    await withTargetMutationLock(
+      config.rootDir,
+      path.join(draftsRoot, projectDirName),
+      async () => {
+        cleanup = service.deleteProjectDrafts(projectPath);
+        await config.editConfig((current) => {
+          current.projects.set(projectPath, projectEntry!);
+          return current;
+        });
+      }
+    );
+    await cleanup;
 
     expect((await new DraftService(config).get(creation)).text).toBe("keep me");
   });

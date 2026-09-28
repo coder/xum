@@ -224,10 +224,14 @@ export class DraftService extends EventEmitter {
    */
   async deleteProjectDrafts(projectPath: string): Promise<void> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
-    const projectDir = path.join(this.creationRoot, projectDraftsDirName(projectPath));
-    await withTargetMutationLock(this.config.rootDir, projectDir, () =>
-      this.clearProjectDir(projectDir)
-    );
+    const dirName = projectDraftsDirName(projectPath);
+    const projectDir = path.join(this.creationRoot, dirName);
+    await withTargetMutationLock(this.config.rootDir, projectDir, async () => {
+      // The same recheck as the GC: this runs after the removal's config write, so the path may
+      // be registered again (with a new creation draft) by now; its drafts are owned again.
+      if (this.configuredProjectDirNames().has(dirName)) return;
+      await this.clearProjectDir(projectDir);
+    });
   }
 
   /**
