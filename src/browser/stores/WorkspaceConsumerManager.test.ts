@@ -21,6 +21,8 @@ const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => 
 const SLOW_CALCULATION_MS = 60_000;
 const DEBOUNCE_MS = 150;
 
+type DeferredStats = ReturnType<typeof Promise.withResolvers<ChatStats>>;
+
 function statsWithTotal(totalTokens: number): ChatStats {
   return {
     ...STATS,
@@ -123,10 +125,7 @@ describe("WorkspaceConsumerManager", () => {
   // #4815: the backend keeps computing (and persists the result) after the renderer's
   // slow-calculation point, so the renderer must keep waiting and show the late result.
   describe("calculations slower than the warning threshold", () => {
-    let requests: Array<{
-      workspaceId: string;
-      deferred: ReturnType<typeof Promise.withResolvers<ChatStats>>;
-    }>;
+    let requests: Array<{ workspaceId: string; deferred: DeferredStats }>;
 
     beforeEach(() => {
       fakeTimers.useFakeTimers();
@@ -196,28 +195,39 @@ describe("WorkspaceConsumerManager", () => {
       expect(manager.getCachedState("ws-1")).toEqual(toCachedState(newStats));
     });
 
+    // bun's runner fails the test if the rejection goes unhandled, so no listener is needed.
     test("a late failure ends the calculation with the empty state", async () => {
       const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
-      const unhandled = mock((_reason: unknown) => undefined);
-      process.on("unhandledRejection", unhandled);
-      try {
-        await startCalculation("ws-1");
-        await passSlowThreshold();
-        expect(manager.getStateSync("ws-1").isCalculating).toBe(true);
-        expect(consoleError).not.toHaveBeenCalled();
+      await startCalculation("ws-1");
+      await passSlowThreshold();
+      expect(manager.getStateSync("ws-1").isCalculating).toBe(true);
+      expect(consoleError).not.toHaveBeenCalled();
 
-        const error = new Error("boom");
-        requests[0].deferred.reject(error);
-        await flushMicrotasks();
+      const error = new Error("boom");
+      requests[0].deferred.reject(error);
+      await flushMicrotasks();
 
-        expect(manager.isPending("ws-1")).toBe(false);
-        expect(manager.getCachedState("ws-1")).toEqual(EMPTY_STATE);
-        expect(consoleError).toHaveBeenCalledTimes(1);
-        expect(consoleError.mock.calls[0]).toContain(error);
-        expect(unhandled).not.toHaveBeenCalled();
-      } finally {
-        process.off("unhandledRejection", unhandled);
-      }
+      expect(manager.isPending("ws-1")).toBe(false);
+      expect(manager.getCachedState("ws-1")).toEqual(EMPTY_STATE);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(consoleError.mock.calls[0]).toContain(error);
+    });
+
+    // A request can stay in flight indefinitely, so it must not repopulate a deleted workspace.
+    test.each([
+      ["result", (deferred: DeferredStats) => deferred.resolve(STATS)],
+      ["failure", (deferred: DeferredStats) => deferred.reject(new Error("boom"))],
+    ])("drops a late %s after the workspace was removed", async (_outcome, settle) => {
+      spyOn(console, "error").mockImplementation(() => undefined);
+      await startCalculation("ws-1");
+      manager.removeWorkspace("ws-1");
+      onCalculationComplete.mockClear();
+
+      settle(requests[0].deferred);
+      await flushMicrotasks();
+
+      expect(manager.getCachedState("ws-1")).toBeNull();
+      expect(onCalculationComplete).not.toHaveBeenCalled();
     });
 
     test("applies a late result to its own workspace after switching to another one", async () => {
