@@ -113,7 +113,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               content={message.content}
               summary={
                 message.contextBudgetWarning.final
-                  ? "Context window ending: notes flush"
+                  ? "Context window ending: final handoff"
                   : message.contextBudgetWarning.handoff
                     ? "Context handoff requested"
                     : "Context budget warning"

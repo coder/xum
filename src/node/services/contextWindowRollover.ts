@@ -117,7 +117,6 @@ interface ContextBudgetWarningOptions {
   contextTokens: number;
   maxTokens: number;
   budgetTokens: number;
-  memoryWritable: boolean;
   sessionHistoryAvailable: boolean;
   final?: boolean;
   handoff?: boolean;
@@ -130,7 +129,6 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     contextTokens,
     maxTokens,
     budgetTokens,
-    memoryWritable,
     sessionHistoryAvailable,
     final,
     handoff,
@@ -167,16 +165,24 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
   if (!sessionHistoryAvailable) {
     return `${usage} History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills.`;
   }
+  const reached =
+    "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.";
+  // new_context is only offered with the memory tool, so its absence may mean memory is gone too.
+  // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
+  if (options.newContextAvailable === false) {
+    return [
+      usage,
+      reached,
+      `If the memory tool is available to you, save ${checkpoint}.`,
+      "new_context is not available under the current tool policy. Continue; Xum will attempt a rollover at the usable limit or pause safely.",
+      "If the task is already complete, finish the reply instead.",
+    ].join(" ");
+  }
   return [
     usage,
-    "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.",
-    memoryWritable
-      ? `Before starting a new context window, save ${checkpoint}. Clean up old notes that are obsolete. Future context windows will not include the current conversation.`
-      : "Memory writes are unavailable for this turn; skip the checkpoint.",
-    // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
-    options.newContextAvailable === false
-      ? "new_context is not available under the current tool policy. Continue; Xum will attempt a rollover at the usable limit or pause safely."
-      : "After saving your checkpoint, call new_context in a later step to continue in a fresh context window. If new_context is not available to you, continue.",
+    reached,
+    `Before starting a new context window, save ${checkpoint}. Clean up old notes that are obsolete. Future context windows will not include the current conversation.`,
+    "After saving your checkpoint, call new_context in a later step to continue in a fresh context window. If new_context is not available to you, continue.",
     "If the task is already complete, finish the reply instead.",
   ].join(" ");
 }

@@ -8,11 +8,6 @@
  * recompute it only on the first use of a model in a session segment and at
  * compaction boundaries, so repeated turns keep prompt-cache-stable bytes.
  */
-import {
-  CONTEXT_NOTES_MEMORY_PATH,
-  CONTEXT_NOTES_RESERVED_BYTES,
-  CONTEXT_NOTES_RESERVED_TOKENS,
-} from "@/common/constants/contextBudget";
 import assert from "@/common/utils/assert";
 import {
   MEMORY_HOT_SET_DECAY_HALF_LIFE_MS,

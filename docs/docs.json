@@ -127,6 +127,7 @@
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
               "adr/0005-token-budget-context-windows",
               "adr/0006-agent-led-context-handoff",
+              "adr/0007-handoff-is-the-rollover-payload",
               "AGENTS"
             ]
           }

@@ -1887,7 +1887,6 @@ describe("AgentSession token-budget lifecycle", () => {
       } satisfies SendMessageOptions,
       expected: {
         handoff: true,
-        memoryWritable: false,
         sessionHistoryAvailable: false,
         newContextAvailable: false,
       },
@@ -2209,52 +2208,38 @@ describe("AgentSession token-budget lifecycle", () => {
       next: {
         toolPolicy: [{ regex_match: "memory|session_history|new_context", action: "disable" }],
       },
-      expected: {
-        memoryWritable: false,
-        sessionHistoryAvailable: false,
-        newContextAvailable: false,
-      },
+      expected: { sessionHistoryAvailable: false, newContextAvailable: false },
     },
     {
       label: "caller restores tools",
       previousEnabled: false,
       next: {},
-      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
+      expected: { sessionHistoryAvailable: true, newContextAvailable: true },
     },
     {
       label: "agent removes tools",
       previousEnabled: true,
       next: { agentId: "restricted" },
-      expected: {
-        memoryWritable: false,
-        sessionHistoryAvailable: false,
-        newContextAvailable: false,
-      },
+      expected: { sessionHistoryAvailable: false, newContextAvailable: false },
     },
     {
       label: "read-only agent",
       previousEnabled: true,
       next: { agentId: "observer" },
-      // Read-only agents can still write their session-scope checkpoint.
-      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
+      expected: { sessionHistoryAvailable: true, newContextAvailable: true },
     },
     {
       label: "memory tool disabled",
       previousEnabled: true,
       next: { toolPolicy: [{ regex_match: "memory", action: "disable" }] },
       // new_context needs the memory tool for its checkpoint.
-      expected: {
-        memoryWritable: false,
-        sessionHistoryAvailable: true,
-        newContextAvailable: false,
-      },
+      expected: { sessionHistoryAvailable: true, newContextAvailable: false },
     },
   ] satisfies Array<{
     label: string;
     previousEnabled: boolean;
     next: Partial<SendMessageOptions>;
     expected: {
-      memoryWritable: boolean;
       sessionHistoryAvailable: boolean;
       newContextAvailable: boolean;
     };
@@ -2291,6 +2276,7 @@ describe("AgentSession token-budget lifecycle", () => {
           await h.requests[0].onStepSettled?.(
             step(90_000, {
               sessionHistoryAvailable: previousEnabled,
+              newContextAvailable: previousEnabled,
             })
           )
         )?.decision
@@ -3919,10 +3905,9 @@ describe("AgentSession token-budget lifecycle", () => {
       toolPolicy: [
         { regex_match: "memory|session_.*", action: "disable" },
       ] satisfies SendMessageOptions["toolPolicy"],
-      settled: { memoryWritable: false, sessionHistoryAvailable: false },
+      settled: { sessionHistoryAvailable: false },
       expected: {
         handoff: true,
-        memoryWritable: false,
         sessionHistoryAvailable: false,
         newContextAvailable: false,
       },
@@ -3936,7 +3921,6 @@ describe("AgentSession token-budget lifecycle", () => {
       settled: {},
       expected: {
         handoff: true,
-        memoryWritable: true,
         sessionHistoryAvailable: true,
         newContextAvailable: false,
       },

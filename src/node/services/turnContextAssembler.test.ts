@@ -552,7 +552,6 @@ describe("assemblePromptPayload", () => {
       contextTokens: 80_000,
       maxTokens: 128_000,
       budgetTokens: 96_000,
-      memoryWritable: true,
       sessionHistoryAvailable: true,
       handoff: true,
     });
@@ -1024,48 +1023,47 @@ describe("buildStreamSystemContext", () => {
     // not steer the agent toward a tool the toolset does not have.
     const withoutMemory = await buildSystemContextForTest(buildArgs);
     expect(withoutMemory.systemMessage).not.toContain("<memory-tool-guidance>");
-    const notesBlock = "<hot_memories>preloaded notebook evidence</hot_memories>";
-    const writableNotes = await buildSystemContextForTest({
+    const hotBlock = "<hot_memories>preloaded evidence</hot_memories>";
+    const writable = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    const readOnlyNotes = await buildSystemContextForTest({
+    const readOnly = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: false,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    const notesSection = (text: string) =>
-      text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
-    expect(notesSection(writableNotes.systemMessage)).toBeDefined();
-    // Every agent may write its session checkpoint, so read-only agents get the same guidance.
-    expect(notesSection(readOnlyNotes.systemMessage)).toBe(
-      notesSection(writableNotes.systemMessage)
-    );
-    expect(memorySection(readOnlyNotes.systemMessage)).not.toEqual(
-      memorySection(writableNotes.systemMessage)
-    );
-    expect(readOnlyNotes.systemMessage).toContain(notesBlock);
-    expect(writableNotes.systemMessage).toContain(notesBlock);
-    expect(notesSection(withMemory.systemMessage)).toBeUndefined();
-    const deniedNotes = await buildSystemContextForTest({
+    const noMemory = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: false,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    expect(notesSection(deniedNotes.systemMessage)).toBeUndefined();
-    expect(deniedNotes.systemMessage).not.toContain(notesBlock);
-    for (const systemMessage of [readOnlyNotes.systemMessage, writableNotes.systemMessage]) {
-      const filtered = removeIntuitionGuidance(systemMessage + pluginContext, false, notesBlock);
-      expect(filtered).not.toContain(notesBlock);
-      expect(notesSection(filtered)).toBeUndefined();
+    const guidanceSection = (text: string) =>
+      text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
+    const guidance = guidanceSection(writable.systemMessage);
+    expect(guidance).toBeDefined();
+    // Every agent may write its session checkpoint, so read-only agents get the same guidance.
+    expect(guidanceSection(readOnly.systemMessage)).toBe(guidance);
+    // The checkpoint lives in memory, so the guidance leaves with the memory tool.
+    expect(guidanceSection(noMemory.systemMessage)).toBeUndefined();
+    expect(guidanceSection(withMemory.systemMessage)).toBeUndefined();
+    expect(memorySection(readOnly.systemMessage)).not.toEqual(
+      memorySection(writable.systemMessage)
+    );
+    expect(writable.systemMessage).toContain(hotBlock);
+    expect(noMemory.systemMessage).not.toContain(hotBlock);
+    for (const systemMessage of [readOnly.systemMessage, writable.systemMessage]) {
+      const filtered = removeIntuitionGuidance(systemMessage + pluginContext, false, hotBlock);
+      expect(filtered).not.toContain(hotBlock);
       expect(filtered).not.toContain("<memory-tool-guidance>");
+      expect(guidanceSection(filtered)).toBeUndefined();
       expect(filtered).toContain(pluginContext);
     }
   });

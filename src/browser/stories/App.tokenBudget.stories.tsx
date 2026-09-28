@@ -16,13 +16,13 @@ export default { ...appMeta, title: "App/TokenBudget" };
 
 const WORKSPACE_ID = "ws-token-budget";
 const MODEL = "google:gemini-3.1-flash-lite";
+// Legacy fixture: new windows no longer send an advance warning, but persisted rows still render.
 const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
 const HANDOFF =
-  "The context handoff target has been reached. Finish the current small unit of work, checkpoint notes, then call new_context.";
-// Legacy fixture: new windows no longer offer a final flush, but persisted rows still render.
-const FINAL_FLUSH =
-  "Last step in this context window: write workspace/context-notes.md in a single memory call.";
+  "The context handoff target has been reached. Finish the current small unit of work, then call new_context with your handoff.";
+const FINAL =
+  "This is the last step in this context window. Call new_context now with your handoff.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
 function setupTokenBudgetStory(inputTokens = 2400) {
@@ -66,7 +66,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
         handoffTokens: 700_000,
       },
     }),
-    createMuxMessage("final-flush", "user", FINAL_FLUSH, {
+    createMuxMessage("final-handoff", "user", FINAL, {
       historySequence: 4,
       timestamp: STABLE_TIMESTAMP - 25_000,
       synthetic: true,
@@ -186,16 +186,16 @@ export const Rollover: AppStory = {
     await userEvent.click(handoff);
     await waitFor(() => expect(canvas.getByText(HANDOFF)).toBeVisible());
     await userEvent.click(handoff);
-    await expect(canvas.queryByText(FINAL_FLUSH)).not.toBeInTheDocument();
-    const finalFlush = await canvas.findByRole("button", {
-      name: /Context window ending: notes flush/,
+    await expect(canvas.queryByText(FINAL)).not.toBeInTheDocument();
+    const finalHandoff = await canvas.findByRole("button", {
+      name: /Context window ending: final handoff/,
     });
     await expect(
-      finalFlush.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
+      finalHandoff.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
     ).not.toBe(0);
-    await userEvent.click(finalFlush);
-    await waitFor(() => expect(canvas.getByText(FINAL_FLUSH)).toBeVisible());
-    await userEvent.click(finalFlush);
+    await userEvent.click(finalHandoff);
+    await waitFor(() => expect(canvas.getByText(FINAL)).toBeVisible());
+    await userEvent.click(finalHandoff);
     const tool = await canvas.findByText("List windows", { exact: true });
     await userEvent.click(tool);
     await expect(await canvas.findByText("Context windows · oldest first")).toBeVisible();

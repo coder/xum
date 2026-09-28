@@ -1,7 +1,5 @@
 import type { CompactionHandler } from "../../compactionHandler";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
-import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
-import { resolveMemoryAccessPolicy } from "../../tools/memory";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { isSyntheticSnapshotUserMessage } from "@/common/types/message";
 import { createUserMessageId } from "../../utils/messageIds";
@@ -133,7 +131,7 @@ export class TokenBudgetStrategy {
   ): Promise<
     | Pick<
         Parameters<typeof createContextBudgetWarning>[0],
-        "memoryWritable" | "sessionHistoryAvailable" | "newContextAvailable"
+        "sessionHistoryAvailable" | "newContextAvailable"
       >
     | undefined
   > {
@@ -142,21 +140,10 @@ export class TokenBudgetStrategy {
     const resolved = await this.resolveAgentForBudgetChecks(options);
     if (!resolved.success) return undefined;
     const allowed = applyToolPolicyToNames(
-      ["memory", "session_history", "new_context"],
+      ["session_history", "new_context"],
       resolved.data.effectiveToolPolicy
     );
-    const memoryEnabled =
-      options.experiments?.memory ?? this.deps.aiService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
     return {
-      memoryWritable:
-        memoryEnabled &&
-        allowed.includes("memory") &&
-        resolveMemoryAccessPolicy({
-          planLike: resolved.data.agentIsPlanLike,
-          editingCapable: isExecLikeEditingCapableInResolvedChain(
-            resolved.data.agentInheritanceChain
-          ),
-        }).session === "readwrite",
       sessionHistoryAvailable: allowed.includes("session_history"),
       // Mirrors applyToolPolicy: new_context is only offered with memory and session_history.
       newContextAvailable: ["memory", "session_history", "new_context"].every((name) =>

@@ -1,7 +1,3 @@
-import {
-  CONTEXT_NOTES_RESERVED_BYTES,
-  CONTEXT_NOTES_RESERVED_TOKENS,
-} from "@/common/constants/contextBudget";
 import { describe, it, expect } from "bun:test";
 
 import {

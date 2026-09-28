@@ -427,7 +427,6 @@ describe("pinned full-payload rollover admission", () => {
       const previous = {
         context: { indexEntries: [], hotMemoriesBlock: "Obsolete notes" },
         includesHotMemories: true,
-        tokenBudgetActive: true,
         memoryEnabled: true,
         hotSetEnabled: true,
       };

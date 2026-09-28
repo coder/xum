@@ -26,7 +26,6 @@ describe("context budget warnings", () => {
     contextTokens: 90_000,
     maxTokens: 128_000,
     budgetTokens: 119_808,
-    memoryWritable: true,
     sessionHistoryAvailable: true,
   };
 
@@ -86,7 +85,6 @@ describe("context window rollover recovery", () => {
       contextTokens: 80_000,
       maxTokens: 128_000,
       budgetTokens: 96_000,
-      memoryWritable: true,
       sessionHistoryAvailable: true,
       handoff: true,
     });
@@ -95,7 +93,6 @@ describe("context window rollover recovery", () => {
       contextTokens: 110_000,
       maxTokens: 128_000,
       budgetTokens: 96_000,
-      memoryWritable: true,
       sessionHistoryAvailable: true,
       final: true,
     });
@@ -129,7 +126,6 @@ describe("context window rollover recovery", () => {
           contextTokens: 80_000,
           maxTokens: 128_000,
           budgetTokens: 96_000,
-          memoryWritable: true,
           sessionHistoryAvailable: true,
           handoff: true,
         }),

@@ -823,7 +823,6 @@ interface AgentSessionOptions {
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
   includesHotMemories: boolean;
-  tokenBudgetActive: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
 }
@@ -6079,14 +6078,7 @@ export class AgentSession {
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
         resolveMemoryContext: (model, memoryOptions) =>
-          this.resolveMemoryContext(
-            model,
-            {
-              ...memoryOptions,
-              tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
-            },
-            cache
-          ),
+          this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
         prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
@@ -7880,10 +7872,7 @@ export class AgentSession {
         // post-compaction check above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
         resolveMemoryContext: (forModelString, memoryOptions) =>
-          this.resolveMemoryContext(forModelString, {
-            ...memoryOptions,
-            tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
-          }),
+          this.resolveMemoryContext(forModelString, memoryOptions),
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
         experiments: options?.experiments,
@@ -11314,10 +11303,9 @@ export class AgentSession {
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const cached = cache.get(modelString);
-    // Policy changes must not retain a previously injected extra (including index-only lookups).
+    // Memory/HotSet gate changes must not reuse a context built under the old gates.
     if (
-      cached?.tokenBudgetActive === tokenBudgetActive &&
-      cached.memoryEnabled === memoryEnabled &&
+      cached?.memoryEnabled === memoryEnabled &&
       cached.hotSetEnabled === hotSetEnabled &&
       (cached.includesHotMemories || !includeHotMemories)
     ) {
@@ -11330,7 +11318,6 @@ export class AgentSession {
       typeof this.aiService.buildMemorySessionContext === "function"
         ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
             includeHotMemories,
-            tokenBudgetActive,
           })
         : null;
     // Invalidated mid-build: serve this snapshot once, do not cache it.
@@ -11338,7 +11325,6 @@ export class AgentSession {
       cache.set(modelString, {
         context,
         includesHotMemories: includeHotMemories,
-        tokenBudgetActive,
         memoryEnabled,
         hotSetEnabled,
       });

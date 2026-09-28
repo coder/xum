@@ -1,7 +1,6 @@
 /** Shared limits for opt-in, lossless context-window rollover and history retrieval. */
-export const CONTEXT_NOTES_MEMORY_PATH = "/memories/workspace/context-notes.md";
-export const CONTEXT_NOTES_RESERVED_BYTES = 8 * 1024;
-export const CONTEXT_NOTES_RESERVED_TOKENS = 2_000;
+// Room reserved for the agent's checkpoint write in the final step.
+export const CONTEXT_CHECKPOINT_MAX_TOKENS = 2_000;
 export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
 export const OUTPUT_RESERVE_TOKENS = 8_192;

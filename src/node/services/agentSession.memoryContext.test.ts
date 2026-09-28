@@ -1,4 +1,4 @@
-import { describe, expect, test, mock, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, mock, afterEach } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -6,12 +6,10 @@ import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
-import type { AgentSession, AgentSessionAIService } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { SendMessageOptions } from "@/common/orpc/types";
-import { Err, Ok } from "@/common/types/result";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { Err } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 
@@ -228,7 +226,7 @@ describe("AgentSession memory context", () => {
     }
   });
 
-  test("invalidates mode and Memory/HotSet gate changes without losing model-specific caching", async () => {
+  test("invalidates Memory/HotSet gate changes without losing model-specific caching", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     let memoryEnabled = true;
@@ -240,9 +238,7 @@ describe("AgentSession memory context", () => {
             ? {
                 indexEntries: [],
                 hotMemoriesBlock:
-                  hotSetEnabled && options?.includeHotMemories !== false
-                    ? `${model}:${options?.tokenBudgetActive ? "notes" : "ordinary"}`
-                    : null,
+                  hotSetEnabled && options?.includeHotMemories !== false ? model : null,
               }
             : null
         )
@@ -257,143 +253,22 @@ describe("AgentSession memory context", () => {
     });
     const priv = session as unknown as PrivateSessionAccess;
     try {
-      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe(
-        "primary:ordinary"
-      );
+      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe("primary");
       await priv.resolveMemoryContext("primary");
+      // An index-only lookup reuses the fuller cached context.
+      await priv.resolveMemoryContext("primary", { includeHotMemories: false });
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
-      expect(
-        (
-          await priv.resolveMemoryContext("primary", {
-            tokenBudgetActive: true,
-            includeHotMemories: false,
-          })
-        )?.hotMemoriesBlock
-      ).toBeNull();
-      expect(
-        (await priv.resolveMemoryContext("primary", { tokenBudgetActive: true }))?.hotMemoriesBlock
-      ).toBe("primary:notes");
-      await priv.resolveMemoryContext("primary", { tokenBudgetActive: true });
-      expect(buildMemorySessionContext).toHaveBeenCalledTimes(3);
-      expect(
-        (await priv.resolveMemoryContext("fallback", { tokenBudgetActive: true }))?.hotMemoriesBlock
-      ).toBe("fallback:notes");
-      expect(
-        (await priv.resolveMemoryContext("primary", { tokenBudgetActive: false }))?.hotMemoriesBlock
-      ).toBe("primary:ordinary");
-      expect(
-        (await priv.resolveMemoryContext("primary", { tokenBudgetActive: true }))?.hotMemoriesBlock
-      ).toBe("primary:notes");
+      expect((await priv.resolveMemoryContext("fallback"))?.hotMemoriesBlock).toBe("fallback");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
       hotSetEnabled = false;
-      expect(
-        (
-          await priv.resolveMemoryContext("primary", {
-            tokenBudgetActive: true,
-            includeHotMemories: false,
-          })
-        )?.hotMemoriesBlock
-      ).toBeNull();
+      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBeNull();
       memoryEnabled = false;
-      expect(
-        await priv.resolveMemoryContext("primary", { tokenBudgetActive: true })
-      ).toBeUndefined();
+      expect(await priv.resolveMemoryContext("primary")).toBeUndefined();
       memoryEnabled = true;
       hotSetEnabled = true;
-      expect(
-        (await priv.resolveMemoryContext("primary", { tokenBudgetActive: true }))?.hotMemoriesBlock
-      ).toBe("primary:notes");
+      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe("primary");
     } finally {
       await session.dispose();
-    }
-  });
-
-  test("actual request callbacks use effective token-budget policy for primary and fallback models", async () => {
-    let hostEnabled = false;
-    const resolved: Array<string | null | undefined> = [];
-    const buildMemorySessionContext = mock<AIService["buildMemorySessionContext"]>(
-      (_workspace, model, options) =>
-        Promise.resolve({
-          indexEntries: [],
-          hotMemoriesBlock:
-            options?.includeHotMemories === false
-              ? null
-              : `${model}:${options?.tokenBudgetActive ? "notes" : "ordinary"}`,
-        })
-    );
-    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(async (request) => {
-      for (const model of [request.modelString, "openai:gpt-4o"]) {
-        await request.resolveMemoryContext!(model, { includeHotMemories: false });
-        resolved.push(
-          (await request.resolveMemoryContext!(model, { includeHotMemories: true }))
-            ?.hotMemoriesBlock
-        );
-      }
-      return Err({ type: "unknown", raw: "test stops before a provider call" });
-    });
-    const h = await createAgentSessionHarness({
-      workspaceId: WORKSPACE_ID,
-      aiServiceOverrides: {
-        buildMemorySessionContext,
-        streamMessage,
-        isExperimentEnabled: (id) =>
-          id === EXPERIMENT_IDS.MEMORY ||
-          id === EXPERIMENT_IDS.MEMORY_HOT_SET ||
-          (id === EXPERIMENT_IDS.TOKEN_BUDGET && hostEnabled),
-      },
-    });
-    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
-      Ok({
-        id: WORKSPACE_ID,
-        name: "memory-policy",
-        projectName: "project",
-        projectPath: h.config.rootDir,
-        namedWorkspacePath: h.config.rootDir,
-        runtimeConfig: { type: "local" },
-      } as FrontendWorkspaceMetadata)
-    );
-    const cases: Array<{
-      host: boolean;
-      experiments?: SendMessageOptions["experiments"];
-      muxMetadata?: SendMessageOptions["muxMetadata"];
-      active: boolean;
-    }> = [
-      { host: false, active: false },
-      { host: false, experiments: { tokenBudget: true }, active: true },
-      { host: false, experiments: { tokenBudget: true }, active: true },
-      { host: true, experiments: { tokenBudget: false }, active: false },
-      { host: true, active: true },
-      { host: true, experiments: { continuousCompaction: true }, active: false },
-      { host: true, experiments: { programmaticToolCalling: true, rlm: true }, active: false },
-      { host: true, experiments: { programmaticToolCalling: false, rlm: true }, active: true },
-      {
-        host: true,
-        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
-        active: false,
-      },
-    ];
-    try {
-      let previous: boolean | undefined;
-      for (const policy of cases) {
-        hostEnabled = policy.host;
-        const calls = buildMemorySessionContext.mock.calls.length;
-        const before = resolved.length;
-        await h.session.sendMessage("Read current memory context", {
-          model: "openai:gpt-5.2",
-          agentId: "exec",
-          experiments: policy.experiments,
-          muxMetadata: policy.muxMetadata,
-        });
-        expect(resolved.slice(before)).toEqual([
-          `openai:gpt-5.2:${policy.active ? "notes" : "ordinary"}`,
-          `openai:gpt-4o:${policy.active ? "notes" : "ordinary"}`,
-        ]);
-        if (previous === policy.active)
-          expect(buildMemorySessionContext.mock.calls.length).toBe(calls);
-        previous = policy.active;
-      }
-    } finally {
-      await h.session.dispose();
-      await h.cleanup();
     }
   });
 
