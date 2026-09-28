@@ -135,6 +135,30 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 
+  test.each(["readiness", "server startup"] as const)(
+    "a discovery whose admission is aborted during %s returns an empty catalog",
+    async (stage) => {
+      const removal = new AbortController();
+      const fixture = createContext({
+        admission: { [Symbol.dispose]: mock(() => undefined), signal: removal.signal },
+        getPromptsForWorkspace: () => {
+          removal.abort();
+          return Promise.reject(new Error("MCP prompt discovery was aborted"));
+        },
+      });
+      if (stage === "readiness") {
+        // SSH/Coder runtimes report an aborted readiness as not ready.
+        fixture.ensureReady.mockImplementation(() => {
+          removal.abort();
+          return Promise.resolve({ ready: false, error: "Aborted" } as never);
+        });
+      }
+
+      expect(await listWorkspaceMcpPrompts(fixture.context, workspaceId)).toEqual([]);
+      expect(fixture.getPromptsForWorkspace).toHaveBeenCalledTimes(stage === "readiness" ? 0 : 1);
+    }
+  );
+
   test("the inherited override read is bounded and cancelled with discovery's signal", async () => {
     // A child whose SSH/Docker parent is unreachable must not pin discovery
     // (and its archive admission) on a remote read after the caller gave up.
