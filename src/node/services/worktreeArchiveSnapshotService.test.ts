@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
 import { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
@@ -1152,6 +1152,57 @@ describe("WorktreeArchiveSnapshotService", () => {
     if (result.success) {
       expect(result.data).toEqual(["a-file.txt", "cache-dir/", "z-file.txt"]);
     }
+  });
+
+  // #4895: staging dirs are git-ignored, and git omits them entirely when the repo tracks files
+  // under `.xum/` or `.mux/`, so staged uploads without a session-dir mirror copy were lost with
+  // no warning.
+  test("getUnsupportedUntrackedPaths lists staged attachments without a valid mirror entry", async () => {
+    const ws = fixture.workspacePath;
+    const excludePath = path.resolve(ws, runGit(ws, ["rev-parse", "--git-path", "info/exclude"]));
+    await fs.mkdir(path.dirname(excludePath), { recursive: true });
+    await fs.appendFile(excludePath, "\n.xum/user-attachments/\n.mux/user-attachments/\n");
+    for (const tracked of [".xum/settings.json", ".mux/legacy.json"]) {
+      await fs.mkdir(path.dirname(path.join(ws, tracked)), { recursive: true });
+      await fs.writeFile(path.join(ws, tracked), "{}\n");
+    }
+    runGit(ws, ["add", ".xum/settings.json", ".mux/legacy.json"]);
+    runGit(ws, ["commit", "-m", "track metadata dirs"]);
+
+    const mirroredId = "11111111-1111-4111-8111-111111111111";
+    const unmirroredId = "22222222-2222-4222-8222-222222222222";
+    const mismatchId = "33333333-3333-4333-8333-333333333333";
+    const legacyId = "44444444-4444-4444-8444-444444444444";
+    const stage = async (dir: string, id: string, name: string, mirror?: string) => {
+      await fs.mkdir(path.join(ws, dir, id), { recursive: true });
+      await fs.writeFile(path.join(ws, dir, id, name), "image-bytes");
+      if (mirror === undefined) return;
+      const mirrorDir = path.join(
+        fixture.config.sessionsDir,
+        fixture.workspaceId,
+        "staged-attachments",
+        id
+      );
+      await fs.mkdir(mirrorDir, { recursive: true });
+      await fs.writeFile(path.join(mirrorDir, name), mirror);
+    };
+    await stage(".xum/user-attachments", mirroredId, "kept.png", "image-bytes");
+    await stage(".xum/user-attachments", unmirroredId, "lost.png");
+    await stage(".xum/user-attachments", mismatchId, "partial.png", "image");
+    await stage(".mux/user-attachments", legacyId, "legacy.png");
+
+    const result = await fixture.service.getUnsupportedUntrackedPaths({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+
+    expect(result).toEqual(
+      Ok([
+        `.mux/user-attachments/${legacyId}/legacy.png`,
+        `.xum/user-attachments/${unmirroredId}/lost.png`,
+        `.xum/user-attachments/${mismatchId}/partial.png`,
+      ])
+    );
   });
 
   test("captureSnapshotForArchive succeeds with matching acknowledgedUntrackedPaths", async () => {

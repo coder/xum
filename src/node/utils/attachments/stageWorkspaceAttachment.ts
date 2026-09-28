@@ -587,7 +587,10 @@ const STAGED_ATTACHMENT_ID_PATTERN =
  * Returns null for anything staging could not have produced: legacy `.mux` paths (never
  * mirrored), non-UUID directories, nested segments, or names that sanitizing would change.
  */
-function resolveStagedAttachmentMirrorPath(sessionDir: string, stagedPath: string): string | null {
+export function resolveStagedAttachmentMirrorPath(
+  sessionDir: string,
+  stagedPath: string
+): string | null {
   const normalized = normalizeReadableStagedPath(stagedPath);
   if (!normalized?.startsWith(`${STAGED_ATTACHMENT_DIR}/`)) {
     return null;
