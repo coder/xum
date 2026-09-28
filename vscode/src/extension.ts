@@ -1747,6 +1747,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       return;
     }
 
+    // Sibling pump under the same controller, so it stops with the chat subscription.
+    void this.pumpSelectedWorkspaceActivity(api.client, workspaceId, controller);
+
     try {
       const iterator = await api.client.workspace.onChat(
         { workspaceId },
@@ -1780,6 +1783,53 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.subscriptionAbort = null;
         this.subscribedWorkspaceId = null;
       }
+    }
+  }
+
+  /**
+   * Forwards the selected workspace's armed bash-monitor count to the webview (#4971): the
+   * barrier's waiting-on-monitor phase needs it, and only the activity feed carries it.
+   * Best-effort: failures are logged, never shown as a notice.
+   */
+  private async pumpSelectedWorkspaceActivity(
+    client: ApiClient,
+    workspaceId: string,
+    controller: AbortController
+  ): Promise<void> {
+    const post = (activeBashMonitorCount: number) => {
+      if (controller.signal.aborted || this.selectedWorkspaceId !== workspaceId) {
+        return;
+      }
+      this.postMessage({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
+    };
+
+    try {
+      // Subscribe before the snapshot so no change between them is lost.
+      const iterator = await client.workspace.activity.subscribe(undefined, {
+        signal: controller.signal,
+      });
+      const snapshots = await client.workspace.activity.list();
+      // null means the backend could not read activity; keep the webview's current value.
+      if (snapshots) {
+        post(snapshots[workspaceId]?.activeBashMonitorCount ?? 0);
+      }
+
+      for await (const event of iterator) {
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (event.type === "activity" && event.workspaceId === workspaceId) {
+          post(event.activity?.activeBashMonitorCount ?? 0);
+        }
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return;
+      }
+      xumLogDebug("mux.chatView: workspace activity subscription failed", {
+        workspaceId,
+        error: formatError(error),
+      });
     }
   }
 

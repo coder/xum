@@ -25,7 +25,12 @@ import {
   TooltipTrigger,
 } from "xum/browser/components/Tooltip/Tooltip";
 import { Button } from "xum/browser/components/Button/Button";
-import { matchesKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isEditableElement,
+  matchesKeybind,
+  KEYBINDS,
+} from "xum/browser/utils/ui/keybinds";
 import { readPersistedState } from "xum/browser/hooks/usePersistedState";
 import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
@@ -186,6 +191,8 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // subscription while non-empty.
   const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
+  // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
+  const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
   const scheduledRenderRef = useRef<{ kind: "raf" | "timeout"; id: number } | null>(null);
@@ -356,6 +363,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           aggregatorRef.current = null;
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setActiveBashMonitorCount(0);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -383,6 +391,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setActiveBashMonitorCount(0);
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           transcriptBarrier.reset(msg.workspaceId);
           setTranscriptCaughtUp(false);
@@ -528,6 +537,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
           return;
         }
+        case "workspaceActivity":
+          if (msg.workspaceId === activeWorkspaceIdRef.current) {
+            setActiveBashMonitorCount(msg.activeBashMonitorCount);
+          }
+          return;
         case "uiNotice": {
           pushNotice({ level: msg.level, message: msg.message });
           return;
@@ -561,6 +575,30 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bridge]);
 
+  // The one interrupt path for Esc and the barrier's Stop button (#4971). Stop also shows while a
+  // turn is starting, when there is no active stream to mark yet: then it only sends the request.
+  const interruptStream = () => {
+    if (!selectedWorkspaceId) {
+      return;
+    }
+    const aggregator = aggregatorRef.current;
+    if (aggregator?.getActiveStreamMessageId()) {
+      aggregator.setInterrupting();
+      flushDisplayedMessagesRef.current();
+    }
+
+    apiClient.workspace.interruptStream({ workspaceId: selectedWorkspaceId }).catch((error) => {
+      bridge.debugLog("interruptStream failed", { error: String(error) });
+
+      pushNoticeRef.current({
+        level: "error",
+        message: `Failed to interrupt stream. (${error instanceof Error ? error.message : String(error)})`,
+      });
+    });
+  };
+  const interruptStreamRef = useRef(interruptStream);
+  interruptStreamRef.current = interruptStream;
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!canChat || !selectedWorkspaceId) {
@@ -592,23 +630,29 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       }
 
       e.preventDefault();
-
-      aggregator.setInterrupting();
-      flushDisplayedMessagesRef.current();
-
-      apiClient.workspace.interruptStream({ workspaceId: selectedWorkspaceId }).catch((error) => {
-        bridge.debugLog("interruptStream failed", { error: String(error) });
-
-        pushNoticeRef.current({
-          level: "error",
-          message: `Failed to interrupt stream. (${error instanceof Error ? error.message : String(error)})`,
-        });
-      });
+      interruptStreamRef.current();
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [apiClient, bridge, canChat, selectedWorkspaceId]);
+  }, [canChat, selectedWorkspaceId]);
+
+  // Transcript-scoped Shift+G, as in desktop useAIViewKeybinds: capture phase, and never while
+  // typing so the composer still receives a capital G.
+  useEffect(() => {
+    if (!selectedWorkspaceId) {
+      return;
+    }
+    const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (isEditableElement(e.target) || !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
+        return;
+      }
+      e.preventDefault();
+      jumpToBottomRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
+  }, [selectedWorkspaceId]);
 
   const requestRefreshWorkspaces = () => {
     bridge.postMessage({ type: "refreshWorkspaces" });
@@ -731,11 +775,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                 />
                               ))}
                             </LiveBashOutputSourceContext.Provider>
-                            <VscodeStreamingBarrier
-                              workspaceId={selectedWorkspaceId}
-                              aggregator={aggregatorRef.current}
-                              className="mt-3"
-                            />
                           </BackgroundBashProvider>
                         ) : null}
 
@@ -768,7 +807,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       />
                     </div>
 
-                    <div className="border-t border-border bg-background-secondary p-3">
+                    <div className="relative border-t border-border bg-background-secondary p-3">
+                      {selectedWorkspaceId && !autoScroll ? (
+                        // Same pill as desktop ChatPane, just above the dock.
+                        <button
+                          onClick={jumpToBottom}
+                          type="button"
+                          className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
+                        >
+                          Jump to bottom{" "}
+                          <span className="mobile-hide-shortcut-hints">
+                            ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                          </span>
+                        </button>
+                      ) : null}
                       {selectedWorkspaceId && heldInputs.length > 0 ? (
                         // Bounded scroll lane: many or long held inputs must not push the composer
                         // below the fixed-height layout or collapse the transcript.
@@ -783,6 +835,15 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                             />
                           ))}
                         </div>
+                      ) : null}
+                      {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
+                      {selectedWorkspaceId ? (
+                        <VscodeStreamingBarrier
+                          workspaceId={selectedWorkspaceId}
+                          aggregator={aggregatorRef.current}
+                          activeBashMonitorCount={activeBashMonitorCount}
+                          onCancel={interruptStream}
+                        />
                       ) : null}
                       {selectedWorkspaceId ? (
                         <ChatComposer
