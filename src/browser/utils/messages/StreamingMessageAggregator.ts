@@ -820,18 +820,15 @@ export class StreamingMessageAggregator {
 
   // statusState stays persisted (unlike derived caches): the renderer replays history only
   // from the latest compaction boundary, so a status_set result compacted away cannot be
-  // re-derived after reload. The on-disk JSON format is unchanged for up/downgrade.
-
-  /** Load persisted agent status */
+  // re-derived after reload. Keep its JSON format stable for up/downgrade.
   private loadPersistedAgentStatus(): AgentStatus | undefined {
     if (!this.workspaceId) return undefined;
-    const stored = readPersistedState<unknown>(getStatusStateKey(this.workspaceId), undefined);
-    if (stored === undefined) return undefined;
-    const parsed = AgentStatusSchema.safeParse(stored);
+    const parsed = AgentStatusSchema.safeParse(
+      readPersistedState<unknown>(getStatusStateKey(this.workspaceId), undefined)
+    );
     return parsed.success ? parsed.data : undefined;
   }
 
-  /** Persist agent status */
   private savePersistedAgentStatus(status: AgentStatus): void {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
@@ -839,7 +836,6 @@ export class StreamingMessageAggregator {
     updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
   }
 
-  /** Remove persisted agent status */
   private clearPersistedAgentStatus(): void {
     if (!this.workspaceId) return;
     updatePersistedState(getStatusStateKey(this.workspaceId), null);

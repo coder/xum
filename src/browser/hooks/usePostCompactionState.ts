@@ -21,7 +21,6 @@ interface CachedPostCompactionData {
  */
 const postCompactionStateCache = new Map<string, CachedPostCompactionData>();
 
-/** Load state from the in-memory cache for a workspace */
 function loadFromCache(wsId: string) {
   const cached = postCompactionStateCache.get(wsId);
   return {
