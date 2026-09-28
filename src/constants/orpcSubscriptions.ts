@@ -9,9 +9,11 @@ export const SUBSCRIPTION_HEARTBEAT_INTERVAL_MS = 5_000;
 export const ONCHAT_REPLAY_BATCH_MAX_ROWS = 64;
 
 /**
- * Soft cap on a batch's summed text length (text/reasoning part characters; metadata is not
- * counted, measuring it would cost a stringify per row). The row cap bounds that uncounted
- * metadata, so batch frames stay well under the 1 MiB WebSocket high-water mark (#4867).
+ * Soft cap on a batch's summed text length in UTF-16 units of text/reasoning parts. JSON escaping
+ * and metadata are not counted (measuring them would cost a stringify per row), so an
+ * escape-heavy or metadata-heavy batch can serialize to more than 1 MiB. That is safe: WebSocket
+ * flow control (#4867) bounds buffered bytes per window, not per frame, and single tool rows over
+ * 1 MiB already exist. Plain-text batches serialize to about this cap plus per-row metadata.
  */
 export const ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES = 256 * 1024;
 
