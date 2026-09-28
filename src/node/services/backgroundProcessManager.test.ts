@@ -3911,7 +3911,9 @@ describe("BackgroundProcessManager", () => {
       const processDir = path.join(workspaceDir, "dev");
       await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
       await fs.writeFile(path.join(processDir, "output.log"), "old output\n");
-      await fs.utimes(path.join(processDir, "exit_code"), settledLongAgo, settledLongAgo);
+      for (const file of ["exit_code", "meta.json"]) {
+        await fs.utimes(path.join(processDir, file), settledLongAgo, settledLongAgo);
+      }
 
       const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
         cwd: process.cwd(),
@@ -3926,6 +3928,23 @@ describe("BackgroundProcessManager", () => {
       expect(await fs.readFile(path.join(processDir, "output.log"), "utf-8")).not.toContain(
         "old output"
       );
+    });
+
+    it("keeps a record whose old exit its owner has only just observed", async () => {
+      // The owner rewrites meta.json when it observes the exit (possibly long after exit_code
+      // was written) and then reads the output, so the recent meta.json write protects it.
+      await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
+      const markerPath = path.join(workspaceDir, "dev", "exit_code");
+      await fs.utimes(markerPath, settledLongAgo, settledLongAgo);
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "dev",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("dev (2)");
+      expect(await fs.readFile(markerPath, "utf-8")).toBe("0");
     });
 
     it("keeps an old settled record whose meta.json still reads running", async () => {

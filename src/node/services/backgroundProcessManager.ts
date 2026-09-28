@@ -152,8 +152,8 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  *   its terminate() returns early and its status refresh skips it, so it never writes into the
  *   directory again. With meta still "running" (exit not observed yet, or a crash), that
  *   backend's later terminate() would stamp exit_code and meta.json onto the reused record.
- * - The marker must be older than SETTLED_RECORD_PRUNE_AGE_MS. That is the only protection for
- *   the other backend's reads: a backend still tracking a record pruned after this age reads
+ * - The marker and meta.json must both be older than SETTLED_RECORD_PRUNE_AGE_MS. That is the
+ *   only protection for the other backend's reads: a backend still tracking a record pruned after this age reads
  *   the new command's output past its old offset. Read-only, and only for such old records.
  * Any failure keeps the record (the caller moves on to a suffixed name).
  */
@@ -162,12 +162,12 @@ async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
     // Regular files only (lstat): never follow a symlink planted in the shared temp records
     // root, and never block on a FIFO while holding the spawn-name lock.
     const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
-    if (!marker.isFile() || Date.now() - marker.mtimeMs < SETTLED_RECORD_PRUNE_AGE_MS) {
-      return false;
-    }
-    if (!(await fsPromises.lstat(nodePath.join(recordDir, BG_META_FILENAME))).isFile()) {
-      return false;
-    }
+    const metaStat = await fsPromises.lstat(nodePath.join(recordDir, BG_META_FILENAME));
+    if (!marker.isFile() || !metaStat.isFile()) return false;
+    // meta.json is rewritten when the owner observes the exit (getProcess, list, monitor), which
+    // may be long after the marker was written and just before it reads the output: age both.
+    const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
+    if (Date.now() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
     const meta = parseSpawnRecordMeta(
       await fsPromises.readFile(nodePath.join(recordDir, BG_META_FILENAME), "utf-8")
     );
