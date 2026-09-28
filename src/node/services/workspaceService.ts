@@ -16861,6 +16861,10 @@ export class WorkspaceService
    * Deliberately no catch: the renderer deletes every key whose id is absent, so a partial answer
    * would delete live workspaces' drafts. Failing the call makes the renderer skip GC. A missing
    * config file is a healthy empty set.
+   *
+   * Not strictly read-only: like workspace.list (which the renderer calls first at startup), the
+   * strict build persists idempotent read-time migrations such as assigning ids to id-less legacy
+   * entries. Opting out (persistMigrations: false) would need its own Config memo slot.
    */
   async listKnownIdsForStorageGc(): Promise<string[]> {
     const knownIds = this.config.readPersistedWorkspaceIdSuperset();
