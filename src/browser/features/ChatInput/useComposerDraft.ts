@@ -58,15 +58,17 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   ) => {
     const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
     latestAttachmentsRef.current = next;
-    const persists =
+    const withinCap =
       next.length > 0 &&
       estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+    let persists = false;
     selfWriteRef.current = true;
     try {
-      updatePersistedState<ChatAttachment[] | undefined>(
-        attachmentsKey,
-        persists ? next : undefined
-      );
+      persists =
+        withinCap && updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, next);
+      // A failed write (quota exceeded even after evicting caches) leaves the previous list on
+      // disk; drop it like an over-cap draft so a reload never restores stale attachments.
+      if (!persists) updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, undefined);
     } finally {
       selfWriteRef.current = false;
     }

@@ -25,6 +25,10 @@ import type {
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createLRUCache } from "@/browser/utils/lruCache";
 import {
+  PR_STATUS_CACHE_ENTRY_PREFIX,
+  PR_STATUS_CACHE_INDEX_KEY,
+} from "@/common/constants/storage";
+import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
   type PassiveRuntimeDeps,
@@ -86,8 +90,8 @@ interface PersistedPRStatus {
 }
 
 const prStatusLRU = createLRUCache<PersistedPRStatus>({
-  entryPrefix: "prStatus:",
-  indexKey: "prStatusIndex",
+  entryPrefix: PR_STATUS_CACHE_ENTRY_PREFIX,
+  indexKey: PR_STATUS_CACHE_INDEX_KEY,
   maxEntries: 50,
   // No TTL - we refresh on mount anyway, just want instant display
 });

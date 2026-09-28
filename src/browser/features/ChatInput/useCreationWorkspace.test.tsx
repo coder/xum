@@ -65,16 +65,17 @@ const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
 });
 
 const updatePersistedStateCalls: Array<[string, unknown]> = [];
-const updatePersistedStateMock = mock((key: string, value: unknown) => {
+const updatePersistedStateMock = mock((key: string, value: unknown): boolean => {
   updatePersistedStateCalls.push([key, value]);
   if (typeof window === "undefined" || !window.localStorage) {
-    return;
+    return false;
   }
   if (value === undefined || value === null) {
     window.localStorage.removeItem(key);
-    return;
+    return true;
   }
   window.localStorage.setItem(key, JSON.stringify(value));
+  return true;
 });
 
 const readPersistedStringMock = mock((key: string) => {

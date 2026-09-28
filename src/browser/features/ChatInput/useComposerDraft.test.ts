@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { installDom } from "../../../../tests/ui/dom";
+import { installQuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import type { ChatAttachment } from "./ChatAttachments";
 import { readPersistedChatAttachments } from "./draftAttachmentsStorage";
 import { useComposerDraft } from "./useComposerDraft";
@@ -18,14 +19,16 @@ const attachment = (id: string): ChatAttachment => ({
   mediaType: "image/png",
 });
 
-const renderDraft = () =>
+const renderDraft = (
+  pushToast: Parameters<typeof useComposerDraft>[0]["pushToast"] = () => undefined
+) =>
   renderHook(() =>
     useComposerDraft({
       variant: "workspace",
       workspaceId: WORKSPACE_ID,
       creationProjectPath: "",
       attachedReviews: [],
-      pushToast: () => undefined,
+      pushToast,
     })
   );
 
@@ -66,5 +69,31 @@ describe("useComposerDraft attachment persistence", () => {
     expect(
       readPersistedChatAttachments(getInputAttachmentsKey(WORKSPACE_ID)).map(({ id }) => id)
     ).toEqual(["a", "b"]);
+  });
+
+  // Under the size cap the write can still fail when the origin quota is full and nothing
+  // evictable is left. The user must hear that the attachment is memory-only, and the
+  // previously saved list must not come back on reload.
+  test("warns when an attachment within the size cap still fails to save", () => {
+    const storage = installQuotaLimitedStorage(400);
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+    const pushToast = mock((_toast: unknown) => undefined);
+    const { result } = renderDraft(pushToast);
+    act(() => {
+      result.current.setAttachments([attachment("small")]);
+    });
+    expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).not.toBeNull();
+    expect(pushToast).not.toHaveBeenCalled();
+
+    storage.seed("reviewState:ws-draft", "y".repeat(300));
+    act(() => {
+      result.current.setAttachments((current) => [...current, attachment("second")]);
+    });
+
+    expect(result.current.attachments.map(({ id }) => id)).toEqual(["small", "second"]);
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast.mock.calls[0]).toEqual([expect.objectContaining({ type: "error" })]);
+    expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).toBeNull();
+    warn.mockRestore();
   });
 });

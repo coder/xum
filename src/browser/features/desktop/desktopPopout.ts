@@ -5,6 +5,7 @@ import {
   DESKTOP_POPOUT_CLOSE_EVENT,
   DESKTOP_POPOUT_CLOSE_POLL_MS,
 } from "@/common/constants/desktop";
+import { getDesktopPopoutKey } from "@/common/constants/storage";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -89,7 +90,7 @@ export class DesktopPopout {
     private readonly workspaceId: string,
     private readonly electron: boolean
   ) {
-    this.storageKey = `desktop-popout:${workspaceId}`;
+    this.storageKey = getDesktopPopoutKey(workspaceId);
     const hint = readPersistedState<unknown>(this.storageKey, null);
     this.instanceId = typeof hint === "string" && hint.length > 0 ? hint : null;
     this.snapshot = {

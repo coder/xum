@@ -72,6 +72,7 @@ import {
 } from "@/browser/utils/RefreshController";
 import { parseDiff, extractAllHunks, buildGitDiffCommand } from "@/common/utils/git/diffParser";
 import {
+  getReviewFileFilterKey,
   getReviewImmersiveKey,
   getReviewDefaultBaseKey,
   getReviewSelectedHunkKey,
@@ -824,7 +825,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
 
   // Persist file filter per workspace
   const [selectedFilePath, setSelectedFilePath] = usePersistedState<string | null>(
-    `review-file-filter:${workspaceId}`,
+    getReviewFileFilterKey(workspaceId),
     null
   );
 

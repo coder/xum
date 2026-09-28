@@ -79,6 +79,10 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  collectOrphanedWorkspaceStorage,
+  snapshotWorkspaceStorageForGc,
+} from "@/browser/utils/workspaceStorageGc";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
@@ -333,6 +337,11 @@ export interface WorkspaceDraft {
 }
 
 type WorkspaceDraftsByProject = Record<string, WorkspaceDraft[]>;
+
+type WorkspaceMetadataLoadResult =
+  | { status: "api-unavailable" }
+  | { status: "failed" }
+  | { status: "loaded"; metadataList: FrontendWorkspaceMetadata[] };
 
 type WorkspaceDraftPromotionsByProject = Record<string, Record<string, FrontendWorkspaceMetadata>>;
 
@@ -1135,11 +1144,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     workspaceMetadataRef.current = workspaceMetadata;
   }, [workspaceMetadata]);
 
-  const loadWorkspaceMetadata = useCallback(async () => {
+  const loadWorkspaceMetadata = useCallback(async (): Promise<WorkspaceMetadataLoadResult> => {
     if (!api) {
       setLoaded(false);
       setLoadError("API not connected");
-      return false; // Return false to indicate metadata wasn't attempted.
+      return { status: "api-unavailable" };
     }
 
     try {
@@ -1162,12 +1171,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       setWorkspaceMetadata(metadataMap);
       setLoaded(true);
       setLoadError(null);
-      return true; // Return true to indicate metadata was attempted.
+      return { status: "loaded", metadataList };
     } catch (error) {
       console.error("Failed to load workspace metadata:", error);
       // Keep the previous metadata map on failure so scoped preferences are not pruned.
       setLoadError(getErrorMessage(error));
-      return true; // Still return true because the request completed with a failure.
+      return { status: "failed" };
     }
   }, [setWorkspaceMetadata, api]);
 
@@ -1177,8 +1186,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     setLoading(true);
 
     const initialLoad = async () => {
-      const attempted = await loadWorkspaceMetadata();
-      if (!attempted || cancelled) {
+      // Snapshot before the load so keys of workspaces created afterwards are never GC candidates.
+      const storageGcCandidates = snapshotWorkspaceStorageForGc();
+      const result = await loadWorkspaceMetadata();
+      if (result.status === "api-unavailable" || cancelled) {
         // api not available yet - effect will run again when api connects
         return;
       }
@@ -1187,6 +1198,19 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       await refreshProjects();
       if (!cancelled) {
         setLoading(false);
+      }
+      // Orphaned-key GC runs only after this startup load succeeded: never after a failed load
+      // and never from later refreshes or config notifications (see workspaceStorageGc.ts).
+      if (!cancelled && api && result.status === "loaded" && storageGcCandidates !== null) {
+        collectOrphanedWorkspaceStorage({
+          candidateKeys: storageGcCandidates,
+          activeWorkspaces: result.metadataList,
+          listArchivedWorkspaces: () => api.workspace.list({ archived: true }),
+          listProjects: () => api.projects.list(),
+          getCurrentWorkspaceIds: () => workspaceMetadataRef.current.keys(),
+        }).catch((error: unknown) => {
+          console.error("Failed to collect orphaned workspace storage:", error);
+        });
       }
     };
 
@@ -1201,7 +1225,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [loadWorkspaceMetadata, refreshProjects]);
+  }, [api, loadWorkspaceMetadata, refreshProjects]);
 
   // URL restoration is now handled by RouterContext which parses the URL on load
   // and provides currentWorkspaceId/currentProjectId that we derive state from.

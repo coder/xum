@@ -851,7 +851,9 @@ describe("ProjectSidebar scratch chats", () => {
       agentItemTestId("alpha"),
     ]);
 
-    act(() => updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false));
+    act(() => {
+      updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false);
+    });
     await waitFor(() => {
       expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
       expect(view.getByLabelText("Expand project beta")).toBeTruthy();

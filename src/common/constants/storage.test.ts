@@ -1,10 +1,29 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
+  PERSISTED_KEY_REGISTRY,
   copyWorkspaceStorage,
   deleteWorkspaceStorage,
+  findOrphanedWorkspaceStorageKeys,
+  getDesktopPopoutKey,
+  getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getInputAttachmentsKey,
+  getInputKey,
+  getPendingScopeId,
+  getPinnedTodoExpandedKey,
+  getProjectScopeId,
+  getReasoningModeKey,
+  getReviewFileFilterKey,
+  getReviewStateKey,
+  getRightSidebarLayoutKey,
+  getSubAgentTasksExpandedKey,
+  getTerminalTitlesKey,
+  getThinkingLevelByModelKey,
+  getThinkingLevelKey,
+  getTimelineFilterKey,
+  getWorkspaceKeyPrefix,
+  GLOBAL_SCOPE_ID,
   normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
   type TerminalBadgeConfig,
@@ -125,6 +144,87 @@ describe("storage workspace-scoped keys", () => {
     deleteWorkspaceStorage(workspaceId);
 
     expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  // These per-workspace keys were missing from the delete lists, so every deleted workspace
+  // left them behind until they filled the origin quota.
+  test("deleteWorkspaceStorage removes per-workspace keys the old lists missed", () => {
+    const workspaceId = "ws-delete-missing";
+    const otherWorkspaceKey = getReasoningModeKey("ws-other");
+    const keys = [
+      getReasoningModeKey,
+      getDisableWorkspaceAgentsKey,
+      getPinnedTodoExpandedKey,
+      getSubAgentTasksExpandedKey,
+      getRightSidebarLayoutKey,
+      getTerminalTitlesKey,
+      getReviewFileFilterKey,
+      getTimelineFilterKey,
+      getDesktopPopoutKey,
+    ].map((getKey) => getKey(workspaceId));
+    for (const key of [...keys, otherWorkspaceKey]) localStorage.setItem(key, "value");
+
+    deleteWorkspaceStorage(workspaceId);
+
+    for (const key of keys) expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(otherWorkspaceKey)).toBe("value");
+  });
+
+  // A prefix that is a prefix of another would misattribute keys: the wrong kind (eviction) or a
+  // mangled scope id (orphan GC deleting or keeping the wrong keys).
+  test("registered key prefixes never shadow each other", () => {
+    const prefixes = PERSISTED_KEY_REGISTRY.map((entry) =>
+      entry.scope === "workspaceId" ? getWorkspaceKeyPrefix(entry.getKey) : entry.key
+    );
+    for (const [index, prefix] of prefixes.entries()) {
+      expect(prefix.length).toBeGreaterThan(0);
+      for (const [otherIndex, other] of prefixes.entries()) {
+        if (index !== otherIndex) expect(other.startsWith(prefix)).toBe(false);
+      }
+    }
+  });
+});
+
+describe("findOrphanedWorkspaceStorageKeys", () => {
+  const known = "0123456789";
+  const unknown = "deadbeef00";
+  const liveDraft = getDraftScopeId("/repo/with/slashes", "draft-live");
+  const staleDraft = getDraftScopeId("/repo/with/slashes", "draft-stale");
+
+  test("collects only unknown stable workspace ids and stale creation drafts", () => {
+    const orphaned = [
+      getInputKey(unknown),
+      getReviewStateKey(unknown),
+      getTerminalTitlesKey(unknown),
+      getInputKey(staleDraft),
+    ];
+    const kept = [
+      getInputKey(known),
+      getInputKey(liveDraft),
+      getInputKey(getPendingScopeId("/repo")),
+      getThinkingLevelKey(getProjectScopeId("/repo")),
+      getThinkingLevelKey(GLOBAL_SCOPE_ID),
+      // Legacy global key sharing a registered prefix.
+      getThinkingLevelByModelKey("openai:gpt-5"),
+      // Legacy (non-stable) workspace id format.
+      getInputKey("myproject-feature-branch"),
+      // Unregistered key.
+      `unregistered:${unknown}`,
+    ];
+
+    expect(
+      findOrphanedWorkspaceStorageKeys(
+        [...orphaned, ...kept],
+        new Set([known]),
+        new Set([liveDraft])
+      )
+    ).toEqual(orphaned);
+  });
+
+  test("keeps every draft key when the drafts map was not loaded", () => {
+    expect(
+      findOrphanedWorkspaceStorageKeys([getInputKey(staleDraft)], new Set([known]), null)
+    ).toEqual([]);
   });
 });
 

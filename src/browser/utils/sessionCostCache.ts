@@ -9,12 +9,16 @@
  */
 
 import { createLRUCache } from "@/browser/utils/lruCache";
+import {
+  SESSION_COST_CACHE_ENTRY_PREFIX,
+  SESSION_COST_CACHE_INDEX_KEY,
+} from "@/common/constants/storage";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const sessionCostCache = createLRUCache<number>({
-  entryPrefix: "session-cost:",
-  indexKey: "session-cost-index",
+  entryPrefix: SESSION_COST_CACHE_ENTRY_PREFIX,
+  indexKey: SESSION_COST_CACHE_INDEX_KEY,
   maxEntries: 500,
   ttlMs: SEVEN_DAYS_MS,
 });
