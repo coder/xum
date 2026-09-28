@@ -74,10 +74,25 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const manualRetryRollbackArmedRef = useRef(false);
   const manualRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
   const apiRef = useRef(api);
+  // Whether this barrier still observes the workspace a Retry started on. After an unmount or a
+  // workspace change, nothing sees the resumed attempt's terminal events (the rollback trigger).
+  const isMountedRef = useRef(false);
+  const liveWorkspaceIdRef = useRef(props.workspaceId);
 
   useEffect(() => {
     apiRef.current = api;
   }, [api]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    liveWorkspaceIdRef.current = props.workspaceId;
+  }, [props.workspaceId]);
 
   const rollbackManualRetryAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -263,6 +278,18 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           resumeResult.data.started === false
         ) {
           await rollbackManualRetryAutoRetryIfNeeded();
+          return;
+        }
+
+        // The barrier unmounted or moved to another workspace while this Retry was in flight (the
+        // VS Code webview unmounts it on a workspace switch). Its unmount/switch cleanup ran before
+        // the temporary enablement was recorded, and no terminal event will reach it now, so
+        // restore the preference here instead of leaving auto-retry on in the background.
+        if (
+          manualRetryRollbackPendingRef.current &&
+          (!isMountedRef.current || liveWorkspaceIdRef.current !== props.workspaceId)
+        ) {
+          await rollbackManualRetryAutoRetryIfNeeded({ suppressErrors: true });
         }
       },
       async (error) => {

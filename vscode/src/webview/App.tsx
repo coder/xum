@@ -776,14 +776,16 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       }
 
       // A starting turn (before stream-start) shows Stop and its Esc chip too, so Esc must reach it.
-      // As on desktop, it also stops while the retry barrier shows (turning auto-retry off).
+      // It also stops while the retry barrier is visible (turning auto-retry off). Gated on the
+      // visible barrier, not the raw interruption: a context_exceeded error shows no barrier, and a
+      // Stop there would only persist an auto-retry opt-out the user never asked for.
       const isStarting =
         aggregator.getPendingStreamStartTime() !== null ||
         aggregator.getStreamLifecycle()?.phase === "preparing";
       if (
         !aggregator.getActiveStreamMessageId() &&
         !isStarting &&
-        !retryBarrierRef.current?.showRetryBarrier
+        !retryBarrierRef.current?.showRetryBarrierUI
       ) {
         return;
       }
@@ -884,7 +886,10 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           autoRetryStatus,
           isHydratingTranscript: !transcriptCaughtUp,
           isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
-          transcriptOnly: false,
+          // Without a server connection (file mode) every bridged action is refused, so the
+          // interrupted divider offers no resume (as a read-only desktop transcript) and the
+          // retry barrier is not mounted below.
+          transcriptOnly: !canChat,
         })
       : null;
   // Retry and resume send as the composer does: a sub-agent's locked agent, not a stored pick
@@ -1071,7 +1076,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                               }}
                             />
                             {/* Transcript tail, after the rows, as in desktop ChatPane. */}
-                            {retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                            {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
                               <RetryBarrierContent
                                 workspaceId={selectedWorkspaceId}
                                 visible={retryBarrier.showRetryBarrierUI}

@@ -2397,6 +2397,54 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.container.textContent).toContain("provider exploded");
     expect(view.container.textContent).not.toContain("Stream interrupted");
     expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    // No barrier, so Esc has nothing to stop: it must not persist an auto-retry opt-out.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(0);
+  });
+
+  test("a Retry still in flight when the workspace switches restores the auto-retry preference", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+    await click(view.getByRole("button", { name: "Retry" }));
+
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
+      await chatEvent(bridge, event, other.id);
+    }
+
+    // Auto-retry was off, so Retry enables it only for this attempt; the switch came first.
+    await bridge.answer("workspace.setAutoRetryEnabled", {
+      success: true,
+      data: { previousEnabled: false, enabled: true },
+    });
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+    await bridge.answer("workspace.resumeStream", { success: true, data: { started: true } });
+
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled").map((call) => call.input)).toEqual([
+      { workspaceId: WORKSPACE.id, enabled: true, persist: false },
+      { workspaceId: WORKSPACE.id, enabled: false, persist: false },
+    ]);
+  });
+
+  test("without a server connection the retry barrier is not offered", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+    // File mode keeps the transcript, but the host refuses every bridged action.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+
+    expect(view.container.textContent).toContain("provider exploded");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
   test("a user-stopped stream shows the interrupted divider; its button and Shift+R resume it", async () => {
