@@ -88,6 +88,7 @@ import {
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -3593,9 +3594,12 @@ export class WorkspaceService
     deleteResult: Awaited<ReturnType<Runtime["deleteWorkspace"]>>
   ): string[] {
     if (deleteResult.success) return [];
-    return runtime instanceof MultiProjectRuntime
-      ? (deleteResult.leftoverPaths ?? [])
-      : [runtime.getWorkspacePath(projectPath, workspaceName)];
+    if (runtime instanceof MultiProjectRuntime) return deleteResult.leftoverPaths ?? [];
+    // A Docker workspace path is the in-container /src; what is left is the container (#5117).
+    if (runtime instanceof DockerRuntime) {
+      return [`Docker container ${getContainerName(projectPath, workspaceName)}`];
+    }
+    return [runtime.getWorkspacePath(projectPath, workspaceName)];
   }
 
   /**
@@ -13051,18 +13055,18 @@ export class WorkspaceService
         const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
         const leftovers: string[] = [];
         // These forks made their own checkout before registering: a new worktree (worktree,
-        // devcontainer) or a remote worktree at a path the fork checked was free (SSH; Coder forks
+        // devcontainer), a remote worktree at a path the fork checked was free (SSH; Coder forks
         // share the source's Coder workspace in existing mode, so the delete leaves that workspace
-        // alone). Init was aborted and awaited above, so this is the same full delete as the
-        // copy-failure cleanup. For a devcontainer it also removes the container the fork's init
-        // may have started, which holds the fork's plan copy (#4775). Docker forks are not
-        // included yet (#5117): their container holds the plan and is not a path a leftover can
-        // name.
+        // alone), or a new container (Docker: its fork refuses a container name in use, #5117).
+        // Init was aborted and awaited above, so this is the same full delete as the copy-failure
+        // cleanup. For a devcontainer it also removes the container the fork's init may have
+        // started, which holds the fork's plan copy (#4775).
         if (
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
-            isSSHRuntime(forkedRuntimeConfig))
+            isSSHRuntime(forkedRuntimeConfig) ||
+            isDockerRuntime(forkedRuntimeConfig))
         ) {
           // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
@@ -13095,13 +13099,15 @@ export class WorkspaceService
         }
         // A later workspace with this name would inherit the copy. Only once the entry is gone,
         // like the checkout: while it persists, the workspace still references its plan. Not for
-        // devcontainers: the copy is inside the container, which the delete above removed, and
-        // deletePlanFiles would remove the host file at the same path instead, which is not this
-        // fork's. A failed delete is already reported through the checkout it left.
+        // devcontainers or Docker: the copy is inside the container, which the delete above
+        // removed. For a devcontainer, deletePlanFiles would remove the host file at the same path
+        // instead, which is not this fork's; for Docker it would exec into the removed container
+        // and fail (#5117). A failed delete is already reported through the container it left.
         if (
           rolledBack &&
           copiedPlanPath !== undefined &&
-          !isDevcontainerRuntime(forkedRuntimeConfig)
+          !isDevcontainerRuntime(forkedRuntimeConfig) &&
+          !isDockerRuntime(forkedRuntimeConfig)
         ) {
           const planDeleted = await this.deletePlanFiles(
             targetRuntime,

@@ -13,6 +13,7 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { ContainerManager } from "@/node/multiProject/containerManager";
@@ -1149,6 +1150,75 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "remote-fork", true]);
       expect(deleteWorkspace.mock.calls[0][5]).toEqual({ keepBranch: true });
       expect(persistedWorkspaceIds()).toEqual(["fffffffff1"]);
+    });
+
+    // #5117, Docker forks: the fork made its own container (DockerRuntime.forkWorkspace refuses a
+    // name in use) before registering. The rollback removes it, and with it the fork's plan copy,
+    // so no plan cleanup runs; a failed removal names the container, not the in-container path.
+    describe("Docker fork rollback (#5117)", () => {
+      const dockerFork = async (options: {
+        deleteResult: Awaited<ReturnType<DockerRuntime["deleteWorkspace"]>>;
+        copyFails?: boolean;
+      }) => {
+        const runtimeConfig = { type: "docker" as const, image: "ubuntu:24.04" };
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push({
+            id: "fffffffff2",
+            name: "docker-src",
+            path: "/src",
+            runtimeConfig,
+          });
+          return cfg;
+        });
+        const prototype = DockerRuntime.prototype;
+        spyOn(prototype, "forkWorkspace").mockResolvedValue({
+          success: true,
+          workspacePath: "/src",
+          sourceBranch: "docker-src",
+        });
+        const deleteWorkspace = spyOn(prototype, "deleteWorkspace").mockResolvedValue(
+          options.deleteResult
+        );
+        const copyPlan = spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes");
+        if (options.copyFails === true) {
+          copyPlan.mockRejectedValueOnce(new Error("plan unreadable"));
+        } else {
+          copyPlan.mockResolvedValue("/var/mux/plans/project/docker-fork.md");
+        }
+        const publish = failConfigPublish();
+        const result = await service
+          .fork("fffffffff2", "docker-fork")
+          .finally(() => publish.mockRestore());
+        return { error: result.success ? "" : result.error, deleteWorkspace };
+      };
+
+      test("removes the fork's container and nothing else", async () => {
+        const { error, deleteWorkspace } = await dockerFork({
+          deleteResult: { success: true, deletedPath: "/src" },
+        });
+        expect(error).toContain("EACCES");
+        expect(error).not.toContain("could not be fully cleaned up");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([
+          projectPath,
+          "docker-fork",
+          true,
+        ]);
+        expect(persistedWorkspaceIds()).toEqual(["fffffffff2"]);
+      });
+
+      test.each([
+        { label: "registration rollback", copyFails: false },
+        { label: "copy-failure cleanup", copyFails: true },
+      ])("$label names the container it could not remove", async ({ copyFails }) => {
+        const { error } = await dockerFork({
+          deleteResult: { success: false, error: "Failed to remove container: daemon down" },
+          copyFails,
+        });
+        expect(error).toEndWith(
+          leftoverSentence([`Docker container ${getContainerName(projectPath, "docker-fork")}`])
+        );
+      });
     });
 
     // #4936 gap 1: the multi-project runtime names the disposable paths it could not delete.
