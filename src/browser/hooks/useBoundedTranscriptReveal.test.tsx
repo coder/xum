@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import {
+  TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_STEP_CHARS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
@@ -64,7 +65,9 @@ const alwaysSafe = () => true;
 describe("useBoundedTranscriptReveal", () => {
   test("(a,b) mounts a tail first, then reveals in chunks until fully revealed", () => {
     const frames = manualFrames();
-    const messages = rows(540);
+    // About the size of the largest perf fixture (xl, ~340 displayed rows): it must reveal fully
+    // without any request, or the nightly perf baselines would shift with the budget.
+    const messages = rows(340);
     const { result } = renderHook(() =>
       useBoundedTranscriptReveal({
         workspaceId: "ws",
@@ -73,7 +76,7 @@ describe("useBoundedTranscriptReveal", () => {
       })
     );
     expect(result.current.isFullyRevealed).toBe(false);
-    expect(result.current.fromIndex).toBe(540 - TRANSCRIPT_REVEAL_TAIL_ROWS);
+    expect(result.current.fromIndex).toBe(340 - TRANSCRIPT_REVEAL_TAIL_ROWS);
     let previous = result.current.fromIndex;
     let steps = 0;
     while (!result.current.isFullyRevealed) {
@@ -86,7 +89,7 @@ describe("useBoundedTranscriptReveal", () => {
     }
     expect(result.current.fromIndex).toBe(0);
     expect(steps).toBe(
-      Math.ceil((540 - TRANSCRIPT_REVEAL_TAIL_ROWS) / TRANSCRIPT_REVEAL_CHUNK_ROWS)
+      Math.ceil((340 - TRANSCRIPT_REVEAL_TAIL_ROWS) / TRANSCRIPT_REVEAL_CHUNK_ROWS)
     );
     expect(frames.hasPending()).toBe(false);
   });
@@ -100,7 +103,7 @@ describe("useBoundedTranscriptReveal", () => {
         isSafeCut: alwaysSafe,
       })
     );
-    expect(result.current).toEqual({ fromIndex: 0, isFullyRevealed: true });
+    expect(result.current).toMatchObject({ fromIndex: 0, isFullyRevealed: true });
     expect(frames.hasPending()).toBe(false);
   });
 
@@ -188,7 +191,7 @@ describe("useBoundedTranscriptReveal", () => {
     expect(result.current.isFullyRevealed).toBe(true);
     props = { ...props, messages: [...rows(200, "old"), ...props.messages] };
     rerender();
-    expect(result.current).toEqual({ fromIndex: 0, isFullyRevealed: true });
+    expect(result.current).toMatchObject({ fromIndex: 0, isFullyRevealed: true });
     expect(frames.hasPending()).toBe(false);
   });
 
@@ -451,5 +454,108 @@ describe("useBoundedTranscriptReveal", () => {
     act(() => frames.flush());
     // Next step: 44, 45 by weight → 44 is inside the bundle → the cut moves to its head, 40.
     expect(result.current.fromIndex).toBe(40);
+  });
+
+  describe("automatic reveal budget", () => {
+    const LONG = TRANSCRIPT_REVEAL_AUTO_MAX_ROWS * 3;
+    const mounted = (fromIndex: number) => LONG - fromIndex;
+
+    function renderLong(frames: ReturnType<typeof manualFrames>) {
+      let props = { workspaceId: "ws", messages: rows(LONG) };
+      const view = renderHook(() =>
+        useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe })
+      );
+      const runFrames = () => {
+        while (frames.hasPending()) act(() => frames.flush());
+      };
+      const setProps = (next: Partial<typeof props>) => {
+        props = { ...props, ...next };
+        view.rerender();
+      };
+      return { ...view, runFrames, setProps, messages: () => props.messages };
+    }
+
+    test("pauses once the budget is mounted, and Load older resumes it by one budget", () => {
+      const frames = manualFrames();
+      const { result, runFrames } = renderLong(frames);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(result.current.isFullyRevealed).toBe(false);
+      expect(frames.hasPending()).toBe(false);
+      const firstPause = mounted(result.current.fromIndex);
+      expect(firstPause).toBeGreaterThanOrEqual(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+      expect(firstPause).toBeLessThan(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+
+      act(() => result.current.revealMore());
+      expect(result.current.isRevealPaused).toBe(false);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      const secondPause = mounted(result.current.fromIndex);
+      expect(secondPause).toBeGreaterThanOrEqual(firstPause + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+      expect(secondPause).toBeLessThan(
+        firstPause + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+
+      // Fewer rows than a budget remain: the next request reveals the rest.
+      act(() => result.current.revealMore());
+      runFrames();
+      expect(result.current).toMatchObject({
+        fromIndex: 0,
+        isFullyRevealed: true,
+        isRevealPaused: false,
+      });
+    });
+
+    test("a navigation to a row far above a paused boundary reveals down to it, then stops", () => {
+      const frames = manualFrames();
+      const { result, runFrames } = renderLong(frames);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      const target = Math.floor(result.current.fromIndex / 4);
+
+      act(() => result.current.revealThrough(target));
+      expect(result.current.isRevealPaused).toBe(false);
+      runFrames();
+      // The target row is mounted, at most one chunk past it, and the reveal paused again.
+      expect(result.current.fromIndex).toBeLessThanOrEqual(target);
+      expect(target - result.current.fromIndex).toBeLessThan(TRANSCRIPT_REVEAL_CHUNK_ROWS);
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(frames.hasPending()).toBe(false);
+
+      // A row already mounted is a no-op.
+      act(() => result.current.revealThrough(result.current.fromIndex));
+      expect(frames.hasPending()).toBe(false);
+    });
+
+    test("a navigation target that disappears stops the reveal it started", () => {
+      const frames = manualFrames();
+      const { result, runFrames, setProps, messages } = renderLong(frames);
+      runFrames();
+      const target = 10;
+      const targetId = messages()[target].id;
+      act(() => result.current.revealThrough(target));
+      act(() => frames.flush());
+      expect(frames.hasPending()).toBe(true);
+      setProps({ messages: messages().filter((row) => row.id !== targetId) });
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(frames.hasPending()).toBe(false);
+    });
+
+    test("a restart resets the budget and drops a pending navigation target", () => {
+      const frames = manualFrames();
+      const { result, runFrames, setProps } = renderLong(frames);
+      runFrames();
+      act(() => result.current.revealMore());
+      act(() => result.current.revealThrough(0));
+      // Switch to another long workspace before either request finished.
+      setProps({ workspaceId: "ws-2", messages: rows(LONG, "other") });
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(mounted(result.current.fromIndex)).toBeLessThan(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+    });
   });
 });

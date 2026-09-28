@@ -180,3 +180,11 @@ export const TRANSCRIPT_REVEAL_CHUNK_ROWS = 60;
 export const TRANSCRIPT_REVEAL_STEP_CHARS = 128_000;
 /** Weight assumed for rows without a text body (tool cards render collapsed by default). */
 export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
+/**
+ * The automatic reveal pauses once this many rows are mounted; older rows mount on request
+ * (Load older, or a navigation to a row above the boundary). #4869: every step costs O(mounted
+ * rows) and each mounted row holds ~130 KB of heap, so revealing every row of a huge chat kept
+ * the renderer busy for minutes. A rows budget, not a steps budget: the largest perf fixture
+ * (~340 rows of heavy replies, many short steps) must still reveal fully.
+ */
+export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;

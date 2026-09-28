@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
+  TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_STEP_CHARS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
@@ -32,6 +33,18 @@ export interface BoundedTranscriptReveal {
   /** Rows at indices >= fromIndex are eligible to mount this render. */
   fromIndex: number;
   isFullyRevealed: boolean;
+  /**
+   * The automatic reveal reached its rows budget and stopped scheduling frames; older rows
+   * mount only through `revealMore` or `revealThrough`.
+   */
+  isRevealPaused: boolean;
+  /** Resumes the automatic reveal for another `TRANSCRIPT_REVEAL_AUTO_MAX_ROWS` rows. */
+  revealMore: () => void;
+  /**
+   * Keeps revealing (past the budget) until the row at `index` is mounted. A no-op when that
+   * row is already inside the mounted range.
+   */
+  revealThrough: (index: number) => void;
 }
 
 interface RevealState {
@@ -57,6 +70,13 @@ interface RevealState {
    * in-place changes leave it in place and never restart the reveal.
    */
   newestMessageId: string | null;
+  /** Automatic steps stop once this many rows are mounted (reset on every restart). */
+  autoRowLimit: number;
+  /**
+   * Row a navigation waits for (see revealThrough): steps continue past the budget until it is
+   * mounted, then it clears. Cleared as well when the row disappears or the reveal restarts.
+   */
+  targetMessageId: string | null;
 }
 
 /**
@@ -150,6 +170,8 @@ function startState<Row extends RevealRow>(
     workspaceId,
     generation,
     newestMessageId: length > 0 ? messages[length - 1].id : null,
+    autoRowLimit: TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
+    targetMessageId: null,
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
   if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
@@ -169,6 +191,11 @@ const unitRowWeight = (): number => 1;
  * changes that leave the newest row in place — including aggregator epoch bumps for rows
  * outside the loaded window — never restart the reveal. Row projections are still computed
  * over the full array by the caller; only the mounted range shrinks.
+ *
+ * The automatic reveal pauses once `TRANSCRIPT_REVEAL_AUTO_MAX_ROWS` rows are mounted (#4869:
+ * each step costs O(mounted rows), so revealing every row of a huge chat kept the renderer busy
+ * for minutes). `revealMore` resumes it for another budget; `revealThrough` reveals down to a
+ * navigation target regardless of the budget.
  *
  * Invariant (tested, not asserted per render): within one workspace and outside the
  * bulk-arrival reset, the set of row ids at indices >= fromIndex only grows.
@@ -240,13 +267,39 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
 
+  // A navigation target is done once its row is mounted, and moot once it is gone. The lookup
+  // runs only while a navigation is pending, never on ordinary renders.
+  if (current.targetMessageId !== null) {
+    const targetId = current.targetMessageId;
+    const targetIndex = args.messages.findIndex((row) => row.id === targetId);
+    if (targetIndex === -1 || targetIndex >= fromIndex) {
+      current = { ...current, targetMessageId: null };
+      setState(current);
+    }
+  }
+  const mountedRows = length - fromIndex;
+  const isRevealPaused =
+    current.anchorMessageId !== null &&
+    current.targetMessageId === null &&
+    mountedRows >= current.autoRowLimit;
+
   // The scheduled step reads the latest COMMITTED inputs when it runs, not what it captured
   // when scheduled: grouping can change while a frame is pending. Published from a layout
   // effect, not during render, so a concurrent render that is abandoned (the caller feeds
   // deferred values) can never hand a pending frame an uncommitted snapshot.
-  const latest = useRef({ messages: args.messages, stepInputs, fromIndex });
+  const latest = useRef({
+    messages: args.messages,
+    stepInputs,
+    fromIndex,
+    generation: current.generation,
+  });
   useLayoutEffect(() => {
-    latest.current = { messages: args.messages, stepInputs, fromIndex };
+    latest.current = {
+      messages: args.messages,
+      stepInputs,
+      fromIndex,
+      generation: current.generation,
+    };
   });
   const scheduleFrame = transcriptRevealFrameScheduler.schedule;
 
@@ -254,7 +307,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const generation = current.generation;
   const workspaceId = args.workspaceId;
   useEffect(() => {
-    if (anchorMessageId === null) return;
+    if (anchorMessageId === null || isRevealPaused) return;
     const cancel = scheduleFrame(() => {
       const snapshot = latest.current;
       setState((previous) => {
@@ -267,6 +320,11 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
         ) {
           return previous;
         }
+        // A frame that slipped past cancellation must not step a reveal that paused meanwhile.
+        const snapshotMountedRows = snapshot.messages.length - snapshot.fromIndex;
+        if (previous.targetMessageId === null && snapshotMountedRows >= previous.autoRowLimit) {
+          return previous;
+        }
         const cut = nextStepCut(
           Math.min(snapshot.fromIndex, snapshot.messages.length),
           TRANSCRIPT_REVEAL_CHUNK_ROWS,
@@ -277,7 +335,36 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       });
     });
     return cancel;
-  }, [anchorMessageId, generation, workspaceId, scheduleFrame]);
+  }, [anchorMessageId, generation, workspaceId, scheduleFrame, isRevealPaused]);
 
-  return { fromIndex, isFullyRevealed: current.anchorMessageId === null };
+  // Both read the latest COMMITTED snapshot (like the scheduled step), so a caller's effect sees
+  // the rows and boundary it just rendered.
+  const revealMore = () => {
+    const snapshot = latest.current;
+    const limit = snapshot.messages.length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
+    setState((previous) =>
+      previous.generation !== snapshot.generation || previous.autoRowLimit >= limit
+        ? previous
+        : { ...previous, autoRowLimit: limit }
+    );
+  };
+  const revealThrough = (index: number) => {
+    assert(Number.isInteger(index) && index >= 0, "revealThrough requires a row index");
+    const snapshot = latest.current;
+    if (index >= snapshot.fromIndex || index >= snapshot.messages.length) return;
+    const targetMessageId = snapshot.messages[index].id;
+    setState((previous) =>
+      previous.generation !== snapshot.generation || previous.targetMessageId === targetMessageId
+        ? previous
+        : { ...previous, targetMessageId }
+    );
+  };
+
+  return {
+    fromIndex,
+    isFullyRevealed: current.anchorMessageId === null,
+    isRevealPaused,
+    revealMore,
+    revealThrough,
+  };
 }

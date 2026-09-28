@@ -13,7 +13,10 @@ import type { Page } from "@playwright/test";
 export interface PageMilestones {
   /** ms from start until the first transcript row exists ("useful content ready"). */
   firstMessageMs: number | null;
-  /** ms from start until the message window reports data-loaded="true" ("fully revealed"). */
+  /**
+   * ms from start until the message window reports data-loaded="true": the tail-first reveal
+   * settled (fully revealed, or paused at its automatic rows budget in a very long chat).
+   */
   fullyLoadedMs: number | null;
   /** Longest main-thread task after start, in ms. 0 when no task exceeded the 50 ms long-task floor. */
   longestTaskMs: number;

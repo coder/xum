@@ -614,7 +614,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
   // it: it would otherwise mount the whole transcript in the one commit that replaces the
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
-  const { fromIndex: revealFromIndex, isFullyRevealed } = useBoundedTranscriptReveal({
+  const {
+    fromIndex: revealFromIndex,
+    isFullyRevealed,
+    isRevealPaused,
+    revealMore,
+    revealThrough,
+  } = useBoundedTranscriptReveal({
     workspaceId,
     messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
     isSafeCut: isSafeRevealCut,
@@ -631,13 +637,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!hasCommittedTranscriptRow) return;
     return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
   }, [workspaceId, hasCommittedTranscriptRow]);
+  // Settled: every row is mounted, or the automatic reveal paused at its rows budget (#4869;
+  // older rows then mount only on request) — either way no chunk is still mounting.
+  const revealSettled = isFullyRevealed || isRevealPaused;
   // Streaming rows render synchronously while older chunks still mount (see
   // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
   // flips the value, which would re-render every mounted markdown row once the reveal ends.
-  const isTranscriptBackfillingDuringStream = canInterrupt && !isFullyRevealed;
-  // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
+  const isTranscriptBackfillingDuringStream = canInterrupt && !revealSettled;
+  // A paused reveal offers its unmounted rows first. Older server pages prepend above rows the
+  // reveal has not reached yet; offer them once it has.
   const shouldRenderLoadOlderMessagesButton =
-    hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
+    (isRevealPaused || (hasOlderHistory && isFullyRevealed)) && !isPixelSnapshotEnvironment();
+  // The server-page loading state never applies to mounting already-loaded rows.
+  const isLoadingOlderHistoryPage = loadingOlderHistory && !isRevealPaused;
 
   // A tail propose_plan usually means the agent paused for user review; reveal only the
   // containing hyper-density bundles by default so historical plans stay collapsed.
@@ -762,7 +774,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
+    // The automatic reveal may have paused above the target, so ask it to reach the target.
     if (targetIndex < revealFromIndex) {
+      revealThrough(targetIndex);
       return;
     }
 
@@ -792,6 +806,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     operationalBundleInfos,
     pendingTimelineReveal,
     revealFromIndex,
+    revealThrough,
     workBundleExpansionOverrides,
     workBundleInfos,
     workspaceId,
@@ -868,16 +883,27 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       setPendingScrollTarget(null);
       return;
     }
-    // Not in the DOM: keep waiting only while the row exists below the reveal boundary. A
-    // row that is gone, or eligible but hidden inside a collapsed bundle, is dropped (the
-    // pre-reveal behavior for an unmounted target was a silent no-op too).
+    // Not in the DOM: keep waiting only while the row exists below the reveal boundary, and
+    // ask the reveal to reach it (the automatic reveal may have paused above it). A row that
+    // is gone, or eligible but hidden inside a collapsed bundle, is dropped (the pre-reveal
+    // behavior for an unmounted target was a silent no-op too).
     const targetIndex = deferredMessages.findIndex(
       (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
     );
     if (targetIndex === -1 || targetIndex >= revealFromIndex) {
       setPendingScrollTarget(null);
+      return;
     }
-  }, [autoScroll, contentRef, deferredMessages, pendingScrollTarget, revealFromIndex, workspaceId]);
+    revealThrough(targetIndex);
+  }, [
+    autoScroll,
+    contentRef,
+    deferredMessages,
+    pendingScrollTarget,
+    revealFromIndex,
+    revealThrough,
+    workspaceId,
+  ]);
 
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
@@ -1328,14 +1354,29 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     );
   }
   const handleLoadOlderHistory = useCallback(() => {
-    if (!shouldRenderLoadOlderMessagesButton || loadingOlderHistory) {
+    if (!shouldRenderLoadOlderMessagesButton) {
+      return;
+    }
+    // Already-loaded rows above a paused reveal mount before any older server page is fetched.
+    if (isRevealPaused) {
+      revealMore();
+      return;
+    }
+    if (loadingOlderHistory) {
       return;
     }
 
     storeRaw.loadOlderHistory(workspaceId).catch((error) => {
       console.warn(`[ChatPane] Failed to load older history for ${workspaceId}:`, error);
     });
-  }, [loadingOlderHistory, shouldRenderLoadOlderMessagesButton, storeRaw, workspaceId]);
+  }, [
+    isRevealPaused,
+    loadingOlderHistory,
+    revealMore,
+    shouldRenderLoadOlderMessagesButton,
+    storeRaw,
+    workspaceId,
+  ]);
 
   // Handle keyboard shortcuts (using optional refs that are safe even if not initialized)
   useAIViewKeybinds({
@@ -1527,10 +1568,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             tabIndex={0}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
-            // decoration data readiness AND the tail-first reveal having mounted
-            // every row, so waiting on it observes the chat view's final layout
-            // rather than a tail whose earlier chunks are still committing.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && isFullyRevealed}
+            // decoration data readiness AND the tail-first reveal having settled
+            // (fully revealed or paused at the automatic budget), so waiting on it
+            // observes the chat view's final layout rather than a tail whose
+            // earlier chunks are still committing.
+            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && revealSettled}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:
@@ -1550,9 +1592,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
-              // Live only once the historical reveal has finished: chunks of replayed history
+              // Live only once the historical reveal has settled: chunks of replayed history
               // mounting during a stream would otherwise be announced as fresh output.
-              aria-live={canInterrupt && isFullyRevealed ? "polite" : "off"}
+              aria-live={canInterrupt && revealSettled ? "polite" : "off"}
               aria-busy={canInterrupt || isHydratingTranscript}
               aria-label="Conversation transcript"
               className={cn(
@@ -1609,10 +1651,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                           <button
                             type="button"
                             onClick={handleLoadOlderHistory}
-                            disabled={loadingOlderHistory}
+                            disabled={isLoadingOlderHistoryPage}
                             className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors disabled:opacity-50"
                           >
-                            {loadingOlderHistory ? "Loading..." : "Load older messages"}
+                            {isLoadingOlderHistoryPage ? "Loading..." : "Load older messages"}
                           </button>
                         </TooltipIfPresent>
                       </div>
