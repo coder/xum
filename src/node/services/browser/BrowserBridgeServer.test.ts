@@ -291,6 +291,38 @@ describe("BrowserBridgeServer", () => {
     }
   });
 
+  test("closes a client that queues too much input before the upstream connects", async () => {
+    let releaseSession: (value: null) => void = () => undefined;
+    const bridgeServer = createBridgeServer({
+      // Hold session discovery so client frames stay queued.
+      getSessionConnection: mock(
+        () =>
+          new Promise<null>((resolve) => {
+            releaseSession = resolve;
+          })
+      ),
+    });
+    const clientSocket = new MockBridgeClientSocket();
+    const bridgeServerPrivate = bridgeServer as unknown as BrowserBridgeServerPrivate;
+
+    try {
+      const setup = bridgeServerPrivate.handleUpgradedConnection(
+        clientSocket as unknown as WebSocket,
+        { url: `/?token=${VALID_TOKEN}` } as IncomingMessage
+      );
+      const chunk = Buffer.alloc(600 * 1024, 1);
+      clientSocket.emit("message", chunk, true);
+      expect(clientSocket.close).not.toHaveBeenCalled();
+      clientSocket.emit("message", chunk, true);
+      expect(clientSocket.close).toHaveBeenCalledWith(1009, "too much input before bridge ready");
+
+      releaseSession(null);
+      await setup;
+    } finally {
+      await bridgeServer.stop();
+    }
+  });
+
   test("bridges explicit other-workspace tokens on the success path", async () => {
     const upstreamHarness = await listenUpstreamServer();
     const getSessionConnection = mock(() =>

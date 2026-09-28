@@ -11,6 +11,10 @@ const INVALID_TOKEN_CLOSE_CODE = 4001;
 const MISSING_SESSION_CLOSE_CODE = 4002;
 const STREAM_CONNECT_FAILURE_CLOSE_CODE = 4003;
 const SERVER_STOPPING_CLOSE_CODE = 1001;
+const MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+// Input frames queued while the upstream connects are tiny (keyboard/mouse events); cap the
+// queue so a stalled upstream handshake cannot grow the backend heap without limit.
+const MAX_PENDING_CLIENT_FRAME_BYTES = 1024 * 1024;
 const STREAM_HOST = "127.0.0.1";
 
 interface BridgePair {
@@ -285,7 +289,15 @@ export class BrowserBridgeServer {
     // delivers such a frame before the upstream 'open', so queue client frames until
     // the bridge listeners are attached instead of silently dropping them.
     const pendingClientFrames: Array<{ data: RawData; isBinary: boolean }> = [];
+    let pendingClientFrameBytes = 0;
     const bufferClientFrame = (data: RawData, isBinary: boolean) => {
+      pendingClientFrameBytes += normalizeBinaryMessage(data).byteLength;
+      if (pendingClientFrameBytes > MAX_PENDING_CLIENT_FRAME_BYTES) {
+        ws.off("message", bufferClientFrame);
+        pendingClientFrames.length = 0;
+        closeWebSocket(ws, MESSAGE_TOO_BIG_CLOSE_CODE, "too much input before bridge ready");
+        return;
+      }
       pendingClientFrames.push({ data, isBinary });
     };
     ws.on("message", bufferClientFrame);
@@ -315,11 +327,10 @@ export class BrowserBridgeServer {
       const upstream = await connectToStream(liveSession.streamPort);
       const pair: BridgePair = { client: ws, upstream, closed: false };
       ws.off("message", bufferClientFrame);
-      this.attachBridgeListeners(
+      const forwardClientFrame = this.attachBridgeListeners(
         pair,
         payload.workspaceId,
-        liveSession.sessionName,
-        pendingClientFrames
+        liveSession.sessionName
       );
       this.activePairs.add(pair);
       if (this.browserSessionStateHub) {
@@ -342,6 +353,12 @@ export class BrowserBridgeServer {
       }
       if (ws.readyState !== WebSocket.OPEN) {
         this.cleanupPair(pair, { closeReason: "websocket closed before bridge finished" });
+        return;
+      }
+      // Flush only after the pair and its subscription are registered, so a forwarding
+      // failure's cleanupPair() removes them instead of racing their registration.
+      for (const frame of pendingClientFrames) {
+        forwardClientFrame(frame.data, frame.isBinary);
       }
     } catch (error) {
       log.warn("BrowserBridgeServer: failed to connect to stream endpoint", {
@@ -357,9 +374,8 @@ export class BrowserBridgeServer {
   private attachBridgeListeners(
     pair: BridgePair,
     workspaceId: string,
-    sessionId: string,
-    pendingClientFrames: ReadonlyArray<{ data: RawData; isBinary: boolean }>
-  ): void {
+    sessionId: string
+  ): (data: RawData, isBinary: boolean) => void {
     const forwardClientFrame = (data: RawData, isBinary: boolean) => {
       if (pair.closed) {
         return;
@@ -425,9 +441,7 @@ export class BrowserBridgeServer {
       this.cleanupPair(pair, { closeReason: "upstream websocket error" });
     });
 
-    for (const frame of pendingClientFrames) {
-      forwardClientFrame(frame.data, frame.isBinary);
-    }
+    return forwardClientFrame;
   }
 
   private cleanupPair(
