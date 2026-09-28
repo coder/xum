@@ -5,7 +5,7 @@ import type { UpdateStatus } from "@/common/orpc/types";
 import { APIProvider } from "@/browser/contexts/API";
 import { AboutDialogProvider, useAboutDialog } from "@/browser/contexts/AboutDialogContext";
 import { Button } from "@/browser/components/Button/Button";
-import { lightweightMeta } from "@/browser/stories/meta";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { AboutDialog } from "./AboutDialog";
 
@@ -99,10 +99,10 @@ export const BlockedPhone: Story = {
         {
           kind: "held-inputs",
           count: 4,
-          // Beyond three names the line collapses into a count and long names are cut, keeping
-          // the dialog bounded.
+          // Beyond three names the line collapses into a count, keeping the dialog bounded. The
+          // backend cuts long names (nameRestartBlockerWorkspaces), as in the first entry.
           workspaceNames: [
-            "Archived: migrate the storage layer to the new schema",
+            "Archived: migrate the storage layer to…",
             "Fix settings validation",
             "Rename the CLI flags",
             "Update docs",
@@ -136,4 +136,29 @@ export const BlockedPhone: Story = {
       );
     }
   },
+};
+
+/**
+ * #5052: two long titles that the backend cut to the same text keep their disambiguating ID
+ * (nameRestartBlockerWorkspaces cuts before appending it). Visual evidence only: Pixel is off
+ * because the snapshot budget is at its cap, and BlockedPhone already covers this layout.
+ */
+export const BlockedDuplicateNames: Story = {
+  args: {
+    status: {
+      type: "install-blocked",
+      info: { version: "0.28.4-next.123.g123456789" },
+      blockers: [
+        {
+          kind: "held-inputs",
+          count: 2,
+          workspaceNames: [
+            "Migrate the storage layer to the new sc… (a1b2c3d4e5)",
+            "Migrate the storage layer to the new sc… (f6a7b8c9d0)",
+          ],
+        },
+      ],
+    },
+  },
+  parameters: { pixel: PIXEL_DISABLED },
 };

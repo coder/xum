@@ -5,6 +5,7 @@ import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import {
   formatKeybind,
+  isDialogOpen,
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
@@ -141,15 +142,23 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
   }, [api, props.workspaceId, props.heldInput.id]);
 
   // Without Send there is no composer (transcript-only, #4770), so nothing dispatches the event
-  // above: the shortcut target listens for Discard itself, outside editable fields.
+  // above: the shortcut target listens for Discard itself, outside editable fields and never
+  // under a modal (the banner is hidden behind it).
   const ownsDiscardShortcut = props.canSend === false && props.isShortcutTarget;
   useEffect(() => {
     if (!ownsDiscardShortcut) return;
     const handler = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) || isEditableElement(event.target)) {
+      if (
+        !matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) ||
+        isEditableElement(event.target) ||
+        isDialogOpen()
+      ) {
         return;
       }
       event.preventDefault();
+      // Like the composer's handler: after a discard the next banner becomes the target, so an
+      // auto-repeating held chord would otherwise discard more than the oldest one (#5052).
+      if (event.repeat) return;
       runHeldInputAction("discard", {
         api,
         workspaceId: props.workspaceId,

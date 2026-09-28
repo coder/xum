@@ -23,21 +23,13 @@ const channelDescriptions: Record<UpdateChannel, string> = {
 };
 
 /**
- * Names shown per blocker line, each cut to a length; the rest collapse into a count so the
- * dialog stays bounded (titles are free text).
+ * Names shown per blocker line; the rest collapse into a count so the dialog stays bounded. The
+ * backend already cut each name (nameRestartBlockerWorkspaces), keeping a duplicate's ID suffix.
  */
 const MAX_BLOCKER_WORKSPACE_NAMES = 3;
-const MAX_BLOCKER_WORKSPACE_NAME_CHARS = 40;
 
 function formatBlockerWorkspaceNames(names: readonly string[]): string {
-  const shown = names
-    .slice(0, MAX_BLOCKER_WORKSPACE_NAMES)
-    .map((name) =>
-      name.length > MAX_BLOCKER_WORKSPACE_NAME_CHARS
-        ? `${name.slice(0, MAX_BLOCKER_WORKSPACE_NAME_CHARS - 1).trimEnd()}…`
-        : name
-    )
-    .join(", ");
+  const shown = names.slice(0, MAX_BLOCKER_WORKSPACE_NAMES).join(", ");
   const hidden = names.length - MAX_BLOCKER_WORKSPACE_NAMES;
   return hidden > 0 ? `${shown} and ${hidden} more` : shown;
 }

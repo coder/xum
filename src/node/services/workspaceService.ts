@@ -513,21 +513,32 @@ function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
   return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
 }
 
+/** Labels are free text; the About dialog shows them verbatim, so they are cut here. */
+const MAX_RESTART_BLOCKER_LABEL_CHARS = 40;
+
 /**
  * Sorted display names for a restart blocker's workspaces (#4770): title, else name, else ID. A
  * hand-edited config can hold a non-string title or name, so those count as missing. Titles may
  * repeat (across projects, repeated task titles), so a label two workspaces share gets the ID.
+ * Long labels are cut BEFORE that check and before the ID is appended (#5052): cutting the whole
+ * name afterwards dropped the ID, and two titles that differ only past the cut read the same.
  */
 export function nameRestartBlockerWorkspaces(
   workspaces: ReadonlyArray<{ id: string; title?: unknown; name?: unknown }>
 ): string[] {
-  const labeled = workspaces.map((workspace) => ({
-    id: workspace.id,
-    label:
+  const labeled = workspaces.map((workspace) => {
+    const label =
       [workspace.title, workspace.name].find(
         (value): value is string => typeof value === "string" && value.length > 0
-      ) ?? workspace.id,
-  }));
+      ) ?? workspace.id;
+    return {
+      id: workspace.id,
+      label:
+        label.length > MAX_RESTART_BLOCKER_LABEL_CHARS
+          ? `${label.slice(0, MAX_RESTART_BLOCKER_LABEL_CHARS - 1).trimEnd()}…`
+          : label,
+    };
+  });
   const labelCounts = new Map<string, number>();
   for (const { label } of labeled) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
   return labeled
