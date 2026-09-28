@@ -1,6 +1,10 @@
-import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "@/browser/stories/meta.js";
 import { expect, waitFor, within, userEvent } from "@storybook/test";
-import { getSettingsDialog, openSettingsDialog } from "@/browser/stories/storyPlayHelpers.js";
+import {
+  getSettingsDialog,
+  openSettingsDialog,
+  waitForChatInputAutofocusDone,
+} from "@/browser/stories/storyPlayHelpers.js";
 import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { setupSettingsStory } from "./Sections/settingsStoryUtils.js";
 
@@ -148,6 +152,47 @@ export const EscapeInInlineEditor: AppStory = {
     await waitForSettingsClosed();
     // Settings has no DialogTrigger, so focus must be returned to the opener explicitly.
     await waitFor(() => expect(within(canvasElement).getByTestId("settings-button")).toHaveFocus());
+  },
+};
+
+// The palette item and model-selector entry that open settings unmount as it opens, so closing
+// must return focus to the chat input they came from instead of leaving it on the body.
+export const FocusReturnsWhenOpenerUnmounts: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await waitForChatInputAutofocusDone(canvasElement);
+    const chatInput = canvasElement.querySelector<HTMLElement>(
+      '[data-component="ChatInputSection"]'
+    );
+    if (!chatInput) {
+      throw new Error("Chat input section not found");
+    }
+    const composer = within(chatInput).getByRole("textbox");
+
+    await userEvent.click(composer);
+    await userEvent.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
+    await userEvent.keyboard(">Settings: Models{Enter}");
+    await body.findByRole("dialog", { name: "Settings" });
+    await userEvent.keyboard("{Escape}");
+    await waitForSettingsClosed();
+    await waitFor(() => expect(composer).toHaveFocus());
+    await userEvent.keyboard("typed");
+    await expect(composer).toHaveValue("typed");
+
+    const modelSelector = chatInput.querySelector<HTMLElement>(
+      '[data-component="ModelSelectorGroup"]'
+    );
+    if (!modelSelector) {
+      throw new Error("Model selector not found");
+    }
+    await userEvent.click(within(modelSelector).getByRole("combobox"));
+    await userEvent.click(await body.findByRole("button", { name: "Model settings" }));
+    await body.findByRole("dialog", { name: "Settings" });
+    await userEvent.keyboard("{Escape}");
+    await waitForSettingsClosed();
+    await waitFor(() => expect(composer).toHaveFocus());
   },
 };
 

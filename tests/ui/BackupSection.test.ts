@@ -198,6 +198,27 @@ describe("BackupSection", () => {
     expect(mcp.getAttribute("aria-checked")).toBe("false");
   });
 
+  test("re-arms shortcuts in the settings dialog after a nested confirm closes", async () => {
+    renderBackupSection({}, undefined, true);
+    const body = within(document.body);
+    const settings = await body.findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const restore = canvas.getByRole("button", { name: /^Restore$/ });
+    await waitFor(() => expect(restore.hasAttribute("disabled")).toBe(false));
+
+    fireEvent.click(restore);
+    const confirm = await body.findByRole("dialog", { name: "Restore settings backup?" });
+    fireEvent.click(within(confirm).getByRole("button", { name: /Cancel/ }));
+    await waitFor(() =>
+      expect(body.queryByRole("dialog", { name: "Restore settings backup?" }) === null).toBe(true)
+    );
+    // The confirm has no trigger to return focus to, so closing it leaves focus on the body.
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+  });
+
   test("refreshes backup settings changed by another window", async () => {
     const { client, view } = renderBackupSection();
     const canvas = within(view.container);

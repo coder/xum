@@ -3126,7 +3126,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       defaultModel={defaultModel}
                       onSetDefaultModel={setDefaultModel}
                       hiddenModels={hiddenModelsForSelector}
-                      onOpenSettings={() => open("models")}
+                      onOpenSettings={() => {
+                        // The dropdown's focused input unmounts; hand focus to the composer (as
+                        // onComplete does) so closing settings returns there.
+                        inputRef.current?.focus();
+                        open("models");
+                      }}
                       className="h-full max-w-[8rem] min-w-0"
                       autoRouting={
                         autoModelRoutingEnabled

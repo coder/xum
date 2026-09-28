@@ -238,9 +238,15 @@ function ChangeList(props: {
 
 // Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
 // only while focus is in the dialog hosting this section, never in a nested dialog or popover.
+// A nested dialog without a trigger drops focus to the body when it closes; the section owns the
+// keys again once its host is the topmost (last portaled) dialog.
 function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | null): boolean {
   const hostDialog = root?.closest('[role="dialog"]');
   if (!hostDialog) return !isDialogOpen();
+  if (target === document.body) {
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    return dialogs[dialogs.length - 1] === hostDialog;
+  }
   return target instanceof Element && target.closest('[role="dialog"]') === hostDialog;
 }
 
