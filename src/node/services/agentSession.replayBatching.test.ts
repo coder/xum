@@ -29,7 +29,7 @@ interface StreamInfo {
 
 async function createHarness(
   rows: unknown[],
-  options?: { streamInfo?: StreamInfo; onReplayStream?: () => void }
+  options?: { streamInfo?: StreamInfo; onReplayStream?: () => void; onReplayInit?: () => void }
 ): Promise<AgentSessionHarness> {
   const harness = await createAgentSessionHarness({
     workspaceId,
@@ -40,7 +40,12 @@ async function createHarness(
         return Promise.resolve();
       }),
     },
-    initStateManagerOverrides: { replayInit: mock((_workspaceId: string) => Promise.resolve()) },
+    initStateManagerOverrides: {
+      replayInit: mock((_workspaceId: string) => {
+        options?.onReplayInit?.();
+        return Promise.resolve();
+      }),
+    },
   });
   // Raw lines so the corpus can hold rows the history writer would refuse (self-healing skip).
   const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
@@ -187,7 +192,17 @@ describe("onChat replay batching (#4868)", () => {
       fileRow("file", 73),
       ...textRows(3, 74),
     ];
-    harness = await createHarness(rows);
+    // Init replay emits after the partial row: batching must not hold the partial past it.
+    const created = await createHarness(rows, {
+      onReplayInit: () =>
+        created.session.emitChatEvent({
+          type: "init-end",
+          exitCode: 0,
+          timestamp: 3_000,
+          replay: true,
+        }),
+    });
+    harness = created;
     const partial = {
       id: "partial",
       role: "assistant",
@@ -217,18 +232,20 @@ describe("onChat replay batching (#4868)", () => {
       "partial",
     ];
     expect(wireRows(single).map(rowId)).toEqual(expectedIds);
-    expect(wireRows(batched).map((row) => JSON.stringify(row))).toEqual(
-      wireRows(single).map((row) => JSON.stringify(row))
-    );
+    // Unpacking the batches gives exactly the single-row event sequence: the same rows (wire
+    // bytes) and the same other events (init replay, terminal state, queue snapshot, caught-up)
+    // in the same places.
+    const flattened = (events: AgentSessionChatEvent[]) =>
+      events.flatMap((event) =>
+        event.message.type === "message" || event.message.type === "message-batch"
+          ? wireRows([event]).map((row) => JSON.stringify(row))
+          : [JSON.stringify(event.message)]
+      );
+    expect(flattened(batched)).toEqual(flattened(single));
+    const types = single.map(({ message }) => message.type);
+    expect(types.indexOf("init-end")).toBeGreaterThan(types.lastIndexOf("message"));
     // The partial row goes out alone after every batch, even though it is text-only.
     expect(shapes(batched).at(-1)).toBe("message:partial");
-
-    // Every non-row event (terminal state, queue snapshot, caught-up) is unchanged and in place.
-    const nonRows = (events: AgentSessionChatEvent[]) =>
-      events
-        .filter(({ message }) => message.type !== "message" && message.type !== "message-batch")
-        .map(({ message }) => JSON.stringify(message));
-    expect(nonRows(batched)).toEqual(nonRows(single));
 
     const skipped = warn.mock.calls.filter((call) => call[0] === SKIP_WARNING);
     expect(skipped.map((call) => (call[1] as { messageId?: string }).messageId)).toEqual([
@@ -245,13 +262,13 @@ describe("onChat replay batching (#4868)", () => {
   });
 
   it("splits batches at the row cap and the text cap, and sends an oversized row alone", async () => {
-    const sixtyKiB = "x".repeat(60 * 1024);
+    const sixtyFourKiB = "x".repeat(64 * 1024);
     harness = await createHarness([
       // 150 small rows: row cap of 64.
       ...textRows(150),
       toolRow("tool", 150),
-      // 60 KiB rows: 4 fit under the 256 KiB text cap, a fifth would exceed it.
-      ...textRows(6, 151, () => sixtyKiB),
+      // Rows at the 64 KiB per-row limit still batch; 4 fill the 256 KiB text cap exactly.
+      ...textRows(6, 151, () => sixtyFourKiB),
       // Over the 64 KiB per-row limit: sent alone even between batchable rows.
       textRow("huge", 157, "y".repeat(64 * 1024 + 1)),
       ...textRows(2, 158),
