@@ -17,13 +17,29 @@ describe("automatic context policy display", () => {
   });
 
   test.each([
-    { tokenBudget: false, continuous: false, ptc: false, rlm: false, rollover: false },
-    { tokenBudget: true, continuous: false, ptc: false, rlm: false, rollover: true },
-    { tokenBudget: true, continuous: true, ptc: false, rlm: false, rollover: false },
-    { tokenBudget: true, continuous: false, ptc: true, rlm: true, rollover: false },
-    { tokenBudget: true, continuous: false, ptc: false, rlm: true, rollover: true },
+    {
+      tokenBudget: false,
+      memory: true,
+      continuous: false,
+      ptc: false,
+      rlm: false,
+      rollover: false,
+    },
+    { tokenBudget: true, memory: true, continuous: false, ptc: false, rlm: false, rollover: true },
+    {
+      tokenBudget: true,
+      memory: false,
+      continuous: false,
+      ptc: false,
+      rlm: false,
+      rollover: false,
+    },
+    { tokenBudget: true, memory: true, continuous: true, ptc: false, rlm: false, rollover: false },
+    { tokenBudget: true, memory: true, continuous: false, ptc: true, rlm: true, rollover: false },
+    { tokenBudget: true, memory: true, continuous: false, ptc: false, rlm: true, rollover: true },
   ])("respects effective policy precedence: %j", (flags) => {
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), flags.tokenBudget);
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), flags.memory);
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), flags.continuous);
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING), flags.ptc);
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.RLM), flags.rlm);

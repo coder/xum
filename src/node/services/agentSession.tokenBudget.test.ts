@@ -57,12 +57,7 @@ const seedThreshold = (h: AgentSessionHarness, fraction: number) =>
 const options: SendMessageOptions = {
   model,
   agentId: "exec",
-  experiments: { tokenBudget: true },
-};
-// Dispatch and resume re-validate memory writability from the caller's options; the harness has
-// no backend experiment service, so these paths state the Memory experiment explicitly.
-const resumeOptions: SendMessageOptions = {
-  ...options,
+  // Token budget requires the Memory experiment; the harness has no backend experiment service.
   experiments: { tokenBudget: true, memory: true },
 };
 const correlation = {
@@ -368,7 +363,7 @@ describe("AgentSession token-budget lifecycle", () => {
   test("manual compaction publishes a summary and clears globally enabled token-budget state", async () => {
     const h = await setup();
     spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
     );
     await seedHistory(h, 20_000);
     const state = budgetOf(h);
@@ -1371,11 +1366,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     // Far below the budget: only the explicit request drives the rollover.
     expect(
-      (
-        await h.requests[0].onStepSettled?.(
-          step(20_000, { newContextRequested: true, newContextHandoff: "Resume at step 3" })
-        )
-      )?.decision
+      (await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true })))?.decision
     ).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
@@ -1392,15 +1383,13 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(resets[0].metadata?.muxMetadata).toMatchObject({
       reason: "mid-stream",
       requestedBy: "model",
-      handoff: { text: "Resume at step 3" },
-      request: { text: "Work", truncated: false },
     });
     expect(text(rows.at(-1)!)).toBe("Continue");
-    const leadIn = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages)
-      .map(text)
-      .find((row) => row.includes("new_context"));
-    expect(leadIn).toContain("Resume at step 3");
-    expect(leadIn).toContain("<request>\nWork\n</request>");
+    expect(
+      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some((row) =>
+        text(row).includes("new_context")
+      )
+    ).toBe(true);
     // The fresh window has no outstanding request: an ordinary settled step continues.
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
@@ -1881,7 +1870,7 @@ describe("AgentSession token-budget lifecycle", () => {
     {
       label: "warning with full capabilities",
       usage: 85_000,
-      sendOptions: resumeOptions,
+      sendOptions: options,
       expected: {
         handoff: false,
         memoryWritable: true,
@@ -1893,7 +1882,7 @@ describe("AgentSession token-budget lifecycle", () => {
       label: "handoff with degraded capabilities",
       usage: 90_000,
       sendOptions: {
-        ...resumeOptions,
+        ...options,
         toolPolicy: [{ regex_match: "memory|session_.*", action: "disable" }],
       } satisfies SendMessageOptions,
       expected: {
@@ -2264,13 +2253,8 @@ describe("AgentSession token-budget lifecycle", () => {
       label: "read-only agent",
       previousEnabled: true,
       next: { agentId: "observer" },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
-    },
-    {
-      label: "Memory experiment disabled",
-      previousEnabled: true,
-      next: { experiments: { tokenBudget: true, memory: false } },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+      // Read-only agents can still write their session-scope checkpoint.
+      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
     },
     {
       label: "memory tool disabled",
@@ -2291,7 +2275,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "queued advisories use dispatch permissions: $label",
     async ({ previousEnabled, next, expected }) => {
       const h = await setup();
-      const dispatchOptions: SendMessageOptions = { ...resumeOptions, ...next };
+      const dispatchOptions: SendMessageOptions = { ...options, ...next };
       if (dispatchOptions.agentId === "restricted" || dispatchOptions.agentId === "observer") {
         const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
         await fs.mkdir(agentsDir, { recursive: true });
@@ -2303,7 +2287,7 @@ describe("AgentSession token-budget lifecycle", () => {
         );
       }
       const previousOptions: SendMessageOptions = {
-        ...resumeOptions,
+        ...options,
         ...(!previousEnabled
           ? {
               toolPolicy: [
@@ -2339,7 +2323,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("unresolved dispatch permissions omit the advisory without consuming its claim", async () => {
     const h = await setup();
-    expect((await h.session.sendMessage("Start work", resumeOptions)).success).toBe(true);
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
     spyOn(
@@ -2697,7 +2681,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await seedLegacyFlushTurn(first, { muxMetadata: correlation });
     await first.session.dispose();
     const h = await setup({ previous: first });
-    const sendOptions = { ...resumeOptions, maxOutputTokens: 300, thinkingLevel: "high" as const };
+    const sendOptions = { ...options, maxOutputTokens: 300, thinkingLevel: "high" as const };
     expect((await h.session.resumeStream(sendOptions)).success).toBe(true);
     // The sealing intent is restored up front; the flush itself runs memory-only at the lowest
     // thinking with the bounded cap, whatever the caller configured.
@@ -2828,12 +2812,12 @@ describe("AgentSession token-budget lifecycle", () => {
     await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
-    // The Memory experiment was turned off before the restart resume.
+    // The memory tool was disabled before the restart resume.
     expect(
       (
         await h.session.resumeStream({
           ...options,
-          experiments: { tokenBudget: true, memory: false },
+          toolPolicy: [{ regex_match: "memory", action: "disable" }],
         })
       ).success
     ).toBe(true);
@@ -2849,7 +2833,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
     expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
     const unregister = eventSpine.useBefore(
       "request.assemble",
@@ -2877,7 +2861,7 @@ describe("AgentSession token-budget lifecycle", () => {
       await seedLegacyFlushTurn(first, { muxMetadata: correlation });
       await first.session.dispose();
       const h = await setup({ previous: first });
-      expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+      expect((await h.session.resumeStream(options)).success).toBe(true);
       expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
       await seedThreshold(h, 1);
       if (ending === "settled-step")
@@ -2916,7 +2900,7 @@ describe("AgentSession token-budget lifecycle", () => {
     );
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([
       "memory",
@@ -2929,7 +2913,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await seedLegacyFlushTurn(first);
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     const streamError = {
       workspaceId,
@@ -2989,7 +2973,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // No tools at all: the resumed turn can only end, then the queued rollover seals the window.
@@ -3008,7 +2992,7 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup({ previous: first, goals: true });
     assert(h.goalAccounting, "Expected an injected goal service");
     const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
     await emitUsageDelta(h);
@@ -4311,9 +4295,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async ({ usage, toolPolicy, settled, expected }) => {
       const h = await setup();
       const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
-      expect((await h.session.sendMessage("Start", { ...resumeOptions, toolPolicy })).success).toBe(
-        true
-      );
+      expect((await h.session.sendMessage("Start", { ...options, toolPolicy })).success).toBe(true);
       expect((await h.requests[0].onStepSettled?.(step(usage, settled)))?.decision).toBe("warn");
       h.settleStream(0, { contextUsage: { inputTokens: usage } });
       await h.waitForRequest(2);

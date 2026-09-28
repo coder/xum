@@ -377,8 +377,12 @@ export async function runMemoryIntuition(args: {
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS)
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS);
+    // The session scope is the agent's own rollover checkpoint, read directly after a rollover;
+    // recall ranks durable memories only.
     let selection = selectIndexForCue(
-      await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx)),
+      (await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx))).filter(
+        (entry) => entry.scope !== "session"
+      ),
       cue
     );
     stats.indexEntriesConsidered = selection.indexEntriesConsidered;

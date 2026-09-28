@@ -55,7 +55,6 @@ import {
   hasUnconsumedNewContextRequest,
   estimateLastStepToolResults,
   getLastStepToolResults,
-  resolveRolloverPayload,
   type ContextWindowRollover,
 } from "../../contextWindowRollover";
 import { resolveAgentForStream, type AgentResolutionResult } from "../../agentResolution";
@@ -67,15 +66,6 @@ import { log } from "../../log";
 import type { ContextManagementDependencies } from "../contextManagementService";
 import type { SessionContextHost } from "../sessionContextHost";
 import type { ContinuationEntry, PreparationReceipt } from "../types";
-
-/** A budget continuation continues a request; any other sent message owns its own turn. */
-function isBudgetContinuation(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  return (
-    muxMetadata?.contextBudgetContinuation === true ||
-    muxMetadata?.type === "context-budget-warning"
-  );
-}
 
 /** Budget policy and window claims; the host retains queue and publication authority. */
 export class TokenBudgetStrategy {
@@ -224,7 +214,7 @@ export class TokenBudgetStrategy {
           editingCapable: isExecLikeEditingCapableInResolvedChain(
             resolved.data.agentInheritanceChain
           ),
-        }).workspace === "readwrite",
+        }).session === "readwrite",
       sessionHistoryAvailable: allowed.includes("session_history"),
       newContextAvailable: allowed.includes("new_context"),
     };
@@ -568,10 +558,6 @@ export class TokenBudgetStrategy {
             contextTokens: decision.projected,
             maxTokens: recordedLimit,
             budgetTokens: getContextBudgetHardCeiling(recordedLimit),
-            ...resolveRolloverPayload({
-              history: history.data,
-              carryRequest: isBudgetContinuation(userMessage),
-            }),
           })
         : undefined;
     // Recovery access is required only when sealing old context, not for a
@@ -764,11 +750,6 @@ export class TokenBudgetStrategy {
         contextTokens: decision.projected,
         maxTokens: recordedLimit,
         budgetTokens: getContextBudgetHardCeiling(recordedLimit),
-        ...resolveRolloverPayload({
-          history: history.data,
-          handoff: step.newContextHandoff,
-          carryRequest: true,
-        }),
       };
     } else {
       assert(
@@ -919,7 +900,6 @@ export class TokenBudgetStrategy {
             maxTokens: finalRow.maxTokens,
             // Legacy final warnings reported the full model limit.
             budgetTokens: finalRow.budgetTokens ?? finalRow.maxTokens,
-            ...resolveRolloverPayload({ history: input.history, carryRequest: true }),
           };
           if (this.host.continuations.isEmpty()) {
             const { contextBudgetFlush: _flush, ...continuationMetadata } = flushMuxMetadata;
@@ -1080,11 +1060,6 @@ export class TokenBudgetStrategy {
       flushOpportunity: false,
       contextTokens: estimate ?? maxTokens,
       maxTokens,
-      // The failed request is re-sent after the lead-in; carry the request only for a continuation.
-      ...resolveRolloverPayload({
-        history: input.history,
-        carryRequest: isBudgetContinuation(user),
-      }),
     };
     const { historySequence: _sequence, ...metadata } = user.metadata ?? {};
     const { contextBudgetFlush: _flushFlag, ...muxMetadata } = metadata.muxMetadata ?? {

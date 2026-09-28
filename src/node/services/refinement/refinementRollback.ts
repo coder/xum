@@ -53,6 +53,7 @@ import {
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { withTargetMutationLocks } from "./targetMutationLocks";
+import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
@@ -313,6 +314,17 @@ function resolveConfinementRoot(
   if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
     if (relToWorkspaceMemory.length > 0) {
       return workspaceMemoryRoot;
+    }
+    throw new RollbackError(
+      `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+    );
+  }
+  // <sessionDir>/session-memory/<file...> (session scope), constrained the same way.
+  const sessionMemoryRoot = path.join(path.resolve(sessionDir), SESSION_MEMORY_DIR_NAME);
+  const relToSessionMemory = path.relative(sessionMemoryRoot, resolved);
+  if (!relToSessionMemory.startsWith("..") && !path.isAbsolute(relToSessionMemory)) {
+    if (relToSessionMemory.length > 0) {
+      return sessionMemoryRoot;
     }
     throw new RollbackError(
       `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`

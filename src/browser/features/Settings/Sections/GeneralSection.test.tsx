@@ -477,6 +477,7 @@ describe("GeneralSection", () => {
         const overrides = {
           [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
           [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+          [EXPERIMENT_IDS.MEMORY]: true,
         };
         const setup = renderGeneralSection({ [source]: overrides });
         await hydrateExperiments(setup);
@@ -491,7 +492,9 @@ describe("GeneralSection", () => {
             expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
           }
         }
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(source === "localOverrides" ? 2 : 0);
+        expect(setup.setOverrideMock).toHaveBeenCalledTimes(
+          source === "localOverrides" ? Object.keys(overrides).length : 0
+        );
         for (const [id, enabled] of Object.entries(overrides)) {
           expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
             source === "localOverrides" ? JSON.stringify(enabled) : null
@@ -521,6 +524,7 @@ describe("GeneralSection", () => {
       backend: {
         [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true,
         [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+        [EXPERIMENT_IDS.MEMORY]: true,
       },
       label: "Token Budget",
     },
@@ -601,7 +605,10 @@ describe("GeneralSection", () => {
         </>
       );
     }
-    const setup = renderGeneralSection({ children: <ConflictToggles /> });
+    const setup = renderGeneralSection({
+      children: <ConflictToggles />,
+      backendOverrides: { [EXPERIMENT_IDS.MEMORY]: true },
+    });
     await hydrateExperiments(setup);
     await chooseSelectOption(setup.view, "Compaction strategy", "Token Budget");
     const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
@@ -624,8 +631,26 @@ describe("GeneralSection", () => {
         [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
         [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
         [EXPERIMENT_IDS.RLM]: true,
+        [EXPERIMENT_IDS.MEMORY]: true,
       })
     );
+  });
+
+  test("hides Token Budget without Agent Memory and keeps the saved preference", async () => {
+    const setup = renderGeneralSection({
+      backendOverrides: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+    });
+    await hydrateExperiments(setup);
+    const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
+    expect(trigger.textContent).toBe("Summarize");
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    const portalRoot = setup.view.baseElement.ownerDocument.body;
+    await waitFor(() =>
+      expect(within(portalRoot).getAllByText("Continuous").length).toBeGreaterThan(0)
+    );
+    expect(within(portalRoot).queryAllByText("Token Budget")).toHaveLength(0);
+    expect(setup.backendOverrides).toEqual({ [EXPERIMENT_IDS.TOKEN_BUDGET]: true });
+    expect(setup.setOverrideMock).not.toHaveBeenCalled();
   });
 
   test("persists flat chat list mode from the Sidebar group", () => {

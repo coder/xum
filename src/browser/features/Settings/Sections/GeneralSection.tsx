@@ -185,12 +185,18 @@ export function GeneralSection() {
   const [tokenBudget, setTokenBudget] = useExperiment(EXPERIMENT_IDS.TOKEN_BUDGET);
   const ptc = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const rlm = useExperimentValue(EXPERIMENT_IDS.RLM);
-  // Preserve legacy both-enabled precedence without rewriting preferences on load.
+  // Token Budget keeps its checkpoint in agent memory, so it is offered only with Agent Memory on.
+  const memory = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  // Preserve legacy both-enabled precedence without rewriting preferences on load. A saved Token
+  // Budget preference without memory shows the effective strategy and stays saved.
   const compactionStrategy: CompactionStrategy = continuousCompaction
     ? "continuous"
-    : tokenBudget
+    : tokenBudget && memory
       ? "token-budget"
       : "summarize";
+  const compactionStrategies = COMPACTION_STRATEGIES.filter(
+    (strategy) => memory || strategy.value !== "token-budget"
+  );
   const tokenBudgetInactive = compactionStrategy === "token-budget" && ptc && rlm;
   const [compactionOpen, setCompactionOpen] = useState(false);
   const sameStrategyActivation = useRef<CompactionStrategy | null>(null);
@@ -950,7 +956,7 @@ export function GeneralSection() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {COMPACTION_STRATEGIES.map((strategy) => (
+              {compactionStrategies.map((strategy) => (
                 <SelectItem
                   key={strategy.value}
                   value={strategy.value}

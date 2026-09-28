@@ -11,6 +11,9 @@
  *                user opts into the project bundle)
  * - workspace -> <sessionDir>/memory/ of the task-tree OWNER (host-local, deleted
  *                with that workspace; sub-agents share their parent's store)
+ * - session   -> <sessionDir>/session-memory/ of the ACTING workspace (host-local,
+ *                deleted with that workspace; never shared with the parent or
+ *                sub-agents). Token budget keeps its rollover checkpoint here.
  */
 
 import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";
@@ -18,8 +21,14 @@ import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";
 /** Virtual root prefix all memory paths are expressed under. */
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
-export const MEMORY_SCOPES = ["global", "project", "workspace"] as const;
+export const MEMORY_SCOPES = ["global", "project", "workspace", "session"] as const;
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
+
+/** Directory of the session scope inside the acting workspace's session dir. */
+export const SESSION_MEMORY_DIR_NAME = "session-memory";
+
+/** Virtual directory of the session scope, where token-budget agents keep their checkpoint. */
+export const SESSION_MEMORY_VIRTUAL_DIR = `${MEMORY_VIRTUAL_ROOT}/session/`;
 
 export type MemoryAccessLevel = "read" | "readwrite";
 
@@ -28,7 +37,9 @@ export type MemoryAccessLevel = "read" | "readwrite";
  * - Exec-like (editing-capable): all scopes read-write.
  * - Plan-like: all scopes read-write; project memory is host-local and never
  *   mutates the checkout.
- * - Explore/read-only: all scopes read-only (view only).
+ * - Explore/read-only: all scopes read-only (view only), except session.
+ * Every agent may write its own session scope: it is a private checkpoint that no
+ * other agent reads, and read-only agents need it to survive a context rollover.
  */
 export type MemoryScopeAccess = Record<MemoryScope, MemoryAccessLevel>;
 

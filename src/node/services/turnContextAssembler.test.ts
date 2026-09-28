@@ -22,6 +22,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
@@ -100,6 +101,7 @@ async function buildSystemContextForTest(args: {
   planFilePath?: string;
   memoryToolAvailable?: boolean;
   tokenBudgetEnabled?: boolean;
+  contextWindowIds?: Parameters<typeof buildStreamSystemContext>[0]["contextWindowIds"];
   workspaceMemoryWritable?: boolean;
   hotMemoriesBlock?: string;
   intuitionToolAvailable?: boolean;
@@ -123,6 +125,7 @@ async function buildSystemContextForTest(args: {
     mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
     tokenBudgetEnabled: args.tokenBudgetEnabled,
+    contextWindowIds: args.contextWindowIds,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     hotMemoriesBlock: args.hotMemoriesBlock,
     intuitionToolAvailable: args.intuitionToolAvailable,
@@ -542,6 +545,41 @@ describe("assemblePromptPayload", () => {
 
     expect(payload.messages.map((message) => message.role)).toEqual(["assistant", "user"]);
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
+  });
+
+  test("token budget tags persisted user rows with their session_history item ID", async () => {
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 7 });
+    const reply = createMuxMessage("reply", "assistant", "on it", { historySequence: 8 });
+    const advisory = createContextBudgetWarning({
+      contextTokens: 80_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+    });
+    advisory.metadata!.historySequence = 9;
+    const unsequenced = createMuxMessage("pending", "user", "follow-up");
+    const history = [request, reply, advisory, unsequenced];
+    const text = (payload: Awaited<ReturnType<typeof assemble>>) =>
+      JSON.stringify(payload.messages);
+
+    const tagged = text(await assemble({ history, tagHistoryItemIds: true }));
+    expect(tagged).toContain("[id: 7]");
+    expect(tagged).not.toContain("[id: 8]");
+    // Budget-internal rows and rows without a persisted sequence cannot be read back.
+    expect(tagged).not.toContain("[id: 9]");
+    expect(tagged).not.toContain("[id: m:");
+    expect(text(await assemble({ history }))).not.toContain("[id:");
+
+    // A tag depends only on its own row, so appending history keeps the cached prefix intact.
+    const shortPayload = await assemble({ history: [request, reply], tagHistoryItemIds: true });
+    const longPayload = await assemble({
+      history: [request, reply, createMuxMessage("next", "user", "next", { historySequence: 10 })],
+      tagHistoryItemIds: true,
+    });
+    expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
+      JSON.stringify(shortPayload.messages)
+    );
   });
 });
 
@@ -992,10 +1030,10 @@ describe("buildStreamSystemContext", () => {
       hotMemoriesBlock: notesBlock,
     });
     const notesSection = (text: string) =>
-      text.split("<context-notes-guidance>")[1]?.split("</context-notes-guidance>")[0];
+      text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
     expect(notesSection(writableNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).not.toBe(
+    // Every agent may write its session checkpoint, so read-only agents get the same guidance.
+    expect(notesSection(readOnlyNotes.systemMessage)).toBe(
       notesSection(writableNotes.systemMessage)
     );
     expect(memorySection(readOnlyNotes.systemMessage)).not.toEqual(
@@ -1020,6 +1058,20 @@ describe("buildStreamSystemContext", () => {
       expect(filtered).not.toContain("<memory-tool-guidance>");
       expect(filtered).toContain(pluginContext);
     }
+
+    // session_history needs the window IDs even when tool policy removes the memory tool.
+    const contextWindowIds = { currentWindowId: "w:12", previousWindowId: "w:5" };
+    const windowSection = (text: string) =>
+      text.split("<context_window>")[1]?.split("</context_window>")[0];
+    const budgetWithoutMemory = await buildSystemContextForTest({
+      ...buildArgs,
+      tokenBudgetEnabled: true,
+      contextWindowIds,
+    });
+    expect(windowSection(budgetWithoutMemory.systemMessage)).toContain("w:12");
+    expect(windowSection(budgetWithoutMemory.systemMessage)).toContain("w:5");
+    const budgetOff = await buildSystemContextForTest({ ...buildArgs, contextWindowIds });
+    expect(windowSection(budgetOff.systemMessage)).toBeUndefined();
   });
 
   test("uses the resolved agent discovery runtime for parent-only subagent prompts", async () => {

@@ -32,6 +32,7 @@ const SCOPE_LABELS: Record<MemoryScope, string> = {
   global: "Global",
   project: "Project",
   workspace: "Workspace",
+  session: "Session",
 };
 
 /** File name shown in the list: path relative to its scope root. */

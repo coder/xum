@@ -38,7 +38,9 @@ export function useAutoCompactionSettings(
   const continuousCompaction = useExperimentValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const ptc = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const rlm = useExperimentValue(EXPERIMENT_IDS.RLM);
-  const rolloverEnabled = tokenBudget && !continuousCompaction && !(ptc && rlm);
+  // Mirrors isTokenBudgetActive: token budget hard-depends on Agent Memory.
+  const memory = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const rolloverEnabled = tokenBudget && memory && !continuousCompaction && !(ptc && rlm);
 
   return { threshold, setThreshold, rolloverEnabled };
 }

@@ -19,7 +19,7 @@ import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, isTokenBudgetActive } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -212,6 +212,7 @@ import {
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
 } from "./turnContextAssembler";
+import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
@@ -1513,8 +1514,7 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const sessionHistoryEnabled =
-      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
+    const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1625,7 +1625,7 @@ export class TurnRequestBuilder {
     // Flush turns: keep global/project stores read-only and pin mutations to the notes file
     // (memoryWritePath below) so injected transcript content cannot reach other memory.
     const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
-      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
+      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace, session: "read" }
       : agentMemoryAccess;
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
@@ -1851,6 +1851,7 @@ export class TurnRequestBuilder {
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
+    const contextWindowIds = tokenBudgetEnabled ? resolveContextWindowIds(messages) : undefined;
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1881,6 +1882,7 @@ export class TurnRequestBuilder {
         advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
+        contextWindowIds,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
         intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
@@ -2890,6 +2892,7 @@ export class TurnRequestBuilder {
               providersConfig: seed.providersConfig,
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
+              tagHistoryItemIds: tokenBudgetEnabled,
             },
             {
               enabled: tokenBudgetEnabled,

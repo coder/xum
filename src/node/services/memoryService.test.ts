@@ -1008,6 +1008,46 @@ describe("MemoryService", () => {
       ).toBe(false);
     });
 
+    it("keeps each agent's session checkpoint in its own session dir, invisible to the rest of the tree", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const checkpoint = "/memories/session/checkpoint.md";
+      for (const workspaceId of ["ws-owner", "ws-child"]) {
+        const created = await fixture.service.create(
+          { ...fixture.ctx, workspaceId },
+          checkpoint,
+          `${workspaceId} state`,
+          "agent"
+        );
+        expect(created.success).toBe(true);
+      }
+      // Parent and child each read their own checkpoint, never the other's.
+      for (const [workspaceId, other] of [
+        ["ws-owner", "ws-child"],
+        ["ws-child", "ws-owner"],
+      ]) {
+        const viewed = await fixture.service.view({ ...fixture.ctx, workspaceId }, checkpoint);
+        expect(viewed.success).toBe(true);
+        if (viewed.success) {
+          expect(viewed.output).toContain(`${workspaceId} state`);
+          expect(viewed.output).not.toContain(`${other} state`);
+        }
+      }
+      // The grandchild shares the owner's workspace scope but not its checkpoint.
+      const grandchild = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-grandchild" },
+        checkpoint
+      );
+      expect(grandchild.success).toBe(false);
+      const ownerWorkspaceScope = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
+        "/memories/workspace"
+      );
+      if (ownerWorkspaceScope.success) {
+        expect(ownerWorkspaceScope.output).not.toContain("checkpoint.md");
+      }
+    });
+
     it("refuses a sub-agent's mutation once the owner's removal tombstone exists", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

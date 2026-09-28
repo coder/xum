@@ -18,11 +18,15 @@ import {
   type MemoryService,
 } from "@/node/services/memoryService";
 
-/** Safe default: without an explicit policy, every scope is read-only. */
+/**
+ * Safe default: without an explicit policy, every shared scope is read-only. The session scope is
+ * the agent's own checkpoint, which no other agent reads, so read-only agents may write it too.
+ */
 const READ_ONLY_ACCESS: MemoryScopeAccess = {
   global: "read",
   project: "read",
   workspace: "read",
+  session: "readwrite",
 };
 
 /** Full write access to every scope, shared by plan-like and exec-like agents. */
@@ -30,6 +34,7 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
   global: "readwrite",
   project: "readwrite",
   workspace: "readwrite",
+  session: "readwrite",
 };
 
 /**
@@ -38,7 +43,7 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
  * - Plan-like and editing-capable (exec-like) agents get read-write everywhere;
  *   project memory is host-local (opt-in settings backup aside) and never
  *   mutates the repo checkout, so even plan agents may write it.
- * - Everything else (explore/read-only agents) is view-only.
+ * - Everything else (explore/read-only agents) is view-only, except its own session scope.
  */
 export function resolveMemoryAccessPolicy(options: {
   planLike: boolean;

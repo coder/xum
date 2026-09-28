@@ -36,6 +36,7 @@ import {
   MEMORY_VIEW_MAX_DEPTH,
   MEMORY_VIRTUAL_ROOT,
   type MemoryScope,
+  SESSION_MEMORY_DIR_NAME,
 } from "@/common/constants/memory";
 import { PlatformPaths } from "@/common/utils/paths";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -255,6 +256,15 @@ async function assertRenameDestinationOutsideDirSource(args: {
 /** Host-local root of one workspace's memory scope (<sessionDir>/memory). */
 export function workspaceMemoryStorePath(sessionsDir: string, workspaceId: string): string {
   return path.join(sessionsDir, workspaceId, "memory");
+}
+
+/**
+ * Host-local root of one workspace's session scope. It sits beside, not inside, the workspace
+ * store: a sub-agent's own `<sessionDir>/memory` is its legacy private notebook, which the
+ * workspace scope adopts into the owner's store, and the session checkpoint must never move.
+ */
+export function sessionMemoryStorePath(sessionsDir: string, workspaceId: string): string {
+  return path.join(sessionsDir, workspaceId, SESSION_MEMORY_DIR_NAME);
 }
 
 export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
@@ -1184,6 +1194,17 @@ export class MemoryService extends EventEmitter {
         }
         return new LocalMemoryStore(
           workspaceMemoryStorePath(this.config.sessionsDir, this.ownerWorkspaceIdFor(ctx))
+        );
+      }
+      case "session": {
+        if (!ctx.workspaceId) {
+          throw new MemoryCommandError(
+            "Session memory is unavailable: no workspace is associated with this session"
+          );
+        }
+        // The ACTING workspace, never the task-tree owner: each agent keeps its own checkpoint.
+        return new LocalMemoryStore(
+          sessionMemoryStorePath(this.config.sessionsDir, ctx.workspaceId)
         );
       }
     }
@@ -2646,6 +2667,11 @@ export class MemoryService extends EventEmitter {
     return rel.split(path.sep)[0];
   }
 
+  private isSessionStore(store: MemoryStore): boolean {
+    const rel = path.relative(this.config.sessionsDir, store.physicalRoot);
+    return rel.split(path.sep)[1] === SESSION_MEMORY_DIR_NAME;
+  }
+
   /** Acting workspace plus the store's owner: both must be alive to touch the store. */
   private guardedWorkspaceIds(ctx: MemoryScopeContext, store: MemoryStore): string[] {
     const owner = this.storeOwnerWorkspaceId(store);
@@ -2799,7 +2825,9 @@ export class MemoryService extends EventEmitter {
     }
     if (ctx.workspaceId === "") return;
     const boundOwner = this.storeOwnerWorkspaceId(store);
-    if (boundOwner !== null) {
+    // Only the workspace scope folds into the task-tree owner; a session store always belongs to
+    // the acting workspace, so ownership cannot move under it.
+    if (boundOwner !== null && !this.isSessionStore(store)) {
       const currentOwner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
       if (currentOwner !== boundOwner) {
         throw new MemoryCommandError(
@@ -2937,8 +2965,9 @@ export class MemoryService extends EventEmitter {
       actor,
       ...(reason === undefined ? {} : { reason }),
       // Owner, not actor: subscribers filter workspace-scope events by the
-      // store they display, and every tree member displays the owner's.
-      workspaceId: this.ownerWorkspaceIdFor(ctx),
+      // store they display, and every tree member displays the owner's. The
+      // session store belongs to the acting workspace alone.
+      workspaceId: scope === "session" ? ctx.workspaceId : this.ownerWorkspaceIdFor(ctx),
       projectPath: ctx.projectPath,
     };
     this.emit("change", event);
@@ -3802,7 +3831,9 @@ export class MemoryService extends EventEmitter {
       onlyContextNotes?: boolean;
     }
   ): Promise<MemoryHotSetItem[]> {
-    const entries = await this.listIndexEntries(ctx);
+    // The session scope is an agent's rollover checkpoint: it reads it on demand after a
+    // rollover, so it never takes preloaded hot-set space.
+    const entries = (await this.listIndexEntries(ctx)).filter((entry) => entry.scope !== "session");
     const meta = await this.metaService.getEntries();
     const candidates = entries.map((entry) => {
       const key = this.logicalKeyFor(ctx, entry.scope, entry.relPath);

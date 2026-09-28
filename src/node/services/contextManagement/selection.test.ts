@@ -13,6 +13,11 @@ const cases: Array<{
   { name: "default", flags: {}, expected: { configured: "summarize" } },
   { name: "budget", flags: { tokenBudget: true }, expected: { configured: "token-budget" } },
   {
+    name: "budget without Agent Memory",
+    flags: { tokenBudget: true, memory: false },
+    expected: { configured: "summarize" },
+  },
+  {
     name: "continuous",
     flags: { continuousCompaction: true },
     expected: { configured: "continuous" },
@@ -79,13 +84,16 @@ function backendFlags(flags: Flags): (id: ExperimentId) => boolean {
     [EXPERIMENT_IDS.TOKEN_BUDGET]: flags.tokenBudget,
     [EXPERIMENT_IDS.RLM]: flags.rlm,
     [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: flags.programmaticToolCalling,
+    [EXPERIMENT_IDS.MEMORY]: flags.memory,
   };
   return (id) => values[id] === true;
 }
 
 describe("context strategy selection", () => {
   for (const source of ["request", "backend"] as const) {
-    test.each(cases)(`${source}: $name`, ({ flags, compact, expected }) => {
+    test.each(cases)(`${source}: $name`, ({ flags: caseFlags, compact, expected }) => {
+      // Token budget requires Agent Memory; cases enable it unless they test its absence.
+      const flags = { memory: true, ...caseFlags };
       expect(
         resolveContextStrategy({
           experiments: source === "request" ? flags : undefined,
@@ -123,6 +131,7 @@ describe("context strategy selection", () => {
           continuousCompaction: true,
           rlm: true,
           programmaticToolCalling: true,
+          memory: true,
         }),
         isCompactionRequest: false,
       })
@@ -133,7 +142,8 @@ describe("context strategy selection", () => {
     let tokenBudget = true;
     const input = {
       experiments: {},
-      isEnabled: (id: ExperimentId) => id === EXPERIMENT_IDS.TOKEN_BUDGET && tokenBudget,
+      isEnabled: (id: ExperimentId) =>
+        id === EXPERIMENT_IDS.MEMORY || (id === EXPERIMENT_IDS.TOKEN_BUDGET && tokenBudget),
       isCompactionRequest: false,
     };
     expect(resolveContextStrategy(input)).toEqual({ configured: "token-budget" });

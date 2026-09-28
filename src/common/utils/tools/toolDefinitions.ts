@@ -31,7 +31,6 @@ import {
   SESSION_HISTORY_MAX_QUERY_CHARS,
   SESSION_HISTORY_MAX_ID_CHARS,
   SESSION_HISTORY_MAX_READ_CHARS,
-  CONTEXT_HANDOFF_MAX_CHARS,
 } from "@/common/constants/contextBudget";
 import {
   SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT,
@@ -65,6 +64,7 @@ import {
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
   MEMORY_INTUITION_MAX_RESULTS,
+  SESSION_MEMORY_VIRTUAL_DIR,
 } from "@/common/constants/memory";
 import {
   ConfigMutationPathSchema,
@@ -2571,20 +2571,10 @@ export const TOOL_DEFINITIONS = {
   new_context: {
     ptcExcluded: "Context lifecycle request; must settle with the top-level step",
     description:
-      "Request a fresh context window (token-budget mode). Nothing happens immediately: the rollover is scheduled after this tool step settles, so sibling tool calls in the same step still complete and their results are persisted. " +
-      "The next window starts with a rollover marker and can retrieve earlier transcript data through session_history; workspace files, tasks, goals and costs are preserved, and this is not a privacy reset. " +
-      "Prefer this after a context handoff request or at a natural task boundary. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
-    schema: z
-      .object({
-        handoff: z
-          .string()
-          .min(1)
-          .max(CONTEXT_HANDOFF_MAX_CHARS)
-          .describe(
-            "Handoff for your next context window, which does not carry this transcript. Xum shows it at the start of that window, together with the request you are working on. Essential state first: goal, decisions, invariants, current step, open tasks, blockers, and the exact paths, commands, and IDs needed to resume."
-          ),
-      })
-      .strict(),
+      "Start a new context window. Does not clear, reset, or otherwise affect environment state. " +
+      `Save your checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} first: the new window does not include this conversation or a summary of it, so you recover only through that checkpoint and session_history. ` +
+      "The new window starts after this tool step settles, so sibling tool calls in the same step still complete. A request is honored once per window; if automatic rollover is disabled (threshold 100%), the request is ignored.",
+    schema: z.object({}).strict(),
     resultSchema: z.object({
       success: z.boolean(),
       status: z.literal("scheduled"),
@@ -2601,6 +2591,7 @@ export const TOOL_DEFINITIONS = {
       "- /memories/global/... — personal, permanent, shared across all projects\n" +
       "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
       "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
+      "- /memories/session/... — your own checkpoint for this session; never shared with the parent or sub-agents, lasts across context windows, deleted with this workspace, and writable even when the other scopes are read-only\n" +
       "Commands:\n" +
       "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
       "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +

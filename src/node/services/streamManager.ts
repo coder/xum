@@ -1,7 +1,6 @@
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
-import { readSettledNewContextRequest } from "./contextWindowRollover";
 import {
   checkAssembledRequestBudgetForModel,
   estimateAssembledRequestTokensForModel,
@@ -291,8 +290,6 @@ export interface SettledStepBudget {
   memoryWritable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
   newContextRequested?: boolean;
-  /** The `handoff` input of that successful `new_context` call. */
-  newContextHandoff?: string;
 }
 
 export type ContextBudgetStepDecision = "continue" | "warn" | "rollover" | "block";
@@ -2667,10 +2664,8 @@ export class StreamManager {
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
-            ...readSettledNewContextRequest(
-              step.toolResults.find(
-                (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
-              )
+            newContextRequested: step.toolResults.some(
+              (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
             ),
           });
           // All siblings have settled: stop before another provider step without discarding results.

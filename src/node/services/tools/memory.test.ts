@@ -19,6 +19,7 @@ import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHe
 import type { MemoryToolResult } from "@/common/types/tools";
 import {
   MEMORY_MAX_FILE_BYTES,
+  MEMORY_SCOPES,
   type MemoryScopeAccess,
   type MemoryScope,
 } from "@/common/constants/memory";
@@ -68,6 +69,7 @@ async function createFixture(options?: {
     global: "readwrite",
     project: "readwrite",
     workspace: "readwrite",
+    session: "readwrite",
   };
   config.memoryWritePath = options?.memoryWritePath;
   return {
@@ -274,7 +276,7 @@ describe("memory tool", () => {
     ];
 
     for (const { name, access } of MATRIX) {
-      for (const scope of ["global", "project", "workspace"] as const) {
+      for (const scope of MEMORY_SCOPES) {
         const writable = access[scope] === "readwrite";
 
         it(`${name}: mutating commands on ${scope} scope are ${writable ? "allowed" : "rejected"}`, async () => {
@@ -588,16 +590,20 @@ describe("memory tool", () => {
         global: "readwrite",
         project: "readwrite",
         workspace: "readwrite",
+        session: "readwrite",
       });
       expect(resolveMemoryAccessPolicy({ planLike: true, editingCapable: true })).toEqual({
         global: "readwrite",
         project: "readwrite",
         workspace: "readwrite",
+        session: "readwrite",
       });
+      // Read-only agents still own their session checkpoint.
       expect(resolveMemoryAccessPolicy({ planLike: false, editingCapable: false })).toEqual({
         global: "read",
         project: "read",
         workspace: "read",
+        session: "readwrite",
       });
     });
   });

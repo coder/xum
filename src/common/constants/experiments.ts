@@ -102,7 +102,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.TOKEN_BUDGET,
     name: "Token-budget context windows",
     description:
-      "Start fresh context windows instead of automatic summaries, with session_history for retrieval. Requires session_history; continuous compaction and RLM take precedence.",
+      "Start fresh context windows instead of automatic summaries, with session_history for retrieval and a /memories/session/ checkpoint. Requires Agent Memory and session_history; continuous compaction and RLM take precedence.",
     enabledByDefault: false,
     // Configured together with Continuous Compaction in Settings → General.
     showInSettings: false,
@@ -204,7 +204,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.MEMORY,
     name: "Agent Memory",
     description:
-      "Enable the agent memory tool and memory index (global / project / workspace scopes)",
+      "Enable the agent memory tool and memory index (global / project / workspace / session scopes)",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -298,6 +298,21 @@ function getPlatformDisplayName(platform: NodeJS.Platform): string {
     default:
       return platform;
   }
+}
+
+/**
+ * Token budget hard-depends on Agent Memory: an agent keeps its rollover checkpoint in the
+ * /memories/session/ scope, so without the memory tool a fresh window could not recover its state.
+ * A missing explicit flag falls back to the backend value, like every other experiment read.
+ */
+export function isTokenBudgetActive(
+  experiments: { tokenBudget?: boolean; memory?: boolean } | undefined,
+  isEnabled: (id: ExperimentId) => boolean
+): boolean {
+  return (
+    (experiments?.tokenBudget ?? isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
+    (experiments?.memory ?? isEnabled(EXPERIMENT_IDS.MEMORY))
+  );
 }
 
 export function isExperimentSupportedOnPlatform(

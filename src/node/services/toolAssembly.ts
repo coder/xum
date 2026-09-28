@@ -12,7 +12,11 @@
 import type { Tool } from "ai";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { getErrorMessage } from "@/common/utils/errors";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  isTokenBudgetActive,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 
 /** Renderer-sent experiment flags (SendMessageOptions.experiments). */
@@ -149,7 +153,7 @@ export function resolveBackendGatedPtcExperiments(
       experiments?.programmaticToolCalling ??
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
-    tokenBudget: experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
+    tokenBudget: isTokenBudgetActive(experiments, isExperimentEnabled),
     continuousCompaction:
       experiments?.continuousCompaction ??
       isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),

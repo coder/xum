@@ -1,4 +1,8 @@
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  isTokenBudgetActive,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { isRlmModeEnabled } from "../branchSummary";
 
@@ -13,8 +17,7 @@ export function resolveContextStrategy(input: {
   isEnabled: (id: ExperimentId) => boolean;
   isCompactionRequest: boolean;
 }): ContextStrategySelection {
-  const tokenBudget =
-    input.experiments?.tokenBudget ?? input.isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
+  const tokenBudget = isTokenBudgetActive(input.experiments, input.isEnabled);
   const continuous =
     input.experiments?.continuousCompaction ??
     input.isEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);

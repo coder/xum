@@ -39,6 +39,7 @@ import {
   withTargetMutationLocks,
 } from "@/node/services/refinement/targetMutationLocks";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /**
@@ -310,6 +311,11 @@ async function withRemovalLocks(
     path.join(args.sessionDir, "memory")
   );
   const sharedMemoryKey = memoryMutationLockKey(args.rootDir, path.join(args.rootDir, "memory"));
+  // The session scope store also lives inside the session directory, under its own key.
+  const sessionMemoryKey = memoryMutationLockKey(
+    args.rootDir,
+    path.join(args.sessionDir, SESSION_MEMORY_DIR_NAME)
+  );
   const ownerMemoryKeys =
     args.sharedWorkspaceMemorySessionDir === undefined
       ? []
@@ -347,7 +353,7 @@ async function withRemovalLocks(
     });
     await withTargetMutationLocks(
       args.rootDir,
-      [sessionDirKey, workspaceMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
+      [sessionDirKey, workspaceMemoryKey, sessionMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
       async () => {
         // History append serialization (r63): a foreign backend's in-flight
         // stream can be mid-append under the history write lock; acquiring

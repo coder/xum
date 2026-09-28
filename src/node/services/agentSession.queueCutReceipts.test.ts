@@ -98,7 +98,7 @@ async function setup(args?: { failure?: boolean }) {
     const sent = await h.session.sendMessage("Work through the task", {
       model: BUDGET_MODEL,
       agentId: "exec",
-      experiments: { tokenBudget: true },
+      experiments: { tokenBudget: true, memory: true },
     });
     expect(sent.success).toBe(true);
     return firstRequest.promise;
