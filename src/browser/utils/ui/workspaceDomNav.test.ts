@@ -16,17 +16,29 @@ function renderWorkspaceRows(workspaceIds: string[]): void {
 }
 
 describe("workspaceDomNav", () => {
+  // Restore whatever DOM globals the process had, never `undefined`: later files in the same
+  // bun process can depend on them. Clearing HTMLElement broke HeldInput.test.tsx's
+  // `instanceof HTMLElement` check whenever tests/ui/dom (which installs it once per process)
+  // had already been imported by an earlier file (#5084).
+  const globals = globalThis as unknown as Record<"window" | "document" | "HTMLElement", unknown>;
+  let previous: Pick<typeof globals, "window" | "document" | "HTMLElement">;
+
   beforeEach(() => {
+    previous = {
+      window: globals.window,
+      document: globals.document,
+      HTMLElement: globals.HTMLElement,
+    };
     const happyWindow = new GlobalWindow();
-    globalThis.window = happyWindow as unknown as Window & typeof globalThis;
-    globalThis.document = happyWindow.document as unknown as Document;
-    (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = happyWindow.HTMLElement;
+    globals.window = happyWindow;
+    globals.document = happyWindow.document;
+    globals.HTMLElement = happyWindow.HTMLElement;
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement = undefined;
+    globals.window = previous.window;
+    globals.document = previous.document;
+    globals.HTMLElement = previous.HTMLElement;
   });
 
   test("returns visible workspace IDs in DOM order", () => {
