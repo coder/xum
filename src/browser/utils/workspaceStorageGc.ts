@@ -15,7 +15,8 @@
  *   project config (which still lists workspaces the backend hides, e.g. multi-project ones while
  *   that experiment is off) and the metadata this tab currently holds. The backend reports no
  *   per-project metadata failures, so the project config ids (read straight from config.json)
- *   are the backstop when a metadata build drops or re-identifies a workspace.
+ *   are the backstop when a metadata build drops or re-identifies an active workspace. An empty
+ *   project list aborts the pass, because it means the config read behind both lists failed.
  * - Only stable-format workspace ids and exact creation-draft scopes are ever collected (see
  *   findOrphanedWorkspaceStorageKeys).
  */
@@ -99,6 +100,12 @@ export async function collectOrphanedWorkspaceStorage(
     input.listArchivedWorkspaces(),
     input.listProjects(),
   ]);
+  // Both lists are built from config.json and resolve empty instead of throwing when the backend
+  // cannot read it (workspace.list swallows errors, loadConfigOrDefault falls back to defaults).
+  // Active workspaces exist, so an empty project list means that read failed, and then an empty
+  // archived list proves nothing either. projects.list omits archived workspaces, so it cannot
+  // stand in for the archived list.
+  if (projects.length === 0) return [];
   for (const workspace of archivedWorkspaces) knownWorkspaceIds.add(workspace.id);
   for (const [, project] of projects) {
     for (const workspace of project.workspaces) {

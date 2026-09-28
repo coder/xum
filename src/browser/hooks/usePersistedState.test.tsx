@@ -86,7 +86,7 @@ describe("persisted state writes under storage quota pressure", () => {
       "planContent:aaaaaaaaaa",
     ];
     for (const key of cacheKeys) storage.seed(key, "x".repeat(300));
-    const keptKeys = ["reviewState:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
+    const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
     for (const key of keptKeys) storage.seed(key, "y".repeat(150));
 
     const saved = updatePersistedState("input:quota-draft", "z".repeat(600));
@@ -101,7 +101,7 @@ describe("persisted state writes under storage quota pressure", () => {
   test("reports failure without throwing when eviction cannot free enough space", () => {
     installStorage(1_000);
     storage.seed("session-cost:bbbbbbbbbb", "x".repeat(100));
-    storage.seed("reviewState:bbbbbbbbbb", "y".repeat(800));
+    storage.seed("review-state:bbbbbbbbbb", "y".repeat(800));
     const events: PersistedStateWriteEvent[] = [];
     const unsubscribe = subscribePersistedStateWrites((event) => events.push(event));
 
@@ -111,7 +111,7 @@ describe("persisted state writes under storage quota pressure", () => {
     expect(results).toEqual([false, false, false]);
     expect(storage.getItem("input:quota-full")).toBeNull();
     expect(storage.getItem("session-cost:bbbbbbbbbb")).toBeNull();
-    expect(storage.getItem("reviewState:bbbbbbbbbb")).not.toBeNull();
+    expect(storage.getItem("review-state:bbbbbbbbbb")).not.toBeNull();
     // First write: original attempt plus one retry after eviction. Later writes find nothing
     // left to evict and do not retry.
     expect(storage.setItemCalls).toEqual([

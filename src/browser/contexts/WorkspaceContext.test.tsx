@@ -1,4 +1,5 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectConfig } from "@/common/types/project";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -2150,6 +2151,11 @@ describe("WorkspaceContext", () => {
       );
     const archivedListCalls = (list: { mock: { calls: unknown[][] } }) =>
       list.mock.calls.filter(([input]) => (input as { archived?: boolean } | undefined)?.archived);
+    // config.json as projects.list returns it (archived workspaces omitted).
+    const listProjects = () =>
+      Promise.resolve<Array<[string, ProjectConfig]>>([
+        ["/alpha", { workspaces: [{ path: "/alpha/ws", id: ACTIVE_ID }] }],
+      ]);
 
     test("removes unknown workspace and stale draft keys, keeping every known owner", async () => {
       resetWorkspaceStorageGcForTests();
@@ -2227,10 +2233,34 @@ describe("WorkspaceContext", () => {
       expect(localStorage.getItem(getInputKey(ORPHAN_ID))).not.toBeNull();
     });
 
+    // A failed config read makes both archived and project lists resolve []; trusting that empty
+    // archived list would delete every archived workspace's drafts and review state.
+    test("skips GC when the project list comes back empty", async () => {
+      resetWorkspaceStorageGcForTests();
+      const { workspace: workspaceApi, projects: projectsApi } = createMockAPI({
+        workspace: {
+          list: (input) =>
+            Promise.resolve(
+              input?.archived ? [] : [createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]
+            ),
+        },
+        localStorage: { [getReviewStateKey(ARCHIVED_ID)]: JSON.stringify("review") },
+      });
+
+      await setup();
+      // Reaching the archived/project lists proves GC got past its earlier bail-outs.
+      await waitFor(() => expect(archivedListCalls(workspaceApi.list)).toHaveLength(1));
+      await waitFor(() => expect(projectsApi.list).toHaveBeenCalled());
+      await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+      expect(localStorage.getItem(getReviewStateKey(ARCHIVED_ID))).not.toBeNull();
+    });
+
     test("runs at most once per session", async () => {
       resetWorkspaceStorageGcForTests();
       createMockAPI({
         workspace: { list: listByArchived },
+        projects: { list: listProjects },
         localStorage: { [getInputKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
       await setup();
@@ -2240,6 +2270,7 @@ describe("WorkspaceContext", () => {
       getWorkspaceStoreRaw().dispose();
       const { workspace: workspaceApi } = createMockAPI({
         workspace: { list: listByArchived },
+        projects: { list: listProjects },
         localStorage: { [getInputKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
       const ctx = await setup();

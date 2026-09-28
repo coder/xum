@@ -85,7 +85,7 @@ describe("useComposerDraft attachment persistence", () => {
     expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).not.toBeNull();
     expect(pushToast).not.toHaveBeenCalled();
 
-    storage.seed("reviewState:ws-draft", "y".repeat(300));
+    storage.seed("review-state:ws-draft", "y".repeat(300));
     act(() => {
       result.current.setAttachments((current) => [...current, attachment("second")]);
     });
