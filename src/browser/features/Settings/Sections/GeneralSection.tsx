@@ -1124,30 +1124,33 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">System</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">
-                Keep screen awake while agents are working
+      {/* The sleep blocker lives in the Electron main process, so browser mode (including
+          `xum server` and desktop server windows) has nothing to toggle. */}
+      {!isBrowserMode() && (
+        <div className="border-border-light border-t pt-6">
+          <h3 className="text-foreground mb-4 text-sm font-medium">System</h3>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex-1">
+                <div className="text-foreground text-sm">
+                  Keep screen awake while agents are working
+                </div>
+                <div className="text-muted mt-0.5 text-xs">
+                  {/* Electron's display-sleep blocker does not guarantee the OS lock policy is
+                      suppressed, so only promise display/system sleep. */}
+                  Prevents display and system sleep while any chat is streaming or waiting on
+                  background bash or workflow activity. Released as soon as all agents are idle.
+                </div>
               </div>
-              <div className="text-muted mt-0.5 text-xs">
-                {/* Electron's display-sleep blocker does not guarantee the OS lock policy is
-                    suppressed, so only promise display/system sleep. */}
-                Prevents display and system sleep while any chat is streaming or waiting on
-                background bash or workflow activity. Released as soon as all agents are idle.
-                Desktop app only.
-              </div>
+              <Switch
+                checked={keepScreenAwake}
+                onCheckedChange={handleKeepScreenAwakeChange}
+                aria-label="Toggle keep screen awake while agents are working"
+              />
             </div>
-            <Switch
-              checked={keepScreenAwake}
-              onCheckedChange={handleKeepScreenAwakeChange}
-              aria-label="Toggle keep screen awake while agents are working"
-            />
           </div>
         </div>
-      </div>
+      )}
 
       <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
