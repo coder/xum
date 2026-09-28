@@ -37,6 +37,7 @@ function stubHeadingTop(el: HTMLElement, top: number): void {
 function withSyncAnimationFrame<T>(run: () => T): T {
   const previous = (globalThis as unknown as { requestAnimationFrame?: unknown })
     .requestAnimationFrame;
+  // eslint-disable-next-line local/no-clear-dom-global -- restored in the finally below
   (globalThis as unknown as { requestAnimationFrame?: unknown }).requestAnimationFrame = undefined;
   try {
     return run();

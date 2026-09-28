@@ -1,3 +1,4 @@
+/* eslint-disable local/no-clear-dom-global -- this file poisons the DOM globals on purpose to test the harness; it runs in its own process (isolated_unit_tests). */
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 

@@ -11,7 +11,8 @@
  * This module has no side effects, so importing it does not install a DOM.
  */
 
-// Every global installDom() replaces and puts back.
+// Every global installDom() replaces and puts back. `local/no-clear-dom-global` in
+// eslint.config.mjs reports clearing any of these in test files.
 const DOM_GLOBAL_KEYS = [
   "window",
   "document",
@@ -32,6 +33,8 @@ const DOM_GLOBAL_KEYS = [
   "IntersectionObserver",
   "MutationObserver",
 ] as const;
+
+export const DOM_GLOBAL_NAMES: readonly string[] = DOM_GLOBAL_KEYS;
 
 /** Snapshot the DOM globals now; the returned function puts those exact values back. */
 export function captureDomGlobals(): () => void {

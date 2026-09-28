@@ -540,6 +540,88 @@ const localPlugin = {
         };
       },
     },
+    "no-clear-dom-global": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow clearing DOM globals (globalThis.window = undefined) in tests",
+        },
+        messages: {
+          clear:
+            "Clearing globalThis.{{name}} leaks into every later test file in the same bun process: tests/ui/dom installs the DOM globals only once per process (#5084). Call saveDomGlobals() from tests/ui/domGlobals in beforeEach, before replacing them, and restoreDomGlobals() in afterEach.",
+        },
+      },
+      create(context) {
+        // Must match DOM_GLOBAL_KEYS in tests/ui/domGlobals.ts (scripts/noClearDomGlobal.test.ts
+        // checks that every key there is reported).
+        const DOM_GLOBALS = new Set([
+          "window",
+          "document",
+          "navigator",
+          "localStorage",
+          "CustomEvent",
+          "DocumentFragment",
+          "Element",
+          "HTMLInputElement",
+          "HTMLElement",
+          "NodeFilter",
+          "Node",
+          "Image",
+          "requestAnimationFrame",
+          "cancelAnimationFrame",
+          "getComputedStyle",
+          "ResizeObserver",
+          "IntersectionObserver",
+          "MutationObserver",
+        ]);
+        const unwrap = (node) => {
+          while (
+            node.type === "TSAsExpression" ||
+            node.type === "TSTypeAssertion" ||
+            node.type === "TSNonNullExpression" ||
+            node.type === "TSSatisfiesExpression"
+          ) {
+            node = node.expression;
+          }
+          return node;
+        };
+        // Returns the DOM global name for `globalThis.X` / `(globalThis as T).X` / `global["X"]`.
+        const domGlobalName = (member) => {
+          if (member.type !== "MemberExpression") {
+            return null;
+          }
+          const object = unwrap(member.object);
+          if (object.type !== "Identifier" || !["globalThis", "global"].includes(object.name)) {
+            return null;
+          }
+          const name = member.computed
+            ? member.property.type === "Literal"
+              ? member.property.value
+              : null
+            : member.property.name;
+          return DOM_GLOBALS.has(name) ? name : null;
+        };
+        // `delete globalThis.X` is not reported: tests also use it to put back a global that
+        // was absent before (`if (original) { restore } else { delete }`), and telling the
+        // two apart needs flow analysis.
+        const isUndefined = (node) => {
+          node = unwrap(node);
+          return (
+            (node.type === "Identifier" && node.name === "undefined") ||
+            (node.type === "UnaryExpression" && node.operator === "void")
+          );
+        };
+        return {
+          AssignmentExpression(node) {
+            const name = domGlobalName(node.left);
+            if (node.operator === "=" && name != null && isUndefined(node.right)) {
+              context.report({ node, messageId: "clear", data: { name } });
+            }
+          },
+        };
+      },
+    },
     "require-module-mock-restore": {
       meta: {
         type: "problem",
@@ -2512,6 +2594,7 @@ export default defineConfig([
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "local/no-cast-to-api-client": "error",
+      "local/no-clear-dom-global": "error",
       "local/require-module-mock-restore": [
         "error",
         {
