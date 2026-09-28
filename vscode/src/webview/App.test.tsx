@@ -97,14 +97,18 @@ async function clearProvidersConfig(bridge: TestBridge): Promise<void> {
   await refreshed;
 }
 
-async function selectWorkspace(bridge: TestBridge, history: unknown[] = []): Promise<void> {
+async function selectWorkspace(
+  bridge: TestBridge,
+  history: unknown[] = [],
+  workspace: UiWorkspace = WORKSPACE
+): Promise<void> {
   await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
-  await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
-  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+  await bridge.emit({ type: "workspaces", workspaces: [workspace] });
+  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspace.id });
   for (const event of history) {
-    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event });
+    await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
   }
-  await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+  await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event: { type: "caught-up" } });
 }
 
 function toolMessage(
@@ -2244,7 +2248,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     type: "message",
   });
   // A persisted failed turn: renders as a stream-error row, like desktop's.
-  const failedTurn = (errorType: "network" | "context_exceeded") => [
+  const failedTurn = (errorType: "network" | "context_exceeded" | "authentication") => [
     userRow("u1", 1),
     {
       type: "message",
@@ -2263,6 +2267,38 @@ describe("vscode webview retry barrier (#5092)", () => {
   });
   const chatEvent = (bridge: TestBridge, event: unknown, workspaceId = WORKSPACE.id) =>
     bridge.emit({ type: "chatEvent", workspaceId, event });
+  // A live stream the user stops after its first token.
+  const stopMidStream = async (bridge: TestBridge, workspaceId = WORKSPACE.id) => {
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-start",
+        workspaceId,
+        messageId: "a1",
+        model: "anthropic:claude-sonnet-4-5",
+        historySequence: 2,
+        startTime: 2,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "a1",
+        delta: "Half an answer",
+        tokens: 3,
+        timestamp: 3,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      { type: "stream-abort", workspaceId, messageId: "a1", abortReason: "user" },
+      workspaceId
+    );
+  };
   const click = async (element: HTMLElement) => {
     await act(async () => {
       fireEvent.click(element);
@@ -2364,28 +2400,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [userRow("u1", 1)]);
-    await chatEvent(bridge, {
-      type: "stream-start",
-      workspaceId: WORKSPACE.id,
-      messageId: "a1",
-      model: "anthropic:claude-sonnet-4-5",
-      historySequence: 2,
-      startTime: 2,
-    });
-    await chatEvent(bridge, {
-      type: "stream-delta",
-      workspaceId: WORKSPACE.id,
-      messageId: "a1",
-      delta: "Half an answer",
-      tokens: 3,
-      timestamp: 3,
-    });
-    await chatEvent(bridge, {
-      type: "stream-abort",
-      workspaceId: WORKSPACE.id,
-      messageId: "a1",
-      abortReason: "user",
-    });
+    await stopMidStream(bridge);
 
     // A user stop is not an error: no retry barrier, only the divider.
     expect(view.container.textContent).not.toContain("Stream interrupted");
@@ -2403,4 +2418,74 @@ describe("vscode webview retry barrier (#5092)", () => {
     // Resuming a user stop never flips the auto-retry preference.
     expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
   });
+
+  // #4738: a child task keeps its assigned agent (agentType), even when a stale stored pick says
+  // otherwise; Retry and resume must send it, as the composer does.
+  const subAgent: UiWorkspace = {
+    ...WORKSPACE,
+    ai: { parentWorkspaceId: "ws-parent", agentId: "plan", agentType: "exec" },
+  };
+  const resumedAgentId = (bridge: TestBridge) => {
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    return (resumes[0].input as { options?: { agentId?: string } }).options?.agentId;
+  };
+
+  test("a sub-agent's Retry sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"), subAgent);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Retry" }));
+    await bridge.answer("workspace.setAutoRetryEnabled", {
+      success: true,
+      data: { previousEnabled: true, enabled: true },
+    });
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
+  test("a sub-agent's interrupted-divider resume sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
+    await stopMidStream(bridge);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Continue interrupted response" }));
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
+  // As WorkspaceStore does on desktop: new provider config may fix the error that stopped
+  // auto-retry, so that banner goes; any other stop reason stays.
+  for (const [reason, cleared] of [
+    ["authentication", true],
+    ["missing_retry_options", false],
+  ] as const) {
+    test(`a provider config change ${cleared ? "drops" : "keeps"} an "Auto-retry stopped: ${reason}" banner`, async () => {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge, [
+        ...failedTurn("authentication"),
+        { type: "auto-retry-abandoned", reason },
+      ]);
+      expect(view.container.textContent).toContain("Auto-retry stopped");
+
+      try {
+        await bridge.answer("providers.getConfig", {
+          anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        });
+        expect(view.container.textContent).toContain("Stream interrupted");
+        expect(view.container.textContent?.includes("Auto-retry stopped")).toBe(!cleared);
+      } finally {
+        await clearProvidersConfig(bridge);
+      }
+    });
+  }
 });
