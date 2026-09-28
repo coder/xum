@@ -52,7 +52,6 @@ function workspaceEntries(
   return ids.map((id) => projectWorkspace(PROJECT_PATH, id, id, options));
 }
 
-
 // #4770: the restart blocker must tell the user which workspaces to open, even when titles repeat.
 describe("nameRestartBlockerWorkspaces", () => {
   test("adds the stable ID only to labels two workspaces share, sorted", () => {
