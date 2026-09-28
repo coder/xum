@@ -748,8 +748,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     </div>
 
                     <div className="border-t border-border bg-background-secondary p-3">
-                      {selectedWorkspaceId
-                        ? heldInputs.map((heldInput, index) => (
+                      {selectedWorkspaceId && heldInputs.length > 0 ? (
+                        // Bounded scroll lane: many or long held inputs must not push the composer
+                        // below the fixed-height layout or collapse the transcript.
+                        <div className="max-h-[40vh] overflow-y-auto">
+                          {heldInputs.map((heldInput, index) => (
                             <HeldInput
                               key={heldInput.id}
                               workspaceId={selectedWorkspaceId}
@@ -757,8 +760,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                               // The composer's held-input shortcuts act on the oldest one.
                               isShortcutTarget={index === 0}
                             />
-                          ))
-                        : null}
+                          ))}
+                        </div>
+                      ) : null}
                       {selectedWorkspaceId ? (
                         <ChatComposer
                           key={selectedWorkspaceId}
