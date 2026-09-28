@@ -43,6 +43,7 @@ import {
   buildRegularFileReadCommand,
   CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
+  readAttemptTimeoutSecs,
   readFileViaExec,
   statViaExec,
   writeFileViaExec,
@@ -584,11 +585,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`;
     return readFileViaExec(
       filePath,
-      (signal) =>
+      (signal, attempt) =>
         this.exec(command, {
           cwd: this.getContainerBasePath(),
           pathEnv: { [FILE_PATH_ENV]: filePath },
-          timeout: 300,
+          timeout: readAttemptTimeoutSecs(attempt, 300),
           abortSignal: signal,
         }),
       abortSignal,
@@ -627,14 +628,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
     return statViaExec(
       filePath,
-      () =>
+      (attempt) =>
         this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
           cwd: this.getContainerBasePath(),
           pathEnv: { [FILE_PATH_ENV]: filePath },
-          timeout: 10,
+          timeout: readAttemptTimeoutSecs(attempt, 10),
           abortSignal,
         }),
-      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
     );
   }
 

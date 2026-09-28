@@ -7,12 +7,42 @@
  */
 
 import type { ExecStream, FileStat } from "./Runtime";
-import { RuntimeError } from "./Runtime";
+import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 import { streamToString } from "./streamUtils";
 
 /** Starts the exec for one file operation; must honor the given signal. */
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
+
+/**
+ * Starts one attempt of an idempotent read (`attempt` 0, then 1 for the single
+ * retry). Pass `readAttemptTimeoutSecs(attempt, …)` as the exec timeout.
+ */
+type StartReadExec = (abortSignal: AbortSignal, attempt: number) => Promise<ExecStream>;
+
+/**
+ * Exec timeout for the one retry of a read or stat (#4830). It must stay short:
+ * the SSH pools wait through their backoff up to the exec deadline, so reusing
+ * readFile's 300 s would hang a persistent outage for minutes instead of
+ * failing fast and retryably.
+ */
+export const READ_RETRY_TIMEOUT_SECS = 10;
+
+/** Exec timeout for a read attempt: the caller's own on the first, the short bound on the retry. */
+export function readAttemptTimeoutSecs(attempt: number, firstAttemptSecs: number): number {
+  return attempt === 0 ? firstAttemptSecs : Math.min(firstAttemptSecs, READ_RETRY_TIMEOUT_SECS);
+}
+
+/**
+ * Whether a failed read attempt gets its one retry: only a transport failure
+ * (one blip: connection reset, channel refused under MaxSessions, a pool
+ * refusal) and only when the caller has not aborted — an abort can surface as
+ * a transport error too. Permission errors and missing files never retry.
+ */
+function shouldRetryRead(error: unknown, abortSignal: AbortSignal | undefined): boolean {
+  return abortSignal?.aborted !== true && isRuntimeTransportError(error);
+}
 
 /**
  * Whether a non-zero exit is the transport's own failure (e.g. OpenSSH exit
@@ -90,7 +120,7 @@ export function buildRegularFileReadCommand(quotedPath: string): string {
  */
 export function readFileViaExec(
   filePath: string,
-  startExec: StartExec,
+  startExec: StartReadExec,
   abortSignal?: AbortSignal,
   classifyExit?: ClassifyTransportExit
 ): ReadableStream<Uint8Array> {
@@ -116,14 +146,18 @@ export function readFileViaExec(
       cleanupAbortForwarder();
     },
     start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
-      try {
-        const stream = await startExec(readAbort.signal);
+      // A retry is only safe before the consumer has seen any bytes: a second
+      // cat would repeat them.
+      let delivered = false;
+      const readOnce = async (attempt: number) => {
+        const stream = await startExec(readAbort.signal, attempt);
         const reader = stream.stdout.getReader();
         const exitCodePromise = stream.exitCode;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          delivered = true;
           controller.enqueue(value);
         }
 
@@ -136,6 +170,15 @@ export function readFileViaExec(
             stderr,
             classifyExit
           );
+        }
+      };
+      try {
+        try {
+          await readOnce(0);
+        } catch (err) {
+          if (delivered || !shouldRetryRead(err, readAbort.signal)) throw err;
+          log.debug(`Retrying read of ${filePath} after a transport failure`, err);
+          await readOnce(1);
         }
 
         controller.close();
@@ -264,10 +307,24 @@ export const STAT_VIA_EXEC_COMMAND = "LC_ALL=C stat -L -c '%s %Y %F'";
  */
 export async function statViaExec(
   filePath: string,
-  startExec: () => Promise<ExecStream>,
-  classifyExit?: ClassifyTransportExit
+  startExec: (attempt: number) => Promise<ExecStream>,
+  classifyExit?: ClassifyTransportExit,
+  abortSignal?: AbortSignal
 ): Promise<FileStat> {
-  const stream = await startExec();
+  try {
+    return await statOnce(filePath, await startExec(0), classifyExit);
+  } catch (err) {
+    if (!shouldRetryRead(err, abortSignal)) throw err;
+    log.debug(`Retrying stat of ${filePath} after a transport failure`, err);
+    return statOnce(filePath, await startExec(1), classifyExit);
+  }
+}
+
+async function statOnce(
+  filePath: string,
+  stream: ExecStream,
+  classifyExit: ClassifyTransportExit | undefined
+): Promise<FileStat> {
   const [stdout, stderr, exitCode] = await Promise.all([
     streamToString(stream.stdout),
     streamToString(stream.stderr),

@@ -31,7 +31,7 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR, isRuntimeTransportError } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
@@ -1136,6 +1136,19 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== Runtime interface implementations =====
 
   async resolvePath(filePath: string): Promise<string> {
+    // One bounded retry on a transport failure (#4830), as for reads and
+    // stats: each attempt is already capped at 10 s, so a persistent outage
+    // still fails fast. A login-shell timeout is not transport and never retries.
+    try {
+      return await this.resolvePathOnce(filePath);
+    } catch (error) {
+      if (!isRuntimeTransportError(error)) throw error;
+      log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
+      return this.resolvePathOnce(filePath);
+    }
+  }
+
+  protected override async resolvePathOnce(filePath: string): Promise<string> {
     // Expand ~ on the remote host.
     // Note: `p='~/x'; echo "$p"` does NOT expand ~ (tilde expansion happens before assignment).
     // We do explicit expansion using parameter substitution (no reliance on `realpath`, `readlink -f`, etc.).
