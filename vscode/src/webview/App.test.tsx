@@ -493,6 +493,14 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
   const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
     ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
     ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
+    [
+      "Esc in the composer",
+      (view) => {
+        const textarea = view.container.querySelector("textarea");
+        if (!textarea) throw new Error("composer textarea did not render");
+        fireEvent.keyDown(textarea, { key: "Escape" });
+      },
+    ],
   ];
   for (const [name, trigger] of interruptTriggers) {
     test(`${name} interrupts the stream through the host and shows interrupting`, async () => {
@@ -520,6 +528,23 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
       expect(view.container.textContent).toContain("Failed to interrupt stream. (stop refused)");
     });
   }
+
+  test("Esc in a text field outside the composer does not interrupt", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await startStream(bridge);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+      await Promise.resolve();
+    });
+
+    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(0);
+    input.remove();
+  });
 
   test("Esc stops a turn that is still starting, like its Stop button", async () => {
     const bridge = new TestBridge();

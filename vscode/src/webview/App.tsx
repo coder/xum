@@ -26,6 +26,7 @@ import {
 } from "xum/browser/components/Tooltip/Tooltip";
 import { Button } from "xum/browser/components/Button/Button";
 import {
+  allowsEscapeToInterruptStream,
   formatKeybind,
   isDialogOpen,
   isEditableElement,
@@ -637,6 +638,16 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
         return;
       }
 
+      // As on desktop, Escape in a text field interrupts only where the field opts in (the chat
+      // input); Ctrl+C in Vim mode always does.
+      if (
+        interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL &&
+        isEditableElement(e.target) &&
+        !allowsEscapeToInterruptStream(e.target)
+      ) {
+        return;
+      }
+
       // ask_user_question is a special waiting state: don't interrupt it with Esc/Ctrl+C.
       // Users can still respond by typing and sending a message.
       if (aggregator.hasAwaitingUserQuestion()) {
@@ -833,7 +844,12 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       />
                     </div>
 
-                    <div className="relative border-t border-border bg-background-secondary p-3">
+                    {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
+                        desktop ChatInput textarea; other editors keep Escape to themselves. */}
+                    <div
+                      className="relative border-t border-border bg-background-secondary p-3"
+                      data-escape-interrupts-stream="true"
+                    >
                       {selectedWorkspaceId && !autoScroll ? (
                         // Same pill as desktop ChatPane, just above the dock.
                         <button
