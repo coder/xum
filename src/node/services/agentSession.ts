@@ -6075,7 +6075,9 @@ export class AgentSession {
       {
         // A continuation is a fresh send: it keeps the turn's configuration, never the
         // triggering message's payload. A replayed editMessageId made sendMessage refuse the
-        // Continue as a stale edit and drop it silently; attachments would be re-sent.
+        // Continue as a stale edit and drop it silently; attachments would be re-sent. ACP
+        // fields stay dropped: the ACP prompt resolves at the first stream-end, so nothing
+        // correlates the continuation or answers its delegated tool calls (they would hang).
         ...pickStartupRetrySendOptions(args.options),
         model: args.model,
         queueDispatchMode: "tool-end",
