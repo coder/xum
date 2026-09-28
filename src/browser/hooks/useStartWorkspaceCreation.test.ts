@@ -5,13 +5,12 @@ import {
 } from "./useStartWorkspaceCreation";
 import {
   getAutoModelRoutingKey,
-  getInputKey,
   getModelKey,
-  getPendingScopeId,
   getProjectScopeId,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
 import type { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 
 type PersistFn = typeof updatePersistedState;
 type PersistCall = [string, unknown, unknown?];
@@ -45,12 +44,12 @@ describe("persistWorkspaceCreationPrefill", () => {
       callMap.set(key, value);
     }
 
-    expect(callMap.get(getInputKey(getPendingScopeId(projectPath)))).toBe("Ship it");
+    expect(getDraftStore().getText(defaultCreationDraftScope(projectPath))).toBe("Ship it");
     expect(callMap.get(getModelKey(getProjectScopeId(projectPath)))).toBe("provider/model");
     expect(callMap.get(getTrunkBranchKey(projectPath))).toBe("main");
     expect(callMap.get(getAutoModelRoutingKey(getProjectScopeId(projectPath)))).toBe(false);
     // runtime is intentionally not persisted - default can only be changed via icon selector
-    expect(calls.length).toBe(4);
+    expect(calls.length).toBe(3);
   });
 
   test("a prefilled model is an explicit pick and leaves the project's Auto routing", () => {

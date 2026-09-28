@@ -13,6 +13,7 @@ import { useBackgroundBashStoreRaw } from "../../stores/BackgroundBashStore";
 import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
+import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
 import { PolicyProvider, usePolicy } from "@/browser/contexts/PolicyContext";
@@ -198,6 +199,7 @@ function AppLoaderInner() {
     getProvidersConfigStore().setClient(api ?? null);
     getAppConfigStore().setClient(api ?? null);
     getReviewStateStore().setClient(api ?? null);
+    getDraftStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {
       workspaceStoreInstance.syncWorkspaces(workspaceContext.workspaceMetadata);
@@ -224,15 +226,25 @@ function AppLoaderInner() {
     api,
   ]);
 
+  // Composers render the in-memory draft store; hold the app until it has the backend's drafts
+  // (and imported legacy localStorage drafts) so a composer never starts from an empty draft.
+  const draftsReady = useDraftStoreReady();
+
   useEffect(() => {
     if (initialLoadComplete) {
       return;
     }
 
-    if (!projectContext.loading && !workspaceContext.loading && storesSynced) {
+    if (!projectContext.loading && !workspaceContext.loading && storesSynced && draftsReady) {
       setInitialLoadComplete(true);
     }
-  }, [initialLoadComplete, projectContext.loading, storesSynced, workspaceContext.loading]);
+  }, [
+    initialLoadComplete,
+    projectContext.loading,
+    storesSynced,
+    workspaceContext.loading,
+    draftsReady,
+  ]);
 
   if (policyState.status.state === "blocked") {
     return <PolicyBlockedScreen reason={policyState.status.reason} />;

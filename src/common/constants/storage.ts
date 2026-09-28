@@ -972,10 +972,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoModelRoutingKey, "ui", true),
   workspaceKey(getAutoThinkingLevelKey, "ui", true),
   workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true),
-  workspaceKey(getInputKey, "draft", true),
   workspaceKey(getAutoExpandPrefsKey, "ui", true),
   workspaceKey(getWorkspaceNameStateKey, "draft", true),
-  workspaceKey(getInputAttachmentsKey, "draft", true),
   workspaceKey(getAgentIdKey, "synced", true),
   workspaceKey(getPinnedAgentIdKey, "ui", true),
   workspaceKey(getThinkingLevelKey, "ui", true),
@@ -1073,29 +1071,10 @@ export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
   return undefined;
 }
 
-function isStagedPersistedAttachment(value: unknown): boolean {
-  return (
-    typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "staged"
-  );
-}
-
-function stripStagedDraftAttachments(value: string): string {
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) {
-      return value;
-    }
-    // Forked worktrees do not share staged draft files. Keep provider attachments, but drop
-    // workspace-local staged file chips so the fork cannot point at missing source-worktree paths.
-    return JSON.stringify(parsed.filter((attachment) => !isStagedPersistedAttachment(attachment)));
-  } catch {
-    return value;
-  }
-}
-
 /**
  * Copy all workspace-specific localStorage keys from source to destination workspace.
- * Includes registry keys marked copyOnFork (model, draft input text/attachments, etc).
+ * Includes registry keys marked copyOnFork (model, review state, etc). Composer drafts are not
+ * here: they live on the backend, whose fork copies the draft (DraftService).
  */
 export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): void {
   for (const { getKey, copyOnFork } of WORKSPACE_KEY_REGISTRATIONS) {
@@ -1104,10 +1083,7 @@ export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId:
     const destKey = getKey(destWorkspaceId);
     const value = localStorage.getItem(sourceKey);
     if (value !== null) {
-      localStorage.setItem(
-        destKey,
-        getKey === getInputAttachmentsKey ? stripStagedDraftAttachments(value) : value
-      );
+      localStorage.setItem(destKey, value);
     }
   }
 }

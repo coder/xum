@@ -274,7 +274,6 @@ export class DraftStore {
   private readonly readyPromise = new Promise<void>((resolve) => {
     this.resolveReady = resolve;
   });
-  private legacyMigrated = false;
 
   constructor() {
     if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
@@ -718,12 +717,11 @@ export class DraftStore {
           this.resubscribeAttempt = 0;
           if (event.type === "snapshot") {
             this.applySnapshot(event.drafts);
-            if (!this.legacyMigrated) {
-              // Before `ready`: composers must not start editing a scope whose legacy draft is
-              // still being imported (the import would then find a backend draft and drop it).
-              this.legacyMigrated = true;
-              await this.migrateLegacyDrafts(client);
-            }
+            // Before `ready`: composers must not start editing a scope whose legacy draft is still
+            // being imported (the import would then find a backend draft and drop it). Runs on
+            // every (re)subscription: keys whose import failed are retried, and without keys the
+            // scan is cheap.
+            await this.migrateLegacyDrafts(client);
             this.hydrated = true;
             this.markReady();
             for (const entry of this.entries.values()) this.scheduleFlush(entry);

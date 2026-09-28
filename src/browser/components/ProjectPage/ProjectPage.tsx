@@ -27,11 +27,10 @@ import {
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getDraftScopeId,
-  getInputKey,
-  getPendingScopeId,
   getProjectScopeId,
 } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -268,11 +267,15 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      const pendingScopeId =
-        typeof pendingDraftId === "string" && pendingDraftId.trim().length > 0
-          ? getDraftScopeId(projectPath, pendingDraftId)
-          : getPendingScopeId(projectPath);
-      updatePersistedState(getInputKey(pendingScopeId), "/init");
+      getDraftStore().setText(
+        getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: pendingDraftId ?? undefined,
+        }),
+        "/init"
+      );
     }
 
     setShowAgentsInitNudge(false);

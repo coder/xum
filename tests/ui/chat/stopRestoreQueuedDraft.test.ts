@@ -13,8 +13,7 @@ jest.mock("lottie-react", () => ({
 }));
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputAttachmentsKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -37,9 +36,9 @@ const providerAttachment = (filename: string) => ({
 });
 
 const composerAttachmentNames = (app: AppHarness) =>
-  readPersistedState<{ filename?: string }[]>(getInputAttachmentsKey(app.workspaceId), []).map(
-    (attachment) => attachment.filename
-  );
+  getDraftStore()
+    .getAttachments({ kind: "workspace", workspaceId: app.workspaceId })
+    .map((attachment) => attachment.filename);
 /** The workspace's reviews in the backend review-state store. */
 const storeReviews = async (app: AppHarness) =>
   (await app.env.services.reviewStateService.getSnapshot(app.workspaceId)).sections.reviews ?? {};
@@ -78,8 +77,8 @@ async function attachStoreReview(app: AppHarness, id: string, data: ReviewNoteDa
 
 async function setComposerAttachments(app: AppHarness, filenames: string[]) {
   act(() => {
-    updatePersistedState(
-      getInputAttachmentsKey(app.workspaceId),
+    getDraftStore().setAttachments(
+      { kind: "workspace", workspaceId: app.workspaceId },
       filenames.map((filename) => providerAttachment(filename))
     );
   });

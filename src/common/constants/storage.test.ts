@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
   PERSISTED_KEY_REGISTRY,
-  copyWorkspaceStorage,
   deleteWorkspaceStorage,
   getDesktopPopoutKey,
   getDisableWorkspaceAgentsKey,
@@ -83,60 +82,6 @@ describe("storage workspace-scoped keys", () => {
     expect(normalizeTranscriptDensity("hyper")).toBe("hyper");
     expect(normalizeTranscriptDensity("compact")).toBe("normal");
     expect(normalizeTranscriptDensity(null)).toBe("normal");
-  });
-
-  test("copyWorkspaceStorage copies inputAttachments key", () => {
-    const source = "ws-source";
-    const dest = "ws-dest";
-
-    const sourceKey = getInputAttachmentsKey(source);
-    const destKey = getInputAttachmentsKey(dest);
-
-    const value = JSON.stringify([
-      { id: "img-1", url: "data:image/png;base64,AAA", mediaType: "image/png" },
-    ]);
-    localStorage.setItem(sourceKey, value);
-
-    copyWorkspaceStorage(source, dest);
-
-    expect(localStorage.getItem(destKey)).toBe(value);
-  });
-
-  test("copyWorkspaceStorage drops staged draft attachments", () => {
-    const source = "ws-source";
-    const dest = "ws-dest";
-
-    const sourceKey = getInputAttachmentsKey(source);
-    const destKey = getInputAttachmentsKey(dest);
-    const providerAttachment = {
-      kind: "provider",
-      id: "img-1",
-      url: "data:image/png;base64,AAA",
-      mediaType: "image/png",
-    };
-    const stagedAttachment = {
-      kind: "staged",
-      id: "zip-1",
-      filename: "archive.zip",
-      mediaType: "application/zip",
-      sizeBytes: 128,
-      stagedPath: ".mux/user-attachments/id/archive.zip",
-    };
-    localStorage.setItem(sourceKey, JSON.stringify([providerAttachment, stagedAttachment]));
-
-    copyWorkspaceStorage(source, dest);
-
-    expect(JSON.parse(localStorage.getItem(destKey) ?? "null")).toEqual([providerAttachment]);
-  });
-
-  test("deleteWorkspaceStorage removes inputAttachments key", () => {
-    const workspaceId = "ws-delete";
-    const key = getInputAttachmentsKey(workspaceId);
-
-    localStorage.setItem(key, "value");
-    deleteWorkspaceStorage(workspaceId);
-
-    expect(localStorage.getItem(key)).toBeNull();
   });
 
   // These per-workspace keys were missing from the delete lists, so every deleted workspace

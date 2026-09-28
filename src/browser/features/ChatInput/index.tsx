@@ -220,6 +220,7 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { useComposerSuggestions } from "./useComposerSuggestions";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
@@ -490,7 +491,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
   const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
-  const { removeDraftReview, updateDraftReviewNote, storageKeys, latestInputValueRef } = draft;
+  const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
   const {
     processingAttachmentCount,
     handlePaste,
@@ -1481,7 +1482,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
         // Merged from the stored draft, exactly as a functional setInput would, so the
         // acknowledgement below can check that this exact value landed.
-        const mergedText = [restoredPending.content, readPersistedState(storageKeys.inputKey, "")]
+        const mergedText = [restoredPending.content, getDraftStore().getText(draftScope)]
           .filter((part) => part.trim().length > 0)
           .join("\n\n");
         setInput(mergedText);
@@ -1511,30 +1512,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
         if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
-          // Checked now, synchronously: the user may edit the draft while the review flush
-          // below is in flight, and that must not revoke a restore that already landed.
+          // The backend copy is released only after the backend confirmed the restored draft
+          // write; a failed write keeps (and shows) the held input.
           const draftDurable = isRestoredDraftDurable({
-            inputKey: storageKeys.inputKey,
-            expectedText: mergedText,
-            attachmentsKey: storageKeys.attachmentsKey,
+            draftStore: getDraftStore(),
+            draftScope,
             restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
             restoredReviewIds,
           });
-          if (draftDurable && restoredReviewIds !== null && restoredReviewIds.length > 0) {
-            // Restored notes live in the backend review-state store: flush them and require
-            // the server-acknowledged copy before releasing the held input. A failed flush
-            // leaves the input held (fail closed; a visible duplicate beats a loss).
-            getReviewStateStore()
-              .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
-              .then(
-                (reviewsDurable) => {
-                  if (reviewsDurable) onAcceptRestoredHeldInputs?.(heldInputIds);
-                },
-                () => undefined
-              );
-          } else if (draftDurable) {
-            onAcceptRestoredHeldInputs?.(heldInputIds);
-          }
+          // Restored notes live in the backend review-state store: require its
+          // server-acknowledged copy too. A failed flush leaves the input held (fail closed; a
+          // visible duplicate beats a loss).
+          const durable =
+            restoredReviewIds !== null && restoredReviewIds.length > 0
+              ? Promise.all([
+                  draftDurable,
+                  getReviewStateStore()
+                    .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
+                    .catch(() => false),
+                ]).then(([draftOk, reviewsOk]) => draftOk && reviewsOk)
+              : draftDurable;
+          onAcceptRestoredHeldInputs?.(heldInputIds, durable);
         }
         focusMessageInput();
       } else if (mode === "replace") {
@@ -1577,8 +1575,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setDraftReviews,
     onAddReviewForRestore,
     onAcceptRestoredHeldInputs,
-    storageKeys.inputKey,
-    storageKeys.attachmentsKey,
+    draftScope,
     focusMessageInput,
   ]);
 
@@ -1941,9 +1938,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         break;
       case "restore-if-empty":
         // Async phases can outlive the invoking render, so check the live
-        // persisted draft: the getDraft closure captured here still reports
+        // draft: the getDraft closure captured here still reports
         // this render's input and would refuse to restore over a newer draft.
-        if (readPersistedState(storageKeys.inputKey, "").trim().length === 0) {
+        if (getDraftStore().getText(draftScope).trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);
@@ -2078,6 +2075,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
     if (!canSend) {
+      return;
+    }
+    if (!draft.payloadsLoaded) {
+      // Hydrated drafts carry attachment metadata only; sending now would drop the attachments.
+      pushToast({ type: "info", message: "Draft attachments are still loading. Try again." });
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
       return;
     }
 
@@ -3053,6 +3058,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     value={input}
                     ghostHint={composerSuggestions.ghostHint}
                     onChange={handleComposerInputChange}
+                    // Write the draft when focus leaves instead of after the debounce; a failure
+                    // keeps the change in the draft store, which retries it.
+                    onBlur={() => {
+                      getDraftStore()
+                        .flush(draftScope)
+                        .catch(() => undefined);
+                    }}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}

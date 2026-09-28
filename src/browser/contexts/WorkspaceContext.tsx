@@ -21,8 +21,6 @@ import {
   deleteWorkspaceStorage,
   getAgentIdKey,
   getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
   getModelKey,
   getPendingScopeId,
   getRightSidebarLayoutKey,
@@ -82,6 +80,8 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import { createDraftId } from "@/common/utils/drafts";
 
 /**
  * Preserve legacy local model choices across port/origin changes.
@@ -389,18 +389,6 @@ function normalizeWorkspaceDraftsByProject(value: unknown): WorkspaceDraftsByPro
   return result;
 }
 
-function createWorkspaceDraftId(): string {
-  const maybeCrypto = globalThis.crypto;
-  if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
-    const id = maybeCrypto.randomUUID();
-    if (typeof id === "string" && id.length > 0) {
-      return id;
-    }
-  }
-
-  return `draft_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-
 /**
  * Check if a draft workspace is empty (no input text, no attachments, and no workspace name set).
  * An empty draft can be reused when the user clicks "New Workspace" instead of creating another.
@@ -408,14 +396,9 @@ function createWorkspaceDraftId(): string {
 function isDraftEmpty(projectPath: string, draftId: string): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
 
-  const inputText = readPersistedState<string>(getInputKey(scopeId), "");
-  if (inputText.trim().length > 0) {
-    return false;
-  }
-
-  // Check for attachments
-  const attachments = readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
-  if (Array.isArray(attachments) && attachments.length > 0) {
+  // Text and attachments live in the backend-backed draft store (hydrated before render).
+  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
+  if (draft.text.trim().length > 0 || draft.attachmentCount > 0) {
     return false;
   }
 
@@ -874,7 +857,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
       // IMPORTANT: Deep links should always create a fresh draft, even if an existing draft
       // is empty. This keeps deep-link navigations predictable and avoids surprising reuse.
-      const draftId = createWorkspaceDraftId();
+      const draftId = createDraftId();
       const createdAt = Date.now();
 
       setWorkspaceDraftsByProjectState((prev) => {
@@ -900,7 +883,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           : null;
 
       if (prompt) {
-        updatePersistedState(getInputKey(getDraftScopeId(owningProjectPath, draftId)), prompt);
+        getDraftStore().setText(
+          { kind: "creation", projectPath: owningProjectPath, draftId },
+          prompt
+        );
       }
 
       navigateToProject(owningProjectPath, draftId);
@@ -1408,6 +1394,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           if (meta === null) {
             deleteWorkspaceStorage(event.workspaceId);
             getReviewStateStore().removeWorkspace(event.workspaceId);
+            getDraftStore().forgetWorkspace(event.workspaceId);
 
             // Navigate away only if the deleted workspace was selected
             const currentSelection = selectedWorkspaceRef.current;
@@ -1534,6 +1521,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
           getReviewStateStore().removeWorkspace(workspaceId);
+          getDraftStore().forgetWorkspace(workspaceId);
 
           // Optimistically remove from the local metadata map so the sidebar updates immediately.
           // Relying on the metadata subscription can leave the item visible until the next refresh.
@@ -1990,7 +1978,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return;
       }
 
-      const draftId = createWorkspaceDraftId();
+      const draftId = createDraftId();
       const createdAt = Date.now();
       const draft: WorkspaceDraft = {
         draftId,
@@ -2004,16 +1992,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         // One-time migration: if the user has an old per-project pending draft, move it
         // into the first draft scope so it stays accessible.
+        // The default creation composer's draft (no draft id) moves into the first listed one.
         if (existing.length === 0) {
           const pendingScopeId = getPendingScopeId(projectPath);
-          const legacyInput = readPersistedState<string>(getInputKey(pendingScopeId), "");
-          const legacyAttachments = readPersistedState<unknown>(
-            getInputAttachmentsKey(pendingScopeId),
-            []
-          );
-          const hasLegacyAttachments =
-            Array.isArray(legacyAttachments) && legacyAttachments.length > 0;
-          if (legacyInput.trim().length > 0 || hasLegacyAttachments) {
+          const defaultScope = defaultCreationDraftScope(projectPath);
+          const pending = getDraftStore().getView(defaultScope);
+          if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
+            getDraftStore().moveDraft(defaultScope, { kind: "creation", projectPath, draftId });
             migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
           }
         }
@@ -2136,6 +2121,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       });
 
       deleteWorkspaceStorage(getDraftScopeId(projectPath, draftId));
+      // Deletes the backend draft file too; failures are logged by the store.
+      getDraftStore()
+        .deleteDraft({ kind: "creation", projectPath, draftId })
+        .catch(() => undefined);
 
       setWorkspaceDraftsByProjectState((prev) => {
         const current = normalizeWorkspaceDraftsByProject(prev);

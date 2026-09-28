@@ -24,8 +24,9 @@ import { DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
-import { DraftStore } from "./DraftStore";
+import { DraftStore, draftStoreScopeKey } from "./DraftStore";
 
 const WS = "draft-store-ws";
 const WS_SCOPE: DraftScope = { kind: "workspace", workspaceId: WS };
@@ -544,5 +545,51 @@ describe("DraftStore", () => {
     expect(store.getText(source)).toBe("moving, edited");
     await store.flush(source);
     expect((await service.get(source)).text).toBe("moving, edited");
+  });
+
+  // The project page opened without a draft id: its text survived a reload in localStorage before
+  // drafts moved to the backend. When the first listed draft is created it takes over the text
+  // and the attachments, even ones whose payloads have not loaded yet.
+  test("saves the default creation composer's draft and moves it, attachments included", async () => {
+    using tempDir = new TestTempDir("draft-store-default-creation");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    const scope = getComposerDraftScope({
+      variant: "creation",
+      workspaceId: null,
+      creationProjectPath: projectPath,
+    });
+    const first = createStore(client);
+    await first.whenReady();
+    first.setText(scope, "typed before reload");
+    first.setAttachments(scope, [image]);
+    await first.flush(scope);
+    first.setClient(null);
+
+    // Reload: a new store hydrates from the backend.
+    const store = createStore(client);
+    await store.whenReady();
+    expect(store.getView(scope)).toMatchObject({
+      text: "typed before reload",
+      attachmentCount: 1,
+      payloadsLoaded: false,
+    });
+
+    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
+    store.moveDraft(scope, listed);
+    await waitFor(() => store.getView(listed).attachmentCount === 1);
+    await store.flush(listed);
+    expect(await service.get(listed)).toMatchObject({
+      text: "typed before reload",
+      attachments: [image],
+    });
+    const deadline = Date.now() + 2_000;
+    while (
+      (await service.list()).some(
+        (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
+      )
+    ) {
+      if (Date.now() > deadline) throw new Error("the moved default draft was not deleted");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
   });
 });

@@ -2,11 +2,10 @@ import { useCallback, useEffect } from "react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import {
   getAutoModelRoutingKey,
-  getInputKey,
   getModelKey,
-  getPendingScopeId,
   getProjectScopeId,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
@@ -30,7 +29,9 @@ export function persistWorkspaceCreationPrefill(
   }
 
   if (detail.startMessage !== undefined) {
-    persist(getInputKey(getPendingScopeId(projectPath)), detail.startMessage);
+    // The creation composer opened without a draft id edits the project's default creation
+    // draft; WorkspaceContext moves it into a listed creation draft when it creates one.
+    getDraftStore().setText(defaultCreationDraftScope(projectPath), detail.startMessage);
   }
 
   if (detail.model !== undefined) {

@@ -5,11 +5,10 @@ jest.mock("lottie-react", () => ({
 }));
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { FilePart } from "@/common/orpc/types";
-import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { Err } from "@/common/types/result";
@@ -58,9 +57,9 @@ const composerReview = (note: string): ReviewNoteData => ({
   userNote: note,
 });
 const composerAttachmentNames = (app: AppHarness) =>
-  readPersistedState<{ filename?: string }[]>(getInputAttachmentsKey(app.workspaceId), []).map(
-    (attachment) => attachment.filename
-  );
+  getDraftStore()
+    .getAttachments({ kind: "workspace", workspaceId: app.workspaceId })
+    .map((attachment) => attachment.filename);
 const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
 /** Notes still attached in the workspace's backend review store (a send checks its notes off). */
 const attachedStoreReviewNotes = async (app: AppHarness) =>
@@ -126,7 +125,7 @@ async function queueTwoRefusedComposerMessages(app: AppHarness): Promise<ReviewN
         },
       });
       act(() => {
-        updatePersistedState(getInputAttachmentsKey(app.workspaceId), [
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: app.workspaceId }, [
           {
             kind: "provider",
             id: `file-${name}`,
@@ -203,11 +202,14 @@ describe("Held (refused) queued messages", () => {
   test("a refusal that lands while another workspace is shown is held: it shows after switching back and after a reload's replay, the draft is untouched, a failed Send keeps it, Discard removes it", async () => {
     const app = await createAppHarness({ branchPrefix: "held-away" });
     let otherWorkspaceId: string | undefined;
-    const draftOf = (workspaceId: string) => readPersistedState(getInputKey(workspaceId), "");
+    const draftOf = (workspaceId: string) =>
+      getDraftStore().getText({ kind: "workspace", workspaceId: workspaceId });
     try {
       await app.chat.typeWithoutSending("draft kept");
       act(() => {
-        updatePersistedState(getInputAttachmentsKey(app.workspaceId), [draftAttachment]);
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: app.workspaceId }, [
+          draftAttachment,
+        ]);
       });
       const created = await app.env.orpc.workspace.create({
         projectPath: app.repoPath,
@@ -539,34 +541,27 @@ describe("Held (refused) queued messages", () => {
     }
   }, 60_000);
 
-  test("a restore whose attachment is too large to save keeps its held copy: the banner stays and nothing is released", async () => {
-    // Codex PRRT_kwDOPxxmWM6mTpjx: the draft keeps such attachments in memory only, so releasing
-    // the backend's copy would lose them on the next workspace switch or restart.
-    const app = await createAppHarness({ branchPrefix: "restore-ack-large" });
+  test("a restore whose draft write fails keeps its held copy: the banner shows and nothing is released", async () => {
+    // The composer's copy lives in memory until the backend stores the draft; releasing the
+    // backend's held copy before that would lose it on the next restart.
+    const app = await createAppHarness({ branchPrefix: "restore-ack-write-fail" });
     try {
       const workspaceService = app.env.services.workspaceService;
       const session = workspaceService.getOrCreateSession(app.workspaceId);
-      const heldInputId = await holdOneRefusedMessage(app, "held with a large file");
+      const heldInputId = await holdOneRefusedMessage(app, "held with a failing draft write");
       const discard = jest.spyOn(workspaceService, "discardHeldInput");
-      const largeFile = {
-        url: `data:text/plain;base64,${"A".repeat(4_100_000)}`,
-        mediaType: "text/plain",
-        filename: "large.txt",
-      };
+      const draftUpdate = jest
+        .spyOn(app.env.services.draftService, "update")
+        .mockRejectedValue(new Error("disk full"));
 
-      await emitRestoreAndWaitForDispatch(
-        app,
-        "held with a large file",
-        [heldInputId],
-        [largeFile]
-      );
+      await emitRestoreAndWaitForDispatch(app, "held with a failing draft write", [heldInputId]);
 
-      await app.chat.expectInputValue("held with a large file");
-      // An acknowledgement would have been requested synchronously with the restore.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await app.chat.expectInputValue("held with a failing draft write");
+      await waitFor(() => expect(draftUpdate).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
       expect(discard).not.toHaveBeenCalled();
-      expect(heldBanners(app)).toHaveLength(1);
       expect(session.getHeldInputs().map((held) => held.id)).toEqual([heldInputId]);
+      draftUpdate.mockRestore();
       discard.mockRestore();
     } finally {
       await app.dispose();

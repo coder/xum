@@ -1,22 +1,54 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
+import { DraftStore } from "@/browser/stores/DraftStore";
+import { createTestApiClient } from "@/browser/testUtils";
+import type { DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 import { installDom } from "../../../../tests/ui/dom";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 
 let cleanupDom: (() => void) | undefined;
 
 const WORKSPACE_ID = "ws-durable";
-const keys = {
-  inputKey: getInputKey(WORKSPACE_ID),
-  attachmentsKey: getInputAttachmentsKey(WORKSPACE_ID),
-};
+const scope: DraftScope = { kind: "workspace", workspaceId: WORKSPACE_ID };
+
+/** A drafts backend whose update replies the test releases (or fails) explicitly. */
+function createGatedBackend() {
+  const replies: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  let revision = 1;
+  const drafts = {
+    subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+      Promise.resolve(
+        (async function* (): AsyncGenerator<DraftEvent> {
+          yield { type: "snapshot", drafts: [] };
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      ),
+    update: () =>
+      new Promise<{ revision: number }>((resolve, reject) => {
+        replies.push({ resolve: () => resolve({ revision: ++revision }), reject });
+      }),
+  };
+  return { client: createTestApiClient({ drafts }), replies };
+}
+
+async function settleMicrotasks(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
 
 describe("isRestoredDraftDurable", () => {
-  beforeEach(() => {
+  let store: DraftStore;
+  let backend: ReturnType<typeof createGatedBackend>;
+
+  beforeEach(async () => {
     cleanupDom = installDom();
-    updatePersistedState(keys.inputKey, "restored\n\ndraft");
-    updatePersistedState(keys.attachmentsKey, [
+    backend = createGatedBackend();
+    store = new DraftStore();
+    store.setClient(backend.client);
+    await store.whenReady();
+    // The restore the composer just applied.
+    store.setText(scope, "restored\n\ndraft");
+    store.setAttachments(scope, [
       {
         kind: "provider",
         id: "restored-1",
@@ -26,36 +58,39 @@ describe("isRestoredDraftDurable", () => {
     ]);
   });
   afterEach(() => {
+    store.setClient(null);
     cleanupDom?.();
   });
 
   const check = (overrides: Partial<Parameters<typeof isRestoredDraftDurable>[0]> = {}) =>
     isRestoredDraftDurable({
-      ...keys,
-      expectedText: "restored\n\ndraft",
+      draftStore: store,
+      draftScope: scope,
       restoredAttachmentIds: ["restored-1"],
       restoredReviewIds: ["review-1"],
       ...overrides,
     });
 
-  test("every restored part is in storage", () => {
-    expect(check()).toBe(true);
+  test("resolves durable only after the backend confirmed the draft write", async () => {
+    let settled: boolean | undefined;
+    const pending = check().then((durable) => (settled = durable));
+    await settleMicrotasks();
+    expect(backend.replies).toHaveLength(1);
+    expect(settled).toBeUndefined();
+
+    backend.replies[0].resolve();
+    await pending;
+    expect(settled).toBe(true);
   });
 
-  // A failed text write leaves the old draft, which may already start with the restored text.
-  test("the stored draft is not exactly the merged draft", () => {
-    expect(check({ expectedText: "restored\n\nrestored\n\ndraft" })).toBe(false);
+  test("a failed draft write keeps the input held", async () => {
+    const pending = check();
+    await settleMicrotasks();
+    backend.replies[0].reject(new Error("write failed"));
+    expect(await pending).toBe(false);
   });
 
-  test("a restored attachment was not saved (too large, or the write failed)", () => {
-    expect(check({ restoredAttachmentIds: ["restored-1", "restored-2"] })).toBe(false);
-  });
-
-  test("restored notes went to the memory-only override", () => {
-    expect(check({ restoredReviewIds: null })).toBe(false);
-  });
-
-  test("nothing to keep beyond the text", () => {
-    expect(check({ restoredAttachmentIds: [], restoredReviewIds: [] })).toBe(true);
+  test("restored notes went to the memory-only override", async () => {
+    expect(await check({ restoredReviewIds: null })).toBe(false);
   });
 });

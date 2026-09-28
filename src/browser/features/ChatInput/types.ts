@@ -75,8 +75,11 @@ export interface ChatInputWorkspaceVariant {
   attachedReviews?: Review[];
   /** Add a review to the workspace's review store, attached to chat input */
   onAddReview?: (data: ReviewNoteData) => Review;
-  /** The composer applied a restore naming these backend held inputs; release them (#4448) */
-  onAcceptRestoredHeldInputs?: (heldInputIds: string[]) => void;
+  /**
+   * The composer applied a restore naming these backend held inputs; release them once `durable`
+   * resolves true, i.e. the backend confirmed the restored draft (#4448)
+   */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[], durable: Promise<boolean>) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */

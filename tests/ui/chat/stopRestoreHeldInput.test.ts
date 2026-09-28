@@ -13,9 +13,8 @@ jest.mock("lottie-react", () => ({
 }));
 import { fireEvent, waitFor } from "@testing-library/react";
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
@@ -177,7 +176,7 @@ describe("Stop keeps a restored queued message the composer cannot take (#4448)"
       await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
       expect(heldBanners(app)[0].textContent).toContain(INTERRUPTED_LABEL);
       expect(heldBanners(app)[0].textContent).toContain("queued while away");
-      expect(readPersistedState(getInputKey(app.workspaceId), "")).toBe("");
+      expect(getDraftStore().getText({ kind: "workspace", workspaceId: app.workspaceId })).toBe("");
       expect(session.getHeldInputs()).toHaveLength(1);
     } finally {
       await app.dispose();

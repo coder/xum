@@ -19,8 +19,7 @@ import {
   getSharedEnv,
   getSharedRepoPath,
 } from "../../ipc/sendMessageTestHelpers";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 
 import { renderApp } from "../renderReviewPanel";
 import {
@@ -56,12 +55,14 @@ describeIntegration("Name generation UI flow", () => {
       const normalizedProjectPath = await addProjectViaUI(view, projectPath);
       await openProjectCreationView(view, normalizedProjectPath);
 
-      // Set input text via persisted state (happy-dom fireEvent.change can be flaky)
+      // Set input text via the draft store (happy-dom fireEvent.change can be flaky)
       // This mimics how ChatHarness.send() works
       const draftId = await waitForLatestDraftId(normalizedProjectPath);
-      const inputKey = getInputKey(getDraftScopeId(normalizedProjectPath, draftId));
       act(() => {
-        updatePersistedState(inputKey, "Fix the sidebar layout bug on mobile devices");
+        getDraftStore().setText(
+          { kind: "creation", projectPath: normalizedProjectPath, draftId },
+          "Fix the sidebar layout bug on mobile devices"
+        );
       });
 
       // Wait for the workspace name input to show a generated name

@@ -2030,8 +2030,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
         onAddReview={reviews.addReview}
-        onAcceptRestoredHeldInputs={(heldInputIds) =>
-          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds)
+        onAcceptRestoredHeldInputs={(heldInputIds, durable) =>
+          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds, durable)
         }
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}

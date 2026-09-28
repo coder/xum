@@ -7,12 +7,11 @@ jest.mock("lottie-react", () => ({
 
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   lockInitialStaging,
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
-import { getInputAttachmentsKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 
@@ -69,7 +68,7 @@ describe("Goal slash command", () => {
     const app = await createAppHarness({
       branchPrefix: "goal-staged",
       beforeRender: (workspaceId) => {
-        updatePersistedState(getInputAttachmentsKey(workspaceId), [
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: workspaceId }, [
           {
             kind: "staged",
             id: "s1",
@@ -111,7 +110,7 @@ describe("Goal slash command", () => {
       // staging on deferred runtimes can finish minutes after the workspace
       // composer mounted, so the write must sync into the mounted composer.
       act(() => {
-        updatePersistedState(getInputAttachmentsKey(app.workspaceId), [
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: app.workspaceId }, [
           {
             kind: "staged",
             id: "s1",

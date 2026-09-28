@@ -20,8 +20,6 @@ import {
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
@@ -139,6 +137,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import { getDraftStore, useDraft } from "@/browser/stores/DraftStore";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -473,19 +472,20 @@ function isDraftVisible(
   values?: {
     draftPrompt?: string;
     workspaceNameState?: unknown;
-    draftAttachments?: unknown[];
+    draftAttachmentCount?: number;
   }
 ): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
-  const draftPrompt = values?.draftPrompt ?? readPersistedState<string>(getInputKey(scopeId), "");
+  // Text and attachments come from the backend-backed draft store.
+  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
+  const draftPrompt = values?.draftPrompt ?? draft.text;
   const workspaceNameState =
     values?.workspaceNameState ??
     readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  const draftAttachments =
-    values?.draftAttachments ?? readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
+  const draftAttachmentCount = values?.draftAttachmentCount ?? draft.attachmentCount;
 
   const hasTextContent = typeof draftPrompt === "string" && draftPrompt.trim().length > 0;
-  const hasAttachments = Array.isArray(draftAttachments) && draftAttachments.length > 0;
+  const hasAttachments = draftAttachmentCount > 0;
   const hasNameState = workspaceNameState !== null;
   return hasTextContent || hasAttachments || hasNameState;
 }
@@ -494,14 +494,14 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const scopeId = getDraftScopeId(props.projectPath, props.draftId);
   const onVisibilityChange = props.onVisibilityChange;
 
-  const [draftPrompt] = usePersistedState<string>(getInputKey(scopeId), "", {
-    listener: true,
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
   });
+  const draftPrompt = draft.text;
 
   const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
-    listener: true,
-  });
-  const [draftAttachments] = usePersistedState<unknown[]>(getInputAttachmentsKey(scopeId), [], {
     listener: true,
   });
 
@@ -518,7 +518,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const isVisible = isDraftVisible(props.projectPath, props.draftId, {
     draftPrompt,
     workspaceNameState,
-    draftAttachments: Array.isArray(draftAttachments) ? draftAttachments : [],
+    draftAttachmentCount: draft.attachmentCount,
   });
 
   useEffect(() => {

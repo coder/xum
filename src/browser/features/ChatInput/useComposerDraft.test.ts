@@ -1,16 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { installDom } from "../../../../tests/ui/dom";
 import { installQuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import type { ChatAttachment } from "./ChatAttachments";
-import { readPersistedChatAttachments } from "./draftAttachmentsStorage";
 import { useComposerDraft } from "./useComposerDraft";
 
 let cleanupDom: (() => void) | undefined;
-
-const WORKSPACE_ID = "ws-draft";
 
 const attachment = (id: string): ChatAttachment => ({
   kind: "provider",
@@ -19,20 +15,19 @@ const attachment = (id: string): ChatAttachment => ({
   mediaType: "image/png",
 });
 
-const renderDraft = (
-  pushToast: Parameters<typeof useComposerDraft>[0]["pushToast"] = () => undefined
-) =>
+// The draft store is a process-wide singleton, so every test uses its own workspace.
+const renderDraft = (workspaceId: string) =>
   renderHook(() =>
     useComposerDraft({
       variant: "workspace",
-      workspaceId: WORKSPACE_ID,
+      workspaceId,
       creationProjectPath: "",
       attachedReviews: [],
-      pushToast,
+      pushToast: () => undefined,
     })
   );
 
-describe("useComposerDraft attachment persistence", () => {
+describe("useComposerDraft", () => {
   beforeEach(() => {
     cleanupDom = installDom();
   });
@@ -41,70 +36,46 @@ describe("useComposerDraft attachment persistence", () => {
     cleanupDom?.();
   });
 
-  // A Stop restore writes text then attachments and acknowledges the backend copy right away
-  // (#4448). If the composer unmounts before React renders, attachments persisted only inside
-  // a state updater would be lost after that acknowledgement.
-  test("persists attachments before the next render, even if the composer unmounts first", () => {
-    const { result, unmount } = renderDraft();
+  // Issue 5006: the composer rendered the localStorage value, so with a full origin quota every
+  // keystroke failed to save and never appeared on screen.
+  test("typed text stays on screen when localStorage writes throw QuotaExceededError", () => {
+    const storage = installQuotaLimitedStorage(0);
+    const { result } = renderDraft("ws-quota-full");
+    act(() => {
+      result.current.setInput("typed while the quota is full");
+    });
+    act(() => {
+      result.current.setInput((previous) => previous + "!");
+    });
+
+    expect(result.current.input).toBe("typed while the quota is full!");
+    expect(storage.length).toBe(0);
+  });
+
+  // A Stop restore writes text then attachments and flushes them right away (#4448). If the
+  // composer unmounts before React renders, a change applied only inside a state updater would
+  // never reach the draft store, so the flush would confirm a draft without it.
+  test("applies a restore to the draft store before the next render, even if the composer unmounts", () => {
+    const workspaceId = "ws-restore-unmount";
+    const { result, unmount } = renderDraft(workspaceId);
     act(() => {
       result.current.setInput("restored text");
       result.current.setAttachments((current) => [attachment("restored"), ...current]);
       unmount();
     });
 
-    expect(readPersistedState(getInputKey(WORKSPACE_ID), "")).toBe("restored text");
-    expect(
-      readPersistedChatAttachments(getInputAttachmentsKey(WORKSPACE_ID)).map(({ id }) => id)
-    ).toEqual(["restored"]);
+    const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
+    expect(draft.text).toBe("restored text");
+    expect(draft.attachments.map(({ id }) => id)).toEqual(["restored"]);
   });
 
-  test("sequential functional updates in one batch compose", () => {
-    const { result } = renderDraft();
+  test("sequential functional attachment updates in one batch compose", () => {
+    const { result } = renderDraft("ws-sequential");
     act(() => {
       result.current.setAttachments((current) => [...current, attachment("a")]);
       result.current.setAttachments((current) => [...current, attachment("b")]);
     });
 
     expect(result.current.attachments.map(({ id }) => id)).toEqual(["a", "b"]);
-    expect(
-      readPersistedChatAttachments(getInputAttachmentsKey(WORKSPACE_ID)).map(({ id }) => id)
-    ).toEqual(["a", "b"]);
-  });
-
-  // Under the size cap the write can still fail when the origin quota is full and nothing
-  // evictable is left. The user must hear that the attachment is memory-only, and the
-  // previously saved list must not come back on reload.
-  test("warns when an attachment within the size cap still fails to save", () => {
-    const storage = installQuotaLimitedStorage(400);
-    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-    const pushToast = mock((_toast: unknown) => undefined);
-    const { result } = renderDraft(pushToast);
-    act(() => {
-      result.current.setAttachments([attachment("small")]);
-    });
-    expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).not.toBeNull();
-    expect(pushToast).not.toHaveBeenCalled();
-
-    storage.seed("review-state:ws-draft", "y".repeat(300));
-    act(() => {
-      result.current.setAttachments((current) => [...current, attachment("second")]);
-    });
-
-    expect(result.current.attachments.map(({ id }) => id)).toEqual(["small", "second"]);
-    expect(pushToast).toHaveBeenCalledTimes(1);
-    expect(pushToast.mock.calls[0]).toEqual([expect.objectContaining({ type: "error" })]);
-    expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).toBeNull();
-
-    // The first toast auto-dismisses, so each later add that also fails must warn again;
-    // removing an attachment adds nothing new to warn about.
-    act(() => {
-      result.current.setAttachments((current) => [...current, attachment("third")]);
-    });
-    expect(pushToast).toHaveBeenCalledTimes(2);
-    act(() => {
-      result.current.setAttachments((current) => current.slice(1));
-    });
-    expect(pushToast).toHaveBeenCalledTimes(2);
-    warn.mockRestore();
   });
 });

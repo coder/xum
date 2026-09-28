@@ -28,8 +28,6 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getInputKey,
-  getInputAttachmentsKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
@@ -68,10 +66,8 @@ import {
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-} from "@/browser/features/ChatInput/draftAttachmentsStorage";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -291,16 +287,11 @@ export type RuntimeAvailabilityState =
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
 function isWorkspaceDraftEmpty(workspaceId: string): boolean {
-  return (
-    readPersistedState<string>(getInputKey(workspaceId), "").trim().length === 0 &&
-    (readPersistedState<ChatAttachment[] | undefined>(
-      getInputAttachmentsKey(workspaceId),
-      undefined
-    )?.length ?? 0) === 0
-  );
+  const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
+  return draft.text.trim().length === 0 && draft.attachmentCount === 0;
 }
 
-// Persist a failed creation send's draft under the new workspace's keys so the
+// Move a failed creation send's draft into the new workspace's draft so the
 // retry happens there instead of creating a duplicate workspace.
 function transferDraftToWorkspace(
   workspaceId: string,
@@ -314,30 +305,15 @@ function transferDraftToWorkspace(
     // the new worktree.
     updatePersistedState(getPendingDraftSkillDiscoveryKey(workspaceId), true);
   }
-  updatePersistedState(getInputKey(workspaceId), text);
+  const scope = { kind: "workspace" as const, workspaceId };
+  getDraftStore().setText(scope, text);
   if (attachments.length === 0) {
-    // A text-only send never touches the attachments key: the mounted composer
-    // is unlocked during such a send, and a write here (even of "nothing") would
+    // A text-only send never touches the attachments: the mounted composer is
+    // unlocked during such a send, and a write here (even of "nothing") would
     // replace attachments the user added there meanwhile.
     return;
   }
-  // Base64-bearing attachments can exceed the persistence cap. Drop the
-  // largest ones first so small retryable chips (e.g. a pending file whose
-  // staging failed) survive the transfer.
-  let persistable = attachments;
-  while (
-    persistable.length > 0 &&
-    estimatePersistedChatAttachmentsChars(persistable) > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS
-  ) {
-    const largest = persistable.reduce((a, b) =>
-      JSON.stringify(b).length > JSON.stringify(a).length ? b : a
-    );
-    persistable = persistable.filter((attachment) => attachment !== largest);
-  }
-  updatePersistedState(
-    getInputAttachmentsKey(workspaceId),
-    persistable.length > 0 ? persistable : undefined
-  );
+  getDraftStore().setAttachments(scope, attachments);
 }
 
 /**
@@ -708,16 +684,10 @@ export function useCreationWorkspace({
           .catch(() => null);
 
         const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
-        const pendingScopeId = projectPath
-          ? isDraftScope
-            ? getDraftScopeId(projectPath, draftId)
-            : getPendingScopeId(projectPath)
-          : null;
-
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
-          if (!pendingScopeId) {
+          if (!projectPath) {
             return;
           }
 
@@ -726,8 +696,16 @@ export function useCreationWorkspace({
             return;
           }
 
-          updatePersistedState(getInputKey(pendingScopeId), "");
-          updatePersistedState(getInputAttachmentsKey(pendingScopeId), undefined);
+          getDraftStore()
+            .deleteDraft(
+              getComposerDraftScope({
+                variant: "creation",
+                workspaceId: null,
+                creationProjectPath: projectPath,
+                pendingDraftId: draftId ?? undefined,
+              })
+            )
+            .catch(() => undefined);
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).

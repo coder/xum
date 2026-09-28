@@ -1,7 +1,6 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 export class ChatHarness {
@@ -42,10 +41,10 @@ export class ChatHarness {
     textarea.focus();
 
     // happy-dom + React can be flaky for synthetic textarea input events.
-    // Since ChatInput uses usePersistedState, updating the persisted key is both deterministic
+    // ChatInput renders the draft store, so writing the draft there is both deterministic
     // and exercises the real UI state path.
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      getDraftStore().setText({ kind: "workspace", workspaceId: this.workspaceId }, text);
     });
 
     await waitFor(
@@ -142,7 +141,7 @@ export class ChatHarness {
     textarea.focus();
 
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      getDraftStore().setText({ kind: "workspace", workspaceId: this.workspaceId }, text);
     });
 
     await waitFor(

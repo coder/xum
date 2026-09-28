@@ -1,3 +1,4 @@
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -13,10 +14,7 @@ import {
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
-  getInputKey,
-  getInputAttachmentsKey,
   getModelKey,
-  getPendingScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
@@ -42,6 +40,11 @@ import { GlobalWindow } from "happy-dom";
 import type { PendingFileChatAttachment } from "./ChatAttachments";
 import type { WorkspaceCreatedOptions } from "./types";
 import { useCreationWorkspace, type CreationSendResult } from "./useCreationWorkspace";
+
+// Composer drafts live in the (singleton) draft store; each test starts from empty drafts.
+const workspaceDraft = () =>
+  getDraftStore().getView({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID });
+const pendingDraft = () => getDraftStore().getView(defaultCreationDraftScope(TEST_PROJECT_PATH));
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
@@ -643,6 +646,10 @@ describe("useCreationWorkspace", () => {
     routerState.currentWorkspaceId = null;
     routerState.currentProjectId = null;
     routerState.pendingDraftId = null;
+    getDraftStore().forgetWorkspace(TEST_WORKSPACE_ID);
+    getDraftStore().forgetProject(TEST_PROJECT_PATH);
+    // The creation composer's draft; a created workspace must clear it.
+    getDraftStore().setText(defaultCreationDraftScope(TEST_PROJECT_PATH), "creation draft");
   });
 
   afterEach(async () => {
@@ -899,12 +906,8 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(onWorkspaceCreated.mock.calls.length).toBe(1));
     expect(onWorkspaceCreated.mock.calls[0][0]).toEqual(TEST_METADATA);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
   });
 
   test("handleSend stages pending files after create and appends the attached-files notice", async () => {
@@ -1075,18 +1078,12 @@ describe("useCreationWorkspace", () => {
 
     // The transferred draft restores the original slash command so a retry
     // re-invokes the skill, and preserves the forced project-path discovery.
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "/review my files",
-    ]);
+    expect(workspaceDraft().text).toBe("/review my files");
     expect(updatePersistedStateCalls).toContainEqual([
       getPendingDraftSkillDiscoveryKey(TEST_WORKSPACE_ID),
       true,
     ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1114,8 +1111,7 @@ describe("useCreationWorkspace", () => {
     expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
     clearPendingInitialSendSpy.mockRestore();
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    expect(updatePersistedStateCalls).toContainEqual([getInputKey(pendingScopeId), ""]);
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
   });
 
   test("handleSend transfers the staged draft when the first send fails after staging", async () => {
@@ -1157,14 +1153,8 @@ describe("useCreationWorkspace", () => {
 
     // Staged files live in the new workspace; the draft must be transferred so
     // the user can retry the send with the chips/notice intact.
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "send my files",
-    ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1214,14 +1204,8 @@ describe("useCreationWorkspace", () => {
     expect(result).toMatchObject({ success: false });
     expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
 
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "send my files",
-    ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1265,16 +1249,7 @@ describe("useCreationWorkspace", () => {
 
     // The user lands in the created workspace with nothing persisted; the text must be
     // waiting in that composer so a model or provider fix can be followed by a plain resend.
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "fix the login bug",
-    ]);
-    // A text-only send leaves the workspace composer unlocked, so the transfer must not touch
-    // its attachments key: even a write of "nothing" would replace attachments added there
-    // meanwhile (oversized ones exist only in component state and are invisible here).
-    expect(
-      updatePersistedStateCalls.some(([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID))
-    ).toBe(false);
+    expect(workspaceDraft().text).toBe("fix the login bug");
     const errorWrite = updatePersistedStateCalls.find(
       ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
     );
@@ -1295,7 +1270,7 @@ describe("useCreationWorkspace", () => {
     setupWindow({ sendMessage: sendMessageMock });
     // Text-only sends leave the new workspace composer unlocked while sendMessage waits on
     // init, so the user may already have typed a follow-up there.
-    window.localStorage.setItem(getInputKey(TEST_WORKSPACE_ID), JSON.stringify("also check CI"));
+    getDraftStore().setText({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID }, "also check CI");
 
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
@@ -1309,12 +1284,7 @@ describe("useCreationWorkspace", () => {
       await getHook().handleSend("fix the login bug");
     });
 
-    expect(updatePersistedStateCalls.some(([key]) => key === getInputKey(TEST_WORKSPACE_ID))).toBe(
-      false
-    );
-    expect(window.localStorage.getItem(getInputKey(TEST_WORKSPACE_ID))).toBe(
-      JSON.stringify("also check CI")
-    );
+    expect(workspaceDraft().text).toBe("also check CI");
     const errorWrite = updatePersistedStateCalls.find(
       ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
     );
@@ -1357,15 +1327,10 @@ describe("useCreationWorkspace", () => {
 
     expect(lockObservedDuringSend).toEqual([true]);
     expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
-      expect.objectContaining({ kind: "provider", url: imagePart.url }),
-    ]);
+    expect(workspaceDraft().attachments).toMatchObject([{ kind: "provider", url: imagePart.url }]);
   });
 
-  test("handleSend keeps small retryable files when trimming an over-cap transfer", async () => {
+  test("handleSend transfers large attachments whole (drafts are no longer capped)", async () => {
     const stageAttachmentMock = mock(
       (_args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> =>
         Promise.resolve({ success: false, error: "disk full" } as WorkspaceStageAttachmentResult)
@@ -1388,7 +1353,7 @@ describe("useCreationWorkspace", () => {
       sizeBytes: 3,
       dataBase64: "Ymlu",
     };
-    // A provider attachment whose data URL alone exceeds the persistence cap.
+    // A provider attachment far above the old localStorage persistence cap.
     const oversizedFilePart = {
       type: "file" as const,
       url: `data:application/pdf;base64,${"a".repeat(4_000_001)}`,
@@ -1409,12 +1374,12 @@ describe("useCreationWorkspace", () => {
 
     expect(result).toEqual({ success: false });
 
-    // The trim drops only the oversized attachment; the small failed pending
-    // file survives so the user can retry staging it.
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([failedPendingFile]);
+    // Both survive: the big attachment and the failed pending file the user can retry.
+    expect(workspaceDraft().attachments).toHaveLength(2);
+    expect(workspaceDraft().attachments).toContainEqual(failedPendingFile);
+    expect(
+      workspaceDraft().attachments.find((attachment) => attachment.kind === "provider")
+    ).toMatchObject({ url: oversizedFilePart.url });
   });
 
   test("handleSend creates workspace and applies initial goal command without sending chat text", async () => {
@@ -1812,12 +1777,8 @@ describe("useCreationWorkspace", () => {
     expect(handleSendResult).toEqual({ success: false, error: sendError });
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     const pendingErrorKey = getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID);
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
     expect(updatePersistedStateCalls).toContainEqual([pendingErrorKey, sendError]);
   });
   test("onWorkspaceCreated is called before sendMessage resolves (no blocking)", async () => {

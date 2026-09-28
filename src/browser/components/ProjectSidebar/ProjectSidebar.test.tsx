@@ -12,7 +12,7 @@ import {
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
 } from "@/common/constants/storage";
-import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -1134,9 +1134,12 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give both drafts persisted content so their rows would render.
-    updatePersistedState(getInputKey(getDraftScopeId("_multi", "draft-multi")), "Multi draft");
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-single")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi" },
+      "Multi draft"
+    );
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
       "Single draft"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1184,8 +1187,8 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    updatePersistedState(
-      getInputKey(getDraftScopeId("_multi", "draft-multi-badge")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
       "Multi draft"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1457,8 +1460,8 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Non-empty drafts render as rows; empty ones stay hidden.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-order")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
       "Draft prompt"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1515,8 +1518,8 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give the draft persisted content so the draft row would render pre-substitution.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-promoted")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-promoted" },
       "Draft prompt"
     );
 
@@ -3327,11 +3330,11 @@ describe("ProjectSidebar project actions menu", () => {
     const view = renderSidebar();
     expect(view.getByText("Empty")).toBeTruthy();
 
-    const draftScopeId = getDraftScopeId(demoProjectPath, draftId);
-    const draftInputKey = getInputKey(draftScopeId);
-
     act(() => {
-      updatePersistedState<string>(draftInputKey, "Visible draft prompt", "");
+      getDraftStore().setText(
+        { kind: "creation", projectPath: demoProjectPath, draftId },
+        "Visible draft prompt"
+      );
     });
 
     await waitFor(() => {

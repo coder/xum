@@ -21,6 +21,7 @@ import {
   deleteWorkspaceStorage,
   getDraftScopeId,
 } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
@@ -305,6 +306,9 @@ export function ProjectProvider(props: { children: ReactNode }) {
             next.delete(path);
             return next;
           });
+
+          // The backend deleted the project's creation draft files; drop them from memory.
+          getDraftStore().forgetProject(path);
 
           // Clean up any UI-only workspace drafts for this project.
           const draftsValue = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
