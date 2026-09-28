@@ -587,9 +587,8 @@ export class RefineService {
     const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
     if (!turnExclusionResult.success) {
       return Err(
-        `a turn is active in this workspace (${turnExclusionResult.error}); refinements cannot ` +
-          `be applied into a running conversation — run /refine apply again once the workspace ` +
-          `is idle (nothing was applied)`
+        `refinements cannot be applied now (${turnExclusionResult.error}) — run /refine apply ` +
+          `again once the workspace is idle (nothing was applied)`
       );
     }
     using _turnExclusion = turnExclusionResult.data;
@@ -1144,9 +1143,8 @@ export class RefineService {
       const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
       if (!turnExclusionResult.success) {
         return Err(
-          `a turn is active in this workspace (${turnExclusionResult.error}); the distilled ` +
-            `proposal cannot be published into a running conversation — run /refine again once ` +
-            `the workspace is idle`
+          `the distilled proposal cannot be published now (${turnExclusionResult.error}) — run ` +
+            `/refine again once the workspace is idle`
         );
       }
       using _turnExclusion = turnExclusionResult.data;

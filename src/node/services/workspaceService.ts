@@ -2589,6 +2589,12 @@ export class WorkspaceService
    * and the pre-interruption hold; one entering later observes archivingWorkspaces.
    */
   private readonly preflightForkCounts = new Map<string, number>();
+  /**
+   * Held refine turn exclusions (acquireIdleTurnExclusion), per workspace. A /refine apply
+   * writes approved skills into the checkout under it (#4965), so the archive gates count it
+   * like the other preflight counters.
+   */
+  private readonly refineExclusionCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -3932,6 +3938,14 @@ export class WorkspaceService
    * send entry-set — sends admitted after release see the completed append.
    */
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable> {
+    // #4965: /refine apply writes approved skills into the checkout under this exclusion.
+    // Model-driven archive and task_remove hold archivingWorkspaces through their lossy-work
+    // checks and the destructive step, and removal holds removingWorkspaces, so refuse here;
+    // an exclusion taken first is counted below and refuses their hold instead. Both run in one
+    // synchronous block, like the other preflight admissions.
+    if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
+      return Err("the workspace is being archived or removed");
+    }
     const session = this.getOrCreateSession(workspaceId);
     const hold = session.holdTurnAdmission();
     // Pending mid-stream compaction counts as turn work (r43): its direct
@@ -3952,7 +3966,13 @@ export class WorkspaceService
       hold[Symbol.dispose]();
       return Err("a send is being admitted");
     }
-    return Ok(hold);
+    const counted = this.acquirePreflightAdmission(this.refineExclusionCounts, workspaceId);
+    return Ok({
+      [Symbol.dispose]: () => {
+        counted[Symbol.dispose]();
+        hold[Symbol.dispose]();
+      },
+    });
   }
 
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
@@ -10588,6 +10608,9 @@ export class WorkspaceService
     if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
       activityLabels.push("an MCP prompt discovery in progress");
     }
+    if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a refine apply or publication in progress");
+    }
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
@@ -10819,6 +10842,9 @@ export class WorkspaceService
         }
         if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
           activityLabels.push("an MCP prompt discovery in progress");
+        }
+        if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a refine apply or publication in progress");
         }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {

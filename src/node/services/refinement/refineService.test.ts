@@ -31,6 +31,7 @@ import { loadStagedRefineSet, saveStagedRefineSet } from "./refineStaging";
 import { listRefinements, rollbackRefinement } from "./refinementRollback";
 import { RefineService } from "./refineService";
 import { TestTempDir } from "../tools/testHelpers";
+import { createWorkspaceServiceHarness } from "../workspaceService.testHarness";
 
 /**
  * Behavior under test: the /refine orchestration rails — RLM gating (backend
@@ -2259,6 +2260,110 @@ describe("RefineService", () => {
     });
     expect(rollback.success).toBe(true);
     expect(await pathExists(skillFile)).toBe(false);
+  });
+
+  // #4965: model-driven archive and task_remove hold workspace admission through their lossy-work
+  // checks and the destructive step. An apply writes approved skills into the checkout, so it must
+  // refuse under that hold, and an apply already writing must refuse the hold.
+  describe("archive/removal admission hold (#4965)", () => {
+    const skillMarkdown = [
+      "---",
+      "name: held-lesson",
+      "description: Run bun install before make test in this repo.",
+      "---",
+      "",
+      "Run `bun install` before `make test`.",
+      "",
+    ].join("\n");
+    const holdOptions = {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+      operation: "remove" as const,
+    };
+
+    async function createHeldFixture(onStagedEditAttempted?: (toolCallId: string) => void) {
+      const harness = await createWorkspaceServiceHarness();
+      await harness.config.addWorkspace("/tmp/refine-hold-project", {
+        id: WORKSPACE_ID,
+        name: WORKSPACE_ID,
+        projectName: "refine-hold-project",
+        projectPath: "/tmp/refine-hold-project",
+        runtimeConfig: { type: "local" },
+      });
+      const fixture = await createFixture({
+        withSkillTool: true,
+        modelFactory: () =>
+          toolCallModel(
+            [
+              {
+                toolCallId: "refine-skill-held",
+                toolName: "agent_skill_write",
+                input: { name: "held-lesson", content: skillMarkdown },
+              },
+            ],
+            "held-lesson: repo test setup procedure."
+          ),
+        // The production wiring (di/layers/desktop.ts).
+        acquireTurnExclusion: (workspaceId) =>
+          harness.service.acquireIdleTurnExclusion(workspaceId),
+        ...(onStagedEditAttempted ? { onStagedEditAttempted } : {}),
+      });
+      await fixture.seedTrajectory();
+      const staged = await fixture.service.run(WORKSPACE_ID);
+      expect(staged.success).toBe(true);
+      const skillFile = path.join(
+        fixture.workspacePath,
+        ".xum",
+        "skills",
+        "held-lesson",
+        "SKILL.md"
+      );
+      return { harness, fixture, skillFile };
+    }
+
+    it("refuses to apply while the hold is armed and writes nothing into the checkout", async () => {
+      const { harness, fixture, skillFile } = await createHeldFixture();
+      await using _harness = harness;
+      using _fixture = fixture;
+
+      const hold = harness.service.acquirePreInterruptionArchiveHold(WORKSPACE_ID, holdOptions);
+      expect(hold.success ? "" : hold.error).toBe("");
+      if (!hold.success) return;
+      const refused = await fixture.applyShown();
+      hold.data[Symbol.dispose]();
+
+      expect(refused.success ? "" : refused.error).toContain("being archived or removed");
+      expect(await pathExists(skillFile)).toBe(false);
+      expect(await loadStagedRefineSet(fixture.sessionDir)).not.toBeNull();
+
+      // Released: the retained staged set applies.
+      const applied = await fixture.applyShown();
+      expect(applied.success ? "" : applied.error).toBe("");
+      expect(await pathExists(skillFile)).toBe(true);
+    });
+
+    it("an apply that is writing refuses a hold armed mid-apply", async () => {
+      let holdDuringApply: Result<Disposable, string> | undefined;
+      const { harness, fixture } = await createHeldFixture(() => {
+        holdDuringApply = harness.service.acquirePreInterruptionArchiveHold(
+          WORKSPACE_ID,
+          holdOptions
+        );
+      });
+      await using _harness = harness;
+      using _fixture = fixture;
+
+      const applied = await fixture.applyShown();
+
+      expect(applied.success ? "" : applied.error).toBe("");
+      expect(holdDuringApply?.success ? "" : holdDuringApply?.error).toContain(
+        "a refine apply or publication in progress"
+      );
+      // Released with the apply: a later hold is admitted.
+      const after = harness.service.acquirePreInterruptionArchiveHold(WORKSPACE_ID, holdOptions);
+      expect(after.success).toBe(true);
+      if (after.success) after.data[Symbol.dispose]();
+    });
   });
 
   it("refuses to apply a staged skill write whose target changed after staging (r49)", async () => {
