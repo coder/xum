@@ -291,7 +291,6 @@ import {
   isSSHRuntime,
   isDockerRuntime,
   isDevcontainerRuntime,
-  isLocalProjectRuntime,
 } from "@/common/types/runtime";
 import { BG_OUTPUT_SUBDIR } from "@/node/services/backgroundProcessExecutor";
 // Backend maintenance sends (goal continuations, idle compaction, heartbeats)
@@ -13051,15 +13050,20 @@ export class WorkspaceService
         await initSettled;
         const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
         const leftovers: string[] = [];
-        // Every fork except a project-dir one made its own checkout before registering (a legacy
-        // `local` config with srcBaseDir is a worktree runtime, so it counts):
-        // a new worktree (worktree, devcontainer), a remote worktree at a path the fork checked
-        // was free (SSH; Coder forks share the source's Coder workspace in existing mode, so the
-        // delete leaves that workspace alone), or a container under a name the fork refused to
-        // reuse (Docker). Init was aborted and awaited above, so this is the same full delete as
-        // the copy-failure cleanup. For a devcontainer it also removes the container the fork's
-        // init may have started, which holds the fork's plan copy (#4775).
-        if (rolledBack && !isLocalProjectRuntime(forkedRuntimeConfig)) {
+        // These forks made their own checkout before registering: a new worktree (worktree,
+        // devcontainer) or a remote worktree at a path the fork checked was free (SSH; Coder forks
+        // share the source's Coder workspace in existing mode, so the delete leaves that workspace
+        // alone). Init was aborted and awaited above, so this is the same full delete as the
+        // copy-failure cleanup. For a devcontainer it also removes the container the fork's init
+        // may have started, which holds the fork's plan copy (#4775). Docker forks are not
+        // included yet (#5117): their container holds the plan and is not a path a leftover can
+        // name.
+        if (
+          rolledBack &&
+          (isWorktreeRuntime(forkedRuntimeConfig) ||
+            isDevcontainerRuntime(forkedRuntimeConfig) ||
+            isSSHRuntime(forkedRuntimeConfig))
+        ) {
           // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
             .deleteWorkspace(

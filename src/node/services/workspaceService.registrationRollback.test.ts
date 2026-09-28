@@ -13,7 +13,6 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
-import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { ContainerManager } from "@/node/multiProject/containerManager";
@@ -1115,21 +1114,16 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       }
     );
 
-    // Item 2, remote forks: an SSH fork made its remote worktree at a path it checked was free, and
-    // a Docker fork made a container under a name it refused to reuse, before registering. Both are
-    // removed; the SSH branch is kept, since the fork does not report whether it made it.
-    test.each([
-      {
-        label: "SSH",
-        runtimeConfig: { type: "ssh" as const, host: "example.invalid", srcBaseDir: "/remote/src" },
-        prototype: SSHRuntime.prototype,
-      },
-      {
-        label: "Docker",
-        runtimeConfig: { type: "docker" as const, image: "example/image" },
-        prototype: DockerRuntime.prototype,
-      },
-    ])("$label fork rollback removes the fork's checkout", async ({ runtimeConfig, prototype }) => {
+    // Item 2, SSH forks (Coder forks too, in existing mode): the fork made its remote worktree at a
+    // path it checked was free, before registering. It is removed; the branch is kept, since the
+    // fork does not report whether it made it.
+    test("SSH fork rollback removes the fork's checkout", async () => {
+      const runtimeConfig = {
+        type: "ssh" as const,
+        host: "example.invalid",
+        srcBaseDir: "/remote/src",
+      };
+      const prototype = SSHRuntime.prototype;
       await harness.config.editConfig((cfg) => {
         cfg.projects.get(projectPath)!.workspaces.push({
           id: "fffffffff1",
