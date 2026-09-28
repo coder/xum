@@ -207,10 +207,12 @@ describe("container exec failures", () => {
     const errors = await failures(new StubbedDockerRuntime([noBash, 126]), false);
     expect(errors.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
     expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
-    // #4985: permanent daemon refusals need a configuration change, not a retry.
+    // #4985: permanent refusals (API version, authz plugin, socket permission) need a
+    // configuration change, not a retry.
     for (const refusal of [
       "Error response from daemon: client version 1.52 is too new. Maximum supported API version is 1.47\n",
       "Error response from daemon: authorization denied by plugin opa-docker-authz: request rejected by administrative policy\n",
+      "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: permission denied\n",
     ]) {
       const refused = await failures(new StubbedDockerRuntime([refusal, 1]), false);
       expect(refused.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
