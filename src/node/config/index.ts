@@ -1010,6 +1010,17 @@ class ProjectRegistrationLockContended extends Error {
   }
 }
 
+/**
+ * Another workspace in the project already has this name. The text avoids "Workspace already
+ * exists", which create() treats as a retry-with-suffix signal.
+ */
+export class WorkspaceNameTakenError extends Error {
+  constructor(workspaceName: string) {
+    super(`Workspace with name "${workspaceName}" already exists in this project`);
+    this.name = "WorkspaceNameTakenError";
+  }
+}
+
 export interface WorkspaceMetadataOptions {
   /**
    * Throw on config read/parse failure instead of silently resolving with
@@ -4178,8 +4189,17 @@ export class Config {
   async addWorkspace(
     projectPath: string,
     metadata: WorkspaceMetadata & { namedWorkspacePath?: string },
-    /** Written only on a new row, in its registration write (see the schema field). */
-    options: { unrelatedWorkspaceConsentPending?: true } = {}
+    options: {
+      /** Written only on a new row, in its registration write (see the schema field). */
+      unrelatedWorkspaceConsentPending?: true;
+      /**
+       * Reject with WorkspaceNameTakenError, writing nothing, when another row in the project has
+       * this name. Checked on the fresh config inside the serialized write, so of two concurrent
+       * registrations of one name exactly one lands (#5026). Legacy rows without a `name` are the
+       * caller's to check up front; rows registered concurrently always carry one.
+       */
+      refuseTakenName?: true;
+    } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
       let project = config.projects.get(projectPath);
@@ -4187,6 +4207,13 @@ export class Config {
       if (!project) {
         project = { workspaces: [] };
         config.projects.set(projectPath, project);
+      }
+
+      if (
+        options.refuseTakenName === true &&
+        project.workspaces.some((w) => w.id !== metadata.id && w.name === metadata.name)
+      ) {
+        throw new WorkspaceNameTakenError(metadata.name);
       }
 
       // Check if workspace already exists (by ID)

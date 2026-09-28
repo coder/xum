@@ -945,6 +945,56 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         });
       });
 
+      // #5026: both forks pass the early check before either registers; the registration write
+      // re-checks the name, and the loser must not delete the plan both copies wrote to.
+      test("concurrent local forks with one name: exactly one registers, the other leaves nothing", async () => {
+        await withTempMuxRoot(async (root) => {
+          await addLocalWorkspace("eeeeeeeee8", "race-a");
+          await addLocalWorkspace("eeeeeeeee9", "race-b");
+          await writeDistinctPlan(root, "race-a");
+          await writeDistinctPlan(root, "race-b");
+          // Hold both forks at the plan copy (after the early name check) until both arrive.
+          const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
+          let arrived = 0;
+          let releaseCopies!: () => void;
+          const bothArrived = new Promise<void>((resolve) => (releaseCopies = resolve));
+          spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(
+            async (...args) => {
+              arrived += 1;
+              if (arrived === 2) releaseCopies();
+              await bothArrived;
+              return realCopy(...args);
+            }
+          );
+          const newIds = spyOn(harness.config, "generateStableId");
+
+          const results = await Promise.all([
+            service.fork("eeeeeeeee8", "race-fork"),
+            service.fork("eeeeeeeee9", "race-fork"),
+          ]);
+
+          expect(arrived).toBe(2);
+          const winners = results.filter((r) => r.success);
+          const errors = results.flatMap((r) => (r.success ? [] : [r.error]));
+          expect(winners).toHaveLength(1);
+          expect(errors).toEqual([
+            'Failed to fork workspace: Workspace with name "race-fork" already exists in this project',
+          ]);
+          const winnerId = winners[0].success ? winners[0].data.metadata.id : "";
+          const loserIds = newIds.mock.results
+            .map((r) => r.value as string)
+            .filter((id) => id !== winnerId);
+          expect(loserIds).toHaveLength(1);
+          await expectNoCreationLeftovers(loserIds[0], "race-fork", []);
+          const names = [...harness.config.loadConfigOrDefault().projects.values()].flatMap((p) =>
+            p.workspaces.map((w) => w.name)
+          );
+          expect(names.filter((n) => n === "race-fork")).toHaveLength(1);
+          // The winner's plan path is shared with the loser's copy; the loser's rollback keeps it.
+          expect(await exists(getPlanFilePath("race-fork", "project", root))).toBe(true);
+        });
+      });
+
       test("local fork with a new name still copies the source plan", async () => {
         await withTempMuxRoot(async (root) => {
           await addLocalWorkspace("eeeeeeeee5", "local-src");

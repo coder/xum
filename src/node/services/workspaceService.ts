@@ -40,7 +40,12 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
+import {
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceNameTakenError,
+  type Config,
+} from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -12449,9 +12454,10 @@ export class WorkspaceService
       // Plan files live at plans/<projectName>/<name>.md, so a fork reusing the name of a workspace
       // in this project would overwrite that workspace's plan (#5009). Project-dir forks never
       // fail on the name by themselves; refuse for every runtime here, before anything is created
-      // or copied. The message avoids the "Workspace already exists" text create() retries on.
+      // or copied. Concurrent forks can both pass this check; the registration write re-checks
+      // the name (#5026).
       if (allMetadata.some((m) => m.projectPath === foundProjectPath && m.name === resolvedName)) {
-        return Err(`Workspace with name "${resolvedName}" already exists in this project`);
+        return Err(new WorkspaceNameTakenError(resolvedName).message);
       }
 
       const sourceWorkspace = this.config.findWorkspace(sourceWorkspaceId);
@@ -12913,8 +12919,17 @@ export class WorkspaceService
         // Marked in the registration write itself so a toggle from any backend cancels the
         // default granted below (#4446).
         await this.config
-          .addWorkspace(foundProjectPath, metadata, { unrelatedWorkspaceConsentPending: true })
+          .addWorkspace(foundProjectPath, metadata, {
+            unrelatedWorkspaceConsentPending: true,
+            // A concurrent fork may have registered this name since the early check (#5026).
+            refuseTakenName: true,
+          })
           .catch(async (error: unknown) => {
+            if (error instanceof WorkspaceNameTakenError) {
+              // The plan path is keyed by name, so the winner's plan is at the path this fork
+              // copied to; the rollback must not delete it. Left in place like any plan (#5019).
+              copiedPlanPath = undefined;
+            }
             // #4745: fail with the write's own error once the fork is undone.
             const rollback = await abortForkRegistration().catch((rollbackError: unknown) => {
               logRegistrationRollbackFailure(newWorkspaceId, rollbackError);
