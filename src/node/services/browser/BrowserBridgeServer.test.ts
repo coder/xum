@@ -106,7 +106,7 @@ function createBridgeServer(
   });
 }
 
-type MockClientSocket = Pick<WebSocket, "readyState" | "close" | "terminate"> & {
+type MockClientSocket = Pick<WebSocket, "readyState" | "close" | "terminate" | "on" | "off"> & {
   close: ReturnType<typeof mock>;
   terminate: ReturnType<typeof mock>;
 };
@@ -127,6 +127,8 @@ function createMockClientSocket(): MockClientSocket {
     readyState: WebSocket.OPEN,
     close: mock(),
     terminate: mock(),
+    on: mock(),
+    off: mock(),
   };
 }
 

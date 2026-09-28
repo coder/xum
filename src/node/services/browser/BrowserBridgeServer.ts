@@ -103,6 +103,11 @@ async function connectToStream(port: number): Promise<WebSocket> {
   return await new Promise<WebSocket>((resolve, reject) => {
     let settled = false;
     const upstream = new WebSocket(`ws://${STREAM_HOST}:${port}`);
+    // Bun >= 1.3.10's `ws` client shim can emit 'error' after onError below removed its
+    // listener: once() installs two native forwarders (the event fires twice), and
+    // terminate() after an error but before close re-emits it. An 'error' with no
+    // listener throws and would crash the backend, so keep a lifetime no-op listener.
+    upstream.on("error", () => undefined);
 
     const cleanup = () => {
       upstream.off("open", onOpen);
@@ -275,6 +280,16 @@ export class BrowserBridgeServer {
       return;
     }
 
+    // `ws` does not buffer 'message' events, and the client may send input as soon as
+    // its socket opens, before the upstream connects below. Bun 1.3.12+ reliably
+    // delivers such a frame before the upstream 'open', so queue client frames until
+    // the bridge listeners are attached instead of silently dropping them.
+    const pendingClientFrames: Array<{ data: RawData; isBinary: boolean }> = [];
+    const bufferClientFrame = (data: RawData, isBinary: boolean) => {
+      pendingClientFrames.push({ data, isBinary });
+    };
+    ws.on("message", bufferClientFrame);
+
     const liveSession = await this.browserSessionDiscoveryService.getSessionConnection(
       payload.workspaceId,
       payload.sessionName,
@@ -299,7 +314,13 @@ export class BrowserBridgeServer {
     try {
       const upstream = await connectToStream(liveSession.streamPort);
       const pair: BridgePair = { client: ws, upstream, closed: false };
-      this.attachBridgeListeners(pair, payload.workspaceId, liveSession.sessionName);
+      ws.off("message", bufferClientFrame);
+      this.attachBridgeListeners(
+        pair,
+        payload.workspaceId,
+        liveSession.sessionName,
+        pendingClientFrames
+      );
       this.activePairs.add(pair);
       if (this.browserSessionStateHub) {
         const unsubscribe = this.browserSessionStateHub.subscribe(
@@ -333,8 +354,13 @@ export class BrowserBridgeServer {
     }
   }
 
-  private attachBridgeListeners(pair: BridgePair, workspaceId: string, sessionId: string): void {
-    pair.client.on("message", (data, isBinary) => {
+  private attachBridgeListeners(
+    pair: BridgePair,
+    workspaceId: string,
+    sessionId: string,
+    pendingClientFrames: ReadonlyArray<{ data: RawData; isBinary: boolean }>
+  ): void {
+    const forwardClientFrame = (data: RawData, isBinary: boolean) => {
       if (pair.closed) {
         return;
       }
@@ -351,7 +377,8 @@ export class BrowserBridgeServer {
         });
         this.cleanupPair(pair, { closeReason: "upstream write failed" });
       }
-    });
+    };
+    pair.client.on("message", forwardClientFrame);
 
     pair.client.on("close", () => {
       this.cleanupPair(pair, { closeReason: "client websocket closed" });
@@ -397,6 +424,10 @@ export class BrowserBridgeServer {
       });
       this.cleanupPair(pair, { closeReason: "upstream websocket error" });
     });
+
+    for (const frame of pendingClientFrames) {
+      forwardClientFrame(frame.data, frame.isBinary);
+    }
   }
 
   private cleanupPair(
