@@ -503,6 +503,16 @@ export const STARTUP_RECOVERY_CONCURRENCY = 8;
 export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
   "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
 
+/**
+ * Where a runtime keeps its plan files, for "do these two workspaces share a plan path": the local
+ * home for local and worktree runtimes, the host's home for SSH. Docker and devcontainer plans live
+ * inside their own container and are never shared (undefined).
+ */
+function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
+  if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
+  return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -7794,6 +7804,14 @@ export class WorkspaceService
         });
       }
 
+      // #5019: delete the plan files after every step that can refuse the removal (the checkout
+      // deletion and the session teardown above) and BEFORE deregistration frees the name: fork()
+      // refuses a registered name, so no fork (in this or another backend) can copy a plan to this
+      // path until the row is gone. If deregistration then fails, the workspace stays registered
+      // without its plan, like its already deleted session. Without captured metadata there is no
+      // path to derive.
+      if (removedMetadata) await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
+
       // Remove from config
       try {
         await (pendingRemovalId != null
@@ -7835,10 +7853,6 @@ export class WorkspaceService
         throw error;
       }
       removedFromConfig = true;
-      // #5019: only now, with the checkout and the registration gone, is the plan unowned. Right
-      // after deregistration, so a fork that takes the freed name has the least time to copy a
-      // plan to this path first. Without captured metadata there is no path to derive.
-      if (removedMetadata) await this.deletePlanFilesAfterRemoval(workspaceId, removedMetadata);
       this.autoTitlingWorkspaces.delete(workspaceId);
       this.agentTaskIntegration?.noteWorkspaceRemoved(workspaceId);
       // Only once the workspace is deregistered (and its session, with the
@@ -7939,11 +7953,12 @@ export class WorkspaceService
 
   /**
    * Delete a removed workspace's plan files (#5019): plan paths key on project and workspace
-   * name, so a plan left behind is inherited by the next workspace that takes the name. Runs only
-   * after a committed removal, so it is best-effort: a failure (for example an unreachable SSH
-   * host, which deletePlanFiles reports as a typed error) is logged and the orphan stays.
+   * name, so a plan left behind is inherited by the next workspace that takes the name. Runs past
+   * every refusal point of the removal, so it is best-effort: a failure (for example an
+   * unreachable SSH host, which deletePlanFiles reports as a typed error) is logged and the orphan
+   * stays.
    */
-  private async deletePlanFilesAfterRemoval(
+  private async deletePlanFilesOfRemovedWorkspace(
     workspaceId: string,
     metadata: FrontendWorkspaceMetadata
   ): Promise<void> {
@@ -7963,13 +7978,14 @@ export class WorkspaceService
     }
     try {
       // Plans key on the project basename: a same-named workspace in another project with that
-      // basename shares this path, and the plan may be its live one. Keep it (a harmless orphan
-      // at worst, when the two live on different hosts).
+      // basename, on the same plan storage, shares this path, and the plan may be its live one.
+      const storage = planStorageOf(runtimeConfig);
       const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
         (other) =>
           other.id !== workspaceId &&
           other.name === metadata.name &&
-          other.projectName === metadata.projectName
+          other.projectName === metadata.projectName &&
+          planStorageOf(other.runtimeConfig) === storage
       );
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {

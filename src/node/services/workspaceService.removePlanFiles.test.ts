@@ -104,17 +104,23 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
     });
   });
 
-  test("a removal whose deregistration fails keeps the plan files", async () => {
+  // A fork refuses a registered name, so deleting before deregistration means no fork can copy a
+  // plan to this path first and then lose it to the deletion.
+  test("the plan files are gone before deregistration frees the name", async () => {
     await withTempMuxRoot(async (root) => {
-      await addLocalWorkspace("ffffffff03", "stuck");
-      const plans = await writePlans(root, "ffffffff03", "stuck");
-      spyOn(harness.config, "removeWorkspace").mockRejectedValueOnce(new Error("lock timeout"));
+      await addLocalWorkspace("ffffffff03", "ordered");
+      const plans = await writePlans(root, "ffffffff03", "ordered");
+      const atDeregistration: boolean[] = [];
+      const realRemove = harness.config.removeWorkspace.bind(harness.config);
+      spyOn(harness.config, "removeWorkspace").mockImplementation(async (...args) => {
+        atDeregistration.push(...(await Promise.all(plans.map(exists))));
+        return realRemove(...args);
+      });
 
       const result = await service.remove("ffffffff03");
 
-      expect(result.success ? "" : result.error).toBe("Failed to remove workspace: lock timeout");
-      expect(harness.config.findWorkspace("ffffffff03")).not.toBeNull();
-      expect(await Promise.all(plans.map(exists))).toEqual([true, true]);
+      expect(result.success ? "" : result.error).toBe("");
+      expect(atDeregistration).toEqual([false, false]);
     });
   });
 
@@ -151,6 +157,33 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
 
       expect(result.success ? "" : result.error).toBe("");
       expect(await exists(sharedPlan)).toBe(true);
+    });
+  });
+
+  test("a same-named workspace on another host does not keep the local plan", async () => {
+    await withTempMuxRoot(async (root) => {
+      const twinProjectPath = path.join(harness.rootDir, "remote", "project");
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(twinProjectPath, {
+          workspaces: [
+            {
+              id: "ffffffff09",
+              name: "hosted",
+              path: "~/xum/project/hosted",
+              runtimeConfig: { type: "ssh", host: "remote-box", srcBaseDir: "~/xum" },
+            },
+          ],
+          trusted: true,
+        });
+        return cfg;
+      });
+      await addLocalWorkspace("ffffffff08", "hosted");
+      const localPlan = await writePlanFile(root, "project", "hosted");
+
+      const result = await service.remove("ffffffff08");
+
+      expect(result.success ? "" : result.error).toBe("");
+      expect(await exists(localPlan)).toBe(false);
     });
   });
 });
