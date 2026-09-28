@@ -202,6 +202,16 @@ export class CoderSSHRuntime extends SSHRuntime {
     return status;
   }
 
+  /** Keep cleanup hooks from starting stopped Coder workspaces through SSH. */
+  async isRunningWithoutStart(abortSignal: AbortSignal): Promise<boolean> {
+    const workspaceName = this.coderConfig.workspaceName;
+    if (!workspaceName) return false;
+    const status = await this.coderService.getWorkspaceStatus(workspaceName, {
+      signal: abortSignal,
+    });
+    return status.kind === "ok" && status.status === "running";
+  }
+
   /** In-flight ensureReady promise to avoid duplicate start/wait sequences */
   private ensureReadyPromise: Promise<EnsureReadyResult> | null = null;
 

@@ -319,6 +319,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
    * Only uses options.cwd if it looks like a valid container path (POSIX absolute, no Windows drive letters).
    */
   private resolveContainerCwd(optionsCwd: string | undefined, workspaceFolder: string): string {
+    // The CLI enters the configured container workspace. Cleanup must not run `up` just to learn this path.
+    if (!this.remoteWorkspaceFolder && optionsCwd === workspaceFolder) return ".";
     if (optionsCwd && this.looksLikeContainerPath(optionsCwd)) {
       return optionsCwd;
     }

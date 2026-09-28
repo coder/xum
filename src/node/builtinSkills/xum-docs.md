@@ -76,6 +76,7 @@ Use this index to find a page's:
       - Dev Container Runtime (`/runtime/devcontainer`) → `references/docs/runtime/devcontainer.mdx`: Run agents in containers defined by devcontainer.json
     - **Hooks**
       - Init Hooks (`/hooks/init`) → `references/docs/hooks/init.mdx`: Run setup commands automatically when creating new workspaces
+      - Archive and Delete Hooks (`/hooks/lifecycle`) → `references/docs/hooks/lifecycle.mdx`: Run project cleanup before archiving or deleting a workspace
       - Tool Hooks (`/hooks/tools`) → `references/docs/hooks/tools.mdx`: Block dangerous commands, lint after edits, and set up your environment
       - Environment Variables (`/hooks/environment-variables`) → `references/docs/hooks/environment-variables.mdx`: Environment variables available in agent bash commands and hooks
   - **Agents**

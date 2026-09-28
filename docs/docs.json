@@ -72,7 +72,7 @@
               },
               {
                 "group": "Hooks",
-                "pages": ["hooks/init", "hooks/tools", "hooks/environment-variables"]
+                "pages": ["hooks/init", "hooks/lifecycle", "hooks/tools", "hooks/environment-variables"]
               }
             ]
           },

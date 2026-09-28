@@ -192,6 +192,24 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
     await fs.rm(binDir, { recursive: true, force: true });
   });
 
+  it.skipIf(process.platform === "win32")(
+    "uses the CLI workspace directory without starting the container to discover its path",
+    async () => {
+      const stream = await createRuntime({ currentWorkspacePath: binDir }).exec("./.xum/archive", {
+        cwd: binDir,
+        timeout: 10,
+      });
+      const [argv, exitCode] = await Promise.all([
+        new Response(stream.stdout).text(),
+        stream.exitCode,
+      ]);
+      expect(exitCode).toBe(0);
+      expect(argv).toContain("exec\n--workspace-folder\n");
+      expect(argv).toContain("cd '.' && ./.xum/archive");
+      expect(argv).not.toContain(`cd '${binDir}'`);
+    }
+  );
+
   async function remoteEnvFor(state: RuntimeState, pathEnv: Record<string, string>) {
     const stream = await createRuntime(state).exec("true", {
       cwd: state.currentWorkspacePath!,

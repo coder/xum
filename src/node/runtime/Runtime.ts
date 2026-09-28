@@ -690,6 +690,9 @@ export interface Runtime {
    */
   ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult>;
 
+  /** Check availability without starting runtimes whose SSH connection can start them. */
+  isRunningWithoutStart?(abortSignal: AbortSignal): Promise<boolean>;
+
   /**
    * Fork an existing workspace to create a new one.
    * Creates a new workspace branching from the source workspace's current branch.

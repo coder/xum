@@ -396,6 +396,7 @@ import {
   type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
+import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
   areArchiveUntrackedPathListsEqual,
   normalizeArchiveUntrackedPaths,
@@ -7538,6 +7539,15 @@ export class WorkspaceService
             }
           }
 
+          await runProjectLifecycleHook({
+            hook: "delete",
+            workspaceId,
+            workspacePath: persistedWorkspacePath,
+            metadata,
+            config: this.config,
+            secretsStore: this.secretsStore,
+          });
+
           for (const projectRemoval of projectRemovals) {
             try {
               const deleteResult = await projectRemoval.runtime.deleteWorkspace(
@@ -7653,6 +7663,14 @@ export class WorkspaceService
           // and keep workspace in config so user can retry. This prevents orphaned directories.
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(projectPath))?.trusted ?? false;
+          await runProjectLifecycleHook({
+            hook: "delete",
+            workspaceId,
+            workspacePath: persistedWorkspacePath,
+            metadata,
+            config: this.config,
+            secretsStore: this.secretsStore,
+          });
           const deleteResult = await runtime.deleteWorkspace(
             projectPath,
             metadata.name, // use branch name
@@ -11268,6 +11286,16 @@ export class WorkspaceService
           return Ok(initialArchiveConfirmationResult.data);
         }
       }
+
+      // Project cleanup needs the checkout before runtime hooks stop or delete it.
+      await runProjectLifecycleHook({
+        hook: "archive",
+        workspaceId,
+        workspacePath,
+        metadata: beforeArchiveMetadata,
+        config: this.config,
+        secretsStore: this.secretsStore,
+      });
 
       // Lifecycle hooks run *before* we persist archivedAt.
       //
