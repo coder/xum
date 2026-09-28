@@ -38,22 +38,17 @@ import {
   type ChatInputDecorationStackItem,
   type TranscriptTailStackItem,
 } from "./layoutStack";
+import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
-  shouldShowInterruptedBarrier,
   mergeConsecutiveStreamErrors,
   shouldBypassDeferredMessages,
 } from "@/browser/utils/messages/messageUtils";
 import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashCollapsedSummaryModeContext";
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
-import {
-  getInterruptionContext,
-  getLastMainRetryCandidateMessage,
-  getLastNonDecorativeMessage,
-  isPreTokenInterruptedUserTurn,
-} from "@/common/utils/messages/retryEligibility";
+import { getLastNonDecorativeMessage } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
@@ -1159,18 +1154,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleJumpToBottom();
   }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
 
-  // Compute showRetryBarrier once for both keybinds and UI.
-  // Track if last message was interrupted or errored (for RetryBarrier).
-  const interruption = workspaceState
-    ? getInterruptionContext(
-        workspaceState.messages,
-        workspaceState.pendingStreamStartTime,
-        workspaceState.runtimeStatus,
-        workspaceState.lastAbortReason
-      )
-    : null;
-
-  const hasInterruptedStream = interruption?.hasInterruptedStream ?? false;
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   // An armed background bash monitor means the turn ended but the agent will be
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
@@ -1180,61 +1163,35 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
     !shouldMountStreamingBarrier;
-  const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
-  const isAutoRetryActive =
-    workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
-    workspaceState.autoRetryStatus?.type === "auto-retry-starting";
-
-  const lastRetryCandidateMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
-  const suppressRetryBarrier =
-    lastRetryCandidateMessage?.type === "stream-error" &&
-    lastRetryCandidateMessage.errorType === "context_exceeded";
-  const shouldMountRetryBarrier = !suppressRetryBarrier;
-  const showRetryBarrierUI = showRetryBarrier && !suppressRetryBarrier;
-
-  // Derive inline transcript chrome once so row rendering and layout pinning share the exact same
-  // visibility decision. This keeps late interrupted markers from sneaking in through a second code
-  // path after hydration or auto-retry state changes.
-  const interruptedBarrierMessageIds = new Set<string>();
-  for (const message of deferredMessages) {
-    if (
-      shouldShowInterruptedBarrier(message, {
-        isHydratingTranscript,
-        isAutoRetryActive,
-      })
-    ) {
-      interruptedBarrierMessageIds.add(message.id);
-    }
-  }
-  // A turn interrupted before its first token leaves the user message as the tail
-  // with no assistant row, so the loop above never marks it. Mark it here (subject
-  // to the same hydration/auto-retry/streaming suppression) so the divider still
-  // offers to continue. interruptedTailResumable/render both key off this set.
-  if (
-    !isHydratingTranscript &&
-    !isAutoRetryActive &&
-    !shouldShowStreamingBarrier &&
-    lastRetryCandidateMessage != null &&
-    isPreTokenInterruptedUserTurn(lastRetryCandidateMessage, workspaceState.lastAbortReason)
-  ) {
-    interruptedBarrierMessageIds.add(lastRetryCandidateMessage.id);
-  }
+  // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
+  // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
+  const {
+    showRetryBarrier,
+    lastRetryCandidateMessage,
+    shouldMountRetryBarrier,
+    showRetryBarrierUI,
+    interruptedBarrierMessageIds,
+    interruptedTailResumable,
+  } = getRetryBarrierDerivation({
+    messages: workspaceState.messages,
+    renderedMessages: deferredMessages,
+    pendingStreamStartTime: workspaceState.pendingStreamStartTime,
+    runtimeStatus: workspaceState.runtimeStatus,
+    lastAbortReason: workspaceState.lastAbortReason,
+    autoRetryStatus: workspaceState.autoRetryStatus,
+    isHydratingTranscript,
+    isTurnActive: shouldShowStreamingBarrier,
+    transcriptOnly,
+  });
 
   // Owned here so the click and keybind paths share one resume/error. resetKey is
   // the resume target, so error/spinner reset when the interrupted turn changes.
   const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
     workspaceId,
-    lastRetryCandidateMessage?.id
+    lastRetryCandidateMessage?.id,
+    workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Resumable only on the writable tail and only when RetryBarrier is suppressed
-  // (user-aborted case). When RetryBarrier is visible, its button owns resume.
-  const interruptedTailResumable =
-    !transcriptOnly &&
-    !showRetryBarrierUI &&
-    lastRetryCandidateMessage != null &&
-    interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   // Live status belongs beside the input, below async decorations: neither history
   // reveal nor banners arriving should bump the label and Stop across the screen.
   const turnStatus = shouldMountStreamingBarrier ? (

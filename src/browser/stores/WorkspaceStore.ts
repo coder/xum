@@ -108,6 +108,10 @@ import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import {
+  isAutoRetryStatusEvent,
+  type AutoRetryStatus,
+} from "@/browser/utils/messages/autoRetryStatus";
+import {
   markChatSwitchMilestone,
   markChatSwitchStart,
 } from "@/browser/utils/perf/chatSwitchTiming";
@@ -182,22 +186,6 @@ const EMPTY_TIMELINE_SNAPSHOT: WorkspaceTimelineSnapshot = {
   loadError: null,
   loadErrorKind: null,
 };
-
-export type AutoRetryStatus = Extract<
-  WorkspaceChatMessage,
-  | { type: "auto-retry-scheduled" }
-  | { type: "auto-retry-starting" }
-  | { type: "auto-retry-abandoned" }
->;
-
-function isAutoRetryStatusEvent(msg: WorkspaceChatMessage): msg is AutoRetryStatus {
-  const type = (msg as { type?: string }).type;
-  return (
-    type === "auto-retry-scheduled" ||
-    type === "auto-retry-starting" ||
-    type === "auto-retry-abandoned"
-  );
-}
 
 export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 

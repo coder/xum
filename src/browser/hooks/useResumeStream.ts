@@ -1,10 +1,10 @@
 import { useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { DisplayedMessage } from "@/common/types/message";
 
 export interface UseResumeStreamResult {
   /** Continue the interrupted stream from where it stopped. */
@@ -25,13 +25,18 @@ export interface UseResumeStreamResult {
  *
  * `resetKey` (the resume target message id) augments the identity so transient
  * state can't bleed across workspaces or across interrupted turns.
+ *
+ * `messages` are the workspace's transcript rows (the caller owns them, so the VS Code webview can
+ * pass its own aggregator's rows). `agentId`, when set, overrides the stored agent: the webview
+ * passes a sub-agent's locked agent, as its composer does (#4738).
  */
 export function useResumeStream(
   workspaceId: string,
-  resetKey?: string | null
+  resetKey: string | null | undefined,
+  messages: DisplayedMessage[],
+  agentId?: string
 ): UseResumeStreamResult {
   const { api } = useAPI();
-  const workspaceState = useWorkspaceState(workspaceId);
   const [error, setError] = useState<string | null>(null);
   const [isResuming, setIsResuming] = useState(false);
 
@@ -66,7 +71,8 @@ export function useResumeStream(
     setError(null);
     try {
       let options = getSendOptionsFromStorage(workspaceId);
-      const lastUserMessage = [...workspaceState.messages]
+      if (agentId) options = { ...options, agentId };
+      const lastUserMessage = [...messages]
         .reverse()
         .find(
           (message): message is Extract<typeof message, { type: "user" }> => message.type === "user"
