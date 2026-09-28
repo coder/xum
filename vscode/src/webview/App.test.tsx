@@ -928,7 +928,8 @@ describe("vscode webview agent lookup", () => {
       fireEvent.click(toggle);
       await Promise.resolve();
     });
-    // An unscoped click would write the webview's global agent key.
+    // The click must not open the picker: an unscoped pick would write the webview's global agent key.
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(readPersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), null)).toBeNull();
   });
 
