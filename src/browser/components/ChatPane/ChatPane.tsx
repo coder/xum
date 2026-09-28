@@ -127,6 +127,7 @@ import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFilter
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
 import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import {
   CUSTOM_EVENTS,
   type CustomEventType,
@@ -955,8 +956,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       for (const id of ids) {
         checkReview(id);
       }
+      // These notes were just sent: persist them as checked now rather than after the store's
+      // flush debounce, so a crash right after the send cannot bring them back as attached.
+      getReviewStateStore()
+        .flush(workspaceId)
+        .catch((error: unknown) => {
+          console.warn("Failed to persist sent review notes; the store keeps retrying:", error);
+        });
     },
-    [checkReview]
+    [checkReview, workspaceId]
   );
   const handleReviewNote = useCallback(
     (data: ReviewNoteData) => {

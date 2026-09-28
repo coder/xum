@@ -249,6 +249,12 @@ interface InternalSendOverrides extends SendOverrides {
   skipBoundaryEditConfirmation?: boolean;
 }
 
+/** Review notes captured for one send: their display data and the store ids to check off. */
+interface ReviewsForSend {
+  data: ReviewNoteDataForDisplay[] | undefined;
+  ids: string[];
+}
+
 /**
  * Calls `onChange` for each provider config change until `signal` aborts.
  * A plain function because React Compiler can't lower `for await` inside a component.
@@ -1505,31 +1511,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
         if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
-          const reviewWorkspaceId = workspaceIdForComposerClear;
-          const restoredAttachmentIds = restoredAttachments.map(({ id }) => id);
-          const acceptIfDurable = (restoredReviewsDurable: boolean) => {
-            if (
-              isRestoredDraftDurable({
-                inputKey: storageKeys.inputKey,
-                expectedText: mergedText,
-                attachmentsKey: storageKeys.attachmentsKey,
-                restoredAttachmentIds,
-                restoredReviewIds,
-                restoredReviewsDurable,
-              })
-            ) {
-              onAcceptRestoredHeldInputs?.(heldInputIds);
-            }
-          };
-          if (restoredReviewIds !== null && restoredReviewIds.length > 0) {
+          // Checked now, synchronously: the user may edit the draft while the review flush
+          // below is in flight, and that must not revoke a restore that already landed.
+          const draftDurable = isRestoredDraftDurable({
+            inputKey: storageKeys.inputKey,
+            expectedText: mergedText,
+            attachmentsKey: storageKeys.attachmentsKey,
+            restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
+            restoredReviewIds,
+          });
+          if (draftDurable && restoredReviewIds !== null && restoredReviewIds.length > 0) {
             // Restored notes live in the backend review-state store: flush them and require
             // the server-acknowledged copy before releasing the held input. A failed flush
             // leaves the input held (fail closed; a visible duplicate beats a loss).
             getReviewStateStore()
-              .areReviewsDurable(reviewWorkspaceId, restoredReviewIds)
-              .then(acceptIfDurable, () => undefined);
-          } else {
-            acceptIfDurable(true);
+              .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
+              .then(
+                (reviewsDurable) => {
+                  if (reviewsDurable) onAcceptRestoredHeldInputs?.(heldInputIds);
+                },
+                () => undefined
+              );
+          } else if (draftDurable) {
+            onAcceptRestoredHeldInputs?.(heldInputIds);
           }
         }
         focusMessageInput();
@@ -1757,6 +1761,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Keep this helper as a plain function so command wiring stays readable without a giant
   // dependency list; the React Compiler already handles memoization.
+  /**
+   * The composer's review notes for a send. Attached notes live in the backend review-state
+   * store; a send racing its first hydration waits for it (normally already resolved) and reads
+   * them from the store, so neither a command (e.g. /compact's follow-up) nor a normal send is
+   * built from the empty loading view.
+   */
+  const readReviewsForSend = async (): Promise<ReviewsForSend> => {
+    const renderTime: ReviewsForSend = { data: reviewData, ids: reviewIdsForCheck };
+    if (variant !== "workspace" || !workspaceId || reviewOverrideActive) return renderTime;
+    const reviewStateStore = getReviewStateStore();
+    if (reviewStateStore.isReady(workspaceId)) return renderTime;
+    await reviewStateStore.whenReady(workspaceId);
+    const attached = reviewStateStore.getAttachedReviews(workspaceId);
+    return {
+      data: attached.length > 0 ? attached.map((review) => review.data) : undefined,
+      ids: attached.map((review) => review.id),
+    };
+  };
+
   const executeParsedCommand = async (
     parsed: ParsedCommand | null,
     restoreInput: string,
@@ -1764,6 +1787,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       skipConfirmation?: boolean;
       queueDispatchMode?: QueueDispatchMode;
       goalInterventionPolicy?: GoalInterventionPolicy;
+      /** Hydrated review notes read by the send path; defaults to the render-time notes. */
+      reviews?: ReviewsForSend;
     }
   ): Promise<boolean> => {
     if (!parsed) {
@@ -1804,7 +1829,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return true;
     }
 
-    const reviewsData = reviewData;
+    const reviewsData = options?.reviews ? options.reviews.data : reviewData;
     const dispatchMode = options?.queueDispatchMode ?? "tool-end";
     // Thread dispatch mode into send options so queued command sends stay in sync with normal sends.
     const commandSendMessageOptions: SendMessageOptions = {
@@ -1835,7 +1860,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
-      attachedReviewIds: reviewIdsForCheck,
+      attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
       isCurrent: () => {
         const scope = asyncCommandScopeRef.current;
         return (
@@ -2135,7 +2160,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           pushToast({ type: "error", message: mcpPromptRefs.error });
           return null;
         }
+        // Before any command runs, so commands and normal sends both get hydrated notes; inside
+        // this in-flight window so a second Enter cannot start a duplicate send meanwhile.
+        const reviewsForSend = await readReviewsForSend();
+        if (!isSendScopeCurrent()) return null;
         return {
+          reviewsForSend,
           parsed: resolution.parsed,
           skillInvocation: resolution.skillInvocation,
           mcpPromptInvocation: resolution.mcpPromptInvocation,
@@ -2147,6 +2177,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     );
     if (!resolved) return;
     const {
+      reviewsForSend,
       parsed,
       skillInvocation,
       mcpPromptInvocation,
@@ -2290,6 +2321,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           : await executeParsedCommand(parsed, input, {
               goalInterventionPolicy: overrides?.goalInterventionPolicy,
               queueDispatchMode: overrides?.queueDispatchMode,
+              reviews: reviewsForSend,
             });
       if (commandHandled) {
         return;
@@ -2414,21 +2446,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             ? fileParts
             : undefined;
 
-        // Prepare reviews data (used for both compaction continueMessage and normal send).
-        // Attached notes live in the backend review-state store; a send racing its first
-        // hydration waits for it (normally already resolved) and reads the notes from the store
-        // so they are never dropped.
-        let reviewsData = reviewData;
-        let reviewIdsToCheck = reviewIdsForCheck;
-        if (variant === "workspace" && workspaceId && !reviewOverrideActive) {
-          const reviewStateStore = getReviewStateStore();
-          if (!reviewStateStore.isReady(workspaceId)) {
-            await reviewStateStore.whenReady(workspaceId);
-            const attached = reviewStateStore.getAttachedReviews(workspaceId);
-            reviewsData = attached.length > 0 ? attached.map((review) => review.data) : undefined;
-            reviewIdsToCheck = attached.map((review) => review.id);
-          }
-        }
+        // Prepare reviews data (used for both compaction continueMessage and normal send),
+        // read after hydration by readReviewsForSend.
+        const reviewsData = reviewsForSend.data;
+        const reviewIdsToCheck = reviewsForSend.ids;
 
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;

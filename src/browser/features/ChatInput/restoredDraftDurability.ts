@@ -8,7 +8,7 @@ import { readPersistedChatAttachments } from "./draftAttachmentsStorage";
  * back what landed instead of trusting the setters: the exact merged text, each restored
  * attachment, and each note the review store added (`null` when the notes went to the
  * memory-only override instead). Review notes live in the backend review-state store, so the
- * caller confirms them asynchronously (flush + server-acknowledged ids) and passes the verdict.
+ * caller additionally confirms restored note ids asynchronously (flush + server-acknowledged ids).
  */
 export function isRestoredDraftDurable(params: {
   inputKey: string;
@@ -16,14 +16,11 @@ export function isRestoredDraftDurable(params: {
   attachmentsKey: string;
   restoredAttachmentIds: readonly string[];
   restoredReviewIds: readonly string[] | null;
-  restoredReviewsDurable: boolean;
 }): boolean {
   if (readPersistedState<string>(params.inputKey, "") !== params.expectedText) return false;
   const storedAttachmentIds = new Set(
     readPersistedChatAttachments(params.attachmentsKey).map(({ id }) => id)
   );
   if (!params.restoredAttachmentIds.every((id) => storedAttachmentIds.has(id))) return false;
-  if (params.restoredReviewIds === null) return false;
-  if (params.restoredReviewIds.length === 0) return true;
-  return params.restoredReviewsDurable;
+  return params.restoredReviewIds !== null;
 }

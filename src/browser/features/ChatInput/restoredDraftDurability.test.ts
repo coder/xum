@@ -35,7 +35,6 @@ describe("isRestoredDraftDurable", () => {
       expectedText: "restored\n\ndraft",
       restoredAttachmentIds: ["restored-1"],
       restoredReviewIds: ["review-1"],
-      restoredReviewsDurable: true,
       ...overrides,
     });
 
@@ -52,17 +51,11 @@ describe("isRestoredDraftDurable", () => {
     expect(check({ restoredAttachmentIds: ["restored-1", "restored-2"] })).toBe(false);
   });
 
-  test("a restored note is not acknowledged by the backend review store (the flush failed)", () => {
-    expect(check({ restoredReviewsDurable: false })).toBe(false);
-  });
-
   test("restored notes went to the memory-only override", () => {
     expect(check({ restoredReviewIds: null })).toBe(false);
   });
 
   test("nothing to keep beyond the text", () => {
-    expect(
-      check({ restoredAttachmentIds: [], restoredReviewIds: [], restoredReviewsDurable: false })
-    ).toBe(true);
+    expect(check({ restoredAttachmentIds: [], restoredReviewIds: [] })).toBe(true);
   });
 });

@@ -573,6 +573,41 @@ describe("Held (refused) queued messages", () => {
     }
   }, 60_000);
 
+  test("a restore with a note is taken once the note is stored, even if the draft is edited while the note is being saved", async () => {
+    const app = await createAppHarness({ branchPrefix: "restore-ack-note" });
+    try {
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const heldInputId = await holdOneRefusedMessage(app, "held with a note");
+      const reviewStateService = app.env.services.reviewStateService;
+      const realApplyDelta = reviewStateService.applyDelta.bind(reviewStateService);
+      let releaseSave: () => void = () => undefined;
+      const saveGate = new Promise<void>((resolve) => {
+        releaseSave = resolve;
+      });
+      const applyDelta = jest
+        .spyOn(reviewStateService, "applyDelta")
+        .mockImplementation(async (...args) => {
+          await saveGate;
+          return realApplyDelta(...args);
+        });
+
+      await emitRestoreAndWaitForDispatch(app, "held with a note", [heldInputId], undefined, [
+        composerReview("restored note"),
+      ]);
+      await app.chat.expectInputValue("held with a note");
+      await waitFor(() => expect(applyDelta).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+      // The user keeps typing while the restored note is still being saved.
+      await app.chat.typeWithoutSending("held with a note, edited");
+      releaseSave();
+
+      await waitFor(() => expect(session.getHeldInputs()).toHaveLength(0), LOAD_TOLERANT_WAIT);
+      expect(heldBanners(app)).toHaveLength(0);
+      applyDelta.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("when the acknowledgement fails, the taken input's banner shows again: a visible duplicate, never a hidden copy", async () => {
     const app = await createAppHarness({ branchPrefix: "restore-ack-fail" });
     try {
@@ -625,7 +660,8 @@ async function emitRestoreAndWaitForDispatch(
   app: AppHarness,
   text: string,
   heldInputIds: string[],
-  fileParts?: FilePart[]
+  fileParts?: FilePart[],
+  reviews?: ReviewNoteData[]
 ): Promise<void> {
   const dispatched = new Promise<void>((resolve) => {
     const listener = () => {
@@ -640,6 +676,7 @@ async function emitRestoreAndWaitForDispatch(
     text,
     heldInputIds,
     ...(fileParts ? { fileParts } : {}),
+    ...(reviews ? { reviews } : {}),
   });
   await act(async () => {
     await dispatched;
