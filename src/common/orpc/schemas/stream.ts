@@ -17,6 +17,7 @@ import {
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
 import { MuxProviderOptionsSchema } from "./providerOptions";
+import { ReviewNoteDataSchema } from "./reviewState";
 import { RuntimeModeSchema } from "./runtime";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
@@ -667,17 +668,6 @@ export const WorkspaceInitEventSchema = z.discriminatedUnion("type", [
 // This wrapper adds a type discriminator for real-time streaming events.
 export const ChatMuxMessageSchema = MuxMessageSchema.extend({
   type: z.literal("message"),
-});
-
-// Review data schema for queued message display
-export const ReviewNoteDataSchema = z.object({
-  filePath: z.string(),
-  lineRange: z.string(),
-  selectedCode: z.string(),
-  selectedDiff: z.string().optional(),
-  oldStart: z.number().optional(),
-  newStart: z.number().optional(),
-  userNote: z.string(),
 });
 
 export const GoalBudgetLimitedEventSchema = z.object({

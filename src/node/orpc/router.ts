@@ -98,6 +98,7 @@ import {
   attachTerminal,
   subscribeConfigChanges,
   subscribeDevTools,
+  subscribeReviewState,
   subscribeLogs,
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
@@ -2124,6 +2125,26 @@ export const router = (authToken?: string) => {
             input.enabled
           )
         ),
+      reviewState: {
+        subscribe: t
+          .input(schemas.workspace.reviewState.subscribe.input)
+          .output(schemas.workspace.reviewState.subscribe.output)
+          .handler(({ context, input, signal }) =>
+            subscribeReviewState(context, input.workspaceId, signal)
+          ),
+        update: t
+          .input(schemas.workspace.reviewState.update.input)
+          .output(schemas.workspace.reviewState.update.output)
+          .handler(({ context, input }) =>
+            context.reviewStateService.applyDelta(input.workspaceId, input.delta)
+          ),
+        importLegacy: t
+          .input(schemas.workspace.reviewState.importLegacy.input)
+          .output(schemas.workspace.reviewState.importLegacy.output)
+          .handler(({ context, input }) =>
+            context.reviewStateService.importLegacy(input.workspaceId, input.sections)
+          ),
+      },
       stats: {
         subscribe: t
           .input(schemas.workspace.stats.subscribe.input)

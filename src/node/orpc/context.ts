@@ -52,6 +52,7 @@ import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserB
 import type { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
@@ -114,6 +115,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   instructionsService: InstructionsService;
   workspaceGoalService: WorkspaceGoalService;
   devToolsService: DevToolsService;
+  reviewStateService: ReviewStateService;
   browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   browserBridgeTokenManager: BrowserBridgeTokenManager;
   browserBridgeServer: BrowserBridgeServer;

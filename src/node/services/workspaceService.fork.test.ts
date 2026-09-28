@@ -9,6 +9,7 @@ import { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { SessionUsageService } from "./sessionUsageService";
+import { ReviewStateService } from "./reviewStateService";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -512,7 +513,7 @@ describe("WorkspaceService fork", () => {
     }
   });
 
-  test("resets forked session usage while preserving copied history", async () => {
+  test("resets forked session usage while preserving copied history and review state", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -545,6 +546,12 @@ describe("WorkspaceService fork", () => {
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
       })
     );
+
+    // Review notes/read state live in the session dir and must follow the fork.
+    const reviewStateService = new ReviewStateService(config);
+    await reviewStateService.applyDelta(sourceWorkspaceId, {
+      hunkExpand: { set: { "hunk-1": true } },
+    });
 
     const sessionUsageService = new SessionUsageService(config, historyService);
     const sourceUsage = await sessionUsageService.getSessionUsage(sourceWorkspaceId);
@@ -608,6 +615,9 @@ describe("WorkspaceService fork", () => {
       );
       expect(historyResult.success).toBe(true);
       expect(forkedMessages).toContain("assistant-1");
+
+      const forkedReviewState = await reviewStateService.getSnapshot(newWorkspaceId);
+      expect(forkedReviewState.sections.hunkExpand).toEqual({ "hunk-1": true });
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();

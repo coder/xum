@@ -26,6 +26,15 @@ export {
 // Workspace stats schemas
 export { WorkspaceStatsSnapshotSchema } from "./schemas/workspaceStats";
 
+// Workspace review-state schemas
+export {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./schemas/reviewState";
+
 // Chat stats schemas
 export { ChatStatsSchema, TokenConsumerSchema } from "./schemas/chatStats";
 

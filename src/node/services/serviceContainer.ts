@@ -36,6 +36,7 @@ import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserB
 import type { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -90,6 +91,7 @@ import {
   DesktopSessionManagerTag,
   DesktopTokenManagerTag,
   DevTools,
+  ReviewState,
   Editor,
   Experiments,
   Evaluation,
@@ -241,6 +243,7 @@ export class ServiceContainer {
   public readonly sessionTimingService: SessionTimingService;
   public readonly timelineService: TimelineService;
   public readonly devToolsService: DevToolsService;
+  public readonly reviewStateService: ReviewStateService;
   public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
   public readonly browserBridgeServer: BrowserBridgeServer;
@@ -337,6 +340,7 @@ export class ServiceContainer {
     this.sessionTimingService = get(SessionTiming);
     this.timelineService = get(Timeline);
     this.devToolsService = get(DevTools);
+    this.reviewStateService = get(ReviewState);
     this.browserSessionDiscoveryService = get(AgentBrowserSessionDiscovery);
     this.browserBridgeTokenManager = get(BrowserBridgeTokenManagerTag);
     this.browserBridgeServer = get(BrowserBridgeServerTag);
@@ -689,6 +693,7 @@ export class ServiceContainer {
       memoryConsolidationService: this.memoryConsolidationService,
       refineService: this.refineService,
       devToolsService: this.devToolsService,
+      reviewStateService: this.reviewStateService,
       browserSessionDiscoveryService: this.browserSessionDiscoveryService,
       browserBridgeTokenManager: this.browserBridgeTokenManager,
       browserBridgeServer: this.browserBridgeServer,

@@ -97,6 +97,13 @@ import {
 import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./reviewState";
+import {
   AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
@@ -2140,6 +2147,21 @@ export const workspace = {
       excluded: z.boolean(),
     }),
     output: ResultSchema(z.void(), z.string()),
+  },
+  // Per-workspace code-review state persisted in <sessionDir>/review-state.json.
+  reviewState: {
+    subscribe: {
+      input: z.object({ workspaceId: z.string() }),
+      output: eventIterator(ReviewStateEventSchema),
+    },
+    update: {
+      input: z.object({ workspaceId: z.string(), delta: ReviewStateDeltaSchema }),
+      output: ReviewStateSnapshotSchema,
+    },
+    importLegacy: {
+      input: z.object({ workspaceId: z.string(), sections: ReviewStateSectionsSchema }),
+      output: ReviewStateImportLegacyOutputSchema,
+    },
   },
   stats: {
     subscribe: {

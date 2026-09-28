@@ -41,6 +41,7 @@ import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInp
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { EditorService } from "@/node/services/editorService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -192,6 +193,9 @@ export class SessionTiming extends Context.Service<SessionTiming, SessionTimingS
 ) {}
 export class Analytics extends Context.Service<Analytics, AnalyticsService>()("xum/Analytics") {}
 export class DevTools extends Context.Service<DevTools, DevToolsService>()("xum/DevTools") {}
+export class ReviewState extends Context.Service<ReviewState, ReviewStateService>()(
+  "xum/ReviewState"
+) {}
 export class WorkspaceMcpOverrides extends Context.Service<
   WorkspaceMcpOverrides,
   WorkspaceMcpOverridesService
@@ -366,6 +370,7 @@ export type CrossCuttingTags =
   | SessionTiming
   | Analytics
   | DevTools
+  | ReviewState
   | WorkspaceMcpOverrides;
 
 /** The desktop-only services provided by the `DesktopLive` group layers, by group. */

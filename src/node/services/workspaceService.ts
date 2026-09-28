@@ -166,6 +166,7 @@ import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
   ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
 } from "@/node/services/additionalSystemContext";
+import { REVIEW_STATE_FILE_NAME } from "@/node/services/reviewStateService";
 import {
   generateWorkspaceIdentity,
   type NameGenerationCandidate,
@@ -12571,6 +12572,9 @@ export class WorkspaceService
 
         const sessionFiles = [
           "session-timing.json",
+          // Code-review notes and hunk read/expand state belong to the diff the fork
+          // inherits, so the fork starts with the same review progress as its source.
+          REVIEW_STATE_FILE_NAME,
           ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
           // Preserve the enabled/disabled toggle when forking so the fork
           // behaves identically to its source from the very first turn.

@@ -14,6 +14,8 @@ import type {
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
+import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
+import { ReviewStateService } from "@/node/services/reviewStateService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "./context";
@@ -111,6 +113,30 @@ export function subscribeDevTools(
       return () => service.off(eventName, emit.push);
     },
     initial: async () => ({ type: "snapshot" as const, runs: await service.getRuns(workspaceId) }),
+  });
+}
+
+export function subscribeReviewState(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<ReviewStateEvent> {
+  const service = context.reviewStateService;
+  return runtimeSubscription<ReviewStateEvent>(context, {
+    signal,
+    // Every event carries the full snapshot, so only the newest unconsumed one matters.
+    buffer: "latest",
+    subscribe: (emit) => {
+      const eventName = ReviewStateService.changeEventName(workspaceId);
+      const listener = (snapshot: ReviewStateEvent["snapshot"]) =>
+        emit.push({ type: "snapshot", snapshot });
+      service.on(eventName, listener);
+      return () => service.off(eventName, listener);
+    },
+    initial: async () => ({
+      type: "snapshot" as const,
+      snapshot: await service.getSnapshot(workspaceId),
+    }),
   });
 }
 
