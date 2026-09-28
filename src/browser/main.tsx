@@ -4,6 +4,7 @@ import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
 import { installViewportHeightSync } from "@/browser/utils/viewportHeight";
+import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry, trackAppStarted } from "@/common/telemetry";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
@@ -20,6 +21,12 @@ try {
   installInactiveAnimationPause();
 } catch {
   // Animation throttling is an optimization and must never block renderer startup.
+}
+
+try {
+  removeDroppedCacheKeys();
+} catch {
+  // Reclaiming localStorage quota is best-effort and must never block renderer startup.
 }
 
 installWindowOpenLocalhostProxyNormalization();
