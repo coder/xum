@@ -77,26 +77,47 @@ describe("persisted state writes under storage quota pressure", () => {
     cleanupDom = null;
   });
 
-  test("evicts only cache keys and retries, so the draft write succeeds", () => {
-    installStorage(2_000);
-    const cacheKeys = [
-      "session-cost:aaaaaaaaaa",
-      "session-cost-index",
-      "prStatus:aaaaaaaaaa",
-      "planContent:aaaaaaaaaa",
-    ];
-    for (const key of cacheKeys) storage.seed(key, "x".repeat(300));
-    const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
-    for (const key of keptKeys) storage.seed(key, "y".repeat(150));
+  // Every public write path shares the quota handling: draft text goes through the hook setter,
+  // attachments/LRU caches through updatePersistedState, and backend preferences through sync.
+  const writePaths: Array<[string, (key: string, value: string) => void]> = [
+    [
+      "updatePersistedState",
+      (key, value) => {
+        expect(updatePersistedState(key, value)).toBe(true);
+      },
+    ],
+    [
+      "usePersistedState setter",
+      (key, value) => {
+        const { result } = renderHook(() => usePersistedState(key, ""));
+        act(() => result.current[1](value));
+      },
+    ],
+    ["syncPersistedStateFromBackend", (key, value) => syncPersistedStateFromBackend(key, value)],
+  ];
 
-    const saved = updatePersistedState("input:quota-draft", "z".repeat(600));
+  test.each(writePaths)(
+    "%s evicts only cache keys and retries, so the write succeeds",
+    (_, write) => {
+      installStorage(2_000);
+      const cacheKeys = [
+        "session-cost:aaaaaaaaaa",
+        "session-cost-index",
+        "prStatus:aaaaaaaaaa",
+        "planContent:aaaaaaaaaa",
+      ];
+      for (const key of cacheKeys) storage.seed(key, "x".repeat(300));
+      const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
+      for (const key of keptKeys) storage.seed(key, "y".repeat(150));
 
-    expect(saved).toBe(true);
-    expect(storage.getItem("input:quota-draft")).toBe(JSON.stringify("z".repeat(600)));
-    for (const key of cacheKeys) expect(storage.getItem(key)).toBeNull();
-    for (const key of keptKeys) expect(storage.getItem(key)).not.toBeNull();
-    expect(warn).not.toHaveBeenCalled();
-  });
+      write("input:quota-draft", "z".repeat(600));
+
+      expect(storage.getItem("input:quota-draft")).toBe(JSON.stringify("z".repeat(600)));
+      for (const key of cacheKeys) expect(storage.getItem(key)).toBeNull();
+      for (const key of keptKeys) expect(storage.getItem(key)).not.toBeNull();
+      expect(warn).not.toHaveBeenCalled();
+    }
+  );
 
   test("reports failure without throwing when eviction cannot free enough space", () => {
     installStorage(1_000);
