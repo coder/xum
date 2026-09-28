@@ -179,6 +179,10 @@ export class DraftService extends EventEmitter {
       text: input.text ?? "",
       attachments: input.attachments ?? [],
     }).draft;
+    const chars = draftJsonChars(legacy);
+    if (chars > MAX_DRAFT_JSON_CHARS) {
+      throw new Error(draftTooLargeMessage(chars));
+    }
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
       const current = await this.load(scope);
@@ -214,49 +218,35 @@ export class DraftService extends EventEmitter {
     await this.withWriteLock(target, () => this.persist(target, filePath, forked));
   }
 
-  /** Delete every creation draft of a removed project (server-side, not only in a renderer). */
+  /**
+   * Delete every creation draft of a removed project (server-side, not only in a renderer). The
+   * whole hashed dir goes, so unparseable files (which name no project) do not outlive it.
+   */
   async deleteProjectDrafts(projectPath: string): Promise<void> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
     const projectDir = path.join(this.creationRoot, projectDraftsDirName(projectPath));
-    await withTargetMutationLock(this.config.rootDir, projectDir, async () => {
-      const draftIds = new Set<string>();
-      for (const entry of this.index.values()) {
-        const scope = entry.summary.scope;
-        if (scope.kind === "creation" && scope.projectPath === projectPath) {
-          draftIds.add(scope.draftId);
-        }
-      }
-      for (const file of await this.readCreationDraftFiles(projectDir)) {
-        if (file.projectPath === projectPath) draftIds.add(file.draftId);
-      }
-      for (const draftId of draftIds) {
-        const scope: CreationScope = { kind: "creation", projectPath, draftId };
-        await this.persist(scope, this.filePathFor(scope), createEmptyDraft());
-      }
-      await this.removeDirIfEmpty(projectDir);
-    });
+    await withTargetMutationLock(this.config.rootDir, projectDir, () =>
+      this.clearProjectDir(projectDir)
+    );
   }
 
   /**
-   * Startup GC: delete creation drafts whose project is no longer configured (e.g. removed while
-   * this build was not running). The scratch pseudo-project is always kept: it is only added to
-   * the config when its first workspace is created. Best-effort; never throws.
+   * Startup GC: delete the drafts dirs of projects that are no longer configured (e.g. removed
+   * while this build was not running), including files too broken to name their project. The
+   * scratch pseudo-project is always kept: it is only added to the config when its first workspace
+   * is created. Best-effort; never throws.
    */
   async collectOrphanedCreationDrafts(): Promise<void> {
     try {
-      // Strict: an unreadable config must never be mistaken for "no projects".
-      const projects = this.config.loadConfigOrDefault({ throwOnError: true }).projects;
       for (const dirName of await readDirNames(this.creationRoot, { dirsOnly: true })) {
+        if (this.configuredProjectDirNames().has(dirName)) continue;
         const projectDir = path.join(this.creationRoot, dirName);
-        const orphanedProjects = new Set<string>();
-        for (const file of await this.readCreationDraftFiles(projectDir)) {
-          if (file.projectPath !== SCRATCH_PROJECT_CONFIG_KEY && !projects.has(file.projectPath)) {
-            orphanedProjects.add(file.projectPath);
-          }
-        }
-        for (const projectPath of orphanedProjects) {
-          await this.deleteProjectDrafts(projectPath);
-        }
+        await withTargetMutationLock(this.config.rootDir, projectDir, async () => {
+          // Re-check under the lock creation-draft writes take: a project re-added since the
+          // check above (e.g. while an earlier dir was being deleted) keeps its new drafts.
+          if (this.configuredProjectDirNames().has(dirName)) return;
+          await this.clearProjectDir(projectDir);
+        });
       }
     } catch (error) {
       log.warn("Failed to collect orphaned creation drafts", { error });
@@ -496,14 +486,34 @@ export class DraftService extends EventEmitter {
     return files;
   }
 
-  private async removeDirIfEmpty(dir: string): Promise<void> {
-    try {
-      await fs.rmdir(dir);
-    } catch (error) {
-      if (!hasErrorCode(error, "ENOENT") && !hasErrorCode(error, "ENOTEMPTY")) {
-        log.warn(`Failed to remove draft dir ${dir}`, { error });
+  /** Hashed dir names of the configured projects plus scratch. */
+  private configuredProjectDirNames(): Set<string> {
+    // Strict: an unreadable config must never be mistaken for "no projects".
+    const projects = this.config.loadConfigOrDefault({ throwOnError: true }).projects;
+    const names = new Set([projectDraftsDirName(SCRATCH_PROJECT_CONFIG_KEY)]);
+    for (const projectPath of projects.keys()) names.add(projectDraftsDirName(projectPath));
+    return names;
+  }
+
+  /**
+   * Under the dir's write lock: delete its drafts (index entries and well-formed files, so
+   * subscribers see each deletion), then the whole dir with any unparseable or temp files.
+   */
+  private async clearProjectDir(projectDir: string): Promise<void> {
+    const scopes = new Map<string, CreationScope>();
+    for (const [key, entry] of this.index) {
+      const scope = entry.summary.scope;
+      if (scope.kind === "creation" && path.dirname(entry.filePath) === projectDir) {
+        scopes.set(key, scope);
       }
     }
+    for (const file of await this.readCreationDraftFiles(projectDir)) {
+      scopes.set(draftScopeKey(file.scope), file.scope);
+    }
+    for (const scope of scopes.values()) {
+      await this.persist(scope, this.filePathFor(scope), createEmptyDraft());
+    }
+    await fs.rm(projectDir, { recursive: true, force: true });
   }
 }
 

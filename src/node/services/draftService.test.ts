@@ -4,6 +4,9 @@ import { describe, expect, it } from "bun:test";
 import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
+import { draftTooLargeMessage } from "@/common/utils/drafts";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 import { DraftService } from "./draftService";
 
@@ -146,6 +149,25 @@ describe("DraftService", () => {
     expect(await exists(path.join(config.sessionsDir, "never-registered"))).toBe(false);
   });
 
+  it("refuses an oversized legacy import like an oversized update", async () => {
+    using tempDir = new TestTempDir("drafts-import-too-large");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const text = "x".repeat(MAX_DRAFT_JSON_CHARS);
+
+    let error: unknown;
+    try {
+      await service.importLegacy({ scope: WORKSPACE_SCOPE, text });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      draftTooLargeMessage(JSON.stringify({ text, attachments: [] }).length)
+    );
+    expect(await exists(workspaceFile)).toBe(false);
+  });
+
   it("rejects scopes that would resolve outside their storage dir", async () => {
     using tempDir = new TestTempDir("drafts-traversal");
     const { config, projectPath } = await createHarness(tempDir);
@@ -204,5 +226,87 @@ describe("DraftService", () => {
     await new DraftService(config).collectOrphanedCreationDrafts();
     const survivor = new DraftService(config);
     expect((await survivor.list()).map(({ scope }) => scope)).toEqual([scratch]);
+  });
+
+  it("removes a project's whole drafts dir, including unparseable files", async () => {
+    using tempDir = new TestTempDir("drafts-project-dir");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "draft-a" },
+      text: "creation",
+    });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [projectDirName] = await fs.readdir(draftsRoot);
+    const projectDir = path.join(draftsRoot, projectDirName);
+    await fs.writeFile(path.join(projectDir, "draft-b.json"), "{truncated");
+
+    await service.deleteProjectDrafts(projectPath);
+    expect(await exists(projectDir)).toBe(false);
+  });
+
+  it("GC removes unparseable files of unconfigured projects and keeps scratch", async () => {
+    using tempDir = new TestTempDir("drafts-gc-unparseable");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scratch: DraftScope = {
+      kind: "creation",
+      projectPath: SCRATCH_PROJECT_CONFIG_KEY,
+      draftId: "draft-s",
+    };
+    await service.update({ scope: scratch, text: "scratch" });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [scratchDirName] = await fs.readdir(draftsRoot);
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "draft-a" },
+      text: "creation",
+    });
+    const projectDirName = (await fs.readdir(draftsRoot)).find((name) => name !== scratchDirName);
+    expect(projectDirName).toBeDefined();
+    const projectDir = path.join(draftsRoot, projectDirName!);
+    // Only an unparseable file is left: nothing in it names its project.
+    await fs.writeFile(path.join(projectDir, "draft-a.json"), "{truncated");
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+
+    await new DraftService(config).collectOrphanedCreationDrafts();
+    expect(await exists(projectDir)).toBe(false);
+    expect((await new DraftService(config).get(scratch)).text).toBe("scratch");
+  });
+
+  it("GC keeps the drafts of a project re-added after its config snapshot", async () => {
+    using tempDir = new TestTempDir("drafts-gc-readd");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const creation: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.update({ scope: creation, text: "keep me" });
+    const projectEntry = config.loadConfigOrDefault().projects.get(projectPath);
+    expect(projectEntry).toBeDefined();
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [projectDirName] = await fs.readdir(draftsRoot);
+
+    let gc: Promise<void> | undefined;
+    // Hold the lock creation-draft writes take, so the GC reads the config (project absent) but
+    // cannot delete until the project is configured again.
+    await withTargetMutationLock(
+      config.rootDir,
+      path.join(draftsRoot, projectDirName),
+      async () => {
+        gc = new DraftService(config).collectOrphanedCreationDrafts();
+        await config.editConfig((current) => {
+          current.projects.set(projectPath, projectEntry!);
+          return current;
+        });
+      }
+    );
+    await gc;
+
+    expect((await new DraftService(config).get(creation)).text).toBe("keep me");
   });
 });
