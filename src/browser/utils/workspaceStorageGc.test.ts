@@ -10,8 +10,8 @@ import {
   GLOBAL_SCOPE_ID,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   getDraftScopeId,
-  getInputKey,
   getMCPTestResultsKey,
+  getModelKey,
   getPendingScopeId,
   getProjectScopeId,
   getReviewStateKey,
@@ -59,24 +59,24 @@ describe("collectOrphanedWorkspaceStorage", () => {
 
   test("removes only keys of unknown stable workspace ids", async () => {
     const orphaned = [
-      getInputKey(ORPHAN_ID),
+      getModelKey(ORPHAN_ID),
       getReviewStateKey(ORPHAN_ID),
       getTerminalTitlesKey(ORPHAN_ID),
       getMCPTestResultsKey("/repo", ORPHAN_ID),
     ];
     const kept = [
-      getInputKey(KNOWN_ID),
+      getModelKey(KNOWN_ID),
       getMCPTestResultsKey("/repo", KNOWN_ID),
       // The drafts map is not authoritative, so creation-draft keys are never collected.
-      getInputKey(MAPPED_DRAFT),
-      getInputKey(UNMAPPED_DRAFT),
-      getInputKey(getPendingScopeId("/repo")),
+      getModelKey(MAPPED_DRAFT),
+      getModelKey(UNMAPPED_DRAFT),
+      getModelKey(getPendingScopeId("/repo")),
       getThinkingLevelKey(getProjectScopeId("/repo")),
       getThinkingLevelKey(GLOBAL_SCOPE_ID),
       // Legacy global key sharing a registered prefix.
       getThinkingLevelByModelKey("openai:gpt-5"),
       // Legacy (non-stable) workspace id format.
-      getInputKey("myproject-feature-branch"),
+      getModelKey("myproject-feature-branch"),
       getMCPTestResultsKey("/repo", "myproject-feature-branch"),
       // Project-level MCP results.
       getMCPTestResultsKey("/repo"),
@@ -100,7 +100,7 @@ describe("collectOrphanedWorkspaceStorage", () => {
   // Mounted usePersistedState consumers must observe the removal, or they would keep showing
   // (and could write back) the deleted value.
   test("notifies persisted-state write listeners for every removed key", async () => {
-    seed([getInputKey(ORPHAN_ID), getInputKey(KNOWN_ID)]);
+    seed([getModelKey(ORPHAN_ID), getModelKey(KNOWN_ID)]);
     const removedKeys: string[] = [];
     const unsubscribe = subscribePersistedStateWrites((event) => {
       if (event.newValue == null) removedKeys.push(event.key);
@@ -114,14 +114,14 @@ describe("collectOrphanedWorkspaceStorage", () => {
       unsubscribe();
     }
 
-    expect(removedKeys).toEqual([getInputKey(ORPHAN_ID)]);
+    expect(removedKeys).toEqual([getModelKey(ORPHAN_ID)]);
   });
 
   test.each([
     ["rejects", () => Promise.reject(new Error("config unreadable"))],
     ["resolves a malformed list", () => Promise.resolve(undefined as unknown as string[])],
   ])("removes nothing when the known-id endpoint %s", async (_name, listKnownWorkspaceIds) => {
-    const keys = [getInputKey(ORPHAN_ID), getMCPTestResultsKey("/repo", ORPHAN_ID)];
+    const keys = [getModelKey(ORPHAN_ID), getMCPTestResultsKey("/repo", ORPHAN_ID)];
     seed(keys);
 
     let failed = false;
@@ -134,7 +134,7 @@ describe("collectOrphanedWorkspaceStorage", () => {
   });
 
   test("runs at most once per session, even after a failed run", async () => {
-    seed([getInputKey(ORPHAN_ID)]);
+    seed([getModelKey(ORPHAN_ID)]);
     await collectOrphanedWorkspaceStorage({
       listKnownWorkspaceIds: () => Promise.reject(new Error("backend unavailable")),
     }).catch(() => undefined);
@@ -143,23 +143,23 @@ describe("collectOrphanedWorkspaceStorage", () => {
     await collectOrphanedWorkspaceStorage({ listKnownWorkspaceIds });
 
     expect(listKnownWorkspaceIds).not.toHaveBeenCalled();
-    expect(remaining([getInputKey(ORPHAN_ID)])).toEqual([getInputKey(ORPHAN_ID)]);
+    expect(remaining([getModelKey(ORPHAN_ID)])).toEqual([getModelKey(ORPHAN_ID)]);
   });
 
   // The backend may enumerate before a workspace created in this session is persisted; that
   // workspace's keys are written after the snapshot and must survive.
   test("never removes keys written after the candidate snapshot", async () => {
-    const createdLaterKey = getInputKey("abcdef0123");
-    seed([getInputKey(ORPHAN_ID)]);
+    const createdLaterKey = getModelKey("abcdef0123");
+    seed([getModelKey(ORPHAN_ID)]);
 
     await collectOrphanedWorkspaceStorage({
       listKnownWorkspaceIds: () => {
-        localStorage.setItem(createdLaterKey, JSON.stringify("new draft"));
+        localStorage.setItem(createdLaterKey, JSON.stringify("new value"));
         return Promise.resolve([]);
       },
     });
 
-    expect(localStorage.getItem(getInputKey(ORPHAN_ID))).toBeNull();
+    expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull();
     expect(localStorage.getItem(createdLaterKey)).not.toBeNull();
   });
 });
