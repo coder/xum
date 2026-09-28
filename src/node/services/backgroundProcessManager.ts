@@ -113,23 +113,66 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
 
 /**
  * Host-local name probe for a new spawn or migrated record, called while holding the
- * per-workspace spawn-name lock: a name is free only if its record directory does not exist.
- * Existing directories are never reused, even settled ones (exit marker, non-running status,
- * dead PID). Two backends on one XUM_ROOT (desktop + `xum server`) cannot see each other's
+ * per-workspace spawn-name lock: a name is free only if its record directory does not exist
+ * (or was just pruned, see below). Existing directories are never reused in place, even settled
+ * ones (exit marker, non-running status, dead PID). Two backends on one XUM_ROOT (desktop + `xum server`) cannot see each other's
  * in-memory process maps, so a settled record may still be tracked by the other backend, and
  * reusing it would make that backend's output/status reads describe the new command (#4882).
  * A crash orphan's directory is skipped the same way, and a fresh directory never inherits a
- * stale exit marker. Cost: a name used before keeps getting a suffix until its old record is
- * removed. Throws when the directory cannot be probed, so callers fail closed instead of
- * looping over candidates.
+ * stale exit marker. Cost: a name used before gets a suffix until its old record is removed,
+ * so an existing record that pruneOldSettledRecord() can safely delete frees the name (#4893).
+ * Throws when the directory cannot be probed, so callers fail closed instead of looping over
+ * candidates.
  */
 async function recordDirIsFree(recordDir: string): Promise<boolean> {
   try {
     await fsPromises.lstat(recordDir);
-    return false;
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) return true;
     throw error;
+  }
+  return await pruneOldSettledRecord(recordDir);
+}
+
+// A settled record is pruned only once its exit marker is at least this old (#4893).
+const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Delete a record that blocks a candidate name, but only when no backend can still write to it.
+ * Called by recordDirIsFree under the spawn-name lock, so no spawn or migration can claim the
+ * name meanwhile, and only for a directory that collides with a candidate (no sweep: records
+ * with unique names still accumulate until reboot, as before #4892).
+ *
+ * Nothing on disk says which backend spawned a record (#4892 rejected an owner field), so:
+ * - The exit marker must exist: it is the settlement proof recordRootHoldsOrphan trusts. A
+ *   SIGKILLed orphan without one keeps blocking its name.
+ * - meta.json must read non-running. Every status transition sets the in-memory status before
+ *   rewriting meta.json, so the backend that spawned it (if alive) now treats it as settled:
+ *   its terminate() returns early and its status refresh skips it, so it never writes into the
+ *   directory again. With meta still "running" (exit not observed yet, or a crash), that
+ *   backend's later terminate() would stamp exit_code and meta.json onto the reused record.
+ * - The marker must be older than SETTLED_RECORD_PRUNE_AGE_MS. That is the only protection for
+ *   the other backend's reads: a backend still tracking a record pruned after this age reads
+ *   the new command's output past its old offset. Read-only, and only for such old records.
+ * Any failure keeps the record (the caller moves on to a suffixed name).
+ */
+async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
+  try {
+    // lstat throughout: never follow a symlink planted in the shared temp records root.
+    if (!(await fsPromises.lstat(recordDir)).isDirectory()) return false;
+    const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
+    if (!marker.isFile() || Date.now() - marker.mtimeMs < SETTLED_RECORD_PRUNE_AGE_MS) {
+      return false;
+    }
+    const meta = parseSpawnRecordMeta(
+      await fsPromises.readFile(nodePath.join(recordDir, BG_META_FILENAME), "utf-8")
+    );
+    if (meta == null || meta.status === "running") return false;
+    await fsPromises.rm(recordDir, { recursive: true });
+    return true;
+  } catch (error) {
+    log.debug(`Keeping background record ${recordDir}: ${getErrorMessage(error)}`);
+    return false;
   }
 }
 
