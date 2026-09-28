@@ -892,7 +892,7 @@ export class TurnRequestBuilder {
         // Permission denied or an I/O error does not fix itself, so it is not
         // retryable (unlike an unreachable host). The title is the text before
         // the first "." (StreamErrorMessage), so it must not contain a path.
-        const errorMessage = `Startup file unreadable. ${getErrorMessage(error)}`;
+        const errorMessage = `Startup file unreadable. ${getErrorMessage(error).trim()}`;
         context.startupState.logSlowStreamStartup?.({
           outcome: "startup_file_unreadable",
           errorMessage,
