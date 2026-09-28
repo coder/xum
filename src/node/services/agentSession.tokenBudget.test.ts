@@ -1341,82 +1341,40 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
-  test.each([
-    { label: "an editing agent", toolPolicy: undefined },
-    {
-      // Explore-like: no memory writes, so a notes-file handoff would be impossible.
-      label: "a read-only agent",
-      toolPolicy: [
-        { regex_match: "memory|file_edit_.*|bash", action: "disable" },
-      ] satisfies SendMessageOptions["toolPolicy"],
-    },
-  ])(
-    "near the ceiling $label gets one new_context-only final step whose handoff seals the window",
-    async ({ toolPolicy }) => {
-      const h = await setup();
-      const sendOptions = toolPolicy ? { ...options, toolPolicy } : options;
-      expect((await h.session.sendMessage("Work", sendOptions)).success).toBe(true);
-      expect(
-        (await h.requests[0].onStepSettled?.(step(110_000, { memoryWritable: !toolPolicy })))
-          ?.decision
-      ).toBe("rollover");
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
-      const final = await h.waitForRequest(2);
-      // The request builder derives the new_context-only ceiling from this flag.
-      expect(final.muxMetadata).toMatchObject({ contextBudgetFlush: true });
-      expect(
-        (
-          await final.onStepSettled?.(
-            step(112_000, { newContextRequested: true, newContextHandoff: "Resume at step 3" })
-          )
-        )?.decision
-      ).toBe("rollover");
-      h.settleStream(1);
-      await h.waitForRequest(3);
-      const rows = await allRows(h);
-      expect(warningRows(rows).map(isFinalFlushRow)).toEqual([true]);
-      const resets = rolloverRows(rows);
-      expect(resets).toHaveLength(1);
-      expect(resets[0].metadata?.muxMetadata).toMatchObject({
-        reason: "mid-stream",
-        flushOpportunity: true,
-        handoff: { text: "Resume at step 3" },
-        request: { text: "Work" },
-      });
-      expect(resets[0].metadata?.muxMetadata).not.toHaveProperty("requestedBy");
-      expect(text(rows.at(-1)!)).toBe("Continue");
-    }
-  );
-
-  test("a final step that does not call new_context seals the window with the carried handoff", async () => {
+  test("near the ceiling one memory-only final step saves the checkpoint and seals the window", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect(
-      (
-        await h.requests[0].onStepSettled?.(
-          step(20_000, { newContextRequested: true, newContextHandoff: "Earlier handoff" })
-        )
-      )?.decision
-    ).toBe("rollover");
-    await h.finishAndDispatch();
-    // The fresh window does real work and runs into the ceiling without handing off itself.
-    const work = createMuxMessage("second-window-work", "assistant", "More work", { model });
-    expect((await h.historyService.appendToHistory(workspaceId, work)).success).toBe(true);
-    expect((await h.requests[1].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    h.settleStream(1, { contextUsage: { inputTokens: 110_000 } });
-    const final = await h.waitForRequest(3);
+    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+    const final = await h.waitForRequest(2);
+    // The request builder derives the memory-only ceiling from this flag.
     expect(final.muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    // Xum seals the window after the final step; it does not wait for new_context.
     expect((await final.onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(2);
-    await h.waitForRequest(4);
-    const resets = rolloverRows(await allRows(h));
-    expect(resets).toHaveLength(2);
-    expect(resets[1].metadata?.muxMetadata).toMatchObject({
-      handoff: { text: "Earlier handoff" },
-      request: { text: "Work" },
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([true]);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      flushOpportunity: true,
     });
+    expect(resets[0].metadata?.muxMetadata).not.toHaveProperty("requestedBy");
+    expect(text(rows.at(-1)!)).toBe("Continue");
+  });
+
+  test("without the memory tool no final step is offered", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // Only the handoff advisory remains; no final step and rollover pair is queued.
+    expect(
+      (await h.requests[0].onStepSettled?.(step(110_000, { memoryAvailable: false })))?.decision
+    ).toBe("warn");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
   });
 
   test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
@@ -1903,7 +1861,7 @@ describe("AgentSession token-budget lifecycle", () => {
         handoff: true,
         memoryWritable: false,
         sessionHistoryAvailable: false,
-        newContextAvailable: true,
+        newContextAvailable: false,
       },
     },
   ])(
@@ -2256,7 +2214,12 @@ describe("AgentSession token-budget lifecycle", () => {
       label: "memory tool disabled",
       previousEnabled: true,
       next: { toolPolicy: [{ regex_match: "memory", action: "disable" }] },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+      // new_context needs the memory tool for its checkpoint.
+      expected: {
+        memoryWritable: false,
+        sessionHistoryAvailable: true,
+        newContextAvailable: false,
+      },
     },
   ] satisfies Array<{
     label: string;
@@ -3933,7 +3896,7 @@ describe("AgentSession token-budget lifecycle", () => {
         handoff: true,
         memoryWritable: false,
         sessionHistoryAvailable: false,
-        newContextAvailable: true,
+        newContextAvailable: false,
       },
     },
     {

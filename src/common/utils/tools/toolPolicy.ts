@@ -72,9 +72,11 @@ export function applyToolPolicy(
   policy?: ToolPolicy
 ): Record<string, Tool> {
   const enabledToolNames = new Set(applyToolPolicyToNames(Object.keys(tools), policy));
-  // new_context only makes sense when the sealed window can be read back: a policy that
-  // disables session_history must not leave a request tool whose rollover could never be admitted.
-  if (!enabledToolNames.has("session_history")) enabledToolNames.delete("new_context");
+  // new_context only makes sense when the agent can save its checkpoint (memory) and read the
+  // sealed window back (session_history): without either, a fresh window could not recover.
+  if (!enabledToolNames.has("session_history") || !enabledToolNames.has("memory")) {
+    enabledToolNames.delete("new_context");
+  }
 
   return Object.fromEntries(
     Object.entries(tools).filter(([toolName]) => enabledToolNames.has(toolName))

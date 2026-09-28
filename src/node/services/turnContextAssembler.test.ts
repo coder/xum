@@ -554,6 +554,7 @@ describe("assemblePromptPayload", () => {
       budgetTokens: 96_000,
       memoryWritable: true,
       sessionHistoryAvailable: true,
+      handoff: true,
     });
     advisory.metadata!.historySequence = 9;
     const unsequenced = createMuxMessage("pending", "user", "follow-up");

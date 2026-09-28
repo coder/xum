@@ -159,7 +159,10 @@ export class TokenBudgetStrategy {
           ),
         }).session === "readwrite",
       sessionHistoryAvailable: allowed.includes("session_history"),
-      newContextAvailable: allowed.includes("new_context"),
+      // Mirrors applyToolPolicy: new_context is only offered with memory and session_history.
+      newContextAvailable: ["memory", "session_history", "new_context"].every((name) =>
+        allowed.includes(name)
+      ),
     };
   }
 
@@ -518,10 +521,11 @@ export class TokenBudgetStrategy {
           modelContextLimit: maxTokens,
           threshold,
           handoffRequested: this.contextBudgetHandoffClaimed,
-          // The final step must be able to hand off, and its sealing reset needs history access.
+          // The final step must be able to save the checkpoint, and its sealing reset needs
+          // history access.
           finalHandoffAvailable:
             !this.contextBudgetFlushClaimed &&
-            step.newContextAvailable &&
+            step.memoryAvailable &&
             step.sessionHistoryAvailable &&
             this.host.continuations.isEmpty(),
         })
@@ -568,7 +572,7 @@ export class TokenBudgetStrategy {
       continuationEntryId = this.host.continuations.enqueue(
         finalStep
           ? [
-              entry("Call new_context now.", CONTEXT_WARNING_DEDUPE_KEY, true),
+              entry("Save your checkpoint now.", CONTEXT_WARNING_DEDUPE_KEY, true),
               entry("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false),
             ]
           : [

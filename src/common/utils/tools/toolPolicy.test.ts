@@ -42,6 +42,19 @@ const mockTools = {
 };
 
 describe("applyToolPolicy", () => {
+  test("offers new_context only with memory and session_history", () => {
+    const budgetTools = {
+      new_context: mockTools.bash,
+      memory: mockTools.bash,
+      session_history: mockTools.bash,
+    };
+    expect(Object.keys(applyToolPolicy(budgetTools))).toContain("new_context");
+    for (const gate of ["memory", "session_history"]) {
+      const result = applyToolPolicy(budgetTools, [{ regex_match: gate, action: "disable" }]);
+      expect(Object.keys(result)).not.toContain("new_context");
+    }
+  });
+
   describe("default behavior", () => {
     test("allows all tools when no policy provided", () => {
       const result = applyToolPolicy(mockTools);
