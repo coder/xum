@@ -168,6 +168,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
+  isDockerRuntime,
   isLocalProjectRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
@@ -13999,6 +14000,7 @@ export class TaskService implements AgentTaskIntegration {
               taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha),
               taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
             }),
+            removalDeletesBundleClone: isDockerRuntime(runtimeConfig),
           });
     // No per-sub-agent removal with a dirty-checkout confirmation exists in the UI today; the
     // parent deletion dialog is the user-confirmed path that removes sub-agents.

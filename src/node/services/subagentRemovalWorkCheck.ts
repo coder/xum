@@ -39,7 +39,7 @@ export type UnpreservedSubagentWork =
       kind: "lossy";
       paths: string[];
       uncapturedCommitCount: number;
-      /** Commits only other local branches or the stash hold, when removal deletes the repository. */
+      /** Commits only other local branches or the stash hold (Docker copies only). */
       otherRefCommitCount?: number;
     };
 
@@ -117,8 +117,8 @@ async function openGitRepo(
 }
 
 /**
- * Commits that only other local branches or the stash hold, when removal deletes the whole
- * repository with the checkout (#4761 gap 2). A patch artifact never covers these: it spans
+ * Commits that only other local branches or the stash hold, in a Docker copy, whose removal
+ * deletes the whole repository (#4761 gap 2). A patch artifact never covers these: it spans
  * base..HEAD only.
  */
 async function countOtherRefCommits(
@@ -127,20 +127,13 @@ async function countOtherRefCommits(
   base: string,
   head: string
 ): Promise<number> {
-  // A linked worktree's repository outlives the removal (worktree runtimes, SSH worktrees,
-  // devcontainers): only the task branch goes, which base..HEAD covers. A checkout that is its own
-  // repository (Docker copies, legacy SSH clones) takes every branch and the stash with it.
-  const [gitDir, commonDir] = (await git(runtime, repo, "rev-parse --git-dir --git-common-dir"))
-    .trim()
-    .split("\n");
-  if (gitDir !== commonDir) return 0;
   const refs = (
     await git(runtime, repo, "for-each-ref '--format=%(refname)' refs/remotes refs/stash")
   )
     .split("\n")
     .filter((ref) => ref.length > 0);
-  // Copies start with every source branch as a local branch; their origin/* refs are the only
-  // record of the source tips. Without an origin URL, creation deletes those refs, and counting
+  // Docker copies are bundle clones that start with every source branch as a local branch; their
+  // origin/* refs are the only record of the source tips. Without an origin URL, creation deletes those refs, and counting
   // anyway would refuse every removal from such a project. Skip until creation keeps them (#5105).
   if (!refs.some((ref) => ref.startsWith("refs/remotes/"))) return 0;
   // A clone never fetches refs/stash, so a stash is always the child's own.
@@ -159,6 +152,13 @@ export async function findUnpreservedSubagentWork(params: {
   /** Session dir holding the artifact's mbox files (the parent's). */
   patchArtifactSessionDir: string;
   taskBaseCommitShaByProjectPath: Readonly<Record<string, string>>;
+  /**
+   * The checkout is a Docker copy: removal deletes the container and the whole repository in it,
+   * not just a worktree and the task branch. Other standalone checkouts (SSH full-copy forks,
+   * legacy SSH clones) are `cp -R` copies that inherit the source's local-only branches and stash,
+   * which this check cannot tell from the child's, so they keep the base..HEAD scope (#5105).
+   */
+  removalDeletesBundleClone: boolean;
 }): Promise<Result<UnpreservedSubagentWork, string>> {
   assert(params.projectRepos.length > 0, "findUnpreservedSubagentWork requires project repos");
   const prefixPaths = params.projectRepos.length > 1;
@@ -225,7 +225,9 @@ export async function findUnpreservedSubagentWork(params: {
       if (commits > 0 && !(captured && (await count("--merges ")) === 0)) {
         uncapturedCommitCount += commits;
       }
-      otherRefCommitCount += await countOtherRefCommits(params.runtime, repo, base, head);
+      if (params.removalDeletesBundleClone) {
+        otherRefCommitCount += await countOtherRefCommits(params.runtime, repo, base, head);
+      }
     }
     if (uncapturedCommitCount === 0 && otherRefCommitCount === 0) return Ok({ kind: "none" });
     return Ok({
