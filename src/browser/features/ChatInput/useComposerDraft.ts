@@ -57,6 +57,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
   ) => {
     const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
+    const previousCount = latestAttachmentsRef.current.length;
     latestAttachmentsRef.current = next;
     const withinCap =
       next.length > 0 &&
@@ -73,7 +74,9 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
       selfWriteRef.current = false;
     }
     if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-    else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+    // Warn once per failing draft, and again whenever another attachment is added to it: the
+    // earlier toast auto-dismisses, so a later add would otherwise fail with no feedback.
+    else if (tooLargeToastKeyRef.current !== attachmentsKey || next.length > previousCount) {
       tooLargeToastKeyRef.current = attachmentsKey;
       pushToast({
         type: "error",

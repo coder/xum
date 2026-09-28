@@ -94,6 +94,17 @@ describe("useComposerDraft attachment persistence", () => {
     expect(pushToast).toHaveBeenCalledTimes(1);
     expect(pushToast.mock.calls[0]).toEqual([expect.objectContaining({ type: "error" })]);
     expect(storage.getItem(getInputAttachmentsKey(WORKSPACE_ID))).toBeNull();
+
+    // The first toast auto-dismisses, so each later add that also fails must warn again;
+    // removing an attachment adds nothing new to warn about.
+    act(() => {
+      result.current.setAttachments((current) => [...current, attachment("third")]);
+    });
+    expect(pushToast).toHaveBeenCalledTimes(2);
+    act(() => {
+      result.current.setAttachments((current) => current.slice(1));
+    });
+    expect(pushToast).toHaveBeenCalledTimes(2);
     warn.mockRestore();
   });
 });

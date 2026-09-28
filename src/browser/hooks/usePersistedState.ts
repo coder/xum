@@ -84,7 +84,10 @@ const keysWithReportedWriteFailures = new Set<string>();
 function reportWriteFailureOnce(key: string, error: unknown): void {
   if (keysWithReportedWriteFailures.has(key)) return;
   keysWithReportedWriteFailures.add(key);
-  console.warn(`Error writing to localStorage key "${key}":`, error);
+  console.warn(
+    `Error writing to localStorage key "${key}" (further failures for this key are not logged):`,
+    error
+  );
 }
 
 /**

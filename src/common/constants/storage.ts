@@ -1012,7 +1012,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Deleted with the workspace but not copied on fork.
   workspaceKey(getPendingWorkspaceSendErrorKey, "workspace-scoped", false),
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false),
-  workspaceKey(getNotifyOnResponseKey, "ui", false),
+  // Synced: UserPreferencesContext mirrors notifyOnResponseByWorkspace from the backend.
+  workspaceKey(getNotifyOnResponseKey, "synced", false),
   workspaceKey(getPlanContentKey, "cache", false),
   workspaceKey(getPostCompactionStateKey, "cache", false),
 
