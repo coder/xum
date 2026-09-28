@@ -164,7 +164,7 @@ describe("storage workspace-scoped keys", () => {
   });
 
   // Workspace-scoped MCP test results embed the project path before the id, so the registry loop
-  // cannot address them; they leaked on every workspace delete.
+  // cannot address them.
   test("deleteWorkspaceStorage removes the workspace's mcpTestResults keys in every project", () => {
     const workspaceId = "ws-delete-mcp";
     const removed = [

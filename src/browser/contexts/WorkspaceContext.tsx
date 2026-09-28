@@ -1192,9 +1192,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!cancelled) {
         setLoading(false);
       }
-      // Orphaned-key GC runs only after this startup load succeeded: never after a failed load
-      // and never from later refreshes or config notifications (see workspaceStorageGc.ts).
-      // Fire-and-forget so it never blocks or breaks startup.
+      // Orphaned-key GC runs only after a successful startup load, never from later refreshes
+      // (see workspaceStorageGc.ts). Not awaited so it cannot block or break startup.
       if (!cancelled && api && result === "loaded") {
         collectOrphanedWorkspaceStorage({
           listKnownWorkspaceIds: async () =>
