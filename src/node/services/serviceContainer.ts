@@ -37,6 +37,7 @@ import type { BrowserControlService } from "@/node/services/browser/BrowserContr
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
+import type { DraftService } from "@/node/services/draftService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -92,6 +93,7 @@ import {
   DesktopTokenManagerTag,
   DevTools,
   ReviewState,
+  Drafts,
   Editor,
   Experiments,
   Evaluation,
@@ -244,6 +246,7 @@ export class ServiceContainer {
   public readonly timelineService: TimelineService;
   public readonly devToolsService: DevToolsService;
   public readonly reviewStateService: ReviewStateService;
+  public readonly draftService: DraftService;
   public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
   public readonly browserBridgeServer: BrowserBridgeServer;
@@ -341,6 +344,7 @@ export class ServiceContainer {
     this.timelineService = get(Timeline);
     this.devToolsService = get(DevTools);
     this.reviewStateService = get(ReviewState);
+    this.draftService = get(Drafts);
     this.browserSessionDiscoveryService = get(AgentBrowserSessionDiscovery);
     this.browserBridgeTokenManager = get(BrowserBridgeTokenManagerTag);
     this.browserBridgeServer = get(BrowserBridgeServerTag);
@@ -609,6 +613,10 @@ export class ServiceContainer {
         log.warn("[MemoryConsolidation] launch sweep failed", { error });
       });
 
+    // Creation drafts of projects removed while this build was not running. Best-effort and
+    // internally non-throwing; fire-and-forget so it never delays startup.
+    void this.draftService.collectOrphanedCreationDrafts();
+
     // Refresh xum-owned Coder SSH config in background (handles binary path changes on restart)
     // Skip getCoderInfo() to avoid caching "unavailable" if coder isn't installed yet
     void this.coderService.ensureMuxCoderSSHConfig().catch((error: unknown) => {
@@ -694,6 +702,7 @@ export class ServiceContainer {
       refineService: this.refineService,
       devToolsService: this.devToolsService,
       reviewStateService: this.reviewStateService,
+      draftService: this.draftService,
       browserSessionDiscoveryService: this.browserSessionDiscoveryService,
       browserBridgeTokenManager: this.browserBridgeTokenManager,
       browserBridgeServer: this.browserBridgeServer,

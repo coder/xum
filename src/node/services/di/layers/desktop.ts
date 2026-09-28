@@ -48,6 +48,7 @@ import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionMan
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { ReviewStateService } from "@/node/services/reviewStateService";
+import { DraftService } from "@/node/services/draftService";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AgentBrowserSessionDiscovery,
@@ -72,6 +73,7 @@ import {
   DesktopTokenManagerTag,
   DevTools,
   ReviewState,
+  Drafts,
   Editor,
   Experiments,
   ExtensionMetadata,
@@ -197,6 +199,7 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
       const analyticsService = new AnalyticsService(config);
       const devToolsService = new DevToolsService(config);
       const reviewStateService = new ReviewStateService(config);
+      const draftService = new DraftService(config);
       // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
       // the persistent config rather than creating a default with an ephemeral one.
       const workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
@@ -208,6 +211,7 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
         Context.add(Analytics, analyticsService),
         Context.add(DevTools, devToolsService),
         Context.add(ReviewState, reviewStateService),
+        Context.add(Drafts, draftService),
         Context.add(WorkspaceMcpOverrides, workspaceMcpOverridesService)
       );
     })
@@ -619,6 +623,7 @@ export const DesktopWiringLive: Layer.Layer<
     const backupService = yield* Backup;
     const memoryService = yield* Memory;
     const projectService = yield* Project;
+    const draftService = yield* Drafts;
     const sshPromptService = yield* SshPrompt;
     const desktopSessionManager = yield* DesktopSessionManagerTag;
     const idleCompactionService = yield* IdleCompaction;
@@ -637,6 +642,8 @@ export const DesktopWiringLive: Layer.Layer<
     projectService.setWorkspaceService(workspaceService);
     projectService.setWorkspaceMetadataRefresher(workspaceService);
     projectService.setMcpServerManager(mcpServerManager);
+    projectService.setDraftCleaner(draftService);
+    workspaceService.setDraftForkCopier(draftService);
     // Backup restores register approved project imports through the same create() path the
     // UI uses; setter injection because BackupService is constructed before ProjectService.
     backupService.setProjectService(projectService);

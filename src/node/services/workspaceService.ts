@@ -3169,6 +3169,10 @@ export class WorkspaceService
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: WorkspaceDevToolsCleanup;
+  /** Copies the composer draft into a fork (DraftService); wired by the service container. */
+  private draftForkCopier?: {
+    copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
+  };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -3868,6 +3872,12 @@ export class WorkspaceService
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
   setDevToolsService(service: WorkspaceDevToolsCleanup): void {
     this.devToolsService = service;
+  }
+
+  setDraftForkCopier(service: {
+    copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
+  }): void {
+    this.draftForkCopier = service;
   }
 
   /** Refine-pass cancellation on remove; wired by the service container. */
@@ -12815,6 +12825,10 @@ export class WorkspaceService
             path.join(newSessionDir, fileName)
           );
         }
+        // The composer draft follows the fork like the other session files, minus staged
+        // attachments (they point into the source worktree). Through DraftService so its index
+        // and subscribers see the new draft.
+        await this.draftForkCopier?.copyWorkspaceDraftForFork(sourceWorkspaceId, newWorkspaceId);
 
         if (sourceMessageId) {
           const truncateResult = await this.historyService.truncateAfterMessage(

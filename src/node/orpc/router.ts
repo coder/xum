@@ -99,6 +99,7 @@ import {
   subscribeConfigChanges,
   subscribeDevTools,
   subscribeReviewState,
+  subscribeDrafts,
   subscribeLogs,
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
@@ -592,6 +593,32 @@ export const router = (authToken?: string) => {
             allowOtherWorkspaceSession: input.allowOtherWorkspaceSession === true,
           })
         ),
+    },
+    drafts: {
+      list: t
+        .input(schemas.drafts.list.input)
+        .output(schemas.drafts.list.output)
+        .handler(({ context }) => context.draftService.list()),
+      get: t
+        .input(schemas.drafts.get.input)
+        .output(schemas.drafts.get.output)
+        .handler(({ context, input }) => context.draftService.get(input.scope)),
+      update: t
+        .input(schemas.drafts.update.input)
+        .output(schemas.drafts.update.output)
+        .handler(({ context, input }) => context.draftService.update(input)),
+      delete: t
+        .input(schemas.drafts.delete.input)
+        .output(schemas.drafts.delete.output)
+        .handler(({ context, input }) => context.draftService.delete(input.scope)),
+      importLegacy: t
+        .input(schemas.drafts.importLegacy.input)
+        .output(schemas.drafts.importLegacy.output)
+        .handler(({ context, input }) => context.draftService.importLegacy(input)),
+      subscribe: t
+        .input(schemas.drafts.subscribe.input)
+        .output(schemas.drafts.subscribe.output)
+        .handler(({ context, signal }) => subscribeDrafts(context, signal)),
     },
     uiLayouts: {
       getAll: t

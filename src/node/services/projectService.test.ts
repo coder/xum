@@ -11,6 +11,7 @@ import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { DraftService } from "./draftService";
 import { ProjectService, type CloneEvent } from "./projectService";
 import {
   projectRegistrationLockFilePath,
@@ -2778,17 +2779,23 @@ exit 1
       expect(after.projects.get(projectPath)?.workspaces.map((ws) => ws.id)).toEqual(["owned-1"]);
     });
 
-    it("removes project with no workspaces", async () => {
+    it("removes project with no workspaces and deletes its creation drafts", async () => {
       const projectPath = "/fake/project";
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
       await config.editConfig(() => cfg);
+      const draftService = new DraftService(config);
+      service.setDraftCleaner(draftService);
+      const draftScope = { kind: "creation" as const, projectPath, draftId: "draft-1" };
+      await draftService.update({ scope: draftScope, text: "unsent" });
 
       const result = await service.remove(projectPath);
 
       expect(result.success).toBe(true);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
+      // Removal cleans the draft files server-side, whichever client (if any) removed it.
+      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {

@@ -404,6 +404,7 @@ export class ProjectService {
   private workspaceService?: WorkspaceRemover;
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
+  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<void> };
 
   constructor(
     private readonly config: Config,
@@ -425,6 +426,11 @@ export class ProjectService {
     mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
   ): void {
     this.mcpServerManager = mcpServerManager;
+  }
+
+  /** Deletes a removed project's creation drafts (DraftService); wired by the service container. */
+  setDraftCleaner(draftCleaner: { deleteProjectDrafts(projectPath: string): Promise<void> }): void {
+    this.draftCleaner = draftCleaner;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -1575,6 +1581,17 @@ export class ProjectService {
         freshConfig.projects.delete(normalizedPath);
         return freshConfig;
       });
+
+      // Creation drafts are keyed by the owning project; delete them server-side so a removal from
+      // any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
+      // cleanup below: the startup GC removes whatever this misses.
+      for (const draftProjectPath of [normalizedPath, ...removedSubProjectPaths]) {
+        try {
+          await this.draftCleaner?.deleteProjectDrafts(draftProjectPath);
+        } catch (error) {
+          log.error(`Failed to clean up drafts for project ${draftProjectPath}:`, error);
+        }
+      }
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {

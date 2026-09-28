@@ -104,6 +104,15 @@ import {
   ReviewStateUpdateOutputSchema,
 } from "./reviewState";
 import {
+  DraftEventSchema,
+  DraftGetOutputSchema,
+  DraftImportLegacyOutputSchema,
+  DraftRevisionOutputSchema,
+  DraftScopeSchema,
+  DraftSummarySchema,
+  DraftUpdateInputSchema,
+} from "./drafts";
+import {
   AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
@@ -3233,6 +3242,36 @@ export const browser = {
       url: z.string().nullable(),
       error: z.string().nullish(),
     }),
+  },
+};
+
+// Composer drafts (text + attachments) persisted by the backend DraftService.
+export const drafts = {
+  /** Every draft as metadata (no attachment payloads), for bulk hydration. */
+  list: {
+    input: z.void(),
+    output: z.array(DraftSummarySchema),
+  },
+  /** One draft including attachment payloads. */
+  get: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftGetOutputSchema,
+  },
+  update: {
+    input: DraftUpdateInputSchema,
+    output: DraftRevisionOutputSchema,
+  },
+  delete: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftRevisionOutputSchema,
+  },
+  importLegacy: {
+    input: DraftUpdateInputSchema,
+    output: DraftImportLegacyOutputSchema,
+  },
+  subscribe: {
+    input: z.void(),
+    output: eventIterator(DraftEventSchema),
   },
 };
 

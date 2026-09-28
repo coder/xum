@@ -175,6 +175,7 @@ export {
   config,
   browser,
   devtools,
+  drafts,
   uiLayouts,
   desktop,
   general,

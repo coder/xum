@@ -16,6 +16,8 @@ import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { ReviewStateService, type ReviewStateChange } from "@/node/services/reviewStateService";
+import type { DraftEvent } from "@/common/orpc/schemas/drafts";
+import { DraftService } from "@/node/services/draftService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ORPCError, ValidationError } from "@orpc/server";
@@ -139,6 +141,24 @@ export function subscribeReviewState(
       type: "snapshot" as const,
       ...(await service.getSnapshotWithRevision(workspaceId)),
     }),
+  });
+}
+
+export function subscribeDrafts(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<DraftEvent> {
+  const service = context.draftService;
+  return runtimeSubscription<DraftEvent>(context, {
+    signal,
+    // Keep every event: each one describes a different scope. Events fired while the snapshot
+    // is computed are delivered after it; clients skip those at or below the snapshot revision.
+    subscribe: (emit) => {
+      const listener = (event: DraftEvent) => emit.push(event);
+      service.on(DraftService.CHANGE_EVENT, listener);
+      return () => service.off(DraftService.CHANGE_EVENT, listener);
+    },
+    initial: () => service.getSnapshotEvent(),
   });
 }
 

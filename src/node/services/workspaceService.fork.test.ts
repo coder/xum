@@ -10,6 +10,7 @@ import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { ReviewStateService } from "./reviewStateService";
+import { DraftService } from "./draftService";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -513,7 +514,7 @@ describe("WorkspaceService fork", () => {
     }
   });
 
-  test("resets forked session usage while preserving copied history and review state", async () => {
+  test("resets forked session usage while preserving copied history, review state and the draft", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -569,6 +570,31 @@ describe("WorkspaceService fork", () => {
       sessionUsageService,
     });
 
+    // The composer draft follows the fork, minus staged attachments (source-worktree paths).
+    const draftService = new DraftService(config);
+    workspaceService.setDraftForkCopier(draftService);
+    const sourceDraftScope = { kind: "workspace" as const, workspaceId: sourceWorkspaceId };
+    await draftService.update({
+      scope: sourceDraftScope,
+      text: "unsent",
+      attachments: [
+        {
+          kind: "provider",
+          id: "img",
+          url: "data:image/png;base64,AA==",
+          mediaType: "image/png",
+        },
+        {
+          kind: "staged",
+          id: "staged",
+          mediaType: "text/plain",
+          filename: "a.txt",
+          sizeBytes: 1,
+          stagedPath: "/source/worktree/a.txt",
+        },
+      ],
+    });
+
     const targetRuntime = {
       getWorkspacePath: mock(() => path.join(sourceProjectPath, "fork-child")),
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
@@ -618,6 +644,13 @@ describe("WorkspaceService fork", () => {
 
       const forkedReviewState = await reviewStateService.getSnapshot(newWorkspaceId);
       expect(forkedReviewState.sections.hunkExpand).toEqual({ "hunk-1": true });
+
+      const forkedDraft = await draftService.get({
+        kind: "workspace",
+        workspaceId: newWorkspaceId,
+      });
+      expect(forkedDraft.text).toBe("unsent");
+      expect(forkedDraft.attachments.map(({ id }) => id)).toEqual(["img"]);
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
