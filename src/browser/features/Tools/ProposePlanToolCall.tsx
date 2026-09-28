@@ -45,7 +45,6 @@ import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getModelKey,
-  getPlanContentKey,
   getReasoningModeKey,
   getAutoRoutingChoiceByAgentKey,
   getThinkingLevelKey,
@@ -181,6 +180,15 @@ interface ProposePlanToolCallProps {
 const HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE =
   "Your settings make this replace the chat history, which is not available here. Use the Xum app, or turn off that setting.";
 
+/**
+ * Latest plan content per workspace, used to paint the latest plan card without a layout
+ * flash when it remounts (e.g. switching back to a workspace). The backend owns the plan
+ * file and the card always refetches it, so this lives in memory only: persisting full plan
+ * text per workspace in localStorage contributed to QuotaExceededError. After a full reload
+ * the card shows the placeholder until getPlanContent resolves.
+ */
+const latestPlanContentCache = new Map<string, { content: string; path: string }>();
+
 export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) => {
   const {
     args,
@@ -254,13 +262,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
 
   // Fresh content from disk for the latest plan (external edit detection)
-  // Only use cache for completed tools (page reload case) - not for in-flight tools
+  // Only use cache for completed tools (remount case) - not for in-flight tools
   // which may have stale cache from a previous propose_plan call
-  const cacheKey = workspaceId ? getPlanContentKey(workspaceId) : "";
   const shouldUseCache = workspaceId && isLatest && !isEphemeralPreview && status === "completed";
-  const cached = shouldUseCache
-    ? readPersistedState<{ content: string; path: string } | null>(cacheKey, null)
-    : null;
+  const cached = shouldUseCache ? latestPlanContentCache.get(workspaceId) : undefined;
 
   const [freshContent, setFreshContent] = useState<string | null>(cached?.content ?? null);
   const [freshPath, setFreshPath] = useState<string | null>(cached?.path ?? null);
@@ -293,8 +298,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         if (res.success) {
           setFreshContent(res.data.content);
           setFreshPath(res.data.path);
-          // Update cache for page reload (only useful when tool is completed)
-          updatePersistedState(cacheKey, { content: res.data.content, path: res.data.path });
+          // Update cache for remounts (only useful when tool is completed)
+          latestPlanContentCache.set(workspaceId, {
+            content: res.data.content,
+            path: res.data.path,
+          });
         }
       } catch {
         // Fetch failed, keep existing content
@@ -309,7 +317,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
     // status in deps ensures refetch when tool completes (captures final file state)
-  }, [api, workspaceId, isLatest, isEphemeralPreview, cacheKey, status]);
+  }, [api, workspaceId, isLatest, isEphemeralPreview, status]);
 
   // Determine plan content and title based on result type
   // For ephemeral previews, use direct content/path props

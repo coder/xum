@@ -104,7 +104,7 @@ describe("persisted state writes under storage quota pressure", () => {
         "session-cost:aaaaaaaaaa",
         "session-cost-index",
         "prStatus:aaaaaaaaaa",
-        "planContent:aaaaaaaaaa",
+        "branch:aaaaaaaaaa",
       ];
       for (const key of cacheKeys) storage.seed(key, "x".repeat(300));
       const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];

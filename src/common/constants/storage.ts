@@ -907,24 +907,6 @@ export function getAutoCompactionThresholdKey(model: string): string {
   return `autoCompaction:threshold:${model}`;
 }
 
-/**
- * Get the localStorage key for cached plan content for a workspace
- * Stores: { content: string; path: string } - used for optimistic rendering
- * Format: "planContent:{workspaceId}"
- */
-export function getPlanContentKey(workspaceId: string): string {
-  return `planContent:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for cached post-compaction state for a workspace
- * Stores: { planPath: string | null; trackedFilePaths: string[]; excludedItems: string[] }
- * Format: "postCompactionState:{workspaceId}"
- */
-export function getPostCompactionStateKey(workspaceId: string): string {
-  return `postCompactionState:${workspaceId}`;
-}
-
 /** localStorage-backed LRU caches (see src/browser/utils/lruCache.ts). */
 export const SESSION_COST_CACHE_ENTRY_PREFIX = "session-cost:";
 export const SESSION_COST_CACHE_INDEX_KEY = "session-cost-index";
@@ -1008,7 +990,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getReviewImmersiveKey, "workspace-scoped", true),
   workspaceKey(getAutoCompactionEnabledKey, "ui", true),
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true),
-  // Kept non-evictable until PR4 confirms nothing depends on it surviving a reload.
+  // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
+  // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
   workspaceKey(getStatusStateKey, "workspace-scoped", true),
   // Note: auto-compaction threshold is per-model, not per-workspace.
 
@@ -1017,8 +1000,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false),
   // Synced: UserPreferencesContext mirrors notifyOnResponseByWorkspace from the backend.
   workspaceKey(getNotifyOnResponseKey, "synced", false),
-  workspaceKey(getPlanContentKey, "cache", false),
-  workspaceKey(getPostCompactionStateKey, "cache", false),
 
   // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
   workspaceKey(getReasoningModeKey, "ui", false),

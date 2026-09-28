@@ -21,7 +21,6 @@ import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getModelKey,
-  getPlanContentKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
@@ -419,11 +418,9 @@ describe("ProposePlanToolCall", () => {
     );
   });
 
-  test("hides Annotate button when completed propose_plan result is an error", () => {
-    updatePersistedState(getPlanContentKey(WORKSPACE_ID), {
-      content: "# Cached Plan\n\nDo the thing.",
-      path: PLAN_PATH,
-    });
+  test("hides Annotate button when completed propose_plan result is an error", async () => {
+    // Fresh plan content from disk still renders for the latest card; Annotate must stay hidden.
+    mockApi = createMockApi();
 
     const view = renderPlanToolCall({
       status: "completed",
@@ -431,7 +428,42 @@ describe("ProposePlanToolCall", () => {
       isLatest: true,
     });
 
+    await waitFor(() => expectSingleQuoteRoot(view, PLAN_CONTENT));
     expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
+  test("keeps latest plan content in memory only: placeholder after reload, instant on remount", async () => {
+    // Own workspace ID: the in-memory cache is module-level and outlives other tests' renders.
+    const workspaceId = "ws-plan-cache";
+    const props: Partial<ProposePlanProps> = {
+      workspaceId,
+      status: "completed",
+      result: { success: true, planPath: PLAN_PATH },
+      isLatest: true,
+    };
+    let resolveFirstFetch: ((result: GetPlanContentResult) => void) | undefined;
+    mockApi = createMockApi({
+      getPlanContent: () =>
+        new Promise<GetPlanContentResult>((resolve) => {
+          resolveFirstFetch = resolve;
+        }),
+    });
+
+    // Reload case (empty cache): placeholder until the backend fetch resolves.
+    const firstView = renderPlanToolCall(props);
+    expectSingleQuoteRoot(firstView, `*Plan saved to ${PLAN_PATH}*`);
+    await waitFor(() => expect(resolveFirstFetch).toBeDefined());
+    resolveFirstFetch?.({ success: true, data: { content: PLAN_CONTENT, path: PLAN_PATH } });
+    await waitFor(() => expectSingleQuoteRoot(firstView, PLAN_CONTENT));
+    for (let index = 0; index < window.localStorage.length; index++) {
+      expect(window.localStorage.key(index)).not.toStartWith("planContent:");
+    }
+    firstView.unmount();
+
+    // Remount (e.g. switching back to the workspace): the fetched content paints immediately,
+    // before the refetch (which never resolves here) returns.
+    mockApi = createMockApi({ getPlanContent: () => new Promise<GetPlanContentResult>(noop) });
+    expectSingleQuoteRoot(renderPlanToolCall(props), PLAN_CONTENT);
   });
 
   test("annotate mode and raw mode are mutually exclusive", () => {
@@ -752,6 +784,9 @@ describe("ProposePlanToolCall", () => {
     ].join("\n");
 
     const view = renderCompletedPlan({
+      // Own workspace ID: earlier tests leave WORKSPACE_ID's fetched plan in the in-memory
+      // latest-plan cache, which takes precedence over the result's embedded content.
+      workspaceId: "ws-plan-toc",
       result: { success: true, planPath: PLAN_PATH, planContent },
     });
 
@@ -778,6 +813,7 @@ describe("ProposePlanToolCall", () => {
     // (the plan title) and never shows up as a list item.
     const planContent = "# A\n\nbody\n\n## B\n\nmore\n\n## C\n\nmore";
     const view = renderCompletedPlan({
+      workspaceId: "ws-plan-toc-annotate", // See the in-memory cache note above.
       result: { success: true, planPath: PLAN_PATH, planContent },
     });
 
