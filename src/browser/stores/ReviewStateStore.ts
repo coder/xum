@@ -464,12 +464,13 @@ export class ReviewStateStore {
   }
 
   /**
-   * One-way migration of the legacy localStorage keys. The backend merges per entry and never
-   * overwrites its own entries, so every legacy section is sent, even one the backend already
-   * has: localStorage is per origin (desktop app vs browser tab) while the backend is shared,
-   * and a key that still exists means this origin was never imported (keys are removed on
-   * import), so its missing entries are new data, not stale leftovers. A key is removed only
-   * after the server reports its section; on error it stays and the next hydration retries.
+   * One-way migration of the legacy localStorage keys. Every legacy section is sent, even one
+   * the backend already has, and the backend decides: it never overwrites its own entries,
+   * adds the review notes it lacks, and leaves a present hunk-keyed section untouched.
+   * localStorage is per origin (desktop app vs browser tab) while the backend is shared, and a
+   * key that still exists means this origin was never imported (keys are removed on import),
+   * so its notes are new data, not stale leftovers. A key is removed only after the server
+   * reports its section (applied or present); on error it stays and the next hydration retries.
    */
   private async importLegacy(workspaceId: string, entry: Entry, client: APIClient): Promise<void> {
     const legacy = readLegacySections(workspaceId);

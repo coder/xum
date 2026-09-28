@@ -137,7 +137,7 @@ function createBackend(initial: ReviewStateSections = {}) {
           results[section] = "applied";
         }
       }
-      // Present sections are only reported: the per-entry merge is the service's contract.
+      // Present sections are only reported: what the service merges is its own contract.
       if (Object.values(results).includes("applied")) revision++;
       return Promise.resolve({ snapshot: { sections }, revision, results });
     },
