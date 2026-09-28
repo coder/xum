@@ -903,6 +903,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
+      // A focused control already handled it (the agent picker treats Alt+Enter as Enter).
+      if (event.defaultPrevented) return;
       // Only the selected workspace's transcript (a sub-agent transcript may show its own plan).
       // Hosts without a workspace context (the webview) show one transcript.
       if (selectedWorkspaceId !== undefined && selectedWorkspaceId !== workspaceId) return;

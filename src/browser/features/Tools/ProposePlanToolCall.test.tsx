@@ -925,6 +925,22 @@ describe("ProposePlanToolCall", () => {
       composer.remove();
     });
 
+    test("leaves Alt+Enter to a focused control that already handled it", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+      // Like the agent picker, which treats Alt+Enter as Enter and prevents the default.
+      const picker = document.createElement("div");
+      picker.addEventListener("keydown", (event) => event.preventDefault());
+      document.body.appendChild(picker);
+
+      pressShortcut(picker);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+      picker.remove();
+    });
+
     test("continues in Auto in Auto mode", async () => {
       startInPlanMode();
       const sendMessageCalls: SendMessageArgs[] = [];
