@@ -1796,10 +1796,17 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     workspaceId: string,
     controller: AbortController
   ): Promise<void> {
+    // Activity events fire for every snapshot change; only a changed count is worth a message.
+    let lastPosted: number | null = null;
     const post = (activeBashMonitorCount: number) => {
-      if (controller.signal.aborted || this.selectedWorkspaceId !== workspaceId) {
+      if (
+        controller.signal.aborted ||
+        this.selectedWorkspaceId !== workspaceId ||
+        activeBashMonitorCount === lastPosted
+      ) {
         return;
       }
+      lastPosted = activeBashMonitorCount;
       this.postMessage({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
     };
 
