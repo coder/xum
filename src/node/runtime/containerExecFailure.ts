@@ -1,3 +1,5 @@
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
+
 /**
  * Whether a failed `docker exec` / `devcontainer exec` never reached the
  * container (#4828): the container is stopped, paused or gone, or the daemon is
@@ -20,5 +22,9 @@ const CONTAINER_UNAVAILABLE_PATTERNS: readonly RegExp[] = [
 ];
 
 export function isContainerUnavailableExit(exitCode: number, stderr: string): boolean {
+  // A probe that hit its own client-side deadline proved nothing about the file:
+  // an unresponsive daemon or CLI reaches the 10 s probe deadlines first, often
+  // with empty stderr. SSHRuntime treats its timeouts the same way (#4825).
+  if (exitCode === EXIT_CODE_TIMEOUT) return true;
   return exitCode !== 0 && CONTAINER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(stderr));
 }

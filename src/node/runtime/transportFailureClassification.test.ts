@@ -180,6 +180,15 @@ describe("container exec failures", () => {
     for (const stderr of [...unavailable, ...devcontainerUnavailable]) {
       expect(await transport(new StubbedDevcontainerRuntime([stderr, 1]))).toEqual([true, true]);
     }
+    // An unresponsive daemon/CLI hits the probe deadline, often with empty stderr.
+    expect(await transport(new StubbedDockerRuntime(["", EXIT_CODE_TIMEOUT]))).toEqual([
+      true,
+      true,
+    ]);
+    expect(await transport(new StubbedDevcontainerRuntime(["", EXIT_CODE_TIMEOUT]))).toEqual([
+      true,
+      true,
+    ]);
   });
 
   it("keeps a missing file and an unstartable exec out of the transport class", async () => {
