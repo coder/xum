@@ -279,6 +279,17 @@ describe("ReviewStateStore legacy localStorage migration", () => {
     expect(readPersistedState(getReviewStateKey(WS), null)).toBeNull();
   });
 
+  test("removes an unparseable legacy key instead of retrying it forever", async () => {
+    const { backend, client } = createBackend();
+    window.localStorage.setItem(getReviewsKey(WS), "{not json");
+
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    expect(backend.importCalls).toBe(0);
+    expect(window.localStorage.getItem(getReviewsKey(WS))).toBeNull();
+  });
+
   test("keeps the legacy key when the import fails", async () => {
     const { backend, client } = createBackend();
     backend.failImport = true;

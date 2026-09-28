@@ -1,6 +1,10 @@
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  readPersistedString,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
   getHunkFirstSeenKey,
@@ -375,9 +379,11 @@ export class ReviewStateStore {
     const importing: ReviewStateSection[] = [];
     for (const section of REVIEW_STATE_SECTIONS) {
       const key = LEGACY_SECTIONS[section].key(workspaceId);
+      if (readPersistedString(key) === undefined) continue;
       const stored = readPersistedState<unknown>(key, undefined);
-      if (stored === undefined || stored === null) continue;
-      if (entry.base[section] !== undefined) {
+      // An unparseable legacy value has nothing to migrate, and a section the backend already
+      // has is newer; drop the key either way so it cannot sit in localStorage forever.
+      if (stored === undefined || stored === null || entry.base[section] !== undefined) {
         updatePersistedState(key, undefined);
         continue;
       }
