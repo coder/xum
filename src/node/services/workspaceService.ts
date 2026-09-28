@@ -7836,6 +7836,7 @@ export class WorkspaceService
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+      this.agentTaskIntegration?.noteWorkspaceRemoved(workspaceId);
       // Only once the workspace is deregistered (and its session, with the
       // transcript, gone) are the retryable harvest records truly
       // unrecoverable; an aborted removal must leave them retryable.

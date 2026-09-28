@@ -991,6 +991,79 @@ describe("TaskService", () => {
     expect(await awaitOutcome()).toBe("timed out");
   });
 
+  // #5028: same shape as #4747 for a reservation that is canceled or fails after its commit wrote
+  // the row: the fence write that interrupts the row rejects, nothing launches it, and the row
+  // stays "starting". A waiter must still settle at its timeout.
+  test.each([
+    { label: "canceled after its commit", commitRejectsAfterWrite: false },
+    { label: "whose commit rejects after writing", commitRejectsAfterWrite: true },
+  ])(
+    "a reservation $label whose fence write rejects still settles its waiters at the timeout",
+    async ({ commitRejectsAfterWrite }) => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+      const taskId = "aaaaaaaaaa";
+
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const controller = new AbortController();
+      const realEditConfig = config.editConfig.bind(config);
+      let failedFenceWrites = 0;
+      spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+        let commitsRow = false;
+        await realEditConfig((cfg) => {
+          const hadRow = findWorkspaceEntry(cfg, taskId) != null;
+          const next = fn(cfg);
+          const row = findWorkspaceEntry(next, taskId)?.workspace;
+          commitsRow = !hadRow && row != null;
+          if (row?.taskStatus === "interrupted") {
+            failedFenceWrites++;
+            throw new Error("EACCES: permission denied");
+          }
+          return next;
+        }, options);
+        if (!commitsRow) return;
+        // The commit landed; the caller cancels now, or the write reports a failure anyway.
+        controller.abort();
+        if (commitRejectsAfterWrite) throw new Error("config lock lost after the write");
+      });
+
+      const result = await taskService
+        .createMany(
+          [
+            {
+              parentWorkspaceId: parentId,
+              kind: "agent",
+              agentId: "explore",
+              prompt: "never launched",
+              title: "Canceled task",
+            },
+          ],
+          { abortSignal: controller.signal }
+        )
+        .catch((error: unknown) => Err(String(error)));
+      expect(result.success).toBe(false);
+      expect(failedFenceWrites).toBeGreaterThan(0);
+      expect(findWorkspaceEntry(config.loadConfigOrDefault(), taskId)?.workspace.taskStatus).toBe(
+        "starting"
+      );
+
+      const awaitOutcome = () =>
+        Promise.race([
+          taskService
+            .waitForAgentReport(taskId, { timeoutMs: 200, requestingWorkspaceId: parentId })
+            .then(
+              () => "resolved",
+              (error: unknown) =>
+                error instanceof AgentReportWaitTimeoutError ? "timed out" : error
+            ),
+          new Promise((resolve) => setTimeout(() => resolve("never settled"), 3_000)),
+        ]);
+      expect(await awaitOutcome()).toBe("timed out");
+    }
+  );
+
   test("queues tasks when maxParallelAgentTasks is reached and starts them when a slot frees", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"], "eeeeeeeeee");

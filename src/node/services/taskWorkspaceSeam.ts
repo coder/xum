@@ -789,6 +789,8 @@ export interface AgentTaskIntegration {
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
+  /** The workspace left the config: drop the task's in-memory marks (#5028). */
+  noteWorkspaceRemoved(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
   /**

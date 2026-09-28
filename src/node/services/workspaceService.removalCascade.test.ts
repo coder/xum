@@ -142,4 +142,18 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
       expect(await exists(checkouts.get(id)!)).toBe(false);
     }
   });
+
+  // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and
+  // has no reader once the row is gone. White-box: the leak is its only observable effect.
+  test("removing tasks drops their unpersisted-end marks", async () => {
+    const marks = (a.taskService as unknown as { unpersistedLaunchFailureTaskIds: Set<string> })
+      .unpersistedLaunchFailureTaskIds;
+    marks.add(childId);
+    marks.add(grandchildId);
+
+    const result = await removeRootWithTree();
+
+    expect(result.success).toBe(true);
+    expect([...marks]).toEqual([]);
+  });
 });

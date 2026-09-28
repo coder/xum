@@ -98,6 +98,7 @@ export function makeAgentTaskIntegrationFake(
     hasActiveTopLevelWorkflowRunsForWorkspace: () => Promise.resolve(false),
     getAgentTaskStatus: () => undefined,
     resetAutoResumeCount: () => undefined,
+    noteWorkspaceRemoved: () => undefined,
     acknowledgeAgentReports: () => Promise.resolve(new Set<string>()),
     backgroundForegroundWaitsForWorkspace: () => 0,
     markInterruptedTaskRunning: () => Promise.resolve(false),
