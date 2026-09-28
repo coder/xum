@@ -60,6 +60,57 @@ describe("findUnpreservedSubagentWork", () => {
     });
   }
 
+  /**
+   * Mimics a Docker copy (#4761 gap 2): a clone whose origin/* refs become local branches, with
+   * the task branch checked out at the source's main.
+   */
+  function makeStandaloneCopy() {
+    execSync("git checkout -q -b feature && git commit -q --allow-empty -m feature", { cwd: repo });
+    execSync("git checkout -q main", { cwd: repo });
+    const copy = path.join(rootDir, "copy");
+    execSync(`git clone -q ${repo} ${copy}`);
+    execSync("git branch feature origin/feature && git checkout -q -b task", { cwd: copy });
+    repo = copy;
+  }
+
+  test("a standalone copy loses commits on other local branches and the stash (#4761 gap 2)", async () => {
+    makeStandaloneCopy();
+    const copy = repo;
+    // Branches that came from the source are preserved there.
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+
+    // A branch the child committed on and then left dies with the copy.
+    execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: copy });
+    execSync("git checkout -q task", { cwd: copy });
+    expect(await check()).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: [], uncapturedCommitCount: 0, otherRefCommitCount: 1 },
+    });
+
+    // Removing a linked worktree keeps its repository, and the side branch with it.
+    repo = path.join(rootDir, "worktree");
+    execSync(`git worktree add -q -b task2 ${repo} task`, { cwd: copy });
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+
+    // A stash also lives only in the copy (clones never fetch refs/stash).
+    repo = copy;
+    execSync("git branch -D -q side", { cwd: copy });
+    await fsPromises.writeFile(path.join(copy, "README.md"), "stashed\n");
+    execSync("git stash -q", { cwd: copy });
+    const result = await check();
+    expect(result.success ? result.data : null).toMatchObject({ kind: "lossy", paths: [] });
+  });
+
+  test("a standalone copy without remote-tracking refs skips the other-branch count (#4761 gap 2)", async () => {
+    makeStandaloneCopy();
+    // A project without an origin URL loses its origin/* refs at creation, so nothing tells source
+    // branches from branches the child made. Counting them would refuse every such removal.
+    execSync("git remote remove origin", { cwd: repo });
+    execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
+    execSync("git checkout -q task", { cwd: repo });
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+  });
+
   test("a clean checkout with no new commits has nothing to preserve", async () => {
     expect(await check()).toEqual({ success: true, data: { kind: "none" } });
   });
