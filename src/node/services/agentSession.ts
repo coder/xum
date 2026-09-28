@@ -6073,7 +6073,10 @@ export class AgentSession {
     const queued = this.messageQueue.addOnce(
       args.text,
       {
-        ...args.options,
+        // A continuation is a fresh send: it keeps the turn's configuration, never the
+        // triggering message's payload. A replayed editMessageId made sendMessage refuse the
+        // Continue as a stale edit and drop it silently; attachments would be re-sent.
+        ...pickStartupRetrySendOptions(args.options),
         model: args.model,
         queueDispatchMode: "tool-end",
         muxMetadata: args.muxMetadata,
