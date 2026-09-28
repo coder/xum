@@ -140,7 +140,7 @@ export class TokenBudgetStrategy {
     const resolved = await this.resolveAgentForBudgetChecks(options);
     if (!resolved.success) return undefined;
     const allowed = applyToolPolicyToNames(
-      ["session_history", "new_context"],
+      ["memory", "session_history", "new_context"],
       resolved.data.effectiveToolPolicy
     );
     return {

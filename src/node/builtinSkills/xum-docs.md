@@ -114,7 +114,7 @@ Use this index to find a page's:
     - CLI Goal Runs are not strict /goal aliases (`/adr/0004-cli-goal-runs-are-not-strict-goal-aliases`) → `references/docs/adr/0004-cli-goal-runs-are-not-strict-goal-aliases.md`: Architecture decision for giving xum run --goal CLI-specific completion and limit semantics
     - Token-Budget Context Windows (`/adr/0005-token-budget-context-windows`) → `references/docs/adr/0005-token-budget-context-windows.md`: An opt-in automatic reset policy with bounded retrieval and a manual-reset privacy floor
     - Agent-Led Context Handoff (`/adr/0006-agent-led-context-handoff`) → `references/docs/adr/0006-agent-led-context-handoff.md`: The token-budget slider is a handoff target for the agent; only the usable limit forces a rollover
-    - The Handoff Is the Rollover Payload (`/adr/0007-handoff-is-the-rollover-payload`) → `references/docs/adr/0007-handoff-is-the-rollover-payload.md`: The agent writes its handoff through new_context, Xum carries it and the active request into the next window, and a final step guarantees a last chance
+    - Session Memory Is the Rollover Checkpoint (`/adr/0007-session-memory-is-the-rollover-checkpoint`) → `references/docs/adr/0007-session-memory-is-the-rollover-checkpoint.md`: Each agent keeps its own rollover checkpoint in the /memories/session/ scope, a fresh window injects nothing from the old one, and a final memory-only step gives a last chance to save it
     - AGENTS.md (`/AGENTS`) → `references/docs/AGENTS.md`: Agent instructions for AI assistants working on the Xum codebase
 <!-- END DOCS_TREE -->
 

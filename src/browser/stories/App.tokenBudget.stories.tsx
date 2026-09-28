@@ -20,9 +20,9 @@ const MODEL = "google:gemini-3.1-flash-lite";
 const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
 const HANDOFF =
-  "The context handoff target has been reached. Finish the current small unit of work, then call new_context with your handoff.";
+  "The context handoff target has been reached. Save your checkpoint in /memories/session/, then call new_context.";
 const FINAL =
-  "This is the last step in this context window. Call new_context now with your handoff.";
+  "The current context window is exhausted. In this step, save your checkpoint with the memory tool.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
 function setupTokenBudgetStory(inputTokens = 2400) {
