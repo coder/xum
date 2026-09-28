@@ -185,7 +185,12 @@ describe("ReviewStateService", () => {
     await fs.mkdir(path.dirname(tombstone), { recursive: true });
     await fs.writeFile(tombstone, "{}");
 
-    await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } });
+    // Rejected (retryable), not reported as written: the tombstone may be transient.
+    let refused = false;
+    await service
+      .applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } })
+      .catch(() => (refused = true));
+    expect(refused).toBe(true);
 
     const exists = await fs.stat(path.join(config.sessionsDir, WORKSPACE_ID)).then(
       () => true,

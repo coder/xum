@@ -202,8 +202,11 @@ export class ReviewStateService extends EventEmitter {
     // A late flush for a removed workspace must not recreate `sessions/<removedId>/`. Removal
     // publishes its tombstone under the same lock before deleting the dir, and deregisters from
     // config only afterwards, so the tombstone (not config) is what closes that window.
+    // Refuse with an error rather than a silent skip: the probe fails closed on I/O errors and a
+    // removal can roll back, so the client must keep its change and retry. It drops the pending
+    // change itself once the workspace-removed event arrives.
     if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
-      return this.getRevision(workspaceId);
+      throw new Error(`Review state write refused: workspace ${workspaceId} is being removed`);
     }
     // Strict lookup: an unreadable config throws, failing the update so the client keeps its
     // change and retries. Only a conclusive "not registered" skips the write.
