@@ -125,14 +125,8 @@ interface ContextBudgetWarningOptions {
 }
 
 export function buildBudgetWarningText(options: ContextBudgetWarningOptions): string {
-  const {
-    contextTokens,
-    maxTokens,
-    budgetTokens,
-    sessionHistoryAvailable,
-    final,
-    handoff,
-  } = options;
+  const { contextTokens, maxTokens, budgetTokens, sessionHistoryAvailable, final, handoff } =
+    options;
   assert(
     Boolean(final) !== Boolean(handoff),
     "A budget prompt is either the handoff request or the final step"
