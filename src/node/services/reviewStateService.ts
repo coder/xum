@@ -7,6 +7,7 @@ import { SessionFileManager } from "@/node/utils/sessionFile";
 import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   REVIEW_STATE_SECTIONS,
   type ReviewStateDelta,
@@ -195,7 +196,8 @@ export class ReviewStateService extends EventEmitter {
     try {
       text = await fs.readFile(filePath, "utf-8");
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      // Not `instanceof Error`: fs errors can come from another realm (e.g. jest vm contexts).
+      if (hasErrorCode(error, "ENOENT")) {
         return createEmptyReviewStateSnapshot();
       }
       throw error;
