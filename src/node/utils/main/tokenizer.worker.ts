@@ -21,7 +21,8 @@ export interface CountTokensBatchInput {
 }
 
 // The barrel evaluates all four encodings (~14.5 s CPU on a loaded host; o200k_base alone ~10 s, #4816).
-// Static specifiers let esbuild include each one in the Docker worker bundle while keeping evaluation lazy.
+// Static specifiers keep evaluation lazy, and the Docker build (Makefile TOKENIZER_ENCODINGS) swaps
+// each for its own bundle next to the worker bundle.
 /* eslint-disable @typescript-eslint/no-require-imports -- lazy require: only this worker's encoding is evaluated */
 const ENCODING_LOADERS: Record<EncodingName, () => Encoding> = {
   claude: () => require("ai-tokenizer/encoding/claude") as Encoding,

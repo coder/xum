@@ -74,7 +74,12 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
-ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
+# Each encoding ships as its own bundle next to the worker, and the worker bundle requires it
+# lazily. Inlining all four made every per-encoding worker parse ~14 MB (~11.7 s CPU) before it
+# loaded its one encoding (#4816). Keep this list in sync with ENCODING_LOADERS in tokenizer.worker.ts.
+TOKENIZER_ENCODINGS := claude o200k_base cl100k_base p50k_base
+TOKENIZER_ENCODING_BUNDLES := $(foreach e,$(TOKENIZER_ENCODINGS),dist/runtime/tokenizer-encoding-$(e).js)
+ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify $(foreach e,$(TOKENIZER_ENCODINGS),--alias:ai-tokenizer/encoding/$(e)=./tokenizer-encoding-$(e).js) --external:./tokenizer-encoding-*
 ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
 
 # Include formatting rules
@@ -309,6 +314,10 @@ build-docker-runtime: build-main build-renderer build-static dist/runtime/server
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
+	@for e in $(TOKENIZER_ENCODINGS); do \
+		test -f dist/runtime/tokenizer-encoding-$$e.js && \
+		grep -qF "./tokenizer-encoding-$$e.js" dist/runtime/tokenizer.worker.js || exit 1; \
+	done
 	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
@@ -323,11 +332,15 @@ dist/runtime/server-bundle.js: build-main $(TS_SOURCES)
 
 # Bundle tokenizer worker next to server-bundle.js so workerPool resolves it at runtime.
 # Depend on build-main explicitly because tokenizer worker JS is emitted under dist/node/ as a side effect.
-dist/runtime/tokenizer.worker.js: build-main
+dist/runtime/tokenizer.worker.js: build-main $(TOKENIZER_ENCODING_BUNDLES)
 	@echo "Bundling tokenizer worker for Docker..."
 	@test -f dist/node/utils/main/tokenizer.worker.js
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
+
+dist/runtime/tokenizer-encoding-%.js: node_modules/.installed
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) ai-tokenizer/encoding/$* --bundle --platform=node --target=node22 --format=cjs --outfile=$@ --minify
 
 # The disposable icon decoder must remain a separate process in bundled runtimes.
 dist/runtime/mcpIconDecode.js: build-main
