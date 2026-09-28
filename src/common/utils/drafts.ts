@@ -15,6 +15,19 @@ export function draftScopeKey(scope: DraftScope): string {
     : `creation:${JSON.stringify([scope.projectPath, scope.draftId])}`;
 }
 
+/** A new creation draft id (matches DRAFT_ID_PATTERN: it becomes a backend file name). */
+export function createDraftId(): string {
+  const maybeCrypto = globalThis.crypto;
+  if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
+    const id = maybeCrypto.randomUUID();
+    if (typeof id === "string" && id.length > 0) {
+      return id;
+    }
+  }
+
+  return `draft_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
 export function createEmptyDraft(): Draft {
   return { text: "", attachments: [] };
 }

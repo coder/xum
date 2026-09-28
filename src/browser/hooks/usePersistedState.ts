@@ -182,6 +182,20 @@ export function readPersistedState<T>(key: string, defaultValue: T): T {
   }
 }
 
+/** Every persisted key starting with `prefix` (e.g. to migrate a family of legacy keys). */
+export function listPersistedKeys(prefix: string): string[] {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+  const storage = window.localStorage;
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key?.startsWith(prefix)) keys.push(key);
+  }
+  return keys;
+}
+
 /**
  * Read a persisted string value from localStorage.
  *
