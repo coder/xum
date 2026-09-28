@@ -287,9 +287,7 @@ describe("TaskService", () => {
       expect(taskService.listInstanceWorkspaces("d-worktree", {}).totalMatching).toBe(4);
     });
 
-    // An accepted delegated turn is a busy turn that task_send_message continues, so its root
-    // stays addressable; a reserved one still refuses peer input and stays hidden.
-    test("omits stopped, stopping and reserved delegated roots before counting, and restores them when eligible", async () => {
+    test("omits stopped, stopping and delegated roots before counting, and restores them when eligible", async () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(
@@ -319,12 +317,11 @@ describe("TaskService", () => {
         "accepted"
       );
       try {
-        const result = taskService.listInstanceWorkspaces("available", {});
-        expect(result.rows.map((row) => row.workspaceId)).toEqual(["accepted", "available"]);
-        expect(result.totalMatching).toBe(2);
+        const result = taskService.listInstanceWorkspaces("available", { limit: 1 });
+        expect(result.rows.map((row) => row.workspaceId)).toEqual(["available"]);
+        expect(result.totalMatching).toBe(1);
         expect(result.nextOffset).toBeUndefined();
-        expect(isBusyForMessage).toHaveBeenCalledTimes(2);
-        expect(isBusyForMessage).toHaveBeenCalledWith("accepted");
+        expect(isBusyForMessage).toHaveBeenCalledTimes(1);
         expect(isBusyForMessage).toHaveBeenCalledWith("available");
       } finally {
         release();

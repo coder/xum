@@ -9483,13 +9483,15 @@ export class TaskService implements AgentTaskIntegration {
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
       const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
-      // A delegated workspace turn is just a busy turn: the recipient's consent already admits
-      // unrelated input, so an opted-in root receives peer messages mid-delegation the same way
-      // same-tree targets do, by CONTINUING the delegated turn (correlation resolved below).
-      // Only an unrelated wake that cannot carry the live turn's correlation is refused: a
-      // pending reservation (the owner's requireIdle send has not passed admission) or a live
-      // handle that differs from the resolved correlation. Dispatched uncorrelated, such a wake
-      // would steal the reserved turn or settle the owner's turn as superseded.
+      // An unrelated root running a delegated workspace turn accepts peer input only from that
+      // turn's OWNER: the owner already steers the turn through follow-ups, so its message may
+      // CONTINUE the turn (correlation resolved below), the same way same-tree sends do. Any
+      // other unrelated sender is refused: its continuation would run under the recipient's saved
+      // agent rather than the owner's per-turn override (handle records do not store it) and land
+      // in the owner's result. Even the owner is refused while the turn is only reserved (its
+      // requireIdle send has not passed admission) or when the live handle no longer matches the
+      // resolved correlation: dispatched uncorrelated, such a wake would steal the reserved turn
+      // or settle the owner's turn as superseded.
       // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
       // CONCURRENT BACKENDS in processLiveness.ts).
       // "unresolved" until the correlation lookup below runs; undefined means no correlation.
@@ -9497,27 +9499,32 @@ export class TaskService implements AgentTaskIntegration {
         | { taskHandleId: string; ownerWorkspaceId: string }
         | undefined
         | "unresolved" = "unresolved";
-      const delegatedRootUnavailable = (): boolean => {
-        if (!unrelatedRoot) return false;
-        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        if (live == null) {
-          // The correlated turn settled before dispatch: its owner's result is final, so the
-          // reply could not continue it. Refuse so the sender retries as an idle-root wake.
-          return delegatedTurnCorrelation !== "unresolved" && delegatedTurnCorrelation != null;
-        }
-        if (!live.accepted) return true;
-        // Before the correlation lookup, an accepted turn is still a candidate for continuation.
-        if (delegatedTurnCorrelation === "unresolved") return false;
-        return (
-          live.handleId !== delegatedTurnCorrelation?.taskHandleId ||
-          live.ownerWorkspaceId !== delegatedTurnCorrelation.ownerWorkspaceId
-        );
-      };
-      const delegatedRootRefusal = {
+      const delegatedRootStartingRefusal = {
         code: "refused" as const,
         reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
       };
-      if (delegatedRootUnavailable()) return Err(delegatedRootRefusal);
+      const delegatedRootForeignRefusal = {
+        code: "refused" as const,
+        reason: "Retry after the target's delegated workspace turn finishes.",
+      };
+      const getDelegatedRootRefusal = ():
+        | typeof delegatedRootStartingRefusal
+        | typeof delegatedRootForeignRefusal
+        | null => {
+        if (!unrelatedRoot) return null;
+        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
+        if (live == null) return null;
+        if (live.ownerWorkspaceId !== senderWorkspaceId) return delegatedRootForeignRefusal;
+        if (!live.accepted) return delegatedRootStartingRefusal;
+        // Before the correlation lookup, the owner's accepted turn is a continuation candidate.
+        if (delegatedTurnCorrelation === "unresolved") return null;
+        return live.handleId !== delegatedTurnCorrelation?.taskHandleId ||
+          live.ownerWorkspaceId !== delegatedTurnCorrelation.ownerWorkspaceId
+          ? delegatedRootStartingRefusal
+          : null;
+      };
+      const initialDelegatedRootRefusal = getDelegatedRootRefusal();
+      if (initialDelegatedRootRefusal != null) return Err(initialDelegatedRootRefusal);
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
@@ -9783,7 +9790,8 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = interruptedRefusal;
           return true;
         }
-        if (delegatedRootUnavailable()) {
+        const delegatedRootRefusal = getDelegatedRootRefusal();
+        if (delegatedRootRefusal != null) {
           admissionRefusal = delegatedRootRefusal;
           return true;
         }
@@ -9872,23 +9880,6 @@ export class TaskService implements AgentTaskIntegration {
       );
       sendOptions = { ...sendOptions, queueDispatchMode: effectiveDispatchMode };
 
-      // A queued continuation can defer the delegated stream's settlement to itself. If it is
-      // withdrawn (probe refusal, stop) or fails before streaming, no replacement stream-end
-      // arrives, so settle the owner's turn here. A still-running correlated stream is left
-      // alone: its own stream-end settles the turn once this entry has left the queue.
-      const settleContinuationFailure = async (
-        status: "interrupted" | "error",
-        reason: string
-      ): Promise<void> => {
-        if (workspaceTurnMuxMetadata == null || this.aiService.isStreaming(targetId)) return;
-        await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-          targetId,
-          workspaceTurnMuxMetadata,
-          status,
-          reason
-        );
-      };
-
       let accepted = false;
       // Admission classification: parent guidance into a live child continues its attempt (no
       // rotation); the fence at the handoff refuses it once the attempt closed.
@@ -9910,13 +9901,6 @@ export class TaskService implements AgentTaskIntegration {
         onAccepted: () => {
           accepted = true;
         },
-        ...(workspaceTurnMuxMetadata != null
-          ? {
-              onCanceled: (reason: string) => settleContinuationFailure("interrupted", reason),
-              onAcceptedPreStreamFailure: (error: SendMessageError) =>
-                settleContinuationFailure("error", formatSendMessageError(error).message),
-            }
-          : {}),
       });
       if (!sendResult.success) {
         // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
@@ -14590,8 +14574,7 @@ export class TaskService implements AgentTaskIntegration {
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||
-          // A reserved delegated turn refuses peer input; an accepted one is continued by it.
-          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id)?.accepted === false ||
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
           // Match peer-path predicates, not a new raw-tag rule. The current index contains
           // only task children, so ordinary roots cannot match these task restrictions.
           this.isWorkflowOwnedTaskUsingIndex(index, id) ||
