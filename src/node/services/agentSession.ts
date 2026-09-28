@@ -6078,6 +6078,11 @@ export class AgentSession {
       // fields stay dropped: the ACP prompt resolves at the first stream-end, so nothing
       // correlates the continuation or answers its delegated tool calls (they would hang).
       ...pickStartupRetrySendOptions(args.options),
+      // The live Chat Instructions snapshot ("" = disabled) is turn configuration: without it
+      // the request builder reloads a disk copy whose opt-out save may still be pending.
+      ...(args.options.additionalSystemContext !== undefined
+        ? { additionalSystemContext: args.options.additionalSystemContext }
+        : {}),
       ...(args.autoModelRouting != null ? { autoModelRoutingRecord: args.autoModelRouting } : {}),
       model: args.model,
       queueDispatchMode: "tool-end",
