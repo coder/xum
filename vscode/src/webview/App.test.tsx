@@ -1266,13 +1266,13 @@ describe("vscode webview workspace AI settings", () => {
       },
     });
 
-    // Pick Sonnet 5 for Plan from the model dropdown (the list shows every suggested model).
+    // Pick Sonnet 5.5 for Plan from the model dropdown (the list shows every suggested model).
     await act(async () => {
       fireEvent.click(view.getByRole("combobox"));
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     await bridge.answer("agents.list", AGENT_DESCRIPTORS);
@@ -1329,7 +1329,7 @@ describe("vscode webview workspace AI settings", () => {
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     // A sub-agent follows its backend settings on every refresh, except a deliberate unsent pick.
@@ -1803,7 +1803,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("persists only the last of several rapid picks", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     await pickModel(view, "Opus 5.5");
 
     const options = await send(bridge, view);
@@ -1832,7 +1832,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("never persists for a workspace without loaded AI settings", async () => {
     const { bridge, view } = await open([WORKSPACE]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1878,7 +1878,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     // Until policy.get answers, the model list is unfiltered and the policy looks disabled, so a
     // pick could be a model the policy forbids.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)], "pending");
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1900,7 +1900,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
         },
       },
     ]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     expect(agentPicker(view).disabled).toBe(true);
     const options = await send(bridge, view);
@@ -1916,7 +1916,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("keeps one persisting send per workspace in flight; the next send writes the latest pick", async () => {
     const other = mainWorkspace(TERRA_HIGH, "ws-2");
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH), other]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
 
@@ -1951,7 +1951,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("stops persisting for a workspace after a send ends without a server result", async () => {
     // Own workspace ID: the unknown outcome lasts for this webview session.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH, "ws-unknown-outcome")]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     const call = bridge.orpcCalls("workspace.sendMessage")[0];
@@ -1966,7 +1966,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("keeps a pick pending after a server-reported send failure", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     await reply(bridge, { success: false, error: { type: "policy_denied", message: "denied" } });
@@ -2105,5 +2105,123 @@ describe("vscode webview message rows", () => {
       await Promise.resolve();
     });
     expect(view.queryByText("reply number 0")).not.toBeNull();
+  });
+
+  // ChatPane-level derivations the webview shares with desktop (#5002).
+  test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
+    const scrolled: Element[] = [];
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge, [
+        historyMessage("first", "user", "first prompt", { historySequence: 1 }),
+        historyMessage("wake", "user", "A monitor matched.", {
+          historySequence: 2,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [{ kind: "match", displayName: "Dev", filter: "ready", filterExclude: false }],
+          },
+        }),
+        historyMessage("second", "user", "second prompt", { historySequence: 3 }),
+      ]);
+
+      const firstRow = view.container.querySelector('[data-message-id="first"]');
+      const next = firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Next message"]');
+      expect(next).not.toBeNull();
+      expect(
+        firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Previous message"]')
+          ?.disabled
+      ).toBe(true);
+
+      await act(async () => {
+        fireEvent.click(next!);
+        await Promise.resolve();
+      });
+      // Compare IDs, not elements: a failing toEqual on DOM nodes can exhaust memory while diffing.
+      expect(scrolled.map((element) => element.getAttribute("data-message-id"))).toEqual(["second"]);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test("consecutive bash_output polls of one process collapse behind a toggle", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(
+      bridge,
+      ["out-1", "out-2", "out-3"].map((id, index) =>
+        toolMessage(
+          id,
+          index + 1,
+          "bash_output",
+          { process_id: "proc-1", timeout_secs: 5 },
+          { success: true, status: "running", output: `poll ${index + 1}`, elapsed_ms: 10 }
+        )
+      )
+    );
+
+    // A boolean, so a failure does not print the whole row element.
+    const middleRowRendered = () => view.container.querySelector('[data-message-id="out-2"]') !== null;
+    expect(view.container.querySelector('[data-message-id="out-1"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-message-id="out-3"]')).not.toBeNull();
+    expect(middleRowRendered()).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Show 1 more output check for proc-1/ }));
+      await Promise.resolve();
+    });
+    expect(middleRowRendered()).toBe(true);
+    expect(view.queryByRole("button", { name: /Hide 1 more output check/ })).not.toBeNull();
+  });
+
+  test("task_await rows name a linked background bash by its spawn intent", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "spawn",
+        1,
+        "bash",
+        {
+          script: "./scripts/wait_pr_ready.sh 27330",
+          display_name: "PR ready watcher",
+          model_intent: "Watching PR 27330 until it is ready",
+          timeout_secs: 30,
+          run_in_background: true,
+        },
+        {
+          success: true,
+          output: "Started",
+          exitCode: 0,
+          wall_duration_ms: 10,
+          taskId: "bash:pr-ready-watcher-a1b2",
+          backgroundProcessId: "pr-ready-watcher-a1b2",
+        }
+      ),
+      toolMessage(
+        "await",
+        2,
+        "task_await",
+        { task_ids: ["bash:pr-ready-watcher-a1b2"] },
+        {
+          results: [
+            {
+              status: "completed",
+              taskId: "bash:pr-ready-watcher-a1b2",
+              title: "PR ready watcher",
+              reportMarkdown: "exit 0",
+            },
+          ],
+        }
+      ),
+    ]);
+
+    expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
   });
 });

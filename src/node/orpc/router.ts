@@ -18,7 +18,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * uninterruptible in the service pipeline (see asAtomicMutation in
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
-import { ORPCError, os } from "@orpc/server";
+import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
@@ -180,10 +180,16 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
 
 export const router = (authToken?: string) => {
-  const t = os
-    .$context<ORPCContext>()
-    .use(createAuthMiddleware(authToken))
-    .use(inFlightProcedureMiddleware);
+  const auth = createAuthMiddleware(authToken);
+  // One factory for every builder so their middleware chains cannot diverge. `$config` exists only
+  // on the root builder and is a plain spread, so `$config({})` leaves `t` unchanged.
+  const procedure = (config: ProcedureConfig = {}) =>
+    os.$context<ORPCContext>().$config(config).use(auth).use(inFlightProcedureMiddleware);
+  const t = procedure();
+  // For subscriptions that validate their own yielded values with the declared output schema
+  // (onChat, #4868: replay rows are then parsed once, not twice). The declared `.output()` stays,
+  // so types and the generated OpenAPI are unchanged.
+  const tSelfValidatedOutput = procedure({ disableOutputValidation: true });
 
   return t.router({
     tokenizer: {
@@ -1971,10 +1977,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.getFileCompletions(input.workspaceId, input.query, input.limit)
         ),
-      onChat: t
+      onChat: tSelfValidatedOutput
         .input(schemas.workspace.onChat.input)
         .output(schemas.workspace.onChat.output)
-        .handler(({ context, input, signal }) => subscribeWorkspaceChat(context, input, signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeWorkspaceChat(context, input, signal, { validateOutput: true })
+        ),
       onMetadata: t
         .input(schemas.workspace.onMetadata.input)
         .output(schemas.workspace.onMetadata.output)

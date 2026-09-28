@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -44,6 +53,13 @@ import {
   TranscriptBundleRows,
   useTranscriptBundles,
 } from "xum/browser/components/ChatPane/TranscriptBundles";
+import {
+  findTranscriptMessageElement,
+  getTranscriptRowProps,
+  useTranscriptRowDerivations,
+  useUserMessageNavigation,
+} from "xum/browser/components/ChatPane/transcriptRowDerivations";
+import { BashOutputCollapsedIndicator } from "xum/browser/features/Tools/BashOutputCollapsedIndicator";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
@@ -295,6 +311,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     contentRef,
     sentinelRef,
     autoScroll,
+    disableAutoScroll,
     handleScroll,
     jumpToBottom,
     markUserScrollIntent,
@@ -768,6 +785,29 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     transcriptDensity,
     isTurnActive: streamState ? streamState.isStreamStarting || streamState.canInterrupt : false,
   });
+  // bash_output grouping, task report linking and prompt navigation, as in ChatPane (#5002).
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId: selectedWorkspaceId ?? "",
+    messages: displayedMessages,
+  });
+  // Stable so the per-prompt navigation objects keep their identity across flushes. Every row is
+  // mounted (no bounded reveal), so the target can be scrolled to directly; disabling auto-scroll
+  // first keeps streaming content from pulling the view back to the tail.
+  const handleNavigateToMessage = useCallback(
+    (historyId: string) => {
+      disableAutoScroll();
+      const scrollContainer = contentRef.current;
+      const target = scrollContainer
+        ? findTranscriptMessageElement(scrollContainer, historyId)
+        : undefined;
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    },
+    [contentRef, disableAutoScroll]
+  );
+  const userMessageNavigationByHistoryId = useUserMessageNavigation({
+    messages: displayedMessages,
+    onNavigateToMessage: handleNavigateToMessage,
+  });
 
   return (
     // Shared providers (SettingsProvider, settings links in the model selector and tool cards) need
@@ -854,24 +894,51 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                 messages={displayedMessages}
                                 indexOffset={0}
                                 bundles={transcriptBundles}
-                                renderMessageAtIndex={(msg, _index, options) => {
+                                renderMessageAtIndex={(msg, index, options) => {
+                                  const rowProps = getTranscriptRowProps({
+                                    derivations: transcriptRowDerivations,
+                                    userMessageNavigationByHistoryId,
+                                    messages: displayedMessages,
+                                    message: msg,
+                                    index,
+                                  });
+                                  if (rowProps.hidden) {
+                                    return null;
+                                  }
+                                  const { bashOutputGroup, bashGroupKey } = rowProps;
                                   const row = (
                                     <DisplayedMessageRenderer
-                                      key={options.key}
                                       message={msg}
                                       workspaceId={selectedWorkspaceId}
                                       isLatestProposePlan={msg.id === latestProposePlanId}
                                       isCompacting={aggregatorRef.current?.isCompacting() ?? false}
                                       onCloseEphemeral={messageRowActions.closeEphemeral}
                                       onShowAllHistory={messageRowActions.showAllHistory}
+                                      bashOutputGroup={bashOutputGroup}
+                                      taskReportLinking={rowProps.taskReportLinking}
+                                      userMessageNavigation={rowProps.userMessageNavigation}
                                     />
                                   );
-                                  return options.className ? (
-                                    <div key={options.key} className={options.className}>
-                                      {row}
-                                    </div>
-                                  ) : (
-                                    row
+                                  return (
+                                    <Fragment key={options.key}>
+                                      {options.className ? (
+                                        <div className={options.className}>{row}</div>
+                                      ) : (
+                                        row
+                                      )}
+                                      {bashOutputGroup?.position === "first" && bashGroupKey ? (
+                                        <BashOutputCollapsedIndicator
+                                          processId={bashOutputGroup.processId}
+                                          collapsedCount={bashOutputGroup.collapsedCount}
+                                          isExpanded={rowProps.isBashGroupExpanded}
+                                          onToggle={() =>
+                                            transcriptRowDerivations.toggleBashOutputGroup(
+                                              bashGroupKey
+                                            )
+                                          }
+                                        />
+                                      ) : null}
+                                    </Fragment>
                                   );
                                 }}
                               />

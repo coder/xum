@@ -72,6 +72,10 @@ isolated_unit_tests=(
   # fail", exit 133) as this file started on main run 35782976621, with zero
   # failing assertions; isolation gets it the signal-exit retry below.
   src/node/services/mcpIconDecodeClient.test.ts
+  # Its Discard-shortcut tests fail after a combination of earlier files in the shared
+  # process (order-dependent; passes alone). Isolated until the polluter is found and
+  # fixed; then move it back (#5084).
+  src/browser/features/Messages/HeldInput.test.tsx
   # Guards the DOM harness itself by deliberately poisoning process globals
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
