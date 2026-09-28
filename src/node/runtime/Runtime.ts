@@ -765,5 +765,5 @@ export function isRuntimeTransportError(error: unknown): error is RuntimeError {
  * user does not read it as a missing agent or a bad argument.
  */
 export function formatRuntimeUnreachableError(operation: string, error: RuntimeError): string {
-  return `${operation}: the workspace runtime is unreachable (${error.message}); retry once it is reachable`;
+  return `${operation}: the workspace runtime is unreachable (${error.message.trim()}); retry once it is reachable`;
 }
