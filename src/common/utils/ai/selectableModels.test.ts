@@ -126,7 +126,7 @@ describe("computeSelectableModels", () => {
 
     test("a custom entry equal to a built-in ID is deduped, keeping the custom position", () => {
       const providersConfig: ProvidersConfigMap = {
-        anthropic: provider({ models: ["claude-sonnet-5", "claude-custom"] }),
+        anthropic: provider({ models: [KNOWN_MODELS.SONNET.providerModelId, "claude-custom"] }),
       };
 
       expect(select({ providersConfig })).toEqual([
@@ -321,7 +321,7 @@ describe("computeSelectableModels", () => {
         select({
           providersConfig: { anthropic: provider(), xai: provider() },
           effectivePolicy: enforcedPolicy([
-            { id: "anthropic", allowedModels: ["claude-sonnet-5"] },
+            { id: "anthropic", allowedModels: [KNOWN_MODELS.SONNET.providerModelId] },
           ]),
         })
       ).toEqual([SONNET]);

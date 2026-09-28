@@ -62,6 +62,7 @@ describe("Known Models Integration", () => {
   // warning) to the generic per-provider tokenizer.
   test.each([
     ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
+    ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
     ["openai:gpt-5.6-sol", "openai/gpt-5"],
     ["openai:gpt-5.6-luna", "openai/gpt-5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {

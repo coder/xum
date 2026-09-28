@@ -4361,7 +4361,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |",
       "| Mythos 5.1             | anthropic:claude-mythos-5-1   | `mythos`                                                     |         |",
       "| Opus 5.5               | anthropic:claude-opus-5-5     | `opus`                                                       | ✓       |",
-      "| Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |",
+      "| Sonnet 5.5             | anthropic:claude-sonnet-5-5   | `sonnet`                                                     |         |",
       "| Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |",
       "| GPT-6 Sol              | openai:gpt-6-sol              | `gpt`, `sol`                                                 |         |",
       "| GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |",
