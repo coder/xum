@@ -208,12 +208,26 @@ async function resolvePackagedMacExecutable(appBundlePath: string): Promise<stri
   return path.join(macOsDir, match.name);
 }
 
+// `lipo` only reads the Mach-O header, but /usr/bin/lipo is an xcrun shim that first locates the
+// developer tool, which can be slow on a loaded macOS runner. The previous 10 s limit timed out
+// there (#4940; that job's cleanup found an orphaned xcodebuild). A longer limit plus one retry on
+// ETIMEDOUT only absorbs that stall; every other lipo failure stays fatal.
+const LIPO_TIMEOUT_MS = 60_000;
+
+function runLipoArchs(executablePath: string) {
+  const run = () =>
+    spawnSync("lipo", ["-archs", executablePath], { encoding: "utf8", timeout: LIPO_TIMEOUT_MS });
+  const first = run();
+  if ((first.error as NodeJS.ErrnoException | undefined)?.code !== "ETIMEDOUT") return first;
+  console.warn(
+    `[attach-file-smoke] lipo timed out after ${LIPO_TIMEOUT_MS} ms for ${executablePath}; retrying once`
+  );
+  return run();
+}
+
 async function getPackagedAppArchitectures(appBundlePath: string): Promise<MacAppArchitecture[]> {
   const executablePath = await resolvePackagedMacExecutable(appBundlePath);
-  const result = spawnSync("lipo", ["-archs", executablePath], {
-    encoding: "utf8",
-    timeout: 10_000,
-  });
+  const result = runLipoArchs(executablePath);
 
   if (result.error != null) {
     throw result.error;
