@@ -677,6 +677,17 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test("drops 'off' for Sonnet 5.5 (provisional always-thinking) but not Sonnet 5", () => {
+    const noOff: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-5")).toEqual(noOff);
+    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-5-20261001")).toEqual(noOff);
+    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5-5")).toEqual(noOff);
+    expect(enforceThinkingPolicy("anthropic:claude-sonnet-5-5", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("bedrock:anthropic.claude-sonnet-5-5", "off")).toBe("low");
+    // Sonnet 5 keeps its "off" level.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-5", undefined)).toBe("off");
+  });
+
   test("returns 5 levels including xhigh for Sonnet 4.6", () => {
     expect(getThinkingPolicyForModel("anthropic:claude-sonnet-4-6")).toEqual([
       "off",

@@ -221,6 +221,10 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(
         anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
       ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
+      // Sonnet 5.5 is provisionally treated the same way (see anthropicRejectsDisabledThinking).
+      expect(buildProviderOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
     });
   });
 

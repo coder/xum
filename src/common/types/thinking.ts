@@ -404,12 +404,19 @@ export function isKimiK3Model(modelString: string): boolean {
  * Matched as the exact id (plus an optional date suffix, tolerating Bedrock's
  * `anthropic.` prefix and bracket suffixes) rather than as "Opus 5+", so
  * `claude-opus-5` keeps its "off" level.
+ *
+ * PROVISIONAL: Claude Sonnet 5.5 (not yet released) is assumed to share this
+ * 5.5-family restriction. This is the fail-safe direction: a wrong "true" only
+ * hides the "off" level, while a wrong "false" makes every "off" request (and
+ * evaluation calls that send reasoning none) return 400. Confirm against the
+ * Sonnet 5.5 "What's new" page at launch; drop `sonnet-5-5` here if it can
+ * still disable thinking like Sonnet 5.
  */
 export function anthropicRejectsDisabledThinking(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
   return (
     /claude-(?:fable|mythos)-/.test(withoutPrefix) ||
-    /claude-opus-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
+    /claude-(?:opus|sonnet)-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
   );
 }
 
