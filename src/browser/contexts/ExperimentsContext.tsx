@@ -11,12 +11,17 @@ import {
   type ExperimentId,
   EXPERIMENT_IDS,
   EXPERIMENTS,
+  EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY,
   getExperimentKey,
   getLegacyPtcExclusiveExperimentKey,
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
 import { getStorageChangeEvent } from "@/common/constants/events";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  syncPersistedStateFromBackend,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
 
 /**
@@ -150,6 +155,39 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
 }
 
 /**
+ * Rewrites an experiment's localStorage mirror to the backend's override (undefined: none).
+ * Goes through the backend-sourced write path so listeners do not treat it as a local choice,
+ * and keeps the legacy exclusive mirror equal to PTC as setExperimentState does.
+ */
+function syncExperimentStateFromBackend(
+  experimentId: ExperimentId,
+  enabled: boolean | undefined
+): void {
+  if (getExperimentOverrideSnapshot(experimentId) === enabled) return;
+  syncPersistedStateFromBackend(getExperimentKey(experimentId), enabled);
+  if (experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) {
+    syncPersistedStateFromBackend(getLegacyPtcExclusiveExperimentKey(), enabled);
+  }
+}
+
+/** A local choice, compared by identity so only the latest one clears its pending entry. */
+interface ExperimentChoice {
+  enabled: boolean;
+}
+
+function persistChoice(
+  pending: Map<ExperimentId, ExperimentChoice>,
+  persist: (experimentId: ExperimentId, enabled: boolean) => Promise<boolean>,
+  experimentId: ExperimentId,
+  choice: ExperimentChoice
+): Promise<boolean> {
+  return persist(experimentId, choice.enabled).then((persisted) => {
+    if (persisted && pending.get(experimentId) === choice) pending.delete(experimentId);
+    return persisted;
+  });
+}
+
+/**
  * Upgrade reconciliation for the legacy exclusive mirror (r33): an old
  * renderer can leave `programmatic-tool-calling: true` alongside a stale
  * legacy exclusive `false` (or none), and setExperimentState rewrites the
@@ -222,6 +260,11 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     [apiState.api]
   );
 
+  // Local choices the backend has not acknowledged: in flight, or failed in this session
+  // (offline, a rejected write). Adopting backend state skips them so a snapshot older than
+  // the choice cannot revert it, and the next connect retries them.
+  const pendingChoices = useRef(new Map<ExperimentId, ExperimentChoice>());
+
   const designTogglePending = useRef(false);
 
   const setExperiment = useCallback(
@@ -245,7 +288,11 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         return;
       }
       publish();
-      persistOverride(experimentId, enabled).catch(() => undefined);
+      const choice = { enabled };
+      pendingChoices.current.set(experimentId, choice);
+      persistChoice(pendingChoices.current, persistOverride, experimentId, choice).catch(
+        () => undefined
+      );
     },
     [persistOverride]
   );
@@ -263,44 +310,92 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     const api = apiState.api;
     const controller = new AbortController();
     let cancelled = false;
+    const pending = pendingChoices.current;
 
-    const reconcile = async () => {
-      // Upload this client's local overrides first, then adopt the merged backend state.
-      // Uploads are per-experiment: this client's localStorage is origin-scoped and may
-      // legitimately be empty, so it must never clear overrides another client set.
-      try {
-        await Promise.all(
-          Object.entries(getExplicitLocalExperimentOverrides()).map(([id, enabled]) => {
-            const experimentId = id as ExperimentId;
-            return isCompactionExperiment(experimentId)
-              ? persistOverride(experimentId, enabled)
-              : api.experiments.setOverride({ experimentId, enabled });
-          })
-        );
-      } catch {
-        // Best effort
+    const markOffline = () => {
+      setBackendOverrides((previous) =>
+        previous
+          ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
+          : null
+      );
+      // Still reconciles the purely-local stale pair (ptc: true,
+      // legacy: false/absent) even when the backend is unreachable.
+      reconcileLegacyPtcExclusiveMirror(null);
+    };
+
+    // The backend is authoritative: its overrides replace this origin's mirrors, including
+    // removing ones it no longer holds, so a restore or another window's toggle reaches the
+    // UI and the send options that read the mirrors.
+    const adopt = (overrides: Partial<Record<ExperimentId, boolean>>) => {
+      setBackendOverrides((previous) => ({
+        ...overrides,
+        [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
+      }));
+      for (const experimentId of Object.keys(EXPERIMENTS) as ExperimentId[]) {
+        if (
+          experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP ||
+          !isExperimentSupported(experimentId) ||
+          pending.has(experimentId)
+        ) {
+          continue;
+        }
+        syncExperimentStateFromBackend(experimentId, overrides[experimentId]);
       }
+      reconcileLegacyPtcExclusiveMirror(overrides);
+    };
+
+    const uploadPendingChoices = async () => {
+      // Once per origin, overrides kept in localStorage from before the backend persisted
+      // them are uploaded. Afterwards only this session's unacknowledged choices are: a stale
+      // mirror would otherwise push old values back over a restore or another window's change.
+      const migrating =
+        readPersistedState<unknown>(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, false) !== true;
+      if (migrating) {
+        for (const [id, enabled] of Object.entries(getExplicitLocalExperimentOverrides())) {
+          const experimentId = id as ExperimentId;
+          if (!pending.has(experimentId)) pending.set(experimentId, { enabled });
+        }
+      }
+      // Per experiment: this client's localStorage is origin-scoped and may legitimately be
+      // empty, so it must never clear overrides another client set.
+      const results = await Promise.all(
+        [...pending].map(([experimentId, choice]) =>
+          persistChoice(pending, persistOverride, experimentId, choice)
+        )
+      );
+      // A failed upload keeps the marker unset so the next launch migrates from the mirrors
+      // again; the pending entry keeps adoption from clearing that mirror meanwhile.
+      if (migrating && !cancelled && results.every(Boolean)) {
+        updatePersistedState(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, true);
+      }
+    };
+
+    const followOverrides = async () => {
+      await uploadPendingChoices().catch(() => undefined);
+      if (cancelled) return;
+
+      let adopted = false;
+      try {
+        // Subscribed after the uploads so its opening snapshot already includes them; later
+        // values arrive in write order, so the newest always wins.
+        const stream = await api.experiments.onOverridesChange(undefined, {
+          signal: controller.signal,
+        });
+        for await (const overrides of stream) {
+          if (cancelled) break;
+          adopted = true;
+          adopt(overrides);
+        }
+      } catch {
+        // Falls back to a single read below.
+      }
+      if (cancelled || adopted) return;
 
       try {
         const overrides = await api.experiments.getOverrides();
-        if (!cancelled) {
-          setBackendOverrides((previous) => ({
-            ...overrides,
-            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
-          }));
-          reconcileLegacyPtcExclusiveMirror(overrides);
-        }
+        if (!cancelled) adopt(overrides);
       } catch {
-        if (!cancelled) {
-          setBackendOverrides((previous) =>
-            previous
-              ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
-              : null
-          );
-          // Still reconciles the purely-local stale pair (ptc: true,
-          // legacy: false/absent) even when the backend is unreachable.
-          reconcileLegacyPtcExclusiveMirror(null);
-        }
+        if (!cancelled) markOffline();
       }
     };
 
@@ -325,7 +420,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         // establishes a fresh subscription and revision domain.
       }
     };
-    reconcile().catch(() => undefined);
+    followOverrides().catch(() => undefined);
     followDesign().catch(() => undefined);
 
     return () => {
@@ -377,8 +472,8 @@ export function useExperimentValue(experimentId: ExperimentId): boolean {
   if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)
     return context?.backendOverrides?.[experimentId] ?? false;
 
-  // An explicit local toggle wins, which also settles the race against an in-flight
-  // backend read: a toggle made while it loads is not overwritten when it resolves.
+  // The mirror follows the backend except for choices it has not acknowledged yet, so it
+  // wins: a toggle made while a backend read is in flight is not overwritten when it resolves.
   if (localOverride !== undefined) {
     return localOverride;
   }

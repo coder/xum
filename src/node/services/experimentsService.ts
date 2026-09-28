@@ -11,9 +11,14 @@ import {
 import { getXumHome } from "@/common/constants/paths";
 import type { TelemetryService } from "@/node/services/telemetryService";
 
+import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import * as path from "path";
+
+export type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
+
+const OVERRIDES_CHANGED_EVENT = "overridesChanged";
 
 interface ExperimentsFile {
   version: 1;
@@ -112,6 +117,7 @@ export class ExperimentsService {
   private readonly platform: NodeJS.Platform;
 
   private overrides = new Map<ExperimentId, boolean>();
+  private readonly emitter = new EventEmitter();
 
   private initialized = false;
   private initialization: Promise<void> | undefined;
@@ -125,6 +131,8 @@ export class ExperimentsService {
     this.xumHome = options.xumHome ?? getXumHome();
     this.overridesFilePath = path.join(this.xumHome, EXPERIMENT_OVERRIDES_FILE_NAME);
     this.platform = options.platform ?? process.platform;
+    // One listener per open renderer subscription.
+    this.emitter.setMaxListeners(50);
   }
 
   private isExperimentSupported(experimentId: ExperimentId): boolean {
@@ -154,18 +162,22 @@ export class ExperimentsService {
    * Overrides persisted for this machine. Renderers read these so a client whose
    * origin-scoped localStorage is empty still shows the state its backend gates use.
    */
-  async getOverrides(): Promise<Partial<Record<ExperimentId, boolean>>> {
+  async getOverrides(): Promise<ExperimentOverrides> {
     await this.ensureInitialized();
     await this.withOverridesLock(() => this.loadOverridesFromDisk());
+    return this.supportedOverrides();
+  }
 
-    const result: Partial<Record<ExperimentId, boolean>> = {};
-    for (const [experimentId, enabled] of this.overrides) {
-      if (this.isExperimentSupported(experimentId)) {
-        result[experimentId] = enabled;
-      }
-    }
-
-    return result;
+  /**
+   * Fires with the full supported override map after every successful write, so open
+   * renderers follow changes they did not make (another window's toggle, a settings
+   * restore) instead of holding a stale localStorage mirror.
+   */
+  onOverridesChange(listener: (overrides: ExperimentOverrides) => void): () => void {
+    this.emitter.on(OVERRIDES_CHANGED_EVENT, listener);
+    return () => {
+      this.emitter.off(OVERRIDES_CHANGED_EVENT, listener);
+    };
   }
 
   /**
@@ -177,21 +189,50 @@ export class ExperimentsService {
     experimentId: ExperimentId,
     enabled: boolean | null | undefined
   ): Promise<void> {
-    await this.ensureInitialized();
     assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
+    await this.applyOverrides({ [experimentId]: enabled ?? null });
+  }
+
+  /**
+   * Update several overrides under one lock and one atomic write (`null` clears). A
+   * settings restore uses this so its experiments land together, and never by writing the
+   * file behind the service, which would leave `isExperimentEnabled` on the old values.
+   */
+  async applyOverrides(changes: Partial<Record<ExperimentId, boolean | null>>): Promise<void> {
+    await this.ensureInitialized();
+    const entries = Object.entries(changes) as Array<[ExperimentId, boolean | null | undefined]>;
+    for (const [experimentId] of entries) {
+      assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
+    }
+    if (entries.length === 0) return;
 
     await this.withOverridesLock(async (lease) => {
-      // Merge the individual mutation into current disk state. A stale sibling
-      // changing an unrelated flag must never restore withdrawn Design consent.
+      // Merge the mutation into current disk state. A stale sibling changing an
+      // unrelated flag must never restore withdrawn Design consent.
       const { overrides: next } = await readOverridesFile(this.overridesFilePath);
-      const value = this.isExperimentSupported(experimentId) ? enabled : null;
-      if (value == null) next.delete(experimentId);
-      else next.set(experimentId, value);
+      for (const [experimentId, enabled] of entries) {
+        if (enabled === undefined) continue;
+        const value = this.isExperimentSupported(experimentId) ? enabled : null;
+        if (value == null) next.delete(experimentId);
+        else next.set(experimentId, value);
+      }
       await lease.assertStillOwned();
       await this.writeOverridesToDisk(next);
       // A successful acknowledgement means the change survives a restart.
       this.adoptOverrides(next);
+      // Inside the lock so listeners see writes in the order they reached disk.
+      this.emitter.emit(OVERRIDES_CHANGED_EVENT, this.supportedOverrides());
     });
+  }
+
+  private supportedOverrides(): ExperimentOverrides {
+    const result: ExperimentOverrides = {};
+    for (const [experimentId, enabled] of this.overrides) {
+      if (this.isExperimentSupported(experimentId)) {
+        result[experimentId] = enabled;
+      }
+    }
+    return result;
   }
 
   private async withOverridesLock<T>(

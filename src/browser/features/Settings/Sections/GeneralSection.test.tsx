@@ -492,9 +492,10 @@ describe("GeneralSection", () => {
           }
         }
         expect(setup.setOverrideMock).toHaveBeenCalledTimes(source === "localOverrides" ? 2 : 0);
+        // Backend overrides are mirrored locally so send options carry what the backend holds.
         for (const [id, enabled] of Object.entries(overrides)) {
           expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
-            source === "localOverrides" ? JSON.stringify(enabled) : null
+            JSON.stringify(enabled)
           );
         }
       }

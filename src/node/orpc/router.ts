@@ -106,6 +106,7 @@ import {
   subscribeOpenSettings,
   subscribePolicyChanges,
   subscribeDesignExperiment,
+  subscribeExperimentOverrides,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -2404,6 +2405,10 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)
         .handler(async ({ context }) => await context.experimentsService.getOverrides()),
+      onOverridesChange: t
+        .input(schemas.experiments.onOverridesChange.input)
+        .output(schemas.experiments.onOverridesChange.output)
+        .handler(({ context, signal }) => subscribeExperimentOverrides(context, signal)),
       setOverride: t
         .input(schemas.experiments.setOverride.input)
         .output(schemas.experiments.setOverride.output)

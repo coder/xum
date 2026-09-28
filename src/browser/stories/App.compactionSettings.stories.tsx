@@ -6,32 +6,47 @@ import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  type ExperimentId,
+  getExperimentKey,
+} from "@/common/constants/experiments";
 
 export default { ...appMeta, title: "App/CompactionSettings" };
 
-const setOverride = fn<APIClient["experiments"]["setOverride"]>(() => Promise.resolve());
-const getOverrides = fn<APIClient["experiments"]["getOverrides"]>(() => Promise.resolve({}));
+// The provider adopts backend overrides over its mirrors, so the mock backend holds the
+// seeded flags and records writes like the real one.
+let backendOverrides: Partial<Record<ExperimentId, boolean>> = {};
+const setOverride = fn<APIClient["experiments"]["setOverride"]>(({ experimentId, enabled }) => {
+  if (enabled == null) delete backendOverrides[experimentId];
+  else backendOverrides[experimentId] = enabled;
+  return Promise.resolve();
+});
+const getOverrides = fn<APIClient["experiments"]["getOverrides"]>(() =>
+  Promise.resolve({ ...backendOverrides })
+);
 
 function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "legacy") {
   expandLeftSidebar();
   setOverride.mockClear();
   getOverrides.mockClear();
-  const client = setupSettingsStory({
-    experiments: {
-      ...(mode === "defaults"
-        ? {}
-        : {
-            [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: mode === "legacy",
-            [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
-          }),
-      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: mode === "conflict",
-      [EXPERIMENT_IDS.RLM]: mode === "conflict",
-    },
-  });
+  const experiments = {
+    ...(mode === "defaults"
+      ? {}
+      : {
+          [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: mode === "legacy",
+          [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+        }),
+    [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: mode === "conflict",
+    [EXPERIMENT_IDS.RLM]: mode === "conflict",
+  };
+  backendOverrides = { ...experiments };
+  const client = setupSettingsStory({ experiments });
   client.experiments = {
     setOverride,
     getOverrides,
+    // Unsubscribable: the provider falls back to the single getOverrides read the plays await.
+    onOverridesChange: () => Promise.reject(new Error("not mocked")),
     onDesignChange: () =>
       Promise.resolve(
         wrapAsyncIterator(

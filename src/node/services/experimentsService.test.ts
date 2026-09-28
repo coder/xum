@@ -343,6 +343,39 @@ describe("ExperimentsService", () => {
     expect(await service.getOverrides()).toEqual({});
   });
 
+  test("applies several overrides in one write, leaving unnamed ones and announcing the result", async () => {
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await service.setOverride(EXPERIMENT_IDS.MEMORY, true);
+    // A sibling backend's write the service has not read yet must survive the merge.
+    const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await sibling.setOverride(EXPERIMENT_IDS.TOOL_SEARCH, true);
+
+    const announced: unknown[] = [];
+    const unsubscribe = service.onOverridesChange((overrides) => announced.push(overrides));
+    await service.applyOverrides({
+      [EXPERIMENT_IDS.ADVISOR_TOOL]: true,
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.TIMELINE]: null,
+    });
+
+    const expected = {
+      [EXPERIMENT_IDS.ADVISOR_TOOL]: true,
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.TOOL_SEARCH]: true,
+    };
+    // Gates read the new state without another disk read.
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL)).toBe(true);
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)).toBe(false);
+    expect(announced).toEqual([expected]);
+    expect((await readOverridesFile()).overrides).toEqual(expected);
+
+    unsubscribe();
+    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    expect(announced).toHaveLength(1);
+  });
+
   test("writes an empty experiments map so older builds still read overrides", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });

@@ -16,6 +16,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import {
+  EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY,
   getExperimentKey,
   getExperimentList,
   type ExperimentId,
@@ -52,6 +53,8 @@ export function resetStorybookPersistedStateForStory(): void {
     for (const experiment of getExperimentList()) {
       localStorage.removeItem(getExperimentKey(experiment.id));
     }
+    // So each story's seeded overrides go through the provider's one-time upload.
+    localStorage.removeItem(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY);
 
     // Sidebar stories can write sidebarAgeGrouping=false into the shared
     // origin; clear it so the GeneralSection switch snapshots its default.

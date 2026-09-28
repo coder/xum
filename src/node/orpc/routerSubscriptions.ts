@@ -1,4 +1,5 @@
 import type { ClaudeDesignExperimentSnapshot } from "@/common/orpc/schemas/claudeDesign";
+import type { ExperimentOverrides } from "@/node/services/experimentsService";
 import type {
   FrontendWorkspaceMetadataSchemaType,
   OnChatMode,
@@ -163,6 +164,24 @@ export function subscribeDesignExperiment(
       await design.getStatus();
       emit.push(design.experimentSnapshot());
     },
+  });
+}
+
+/**
+ * Opens with the current override map (read after the listener attaches, so no write is
+ * lost) and then yields the map after every write. `latest` buffering keeps only the newest
+ * map, which is complete on its own.
+ */
+export function subscribeExperimentOverrides(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<ExperimentOverrides> {
+  const experiments = context.experimentsService;
+  return runtimeSubscription(context, {
+    signal,
+    buffer: "latest",
+    subscribe: (emit) => experiments.onOverridesChange(emit.push),
+    initial: () => experiments.getOverrides(),
   });
 }
 

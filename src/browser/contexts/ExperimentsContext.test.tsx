@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import {
   EXPERIMENT_IDS,
+  EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY,
   type ExperimentId,
   getExperimentKey,
   getLegacyPtcExclusiveExperimentKey,
@@ -16,6 +17,24 @@ import { ExperimentsProvider, useExperiment, useExperimentValue } from "./Experi
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into ProjectContext and other later context tests.
 let currentClientMock: TestApiOverrides<APIClient> = {};
+
+type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
+
+/** A backend double that keeps what it is sent, as the real one does. */
+function createBackend(initial: ExperimentOverrides = {}) {
+  const overrides: ExperimentOverrides = { ...initial };
+  return {
+    overrides,
+    setOverride: mock(
+      ({ experimentId, enabled }: Parameters<APIClient["experiments"]["setOverride"]>[0]) => {
+        if (enabled == null) delete overrides[experimentId];
+        else overrides[experimentId] = enabled;
+        return Promise.resolve();
+      }
+    ),
+    getOverrides: mock(() => Promise.resolve({ ...overrides })),
+  };
+}
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -452,11 +471,9 @@ describe("ExperimentsProvider", () => {
     // the mirror, and a downgraded renderer treats the stale explicit key as
     // an override that wins over the backend flag — resuming the removed
     // supplement posture (r33). Initialization reconciles it.
+    const backend = createBackend();
     currentClientMock = {
-      experiments: {
-        setOverride: mock(() => Promise.resolve()),
-        getOverrides: mock(() => Promise.resolve({})),
-      },
+      experiments: { setOverride: backend.setOverride, getOverrides: backend.getOverrides },
     };
 
     globalThis.window.localStorage.setItem(
@@ -490,11 +507,9 @@ describe("ExperimentsProvider", () => {
   });
 
   test("stale legacy exclusive true reads as PTC on, and toggling PTC rewrites the legacy key", async () => {
+    const backend = createBackend();
     currentClientMock = {
-      experiments: {
-        setOverride: mock(() => Promise.resolve()),
-        getOverrides: mock(() => Promise.resolve({})),
-      },
+      experiments: { setOverride: backend.setOverride, getOverrides: backend.getOverrides },
     };
 
     // Pre-merge state: "PTC Exclusive Mode" enabled — exactly the posture
@@ -538,5 +553,150 @@ describe("ExperimentsProvider", () => {
         getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)
       )
     ).toBe("false");
+  });
+  test("uploads pre-backend local overrides once, then lets the backend win on reconnect", async () => {
+    window.localStorage.setItem(
+      getExperimentKey(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES),
+      JSON.stringify(true)
+    );
+    const backend = createBackend();
+    const client = () =>
+      createTestApiClient({
+        experiments: { setOverride: backend.setOverride, getOverrides: backend.getOverrides },
+      });
+    function Observer() {
+      return <div>{String(useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES))}</div>;
+    }
+    const tree = (api: APIClient) => (
+      <APIProvider client={api}>
+        <ExperimentsProvider>
+          <Observer />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    const view = render(tree(client()));
+    await waitFor(() => expect(backend.getOverrides).toHaveBeenCalledTimes(1));
+    expect(backend.overrides).toEqual({ [EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES]: true });
+    expect(window.localStorage.getItem(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY)).toBe("true");
+
+    // Another window (or a restore) clears the override while this one keeps its mirror.
+    delete backend.overrides[EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES];
+    view.rerender(tree(client()));
+    await waitFor(() => expect(view.getByText("false")).toBeDefined());
+    expect(backend.setOverride).toHaveBeenCalledTimes(1);
+    expect(
+      window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES))
+    ).toBeNull();
+  });
+
+  test("a renderer with stale mirrors adopts the backend's overrides on connect", async () => {
+    window.localStorage.setItem(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, "true");
+    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.TIMELINE), JSON.stringify(false));
+    window.localStorage.setItem(
+      getExperimentKey(EXPERIMENT_IDS.ADVISOR_TOOL),
+      JSON.stringify(true)
+    );
+    const backend = createBackend({ [EXPERIMENT_IDS.TIMELINE]: true });
+    currentClientMock = {
+      experiments: { setOverride: backend.setOverride, getOverrides: backend.getOverrides },
+    };
+    function Observer() {
+      const timeline = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
+      const advisor = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+      return <output>{`${timeline}/${advisor}`}</output>;
+    }
+    const view = render(
+      <APIProvider client={createTestApiClient(currentClientMock)}>
+        <ExperimentsProvider>
+          <Observer />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByRole("status").textContent).toBe("true/false"));
+    expect(backend.setOverride).not.toHaveBeenCalled();
+    expect(backend.overrides).toEqual({ [EXPERIMENT_IDS.TIMELINE]: true });
+  });
+
+  test("retries a failed toggle on reconnect instead of adopting the stale backend value", async () => {
+    window.localStorage.setItem(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, "true");
+    const backend = createBackend();
+    const offline = createTestApiClient({
+      experiments: {
+        setOverride: mock(() => Promise.reject(new Error("offline"))),
+        getOverrides: backend.getOverrides,
+      },
+    });
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+      return <button onClick={() => setEnabled(true)}>{String(enabled)}</button>;
+    }
+    const tree = (api: APIClient) => (
+      <APIProvider client={api}>
+        <ExperimentsProvider>
+          <Toggle />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    const view = render(tree(offline));
+    await waitFor(() => expect(backend.getOverrides).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      fireEvent.click(view.getByRole("button"));
+      await Promise.resolve();
+    });
+
+    // The reconnect reads a backend that never saw the toggle; the choice is retried first.
+    view.rerender(
+      tree(
+        createTestApiClient({
+          experiments: { setOverride: backend.setOverride, getOverrides: backend.getOverrides },
+        })
+      )
+    );
+    await waitFor(() => expect(backend.getOverrides).toHaveBeenCalledTimes(2));
+    expect(backend.setOverride).toHaveBeenCalledWith({
+      experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES,
+      enabled: true,
+    });
+    expect(backend.overrides).toEqual({ [EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES]: true });
+    expect(view.getByRole("button").textContent).toBe("true");
+  });
+
+  test("follows backend override changes live through the stream", async () => {
+    window.localStorage.setItem(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, "true");
+    const updates = createAsyncMessageQueue<ExperimentOverrides>();
+    updates.push({});
+    const getOverrides = mock(() => Promise.resolve({}));
+    currentClientMock = {
+      experiments: {
+        setOverride: mock(() => Promise.resolve()),
+        getOverrides,
+        onOverridesChange: (_input, { signal } = {}) => {
+          signal?.addEventListener("abort", updates.end, { once: true });
+          return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+        },
+      },
+    };
+    function Observer() {
+      return <div>{String(useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL))}</div>;
+    }
+    const view = render(
+      <APIProvider client={createTestApiClient(currentClientMock)}>
+        <ExperimentsProvider>
+          <Observer />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    const mirror = () => window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.ADVISOR_TOOL));
+    await waitFor(() => expect(view.getByText("false")).toBeDefined());
+
+    act(() => updates.push({ [EXPERIMENT_IDS.ADVISOR_TOOL]: true }));
+    await waitFor(() => expect(view.getByText("true")).toBeDefined());
+    // Mirrored, so send options carry the backend's value too.
+    expect(mirror()).toBe("true");
+
+    act(() => updates.push({}));
+    await waitFor(() => expect(view.getByText("false")).toBeDefined());
+    expect(mirror()).toBeNull();
+    expect(getOverrides).not.toHaveBeenCalled();
   });
 });

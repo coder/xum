@@ -182,6 +182,8 @@ import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thin
 import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 
 // Experiments
+const ExperimentOverridesSchema = z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean());
+
 export const experiments = {
   onDesignChange: {
     input: z.void(),
@@ -189,7 +191,12 @@ export const experiments = {
   },
   getOverrides: {
     input: z.void(),
-    output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
+    output: ExperimentOverridesSchema,
+  },
+  /** The full override map at subscription, then after every backend write. */
+  onOverridesChange: {
+    input: z.void(),
+    output: eventIterator(ExperimentOverridesSchema),
   },
   setOverride: {
     input: z.object({

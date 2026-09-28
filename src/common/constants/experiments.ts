@@ -354,6 +354,12 @@ export function getLegacyPtcExclusiveExperimentKey(): string {
 }
 
 /**
+ * localStorage marker: this origin has uploaded the overrides it kept from before the
+ * backend persisted them, so the backend's overrides now win over its mirrors on connect.
+ */
+export const EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY = "experiments:backendAuthoritative";
+
+/**
  * Get all experiment definitions as an array for iteration.
  */
 export function getExperimentList(): ExperimentDefinition[] {

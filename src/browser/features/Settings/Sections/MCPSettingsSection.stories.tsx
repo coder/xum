@@ -587,6 +587,8 @@ function setupDesignStory(
       return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
     },
     getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
+    // Unsubscribable: the provider falls back to a single getOverrides read.
+    onOverridesChange: () => Promise.reject(new Error("not mocked")),
     setOverride: () => Promise.resolve(),
   };
   client.mcp.designStatus = () => Promise.resolve(status);
