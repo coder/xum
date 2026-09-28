@@ -98,11 +98,36 @@ describe("StreamingMessageAggregator agent peer message folding", () => {
         triggerRow("trigger", 2, peerTrigger("payload")),
       ])
     ).toEqual(["payload", "trigger"]);
+    // The payload row fails the envelope authenticity check, so it renders as a plain message
+    // with no sender attribution; the trigger is then the only machine notification left.
+    const inauthentic = payloadRow("payload", 1);
+    inauthentic.parts = [{ type: "text", text: "not an envelope" }];
+    expect(displayedIds([inauthentic, triggerRow("trigger", 2, peerTrigger("payload"))])).toEqual([
+      "payload",
+      "trigger",
+    ]);
     // A human (non-synthetic) row wearing trigger metadata is never hidden.
     const human = createMuxMessage("human", "user", "please review", {
       historySequence: 2,
       muxMetadata: peerTrigger("payload"),
     });
     expect(displayedIds([payloadRow("payload", 1), human])).toEqual(["payload", "human"]);
+  });
+
+  test("keeps the trigger when transcript truncation drops its payload card", () => {
+    // A long reply between payload and trigger pushes the (not always-kept) card out of the
+    // default window; the recent trigger must stay so the delivery is still visible.
+    const filler = Array.from({ length: 80 }, (_, index) =>
+      createMuxMessage(`filler-${index}`, "assistant", `step ${index}`, {
+        historySequence: 2 + index,
+      })
+    );
+    const ids = displayedIds([
+      payloadRow("payload", 1),
+      ...filler,
+      triggerRow("trigger", 100, peerTrigger("payload")),
+    ]);
+    expect(ids).not.toContain("payload");
+    expect(ids.at(-1)).toBe("trigger");
   });
 });

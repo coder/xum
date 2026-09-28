@@ -298,7 +298,7 @@ function getValidAgentPeerMessage(
  * notification. When the recipient is executing a delegated workspace turn, the trigger carries
  * that turn's correlation metadata with the attribution nested on it.
  */
-export function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
   if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
   const muxMeta = message.metadata.muxMetadata;
   if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
@@ -338,6 +338,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -432,7 +433,14 @@ function buildUserDisplayedMessages(options: {
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
       // navigation skips it (the envelope payload itself is a separate assistant row).
-      agentPeerMessageTrigger: getAgentPeerTriggerRowMeta(message) != null ? true : undefined,
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
+          : undefined,
     },
   ];
 }
