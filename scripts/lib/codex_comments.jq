@@ -16,6 +16,12 @@ def codex_without_help:
 
 def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
 
+# Input: review thread nodes. Output: the root comment IDs of resolved Codex
+# threads, the IDs that board advisory links use (#discussion_r<id>).
+def codex_resolved_discussions($bot):
+  [.[] | select(.isResolved == true and .comments.nodes[0].author.login == $bot)
+    | .comments.nodes[0].fullDatabaseId // empty];
+
 def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
 def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$";
 def codex_relative_time: "<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>";
@@ -31,7 +37,8 @@ def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_
 # board's metadata; a Completed board for another head is a review of an older
 # push, not of this one. Codex re-reviews on new commits and edits the board in
 # place, so that state is "running" for the current head, never "completed".
-def codex_summary_status($bot; $head):
+# $resolved is the output of codex_resolved_discussions.
+def codex_summary_status($bot; $head; $resolved):
   if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
@@ -58,13 +65,17 @@ def codex_summary_status($bot; $head):
               or . == "| --- | --- | --- | --- |"
               or test(codex_completed_row)
               or test(codex_running_row)
-              # Security advisories stay listed after their review threads are resolved, and
-              # Codex adds the Resolved marker only when a later review completes. A bullet
-              # without it is a live finding and keeps blocking; other sections stay unknown.
+              # Security advisories stay listed after their review threads are resolved.
+              # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
+              # resolved linked thread also clears its bullet. A bullet with neither is a
+              # live finding and keeps blocking; other sections stay unknown.
               or . == "### Security findings"
               or test("^#### Advisory findings \\([0-9]+\\)$")
-              or test("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r[0-9]+\\)"
-                + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
+              # capture() yields empty on a mismatch, and all() would pass an empty
+              # condition, so `// false` keeps an unknown bullet blocking.
+              or (first(capture("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r(?<id>[0-9]+)\\)"
+                + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$")
+                | .marker != null or (.id | IN($resolved[]))) // false)
             ))
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or $security.headSha != $head
@@ -80,15 +91,15 @@ def codex_summary_status($bot; $head):
 
 # Codex is still reviewing. Callers may wait on this state instead of failing on
 # it, but it never supplies approval: after any wait budget it blocks like before.
-def codex_review_in_progress($bot; $head):
-  codex_summary_status($bot; $head) == "running";
+def codex_review_in_progress($bot; $head; $resolved):
+  codex_summary_status($bot; $head; $resolved) == "running";
 
-def codex_comment_is_informational($bot; $head):
+def codex_comment_is_informational($bot; $head; $resolved):
   if .author.login != $bot then false
   else
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
-        codex_summary_status($bot; $head) == "completed"
+        codex_summary_status($bot; $head; $resolved) == "completed"
       else
         ($body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or

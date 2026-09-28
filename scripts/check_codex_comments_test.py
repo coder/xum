@@ -42,11 +42,14 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False, created_at=AFTER):
+def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1"):
+    """`discussion` is the root comment ID that board links use (#discussion_r<id>)."""
+    root = comment(body, author, created_at)
+    root["fullDatabaseId"] = discussion
     return {
         "id": "thread",
         "isResolved": resolved,
-        "comments": {"nodes": [comment(body, author, created_at)]},
+        "comments": {"nodes": [root]},
     }
 
 
@@ -237,6 +240,35 @@ else:
             for cached in (False, True):
                 with self.subTest(body=body, cached=cached):
                     data = snapshot([comment(body)])
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_resolved_advisory_threads_clear_their_board_bullets(self):
+        # Codex can leave a bullet without its Resolved marker after the thread is
+        # resolved and later reviews complete (coder/xum#5045).
+        board = (
+            FIXTURES["security_findings_summary"]["body"]
+            .replace('"status":"running"', '"status":"completed"')
+            .replace("🔄 **Running** since", "✅ **Completed**")
+        )
+        advisory = "3960253571"
+        for threads, expected in (
+            ([thread("[P2] Advisory", resolved=True, discussion=advisory)], 0),
+            ([thread("[P2] Other", resolved=True, discussion="1")], 1),
+            (
+                [
+                    thread(
+                        "[P2] Advisory",
+                        author="human-reviewer",
+                        resolved=True,
+                        discussion=advisory,
+                    )
+                ],
+                1,
+            ),
+        ):
+            for cached in (False, True):
+                with self.subTest(threads=threads, cached=cached):
+                    data = snapshot([comment(board)], threads)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_wait_for_review_polls_until_codex_finishes(self):
@@ -492,7 +524,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '")]',
+                + '"; [])]',
             ],
             input=json.dumps(comments),
             text=True,

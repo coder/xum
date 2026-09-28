@@ -124,9 +124,12 @@ compute_codex_sets_from_arrays() {
   # JSON goes through stdin, never argv: a long review history exceeds Linux's
   # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
-  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments"; [
+  local resolved_ids
+  resolved_ids=$(printf '%s' "$threads_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; codex_resolved_discussions($bot)')
+
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" 'include "codex_comments"; [
     .[]
-    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot; $head) | not))
+    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot; $head; $resolved) | not))
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
@@ -139,8 +142,8 @@ compute_codex_sets_from_arrays() {
 
   # In-progress summaries are a subset of REGULAR_COMMENTS: they block, but the
   # wait loop below may give Codex time to finish before the verdict.
-  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments";
-    [.[] | select(codex_review_in_progress($bot; $head))] | length')
+  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" 'include "codex_comments";
+    [.[] | select(codex_review_in_progress($bot; $head; $resolved))] | length')
 }
 
 # The classifier compares Codex's recorded head with the PR head, so a payload
@@ -307,6 +310,7 @@ fetch_all_threads_via_api() {
             comments(first: 1) {
               nodes {
                 id
+                fullDatabaseId
                 author { login }
                 body
                 createdAt
