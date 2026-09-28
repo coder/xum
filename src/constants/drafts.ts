@@ -18,3 +18,9 @@ export const MAX_DRAFT_JSON_CHARS = 40 * 1024 * 1024;
 
 /** Creation draft ids become file names on the backend, so they are restricted to a safe set. */
 export const DRAFT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Longest the app waits for the drafts subscription's first snapshot (and the legacy import)
+ * before composers may render anyway; hydration continues in the background.
+ */
+export const DRAFT_STORE_READY_TIMEOUT_MS = 10_000;
