@@ -1,5 +1,6 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -1368,6 +1369,101 @@ describe("createOrpcServer", () => {
       expect(callbackCalls.map((c) => c.state)).toEqual(["known-state", "stale-state"]);
     } finally {
       await server?.close();
+    }
+  });
+
+  test("localhost binds both loopback families on one port", async () => {
+    // Regression: binding "localhost" used to take only the first resolved family,
+    // leaving the other loopback address free for another dev server on the same port.
+    // Mixed case also exercises hostname normalization.
+    const stubContext: Partial<ORPCContext> = {};
+    const server = await createOrpcServer({
+      host: "LocalHost",
+      port: 0,
+      context: stubContext as ORPCContext,
+      authToken: "test-token",
+    });
+
+    try {
+      expect(server.baseUrl).toBe(`http://LocalHost:${server.port}`);
+      const v4 = await fetch(`http://127.0.0.1:${server.port}/version`);
+      expect(v4.status).toBe(200);
+
+      let v6: Response;
+      try {
+        v6 = await fetch(`http://[::1]:${server.port}/version`);
+      } catch {
+        // Some CI environments do not have IPv6 loopback; the server falls back to IPv4 only.
+        return;
+      }
+      expect(v6.status).toBe(200);
+
+      // WebSocket upgrades arriving on ::1 must reach the shared upgrade handler.
+      const ws = new WebSocket(`ws://[::1]:${server.port}${ORPC_WS_PATH}?token=test-token`);
+      try {
+        await waitForWebSocketOpen(ws);
+      } finally {
+        ws.terminate();
+      }
+    } finally {
+      await server.close();
+    }
+
+    // close() must release both listeners.
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(server.port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+
+  test("localhost fails with EADDRINUSE when another process holds the IPv6 loopback port", async () => {
+    const squatter = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject);
+        squatter.listen(0, "::1", () => resolve());
+      });
+    } catch (error) {
+      const code = getErrorCode(error);
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        return;
+      }
+      throw error;
+    }
+
+    const address = squatter.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected TCP address");
+    }
+    const port = address.port;
+
+    try {
+      const stubContext: Partial<ORPCContext> = {};
+      let caught: unknown = null;
+      try {
+        const server = await createOrpcServer({
+          host: "localhost",
+          port,
+          context: stubContext as ORPCContext,
+          authToken: "test-token",
+        });
+        await server.close();
+      } catch (error) {
+        caught = error;
+      }
+      expect(getErrorCode(caught)).toBe("EADDRINUSE");
+
+      // The IPv4 listener bound before the failure must be released.
+      const reuse = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        reuse.once("error", reject);
+        reuse.listen(port, "127.0.0.1", () => resolve());
+      });
+      await new Promise<void>((resolve) => reuse.close(() => resolve()));
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
     }
   });
 

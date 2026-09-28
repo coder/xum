@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
@@ -2124,18 +2124,17 @@ describe("bash tool - background execution", () => {
       expect(result.error).toContain("terminated because it could not be tracked");
     }
 
+    // The failure is returned only once the terminated command exited (#4805): until then a
+    // removal's cleanup() waits on the pending migration.
     const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     expect(pid).toBeGreaterThan(1);
-    const killDeadline = Date.now() + 5000;
     let alive = true;
-    while (alive && Date.now() < killDeadline) {
-      try {
-        process.kill(pid, 0);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      } catch {
-        alive = false;
-      }
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
     }
+    if (alive) process.kill(pid, "SIGKILL");
     expect(alive).toBe(false);
 
     tempDir[Symbol.dispose]();
@@ -2176,6 +2175,59 @@ describe("bash tool - background execution", () => {
     await manager.cleanup(config.workspaceId!);
 
     // cleanup() joins the exit, so the process is gone as soon as it returns.
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
+  // #4805: while migrateToBackground sets up its files, the command has left foreground
+  // tracking but is not in the manager's processes yet. A removal's cleanup() landing then
+  // must still kill it instead of letting it register and keep running in a deleted checkout.
+  it("cleanup during a foreground command's migration kills it", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-cleanup-window");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+    // bash.ts reads the output dir as the migrateToBackground argument, inside the window.
+    const bgOutputDir = manager.getBgOutputDir();
+    let cleanupInWindow: Promise<void> | undefined;
+    spyOn(manager, "getBgOutputDir").mockImplementation(() => {
+      cleanupInWindow ??= manager.cleanup(config.workspaceId!);
+      return bgOutputDir;
+    });
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-window.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-window",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+    expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+    await resultPromise;
+    expect(cleanupInWindow).toBeDefined();
+    await cleanupInWindow;
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
     let alive = true;
     try {
       process.kill(pid, 0);

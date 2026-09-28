@@ -495,6 +495,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // still writes — blinding the crash-orphan archive gates. Reserved synchronously when a
   // candidate is chosen; released when the spawn registers or fails.
   private readonly reservedProcessIds = new Set<string>();
+  /**
+   * Foreground commands mid-migration, by workspace (#4805): they have left foreground tracking
+   * but are not in `processes` until migrateToBackground's file setup returns. cleanup() waits
+   * for them so a removal cannot delete the checkout under a command that registers afterwards.
+   */
+  private readonly pendingMigrations = new Map<string, Set<Promise<void>>>();
 
   // Base directory for process output files
   private readonly bgOutputDir: string;
@@ -1419,6 +1425,29 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
       await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
     }
+  }
+
+  /**
+   * Mark a foreground command as migrating to the background in `workspaceId`. Begin it before
+   * the command leaves foreground tracking and dispose it once the command is registered (or
+   * terminated after a failed migration); cleanup() waits for it in between.
+   */
+  beginMigration(workspaceId: string): Disposable {
+    const settled = Promise.withResolvers<void>();
+    let pending = this.pendingMigrations.get(workspaceId);
+    if (pending === undefined) {
+      pending = new Set();
+      this.pendingMigrations.set(workspaceId, pending);
+    }
+    pending.add(settled.promise);
+    return {
+      [Symbol.dispose]: () => {
+        const current = this.pendingMigrations.get(workspaceId);
+        current?.delete(settled.promise);
+        if (current?.size === 0) this.pendingMigrations.delete(workspaceId);
+        settled.resolve();
+      },
+    };
   }
 
   /**
@@ -3002,6 +3031,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async cleanup(workspaceId: string): Promise<void> {
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
+    // A migrating command registers in `processes` once its migration settles (#4805).
+    await Promise.all([...(this.pendingMigrations.get(workspaceId) ?? new Set<Promise<void>>())]);
     const matching = Array.from(this.processes.values()).filter(
       (p) => p.workspaceId === workspaceId
     );

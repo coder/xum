@@ -57,8 +57,12 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import {
+  useHostTranscriptMutationAllowed,
+  useHostTranscriptMutationCheck,
+} from "@/browser/utils/transcriptBarrier";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveAutoRoutingForAgent,
@@ -173,6 +177,10 @@ interface ProposePlanToolCallProps {
   className?: string;
 }
 
+// Shown on hosts that cannot replace chat history (VS Code webview, #4942).
+const HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE =
+  "Your settings make this replace the chat history, which is not available here. Use the Xum app, or turn off that setting.";
+
 export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) => {
   const {
     args,
@@ -191,7 +199,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const [annotateMode, setAnnotateMode] = useState(false);
   const [isImplementing, setIsImplementing] = useState(false);
   const [isContinuingInAuto, setIsContinuingInAuto] = useState(false);
-  const [implementReplacesChatHistory, setImplementReplacesChatHistory] = useState(false);
 
   // On small screens, render the primary plan actions (Implement / Continue in Auto) as
   // shortcut icons alongside the other action buttons to avoid right-side overflow.
@@ -228,12 +235,23 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // the caught-up flag only; the full WorkspaceState would re-render every plan card per delta.
   // Ephemeral previews have no workspace: nothing to subscribe to, and no primary actions.
   // The snapshot is the same predicate the click handlers re-check at dispatch time.
-  const workspaceStore = useWorkspaceStoreRaw();
-  const isTranscriptCaughtUp = useSyncExternalStore(
-    (listener) =>
-      workspaceId ? workspaceStore.subscribeKey(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? isTranscriptMutationAllowed(workspaceId) : false)
+  // Host-aware (#4942): the VS Code webview supplies its own barrier through ChatHostContext
+  // instead of registering in WorkspaceStore.
+  const isTranscriptCaughtUp = useHostTranscriptMutationAllowed(workspaceId);
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
+  // A host that cannot replace chat history (VS Code webview) hides Start Here, and refuses
+  // Implement / Continue in Auto when the user's setting says they replace history, rather than
+  // silently sending without the replacement.
+  // Live from the shared app config store (refreshed on config changes), so a setting change
+  // while the card is mounted updates the affordance. Dispatch re-reads the config anyway.
+  const appConfig = useSyncExternalStore(
+    getAppConfigStore().subscribe,
+    getAppConfigStore().getSnapshot
   );
+  const implementReplacesChatHistory = appConfig?.proposePlanImplementReplacesChatHistory ?? false;
+  const canReplaceChatHistory =
+    useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
+  const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -263,31 +281,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
-
-  useEffect(() => {
-    if (!api) return;
-    if (isEphemeralPreview) return;
-    if (!isLatest) return;
-    if (status !== "completed") return;
-
-    let cancelled = false;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) return;
-        setImplementReplacesChatHistory(
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false
-        );
-      })
-      .catch(() => {
-        // Ignore failures (we'll default to old behavior).
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isEphemeralPreview, isLatest, status]);
 
   // Fetch fresh plan content for the latest plan
   // Re-fetches on mount, when window regains focus, and when tool completes
@@ -613,6 +606,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     } catch {
       // Ignore config read errors (we'll default to old behavior).
     }
+    if (shouldReplaceChatHistory && !canReplaceChatHistory) return;
 
     const settings = resolveTargetAgentSettings({
       workspaceId,
@@ -777,13 +771,20 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Implement",
           onClick: () => void handleImplement(),
-          disabled: !api || isImplementing || isContinuingInAuto || !isTranscriptCaughtUp,
+          disabled:
+            !api ||
+            isImplementing ||
+            isContinuingInAuto ||
+            !isTranscriptCaughtUp ||
+            historyReplacementUnavailable,
           icon: <Play className="size-4" />,
           tooltip: !isTranscriptCaughtUp
             ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
-            : implementReplacesChatHistory
-              ? "Replace chat history with this plan, switch to Exec, and start implementing"
-              : "Switch to Exec and start implementing",
+            : historyReplacementUnavailable
+              ? HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE
+              : implementReplacesChatHistory
+                ? "Replace chat history with this plan, switch to Exec, and start implementing"
+                : "Switch to Exec and start implementing",
         }
       : null;
 
@@ -792,18 +793,26 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Continue in Auto",
           onClick: () => void handleContinueInAuto(),
-          disabled: !api || isContinuingInAuto || isImplementing || !isTranscriptCaughtUp,
+          disabled:
+            !api ||
+            isContinuingInAuto ||
+            isImplementing ||
+            !isTranscriptCaughtUp ||
+            historyReplacementUnavailable,
           icon: <Sparkles className="size-4" />,
           tooltip: !isTranscriptCaughtUp
             ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
-            : implementReplacesChatHistory
-              ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
-              : "Switch to Auto and let it decide the executor",
+            : historyReplacementUnavailable
+              ? HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE
+              : implementReplacesChatHistory
+                ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
+                : "Switch to Auto and let it decide the executor",
         }
       : null;
 
-  // Start Here button: only for tool calls, not ephemeral previews
-  if (!isEphemeralPreview && workspaceId) {
+  // Start Here button: only for tool calls, not ephemeral previews, on hosts that can replace
+  // chat history
+  if (!isEphemeralPreview && workspaceId && canReplaceChatHistory) {
     actionButtons.push({
       label: buttonLabel,
       onClick: openModal,

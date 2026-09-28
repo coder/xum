@@ -1085,19 +1085,14 @@ describe("compaction cancellation runtime", () => {
     async (rollbackFails) => {
       const h = await fixture();
       const cancel = new AbortController();
-      let rowsPersisted = false;
-      let budgetReserved = true;
       const accepted = mock(() => undefined);
-      const canceled = mock(() => {
-        if (!rowsPersisted) budgetReserved = false;
-      });
+      const canceled = mock(() => undefined);
       const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
       spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
         async (...args) => {
           const result = await publish(...args);
           assert(result.success && result.data.kind === "accepted");
           expect(result.data.witness).toBeNull();
-          expect(rowsPersisted).toBe(false);
           cancel.abort();
           return result;
         }
@@ -1117,17 +1112,9 @@ describe("compaction cancellation runtime", () => {
               synthetic: true,
             }),
           ],
-          onPreTurnRowsPersisted: () => {
-            rowsPersisted = true;
-          },
-          onAcceptedPreStreamFailure: () => {
-            if (!rowsPersisted) budgetReserved = false;
-          },
         })
       ).toEqual(Ok(undefined));
       expect(await h.rows()).toHaveLength(rollbackFails ? 2 : 0);
-      expect(rowsPersisted).toBe(rollbackFails);
-      expect(budgetReserved).toBe(rollbackFails);
       expect(accepted).toHaveBeenCalledTimes(rollbackFails ? 1 : 0);
       expect(canceled).toHaveBeenCalledTimes(rollbackFails ? 0 : 1);
     }
@@ -1156,16 +1143,11 @@ describe("compaction cancellation runtime", () => {
     expect(await h.session.interruptStream()).toEqual(Ok(undefined));
     const stopped = await h.storage.read();
     assert(stopped?.version === 2);
-    let budgetReserved = true;
-    let rowsPersisted = false;
     const accepted = mock(() => {
-      expect(rowsPersisted).toBe(true);
       throw new Error("acceptance observer failed");
     });
     const canceled = mock(() => undefined);
-    const failed = mock(() => {
-      if (!rowsPersisted) budgetReserved = false;
-    });
+    const failed = mock(() => undefined);
     await nodeAssert.rejects(
       h.session.sendMessage("accepted automatic input", options, {
         acceptanceOrigin: "automatic",
@@ -1177,14 +1159,10 @@ describe("compaction cancellation runtime", () => {
             synthetic: true,
           }),
         ],
-        onPreTurnRowsPersisted: () => {
-          rowsPersisted = true;
-        },
       }),
       /acceptance observer failed/
     );
     expect(accepted).toHaveBeenCalledTimes(1);
-    expect(budgetReserved).toBe(true);
     expect((await h.rows()).map((row) => row.id)).toContain("peer-payload");
     expect(canceled).not.toHaveBeenCalled();
     expect(failed).toHaveBeenCalledTimes(1);
@@ -1204,13 +1182,9 @@ describe("compaction cancellation runtime", () => {
       const foreignStorage = foreignHistory.getCompactionCancellationStorage(workspaceId);
       const foreign = new CompactionCancellation(foreignStorage);
       let successor: Awaited<ReturnType<typeof foreignStorage.read>> = null;
-      let rowsPersisted = false;
-      let budgetReserved = true;
       const accepted = mock(() => undefined);
       const canceled = mock(() => undefined);
-      const failed = mock(() => {
-        if (!rowsPersisted) budgetReserved = false;
-      });
+      const failed = mock(() => undefined);
       const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
       spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
         async (...args) => {
@@ -1237,16 +1211,11 @@ describe("compaction cancellation runtime", () => {
             synthetic: true,
           }),
         ],
-        onPreTurnRowsPersisted: () => {
-          rowsPersisted = true;
-        },
       });
       expect(result.success).toBe(foreignStop === "none");
       expect(accepted).toHaveBeenCalledTimes(foreignStop === "none" ? 1 : 0);
       expect(failed).toHaveBeenCalledTimes(foreignStop === "none" ? 0 : 1);
       expect(canceled).not.toHaveBeenCalled();
-      expect(rowsPersisted).toBe(true);
-      expect(budgetReserved).toBe(true);
       const rows = await h.rows();
       expect(rows.map((row) => row.id)).toContain("retirement-peer-payload");
       expect(rows.at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);

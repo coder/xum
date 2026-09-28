@@ -1,5 +1,14 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeEach,
+  afterEach,
+  setSystemTime,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
@@ -8,15 +17,14 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   INSTANCE_DISCOVERY_DEFAULT_LIMIT,
   INSTANCE_DISCOVERY_MAX_LIMIT,
+  PEER_MESSAGE_RATE_LIMIT_MAX,
+  PEER_MESSAGE_RATE_WINDOW_MS,
 } from "@/constants/agentMessaging";
-import {
-  TASK_FAMILY_MESSAGE_MAX_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
-} from "@/constants/taskMessages";
+import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { Ok, Err, type Result } from "@/common/types/result";
+import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -1282,12 +1290,14 @@ describe("TaskService", () => {
     ).toBe(true);
   });
 
-  test("family routes share the aggregate message-count budget and error shape", async () => {
+  test("family routes share the peer rate limit instead of a lifetime budget", async () => {
+    // A per-session budget (32 messages per sender→target) used to refuse long RLM
+    // conversations until restart. The routes now share task_send_message's throttles.
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "family-budget-parent";
-    const senderTaskId = "family-budget-sender";
-    const targetTaskId = "family-budget-target";
+    const parentWorkspaceId = "family-rate-parent";
+    const senderTaskId = "family-rate-sender";
+    const targetTaskId = "family-rate-target";
     await saveWorkspaces(
       config,
       projectPath,
@@ -1316,30 +1326,37 @@ describe("TaskService", () => {
       (message: string) =>
         taskService.sendMessageToSiblingAgentTask(senderTaskId, targetTaskId, message, "tool-end"),
     ];
-    for (const send of routes) {
-      for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-        expect((await send("update " + i)).success).toBe(true);
+    const sendsPerRoute = 40;
+    let now = Date.now();
+    setSystemTime(new Date(now));
+    try {
+      for (const send of routes) {
+        for (let i = 0; i < sendsPerRoute; i++) {
+          if (i > 0 && i % PEER_MESSAGE_RATE_LIMIT_MAX === 0) {
+            // Within one window the next send is throttled; the next window admits it.
+            const limited = await send(`throttled ${i}`);
+            expect(limited).toEqual(Err(expect.objectContaining({ code: "send_failed" })));
+            assert(!limited.success && "message" in limited.error);
+            expect(limited.error.message).toMatch(/rate limited/i);
+            now += PEER_MESSAGE_RATE_WINDOW_MS + 1;
+            setSystemTime(new Date(now));
+          }
+          expect((await send(`update ${i}`)).success).toBe(true);
+        }
       }
-      expect(await send("one too many")).toEqual(
-        Err(expect.objectContaining({ code: "send_failed" }))
-      );
+    } finally {
+      setSystemTime();
     }
-    expect(sendMessage).toHaveBeenCalledTimes(
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES * routes.length
-    );
+    expect(sendMessage).toHaveBeenCalledTimes(sendsPerRoute * routes.length);
   });
 
-  test("post-acceptance wake failures retain the budget charge for persisted payload rows", async () => {
-    // Codex round 18: refunding on wake failure let a child that catches the
-    // tool error retry unlimited max-size payload rows while the wake path
-    // was down — each retry durably appended another row into parent history
-    // (and the next provider request) without ever consuming budget. Once
-    // the payload row is persisted (turn accepted), the charge must stay.
+  test("failed family deliveries still consume the rate limit", async () => {
+    // A wake can persist its payload and still report failure, so a loop retrying a failing
+    // delivery must not bypass the throttle.
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-wake-fail-budget";
-    const childTaskId = "child-wake-fail-budget";
-
+    const parentWorkspaceId = "family-fail-parent";
+    const childTaskId = "family-fail-child";
     await saveWorkspaces(
       config,
       projectPath,
@@ -1350,215 +1367,38 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "child", childTaskId, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
       ],
       testTaskSettings()
     );
 
-    // Stream path is down AFTER acceptance: the turn is accepted (payload +
-    // trigger durably persisted) but the send still reports failure.
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-    sendMessage.mockImplementation(
-      async (
-        workspaceId: string,
-        _message: string,
-        _options: unknown,
-        internal?: {
-          preTurnMessages?: MuxMessage[];
-          onAccepted?: () => Promise<void> | void;
-          onPreTurnRowsPersisted?: () => void;
-        }
-      ): Promise<Result<void, { type: string; raw: string }>> => {
-        for (const row of internal?.preTurnMessages ?? []) {
-          const appended = await historyService.appendToHistory(workspaceId, row);
-          if (!appended.success) throw new Error(appended.error);
-        }
-        // r54: the real path signals persistence at the rollback horizon
-        // (rows durable), before acceptance.
-        internal?.onPreTurnRowsPersisted?.();
-        await internal?.onAccepted?.();
-        return Err({ type: "unknown", raw: "stream path down after acceptance" });
-      }
-    );
-
-    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
-    for (let i = 0; i < maxSizeSends; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
-        childTaskId,
-        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-        "tool-end"
-      );
-      // Each attempt fails (wake down, or budget once rendered charging
-      // exhausts it) — persisted rows must have consumed budget.
-      expect(sent.success).toBe(false);
-    }
-
-    // The budget is exhausted for max-size sends: the next retry is refused
-    // WITHOUT appending another payload row.
-    const exhausted = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-      "tool-end"
-    );
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
-    }
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const payloadRows = history.data.filter(
-      (m) => m.metadata?.muxMetadata?.type === "family-message"
-    );
-    // Rendered-length charging (round 20) refuses before the raw quotient.
-    expect(payloadRows.length).toBeGreaterThan(0);
-    expect(payloadRows.length).toBeLessThan(maxSizeSends);
-  });
-
-  test("post-persistence pre-acceptance failures retain the budget charge (r54)", async () => {
-    // Codex round 54: the charge was keyed to turn ACCEPTANCE — but a send
-    // can fail between the pre-turn batch committing (rollback horizon:
-    // rows irrevocably durable in parent history) and acceptance (e.g. goal
-    // sync throwing). Refunding there let a child that catches the tool
-    // error retry unlimited max-size payload rows, each durably appended,
-    // without ever consuming budget.
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-postpersist-budget";
-    const childTaskId = "child-postpersist-budget";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          parentWorkspaceId,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    // Rows persist and cross the rollback horizon, then the send fails
-    // BEFORE acceptance: onAccepted never fires.
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-    sendMessage.mockImplementation(
-      async (
-        workspaceId: string,
-        _message: string,
-        _options: unknown,
-        internal?: {
-          preTurnMessages?: MuxMessage[];
-          onPreTurnRowsPersisted?: () => void;
-        }
-      ): Promise<Result<void, { type: string; raw: string }>> => {
-        for (const row of internal?.preTurnMessages ?? []) {
-          const appended = await historyService.appendToHistory(workspaceId, row);
-          if (!appended.success) throw new Error(appended.error);
-        }
-        internal?.onPreTurnRowsPersisted?.();
-        return Err({ type: "unknown", raw: "goal sync down after persistence" });
-      }
-    );
-
-    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
-    for (let i = 0; i < maxSizeSends; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
-        childTaskId,
-        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-        "tool-end"
-      );
-      expect(sent.success).toBe(false);
-    }
-
-    // Budget exhausted: the next retry is refused WITHOUT appending another
-    // payload row, even though acceptance never fired.
-    const exhausted = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-      "tool-end"
-    );
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
-    }
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const payloadRows = history.data.filter(
-      (m) => m.metadata?.muxMetadata?.type === "family-message"
-    );
-    expect(payloadRows.length).toBeGreaterThan(0);
-    expect(payloadRows.length).toBeLessThan(maxSizeSends);
-  });
-
-  test("pre-acceptance send failures refund the budget (nothing persisted)", async () => {
-    // r30: the payload rides the trigger send as a pre-turn row, and a
-    // pre-acceptance failure rolls every persisted row back — nothing lands
-    // in the parent transcript, so keeping the charge would burn the sender's
-    // budget on a flaky target that never received any bytes.
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-preaccept-refund";
-    const childTaskId = "child-preaccept-refund";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          parentWorkspaceId,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    // Every send fails BEFORE acceptance: onAccepted never fires and nothing
-    // is persisted (a real pre-acceptance failure rolls pre-turn rows back).
     const sendMessage = mock(() =>
-      Promise.resolve(Err({ type: "unknown", raw: "wake path down" }))
+      Promise.resolve(Err(createUnknownSendMessageError("goal sync failed after persistence")))
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-
-    // Well past the budget quotient: refunds must keep every retry admissible.
-    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
-    for (let i = 0; i < maxSizeSends + 2; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    setSystemTime(new Date(Date.now()));
+    try {
+      for (let i = 0; i < PEER_MESSAGE_RATE_LIMIT_MAX; i++) {
+        const failed = await taskService.sendMessageToParentFromAgentTask(
+          childTaskId,
+          `attempt ${i}`,
+          "tool-end"
+        );
+        assert(!failed.success && "message" in failed.error);
+        expect(failed.error.message).toContain("goal sync failed");
+      }
+      const limited = await taskService.sendMessageToParentFromAgentTask(
         childTaskId,
-        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+        "one more attempt",
         "tool-end"
       );
-      expect(sent.success).toBe(false);
-      if (!sent.success) {
-        // The failure is the wake error every time — never budget exhaustion.
-        expect("message" in sent.error && sent.error.message).not.toContain("budget");
-      }
+      assert(!limited.success && "message" in limited.error);
+      expect(limited.error.message).toMatch(/rate limited/i);
+      expect(sendMessage).toHaveBeenCalledTimes(PEER_MESSAGE_RATE_LIMIT_MAX);
+    } finally {
+      setSystemTime();
     }
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    expect(
-      history.data.filter((m) => m.metadata?.muxMetadata?.type === "family-message")
-    ).toHaveLength(0);
   });
 
   test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {

@@ -188,8 +188,6 @@ interface QueuedMessageInternalOptions {
    * append could land between that turn's user row and its assistant response.
    */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
-  onPreTurnRowsPersisted?: () => void;
   /**
    * Caller staleness probe re-emitted at dispatch and re-checked by the session's
    * turn-admission gates. Peer agent sends use it so a Stop/task_stop landing after
@@ -291,8 +289,6 @@ interface QueueEntry {
   cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
-  onPreTurnRowsPersisted?: () => void;
   /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
   admissionStale?: () => boolean;
   /** Dispatch without on-send compaction (sealed; see QueuedMessageInternalOptions). */
@@ -369,10 +365,16 @@ export class MessageQueue {
   countAgentPeerMessageEntries(): number {
     // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
     // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    // Family-message entries (task_message_parent/sibling) are recognized by their payload row:
+    // their triggers carry neither marker, and they share the same queue cap.
     return this.entries.filter(
       (entry) =>
         isAgentPeerMessageMetadata(entry.muxMetadata) ||
-        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX)) ||
+        (entry.preTurnMessages?.some(
+          (row) => row.metadata?.muxMetadata?.type === "family-message"
+        ) ??
+          false)
     ).length;
   }
 
@@ -801,20 +803,6 @@ export class MessageQueue {
     }
     if (internal?.onAcceptedPreStreamFailure != null) {
       entry.onAcceptedPreStreamFailure = internal.onAcceptedPreStreamFailure;
-    }
-    if (internal?.onPreTurnRowsPersisted != null) {
-      // Callback-carrying sends seal their entries, but pre-turn batches can
-      // in principle concatenate — chain instead of overwrite so no
-      // producer's persistence signal is dropped (r54).
-      const previous = entry.onPreTurnRowsPersisted;
-      const next = internal.onPreTurnRowsPersisted;
-      entry.onPreTurnRowsPersisted =
-        previous == null
-          ? next
-          : () => {
-              previous();
-              next();
-            };
     }
 
     if (internal?.cancelState != null) {
@@ -1360,9 +1348,6 @@ export class MessageQueue {
             : {}),
           ...(entry.preTurnMessages != null && entry.preTurnMessages.length > 0
             ? { preTurnMessages: entry.preTurnMessages }
-            : {}),
-          ...(entry.onPreTurnRowsPersisted != null
-            ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
           ...(entry.skipOnSendCompaction === true ? { skipOnSendCompaction: true } : {}),

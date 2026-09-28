@@ -8,6 +8,7 @@
 import express, { type Express } from "express";
 import * as fs from "fs/promises";
 import * as http from "http";
+import type * as net from "net";
 import * as path from "path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
@@ -748,6 +749,118 @@ function shouldEnforceOriginValidation(req: Pick<express.Request, "path">): bool
   return (
     req.path.startsWith("/orpc") || req.path.startsWith("/api") || req.path.startsWith("/auth/")
   );
+}
+
+function listenOnce(server: net.Server, port: number, host: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onListenError = (error: Error) => {
+      server.removeListener("error", onListenError);
+      reject(error);
+    };
+
+    server.once("error", onListenError);
+    server.listen(port, host, () => {
+      server.removeListener("error", onListenError);
+      resolve();
+    });
+  });
+}
+
+function closeListener(server: net.Server): Promise<void> {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function getListenErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/** The address family is disabled or has no loopback address on this host. */
+function isLoopbackFamilyUnavailable(error: unknown): boolean {
+  const code = getListenErrorCode(error);
+  return code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL";
+}
+
+/** Random-port attempts before giving up when ::1 is taken on the port chosen for 127.0.0.1. */
+const LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS = 5;
+
+/**
+ * Bind "localhost" as both 127.0.0.1 and ::1 on the same port.
+ *
+ * Node resolves "localhost" to a single address and binds only that family, which left the
+ * other loopback address free: a dev server started later could bind the same port there
+ * without EADDRINUSE, and clients (browsers, Coder port forwarding) then reached whichever
+ * server matched the family they picked. Holding both addresses makes the port exclusive,
+ * so a later bind fails instead of silently splitting traffic.
+ *
+ * The ::1 listener is a second HTTP server that re-emits its request, upgrade, and
+ * clientError events on the primary server, so both families share one set of handlers.
+ * (Handing raw sockets over with emit("connection") works in Node but not in Bun.)
+ * When one family has no loopback (IPv4-only containers, IPv6-only hosts), binds the other
+ * one alone, as the previous single-family bind did. Returns the IPv6 server, or null when
+ * the primary server is the only listener.
+ */
+async function listenOnBothLoopbacks(
+  httpServer: http.Server,
+  port: number
+): Promise<http.Server | null> {
+  const attempts = port === 0 ? LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS : 1;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await listenOnce(httpServer, port, "127.0.0.1");
+    } catch (error) {
+      if (!isLoopbackFamilyUnavailable(error)) {
+        throw error;
+      }
+      log.debug("IPv4 loopback unavailable; listening on ::1 only");
+      await listenOnce(httpServer, port, "::1");
+      return null;
+    }
+    const address = httpServer.address();
+    assert(address !== null && typeof address !== "string", "expected a TCP listen address");
+
+    // Clients can connect to 127.0.0.1 before the ::1 bind settles. If that bind fails,
+    // close() would wait on them (upgraded WebSockets are never closed by the HTTP server),
+    // so track them and destroy them on failure.
+    const bindWindowSockets = new Set<net.Socket>();
+    const trackSocket = (socket: net.Socket) => {
+      bindWindowSockets.add(socket);
+      socket.once("close", () => bindWindowSockets.delete(socket));
+    };
+    httpServer.on("connection", trackSocket);
+
+    const ipv6Server = http.createServer();
+    attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
+    for (const event of ["request", "upgrade", "clientError"] as const) {
+      ipv6Server.on(event, (...args: unknown[]) => httpServer.emit(event, ...args));
+    }
+    try {
+      await listenOnce(ipv6Server, address.port, "::1");
+      return ipv6Server;
+    } catch (error) {
+      if (isLoopbackFamilyUnavailable(error)) {
+        log.debug("IPv6 loopback unavailable; listening on 127.0.0.1 only");
+        return null;
+      }
+
+      const closed = closeListener(httpServer);
+      for (const socket of bindWindowSockets) {
+        socket.destroy();
+      }
+      await closed;
+      // A random IPv4 port can already be in use on ::1; pick another one. An explicit
+      // port stays an error: someone else owns it on ::1, which is the clash we prevent.
+      if (getListenErrorCode(error) === "EADDRINUSE" && attempt < attempts) {
+        continue;
+      }
+      throw error;
+    } finally {
+      httpServer.removeListener("connection", trackSocket);
+    }
+  }
 }
 
 /**
@@ -1767,18 +1880,24 @@ export async function createOrpcServer({
   });
 
   // Start listening
-  await new Promise<void>((resolve, reject) => {
-    const onListenError = (error: Error) => {
-      httpServer.removeListener("error", onListenError);
-      reject(error);
-    };
-
-    httpServer.once("error", onListenError);
-    httpServer.listen(port, host, () => {
-      httpServer.removeListener("error", onListenError);
-      resolve();
-    });
-  });
+  let ipv6LoopbackServer: http.Server | null = null;
+  try {
+    // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
+    if (host.trim().toLowerCase() === "localhost") {
+      ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
+    } else {
+      await listenOnce(httpServer, port, host);
+    }
+  } catch (error) {
+    // The caller gets no OrpcServer to close, and desktop startup keeps running after a
+    // failed bind, so release what was created above instead of leaking it per attempt.
+    clearInterval(heartbeatInterval);
+    for (const ws of wsServer.clients) {
+      ws.terminate();
+    }
+    wsServer.close();
+    throw error;
+  }
 
   // Get actual port (useful when port=0)
   const address = httpServer.address();
@@ -1820,7 +1939,14 @@ export async function createOrpcServer({
         await browserBridgeServer.stop();
       }
 
-      // Then close HTTP server.
+      // Then close HTTP server (and the IPv6 loopback listener feeding it).
+      if (ipv6LoopbackServer) {
+        ipv6LoopbackServer.closeIdleConnections?.();
+        ipv6LoopbackServer.closeAllConnections?.();
+        if (ipv6LoopbackServer.listening) {
+          await closeListener(ipv6LoopbackServer);
+        }
+      }
       httpServer.closeIdleConnections?.();
       httpServer.closeAllConnections?.();
       if (httpServer.listening) {

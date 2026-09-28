@@ -13,7 +13,7 @@ const metadata = {
 };
 
 function createContext(options: {
-  admission: Disposable | undefined;
+  admission: (Disposable & { signal: AbortSignal }) | undefined;
   getPromptsForWorkspace: () => Promise<never[]>;
 }) {
   const waitForInit = mock(() => Promise.resolve());
@@ -97,7 +97,7 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     });
     const dispose = mock(() => undefined);
     const fixture = createContext({
-      admission: { [Symbol.dispose]: dispose },
+      admission: { [Symbol.dispose]: dispose, signal: new AbortController().signal },
       getPromptsForWorkspace: () => {
         markStartupReached();
         return startupGate;
@@ -116,15 +116,59 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 
+  // #4805: a removal aborts discoveries admitted before it started, then joins them.
+  test("a discovery whose admission is aborted during init starts no servers", async () => {
+    const removal = new AbortController();
+    const dispose = mock(() => undefined);
+    const fixture = createContext({
+      admission: { [Symbol.dispose]: dispose, signal: removal.signal },
+      getPromptsForWorkspace: () => Promise.reject(new Error("should not start servers")),
+    });
+    fixture.waitForInit.mockImplementation(() => {
+      removal.abort();
+      return Promise.resolve();
+    });
+
+    expect(await listWorkspaceMcpPrompts(fixture.context, workspaceId)).toEqual([]);
+    expect(fixture.ensureReady).not.toHaveBeenCalled();
+    expect(fixture.getPromptsForWorkspace).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["readiness", "server startup"] as const)(
+    "a discovery whose admission is aborted during %s returns an empty catalog",
+    async (stage) => {
+      const removal = new AbortController();
+      const fixture = createContext({
+        admission: { [Symbol.dispose]: mock(() => undefined), signal: removal.signal },
+        getPromptsForWorkspace: () => {
+          removal.abort();
+          return Promise.reject(new Error("MCP prompt discovery was aborted"));
+        },
+      });
+      if (stage === "readiness") {
+        // SSH/Coder runtimes report an aborted readiness as not ready.
+        fixture.ensureReady.mockImplementation(() => {
+          removal.abort();
+          return Promise.resolve({ ready: false, error: "Aborted" } as never);
+        });
+      }
+
+      expect(await listWorkspaceMcpPrompts(fixture.context, workspaceId)).toEqual([]);
+      expect(fixture.getPromptsForWorkspace).toHaveBeenCalledTimes(stage === "readiness" ? 0 : 1);
+    }
+  );
+
   test("the inherited override read is bounded and cancelled with discovery's signal", async () => {
     // A child whose SSH/Docker parent is unreachable must not pin discovery
     // (and its archive admission) on a remote read after the caller gave up.
     const dispose = mock(() => undefined);
     const fixture = createContext({
-      admission: { [Symbol.dispose]: dispose },
+      admission: { [Symbol.dispose]: dispose, signal: new AbortController().signal },
       getPromptsForWorkspace: () => Promise.reject(new Error("should not start servers")),
     });
     const controller = new AbortController();
+    const readStarted = Promise.withResolvers<void>();
     const getOverrides = (
       fixture.context.workspaceMcpOverridesService as unknown as {
         getOverridesForWorkspace: ReturnType<typeof mock>;
@@ -133,6 +177,7 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     getOverrides.mockImplementation(
       (_workspaceId: string, options?: { timeoutMs?: number; signal?: AbortSignal }) =>
         new Promise((resolve) => {
+          readStarted.resolve();
           const settle = () => resolve({ overrides: {}, revision: "r", authoritative: false });
           if (options?.signal?.aborted) settle();
           options?.signal?.addEventListener("abort", settle, { once: true });
@@ -140,6 +185,7 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     );
 
     const discovery = listWorkspaceMcpPrompts(fixture.context, workspaceId, controller.signal);
+    await readStarted.promise;
     controller.abort();
     expect(await discovery).toEqual([]);
 
@@ -147,7 +193,8 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
       string,
       { timeoutMs?: number; signal?: AbortSignal },
     ];
-    expect(readOptions.signal).toBe(controller.signal);
+    // The caller's signal, combined with the admission's (#4805).
+    expect(readOptions.signal?.aborted).toBe(true);
     expect(typeof readOptions.timeoutMs).toBe("number");
     expect(fixture.getPromptsForWorkspace).not.toHaveBeenCalled();
     expect(dispose).toHaveBeenCalledTimes(1);

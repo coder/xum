@@ -50,6 +50,7 @@ import { DisplayedMessageRenderer } from "./DisplayedMessageRenderer";
 import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import { WebviewLiveBashOutput } from "./liveBashOutput";
+import { WebviewTranscriptBarrier } from "./transcriptBarrier";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
@@ -175,6 +176,12 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const aggregatorRef = useRef<StreamingMessageAggregator | null>(null);
   // Running bash cards read their live output here; the webview does not feed WorkspaceStore.
   const [liveBashOutput] = useState(() => new WebviewLiveBashOutput());
+  // The shared plan card's transcript barrier (#4942); the webview does not feed WorkspaceStore.
+  const [chatHostContextValue] = useState(() => ({
+    ...VSCODE_CHAT_HOST_CONTEXT_VALUE,
+    transcriptBarrier: new WebviewTranscriptBarrier(),
+  }));
+  const transcriptBarrier = chatHostContextValue.transcriptBarrier;
   // The backend's held inputs for the selected workspace (#4771): full list, replayed on each
   // subscription while non-empty.
   const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
@@ -314,6 +321,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
       switch (msg.type) {
         case "connectionStatus":
+          transcriptBarrier.setConnected(msg.status.mode === "api");
           setConnectionStatus(msg.status);
           return;
         case "workspaces":
@@ -351,6 +359,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
+          transcriptBarrier.reset(msg.workspaceId);
           setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
@@ -375,6 +384,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
+          transcriptBarrier.reset(msg.workspaceId);
           setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
@@ -409,6 +419,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               chatReplayStateRef.current = replayState;
               liveBashOutput.reset(msg.workspaceId);
               setHeldInputs([]);
+              transcriptBarrier.reset(msg.workspaceId);
               setTranscriptCaughtUp(false);
             }
 
@@ -428,6 +439,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               replayState.pendingStreamEvents.length = 0;
 
               replayState.caughtUp = true;
+              // A forced catch-up (buffer overflow) showed a partial transcript; the barrier stays
+              // closed for the rest of this replay, even when the real caught-up follows.
+              transcriptBarrier.markCaughtUp(msg.workspaceId, !replayState.didWarnBufferOverflow);
               setTranscriptCaughtUp(true);
               flushDisplayedMessages();
             };
@@ -633,7 +647,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // a router. The webview renders no routes, so an embedded in-memory router is enough: those
     // navigations become no-ops instead of crashing the mount or rewriting the webview URL.
     <RouterProvider embedded>
-      <ChatHostContextProvider value={VSCODE_CHAT_HOST_CONTEXT_VALUE}>
+      <ChatHostContextProvider value={chatHostContextValue}>
         <APIProvider client={apiClient}>
           <SettingsProvider>
             <ProviderOptionsProvider>

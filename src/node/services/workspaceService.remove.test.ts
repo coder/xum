@@ -533,6 +533,51 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
+  // #4805: a discovery admitted BEFORE the removal started could publish stdio servers after
+  // removal's stopServers, leaving them running in the deleted checkout. Removal aborts such a
+  // discovery and waits for it to settle before it stops servers.
+  test("aborts and joins an MCP prompt discovery admitted before the removal", async () => {
+    const { createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness(undefined);
+      const calls: string[] = [];
+      const stopped = Promise.withResolvers<void>();
+      harness.service.setMCPServerManager({
+        stopServers: mock((id: string) => {
+          calls.push(`stopServers:${id}`);
+          stopped.resolve();
+          return Promise.resolve();
+        }),
+      } as unknown as MCPServerManager);
+      const admission = harness.service.acquireMcpPromptDiscoveryAdmission(workspaceId);
+      if (admission === undefined) throw new Error("the discovery must be admitted");
+      const signal = (admission as { signal?: AbortSignal }).signal;
+
+      const removal = harness.service.remove(workspaceId, true);
+      // The removal reaches its teardown only once the admitted discovery settled.
+      const firstSettled = await Promise.race([
+        stopped.promise.then(() => "stopServers"),
+        new Promise<string>((resolve) => {
+          if (signal?.aborted) resolve("aborted");
+          signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
+        }),
+      ]);
+      expect(firstSettled).toBe("aborted");
+      expect(calls).toEqual([]);
+      calls.push("discovery-settled");
+      admission[Symbol.dispose]();
+
+      expect((await removal).success).toBe(true);
+      expect(calls).toEqual([
+        "discovery-settled",
+        `stopServers:${workspaceId}`,
+        `stopServers:${workspaceId}`,
+      ]);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   async function createParentHarness(
     childTaskStatus: "running" | "queued" | "reported"

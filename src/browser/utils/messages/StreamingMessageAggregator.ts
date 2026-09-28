@@ -129,7 +129,10 @@ const AgentStatusSchema = z.object({
 
 // Synthetic agent-skill snapshot messages include metadata.agentSkillSnapshot.
 // We use this to keep the SkillIndicator in sync for /{skillName} invocations.
-const AgentSkillSnapshotMetadataSchema = z.object({
+// Exported for tests: the replay test counts parse attempts, because a parse per
+// snapshot-less history row is the #4869 regression. Production callers are
+// maybeCollectAgentSkillSnapshot and maybeTrackLoadedSkillFromAgentSkillSnapshot below.
+export const AgentSkillSnapshotMetadataSchema = z.object({
   skillName: z.string().min(1),
   scope: z.enum(["project", "global", "built-in"]),
   sha256: z.string().optional(),
@@ -2681,6 +2684,13 @@ export class StreamingMessageAggregator {
   }
 
   private maybeTrackLoadedSkillFromAgentSkillSnapshot(snapshot: unknown): void {
+    // Replay calls this for every history row, and almost no row carries a snapshot.
+    // A failing safeParse builds a ZodError per row, which cost seconds at 500k+ rows
+    // (#4869). Any present value (including null or malformed objects) is still parsed.
+    if (snapshot === undefined) {
+      return;
+    }
+
     const parsed = AgentSkillSnapshotMetadataSchema.safeParse(snapshot);
     if (!parsed.success) {
       return;

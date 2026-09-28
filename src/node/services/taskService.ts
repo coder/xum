@@ -410,8 +410,7 @@ type AgentReportFinalizationResult =
 
 /**
  * Rendered form of a labeled task message as sendMessageToDescendantAgentTask
- * persists it. Shared with the sibling family-message budget accounting so
- * the charged trigger length can never drift from the delivered bytes (r21).
+ * persists it.
  */
 function renderLabeledTaskMessage(label: string, message: string): string {
   return `${label}:\n\n${message}`;
@@ -908,7 +907,6 @@ export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMes
 interface TrustedDescendantMessageOptions {
   messageLabel?: string;
   preTurnMessages?: MuxMessage[];
-  onPreTurnPersisted?: () => void;
 }
 
 type TreeMessageSpec =
@@ -948,11 +946,6 @@ type TreeMessagePipelineResult =
   | (SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation });
 
 type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessageError;
-
-interface TreeMessageBudgetReservation {
-  markPersisted(): void;
-  refundIfUnpersisted(): void;
-}
 
 /** The caller-relative relationship tag on task_list scope:"tree" rows. */
 export type TreeAgentRelationship = "self" | "ancestor" | "sibling" | "descendant";
@@ -8389,8 +8382,6 @@ export class TaskService implements AgentTaskIntegration {
        * updates, reactivation, or live turn admission.
        */
       preTurnMessages?: MuxMessage[];
-      /** Invoked as soon as the pre-turn rows are durably persisted. */
-      onPreTurnPersisted?: () => void;
     }
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     assert(
@@ -8419,7 +8410,6 @@ export class TaskService implements AgentTaskIntegration {
     buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
-    onPreTurnPersisted?: () => void;
     sendMessage?: WorkspaceTurnHost["sendMessage"];
     /**
      * Ancestor-triggered reawakening only: re-resolve AI settings from current defaults
@@ -8482,13 +8472,9 @@ export class TaskService implements AgentTaskIntegration {
     // locks held there, so no task-driven turn admission can be in flight
     // during this append; the rows precede the reactivation prompt row
     // createWorkspaceTurn sends. A createWorkspaceTurn failure leaves an
-    // untriggered untrusted-labeled row behind (charge kept).
+    // untriggered untrusted-labeled row behind.
     if (params.preTurnMessages != null && params.preTurnMessages.length > 0) {
-      const appendOutcome = await this.appendFamilyPayloadRows(
-        taskId,
-        params.preTurnMessages,
-        params.onPreTurnPersisted
-      );
+      const appendOutcome = await this.appendFamilyPayloadRows(taskId, params.preTurnMessages);
       if (!appendOutcome.success) {
         return appendOutcome;
       }
@@ -8798,14 +8784,9 @@ export class TaskService implements AgentTaskIntegration {
       // under this same mutex before sending), so a direct durable append
       // cannot land inside a PREPARING window; the rows precede the future
       // prompt row. Persisted before the splice: a splice failure leaves an
-      // untriggered untrusted-labeled row behind (charge kept), never a
-      // refunded-but-persisted one.
+      // untriggered untrusted-labeled row behind.
       if (options?.preTurnMessages != null && options.preTurnMessages.length > 0) {
-        const appendOutcome = await this.appendFamilyPayloadRows(
-          taskId,
-          options.preTurnMessages,
-          options.onPreTurnPersisted
-        );
+        const appendOutcome = await this.appendFamilyPayloadRows(taskId, options.preTurnMessages);
         if (!appendOutcome.success) {
           return appendOutcome;
         }
@@ -8887,7 +8868,6 @@ export class TaskService implements AgentTaskIntegration {
             },
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
-            onPreTurnPersisted: options?.onPreTurnPersisted,
             ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
           });
         }
@@ -9000,10 +8980,6 @@ export class TaskService implements AgentTaskIntegration {
               await guidance.onAccepted();
               accepted = true;
             },
-            // r54: persistence is signaled at the rollback horizon, not at
-            // acceptance — acceptance can fail after the pre-turn batch is
-            // already irrevocable, and the budget charge must stick then.
-            onPreTurnRowsPersisted: options?.onPreTurnPersisted,
           }
         );
 
@@ -9059,14 +9035,12 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Append family payload rows directly to a target's durable history for the
    * delivery paths with no live turn admission (queued splice, reactivation).
-   * `onPersisted` fires before the chat events so budget accounting observes
-   * persistence first; a mid-loop failure rolls earlier rows back (best
-   * effort) so the caller can treat the failure as nothing-persisted.
+   * A mid-loop failure rolls earlier rows back (best effort) so the caller can
+   * treat the failure as nothing-persisted.
    */
   private async appendFamilyPayloadRows(
     targetWorkspaceId: string,
-    rows: MuxMessage[],
-    onPersisted?: () => void
+    rows: MuxMessage[]
   ): Promise<Result<void, SendAgentTaskMessageError>> {
     assert(rows.length > 0, "appendFamilyPayloadRows: rows must be non-empty");
     const appendedIds: string[] = [];
@@ -9080,7 +9054,6 @@ export class TaskService implements AgentTaskIntegration {
       }
       appendedIds.push(row.id);
     }
-    onPersisted?.();
     for (const row of rows) {
       this.workspaceService.emitChatEvent(targetWorkspaceId, { ...row, type: "message" });
     }
@@ -9174,7 +9147,7 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "send_failed" as const, message: "Parent workspace no longer exists." });
       }
       // A parent whose checkout is missing could never run the wake turn (#4824): refuse before
-      // any budget is reserved or row persisted, instead of failing later with runtime_not_ready.
+      // any row is persisted, instead of failing later with runtime_not_ready.
       // The sender is the parent's own child, so it may see the readiness error.
       const checkoutError = await getMissingHostLocalCheckoutError(parentEntry);
       if (checkoutError != null) {
@@ -9225,20 +9198,31 @@ export class TaskService implements AgentTaskIntegration {
     if (spec.relation === "sibling-family") {
       assert(triggerLabel != null, "sibling family message requires a trigger label");
     }
-    const renderedTrigger =
-      triggerLabel != null
-        ? renderLabeledTaskMessage(triggerLabel, prepared.triggerContent)
-        : prepared.triggerContent;
-    const reservation = this.reserveTreeMessageBudget(
-      spec.senderWorkspaceId,
-      targetWorkspaceId,
-      prepared.payloadContent.length + this.agentPeerMessageBroker.triggerCharge(renderedTrigger)
-    );
-    if (reservation == null) {
-      return Err(this.agentPeerMessageBroker.budgetExhaustedError());
-    }
 
     return this.agentPeerMessageBroker.withDeliveryLock(targetWorkspaceId, async () => {
+      // A code_execution loop can call these helpers far faster than a model emits tool calls,
+      // so they share task_send_message's peer throttles (rate limits, duplicate suppression,
+      // queue cap) instead of a per-session budget that refused long conversations until
+      // restart. Checked and recorded under the target's delivery lock so concurrent sends
+      // cannot both pass the same slot.
+      const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
+        spec.senderWorkspaceId,
+        targetWorkspaceId,
+        message
+      );
+      if (throttleError != null) {
+        return Err({
+          code: "send_failed" as const,
+          message:
+            throttleError.code === "rate_limited"
+              ? `Rate limited: too many messages to this target; retry in ${Math.ceil((throttleError.retryAfterMs ?? 0) / 1000)} s.`
+              : throttleError.reason,
+        });
+      }
+      // Charge the rate slot before dispatch: a delivery can persist its rows and still report
+      // failure (goal sync, acceptance observers), and charging only successes would let a
+      // loop retry at full speed while appending a payload each time.
+      this.agentPeerMessageBroker.recordPeerAttempt(spec.senderWorkspaceId, targetWorkspaceId);
       // SECURITY: sender-controlled content and title stay in an untrusted assistant row. A fixed
       // user-row trigger containing only server-generated IDs wakes the recipient (r21/r25), and
       // both rows ride turn admission together so neither can land in a PREPARING window (r30).
@@ -9265,12 +9249,15 @@ export class TaskService implements AgentTaskIntegration {
             spec.queueDispatchMode
           ),
           preTurnMessages: [payloadRow],
-          onPreTurnRowsPersisted: () => reservation.markPersisted(),
         });
         if (!wakeResult.success) {
-          reservation.refundIfUnpersisted();
           return Err({ code: "send_failed" as const, message: wakeResult.error });
         }
+        this.agentPeerMessageBroker.recordPeerDelivery(
+          spec.senderWorkspaceId,
+          targetWorkspaceId,
+          message
+        );
         return Ok({ parentWorkspaceId: targetWorkspaceId });
       }
 
@@ -9285,10 +9272,15 @@ export class TaskService implements AgentTaskIntegration {
         {
           messageLabel: triggerLabel,
           preTurnMessages: [payloadRow],
-          onPreTurnPersisted: () => reservation.markPersisted(),
         }
       );
-      if (!sendResult.success) reservation.refundIfUnpersisted();
+      if (sendResult.success) {
+        this.agentPeerMessageBroker.recordPeerDelivery(
+          spec.senderWorkspaceId,
+          targetWorkspaceId,
+          message
+        );
+      }
       return sendResult;
     });
   }
@@ -9308,31 +9300,6 @@ export class TaskService implements AgentTaskIntegration {
     const recipient =
       getValidAgentMessageDispatchMode(entry?.workspace.agentMessageDispatchMode) ?? "tool-end";
     return recipient === "turn-end" ? "turn-end" : (requested ?? recipient);
-  }
-
-  private reserveTreeMessageBudget(
-    senderWorkspaceId: string,
-    targetWorkspaceId: string,
-    chars: number
-  ): TreeMessageBudgetReservation | null {
-    const refund = this.agentPeerMessageBroker.reserveBudget(
-      senderWorkspaceId,
-      targetWorkspaceId,
-      chars
-    );
-    if (refund == null) return null;
-
-    // The reservation becomes irrevocable at the persistence horizon, not at turn acceptance.
-    // Every route can therefore share idempotent rollback without weakening its refund policy.
-    let payloadPersisted = false;
-    return {
-      markPersisted: () => {
-        payloadPersisted = true;
-      },
-      refundIfUnpersisted: () => {
-        if (!payloadPersisted) refund();
-      },
-    };
   }
 
   private sendTreeMessage(
@@ -12807,13 +12774,6 @@ export class TaskService implements AgentTaskIntegration {
     preTurnMessages?: MuxMessage[];
     /** Invoked once the wake turn is durably accepted. */
     onAccepted?: () => void;
-    /**
-     * r54: invoked once the pre-turn rows cross the rollback horizon —
-     * acceptance can still fail AFTER that point (e.g. goal sync throwing)
-     * with the rows durable, so budget accounting must key off this, not
-     * onAccepted.
-     */
-    onPreTurnRowsPersisted?: () => void;
   }): Promise<Result<void, string>> {
     assert(params.parentWorkspaceId.length > 0, "wakeParentWorkspace: parent ID required");
     assert(params.content.length > 0, "wakeParentWorkspace: content required");
@@ -12888,9 +12848,6 @@ export class TaskService implements AgentTaskIntegration {
         workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
         ...(params.preTurnMessages != null ? { preTurnMessages: params.preTurnMessages } : {}),
         ...(params.onAccepted != null ? { onAccepted: params.onAccepted } : {}),
-        ...(params.onPreTurnRowsPersisted != null
-          ? { onPreTurnRowsPersisted: params.onPreTurnRowsPersisted }
-          : {}),
         ...(params.queueDedupeKey != null
           ? { queueDedupeKey: params.queueDedupeKey, removableQueueDedupeKey: true }
           : {}),
@@ -13844,8 +13801,55 @@ export class TaskService implements AgentTaskIntegration {
           error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
         });
       }
+      // #4761: a live writer in the checkout (a background process, a terminal, an external
+      // editor) could write after the lossy-work check below, and the forced removal would lose
+      // that work unreported. Take the archive path's admission hold: it refuses while such
+      // activity exists and admits no new sends, bash, terminals or opens until it is released
+      // after the removal. Model-driven only: automatic cleanup and the user cascade never refuse.
+      // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
+      // checkout loses no files, and the sticky app marker would block its removal forever.
+      const guardLiveWriters =
+        options?.lossyWorkPolicy === "refuse" && !subagentRemovalPreservesCheckout(entry.workspace);
+      // The fresh background-process check first, as model-driven archive does: it refreshes exit
+      // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
+      if (
+        guardLiveWriters &&
+        (await this.workspaceService.hasRunningBackgroundBashProcesses(taskId))
+      ) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          error:
+            "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
+        });
+      }
+      const liveWriterHold = guardLiveWriters
+        ? this.workspaceService.acquirePreInterruptionArchiveHold(taskId, {
+            queuedDelegatedTurnCount: 0,
+            expectedDelegatedTurnCorrelations: [],
+            operation: "remove",
+          })
+        : undefined;
+      if (liveWriterHold?.success === false) {
+        return Ok({ status: "error", action: "remove", ...target, error: liveWriterHold.error });
+      }
+      using _liveWriterHold = liveWriterHold?.success === true ? liveWriterHold.data : undefined;
       // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
       if (options?.lossyWorkPolicy === "refuse") {
+        // An editor or native terminal opened earlier is not trackable, so it may still write.
+        if (
+          guardLiveWriters &&
+          (await this.workspaceService.hasUntrackableExternalAppOpen(taskId))
+        ) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error:
+              "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
+          });
+        }
         const refusal = await this.refuseLossySubagentRemoval(taskId, entry, patchArtifact ?? null);
         if (refusal != null)
           return Ok({ status: "error", action: "remove", ...target, ...refusal });
@@ -13882,9 +13886,7 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<{ error: string; paths?: string[] } | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-    // Removal deletes no checkout for isolation "none" children (they share the parent's) or for
-    // project-dir local runtimes (deleteWorkspace is a no-op there).
-    if (ws.taskIsolation === "none" || isLocalProjectRuntime(runtimeConfig)) return null;
+    if (subagentRemovalPreservesCheckout(ws)) return null;
     const workspacePath = coerceNonEmptyString(ws.path);
     const workspaceName = coerceNonEmptyString(ws.name);
     const check =
@@ -19769,4 +19771,14 @@ export class TaskService implements AgentTaskIntegration {
     });
     return removedCount;
   }
+}
+
+/**
+ * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
+ * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ */
+function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  return (
+    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+  );
 }

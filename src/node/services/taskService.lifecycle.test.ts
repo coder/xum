@@ -353,7 +353,7 @@ describe("TaskService", () => {
       taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
         lossyWorkPolicy: "refuse",
       });
-    return { config, projectPath, childPath, remove, taskService, removeAsModel };
+    return { config, projectPath, childPath, remove, taskService, workspaceService, removeAsModel };
   }
 
   test("model-driven task removal refuses to discard a child's uncommitted work, but the user cascade still removes it", async () => {
@@ -386,14 +386,16 @@ describe("TaskService", () => {
   test("model-driven task removal still removes clean and shared-checkout children", async () => {
     const parentWorkspaceId = "parent-remove-clean";
     const childTaskId = "child-remove-clean";
-    const { config, projectPath, remove, removeAsModel } = await createChildCheckoutHarness(
-      parentWorkspaceId,
-      childTaskId
-    );
+    const { config, projectPath, remove, workspaceService, removeAsModel } =
+      await createChildCheckoutHarness(parentWorkspaceId, childTaskId);
     expect(await removeAsModel(childTaskId)).toMatchObject(
       Ok({ status: "removed", action: "remove", taskId: childTaskId })
     );
     expect(remove).toHaveBeenCalledTimes(1);
+    // A preserved checkout loses nothing to removal, so neither the live-writer hold nor the
+    // sticky "an editor was once opened" marker may block it (#4761).
+    const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold");
+    spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockResolvedValue(true);
 
     // An isolation "none" child shares the parent's checkout, which removal never deletes, so
     // the parent's own uncommitted files must not block removing it.
@@ -433,6 +435,84 @@ describe("TaskService", () => {
     });
     expect(await removeAsModel(localTaskId)).toMatchObject(Ok({ status: "removed" }));
     expect(remove).toHaveBeenCalledTimes(3);
+    expect(hold).not.toHaveBeenCalled();
+  });
+
+  // Automatic cleanup and the user-confirmed cascade never refuse (#3950/#4723 contract), so
+  // they never take the refusing live-writer hold either (#4761).
+  test("the user-confirmed removal cascade does not take the live-writer hold", async () => {
+    const parentWorkspaceId = "parent-remove-cascade";
+    const childTaskId = "child-remove-cascade";
+    const { remove, taskService, workspaceService } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold");
+    expect(
+      await taskService.withTaskTreeLifecycleLock(childTaskId, () =>
+        taskService.removeAcknowledgedDescendantsWhileTaskTreeLocked(parentWorkspaceId, [
+          childTaskId,
+        ])
+      )
+    ).toEqual(Ok(undefined));
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(hold).not.toHaveBeenCalled();
+  });
+
+  // #4761 gap 1: a live writer in the child checkout (a background process, a terminal, an
+  // external editor) could write after the lossy-work check and lose that work to the forced
+  // removal. Model-driven removal takes the archive path's admission hold, refuses while such
+  // activity exists, and keeps the hold (no new sends, bash, terminals or opens) through the
+  // check and the removal.
+  test("model-driven task removal refuses live writers and holds admission through the check and removal", async () => {
+    const parentWorkspaceId = "parent-remove-live";
+    const childTaskId = "child-remove-live";
+    const { config, remove, workspaceService, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    const events: string[] = [];
+    let liveActivity: string | undefined = "open terminal sessions";
+    const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
+      (workspaceId: string) => {
+        expect(workspaceId).toBe(childTaskId);
+        if (liveActivity !== undefined) return Err(`Workspace has live activity (${liveActivity})`);
+        events.push("hold");
+        return Ok({ [Symbol.dispose]: () => events.push("release") });
+      }
+    );
+    let editorOpen = false;
+    spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockImplementation(() =>
+      Promise.resolve(editorOpen)
+    );
+    // The fresh check (exit statuses refreshed, crash orphans included) refuses before the hold.
+    let backgroundRunning = true;
+    spyOn(workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation(() =>
+      Promise.resolve(backgroundRunning)
+    );
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
+    expect(hold).not.toHaveBeenCalled();
+    backgroundRunning = false;
+    remove.mockImplementation(() => {
+      events.push("remove");
+      return Promise.resolve(Ok(undefined));
+    });
+
+    const refusal = await removeAsModel(childTaskId);
+    assert(refusal.success && refusal.data.status === "error", "live writers must refuse");
+    expect(refusal.data.error).toContain("open terminal sessions");
+    // An external editor opened earlier is untrackable: it refuses too, and releases the hold.
+    liveActivity = undefined;
+    editorOpen = true;
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
+    expect(events).toEqual(["hold", "release"]);
+    expect(remove).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+
+    editorOpen = false;
+    events.length = 0;
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "removed" }));
+    expect(events).toEqual(["hold", "remove", "release"]);
   });
 
   test("task removal preserves an inactive child while its patch artifact is pending", async () => {

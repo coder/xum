@@ -1322,7 +1322,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await session.waitForIdle();
 
       // Refused before acceptance: no turn, no payload or trigger row, and the queued-dispatch
-      // failure callback (the sender's budget refund) fires exactly once.
+      // failure callback fires exactly once.
       expect(streamMessage).not.toHaveBeenCalled();
       expect(accepted).toBe(0);
       expect(preStreamFailures).toBe(1);
@@ -2330,9 +2330,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
         {
           acceptanceOrigin: "automatic",
           synthetic: true,
-          // Peer sends refund their family-message reservation through this hook; a dispatch
-          // that REJECTS (throws) instead of returning Err must reach it just like the
-          // returned-error branch, or the reservation is stranded until restart.
+          // A dispatch that REJECTS (throws) instead of returning Err must reach this hook just
+          // like the returned-error branch, or the caller never learns the send failed.
           onAcceptedPreStreamFailure: (error) => {
             failures.push(error.type === "unknown" ? error.raw : error.type);
           },
