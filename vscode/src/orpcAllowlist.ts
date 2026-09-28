@@ -1,4 +1,6 @@
 import assert from "node:assert";
+import { isBashCollapsedSummaryMode } from "xum/common/constants/storage";
+import { normalizeAgentAiDefaults } from "xum/common/types/agentAiDefaults";
 
 const FORBIDDEN_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -94,6 +96,8 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) is forwarded, and
+ * agentAiDefaults is forwarded rebuilt by normalizeAgentAiDefaults (#4972, #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
  * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
@@ -161,6 +165,27 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
       : undefined;
   if (typeof replacesHistory === "boolean") {
     projected.taskSettings = { proposePlanImplementReplacesChatHistory: replacesHistory };
+  }
+  // Bash tool headers follow the user's collapsed-summary preference, as on desktop (#4972). Only
+  // this one valid mode crosses, never the rest of userPreferences (theme, editor, paths, ...).
+  const userPreferences = config.userPreferences as Record<string, unknown> | null | undefined;
+  const appearance =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.appearance as Record<string, unknown> | null | undefined)
+      : undefined;
+  const bashMode =
+    typeof appearance === "object" && appearance !== null
+      ? appearance.bashCollapsedSummaryMode
+      : undefined;
+  if (isBashCollapsedSummaryMode(bashMode)) {
+    projected.userPreferences = { appearance: { bashCollapsedSummaryMode: bashMode } };
+  }
+  // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
+  // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each
+  // entry from named fields only and drops invalid agent IDs, so fields added to the on-disk entry
+  // later stay in the host unless the normalizer is changed to read them.
+  if (typeof config.agentAiDefaults === "object" && config.agentAiDefaults !== null) {
+    projected.agentAiDefaults = normalizeAgentAiDefaults(config.agentAiDefaults);
   }
   return projected;
 }

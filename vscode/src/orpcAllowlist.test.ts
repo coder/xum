@@ -110,6 +110,57 @@ describe("plan implement setting (#4942)", () => {
   });
 });
 
+describe("webview preferences (#4972, #4962)", () => {
+  test("forwards a valid bash collapsed-summary mode and nothing else from userPreferences", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          appearance: {
+            theme: "light",
+            bashCollapsedSummaryMode: "intent",
+            vimEnabled: true,
+            transcriptDensity: "hyper",
+          },
+          editorConfig: { editor: "custom", customCommand: "/opt/editor --wait" },
+          ai: { projectDefaults: { "/home/alice/secret-project": { model: "openai:gpt-5" } } },
+          workspaceCreation: {
+            byProject: { "/home/alice/secret-project": { lastRuntimeConfig: { type: "ssh" } } },
+          },
+          notifications: { sound: true },
+        },
+      })
+    ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
+  });
+
+  test("omits userPreferences when the bash mode is invalid", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: { appearance: { bashCollapsedSummaryMode: "everything", theme: "dark" } },
+      })
+    ).toEqual({});
+  });
+
+  test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        agentAiDefaults: {
+          exec: {
+            modelString: "openai:gpt-5.6-terra",
+            thinkingLevel: "high",
+            futureSecret: "must stay in the host",
+          },
+          "Not An Agent!": { modelString: "openai:gpt-5.6-terra" },
+        },
+      })
+    ).toEqual({
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.6-terra", thinkingLevel: "high" } },
+    });
+    expect(redactWebviewOrpcResult(["config", "getConfig"], { agentAiDefaults: "exec" })).toEqual(
+      {}
+    );
+  });
+});
+
 describe("held inputs (#4771)", () => {
   const known = new Set(["ws-1"]);
 

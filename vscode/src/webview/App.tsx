@@ -14,6 +14,7 @@ import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
 import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
+import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
 import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
 import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
@@ -51,6 +52,7 @@ import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import { WebviewLiveBashOutput } from "./liveBashOutput";
 import { WebviewTranscriptBarrier } from "./transcriptBarrier";
+import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
@@ -80,7 +82,10 @@ function WebviewChatProviders(props: {
         {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
             model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
         {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
-        <TooltipProvider>{props.children}</TooltipProvider>
+        {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
+        <BashCollapsedSummaryModeProvider>
+          <TooltipProvider>{props.children}</TooltipProvider>
+        </BashCollapsedSummaryModeProvider>
       </AgentProvider>
     </PolicyProvider>
   );
@@ -292,15 +297,22 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // server connection (it rejects calls in file mode), and reconnect them for each server, so a
   // recovery or a switch to another server fetches them again. The host
   // redacts both results (see redactWebviewOrpcResult).
+  // The app config snapshot also seeds the backend preferences shared components read from
+  // localStorage (#4972, #4962), on connect and on every config change.
   useEffect(() => {
     if (apiConnectionKey === null) {
       return;
     }
     const providersConfigStore = getProvidersConfigStore();
     const appConfigStore = getAppConfigStore();
+    const unsubscribeSeed = appConfigStore.subscribe(() => {
+      seedWebviewPreferences(appConfigStore.getSnapshot());
+    });
+    seedWebviewPreferences(appConfigStore.getSnapshot());
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     return () => {
+      unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
     };

@@ -1,5 +1,7 @@
 import type { APIClient } from "@/browser/contexts/API";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { BashCollapsedSummaryMode } from "@/common/constants/storage";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 
 /**
  * Slices of the app config consumed by per-model hooks (useRouting,
@@ -12,6 +14,12 @@ export interface AppConfigSnapshot {
   minThinkingLevelByModel?: Record<string, ThinkingLevel>;
   /** Plan Implement / Continue in Auto replace the chat history first (task setting). */
   proposePlanImplementReplacesChatHistory?: boolean;
+  /**
+   * Read only by the VS Code webview to seed its local preference cache (#4972, #4962). Desktop
+   * hydrates these through UserPreferencesContext / WorkspaceContext instead.
+   */
+  bashCollapsedSummaryMode?: BashCollapsedSummaryMode;
+  agentAiDefaults?: AgentAiDefaults;
 }
 
 /**
@@ -83,6 +91,9 @@ export class AppConfigStore {
           minThinkingLevelByModel: config.minThinkingLevelByModel,
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
+          // The webview projection may omit both (see redactWebviewOrpcResult).
+          bashCollapsedSummaryMode: config.userPreferences?.appearance?.bashCollapsedSummaryMode,
+          agentAiDefaults: config.agentAiDefaults,
         };
         this.notify();
       }

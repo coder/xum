@@ -670,6 +670,109 @@ describe("vscode webview plan actions (#4942)", () => {
   });
 });
 
+// #4972, #4962: the webview seeds backend preferences that shared components read from
+// localStorage out of the (host-projected) app config.
+describe("vscode webview backend preferences (#4972, #4962)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
+  });
+
+  afterEach(() => {
+    cleanup();
+    // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({
+      bashCollapsedSummaryMode: undefined,
+      agentAiDefaults: undefined,
+    });
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("bash headers follow the user's collapsed-summary mode once config arrives", async () => {
+    const script = "ls -la && git log --oneline -3";
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "m1",
+        1,
+        "bash",
+        {
+          script,
+          timeout_secs: 10,
+          display_name: "List files",
+          model_intent: "List the repository files",
+        },
+        { success: true, output: "ok", exitCode: 0, wall_duration_ms: 5 }
+      ),
+    ]);
+
+    // Default mode: the intent above the command.
+    expect(view.getByText("List the repository files")).toBeDefined();
+    expect(view.queryByText(script)).not.toBeNull();
+
+    await bridge.answer("config.getConfig", {
+      userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } },
+    });
+    expect(view.getByText("List the repository files")).toBeDefined();
+    expect(view.queryByText(script)).toBeNull();
+  });
+
+  test("Implement uses the configured Exec default when the workspace has no Exec settings", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [
+        {
+          ...WORKSPACE,
+          ai: {
+            agentId: "plan",
+            aiSettingsByAgent: { plan: { model: "openai:gpt-5.6-terra", thinkingLevel: "high" } },
+          },
+        },
+      ],
+    });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: toolMessage(
+        "m1",
+        1,
+        "propose_plan",
+        {},
+        { success: true, planPath: "/home/alice/plan.md" }
+      ),
+    });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: { type: "caught-up" },
+    });
+    await bridge.answer("config.getConfig", {
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-5-5", thinkingLevel: "low" } },
+    });
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Implement/ }));
+      await Promise.resolve();
+    });
+    await bridge.answer("config.getConfig", {
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-5-5", thinkingLevel: "low" } },
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({
+      options: { agentId: "exec", model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
+    });
+  });
+});
+
 describe("vscode webview AI settings persistence", () => {
   let cleanupDom: (() => void) | null = null;
 
