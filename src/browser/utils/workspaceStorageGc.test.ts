@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
 import { subscribePersistedStateWrites } from "@/browser/hooks/usePersistedState";
@@ -45,6 +46,7 @@ function remaining(keys: readonly string[]): string[] {
 
 describe("collectOrphanedWorkspaceStorage", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -52,9 +54,7 @@ describe("collectOrphanedWorkspaceStorage", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("removes only keys of unknown stable workspace ids", async () => {

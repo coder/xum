@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
 import { handleLayoutSlotHotkeys } from "./layoutSlotHotkeys";
@@ -49,6 +50,7 @@ function createLayoutPresetsWithSlot1(): LayoutPresetsConfig {
 
 describe("handleLayoutSlotHotkeys", () => {
   beforeEach(() => {
+    saveDomGlobals();
     const happyWindow = new GlobalWindow();
     globalThis.window = happyWindow as unknown as Window & typeof globalThis;
     globalThis.document = happyWindow.document as unknown as Document;
@@ -56,9 +58,7 @@ describe("handleLayoutSlotHotkeys", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement = undefined;
+    restoreDomGlobals();
   });
 
   test("handles slot hotkey even when focus is in a textarea", () => {

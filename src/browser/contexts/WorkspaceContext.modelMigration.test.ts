@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
@@ -37,6 +38,7 @@ function getNonDefaultModel(): string {
 
 describe("migrateLocalModelPrefsToBackend", () => {
   beforeEach(() => {
+    saveDomGlobals();
     const happyWindow = new GlobalWindow();
     globalThis.window = happyWindow as unknown as Window & typeof globalThis;
     globalThis.document = happyWindow.document as unknown as Document;
@@ -46,9 +48,7 @@ describe("migrateLocalModelPrefsToBackend", () => {
 
   afterEach(() => {
     globalThis.window.localStorage.clear();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("migrates an explicit local default when it matches the built-in default", () => {

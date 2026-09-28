@@ -1,6 +1,7 @@
 import { VERSION } from "@/version";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { createTestApiClient } from "@/browser/testUtils";
 import * as RealOrpcClientModule from "@/common/orpc/client";
@@ -146,6 +147,7 @@ const createMockWebSocket = (url: string) => new MockWebSocket(url) as unknown a
 
 describe("API reconnection", () => {
   beforeEach(() => {
+    saveDomGlobals();
     // Minimal DOM setup required by @testing-library/react.
     //
     // Happy DOM can default to an opaque origin ("null") in some modes (e.g. coverage).
@@ -173,8 +175,7 @@ describe("API reconnection", () => {
     cleanup();
     MockWebSocket.reset();
     globalThis.fetch = originalFetch;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("constructs WebSocket URL with app proxy prefix", () => {

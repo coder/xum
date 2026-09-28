@@ -36,6 +36,7 @@ import type {
 } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isInitialStagingLocked } from "@/browser/features/ChatInput/initialStagingLock";
 import { GlobalWindow } from "happy-dom";
@@ -632,6 +633,7 @@ describe("useCreationWorkspace", () => {
   });
 
   beforeEach(async () => {
+    saveDomGlobals();
     await installUseCreationWorkspaceModuleMocks();
     restorePersistedStateMocks = installPersistedStateMocks();
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
@@ -652,12 +654,7 @@ describe("useCreationWorkspace", () => {
     await restoreUseCreationWorkspaceModuleMocks();
     mock.restore();
     // Reset global window/document/localStorage between tests
-    // @ts-expect-error - test cleanup
-    globalThis.window = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.document = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.localStorage = undefined;
+    restoreDomGlobals();
   });
 
   test("loads branches when projectPath is provided", async () => {

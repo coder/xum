@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -12,6 +13,7 @@ import { parseSubagentReportEnvelope } from "./SubagentReportMessageContent";
 
 describe("MessageRenderer goal continuation rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -20,9 +22,7 @@ describe("MessageRenderer goal continuation rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("budget warnings collapse machine text without hiding ordinary user input", () => {
@@ -305,6 +305,7 @@ Live goal accounting at limit:
 
 describe("MessageRenderer subagent report rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -313,9 +314,7 @@ describe("MessageRenderer subagent report rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   function createReportMessage(content: string, synthetic = true): DisplayedMessage {
@@ -502,6 +501,7 @@ This was typed by a user.
 
 describe("MessageRenderer subagent failure rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -509,9 +509,7 @@ describe("MessageRenderer subagent failure rows", () => {
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   function failureMessage(
@@ -596,6 +594,7 @@ This sub-agent task failed terminally and will not produce a report. Do not re-a
 
 describe("MessageRenderer background work wake rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -604,9 +603,7 @@ describe("MessageRenderer background work wake rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   const wakePrompt =
@@ -696,6 +693,7 @@ describe("MessageRenderer background work wake rows", () => {
 
 describe("MessageRenderer bash monitor wake rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -704,9 +702,7 @@ describe("MessageRenderer bash monitor wake rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   const wakePrompt = `A background bash monitor matched output.
@@ -828,6 +824,7 @@ This is a condition-driven wake-up. Continue from this event.`;
 
 describe("MessageRenderer compaction boundary rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
@@ -835,8 +832,7 @@ describe("MessageRenderer compaction boundary rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("renders start compaction boundary rows", () => {
@@ -923,6 +919,7 @@ describe("MessageRenderer compaction boundary rows", () => {
 
 describe("MessageRenderer agent peer message rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -931,9 +928,7 @@ describe("MessageRenderer agent peer message rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   // Peer payloads are assistant-role synthetic rows (peer bytes never gain user-role authority).

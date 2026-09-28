@@ -1,5 +1,6 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { StrictMode } from "react";
 import { useLocation, useNavigate, type NavigateFunction } from "react-router-dom";
@@ -89,12 +90,12 @@ describe("settings background location", () => {
     return view;
   }
 
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
     latestRouter = null;
     latestNavigate = null;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("keeps the workspace behind settings across section switches and redirects", async () => {
@@ -179,10 +180,10 @@ describe("settings background location", () => {
 });
 
 describe("browser startup launch behavior", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("dashboard mode preserves a direct /workspace/:id URL", async () => {
@@ -261,10 +262,10 @@ describe("browser startup launch behavior", () => {
 });
 
 describe("desktop startup route restoration", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("restores the last visited route when Electron boots from file:///index.html", async () => {
@@ -442,10 +443,10 @@ describe("desktop startup route restoration", () => {
 });
 
 describe("standalone PWA startup", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("shows the dashboard on cold launch even if the launch URL points at a workspace", async () => {
@@ -520,10 +521,10 @@ describe("standalone PWA startup", () => {
 });
 
 describe("embedded router (VS Code webview)", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("starts at / and keeps navigation in memory without touching the host URL or persisted route", async () => {

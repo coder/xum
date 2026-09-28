@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test, type Mock } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
@@ -14,6 +15,7 @@ describe("SelectableDiffRenderer drag selection", () => {
   const rafTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -69,8 +71,7 @@ describe("SelectableDiffRenderer drag selection", () => {
       globalThis.window.cancelAnimationFrame = originalCancelAnimationFrame;
     }
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("hovering the review button uses the full custom range-selection tooltip", async () => {

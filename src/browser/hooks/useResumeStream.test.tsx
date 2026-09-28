@@ -1,5 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
@@ -80,6 +81,7 @@ const Harness: React.FC<{ workspaceId?: string; resetKey?: string | null }> = (p
 
 describe("useResumeStream", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     useWorkspaceStoreRaw().dispose();
@@ -92,8 +94,7 @@ describe("useResumeStream", () => {
   afterEach(() => {
     cleanup();
     useWorkspaceStoreRaw().dispose();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("resumes the stream without touching the auto-retry preference", async () => {

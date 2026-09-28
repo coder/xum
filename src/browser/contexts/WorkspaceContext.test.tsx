@@ -1,6 +1,7 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
@@ -72,6 +73,7 @@ const createProjectWorkspaceMetadata = (
 type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
 
 describe("WorkspaceContext", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
     mock.restore();
@@ -79,9 +81,7 @@ describe("WorkspaceContext", () => {
     // Reset global workspace store to avoid cross-test leakage
     getWorkspaceStoreRaw().dispose();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
 
     currentClientMock = {};
   });

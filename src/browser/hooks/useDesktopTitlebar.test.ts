@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import {
   MAC_TRAFFIC_LIGHTS_INSET,
@@ -23,14 +24,14 @@ function clearDesktopApi() {
 }
 
 beforeEach(() => {
+  saveDomGlobals();
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
   globalThis.document = globalThis.window.document;
 });
 
 afterEach(() => {
   clearDesktopApi();
-  globalThis.window = undefined as unknown as Window & typeof globalThis;
-  globalThis.document = undefined as unknown as Document;
+  restoreDomGlobals();
 });
 
 describe("isDesktopMode", () => {

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
@@ -220,6 +221,7 @@ describe("useAnalytics hooks", () => {
   let server: OrpcServer | null = null;
 
   beforeEach(async () => {
+    saveDomGlobals();
     mock.restore();
 
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
@@ -249,8 +251,7 @@ describe("useAnalytics hooks", () => {
     analyticsServiceCalls = null;
     await server?.close();
     server = null;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("loads summary from a real ORPC client without backend-unavailable false negatives", async () => {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
@@ -19,6 +20,7 @@ describe("CommandSuggestions", () => {
   let originalScrollIntoView: ((...args: unknown[]) => unknown) | undefined;
 
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     const prototype = globalThis.window.HTMLElement.prototype as unknown as {
@@ -34,8 +36,7 @@ describe("CommandSuggestions", () => {
       scrollIntoView?: (...args: unknown[]) => unknown;
     };
     prototype.scrollIntoView = originalScrollIntoView;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   it.each([
