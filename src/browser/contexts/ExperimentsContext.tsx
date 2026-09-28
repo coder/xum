@@ -100,23 +100,12 @@ function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | un
   }
 }
 
-function getExplicitLocalExperimentOverrides(): Partial<Record<ExperimentId, boolean>> {
-  const overrides: Partial<Record<ExperimentId, boolean>> = {};
-
-  for (const experimentId of Object.keys(EXPERIMENTS) as ExperimentId[]) {
-    if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP || !isExperimentSupported(experimentId)) {
-      continue;
-    }
-
-    const override = getExperimentOverrideSnapshot(experimentId);
-    if (override === undefined) {
-      continue;
-    }
-
-    overrides[experimentId] = override;
-  }
-
-  return overrides;
+/** Experiments mirrored from the backend override map; Design follows its own stream. */
+function getMirroredExperimentIds(): ExperimentId[] {
+  return (Object.keys(EXPERIMENTS) as ExperimentId[]).filter(
+    (experimentId) =>
+      experimentId !== EXPERIMENT_IDS.CLAUDE_DESIGN_MCP && isExperimentSupported(experimentId)
+  );
 }
 
 /**
@@ -312,17 +301,6 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     let cancelled = false;
     const pending = pendingChoices.current;
 
-    const markOffline = () => {
-      setBackendOverrides((previous) =>
-        previous
-          ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
-          : null
-      );
-      // Still reconciles the purely-local stale pair (ptc: true,
-      // legacy: false/absent) even when the backend is unreachable.
-      reconcileLegacyPtcExclusiveMirror(null);
-    };
-
     // The backend is authoritative: its overrides replace this origin's mirrors, including
     // removing ones it no longer holds, so a restore or another window's toggle reaches the
     // UI and the send options that read the mirrors.
@@ -331,15 +309,10 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         ...overrides,
         [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
       }));
-      for (const experimentId of Object.keys(EXPERIMENTS) as ExperimentId[]) {
-        if (
-          experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP ||
-          !isExperimentSupported(experimentId) ||
-          pending.has(experimentId)
-        ) {
-          continue;
+      for (const experimentId of getMirroredExperimentIds()) {
+        if (!pending.has(experimentId)) {
+          syncExperimentStateFromBackend(experimentId, overrides[experimentId]);
         }
-        syncExperimentStateFromBackend(experimentId, overrides[experimentId]);
       }
       reconcileLegacyPtcExclusiveMirror(overrides);
     };
@@ -351,9 +324,11 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       const migrating =
         readPersistedState<unknown>(EXPERIMENTS_BACKEND_AUTHORITATIVE_KEY, false) !== true;
       if (migrating) {
-        for (const [id, enabled] of Object.entries(getExplicitLocalExperimentOverrides())) {
-          const experimentId = id as ExperimentId;
-          if (!pending.has(experimentId)) pending.set(experimentId, { enabled });
+        for (const experimentId of getMirroredExperimentIds()) {
+          const enabled = getExperimentOverrideSnapshot(experimentId);
+          if (enabled !== undefined && !pending.has(experimentId)) {
+            pending.set(experimentId, { enabled });
+          }
         }
       }
       // Per experiment: this client's localStorage is origin-scoped and may legitimately be
@@ -395,7 +370,15 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         const overrides = await api.experiments.getOverrides();
         if (!cancelled) adopt(overrides);
       } catch {
-        if (!cancelled) markOffline();
+        if (cancelled) return;
+        setBackendOverrides((previous) =>
+          previous
+            ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
+            : null
+        );
+        // Still reconciles the purely-local stale pair (ptc: true,
+        // legacy: false/absent) even when the backend is unreachable.
+        reconcileLegacyPtcExclusiveMirror(null);
       }
     };
 

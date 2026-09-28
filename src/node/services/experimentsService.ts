@@ -189,7 +189,6 @@ export class ExperimentsService {
     experimentId: ExperimentId,
     enabled: boolean | null | undefined
   ): Promise<void> {
-    assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
     await this.applyOverrides({ [experimentId]: enabled ?? null });
   }
 

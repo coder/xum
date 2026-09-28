@@ -279,7 +279,7 @@ export function createBackupPayloadStore(options: {
   }
 
   async function buildPayload(contents: BackupContents, overrides?: { keepLocalSecrets: true }) {
-    // Both projections are the portable subsets an export writes; machine-local keys are
+    // The projections are the portable subsets an export writes; machine-local keys are
     // excluded by design.
     const config = options.config.loadConfigOrDefault();
     return await createBackupPayload({
