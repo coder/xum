@@ -167,6 +167,10 @@ describe("container exec failures", () => {
     "Cannot connect to the Docker daemon at unix:///tmp/nope.sock. Is the docker daemon running?\n",
     // Docker Desktop stopped on Windows (wording from docker/for-win#13137; not measured here).
     'error during connect: This error may indicate that the docker daemon is not running.: Get "http:////./pipe/docker_engine/v1.24/containers/json": open //./pipe/docker_engine: The system cannot find the file specified.\n',
+    // #4985: any daemon refusal counts, not just the listed states (measured on docker 27.5.1).
+    "Error response from daemon: Container 506af2d53fea is restarting, wait until the container is running\n",
+    // #4985: newer clients' connection failure (moby client/request.go; not measured here).
+    "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory\n",
   ];
   const devcontainerUnavailable = [
     "Shell server terminated (code: 1, signal: null)\n\n" + unavailable[0],
@@ -203,6 +207,14 @@ describe("container exec failures", () => {
     const errors = await failures(new StubbedDockerRuntime([noBash, 126]), false);
     expect(errors.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
     expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
+    // #4985: a daemon line does not make an uninvokable command (exit 126/127) transport.
+    const daemonNoBash = `Error response from daemon: ${noBash}`;
+    for (const exitCode of [126, 127]) {
+      expect(await transport(new StubbedDockerRuntime([daemonNoBash, exitCode]))).toEqual([
+        false,
+        false,
+      ]);
+    }
   });
 });
 
