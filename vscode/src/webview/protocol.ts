@@ -120,6 +120,8 @@ export type ExtensionToWebviewMessage =
   | { type: "setSelectedWorkspace"; workspaceId: string | null }
   | { type: "chatReset"; workspaceId: string }
   | { type: "chatEvent"; workspaceId: string; event: WorkspaceChatMessage }
+  // Armed background bash monitors of the selected workspace, from workspace.activity (#4971).
+  | { type: "workspaceActivity"; workspaceId: string; activeBashMonitorCount: number }
   | { type: "uiNotice"; level: "info" | "error"; message: string }
   | { type: "debugProbe"; attempt: number; sentAtMs: number }
   | OrpcResponse

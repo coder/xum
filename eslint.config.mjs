@@ -2256,6 +2256,16 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
+          // Lives here, not in the src/** block above: this later block replaces that block's
+          // no-restricted-imports options for every file it matches.
+          paths: [
+            {
+              name: "ai-tokenizer/encoding",
+              allowTypeImports: true,
+              message:
+                "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
+            },
+          ],
           patterns: [
             {
               group: ["shiki"],

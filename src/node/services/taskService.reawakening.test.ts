@@ -140,6 +140,7 @@ describe("TaskService", () => {
         fromWorkspaceId: "child-a",
         fromTitle: "child-a",
         relationship: "descendant",
+        payloadMessageId: internalArg.preTurnMessages?.[0]?.id,
       },
     });
     expect(internalArg.workspaceTurnContinuation).toBe(true);

@@ -830,6 +830,8 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         fromTitle?: string;
         /** The sender's relationship to the recipient (mirrors the envelope enum). */
         relationship: AgentMessageRelationship;
+        /** Trigger rows only: history ID of the payload row (see AgentPeerMessageMeta). */
+        payloadMessageId?: string;
       }
     | {
         // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
@@ -1309,6 +1311,11 @@ export type DisplayedMessage =
        * payload itself is a separate assistant row). Excluded from human-prompt navigation.
        */
       agentPeerMessageTrigger?: true;
+      /**
+       * Trigger rows that name their payload row: lets the transcript fold this notification
+       * into the payload's agent-message card once that card is actually rendered.
+       */
+      agentPeerTriggerPayload?: { payloadMessageId: string; fromWorkspaceId: string };
       /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
       contextBudgetWarning?: {
         contextTokens: number;

@@ -536,6 +536,32 @@ export interface TranscriptRevealTarget {
   toolCallId?: string;
 }
 
+/**
+ * A peer message is persisted as two rows: the assistant payload (rendered as the agent-message
+ * card) and a fixed user-role trigger that wakes the recipient. The trigger only repeats the card
+ * to the user, so drop it when its payload card is among the rendered rows. This runs on the
+ * final (truncated) rows and keys on rendered cards, which exist only for payloads that passed
+ * the envelope authenticity check. A trigger whose card was truncated away, failed that check,
+ * or is missing keeps its own notification row, so a message never disappears entirely.
+ */
+function foldAgentPeerTriggers(messages: DisplayedMessage[]): DisplayedMessage[] {
+  const renderedCards = new Set<string>();
+  for (const message of messages) {
+    if (message.type === "assistant" && message.agentPeerMessage != null) {
+      renderedCards.add(`${message.historyId}\n${message.agentPeerMessage.fromWorkspaceId}`);
+    }
+  }
+  if (renderedCards.size === 0) return messages;
+  return messages.filter(
+    (message) =>
+      message.type !== "user" ||
+      message.agentPeerTriggerPayload == null ||
+      !renderedCards.has(
+        `${message.agentPeerTriggerPayload.payloadMessageId}\n${message.agentPeerTriggerPayload.fromWorkspaceId}`
+      )
+  );
+}
+
 export class StreamingMessageAggregator {
   private messages = new Map<string, MuxMessage>();
   private activeStreams = new Map<string, StreamingContext>();
@@ -3944,6 +3970,11 @@ export class StreamingMessageAggregator {
           truncationPlan.hiddenCount > 0
             ? this.normalizeLastPartFlags(truncationPlan.rows)
             : truncationPlan.rows;
+      }
+
+      // Debug-LLM mode keeps triggers visible: it shows what the model actually received.
+      if (!showSyntheticMessages) {
+        resultMessages = foldAgentPeerTriggers(resultMessages);
       }
 
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);

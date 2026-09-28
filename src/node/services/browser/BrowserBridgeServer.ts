@@ -11,6 +11,10 @@ const INVALID_TOKEN_CLOSE_CODE = 4001;
 const MISSING_SESSION_CLOSE_CODE = 4002;
 const STREAM_CONNECT_FAILURE_CLOSE_CODE = 4003;
 const SERVER_STOPPING_CLOSE_CODE = 1001;
+const MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+// Input frames queued while the upstream connects are tiny (keyboard/mouse events); cap the
+// queue so a stalled upstream handshake cannot grow the backend heap without limit.
+const MAX_PENDING_CLIENT_FRAME_BYTES = 1024 * 1024;
 const STREAM_HOST = "127.0.0.1";
 
 interface BridgePair {
@@ -103,6 +107,11 @@ async function connectToStream(port: number): Promise<WebSocket> {
   return await new Promise<WebSocket>((resolve, reject) => {
     let settled = false;
     const upstream = new WebSocket(`ws://${STREAM_HOST}:${port}`);
+    // Bun >= 1.3.10's `ws` client shim can emit 'error' after onError below removed its
+    // listener: once() installs two native forwarders (the event fires twice), and
+    // terminate() after an error but before close re-emits it. An 'error' with no
+    // listener throws and would crash the backend, so keep a lifetime no-op listener.
+    upstream.on("error", () => undefined);
 
     const cleanup = () => {
       upstream.off("open", onOpen);
@@ -275,6 +284,24 @@ export class BrowserBridgeServer {
       return;
     }
 
+    // `ws` does not buffer 'message' events, and the client may send input as soon as
+    // its socket opens, before the upstream connects below. Bun 1.3.12+ reliably
+    // delivers such a frame before the upstream 'open', so queue client frames until
+    // the bridge listeners are attached instead of silently dropping them.
+    const pendingClientFrames: Array<{ data: RawData; isBinary: boolean }> = [];
+    let pendingClientFrameBytes = 0;
+    const bufferClientFrame = (data: RawData, isBinary: boolean) => {
+      pendingClientFrameBytes += normalizeBinaryMessage(data).byteLength;
+      if (pendingClientFrameBytes > MAX_PENDING_CLIENT_FRAME_BYTES) {
+        ws.off("message", bufferClientFrame);
+        pendingClientFrames.length = 0;
+        closeWebSocket(ws, MESSAGE_TOO_BIG_CLOSE_CODE, "too much input before bridge ready");
+        return;
+      }
+      pendingClientFrames.push({ data, isBinary });
+    };
+    ws.on("message", bufferClientFrame);
+
     const liveSession = await this.browserSessionDiscoveryService.getSessionConnection(
       payload.workspaceId,
       payload.sessionName,
@@ -299,7 +326,12 @@ export class BrowserBridgeServer {
     try {
       const upstream = await connectToStream(liveSession.streamPort);
       const pair: BridgePair = { client: ws, upstream, closed: false };
-      this.attachBridgeListeners(pair, payload.workspaceId, liveSession.sessionName);
+      ws.off("message", bufferClientFrame);
+      const forwardClientFrame = this.attachBridgeListeners(
+        pair,
+        payload.workspaceId,
+        liveSession.sessionName
+      );
       this.activePairs.add(pair);
       if (this.browserSessionStateHub) {
         const unsubscribe = this.browserSessionStateHub.subscribe(
@@ -321,6 +353,12 @@ export class BrowserBridgeServer {
       }
       if (ws.readyState !== WebSocket.OPEN) {
         this.cleanupPair(pair, { closeReason: "websocket closed before bridge finished" });
+        return;
+      }
+      // Flush only after the pair and its subscription are registered, so a forwarding
+      // failure's cleanupPair() removes them instead of racing their registration.
+      for (const frame of pendingClientFrames) {
+        forwardClientFrame(frame.data, frame.isBinary);
       }
     } catch (error) {
       log.warn("BrowserBridgeServer: failed to connect to stream endpoint", {
@@ -333,8 +371,12 @@ export class BrowserBridgeServer {
     }
   }
 
-  private attachBridgeListeners(pair: BridgePair, workspaceId: string, sessionId: string): void {
-    pair.client.on("message", (data, isBinary) => {
+  private attachBridgeListeners(
+    pair: BridgePair,
+    workspaceId: string,
+    sessionId: string
+  ): (data: RawData, isBinary: boolean) => void {
+    const forwardClientFrame = (data: RawData, isBinary: boolean) => {
       if (pair.closed) {
         return;
       }
@@ -351,7 +393,8 @@ export class BrowserBridgeServer {
         });
         this.cleanupPair(pair, { closeReason: "upstream write failed" });
       }
-    });
+    };
+    pair.client.on("message", forwardClientFrame);
 
     pair.client.on("close", () => {
       this.cleanupPair(pair, { closeReason: "client websocket closed" });
@@ -397,6 +440,8 @@ export class BrowserBridgeServer {
       });
       this.cleanupPair(pair, { closeReason: "upstream websocket error" });
     });
+
+    return forwardClientFrame;
   }
 
   private cleanupPair(

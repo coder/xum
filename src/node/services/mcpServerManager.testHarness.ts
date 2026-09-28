@@ -23,7 +23,7 @@ import { MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
 // The manager's per-server startup deadline (a real timer), shared so the harness cannot drift.
 export { MCP_STARTUP_TIMEOUT_MS };
 
-// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.5), which implements this.
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 type MCPClientHandle = Awaited<ReturnType<typeof mcpSdk.createMCPClient>>;

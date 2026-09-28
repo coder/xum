@@ -3,7 +3,7 @@ import assert from "@/common/utils/assert";
 import { createHash, hash } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import { getAvailableTools, getToolSchemas } from "@/common/utils/tools/toolDefinitions";
-import type { CountTokensBatchInput } from "./tokenizer.worker";
+import type { CountTokensBatchInput, EncodingName } from "./tokenizer.worker";
 import { models, type ModelName } from "ai-tokenizer";
 import { run } from "./workerPool";
 import { TOKENIZER_MODEL_OVERRIDES, DEFAULT_WARM_MODELS } from "@/common/constants/knownModels";
@@ -119,10 +119,18 @@ function resolveModelName(modelString: string): ModelName {
   return modelName;
 }
 
+// Each encoding has its own worker, so requests are routed by the model's encoding.
+function encodingOf(modelName: ModelName): EncodingName {
+  const model = models[modelName];
+  assert(model, `Unknown tokenizer model '${modelName}'`);
+  return model.encoding;
+}
+
 function resolveEncoding(modelName: ModelName): Promise<string> {
   let promise = encodingPromises.get(modelName);
   if (!promise) {
-    promise = run<string>("encodingName", modelName)
+    // run() spawns the encoding's worker on first use; "ready" answers once the encoding is loaded.
+    promise = run<string>(encodingOf(modelName), "ready", modelName)
       .then((result: unknown) => {
         assert(
           typeof result === "string" && result.length > 0,
@@ -188,7 +196,7 @@ function flushOpenBatch(): void {
 
   const payload: CountTokensBatchInput = { modelName: batch.modelName, inputs: batch.inputs };
   // The chain ends in a handler that settles every text, so it can never reject unhandled.
-  run<number[]>("countTokensBatch", payload)
+  run<number[]>(encodingOf(batch.modelName), "countTokensBatch", payload)
     .then((counts: unknown) => {
       // Validate every count before settling any, so a bad reply rejects the whole batch.
       assert(
@@ -262,27 +270,24 @@ async function countTokensInternal(modelName: ModelName, text: string): Promise<
   return pending;
 }
 
-export function loadTokenizerModules(
+export async function loadTokenizerModules(
   modelsToWarm: string[] = Array.from(DEFAULT_WARM_MODELS)
 ): Promise<Array<PromiseSettledResult<string>>> {
-  if (shouldUseApproxTokenizer()) {
-    const fulfilled: Array<PromiseFulfilledResult<string>> = modelsToWarm.map(() => ({
-      status: "fulfilled",
-      value: APPROX_ENCODING,
-    }));
-    return Promise.resolve(fulfilled);
-  }
-
-  return Promise.allSettled(
-    modelsToWarm.map((modelString) => {
-      const modelName = normalizeModelKey(modelString);
-      // Skip unknown models during warmup
-      if (!modelName) {
-        return Promise.reject(new Error(`Unknown model: ${modelString}`));
-      }
-      return resolveEncoding(modelName);
-    })
+  const startTime = Date.now();
+  // Same resolution as counting (overrides, provider fallbacks), so warm-up builds exactly the
+  // tokenizer the first real count will use. Distinct encodings load in parallel workers.
+  // The async wrapper turns a synchronous resolution assertion (e.g. an empty id) into a
+  // rejection of that entry only.
+  const results = await Promise.allSettled(
+    modelsToWarm.map(async (model) => (await getTokenizerForModel(model)).encoding)
   );
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      log.warn(`Failed to warm tokenizer for '${modelsToWarm[index]}':`, result.reason);
+    }
+  });
+  log.debug(`Warmed ${modelsToWarm.length} tokenizer model(s) in ${Date.now() - startTime}ms`);
+  return results;
 }
 
 export async function getTokenizerForModel(

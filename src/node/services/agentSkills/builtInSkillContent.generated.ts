@@ -6032,7 +6032,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0",
       "        if: ${{ steps.precheck.outputs.enabled == 'true' }}",
       "        with:",
-      "          bun-version: 1.3.5",
+      "          bun-version: 1.3.12",
       "",
       "      # Pin the git identity so the AI agent doesn't invent its own.",
       '      # Without this, commits end up as "mux-auto-cleanup[bot]" while the',

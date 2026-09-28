@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -25,7 +25,14 @@ import {
   TooltipTrigger,
 } from "xum/browser/components/Tooltip/Tooltip";
 import { Button } from "xum/browser/components/Button/Button";
-import { matchesKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
+import {
+  allowsEscapeToInterruptStream,
+  formatKeybind,
+  isDialogOpen,
+  isEditableElement,
+  matchesKeybind,
+  KEYBINDS,
+} from "xum/browser/utils/ui/keybinds";
 import { readPersistedState } from "xum/browser/hooks/usePersistedState";
 import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
@@ -186,8 +193,13 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // subscription while non-empty.
   const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
+  // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
+  const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
+  // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
+  // reads aggregator state that has no transcript row (stream lifecycle, startup breadcrumbs) (#4971).
+  const [, bumpAggregatorRevision] = useReducer((revision: number) => revision + 1, 0);
   const scheduledRenderRef = useRef<{ kind: "raf" | "timeout"; id: number } | null>(null);
   const isRenderScheduledRef = useRef(false);
 
@@ -218,6 +230,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     }
 
     setDisplayedMessages(aggregator.getDisplayedMessages());
+    bumpAggregatorRevision();
   };
 
   const flushDisplayedMessagesRef = useRef(flushDisplayedMessages);
@@ -239,6 +252,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       }
 
       setDisplayedMessages(aggregator.getDisplayedMessages());
+      bumpAggregatorRevision();
     };
 
     if (typeof requestAnimationFrame === "function") {
@@ -356,6 +370,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           aggregatorRef.current = null;
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setActiveBashMonitorCount(0);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -383,6 +398,8 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          // The monitor count is kept: a resubscribe to the same workspace posts a fresh count, but
+          // if the host cannot read it, the last one is better than hiding an armed monitor.
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           transcriptBarrier.reset(msg.workspaceId);
           setTranscriptCaughtUp(false);
@@ -528,6 +545,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
           return;
         }
+        case "workspaceActivity":
+          if (msg.workspaceId === activeWorkspaceIdRef.current) {
+            setActiveBashMonitorCount(msg.activeBashMonitorCount);
+          }
+          return;
         case "uiNotice": {
           pushNotice({ level: msg.level, message: msg.message });
           return;
@@ -561,6 +583,41 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bridge]);
 
+  // The one user-Stop path for Esc and the barrier's Stop button (#4971), with desktop stopStream's
+  // options: owed monitor output is dismissed instead of waking the agent, auto-retry is turned off,
+  // and a stopped compaction drops its partial summary. Stop also shows while a turn is starting,
+  // when there is no active stream to mark yet: then it only sends the request.
+  const interruptStream = (options: { abandonPartial: boolean }) => {
+    if (!selectedWorkspaceId) {
+      return;
+    }
+    const aggregator = aggregatorRef.current;
+    if (aggregator?.getActiveStreamMessageId()) {
+      aggregator.setInterrupting();
+      flushDisplayedMessagesRef.current();
+    }
+
+    const reportFailure = (error: string) => {
+      bridge.debugLog("interruptStream failed", { error });
+      pushNoticeRef.current({ level: "error", message: `Failed to interrupt stream. (${error})` });
+    };
+    apiClient.workspace
+      .interruptStream({
+        workspaceId: selectedWorkspaceId,
+        options: {
+          ...(options.abandonPartial ? { abandonPartial: true } : {}),
+          disableAutoRetry: true,
+          retireBashMonitorAttention: true,
+        },
+      })
+      .then((result) => {
+        if (!result.success) reportFailure(result.error);
+      })
+      .catch((error) => reportFailure(error instanceof Error ? error.message : String(error)));
+  };
+  const interruptStreamRef = useRef(interruptStream);
+  interruptStreamRef.current = interruptStream;
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!canChat || !selectedWorkspaceId) {
@@ -581,34 +638,58 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
         return;
       }
 
+      // As on desktop, Escape in a text field interrupts only where the field opts in (the chat
+      // input); Ctrl+C in Vim mode always does.
+      if (
+        interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL &&
+        isEditableElement(e.target) &&
+        !allowsEscapeToInterruptStream(e.target)
+      ) {
+        return;
+      }
+
       // ask_user_question is a special waiting state: don't interrupt it with Esc/Ctrl+C.
       // Users can still respond by typing and sending a message.
       if (aggregator.hasAwaitingUserQuestion()) {
         return;
       }
 
-      if (!aggregator.getActiveStreamMessageId()) {
+      // A starting turn (before stream-start) shows Stop and its Esc chip too, so Esc must reach it.
+      const isStarting =
+        aggregator.getPendingStreamStartTime() !== null ||
+        aggregator.getStreamLifecycle()?.phase === "preparing";
+      if (!aggregator.getActiveStreamMessageId() && !isStarting) {
         return;
       }
 
       e.preventDefault();
-
-      aggregator.setInterrupting();
-      flushDisplayedMessagesRef.current();
-
-      apiClient.workspace.interruptStream({ workspaceId: selectedWorkspaceId }).catch((error) => {
-        bridge.debugLog("interruptStream failed", { error: String(error) });
-
-        pushNoticeRef.current({
-          level: "error",
-          message: `Failed to interrupt stream. (${error instanceof Error ? error.message : String(error)})`,
-        });
-      });
+      interruptStreamRef.current({ abandonPartial: aggregator.isCompacting() });
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [apiClient, bridge, canChat, selectedWorkspaceId]);
+  }, [canChat, selectedWorkspaceId]);
+
+  // Transcript-scoped Shift+G, as in desktop useAIViewKeybinds: capture phase, and never while
+  // typing (the composer still receives a capital G) or while a modal owns the keyboard.
+  useEffect(() => {
+    if (!selectedWorkspaceId) {
+      return;
+    }
+    const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (
+        isDialogOpen() ||
+        isEditableElement(e.target) ||
+        !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      jumpToBottomRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
+  }, [selectedWorkspaceId]);
 
   const requestRefreshWorkspaces = () => {
     bridge.postMessage({ type: "refreshWorkspaces" });
@@ -731,11 +812,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                 />
                               ))}
                             </LiveBashOutputSourceContext.Provider>
-                            <VscodeStreamingBarrier
-                              workspaceId={selectedWorkspaceId}
-                              aggregator={aggregatorRef.current}
-                              className="mt-3"
-                            />
                           </BackgroundBashProvider>
                         ) : null}
 
@@ -768,7 +844,25 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       />
                     </div>
 
-                    <div className="bg-surface-primary px-[15px] pt-2 pb-2">
+                    {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
+                        desktop ChatInput textarea; other editors keep Escape to themselves. */}
+                    <div
+                      className="relative bg-surface-primary px-[15px] pt-2 pb-2"
+                      data-escape-interrupts-stream="true"
+                    >
+                      {selectedWorkspaceId && !autoScroll ? (
+                        // Same pill as desktop ChatPane, just above the dock.
+                        <button
+                          onClick={jumpToBottom}
+                          type="button"
+                          className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
+                        >
+                          Jump to bottom{" "}
+                          <span className="mobile-hide-shortcut-hints">
+                            ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                          </span>
+                        </button>
+                      ) : null}
                       {selectedWorkspaceId && heldInputs.length > 0 ? (
                         // Bounded scroll lane: many or long held inputs must not push the composer
                         // below the fixed-height layout or collapse the transcript.
@@ -783,6 +877,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                             />
                           ))}
                         </div>
+                      ) : null}
+                      {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
+                      {selectedWorkspaceId ? (
+                        <VscodeStreamingBarrier
+                          workspaceId={selectedWorkspaceId}
+                          aggregator={aggregatorRef.current}
+                          activeBashMonitorCount={activeBashMonitorCount}
+                          onCancel={(phase) =>
+                            interruptStream({ abandonPartial: phase === "compacting" })
+                          }
+                        />
                       ) : null}
                       {selectedWorkspaceId ? (
                         <ChatComposer

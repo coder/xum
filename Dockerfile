@@ -20,7 +20,7 @@ WORKDIR /app
 ARG RELEASE_TAG
 
 # Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.2
+RUN npm install -g bun@1.3.12
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball

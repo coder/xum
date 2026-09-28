@@ -1232,30 +1232,53 @@ test("buildCoreSources includes rebuild analytics database action with discovera
   expect(rebuildAction?.keywords).toContain("stats");
 });
 
+test("toggle keep screen awake command is only offered in the desktop app", () => {
+  const originalWindow = globalThis.window;
+  const hasToggle = () => getActions().some((a) => a.id === "settings:toggle-keep-screen-awake");
+  try {
+    const testWindow = new GlobalWindow();
+    globalThis.window = testWindow as unknown as Window & typeof globalThis;
+    // Browser mode: no preload bridge.
+    expect(hasToggle()).toBe(false);
+
+    globalThis.window.api = { platform: "linux", versions: {} };
+    expect(hasToggle()).toBe(true);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test("toggle keep screen awake command inverts the persisted config flag", async () => {
-  let keepScreenAwake = false;
-  const updateKeepScreenAwake = mock((input: { enabled: boolean }) => {
-    keepScreenAwake = input.enabled;
-    return Promise.resolve();
-  });
-  const actions = getActions({
-    api: createTestApiClient({
-      config: {
-        getConfig: () => Promise.resolve(createTestConfig({ keepScreenAwake })),
-        updateKeepScreenAwake,
-      },
-    }),
-  });
-  const toggleAction = actions.find((a) => a.id === "settings:toggle-keep-screen-awake");
+  const originalWindow = globalThis.window;
+  globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+  globalThis.window.api = { platform: "linux", versions: {} };
+  try {
+    let keepScreenAwake = false;
+    const updateKeepScreenAwake = mock((input: { enabled: boolean }) => {
+      keepScreenAwake = input.enabled;
+      return Promise.resolve();
+    });
+    const actions = getActions({
+      api: createTestApiClient({
+        config: {
+          getConfig: () => Promise.resolve(createTestConfig({ keepScreenAwake })),
+          updateKeepScreenAwake,
+        },
+      }),
+    });
+    const toggleAction = actions.find((a) => a.id === "settings:toggle-keep-screen-awake");
 
-  expect(toggleAction).toBeDefined();
-  await toggleAction!.run();
-  expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: true });
+    expect(toggleAction).toBeDefined();
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: true });
 
-  // Reads the current backend value each time instead of tracking local state.
-  await toggleAction!.run();
-  expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: false });
-  expect(keepScreenAwake).toBe(false);
+    // Reads the current backend value each time instead of tracking local state.
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: false });
+    expect(keepScreenAwake).toBe(false);
+  } finally {
+    globalThis.window = originalWindow;
+  }
 });
 
 test("analytics rebuild command calls route and dispatches toast feedback", async () => {

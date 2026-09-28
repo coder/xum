@@ -9,7 +9,7 @@ import {
   type SSHRuntimeConfig,
 } from "./sshConnectionPool";
 
-// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.5), which implements this.
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("sshConnectionPool", () => {

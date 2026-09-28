@@ -9,9 +9,10 @@ import {
   loadTokenizerModules,
   type Tokenizer,
 } from "./tokenizer";
-import type { CountTokensBatchInput } from "./tokenizer.worker";
+import type { CountTokensBatchInput, EncodingName } from "./tokenizer.worker";
 import * as workerPool from "./workerPool";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_MODEL, DEFAULT_WARM_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
+import { Tokenizer as AiTokenizer, models, type Encoding } from "ai-tokenizer";
 
 jest.setTimeout(20000);
 
@@ -50,8 +51,8 @@ async function countOneAtATime(tokenizer: Tokenizer, texts: string[]): Promise<n
 
 function postedBatches(runSpy: { mock: { calls: unknown[][] } }): string[][] {
   return runSpy.mock.calls
-    .filter(([taskName]) => taskName === "countTokensBatch")
-    .map(([, payload]) => (payload as CountTokensBatchInput).inputs);
+    .filter(([, taskName]) => taskName === "countTokensBatch")
+    .map(([, , payload]) => (payload as CountTokensBatchInput).inputs);
 }
 
 // Seeded so a failure reproduces; mixes the shapes real chats contain.
@@ -269,5 +270,122 @@ describe("tokenizer", () => {
     await expect(
       getToolDefinitionTokens("google_search", "google:gemini-3.5-flash", undefined, undefined)
     ).resolves.toBe(50);
+  });
+
+  describe("per-encoding workers (#4816)", () => {
+    // Shapes where BPE merges, byte fallback and pre-tokenization differ most between encodings.
+    const corpus = [
+      "",
+      "The quick brown fox jumps over the lazy dog. It's 3:45pm, isn't it?",
+      "function add(a, b) {\n    if (a == null) {\n\t\treturn b;\n    }\n    return a + b;\n}\n",
+      "漢字とひらがなとカタカナ、한국어 텍스트, 中文句子。",
+      "👩‍👩‍👧‍👦 👨🏽‍💻 🏳️‍🌈 🙂🙃",
+      "e\u0301 a\u0308 n\u0303 Z\u0351\u0334\u0353a\u0337\u0348l\u0335go",
+      "مرحبا بالعالم — שלום עולם",
+      "31415926535897932384626433832795028841971693993751058209749445923078164062862",
+      "123e4567-e89b-12d3-a456-426614174000",
+      Buffer.from(Array.from({ length: 1536 }, (_, i) => (i * 7919) % 256)).toString("base64"),
+      "a   b\t\t\tc\n\n\n\n        d      ",
+      "<|endoftext|> <|fim_prefix|>x<|fim_suffix|>y<|fim_middle|> <|im_start|>",
+      "Repeated sentence number one, with punctuation; and more words. ".repeat(800),
+    ];
+
+    test("counts match the pre-change all-encodings construction for every encoding", async () => {
+      // Oracle: exactly what the single worker built before #4816 (the barrel's encoding object).
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- the oracle needs the barrel that product code must not load
+      const barrel = require("ai-tokenizer/encoding") as Record<EncodingName, Encoding>;
+      const oracles = new Map<string, AiTokenizer>();
+
+      // One id per encoding from ai-tokenizer's own table (key "a/b" is the id "a:b"), so
+      // cl100k_base and p50k_base are covered even though no provider fallback reaches them.
+      const perEncoding = new Map<string, string>();
+      for (const [key, model] of Object.entries(models)) {
+        if (!perEncoding.has(model.encoding)) {
+          perEncoding.set(model.encoding, key.replace("/", ":"));
+        }
+      }
+      const ids = [
+        ...DEFAULT_WARM_MODELS,
+        "anthropic:claude-sonnet-4-5",
+        "google:gemini-unknown-test-model",
+        "github-copilot:claude-sonnet-4.5",
+        "github-copilot:gpt-4.1",
+        ...perEncoding.values(),
+      ];
+
+      const covered = new Set<string>();
+      for (const id of ids) {
+        __resetTokenizerForTests();
+        const tokenizer = await realTokenizer(id);
+        const encoding = tokenizer.encoding as EncodingName;
+        const expectedEncoding = [...perEncoding].find(([, perId]) => perId === id)?.[0];
+        if (expectedEncoding !== undefined) {
+          expect({ id, encoding }).toEqual({ id, encoding: expectedEncoding });
+        }
+        covered.add(encoding);
+
+        let oracle = oracles.get(encoding);
+        if (!oracle) {
+          expect(barrel[encoding]).toBeDefined();
+          oracle = new AiTokenizer(barrel[encoding]);
+          oracles.set(encoding, oracle);
+        }
+        const expected = corpus.map((text) => oracle.encode(text, [], []).length);
+        const actual = await Promise.all(corpus.map((text) => tokenizer.countTokens(text)));
+        expect({ id, counts: actual }).toEqual({ id, counts: expected });
+      }
+
+      expect([...covered].sort()).toEqual(["cl100k_base", "claude", "o200k_base", "p50k_base"]);
+    }, 120_000);
+
+    describe("loadTokenizerModules", () => {
+      let previousForceReal: string | undefined;
+      beforeEach(() => {
+        previousForceReal = process.env.XUM_FORCE_REAL_TOKENIZER;
+        process.env.XUM_FORCE_REAL_TOKENIZER = "1";
+      });
+      afterEach(() => {
+        if (previousForceReal === undefined) {
+          delete process.env.XUM_FORCE_REAL_TOKENIZER;
+        } else {
+          process.env.XUM_FORCE_REAL_TOKENIZER = previousForceReal;
+        }
+      });
+
+      test("resolves ids like counting does, so provider fallbacks warm their encoding", async () => {
+        // No tokenizer override and no "anthropic/claude-sonnet-4-5" entry: counting falls back
+        // to anthropic/claude-sonnet-4.5, and warm-up must build that same tokenizer.
+        expect(await loadTokenizerModules(["anthropic:claude-sonnet-4-5"])).toEqual([
+          { status: "fulfilled", value: "claude" },
+        ]);
+      }, 120_000);
+
+      test("a bad id rejects only its own entry", async () => {
+        const results = await loadTokenizerModules(["", DEFAULT_MODEL]);
+        expect(results.map((result) => result.status)).toEqual(["rejected", "fulfilled"]);
+        expect(results[1]).toEqual({ status: "fulfilled", value: "claude" });
+      }, 120_000);
+
+      test("the default warm set warms the default model's encoding", async () => {
+        const results = await loadTokenizerModules();
+        expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+        const warmed = new Set(
+          results.map((result) => (result.status === "fulfilled" ? result.value : ""))
+        );
+        expect(warmed.has((await realTokenizer(DEFAULT_MODEL)).encoding)).toBe(true);
+      }, 120_000);
+    });
+
+    test("a worker that fails to start fails only its own encoding's requests", async () => {
+      // A worker dies at startup when workerData names no loader; that is the only failure the
+      // pool can provoke without a test-only hook.
+      const broken = "not-an-encoding" as EncodingName;
+      await expect(workerPool.run(broken, "ready", "x")).rejects.toThrow("workerData.encoding");
+      // Later calls reject at once instead of posting to the dead worker (or hanging).
+      await expect(workerPool.run(broken, "ready", "x")).rejects.toThrow("workerData.encoding");
+
+      const tokenizer = await realTokenizer(DEFAULT_MODEL);
+      expect(await tokenizer.countTokens("hello world")).toBeGreaterThan(0);
+    }, 120_000);
   });
 });

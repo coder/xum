@@ -31,7 +31,8 @@ export PATH="${BUN_INSTALL}/bin:${PATH}"
 
 if ! command -v bun >/dev/null 2>&1; then
   log "installing bun"
-  curl -fsSL "${MUX_BUN_INSTALL_URL:-https://bun.sh/install}" | bash
+  # Pin the repo's Bun (package.json packageManager); an unpinned install floats to the latest major.
+  curl -fsSL "${MUX_BUN_INSTALL_URL:-https://bun.sh/install}" | bash -s "bun-v1.3.12"
 fi
 
 MUX_APP_ROOT="${MUX_APP_ROOT:-/opt/mux-app}"

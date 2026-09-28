@@ -19,6 +19,7 @@ import {
   getValidAgentPeerMessageMeta,
   getValidAgentPeerTriggerMeta,
   parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
@@ -290,6 +291,23 @@ function getValidAgentPeerMessage(
   return meta;
 }
 
+/**
+ * Validated attribution of a peer-message wake trigger row, or null. SECURITY/self-healing:
+ * requires synthetic provenance AND validated attribution — a corrupted human user row wearing
+ * peer metadata must keep ordinary rendering, not be disguised as (or folded into) a machine
+ * notification. When the recipient is executing a delegated workspace turn, the trigger carries
+ * that turn's correlation metadata with the attribution nested on it.
+ */
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
+  const muxMeta = message.metadata.muxMetadata;
+  if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
+  if (muxMeta?.type === "workspace-turn-task") {
+    return getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger);
+  }
+  return null;
+}
+
 function getRawCommand(muxMetadata: unknown): string | undefined {
   if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
     return undefined;
@@ -320,6 +338,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -413,19 +432,14 @@ function buildUserDisplayedMessages(options: {
             }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
-      // navigation skips it (the envelope payload itself is a separate assistant row). When the
-      // recipient is executing a delegated workspace turn, the trigger carries that turn's
-      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
-      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
-      // human user row wearing peer metadata must fall back to ordinary rendering, not be
-      // disguised as a machine notification hidden from prompt navigation.
-      agentPeerMessageTrigger:
-        message.metadata?.synthetic === true &&
-        (muxMeta?.type === "agent-peer-message"
-          ? getValidAgentPeerMessageMeta(muxMeta) != null
-          : muxMeta?.type === "workspace-turn-task" &&
-            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
-          ? true
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
           : undefined,
     },
   ];

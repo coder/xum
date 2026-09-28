@@ -1731,22 +1731,27 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
   ]);
 
-  // Keyboard route for the Settings → General → System switch.
-  actions.push(() => [
-    {
-      id: CommandIds.settingsToggleKeepScreenAwake(),
-      title: "Toggle Keep Screen Awake",
-      subtitle: "Prevent display sleep while agents are working (desktop app only)",
-      section: section.settings,
-      keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
-      run: async () => {
-        if (!p.api) return;
-        // The flag lives in config.json (not localStorage), so read the current value first.
-        const cfg = await p.api.config.getConfig();
-        await p.api.config.updateKeepScreenAwake({ enabled: !cfg.keepScreenAwake });
-      },
-    },
-  ]);
+  // Keyboard route for the Settings → General → System switch. Like that switch, it only
+  // exists in the Electron app (window.api is set by the preload), where the blocker runs.
+  actions.push(() =>
+    typeof window === "undefined" || !window.api
+      ? []
+      : [
+          {
+            id: CommandIds.settingsToggleKeepScreenAwake(),
+            title: "Toggle Keep Screen Awake",
+            subtitle: "Prevent display sleep while agents are working",
+            section: section.settings,
+            keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
+            run: async () => {
+              if (!p.api) return;
+              // The flag lives in config.json (not localStorage), so read the current value first.
+              const cfg = await p.api.config.getConfig();
+              await p.api.config.updateKeepScreenAwake({ enabled: !cfg.keepScreenAwake });
+            },
+          },
+        ]
+  );
 
   // Settings
   if (p.onOpenSettings) {

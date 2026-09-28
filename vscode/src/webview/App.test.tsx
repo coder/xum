@@ -486,6 +486,193 @@ describe("vscode webview workspace selection", () => {
   });
 });
 
+// #4971: the webview renders the desktop turn-status barrier and jump-to-bottom pill.
+describe("vscode webview turn status and jump to bottom (#4971)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const startStream = (bridge: TestBridge) =>
+    bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: {
+        type: "stream-start",
+        workspaceId: WORKSPACE.id,
+        messageId: "a1",
+        model: "anthropic:claude-sonnet-4-5",
+        historySequence: 1,
+        startTime: 1,
+      },
+    });
+
+  // Stop and Esc share one interrupt path; both must reach the host and mark the stream.
+  const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
+    ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
+    ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
+    [
+      "Esc in the composer",
+      (view) => {
+        const textarea = view.container.querySelector("textarea");
+        if (!textarea) throw new Error("composer textarea did not render");
+        fireEvent.keyDown(textarea, { key: "Escape" });
+      },
+    ],
+  ];
+  for (const [name, trigger] of interruptTriggers) {
+    test(`${name} interrupts the stream through the host and shows interrupting`, async () => {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge);
+      await startStream(bridge);
+
+      await act(async () => {
+        trigger(view);
+        await Promise.resolve();
+      });
+
+      const calls = bridge.orpcCalls("workspace.interruptStream");
+      expect(calls).toHaveLength(1);
+      // User-Stop semantics, as desktop stopStream sends them.
+      expect(calls[0].input).toEqual({
+        workspaceId: WORKSPACE.id,
+        options: { disableAutoRetry: true, retireBashMonitorAttention: true },
+      });
+      expect(view.container.textContent).toContain("interrupting...");
+
+      // A Stop the backend refused is reported, not shown as success.
+      await bridge.answer("workspace.interruptStream", { success: false, error: "stop refused" });
+      expect(view.container.textContent).toContain("Failed to interrupt stream. (stop refused)");
+    });
+  }
+
+  test("Esc in a text field outside the composer does not interrupt", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await startStream(bridge);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+      await Promise.resolve();
+    });
+
+    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(0);
+    input.remove();
+  });
+
+  test("Esc stops a turn that is still starting, like its Stop button", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: {
+        type: "stream-lifecycle",
+        workspaceId: WORKSPACE.id,
+        phase: "preparing",
+        hadAnyOutput: false,
+      },
+    });
+    expect(view.getByRole("button", { name: "Stop streaming" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await Promise.resolve();
+    });
+
+    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(1);
+  });
+
+  test("an armed monitor with no stream shows the waiting status until it disarms or the workspace changes", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    const waiting = "Waiting on background bash monitor...";
+    const activity = (workspaceId: string, activeBashMonitorCount: number) =>
+      bridge.emit({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
+
+    await activity(WORKSPACE.id, 1);
+    expect(view.container.textContent).toContain(waiting);
+    expect(view.queryByRole("button", { name: "Stop streaming" })).toBeNull();
+
+    // A resubscribe to the same workspace keeps the count until the host sends a new one.
+    await bridge.emit({ type: "chatReset", workspaceId: WORKSPACE.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+    expect(view.container.textContent).toContain(waiting);
+
+    await activity(WORKSPACE.id, 0);
+    expect(view.container.textContent).not.toContain(waiting);
+
+    // A count left from the previous workspace must not show on the next one.
+    await activity(WORKSPACE.id, 1);
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await bridge.emit({ type: "chatReset", workspaceId: other.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: other.id, event: { type: "caught-up" } });
+    expect(view.container.textContent).not.toContain(waiting);
+    // Late activity for the old workspace is ignored.
+    await activity(WORKSPACE.id, 1);
+    expect(view.container.textContent).not.toContain(waiting);
+  });
+
+  test("scrolling up shows Jump to bottom; the pill and Shift+G return to the bottom, typing Shift+G does not", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+
+    const sentinel = view.getByTestId("transcript-bottom-sentinel");
+    const scrollport = sentinel.parentElement as HTMLElement;
+    const content = scrollport.firstElementChild as HTMLElement;
+    const scrollUp = () =>
+      act(async () => {
+        setScrollGeometry(scrollport, { scrollTop: 800 });
+        fireEvent.scroll(scrollport);
+        fireEvent.wheel(scrollport, { deltaY: -120 });
+        setScrollGeometry(scrollport, { scrollTop: 300 });
+        fireEvent.scroll(scrollport);
+        await Promise.resolve();
+      });
+    const pressShiftG = (target: Element) =>
+      act(async () => {
+        fireEvent.keyDown(target, { key: "G", shiftKey: true });
+        await Promise.resolve();
+      });
+
+    expect(view.queryByRole("button", { name: /Jump to bottom/ })).toBeNull();
+
+    await scrollUp();
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Jump to bottom/ }));
+      await Promise.resolve();
+    });
+    expect(content.style.overflowAnchor).toBe("none");
+    expect(view.queryByRole("button", { name: /Jump to bottom/ })).toBeNull();
+
+    await scrollUp();
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await pressShiftG(textarea);
+    expect(view.queryByRole("button", { name: /Jump to bottom/ })).not.toBeNull();
+
+    await pressShiftG(document.body);
+    expect(content.style.overflowAnchor).toBe("none");
+    expect(view.queryByRole("button", { name: /Jump to bottom/ })).toBeNull();
+  });
+});
+
 // #4755: the webview never loads the workspace's AI settings, so a send must not persist its local
 // defaults onto the workspace.
 describe("vscode webview held inputs (#4771)", () => {

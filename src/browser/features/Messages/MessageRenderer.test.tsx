@@ -973,9 +973,8 @@ describe("MessageRenderer agent peer message rows", () => {
       </TooltipProvider>
     );
 
-    // Collapsed: attribution and relationship visible, body and raw envelope hidden.
+    // Collapsed: attribution visible, body and raw envelope hidden.
     expect(getByText("Message from Watcher")).toBeDefined();
-    expect(getByText("sibling")).toBeDefined();
     expect(queryByText(/re-run/)).toBeNull();
     expect(queryByText(/mux_agent_message/)).toBeNull();
 

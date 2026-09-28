@@ -9635,10 +9635,12 @@ export class TaskService implements AgentTaskIntegration {
       };
       // Bare attribution (no discriminator) — carried on workspace-turn correlated triggers so
       // correlation stripping can downgrade the row to plain peer metadata (see message.ts).
+      // payloadMessageId lets the transcript fold the trigger into the payload card.
       const peerTriggerMeta: AgentPeerMessageMeta = {
         fromWorkspaceId: senderWorkspaceId,
         ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
         relationship,
+        payloadMessageId,
       };
       // SECURITY: same assistant-row/fixed-trigger separation as the family-message paths above —
       // sending the envelope as the message TEXT persisted it as a USER row, promoting
@@ -9668,7 +9670,7 @@ export class TaskService implements AgentTaskIntegration {
       const triggerMuxMetadata: MuxMessageMetadata =
         workspaceTurnMuxMetadata != null
           ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: peerTriggerMeta }
-          : muxMetadata;
+          : { type: "agent-peer-message", ...peerTriggerMeta };
 
       let sendOptions: SendMessageOptions;
       if (relation === "target_ancestor") {

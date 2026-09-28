@@ -11,6 +11,8 @@ import {
 } from "./Runtime";
 import { ssh2ConnectionPool } from "./SSH2ConnectionPool";
 import { SSHRuntime } from "./SSHRuntime";
+import { DockerRuntime } from "./DockerRuntime";
+import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { SSHRuntimeConfig } from "./sshConnectionPool";
 import { TestRemoteRuntime } from "./testRemoteRuntime";
 import { createSSHTransport, type SSHTransport } from "./transports";
@@ -134,6 +136,72 @@ describe("read failure vs positive absence", () => {
 
   it("keeps transport failures in the read-failure class", async () => {
     const errors = await failures(new StubbedSSHRuntime([REFUSED, 255]), false);
+    expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
+  });
+});
+
+// #4828: a docker/devcontainer exec that never reached the container (stopped,
+// paused, removed, daemon down) is a transport failure too. Stderr samples were
+// captured from docker 27.5.1 and devcontainer CLI 0.87.0; all of them exit 1.
+describe("container exec failures", () => {
+  class StubbedDockerRuntime extends DockerRuntime {
+    constructor(private readonly result: [stderr: string, exitCode: number]) {
+      super({ image: "alpine:3", containerName: "ws" });
+    }
+    override exec(): Promise<ExecStream> {
+      return Promise.resolve(execResult(...this.result));
+    }
+  }
+  class StubbedDevcontainerRuntime extends DevcontainerRuntime {
+    constructor(private readonly result: [stderr: string, exitCode: number]) {
+      super({ srcBaseDir: "/tmp/mux", configPath: ".devcontainer/devcontainer.json" });
+    }
+    override exec(): Promise<ExecStream> {
+      return Promise.resolve(execResult(...this.result));
+    }
+  }
+  const unavailable = [
+    "Error response from daemon: container d5b714b147cb is not running\n",
+    "Error response from daemon: Container ws is paused, unpause the container before exec\n",
+    "Error response from daemon: No such container: ws\n",
+    "Cannot connect to the Docker daemon at unix:///tmp/nope.sock. Is the docker daemon running?\n",
+    // Docker Desktop stopped on Windows (wording from docker/for-win#13137; not measured here).
+    'error during connect: This error may indicate that the docker daemon is not running.: Get "http:////./pipe/docker_engine/v1.24/containers/json": open //./pipe/docker_engine: The system cannot find the file specified.\n',
+  ];
+  const devcontainerUnavailable = [
+    "Shell server terminated (code: 1, signal: null)\n\n" + unavailable[0],
+    "[2026-09-28T07:09:47.831Z] Error: Dev container not found.\n    at Ng (devContainersSpecCLI.js:473:1096)\n",
+  ];
+  const transport = async (runtime: Probed) =>
+    (await failures(runtime, false)).map((error) => isRuntimeTransportError(error));
+
+  it("classifies an unavailable container as transport on reads and stats", async () => {
+    for (const stderr of unavailable) {
+      expect(await transport(new StubbedDockerRuntime([stderr, 1]))).toEqual([true, true]);
+    }
+    for (const stderr of [...unavailable, ...devcontainerUnavailable]) {
+      expect(await transport(new StubbedDevcontainerRuntime([stderr, 1]))).toEqual([true, true]);
+    }
+    // An unresponsive daemon/CLI hits the probe deadline, often with empty stderr.
+    expect(await transport(new StubbedDockerRuntime(["", EXIT_CODE_TIMEOUT]))).toEqual([
+      true,
+      true,
+    ]);
+    expect(await transport(new StubbedDevcontainerRuntime(["", EXIT_CODE_TIMEOUT]))).toEqual([
+      true,
+      true,
+    ]);
+  });
+
+  it("keeps a missing file and an unstartable exec out of the transport class", async () => {
+    const missing = "cat: can't open '/remote/AGENTS.md': No such file or directory\n";
+    expect(await transport(new StubbedDockerRuntime([missing, 1]))).toEqual([false, false]);
+    expect(await transport(new StubbedDevcontainerRuntime([missing, 1]))).toEqual([false, false]);
+    // No bash in the image: retrying cannot fix it, so it stays a (loud) read failure.
+    const noBash =
+      'OCI runtime exec failed: exec failed: unable to start container process: exec: "bash": executable file not found in $PATH: unknown\n';
+    const errors = await failures(new StubbedDockerRuntime([noBash, 126]), false);
+    expect(errors.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
     expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
   });
 });

@@ -497,6 +497,7 @@ describe("TaskService", () => {
           fromWorkspaceId?: string;
           fromTitle?: string;
           relationship?: string;
+          payloadMessageId?: string;
         };
       },
       {
@@ -527,7 +528,15 @@ describe("TaskService", () => {
     expect(options.model).toBe("openai:gpt-5.2");
     expect(options.agentId).toBe("explore");
     expect(options.queueDispatchMode).toBe("tool-end");
+    // The trigger names its payload row so the transcript can fold the two into one card.
     expect(options.muxMetadata).toEqual({
+      type: "agent-peer-message",
+      fromWorkspaceId: "sib-a",
+      fromTitle: "Watcher A",
+      relationship: "sibling",
+      payloadMessageId: payloadRow!.id,
+    });
+    expect(payloadRow?.metadata?.muxMetadata).toEqual({
       type: "agent-peer-message",
       fromWorkspaceId: "sib-a",
       fromTitle: "Watcher A",
@@ -1594,7 +1603,11 @@ describe("TaskService", () => {
           type: "workspace-turn-task",
           taskHandleId: "wst_live",
           ownerWorkspaceId: "foreign-root",
-          agentPeerMessageTrigger: { relationship: "unrelated", fromWorkspaceId: "sender" },
+          agentPeerMessageTrigger: {
+            relationship: "unrelated",
+            fromWorkspaceId: "sender",
+            payloadMessageId: internal?.preTurnMessages?.[0]?.id,
+          },
         },
       });
       expect(internal?.workspaceTurnContinuation).toBe(true);

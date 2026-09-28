@@ -106,7 +106,7 @@ function createBridgeServer(
   });
 }
 
-type MockClientSocket = Pick<WebSocket, "readyState" | "close" | "terminate"> & {
+type MockClientSocket = Pick<WebSocket, "readyState" | "close" | "terminate" | "on" | "off"> & {
   close: ReturnType<typeof mock>;
   terminate: ReturnType<typeof mock>;
 };
@@ -127,6 +127,8 @@ function createMockClientSocket(): MockClientSocket {
     readyState: WebSocket.OPEN,
     close: mock(),
     terminate: mock(),
+    on: mock(),
+    off: mock(),
   };
 }
 
@@ -286,6 +288,38 @@ describe("BrowserBridgeServer", () => {
       await upgradeHarness.close();
       await bridgeServer.stop();
       await upstreamHarness.close();
+    }
+  });
+
+  test("closes a client that queues too much input before the upstream connects", async () => {
+    let releaseSession: (value: null) => void = () => undefined;
+    const bridgeServer = createBridgeServer({
+      // Hold session discovery so client frames stay queued.
+      getSessionConnection: mock(
+        () =>
+          new Promise<null>((resolve) => {
+            releaseSession = resolve;
+          })
+      ),
+    });
+    const clientSocket = new MockBridgeClientSocket();
+    const bridgeServerPrivate = bridgeServer as unknown as BrowserBridgeServerPrivate;
+
+    try {
+      const setup = bridgeServerPrivate.handleUpgradedConnection(
+        clientSocket as unknown as WebSocket,
+        { url: `/?token=${VALID_TOKEN}` } as IncomingMessage
+      );
+      const chunk = Buffer.alloc(600 * 1024, 1);
+      clientSocket.emit("message", chunk, true);
+      expect(clientSocket.close).not.toHaveBeenCalled();
+      clientSocket.emit("message", chunk, true);
+      expect(clientSocket.close).toHaveBeenCalledWith(1009, "too much input before bridge ready");
+
+      releaseSession(null);
+      await setup;
+    } finally {
+      await bridgeServer.stop();
     }
   });
 

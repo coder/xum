@@ -203,6 +203,8 @@ interface RenderGeneralSectionOptions {
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   chatTranscriptFullWidth?: boolean;
   keepScreenAwake?: boolean;
+  /** Render as the Electron app (window.api set by the preload) instead of browser mode. */
+  desktop?: boolean;
   localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
@@ -389,6 +391,7 @@ describe("GeneralSection", () => {
       options.backendOverrides
     );
     mockApi = setup.api;
+    if (options.desktop) window.api = { platform: "linux", versions: {} };
 
     const view = render(
       <TestProviders>
@@ -700,8 +703,19 @@ describe("GeneralSection", () => {
     });
   });
 
+  test("shows the keep screen awake toggle only in the desktop app", async () => {
+    const browser = renderGeneralSection();
+    await settleMountLoads(browser);
+    expect(browser.view.queryByText("Keep screen awake while agents are working")).toBeNull();
+    browser.view.unmount();
+
+    const desktop = renderGeneralSection({ desktop: true });
+    await settleMountLoads(desktop);
+    expect(desktop.view.getByText("Keep screen awake while agents are working")).toBeTruthy();
+  });
+
   test("loads and persists the keep screen awake toggle", async () => {
-    const setup = renderGeneralSection({ keepScreenAwake: true });
+    const setup = renderGeneralSection({ desktop: true, keepScreenAwake: true });
     const { updateKeepScreenAwakeMock, view } = setup;
 
     const toggle = view.getByRole("switch", {
@@ -719,7 +733,10 @@ describe("GeneralSection", () => {
   });
 
   test.each([true, false])("reverts a rejected keep-awake save from %s", async (saved) => {
-    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({ keepScreenAwake: saved });
+    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: saved,
+    });
     const toggle = view.getByRole("switch", {
       name: "Toggle keep screen awake while agents are working",
     });
@@ -738,7 +755,10 @@ describe("GeneralSection", () => {
   test.each([true, false])(
     "rolls rapid keep-awake toggles back to the confirmed value (first save succeeds: %s)",
     async (firstSucceeds) => {
-      const { updateKeepScreenAwakeMock, view } = renderGeneralSection({ keepScreenAwake: true });
+      const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+        desktop: true,
+        keepScreenAwake: true,
+      });
       const toggle = view.getByRole("switch", {
         name: "Toggle keep screen awake while agents are working",
       });
@@ -772,7 +792,10 @@ describe("GeneralSection", () => {
 
   test("follows keep-awake changes made outside the mounted section", async () => {
     // e.g. the "Toggle Keep Screen Awake" palette command runs while Settings is open.
-    const { config, emitConfigChanged, view } = renderGeneralSection({ keepScreenAwake: false });
+    const { config, emitConfigChanged, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
     const toggle = view.getByRole("switch", {
       name: "Toggle keep screen awake while agents are working",
     });
@@ -789,6 +812,7 @@ describe("GeneralSection", () => {
 
   test("an external config change does not override an in-flight keep-awake save", async () => {
     const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
       keepScreenAwake: false,
     });
     const toggle = view.getByRole("switch", {
@@ -820,6 +844,7 @@ describe("GeneralSection", () => {
 
   test("replays an external keep-awake change that landed during a local save", async () => {
     const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
       keepScreenAwake: false,
     });
     const toggle = view.getByRole("switch", {
