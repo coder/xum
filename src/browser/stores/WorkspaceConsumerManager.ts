@@ -34,8 +34,7 @@ async function calculateTokenStatsLatest(workspaceId: string, model: string): Pr
   }
 }
 
-// After this long, log that a calculation is slow. This is only a warning: the backend
-// keeps computing and persists the newest result, so the renderer keeps waiting for it (#4815).
+// Log a warning when a calculation runs longer than this. It is not a timeout (#4815).
 const SLOW_CALCULATION_WARNING_MS = 60_000;
 
 /**
@@ -232,10 +231,9 @@ export class WorkspaceConsumerManager {
           return;
         }
 
-        // Do not abandon a slow request. Backend calculations never join and only the newest
-        // one persists, so giving up here left the Stats tab empty while the result landed on
-        // disk unseen (#4815). A retry would supersede the running request and slow things
-        // down further, so just warn and keep waiting; the UI stays "Calculating...".
+        // Never abandon a slow request: backend calculations do not join and only the newest
+        // one persists, so giving up would leave the Stats tab empty while the result lands on
+        // disk unseen (#4815). A retry would supersede the running request, so only warn.
         const slowWarningTimer = setTimeout(() => {
           console.warn(
             `[WorkspaceConsumerManager] Calculation for ${workspaceId} is still running after ${SLOW_CALCULATION_WARNING_MS}ms; still waiting for it.`

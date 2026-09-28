@@ -41,22 +41,6 @@ function toCachedState(stats: ChatStats) {
 
 const EMPTY_STATE = { consumers: [], tokenizerName: "", totalTokens: 0, isCalculating: false };
 
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (error: unknown) => void;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 // Under fake timers the setTimeout-based waitForCalculation never advances, so settle
 // promise chains (RPC client wrappers, async handlers, queueMicrotask notifications) instead.
 async function flushMicrotasks() {
@@ -139,13 +123,16 @@ describe("WorkspaceConsumerManager", () => {
   // #4815: the backend keeps computing (and persists the result) after the renderer's
   // slow-calculation point, so the renderer must keep waiting and show the late result.
   describe("calculations slower than the warning threshold", () => {
-    let requests: Array<{ workspaceId: string; deferred: Deferred<ChatStats> }>;
+    let requests: Array<{
+      workspaceId: string;
+      deferred: ReturnType<typeof Promise.withResolvers<ChatStats>>;
+    }>;
 
     beforeEach(() => {
       fakeTimers.useFakeTimers();
       requests = [];
       calculateStats.mockImplementation((input: unknown) => {
-        const deferred = createDeferred<ChatStats>();
+        const deferred = Promise.withResolvers<ChatStats>();
         requests.push({ workspaceId: (input as { workspaceId: string }).workspaceId, deferred });
         return deferred.promise;
       });
