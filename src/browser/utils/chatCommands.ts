@@ -37,6 +37,7 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import {
   formatCompactionCommandLine,
@@ -127,6 +128,12 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  // The backend copies the source's draft file into the fork: save the latest (debounced) edit
+  // first. A failed save does not block the fork, which then copies the last saved draft; the
+  // source keeps the change and retries it.
+  await getDraftStore()
+    .flush({ kind: "workspace", workspaceId: options.sourceWorkspaceId })
+    .catch((error: unknown) => console.warn("Failed to save the draft before forking:", error));
   const result = await client.workspace.fork({
     sourceWorkspaceId: options.sourceWorkspaceId,
     newName: options.newName,
