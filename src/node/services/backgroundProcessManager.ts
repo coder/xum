@@ -161,17 +161,18 @@ async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
   try {
     // Regular files only (lstat): never follow a symlink planted in the shared temp records
     // root, and never block on a FIFO while holding the spawn-name lock.
-    const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
-    const metaStat = await fsPromises.lstat(nodePath.join(recordDir, BG_META_FILENAME));
-    if (!marker.isFile() || !metaStat.isFile()) return false;
+    const metaPath = nodePath.join(recordDir, BG_META_FILENAME);
+    if (!(await fsPromises.lstat(metaPath)).isFile()) return false;
+    const meta = parseSpawnRecordMeta(await fsPromises.readFile(metaPath, "utf-8"));
+    if (meta == null || meta.status === "running") return false;
     // meta.json is rewritten when the owner observes the exit (getProcess, list, monitor), which
     // may be long after the marker was written and just before it reads the output: age both.
+    // Stat meta.json AFTER reading it, so a rewrite racing the read shows up as a fresh mtime.
+    const metaStat = await fsPromises.lstat(metaPath);
+    const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
+    if (!marker.isFile() || !metaStat.isFile()) return false;
     const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
     if (Date.now() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
-    const meta = parseSpawnRecordMeta(
-      await fsPromises.readFile(nodePath.join(recordDir, BG_META_FILENAME), "utf-8")
-    );
-    if (meta == null || meta.status === "running") return false;
     await fsPromises.rm(recordDir, { recursive: true });
     return true;
   } catch (error) {

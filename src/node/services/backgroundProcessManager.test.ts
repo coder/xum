@@ -3947,6 +3947,35 @@ describe("BackgroundProcessManager", () => {
       expect(await fs.readFile(markerPath, "utf-8")).toBe("0");
     });
 
+    it("keeps a record whose owner records the exit while the probe reads meta.json", async () => {
+      await writeSpawnRecord("dev", { pid: 999_999, status: "running" }, { exitCode: "0" });
+      const metaPath = path.join(workspaceDir, "dev", "meta.json");
+      for (const file of ["exit_code", "meta.json"]) {
+        await fs.utimes(path.join(workspaceDir, "dev", file), settledLongAgo, settledLongAgo);
+      }
+      // The owner observes the old exit and rewrites meta.json right as the probe reads it.
+      const realReadFile = fs.readFile;
+      const readSpy = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fs.readFile>
+      ) => {
+        if (args[0] === metaPath) {
+          await fs.writeFile(metaPath, JSON.stringify({ pid: 999_999, status: "exited" }));
+        }
+        return realReadFile(...args);
+      }) as typeof fs.readFile);
+      try {
+        const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+          cwd: process.cwd(),
+          displayName: "dev",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.processId).toBe("dev (2)");
+      } finally {
+        readSpy.mockRestore();
+      }
+    });
+
     it("keeps an old settled record whose meta.json still reads running", async () => {
       // The exit marker is there, but the owning backend has not observed the exit yet (its
       // in-memory status is still running), so its later terminate() would write exit_code
