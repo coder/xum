@@ -371,8 +371,8 @@ describe("vscode webview workspace selection", () => {
     expect(view.container.textContent).toContain("compiling step one");
     expect(view.container.textContent).toContain("warning: slow disk");
 
-    // A newly selected workspace must not show the previous workspace's live output.
-    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    // A resubscription (chatReset + replay) must not show the previous feed's live output.
+    await bridge.emit({ type: "chatReset", workspaceId: WORKSPACE.id });
     await bridge.emit({
       type: "chatEvent",
       workspaceId: WORKSPACE.id,
@@ -410,6 +410,34 @@ describe("vscode webview workspace selection", () => {
     }
     expect(view.container.textContent).toContain("fresh line");
     expect(view.container.textContent).not.toContain("compiling step one");
+  });
+
+  test("reselecting the current workspace keeps the transcript; selecting another clears it (#4949)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "m1",
+        1,
+        "bash",
+        { script: "echo kept", timeout_secs: 5, display_name: "Probe" },
+        { success: true, output: "kept", exitCode: 0, wall_duration_ms: 3 }
+      ),
+    ]);
+    const textarea = () => view.container.querySelector("textarea");
+    expect(view.container.textContent).toContain("echo kept");
+    expect(textarea()?.disabled).toBe(false);
+
+    // Clicking the selected row: the host re-posts the same selection, but its live
+    // subscription sends no chatReset or replay, so nothing would refill a cleared transcript.
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    expect(view.container.textContent).toContain("echo kept");
+    expect(textarea()?.disabled).toBe(false);
+
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    expect(view.container.textContent).not.toContain("echo kept");
   });
 
   test("keeps the composer disabled until the history replay catches up", async () => {
