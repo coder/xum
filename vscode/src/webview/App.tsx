@@ -33,6 +33,7 @@ import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
+import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
 
 import type {
   ExtensionToWebviewMessage,
@@ -47,6 +48,7 @@ import { VscodeStreamingBarrier } from "./StreamingBarrier";
 import { DisplayedMessageRenderer } from "./DisplayedMessageRenderer";
 import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
+import { WebviewLiveBashOutput } from "./liveBashOutput";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
@@ -170,6 +172,8 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [notices, setNotices] = useState<Notice[]>([]);
 
   const aggregatorRef = useRef<StreamingMessageAggregator | null>(null);
+  // Running bash cards read their live output here; the webview does not feed WorkspaceStore.
+  const [liveBashOutput] = useState(() => new WebviewLiveBashOutput());
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
@@ -331,6 +335,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           // switching workspaces (avoids showing stale messages for a new selection).
           cancelScheduledRender();
           aggregatorRef.current = null;
+          liveBashOutput.reset(msg.workspaceId);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -355,6 +360,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             msg.workspaceId,
             workspace?.unarchivedAt
           );
+          liveBashOutput.reset(msg.workspaceId);
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
@@ -388,6 +394,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             if (!replayState || replayState.workspaceId !== msg.workspaceId) {
               replayState = createChatReplayState(msg.workspaceId);
               chatReplayStateRef.current = replayState;
+              liveBashOutput.reset(msg.workspaceId);
               setTranscriptCaughtUp(false);
             }
 
@@ -439,6 +446,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               flushReplayBuffer();
             };
             const event = msg.event;
+            // The aggregator ignores bash-output; the live output feed takes it (and drops a
+            // tool's buffer once its tool-call-end carries the final output).
+            liveBashOutput.apply(msg.workspaceId, event);
 
             if (event.type === "caught-up") {
               flushReplayBuffer();
@@ -674,14 +684,16 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
                         {selectedWorkspaceId ? (
                           <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
-                            {displayedMessages.map((msg) => (
-                              <DisplayedMessageRenderer
-                                key={msg.id}
-                                message={msg}
-                                workspaceId={selectedWorkspaceId}
-                                isLatestProposePlan={msg.id === latestProposePlanId}
-                              />
-                            ))}
+                            <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
+                              {displayedMessages.map((msg) => (
+                                <DisplayedMessageRenderer
+                                  key={msg.id}
+                                  message={msg}
+                                  workspaceId={selectedWorkspaceId}
+                                  isLatestProposePlan={msg.id === latestProposePlanId}
+                                />
+                              ))}
+                            </LiveBashOutputSourceContext.Provider>
                             <VscodeStreamingBarrier
                               workspaceId={selectedWorkspaceId}
                               aggregator={aggregatorRef.current}

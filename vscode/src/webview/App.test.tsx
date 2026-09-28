@@ -281,6 +281,97 @@ describe("vscode webview workspace selection", () => {
     expect(view.container.textContent).toContain("Webview plan");
   });
 
+  test("a running bash card shows live output from bash-output events (#4750)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+
+    const chat = (event: Record<string, unknown>) =>
+      bridge.emit({
+        type: "chatEvent",
+        workspaceId: WORKSPACE.id,
+        event: { workspaceId: WORKSPACE.id, ...event },
+      });
+    await chat({
+      type: "stream-start",
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    await chat({
+      type: "tool-call-start",
+      messageId: "a1",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { script: "make build", timeout_secs: 60, display_name: "Build" },
+      tokens: 1,
+      timestamp: 2,
+    });
+    // Live output renders inside the expanded card.
+    await act(async () => {
+      fireEvent.click(view.getByText("make build"));
+      await Promise.resolve();
+    });
+    await chat({
+      type: "bash-output",
+      toolCallId: "call-1",
+      text: "compiling step one\n",
+      isError: false,
+      timestamp: 3,
+    });
+    await chat({
+      type: "bash-output",
+      toolCallId: "call-1",
+      text: "warning: slow disk\n",
+      isError: true,
+      timestamp: 4,
+    });
+
+    expect(view.container.textContent).toContain("compiling step one");
+    expect(view.container.textContent).toContain("warning: slow disk");
+
+    // A newly selected workspace must not show the previous workspace's live output.
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: { type: "caught-up" },
+    });
+    await chat({
+      type: "stream-start",
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    await chat({
+      type: "tool-call-start",
+      messageId: "a1",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { script: "make build", timeout_secs: 60, display_name: "Build" },
+      tokens: 1,
+      timestamp: 2,
+    });
+    await chat({
+      type: "bash-output",
+      toolCallId: "call-1",
+      text: "fresh line\n",
+      isError: false,
+      timestamp: 5,
+    });
+    // Expand the new card if the expansion preference did not carry over.
+    if (!view.container.textContent?.includes("fresh line")) {
+      await act(async () => {
+        fireEvent.click(view.getByText("make build"));
+        await Promise.resolve();
+      });
+    }
+    expect(view.container.textContent).toContain("fresh line");
+    expect(view.container.textContent).not.toContain("compiling step one");
+  });
+
   test("keeps the composer disabled until the history replay catches up", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
