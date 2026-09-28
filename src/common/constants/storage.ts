@@ -642,6 +642,7 @@ export const DEFAULT_TUTORIAL_STATE: TutorialState = {
 /**
  * Get the localStorage key for review (hunk read) state per workspace
  * Stores which hunks have been marked as read during code review
+ * Legacy: migrated to the backend review-state.json; read once for import, then removed.
  * Format: "review-state:{workspaceId}"
  */
 export function getReviewStateKey(workspaceId: string): string {
@@ -659,6 +660,7 @@ export function getReviewSelectedHunkKey(workspaceId: string): string {
 /**
  * Get the localStorage key for hunk first-seen timestamps per workspace
  * Tracks when each hunk content address was first observed (for LIFO sorting)
+ * Legacy: migrated to the backend review-state.json; read once for import, then removed.
  * Format: "hunkFirstSeen:{workspaceId}"
  */
 export function getHunkFirstSeenKey(workspaceId: string): string {
@@ -688,6 +690,7 @@ export const REVIEW_SORT_ORDER_KEY = "review-sort-order";
 /**
  * Get the localStorage key for hunk expand/collapse state in Review tab
  * Stores user's manual expand/collapse preferences per hunk
+ * Legacy: migrated to the backend review-state.json; read once for import, then removed.
  * Format: "reviewExpandState:{workspaceId}"
  */
 export function getReviewExpandStateKey(workspaceId: string): string {
@@ -697,6 +700,7 @@ export function getReviewExpandStateKey(workspaceId: string): string {
 /**
  * Get the localStorage key for read-more expansion state per hunk.
  * Tracks how many lines are expanded up/down for each hunk.
+ * Legacy: migrated to the backend review-state.json; read once for import, then removed.
  * Format: "reviewReadMore:{workspaceId}"
  */
 export function getReviewReadMoreKey(workspaceId: string): string {
@@ -846,6 +850,7 @@ export function getReviewSearchStateKey(workspaceId: string): string {
 /**
  * Get the localStorage key for reviews per workspace
  * Stores: ReviewsState (reviews created from diff viewer - pending, attached, or checked)
+ * Legacy: migrated to the backend review-state.json; read once for import, then removed.
  * Format: "reviews:{workspaceId}"
  */
 export function getReviewsKey(workspaceId: string): string {
