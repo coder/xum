@@ -321,6 +321,19 @@ const pauseAtBudget: AppStory["play"] = async ({ canvasElement, step }) => {
     const button = await canvas.findByRole("button", { name: "Load older messages" });
     await waitFor(() => expect(button).toBeVisible());
     const pausedCount = mountedCount();
+    // The button is only reachable at scrollTop 0, where native scroll anchoring does not
+    // apply: the row being read must still stay in place while older rows mount above it.
+    const messageWindow = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="message-window"]'
+    )!;
+    // A wheel gesture releases the bottom lock, as a reader scrolling up would.
+    messageWindow.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+    messageWindow.scrollTop = 0;
+    messageWindow.dispatchEvent(new Event("scroll"));
+    await canvas.findByRole("button", { name: /Jump to bottom/ });
+    await expect(messageWindow.scrollTop).toBe(0);
+    const readRow = messageWindow.querySelector<HTMLElement>("[data-message-id]")!;
+    const readRowTop = readRow.getBoundingClientRect().top;
     await userEvent.click(button);
     // Fewer rows than one more budget remain, so the reveal completes; with no older server
     // page to offer, the button goes away.
@@ -328,6 +341,8 @@ const pauseAtBudget: AppStory["play"] = async ({ canvasElement, step }) => {
       timeout: 15_000,
     });
     await expect(mountedCount()).toBeGreaterThan(pausedCount);
+    await expect(readRow.isConnected).toBe(true);
+    await expect(Math.abs(readRow.getBoundingClientRect().top - readRowTop)).toBeLessThanOrEqual(1);
     await waitFor(() =>
       expect(canvas.queryByRole("button", { name: "Load older messages" })).toBeNull()
     );

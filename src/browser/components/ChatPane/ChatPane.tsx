@@ -1353,12 +1353,61 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       })
     );
   }
+  // Rows a paused reveal mounts on request land above the reading position (#4869). Native
+  // scroll anchoring keeps that position only while scrollTop > 0, and the Load-older button
+  // sits at scrollTop 0, so the first mounted row's viewport offset is pinned explicitly from
+  // the request until the reveal settles again. Offsets are viewport-relative and measured after
+  // layout, so a native anchoring adjustment is never applied twice.
+  const loadOlderAnchorRef = useRef<{
+    element: HTMLElement;
+    top: number;
+    /** scrollTop after the last correction; a scroll away from it moves `top` (see below). */
+    scrollTop: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const anchor = loadOlderAnchorRef.current;
+    const scrollContainer = contentRef.current;
+    if (anchor === null || scrollContainer === null) return;
+    if (anchor.element.isConnected) {
+      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
+      if (delta !== 0) scrollContainer.scrollTop += delta;
+      anchor.scrollTop = scrollContainer.scrollTop;
+    }
+    if (revealSettled || !anchor.element.isConnected) loadOlderAnchorRef.current = null;
+  }, [contentRef, revealFromIndex, revealSettled, shouldRenderLoadOlderMessagesButton]);
+  const handleTranscriptScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    handleScroll(event);
+    // The reader scrolling while the requested rows mount moves the position to keep, so the
+    // next correction never undoes it. Shifted by the scroll distance rather than re-measured,
+    // so a correction's sub-pixel rounding never accumulates across chunks.
+    const anchor = loadOlderAnchorRef.current;
+    if (anchor !== null) {
+      const scrollTop = event.currentTarget.scrollTop;
+      anchor.top -= scrollTop - anchor.scrollTop;
+      anchor.scrollTop = scrollTop;
+    }
+  };
+
   const handleLoadOlderHistory = useCallback(() => {
     if (!shouldRenderLoadOlderMessagesButton) {
       return;
     }
     // Already-loaded rows above a paused reveal mount before any older server page is fetched.
+    // Requests made while those rows mount are ignored (the button is gone until the reveal
+    // pauses again), like presses while a server page loads.
     if (isRevealPaused) {
+      // While locked to the bottom the sentinel keeps the tail in place instead.
+      const firstRow = autoScroll
+        ? null
+        : contentRef.current?.querySelector<HTMLElement>("[data-message-id]");
+      loadOlderAnchorRef.current =
+        firstRow && contentRef.current
+          ? {
+              element: firstRow,
+              top: firstRow.getBoundingClientRect().top,
+              scrollTop: contentRef.current.scrollTop,
+            }
+          : null;
       revealMore();
       return;
     }
@@ -1370,6 +1419,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       console.warn(`[ChatPane] Failed to load older history for ${workspaceId}:`, error);
     });
   }, [
+    autoScroll,
+    contentRef,
     isRevealPaused,
     loadingOlderHistory,
     revealMore,
@@ -1563,7 +1614,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onMouseUp={handleScrollContainerMouseUp}
             onTouchMove={handleTranscriptTouchMove}
             onKeyDown={handleTranscriptKeyDown}
-            onScroll={handleScroll}
+            onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
             tabIndex={0}
             data-testid="message-window"
