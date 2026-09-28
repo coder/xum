@@ -267,8 +267,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
 
-  // A navigation target is done once its row is mounted, and moot once it is gone. The lookup
-  // runs only while a navigation is pending, never on ordinary renders.
+  // A navigation target is done once its row is mounted, and moot once it is gone.
   if (current.targetMessageId !== null) {
     const targetId = current.targetMessageId;
     const targetIndex = args.messages.findIndex((row) => row.id === targetId);
@@ -351,7 +350,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const revealThrough = (index: number) => {
     assert(Number.isInteger(index) && index >= 0, "revealThrough requires a row index");
     const snapshot = latest.current;
-    if (index >= snapshot.fromIndex || index >= snapshot.messages.length) return;
+    if (index >= snapshot.fromIndex) return;
     const targetMessageId = snapshot.messages[index].id;
     setState((previous) =>
       previous.generation !== snapshot.generation || previous.targetMessageId === targetMessageId
