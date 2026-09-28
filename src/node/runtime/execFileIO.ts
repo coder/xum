@@ -9,6 +9,7 @@
 import type { ExecStream, FileStat } from "./Runtime";
 import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { getErrorMessage } from "@/common/utils/errors";
+import { READ_RETRY_TIMEOUT_SECS } from "@/constants/runtimeReads";
 import { log } from "@/node/services/log";
 import { streamToString } from "./streamUtils";
 
@@ -17,17 +18,12 @@ type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
  * Starts one attempt of an idempotent read (`attempt` 0, then 1 for the single
- * retry). Pass `readAttemptTimeoutSecs(attempt, …)` as the exec timeout.
+ * retry). Pass `readAttemptTimeoutSecs(attempt, …)` as the exec timeout, and
+ * read only a regular file on the retry (`buildRegularFileReadCommand`): the
+ * failed attempt may already have consumed a FIFO's or device's data, so
+ * re-reading one is not replay-safe.
  */
 type StartReadExec = (abortSignal: AbortSignal, attempt: number) => Promise<ExecStream>;
-
-/**
- * Exec timeout for the one retry of a read or stat (#4830). It must stay short:
- * the SSH pools wait through their backoff up to the exec deadline, so reusing
- * readFile's 300 s would hang a persistent outage for minutes instead of
- * failing fast and retryably.
- */
-export const READ_RETRY_TIMEOUT_SECS = 10;
 
 /** Exec timeout for a read attempt: the caller's own on the first, the short bound on the retry. */
 export function readAttemptTimeoutSecs(attempt: number, firstAttemptSecs: number): number {

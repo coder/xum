@@ -1,4 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { shellQuote } from "@/common/utils/shell";
 import {
   type ExecOptions,
   type ExecStream,
@@ -6,7 +11,9 @@ import {
   isRuntimeReadFailure,
   isRuntimeTransportError,
 } from "./Runtime";
+import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime } from "./SSHRuntime";
+import { TestRemoteRuntime } from "./testRemoteRuntime";
 import type { SSHRuntimeConfig } from "./sshConnectionPool";
 import type { SSHTransport } from "./transports";
 
@@ -155,4 +162,46 @@ describe("bounded retry of idempotent SSH reads (#4830)", () => {
     expect(await stat(stater, statAbort.signal)).toBeInstanceOf(Error);
     expect(stater.calls).toHaveLength(1);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "retries only a regular file, never a FIFO the failed attempt may have drained",
+    async () => {
+      // The first attempt fails in transport (before any remote process); the
+      // retry runs in a real local shell against a FIFO that has a writer.
+      class BlipThenLocalShell extends TestRemoteRuntime {
+        spawns = 0;
+        protected override quoteForRemote(filePath: string): string {
+          return shellQuote(filePath);
+        }
+        protected override cdCommand(cwd: string): string {
+          return `cd ${shellQuote(cwd)}`;
+        }
+        protected override getBasePath(): string {
+          return os.tmpdir();
+        }
+        // Optional only to stay assignable to TestRemoteRuntime's zero-argument stub.
+        protected override spawnRemoteProcess(fullCommand?: string): Promise<SpawnResult> {
+          if (this.spawns++ === 0) {
+            return Promise.reject(new RuntimeError("Connection reset", "network"));
+          }
+          const child = spawn("bash", ["-c", fullCommand ?? "exit 1"], { stdio: "pipe" });
+          return Promise.resolve({ process: child });
+        }
+      }
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-read-retry-fifo-"));
+      const fifo = path.join(dir, "AGENTS.md");
+      execFileSync("mkfifo", [fifo]);
+      const writer = execFile("sh", ["-c", 'printf "next writer" > "$0"', fifo]);
+      try {
+        const runtime = new BlipThenLocalShell();
+        const result = await settle(new Response(runtime.readFile(fifo)).text());
+        expect(result).toBeInstanceOf(RuntimeError);
+        expect(String(result)).toContain("not a regular file");
+        expect(runtime.spawns).toBe(2);
+      } finally {
+        writer.kill("SIGKILL");
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  );
 });

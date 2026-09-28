@@ -437,9 +437,11 @@ export abstract class RemoteRuntime implements Runtime {
       async (signal, attempt) => {
         const resolvedPath = await this.resolveFilePath(filePath, signal);
         const quotedPath = this.quoteForRemote(resolvedPath);
-        const command = options?.requireRegularFile
-          ? buildRegularFileReadCommand(quotedPath)
-          : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
+        // The retry reads only a regular file: see readFileViaExec's StartReadExec.
+        const command =
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(quotedPath)
+            : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
         return this.exec(command, {
           cwd: this.getBasePath(),
           timeout: readAttemptTimeoutSecs(attempt, 300),

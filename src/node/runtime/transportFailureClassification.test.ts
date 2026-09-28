@@ -293,10 +293,7 @@ describe("SSH2 channel failures after acquisition (#4835)", () => {
     return new SSHRuntime(config, createSSHTransport(config, true));
   }
 
-  /**
-   * Starts the reads and stats, waits for their channels to open, then applies
-   * `fail` to each, including the channels their one retry opens (#4830).
-   */
+  /** Starts the reads and stats, waits for their channels to open, then applies `fail` to each. */
   async function probeWith(
     fail: (channel: FakeSSH2Channel) => void,
     abortSignal?: AbortSignal
@@ -311,15 +308,12 @@ describe("SSH2 channel failures after acquisition (#4835)", () => {
         (error: unknown) => error
       )
     );
-    let settled = false;
-    const all = Promise.all(pending).finally(() => (settled = true));
     while (channels.length < pending.length) await new Promise((r) => setTimeout(r, 1));
-    let failed = 0;
-    while (!settled) {
-      while (failed < channels.length) fail(channels[failed++]);
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    return all;
+    // The one transport retry (#4830) must not find a healthy channel: refuse
+    // every later open, which ssh2 reports through the exec callback.
+    client.exec = (_command, cb) => cb(new Error("(SSH) Channel open failure: open failed"));
+    for (const channel of channels) fail(channel);
+    return Promise.all(pending);
   }
 
   it("classifies a channel error after the channel opened as transport", async () => {
