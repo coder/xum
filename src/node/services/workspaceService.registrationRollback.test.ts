@@ -117,13 +117,17 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
   });
 
+  /**
+   * The retained settlements of this service's background inits. Each settles after its init use
+   * lease is released (withInitUseLease), unlike init-end, which fires inside the lease.
+   */
+  const initSettlements = () =>
+    (service as unknown as { initSettlementPromises: Map<string, Promise<void>> })
+      .initSettlementPromises;
+
   afterEach(async () => {
     // Let deferred checkouts of successful retries finish before the temp root goes away.
-    await Promise.all(
-      (
-        service as unknown as { initSettlementPromises: Map<string, Promise<void>> }
-      ).initSettlementPromises.values()
-    );
+    await Promise.all(initSettlements().values());
     mock.restore();
     await harness.cleanup();
   });
@@ -317,6 +321,11 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     );
     if (!created.success) throw new Error(created.error);
     const { id, namedWorkspacePath: oldContainer } = created.data;
+    // createMultiProject runs its per-project init for real (the runBackgroundInit mock does not
+    // cover it) under an "init" use lease taken after it returns. A rename refuses while that
+    // lease is held (#4857), so without this wait it got the init refusal instead of the save
+    // error whenever the init took its lease first (#4938).
+    await initSettlements().get(id);
     const checkoutsBefore = [worktreePaths(projectPath), worktreePaths(otherProjectPath)];
 
     await expectFailsWithSaveError(() => service.rename(id, "multi-after"));
