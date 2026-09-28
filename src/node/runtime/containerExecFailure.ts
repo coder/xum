@@ -17,6 +17,10 @@ const CONTAINER_UNAVAILABLE_PATTERNS: readonly RegExp[] = [
   /^Error response from daemon: container \S+ is paused/im,
   /^Error response from daemon: No such container:/m,
   /^Cannot connect to the Docker daemon/m,
+  // The Docker client's prefix for other failed connections to the daemon, e.g.
+  // Docker Desktop stopped on Windows ("… open //./pipe/docker_engine: The
+  // system cannot find the file specified.").
+  /^(?:docker: )?error during connect: /im,
   // devcontainer CLI when no container matches the workspace folder.
   /^(?:\[[^\]]*\] )?Error: Dev container not found\./m,
 ];

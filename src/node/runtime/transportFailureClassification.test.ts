@@ -165,6 +165,8 @@ describe("container exec failures", () => {
     "Error response from daemon: Container ws is paused, unpause the container before exec\n",
     "Error response from daemon: No such container: ws\n",
     "Cannot connect to the Docker daemon at unix:///tmp/nope.sock. Is the docker daemon running?\n",
+    // Docker Desktop stopped on Windows (wording from docker/for-win#13137; not measured here).
+    'error during connect: This error may indicate that the docker daemon is not running.: Get "http:////./pipe/docker_engine/v1.24/containers/json": open //./pipe/docker_engine: The system cannot find the file specified.\n',
   ];
   const devcontainerUnavailable = [
     "Shell server terminated (code: 1, signal: null)\n\n" + unavailable[0],
