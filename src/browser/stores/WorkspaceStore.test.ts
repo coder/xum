@@ -6440,7 +6440,7 @@ describe("WorkspaceStore", () => {
       expect(allStates.has("workspace-2")).toBe(true);
     });
 
-    it("handles workspace removal during state access", () => {
+    it("drops cached state on removal and creates a fresh snapshot after re-add", () => {
       createAndAddWorkspace(store, "test-workspace", TEST_WORKSPACE_OPTIONS, false);
 
       const state1 = store.getWorkspaceState("test-workspace");
@@ -6449,9 +6449,11 @@ describe("WorkspaceStore", () => {
       // Remove workspace
       store.removeWorkspace("test-workspace");
 
-      // Accessing state after removal should create new aggregator (lazy init)
+      // A removed workspace must be registered again, not served its old cached snapshot.
+      expect(() => store.getWorkspaceState("test-workspace")).toThrow();
+      createAndAddWorkspace(store, "test-workspace", TEST_WORKSPACE_OPTIONS, false);
       const state2 = store.getWorkspaceState("test-workspace");
-      expect(state2).toBeDefined();
+      expect(state2).not.toBe(state1);
       expect(state2.loading).toBe(true); // Fresh workspace, not caught up
     });
   });

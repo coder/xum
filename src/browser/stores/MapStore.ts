@@ -2,7 +2,7 @@
  * Integrated versioned cache store with reactive subscriptions.
  *
  * Combines versioning, lazy caching, and change notifications into one tool:
- * - Version-based cache keys ensure automatic invalidation
+ * - Explicit invalidation keeps only the current snapshot per key
  * - Lazy computation via get(key, compute) for derived state
  * - Global and per-key subscriptions for selective re-renders
  * - Explicit change signaling via bump() - no hidden equality checks
@@ -12,15 +12,15 @@
  * Design:
  * - bump(key) increments version and notifies subscribers
  * - get(key, compute) returns cached value for current version
- * - Cache keys are "{key}:{version}" for automatic invalidation
- * - Old cache entries naturally garbage collected as versions advance
+ * - Cache entries use logical keys and are removed on bump
+ * - Old snapshots are released immediately rather than retained across versions
  */
 
 type Listener = () => void;
 
 export class MapStore<K, V> {
   private versions = new Map<K, number>();
-  private cache = new Map<string, V>();
+  private cache = new Map<K, V>();
   private global = new Set<Listener>();
   private perKey = new Map<K, Set<Listener>>();
   // DEV-mode guard: track render depth to catch bump() during render
@@ -54,14 +54,11 @@ export class MapStore<K, V> {
   }
 
   private getImpl(key: K, compute: () => V): V {
-    const version = this.versions.get(key) ?? 0;
-    const cacheKey = this.makeCacheKey(key, version);
-
-    if (!this.cache.has(cacheKey)) {
-      this.cache.set(cacheKey, compute());
+    if (!this.cache.has(key)) {
+      this.cache.set(key, compute());
     }
 
-    return this.cache.get(cacheKey)!;
+    return this.cache.get(key)!;
   }
 
   /**
@@ -122,6 +119,9 @@ export class MapStore<K, V> {
 
     const current = this.versions.get(key) ?? 0;
     this.versions.set(key, current + 1);
+    // Release old snapshots even if nobody reads again; retaining every streaming
+    // version grows memory for the lifetime of a workspace. Invalidate before notifying.
+    this.cache.delete(key);
     // Notify subscribers
     for (const l of this.global) l();
     const ks = this.perKey.get(key);
@@ -134,17 +134,10 @@ export class MapStore<K, V> {
    * Delete a key (clears version and all cached values).
    */
   delete(key: K): void {
-    if (!this.versions.has(key)) return;
-
-    // Clear all cached values for this key
-    const keyStr = String(key);
-    for (const cacheKey of Array.from(this.cache.keys())) {
-      if (cacheKey.startsWith(`${keyStr}:`)) {
-        this.cache.delete(cacheKey);
-      }
-    }
-
-    this.versions.delete(key);
+    const hadCache = this.cache.delete(key);
+    const hadVersion = this.versions.delete(key);
+    // A render may have cached a snapshot before the first bump.
+    if (!hadCache && !hadVersion) return;
 
     // Notify
     for (const l of this.global) l();
@@ -191,9 +184,5 @@ export class MapStore<K, V> {
    */
   hasKeySubscribers(key: K): boolean {
     return this.perKey.has(key);
-  }
-
-  private makeCacheKey(key: K, version: number): string {
-    return `${String(key)}:${version}`;
   }
 }
