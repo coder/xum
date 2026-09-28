@@ -3815,7 +3815,15 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
-      return { success: true, workspacePath: newWorkspacePath, sourceBranch };
+      // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
+      // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
+      // delete the branch only when this is true (#5119).
+      return {
+        success: true,
+        workspacePath: newWorkspacePath,
+        sourceBranch,
+        createdBranch: usedWorktree,
+      };
     } catch (error) {
       // Catch-all cleanup so an aborted/thrown fork can never leave the
       // staging worktree registered in the bare repo with a dangling gitdir.

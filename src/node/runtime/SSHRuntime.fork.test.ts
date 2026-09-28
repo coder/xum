@@ -463,3 +463,52 @@ describe("SSHRuntime.forkWorkspace staging-name uniqueness", () => {
     expect(extract(runtime1.commands)).not.toBe(extract(runtime2.commands));
   });
 });
+
+// Fork rollbacks delete the fork's branch only when the fork reports creating it (#5119).
+describe("SSHRuntime.forkWorkspace createdBranch", () => {
+  function createRuntime(): ForkTestSSHRuntime {
+    return new ForkTestSSHRuntime("/remote/src", {
+      project: "/Users/me/Projects/coder/mux",
+      name: "feature-source",
+      path: "/remote/src/mux-canonical/feature-source",
+    });
+  }
+
+  it("reports the branch its own `worktree add -b` created", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree add -b "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree move "), exitCode: 0 }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(true);
+    expect(result.createdBranch).toBe(true);
+  });
+
+  it("does not claim the branch when `worktree add -b` failed and the copy fallback ran", async () => {
+    // `worktree add -b` fails when the branch already exists; the fallback may then check out
+    // that existing branch, which a rollback must keep.
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      {
+        matches: (c) => c.includes("worktree add -b "),
+        stderr: "fatal: a branch named 'feature-new' already exists\n",
+        exitCode: 128,
+      }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(true);
+    expect(runtime.commands.some((c) => c.startsWith("cp -R -P "))).toBe(true);
+    expect(result.createdBranch).not.toBe(true);
+  });
+});

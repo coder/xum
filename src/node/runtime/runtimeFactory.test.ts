@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { createRuntime, IncompatibleRuntimeError } from "./runtimeFactory";
-import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import { LocalRuntime } from "./LocalRuntime";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { CoderSSHRuntime } from "./CoderSSHRuntime";
@@ -84,6 +88,27 @@ describe("createRuntime", () => {
     const config = { type: "future-runtime" } as unknown as RuntimeConfig;
     expect(() => createRuntime(config)).toThrow(IncompatibleRuntimeError);
     expect(() => createRuntime(config)).toThrow(/newer version/);
+  });
+
+  // Callers pick delete-vs-keep of a checkout with these predicates, so they must classify every
+  // legacy "local" form the way the factory builds it (#5118): an empty srcBaseDir is a worktree.
+  it("runtime predicates agree with the factory for every legacy local config", () => {
+    const configs: RuntimeConfig[] = [
+      { type: "local" },
+      { type: "local", srcBaseDir: "/tmp/test-src" },
+      { type: "local", srcBaseDir: "" },
+    ];
+    for (const config of configs) {
+      const runtime = createRuntime(config, { projectPath: "/tmp/my-project" });
+      expect({ config, worktree: isWorktreeRuntime(config) }).toEqual({
+        config,
+        worktree: runtime instanceof WorktreeRuntime,
+      });
+      expect({ config, projectDir: isLocalProjectRuntime(config) }).toEqual({
+        config,
+        projectDir: runtime instanceof LocalRuntime,
+      });
+    }
   });
 });
 

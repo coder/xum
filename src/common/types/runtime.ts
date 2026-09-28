@@ -283,8 +283,9 @@ export function isWorktreeRuntime(
   | Extract<RuntimeConfig, { type: "local"; srcBaseDir: string }> {
   if (!config) return false;
   if (config.type === "worktree") return true;
-  // Legacy: "local" with srcBaseDir is treated as worktree
-  if (config.type === "local" && "srcBaseDir" in config && config.srcBaseDir) return true;
+  // Legacy: "local" with srcBaseDir is treated as worktree. Any string counts, including a legacy
+  // empty one, because createRuntime builds a WorktreeRuntime for it (#5118).
+  if (config.type === "local" && hasSrcBaseDir(config)) return true;
   return false;
 }
 
@@ -295,8 +296,8 @@ export function isLocalProjectRuntime(
   config: RuntimeConfig | undefined
 ): config is Extract<RuntimeConfig, { type: "local"; srcBaseDir?: never }> {
   if (!config) return false;
-  // "local" without srcBaseDir is project-dir runtime
-  return config.type === "local" && !("srcBaseDir" in config && config.srcBaseDir);
+  // "local" without srcBaseDir is project-dir runtime (same string test as createRuntime, #5118)
+  return config.type === "local" && !hasSrcBaseDir(config);
 }
 
 /**
