@@ -11,12 +11,12 @@ import * as esbuild from "esbuild";
  * Guards the VS Code webview stylesheet against drift from the desktop styles.
  *
  * The webview renders shared desktop components, but ships its own stylesheet
- * (vscode/src/webview/webview.css). When a component the webview bundles uses a Tailwind
- * utility or CSS custom property that the desktop styles define but the webview stylesheet
- * does not, the webview renders it unstyled (for example transparent tooltips when the
- * tooltip tokens were missing). Both checks below compare against the desktop globals.css,
- * so tokens that are undefined on desktop too (Radix runtime vars, story-only vars) are not
- * reported.
+ * (vscode/src/webview/webview.css). When a component the webview bundles (or can import)
+ * uses a Tailwind utility or CSS custom property that the desktop styles define but the
+ * webview stylesheet does not, the webview renders it unstyled (for example transparent
+ * tooltips when the tooltip tokens were missing). Both checks below compare against the
+ * desktop globals.css, so tokens that are undefined on desktop too (Radix runtime vars,
+ * story-only vars) are not reported.
  */
 
 const vscodeDir = path.resolve(import.meta.dir, "..", "..");
@@ -34,7 +34,7 @@ interface EsbuildConfigModule {
   compileWebviewCss: () => Promise<{ css: string; dependencies: string[] }>;
 }
 
-// Reuse the real bundle config so the checked sources are exactly the ones the webview ships.
+// Reuse the real bundle config so the checked sources include exactly the ones the webview ships.
 const esbuildConfig = createRequire(import.meta.url)(
   path.join(vscodeDir, "esbuild.config.js")
 ) as EsbuildConfigModule;
@@ -57,6 +57,20 @@ async function getBundledSourceFiles(): Promise<string[]> {
   return files;
 }
 
+// Every non-test, non-story renderer module, whether or not the webview imports it today.
+// Webview work keeps pulling in more desktop components (for example the composer adopting
+// src/browser/features/ChatInput/), so the guard covers what the bundle CAN import, not only
+// what it imports now: a later import must not reintroduce drift.
+function getImportableRendererFiles(): string[] {
+  const browserDir = path.join(repoRoot, "src", "browser");
+  const files = fs
+    .readdirSync(browserDir, { recursive: true, encoding: "utf8" })
+    .filter((file) => /\.tsx?$/.test(file) && !/\.(test|stories)\.tsx?$/.test(file))
+    .map((file) => path.join(browserDir, file));
+  expect(files).toContain(path.join(browserDir, "features", "ChatInput", "index.tsx"));
+  return files;
+}
+
 function readCandidates(files: string[]): string[] {
   const scanner = new Scanner({});
   return scanner.scanFiles(
@@ -70,10 +84,10 @@ function readCandidates(files: string[]): string[] {
 // Both tests need the same bundle scan; compute it once.
 let bundledSources: Promise<{ files: string[]; candidates: string[] }> | null = null;
 function loadBundledSources(): Promise<{ files: string[]; candidates: string[] }> {
-  bundledSources ??= getBundledSourceFiles().then((files) => ({
-    files,
-    candidates: readCandidates(files),
-  }));
+  bundledSources ??= getBundledSourceFiles().then((bundled) => {
+    const files = [...new Set([...bundled, ...getImportableRendererFiles()])];
+    return { files, candidates: readCandidates(files) };
+  });
   return bundledSources;
 }
 
@@ -90,7 +104,7 @@ function referencedCustomProperties(text: string): Set<string> {
 }
 
 describe("webview stylesheet", () => {
-  test("compiles every desktop utility used by bundled components", async () => {
+  test("compiles every desktop utility used by webview-importable components", async () => {
     const { candidates } = await loadBundledSources();
 
     const desktop = await __unstable__loadDesignSystem(fs.readFileSync(desktopCssPath, "utf8"), {
@@ -106,7 +120,7 @@ describe("webview stylesheet", () => {
 
     if (missing.length > 0) {
       throw new Error(
-        `Utilities used by webview-bundled components compile on desktop but not in the webview: ` +
+        `Utilities used by webview-importable components compile on desktop but not in the webview: ` +
           `${missing.sort().join(", ")}. ${FIX_HINT}`
       );
     }
