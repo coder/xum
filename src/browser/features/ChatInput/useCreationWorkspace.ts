@@ -292,13 +292,16 @@ function isWorkspaceDraftEmpty(workspaceId: string): boolean {
 }
 
 // Move a failed creation send's draft into the new workspace's draft so the
-// retry happens there instead of creating a duplicate workspace.
-function transferDraftToWorkspace(
+// retry happens there instead of creating a duplicate workspace. The creation
+// draft is already deleted, so this waits until the backend confirmed the
+// hand-off (a hard close right after must not lose the prompt). A failed save
+// is logged: the text still shows in the composer, and the store retries it.
+async function transferDraftToWorkspace(
   workspaceId: string,
   text: string,
   attachments: ChatAttachment[],
   forceProjectSkillDiscovery: boolean
-): void {
+): Promise<void> {
   if (forceProjectSkillDiscovery) {
     // The original send resolved its slash skill against the project path;
     // carry that choice so the retry cannot resolve a different skill from
@@ -307,13 +310,13 @@ function transferDraftToWorkspace(
   }
   const scope = { kind: "workspace" as const, workspaceId };
   getDraftStore().setText(scope, text);
-  if (attachments.length === 0) {
-    // A text-only send never touches the attachments: the mounted composer is
-    // unlocked during such a send, and a write here (even of "nothing") would
-    // replace attachments the user added there meanwhile.
-    return;
-  }
-  getDraftStore().setAttachments(scope, attachments);
+  // A text-only send never touches the attachments: the mounted composer is
+  // unlocked during such a send, and a write here (even of "nothing") would
+  // replace attachments the user added there meanwhile.
+  if (attachments.length > 0) getDraftStore().setAttachments(scope, attachments);
+  await getDraftStore()
+    .flush(scope)
+    .catch((error: unknown) => console.warn("Failed to save the transferred draft:", error));
 }
 
 /**
@@ -782,7 +785,7 @@ export function useCreationWorkspace({
           // For slash-skill sends messageText is the rewritten skill text;
           // restore the original typed command from rawCommand so the retry
           // re-invokes the skill.
-          transferDraftToWorkspace(
+          await transferDraftToWorkspace(
             metadata.id,
             overrideRawCommand ?? messageText,
             [
@@ -900,7 +903,7 @@ export function useCreationWorkspace({
           // attachment-bearing sends lock that composer, so a text-only send that waited on
           // init may already hold something the user typed there; never overwrite that.
           if (isWorkspaceDraftEmpty(metadata.id)) {
-            transferDraftToWorkspace(
+            await transferDraftToWorkspace(
               metadata.id,
               overrideRawCommand ?? messageText,
               [

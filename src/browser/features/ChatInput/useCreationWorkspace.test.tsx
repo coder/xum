@@ -21,6 +21,7 @@ import {
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 
 import {
   CODER_RUNTIME_PLACEHOLDER,
@@ -45,6 +46,28 @@ import { useCreationWorkspace, type CreationSendResult } from "./useCreationWork
 const workspaceDraft = () =>
   getDraftStore().getView({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID });
 const pendingDraft = () => getDraftStore().getView(defaultCreationDraftScope(TEST_PROJECT_PATH));
+/** Draft texts the backend confirmed, by workspace id (the store's writes land here). */
+const savedWorkspaceDraftText = new Map<string, string>();
+const draftBackend = createTestApiClient({
+  drafts: {
+    subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+      Promise.resolve(
+        (async function* (): AsyncGenerator<DraftEvent> {
+          yield { type: "snapshot", drafts: [] };
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      ),
+    update: (input: DraftUpdateInput) => {
+      if (input.scope.kind === "workspace" && input.text !== undefined) {
+        savedWorkspaceDraftText.set(input.scope.workspaceId, input.text);
+      }
+      return Promise.resolve({ revision: Date.now() });
+    },
+    delete: () => Promise.resolve({ revision: Date.now() }),
+  },
+});
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
@@ -648,11 +671,15 @@ describe("useCreationWorkspace", () => {
     routerState.pendingDraftId = null;
     getDraftStore().forgetWorkspace(TEST_WORKSPACE_ID);
     getDraftStore().forgetProject(TEST_PROJECT_PATH);
+    savedWorkspaceDraftText.clear();
+    getDraftStore().setClient(draftBackend);
+    await getDraftStore().whenReady();
     // The creation composer's draft; a created workspace must clear it.
     getDraftStore().setText(defaultCreationDraftScope(TEST_PROJECT_PATH), "creation draft");
   });
 
   afterEach(async () => {
+    getDraftStore().setClient(null);
     cleanup();
     restorePersistedStateMocks?.();
     restorePersistedStateMocks = null;
@@ -1250,6 +1277,9 @@ describe("useCreationWorkspace", () => {
     // The user lands in the created workspace with nothing persisted; the text must be
     // waiting in that composer so a model or provider fix can be followed by a plain resend.
     expect(workspaceDraft().text).toBe("fix the login bug");
+    // The creation draft is already deleted: the hand-off is saved before handleSend returns
+    // (a hard close right after must not lose the prompt).
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("fix the login bug");
     const errorWrite = updatePersistedStateCalls.find(
       ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
     );
