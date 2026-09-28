@@ -2035,8 +2035,20 @@ describe("TaskService", () => {
     // Codex P2: an error settlement enqueued a pending wake; a later
     // correlated tool-calls resettle to the quiet owner-follow-up flavor must
     // delete that stale generation instead of letting the drain deliver it.
-    const { config, parentId, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest(rootDir);
+    const hasPendingQueuedOrPreparingTurn = mock(
+      (workspaceId: string): boolean => workspaceId === "owner"
+    );
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      { hasPendingQueuedOrPreparingTurn }
+    );
+    // Keep the owner busy so the wake the error settlement arms stays pending until the
+    // resettle. Otherwise the settlement's detached drain races the resettle: on a loaded runner
+    // it delivered the wake, and its read-then-write markDelivered re-created the notification
+    // the resettle had just deleted, as "delivered" (#5041).
+    hasPendingQueuedOrPreparingTurn.mockImplementation(
+      (workspaceId: string) => workspaceId === parentId
+    );
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -2051,6 +2063,7 @@ describe("TaskService", () => {
     });
     truncated.metadata.historySequence = 1;
     await streamEnd(taskService, truncated);
+    await flushTerminalAttentionDrains(taskService);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -2060,7 +2073,9 @@ describe("TaskService", () => {
       "wst_handle",
       `wst_handle:error:${errored.updatedAt}`
     );
-    expect(await attentionStore.get(parentId, staleVersionedId)).not.toBeNull();
+    expect(await attentionStore.get(parentId, staleVersionedId)).toMatchObject({
+      status: "pending",
+    });
 
     // Same-turn auto-retry gets cut by the owner's follow-up: quiet resettle.
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
