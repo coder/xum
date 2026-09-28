@@ -15,7 +15,6 @@ import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArti
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TaskService } from "@/node/services/taskService";
-import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { Ok, type Result } from "@/common/types/result";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
@@ -141,18 +140,6 @@ export function createTaskServiceHarness(
 ) {
   const stack = createTaskServiceStack(config, overrides);
   return { ...stack, partialService: stack.historyService };
-}
-
-export function reserveFamilyMessageTargetSlots(
-  taskService: TaskService,
-  targetId: string,
-  count: number
-): void {
-  const broker = (taskService as unknown as { agentPeerMessageBroker: AgentPeerMessageBroker })
-    .agentPeerMessageBroker;
-  for (let i = 0; i < count; i++) {
-    expect(broker.reserveBudget(`prefill-${i}`, targetId, 1)).not.toBeNull();
-  }
 }
 
 export async function waitForWorkspaceTaskStatus(

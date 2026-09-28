@@ -1,12 +1,22 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeEach,
+  afterEach,
+  setSystemTime,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { PEER_MESSAGE_RATE_LIMIT_MAX } from "@/constants/agentMessaging";
-import { TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES } from "@/constants/taskMessages";
+import {
+  PEER_MESSAGE_RATE_LIMIT_MAX,
+  PEER_MESSAGE_RATE_WINDOW_MS,
+} from "@/constants/agentMessaging";
 import type { TaskService } from "@/node/services/taskService";
-import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import { defaultModel } from "@/common/utils/ai/models";
@@ -32,7 +42,6 @@ import {
   registerLiveWorkspaceTurnHandle,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
-  reserveFamilyMessageTargetSlots,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
@@ -779,88 +788,79 @@ describe("TaskService", () => {
       (["pre-admission", "queued"] as const).flatMap((phase) =>
         [false, true].map((reenable) => ({ phase, reenable }))
       )
-    )(
-      "revokes and refunds unrelated consent at $phase (reenable=$reenable)",
-      async ({ phase, reenable }) => {
-        const config = await createTestConfig(rootDir);
-        const projectPath = path.join(rootDir, "repo");
-        await saveWorkspaces(
-          config,
-          projectPath,
-          [
-            projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target", {
-              unrelatedWorkspaceConsent: "original-generation",
-            }),
-          ],
-          testTaskSettings()
-        );
-        expect(
-          findWorkspaceEntry(config.loadConfigOrDefault(), "target")?.workspace
-            .unrelatedWorkspaceConsent
-        ).toBe("original-generation");
-        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-        const { taskService, historyService } = createTaskServiceHarness(config, {
-          workspaceService,
+    )("revokes unrelated consent at $phase (reenable=$reenable)", async ({ phase, reenable }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "target", "target", {
+            unrelatedWorkspaceConsent: "original-generation",
+          }),
+        ],
+        testTaskSettings()
+      );
+      expect(
+        findWorkspaceEntry(config.loadConfigOrDefault(), "target")?.workspace
+          .unrelatedWorkspaceConsent
+      ).toBe("original-generation");
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const setGeneration = async (generation?: string) => {
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "target");
+          assert(entry);
+          if (generation == null) delete entry.workspace.unrelatedWorkspaceConsent;
+          else entry.workspace.unrelatedWorkspaceConsent = generation;
+          return cfg;
         });
-        reserveFamilyMessageTargetSlots(
-          taskService,
-          "target",
-          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-        );
-        const setGeneration = async (generation?: string) => {
-          await config.editConfig((cfg) => {
-            const entry = findWorkspaceEntry(cfg, "target");
-            assert(entry);
-            if (generation == null) delete entry.workspace.unrelatedWorkspaceConsent;
-            else entry.workspace.unrelatedWorkspaceConsent = generation;
-            return cfg;
-          });
-        };
-        const revoke = async () => {
-          await setGeneration();
-          if (reenable) await setGeneration("new-generation");
-        };
-        const internals = taskService as unknown as {
-          resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
-        };
-        const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
-        try {
-          if (phase === "pre-admission") {
-            resolve.mockImplementationOnce(async () => {
-              await revoke();
-              return { model: defaultModel, agentId: "exec" };
-            });
-          }
-          const result = await taskService.sendAgentTreeMessage("sender", "target", "Old consent");
-          if (phase === "queued") {
-            expect(result).toMatchObject(Ok({ delivery: "queued" }));
-            const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
-              WorkspaceHost["sendMessage"]
-            >;
-            expect(internal?.admissionStale?.()).toBe(false);
+      };
+      const revoke = async () => {
+        await setGeneration();
+        if (reenable) await setGeneration("new-generation");
+      };
+      const internals = taskService as unknown as {
+        resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
+      };
+      const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
+      try {
+        if (phase === "pre-admission") {
+          resolve.mockImplementationOnce(async () => {
             await revoke();
-            expect(internal?.admissionStale?.()).toBe(true);
-            await internal?.onCanceled?.("Recipient consent was revoked");
-          } else {
-            expect(result).toEqual(Err({ code: "not_found" }));
-            expect(sendMessage).not.toHaveBeenCalled();
-          }
-          expect(await collectFullHistory(historyService, "target")).toEqual([]);
-          await setGeneration("new-generation");
-          // A fresh send can use the refunded slot, even though the sender never opted in.
-          expect(
-            findWorkspaceEntry(config.loadConfigOrDefault(), "sender")?.workspace
-              .unrelatedWorkspaceConsent
-          ).toBeUndefined();
-          expect(
-            (await taskService.sendAgentTreeMessage("sender", "target", "Fresh consent")).success
-          ).toBe(true);
-        } finally {
-          resolve.mockRestore();
+            return { model: defaultModel, agentId: "exec" };
+          });
         }
+        const result = await taskService.sendAgentTreeMessage("sender", "target", "Old consent");
+        if (phase === "queued") {
+          expect(result).toMatchObject(Ok({ delivery: "queued" }));
+          const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+            WorkspaceHost["sendMessage"]
+          >;
+          expect(internal?.admissionStale?.()).toBe(false);
+          await revoke();
+          expect(internal?.admissionStale?.()).toBe(true);
+        } else {
+          expect(result).toEqual(Err({ code: "not_found" }));
+          expect(sendMessage).not.toHaveBeenCalled();
+        }
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+        await setGeneration("new-generation");
+        // A fresh send succeeds under the new grant, even though the sender never opted in.
+        expect(
+          findWorkspaceEntry(config.loadConfigOrDefault(), "sender")?.workspace
+            .unrelatedWorkspaceConsent
+        ).toBeUndefined();
+        expect(
+          (await taskService.sendAgentTreeMessage("sender", "target", "Fresh consent")).success
+        ).toBe(true);
+      } finally {
+        resolve.mockRestore();
       }
-    );
+    });
 
     test("refuses unrelated messaging while legacy runtime identity is unresolved", async () => {
       const config = await createTestConfig(rootDir);
@@ -1139,7 +1139,7 @@ describe("TaskService", () => {
     );
 
     test.each([false, true])(
-      "refuses a delegated root before budget reservation (accepted=%s)",
+      "refuses a delegated root before dispatch (accepted=%s)",
       async (accepted) => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "repo");
@@ -1157,10 +1157,6 @@ describe("TaskService", () => {
         );
         const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
         const { taskService } = createTaskServiceHarness(config, { workspaceService });
-        const internals = taskService as unknown as {
-          agentPeerMessageBroker: AgentPeerMessageBroker;
-        };
-        const reserve = spyOn(internals.agentPeerMessageBroker, "reserveBudget");
         await registerLiveWorkspaceTurnHandle(
           taskService,
           "target",
@@ -1168,39 +1164,32 @@ describe("TaskService", () => {
           "sender",
           accepted ? "accepted" : "reserved"
         );
-        try {
-          const result = await taskService.sendAgentTreeMessage(
-            "sender",
-            "target",
-            "Do not resume delegated work"
-          );
-          expect(result).toMatchObject(Err({ code: "refused" }));
-          assert(!result.success && "reason" in result.error);
-          expect(result.error.reason).toMatch(/retry.*delegated/i);
-          expect(reserve).not.toHaveBeenCalled();
-          expect(sendMessage).not.toHaveBeenCalled();
-          // Existing ownership is separate from ancestry; finishing the delegation opens messaging.
-          workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
-            "target"
-          );
-          expect(
-            await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
-          ).toEqual(
-            Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
-          );
-          const [, , options] = sendMessage.mock.calls[0] as Parameters<
-            WorkspaceHost["sendMessage"]
-          >;
-          expect(options?.agentId).toBe("exec");
-          expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
-        } finally {
-          reserve.mockRestore();
-        }
+        const result = await taskService.sendAgentTreeMessage(
+          "sender",
+          "target",
+          "Do not resume delegated work"
+        );
+        expect(result).toMatchObject(Err({ code: "refused" }));
+        assert(!result.success && "reason" in result.error);
+        expect(result.error.reason).toMatch(/retry.*delegated/i);
+        expect(sendMessage).not.toHaveBeenCalled();
+        // Existing ownership is separate from ancestry; finishing the delegation opens messaging.
+        workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+          "target"
+        );
+        expect(
+          await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
+        ).toEqual(
+          Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
+        );
+        const [, , options] = sendMessage.mock.calls[0] as Parameters<WorkspaceHost["sendMessage"]>;
+        expect(options?.agentId).toBe("exec");
+        expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
       }
     );
 
     test.each(["pre-admission", "queued"] as const)(
-      "withdraws and refunds when delegation starts %s",
+      "withdraws when delegation starts %s",
       async (phase) => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "repo");
@@ -1223,11 +1212,6 @@ describe("TaskService", () => {
         const internals = taskService as unknown as {
           resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
         };
-        reserveFamilyMessageTargetSlots(
-          taskService,
-          "target",
-          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-        );
         const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
         try {
           if (phase === "pre-admission") {
@@ -1266,7 +1250,6 @@ describe("TaskService", () => {
               WorkspaceHost["sendMessage"]
             >;
             expect(internal?.admissionStale?.()).toBe(true);
-            await internal?.onCanceled?.("Delegated execution began before dispatch");
           } else {
             expect(result).toMatchObject(Err({ code: "refused" }));
             expect(sendMessage).not.toHaveBeenCalled();
@@ -1275,7 +1258,7 @@ describe("TaskService", () => {
           workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
             "target"
           );
-          // One available budget slot proves that either cancellation path refunded the first send.
+          // Finishing the delegation opens messaging again.
           expect(
             (await taskService.sendAgentTreeMessage("sender", "target", "After delegation")).success
           ).toBe(true);
@@ -1392,7 +1375,7 @@ describe("TaskService", () => {
       { endpoint: "sender", state: "unresolved", code: "refused" },
       { endpoint: "target", state: "unresolved", code: "refused" },
     ])(
-      "refunds when $endpoint becomes $state during identity resolution",
+      "refuses when $endpoint becomes $state during identity resolution",
       async ({ endpoint, state, code }) => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "repo");
@@ -1416,11 +1399,6 @@ describe("TaskService", () => {
           resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
         };
         const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
-        reserveFamilyMessageTargetSlots(
-          taskService,
-          "target",
-          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-        );
         try {
           resolve.mockImplementationOnce(async () => {
             if (state === "stopped") taskService.markParentWorkspaceInterrupted(endpoint);
@@ -1496,11 +1474,6 @@ describe("TaskService", () => {
         const { taskService, historyService } = createTaskServiceHarness(config, {
           workspaceService,
         });
-        reserveFamilyMessageTargetSlots(
-          taskService,
-          "target",
-          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-        );
         expect(
           await taskService.sendAgentTreeMessage("sender", "target", "Queued peer input")
         ).toMatchObject(Ok({ delivery: "queued" }));
@@ -1516,7 +1489,6 @@ describe("TaskService", () => {
           return cfg;
         });
         expect(internal?.admissionStale?.()).toBe(true);
-        await internal?.onCanceled?.("Endpoint runtime changed before dispatch");
         expect(await collectFullHistory(historyService, "target")).toEqual([]);
 
         await config.editConfig((cfg) => {
@@ -1525,7 +1497,7 @@ describe("TaskService", () => {
           entry.workspace.runtimeConfig = { type: "local" };
           return cfg;
         });
-        // The sole available target slot must have been returned by queue cancellation.
+        // Restoring the local runtime opens messaging again.
         expect(
           (await taskService.sendAgentTreeMessage("sender", "target", "After local restore"))
             .success
@@ -1772,6 +1744,49 @@ describe("TaskService", () => {
     expect(limited.success).toBe(false);
     if (!limited.success) {
       expect(limited.error.code).toBe("rate_limited");
+    }
+  });
+
+  test("sendAgentTreeMessage has no lifetime budget once each rate window passes", async () => {
+    // Peer sends used to draw on a per-session budget (32 messages per sender→target) that
+    // refused long-running coordinator conversations until restart. Only the rate limit,
+    // duplicate suppression, and queue cap bound them now.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    let now = Date.now();
+    setSystemTime(new Date(now));
+    try {
+      for (let i = 0; i < 40; i++) {
+        if (i > 0 && i % PEER_MESSAGE_RATE_LIMIT_MAX === 0) {
+          now += PEER_MESSAGE_RATE_WINDOW_MS + 1;
+          setSystemTime(new Date(now));
+        }
+        const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `update ${i}`);
+        expect(result).toEqual(
+          Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+        );
+      }
+    } finally {
+      setSystemTime();
     }
   });
 
@@ -2254,113 +2269,6 @@ describe("TaskService", () => {
     releaseStop?.();
     expect(await terminating).toEqual(["leaf-a"]);
     expect(sendMessage).not.toHaveBeenCalled();
-  });
-
-  test("sendAgentTreeMessage refunds budget reservations when dispatch throws pre-persistence", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    // Awaited preparation/dispatch can THROW (e.g. a transient handle-store read failure), and
-    // only returned failures reach the inline refund — a leaked reservation would consume the
-    // session-wide budgets without delivering anything, eventually refusing valid messages
-    // until restart.
-    let failFirst = true;
-    const sendMessage = mock((): Promise<Result<void>> => {
-      if (failFirst) {
-        failFirst = false;
-        return Promise.reject(new Error("transient handle store failure"));
-      }
-      return Promise.resolve(Ok(undefined));
-    });
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // Exactly ONE aggregate slot left for sib-b: without the refund, the thrown first attempt
-    // permanently consumes it and the follow-up is budget-refused.
-    reserveFamilyMessageTargetSlots(
-      taskService,
-      "sib-b",
-      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-    );
-
-    try {
-      await taskService.sendAgentTreeMessage("sib-a", "sib-b", "first try");
-      expect.unreachable("dispatch throw must propagate to the caller");
-    } catch (error) {
-      expect((error as Error).message).toBe("transient handle store failure");
-    }
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "second try")).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-    );
-  });
-
-  test("sendAgentTreeMessage refunds queued sends canceled before dispatch", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // One aggregate slot left: a queued-then-canceled send that never refunds would consume it
-    // permanently and refuse the follow-up.
-    reserveFamilyMessageTargetSlots(
-      taskService,
-      "sib-b",
-      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-    );
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-    );
-    // A busy target queued the entry; a user interrupt clears the queue before dispatch —
-    // AgentSession invokes the entry's onCanceled, which must release the reservation.
-    const [, , , internalArg] = sendMessage.mock.calls[0] as [
-      string,
-      string,
-      unknown,
-      { onCanceled?: (reason: string) => void },
-    ];
-    expect(internalArg.onCanceled).toBeDefined();
-    internalArg.onCanceled?.("Queue cleared before dispatch");
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "after cancel")).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-    );
   });
 
   test("failed hard-interrupt cascade persistence retains the descendant's stop latch", async () => {

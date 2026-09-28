@@ -72,15 +72,6 @@ describe("Unrelated messages and a recipient's missing checkout", () => {
     return result.data;
   }
 
-  function spyOnBudgetReservation(testEnv: TestEnvironment) {
-    const broker = (
-      testEnv.services.taskService as unknown as {
-        agentPeerMessageBroker: { reserveBudget: (...args: unknown[]) => unknown };
-      }
-    ).agentPeerMessageBroker;
-    return jest.spyOn(broker, "reserveBudget");
-  }
-
   const MESSAGE = "hello from another tree";
   const hasEnvelope = (rows: Awaited<ReturnType<typeof historyRows>>) =>
     rows.some((row) =>
@@ -89,14 +80,13 @@ describe("Unrelated messages and a recipient's missing checkout", () => {
       )
     );
 
-  test("refuses before persisting any row or reserving budget, and discovery still lists it", async () => {
+  test("refuses before persisting any row, and discovery still lists it", async () => {
     if (!env || !repoPath) throw new Error("Test environment not initialized");
     const sender = await createRoot(env, repoPath, "peer-sender");
     const target = await createRoot(env, repoPath, "peer-missing");
     await setConsent(env, target.workspaceId, true);
     await fs.rm(target.workspacePath, { recursive: true, force: true });
     const rowsBefore = await historyRows(env, target.workspaceId);
-    const reserveBudget = spyOnBudgetReservation(env);
 
     const result = await env.services.taskService.sendAgentTreeMessage(
       sender.workspaceId,
@@ -111,7 +101,6 @@ describe("Unrelated messages and a recipient's missing checkout", () => {
     expect(reason).toContain("checkout is unavailable");
     // The untrusted sender learns nothing about the recipient's paths.
     expect(reason).not.toContain(target.workspacePath);
-    expect(reserveBudget).not.toHaveBeenCalled();
     expect(await historyRows(env, target.workspaceId)).toEqual(rowsBefore);
     // Discovery stays a snapshot without disk probes: the target is listed and refuses on send.
     const listed = env.services.taskService.listInstanceWorkspaces(sender.workspaceId, {});
@@ -140,7 +129,6 @@ describe("Unrelated messages and a recipient's missing checkout", () => {
     const target = await createRoot(env, repoPath, "peer-healthy");
     await setConsent(env, target.workspaceId, true);
     expect(hasEnvelope(await historyRows(env, target.workspaceId))).toBe(false);
-    const reserveBudget = spyOnBudgetReservation(env);
 
     const result = await env.services.taskService.sendAgentTreeMessage(
       sender.workspaceId,
@@ -149,7 +137,6 @@ describe("Unrelated messages and a recipient's missing checkout", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(reserveBudget).toHaveBeenCalledTimes(1);
     await env.services.workspaceService.waitForIdle(target.workspaceId);
     const rows = await historyRows(env, target.workspaceId);
     expect(hasEnvelope(rows)).toBe(true);

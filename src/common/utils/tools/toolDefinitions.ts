@@ -1089,7 +1089,7 @@ export const TaskSendMessageToolArgsSchema = z
       .trim()
       .min(1)
       .describe(
-        `Plain-text message to deliver to the target. Sibling/upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters and draw from shared per-pair/per-target session budgets; descendant guidance is uncapped.`
+        `Plain-text message to deliver to the target. Sibling/upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters; descendant guidance is uncapped.`
       ),
     queue_dispatch_mode: z
       .enum(["tool-end", "turn-end"])

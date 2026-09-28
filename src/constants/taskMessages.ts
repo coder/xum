@@ -20,6 +20,13 @@ export const TASK_FAMILY_MESSAGE_MAX_CHARS = 16 * 1024;
  * 32 messages / 256K chars (= 16 max-size messages) is far beyond legitimate
  * status-update traffic, and the final result travels via agent_report,
  * which is not part of this budget.
+ *
+ * Only the code_execution family helpers (task_message_parent /
+ * task_message_sibling) draw on these budgets, because they have no other
+ * aggregate bound. task_send_message peer sends are bounded by the rate
+ * limits, duplicate suppression, and queue cap in agentMessaging.ts instead;
+ * a lifetime budget there refused long-running coordinator conversations
+ * until restart.
  */
 export const TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES = 32;
 export const TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS = 256 * 1024;

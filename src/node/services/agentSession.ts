@@ -3898,7 +3898,7 @@ export class AgentSession {
     /**
      * Returns whether the rows are verifiably gone. deleteMessages can fail AFTER its atomic
      * rewrite committed, so a reported failure re-reads the durable history before concluding —
-     * callers that couple side effects to the rollback (peer budget refunds) must only act when
+     * callers that couple side effects to the rollback (family-message budget refunds) must only act when
      * deletion actually committed, or a "canceled" payload would stay durable while no longer
      * counting against the sender's budget.
      */
@@ -4983,11 +4983,10 @@ export class AgentSession {
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
     if (isAdmissionStale()) {
       const rolledBack = await rollbackPersistedTurnRows();
-      // Probe-carrying sends are peer messages whose caller already returned success when the
-      // entry was queued — the cancellation hook is their only way to observe this refusal and
-      // release the budget reservation (the refund closure is idempotent). Fire it ONLY when the
-      // rollback verifiably committed: rows that remain durable can enter provider context after
-      // a resume, so their charge must stand (budget charged ⇔ rows durable).
+      // Probe-carrying sends may have returned success to their caller when the entry was
+      // queued — the cancellation hook is the caller's only way to observe this refusal. Fire it
+      // ONLY when the rollback verifiably committed: rows that remain durable can enter provider
+      // context after a resume, so the caller must not treat them as canceled.
       if (rolledBack) {
         await internal?.onCanceled?.(
           "Send refused: the caller's admission became stale before the turn was accepted."

@@ -13,7 +13,6 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
-  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
@@ -41,7 +40,6 @@ import {
   registerLiveWorkspaceTurnHandle,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
-  reserveFamilyMessageTargetSlots,
 } from "@/node/services/taskService.shared.testHarness";
 
 /**
@@ -801,56 +799,6 @@ describe("TaskService", () => {
     expect(fromA.callerPeerMessagingRestricted).toBeUndefined();
     expect(fromA.tasks.some((task) => task.taskId === "task-cand")).toBe(true);
     expect(fromA.tasks.some((task) => task.taskId.startsWith("task-wf"))).toBe(false);
-  });
-
-  test("sendAgentTreeMessage refunds queued sends whose dispatch fails pre-persistence", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    reserveFamilyMessageTargetSlots(
-      taskService,
-      "sib-b",
-      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
-    );
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-    );
-    // Queued dispatch fails pre-persistence (e.g. a pricing gate rejects the waiting entry):
-    // sendQueuedMessages surfaces the error through onAcceptedPreStreamFailure — which must
-    // release the reservation, or the failed entry would consume the budget forever.
-    const [, , , internalArg] = sendMessage.mock.calls[0] as [
-      string,
-      string,
-      unknown,
-      { onAcceptedPreStreamFailure?: (error: unknown) => void },
-    ];
-    expect(internalArg.onAcceptedPreStreamFailure).toBeDefined();
-    internalArg.onAcceptedPreStreamFailure?.(new Error("pricing gate rejected"));
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "after failure")).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-    );
   });
 
   test("listTaskTreeAgents flags an archived root so discovery can hide it", async () => {

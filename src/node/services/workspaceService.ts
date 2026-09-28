@@ -14145,16 +14145,15 @@ export class WorkspaceService
           });
         // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
         // (its onCanceled settles the owner's handle, which the superseded entry no longer
-        // represents) — but a peer trigger's onCanceled is the sender's budget refund, tied to
-        // this entry rather than the foreign handle, so it survives the downgrade.
-        const isPeerTrigger = workspaceTurnContinuationMetadata?.agentPeerMessageTrigger != null;
+        // represents).
         return {
           options: preserveCorrelation
             ? normalizedOptions
             : stripWorkspaceTurnCorrelation(normalizedOptions),
-          onCanceled: preserveCorrelation || isPeerTrigger ? internal?.onCanceled : undefined,
-          onAcceptedPreStreamFailure:
-            preserveCorrelation || isPeerTrigger ? internal?.onAcceptedPreStreamFailure : undefined,
+          onCanceled: preserveCorrelation ? internal?.onCanceled : undefined,
+          onAcceptedPreStreamFailure: preserveCorrelation
+            ? internal?.onAcceptedPreStreamFailure
+            : undefined,
         };
       };
 

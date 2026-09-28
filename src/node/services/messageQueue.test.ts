@@ -1200,7 +1200,7 @@ describe("MessageQueue", () => {
       expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
     });
 
-    it("should keep peer trigger identity and refund hook when correlation is stripped", () => {
+    it("should keep peer trigger identity but drop owner callbacks when correlation is stripped", () => {
       const onCanceled = () => undefined;
       const onAcceptedPreStreamFailure = () => undefined;
       queue.add(
@@ -1229,17 +1229,16 @@ describe("MessageQueue", () => {
       expect(first.message).toBe("User send now");
 
       // The superseded correlation is stripped, but a peer trigger keeps its
-      // machine-notification identity (downgraded to plain peer attribution) plus both refund
-      // hooks — onCanceled and onAcceptedPreStreamFailure carry the sender's budget refund,
-      // tied to this entry rather than the superseded owner handle.
+      // machine-notification identity (downgraded to plain peer attribution). The callbacks
+      // settle the superseded owner handle, so they are dropped like any other entry's.
       const second = queue.dequeueNext();
       expect(second.options?.muxMetadata).toEqual({
         type: "agent-peer-message",
         fromWorkspaceId: "sib-a",
         relationship: "sibling",
       });
-      expect(second.internal?.onCanceled).toBe(onCanceled);
-      expect(second.internal?.onAcceptedPreStreamFailure).toBe(onAcceptedPreStreamFailure);
+      expect(second.internal?.onCanceled).toBeUndefined();
+      expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
     });
 
     it("should preserve an original queued workspace-turn prompt during reordering", () => {
