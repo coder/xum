@@ -33,10 +33,8 @@ export function getPendingScopeId(projectPath: string): string {
  *
  * Format: "__draft__/{projectPath}/{draftId}"
  */
-const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
-
 export function getDraftScopeId(projectPath: string, draftId: string): string {
-  return `${DRAFT_SCOPE_ID_PREFIX}${projectPath}/${draftId}`;
+  return `__draft__/${projectPath}/${draftId}`;
 }
 
 /**
@@ -939,8 +937,8 @@ export const BRANCH_CACHE_INDEX_KEY = "branchIndex";
  * - `synced`: frontend copy of backend-owned preferences; never evicted.
  * - `ui`: small UI preferences; never evicted.
  *
- * Keys that are not registered are treated as non-evictable and are never garbage collected, so
- * forgetting to register a key can only leak space, never lose data.
+ * Keys that are not registered are treated as non-evictable, so forgetting to register a key can
+ * only leak space, never lose data.
  */
 export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft" | "synced";
 
@@ -1029,13 +1027,20 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getDesktopPopoutKey, "ui", false),
 
   // LRU caches bound themselves by entry count; their entries and index keys are only evicted
-  // under quota pressure, never garbage collected per workspace (that would strand index entries).
+  // under quota pressure.
   globalCacheKey(SESSION_COST_CACHE_ENTRY_PREFIX, "prefix"),
   globalCacheKey(SESSION_COST_CACHE_INDEX_KEY, "exact"),
   globalCacheKey(PR_STATUS_CACHE_ENTRY_PREFIX, "prefix"),
   globalCacheKey(PR_STATUS_CACHE_INDEX_KEY, "exact"),
   globalCacheKey(BRANCH_CACHE_ENTRY_PREFIX, "prefix"),
   globalCacheKey(BRANCH_CACHE_INDEX_KEY, "exact"),
+
+  // Backend data cached only to avoid a flash on mount; the owners refetch or re-test it.
+  // mcpTestResults keys are project-scoped (optionally ":{workspaceId}" after the project path), so
+  // they are registered as one global prefix rather than as a workspace key.
+  globalCacheKey(getWorkspaceKeyPrefix(getArchivedWorkspacesKey), "prefix"),
+  globalCacheKey(getWorkspaceKeyPrefix(getMCPServersKey), "prefix"),
+  globalCacheKey(getWorkspaceKeyPrefix(getMCPTestResultsKey), "prefix"),
 ];
 
 const WORKSPACE_KEY_REGISTRATIONS = PERSISTED_KEY_REGISTRY.filter(
@@ -1057,15 +1062,6 @@ export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
     }
   }
   return undefined;
-}
-
-/** Scope id embedded in a registered workspace-scoped key, or null for any other key. */
-function getWorkspaceScopeIdFromKey(key: string): string | null {
-  for (const entry of WORKSPACE_KEY_REGISTRATIONS) {
-    const prefix = getWorkspaceKeyPrefix(entry.getKey);
-    if (key.startsWith(prefix)) return key.slice(prefix.length);
-  }
-  return null;
 }
 
 function isStagedPersistedAttachment(value: unknown): boolean {
@@ -1114,57 +1110,6 @@ export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId:
 export function deleteWorkspaceStorage(workspaceId: string): void {
   for (const { getKey } of WORKSPACE_KEY_REGISTRATIONS) {
     localStorage.removeItem(getKey(workspaceId));
-  }
-}
-
-/**
- * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
- * collects keys whose scope id has this shape, so legacy-format ids, project/global/pending scopes
- * and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
- * Failing closed here leaks a little space at worst; guessing wrong would delete user data.
- */
-const STABLE_WORKSPACE_ID_PATTERN = /^[0-9a-f]{10}$/;
-
-/** Every localStorage key that belongs to a registered workspace-scoped key function. */
-export function listWorkspaceScopedStorageKeys(): string[] {
-  const keys: string[] = [];
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index);
-    if (key !== null && getWorkspaceScopeIdFromKey(key) !== null) keys.push(key);
-  }
-  return keys;
-}
-
-/**
- * Pick the workspace-scoped keys whose owner no longer exists.
- *
- * - Workspace keys are orphaned only when their scope id is a stable workspace id that is not in
- *   `knownWorkspaceIds` (see STABLE_WORKSPACE_ID_PATTERN).
- * - Creation-draft keys are orphaned only when `liveDraftScopeIds` is known (the drafts map was
- *   loaded) and does not contain their exact scope id. Draft scope ids embed project paths that
- *   may contain "/", so they are compared whole, never parsed.
- * - Pending scopes (`__pending__{projectPath}`) are never collected: they are bounded to one per
- *   project and are the source of the legacy pending-to-draft migration.
- */
-export function findOrphanedWorkspaceStorageKeys(
-  candidateKeys: readonly string[],
-  knownWorkspaceIds: ReadonlySet<string>,
-  liveDraftScopeIds: ReadonlySet<string> | null
-): string[] {
-  return candidateKeys.filter((key) => {
-    const scopeId = getWorkspaceScopeIdFromKey(key);
-    if (scopeId === null) return false;
-    if (scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)) {
-      return liveDraftScopeIds !== null && !liveDraftScopeIds.has(scopeId);
-    }
-    return STABLE_WORKSPACE_ID_PATTERN.test(scopeId) && !knownWorkspaceIds.has(scopeId);
-  });
-}
-
-/** Remove keys selected by findOrphanedWorkspaceStorageKeys. */
-export function removeWorkspaceStorageKeys(keys: readonly string[]): void {
-  for (const key of keys) {
-    localStorage.removeItem(key);
   }
 }
 

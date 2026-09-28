@@ -4,26 +4,18 @@ import {
   PERSISTED_KEY_REGISTRY,
   copyWorkspaceStorage,
   deleteWorkspaceStorage,
-  findOrphanedWorkspaceStorageKeys,
   getDesktopPopoutKey,
   getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getInputAttachmentsKey,
-  getInputKey,
-  getPendingScopeId,
   getPinnedTodoExpandedKey,
-  getProjectScopeId,
   getReasoningModeKey,
   getReviewFileFilterKey,
-  getReviewStateKey,
   getRightSidebarLayoutKey,
   getSubAgentTasksExpandedKey,
   getTerminalTitlesKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
   getTimelineFilterKey,
   getWorkspaceKeyPrefix,
-  GLOBAL_SCOPE_ID,
   normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
   type TerminalBadgeConfig,
@@ -170,8 +162,8 @@ describe("storage workspace-scoped keys", () => {
     expect(localStorage.getItem(otherWorkspaceKey)).toBe("value");
   });
 
-  // A prefix that is a prefix of another would misattribute keys: the wrong kind (eviction) or a
-  // mangled scope id (orphan GC deleting or keeping the wrong keys).
+  // A prefix that is a prefix of another would give keys the wrong kind, so quota eviction could
+  // remove a draft or preference that merely shares a cache key's prefix.
   test("registered key prefixes never shadow each other", () => {
     const prefixes = PERSISTED_KEY_REGISTRY.map((entry) =>
       entry.scope === "workspaceId" ? getWorkspaceKeyPrefix(entry.getKey) : entry.key
@@ -182,49 +174,6 @@ describe("storage workspace-scoped keys", () => {
         if (index !== otherIndex) expect(other.startsWith(prefix)).toBe(false);
       }
     }
-  });
-});
-
-describe("findOrphanedWorkspaceStorageKeys", () => {
-  const known = "0123456789";
-  const unknown = "deadbeef00";
-  const liveDraft = getDraftScopeId("/repo/with/slashes", "draft-live");
-  const staleDraft = getDraftScopeId("/repo/with/slashes", "draft-stale");
-
-  test("collects only unknown stable workspace ids and stale creation drafts", () => {
-    const orphaned = [
-      getInputKey(unknown),
-      getReviewStateKey(unknown),
-      getTerminalTitlesKey(unknown),
-      getInputKey(staleDraft),
-    ];
-    const kept = [
-      getInputKey(known),
-      getInputKey(liveDraft),
-      getInputKey(getPendingScopeId("/repo")),
-      getThinkingLevelKey(getProjectScopeId("/repo")),
-      getThinkingLevelKey(GLOBAL_SCOPE_ID),
-      // Legacy global key sharing a registered prefix.
-      getThinkingLevelByModelKey("openai:gpt-5"),
-      // Legacy (non-stable) workspace id format.
-      getInputKey("myproject-feature-branch"),
-      // Unregistered key.
-      `unregistered:${unknown}`,
-    ];
-
-    expect(
-      findOrphanedWorkspaceStorageKeys(
-        [...orphaned, ...kept],
-        new Set([known]),
-        new Set([liveDraft])
-      )
-    ).toEqual(orphaned);
-  });
-
-  test("keeps every draft key when the drafts map was not loaded", () => {
-    expect(
-      findOrphanedWorkspaceStorageKeys([getInputKey(staleDraft)], new Set([known]), null)
-    ).toEqual([]);
   });
 });
 
