@@ -636,3 +636,106 @@ describe("unsanitized task checkout whose reclaim failed", () => {
     }
   }, 120_000);
 });
+
+/**
+ * #4742: a direct `TaskService.create` persists its row as `running` before it sanitizes the
+ * checkout. A send admitted in that window expands its slash-invoked MCP prompt (the prompt
+ * snapshot) before the turn's init wait. That expansion must not start the prompt's server in
+ * the checkout before sanitize returns. It cannot today: `MCPServerManager.getPrompt` only
+ * serves a workspace whose options an earlier tool or prompt listing recorded, both listings
+ * wait for init, and the launch completes init only after sanitize. This pins that chain for
+ * the direct path: a listing that served before sanitize, or a cold-starting getPrompt, fails it.
+ */
+describe("direct create: MCP prompt snapshot before sanitize", () => {
+  test("a send racing the direct create starts no MCP server before the checkout is sanitized", async () => {
+    const env = await createTestEnvironment();
+    const repoPath = await createTempGitRepo();
+    const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
+    try {
+      const { parentId } = await setUpReplacement(env, repoPath, recordFile);
+      const workspaceService = env.services.workspaceService;
+      const realSanitize =
+        workspaceService.sanitizeMaterializedTaskWorkspace.bind(workspaceService);
+      const sanitizeEntered = Promise.withResolvers<{ taskId: string; checkout: string }>();
+      const releaseSanitize = Promise.withResolvers<void>();
+      let sanitizedAt = Number.POSITIVE_INFINITY;
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        async (...args) => {
+          if (args[0] === parentId) return realSanitize(...args);
+          sanitizeEntered.resolve({ taskId: args[0], checkout: await fs.realpath(args[1]) });
+          await releaseSanitize.promise;
+          const result = await realSanitize(...args);
+          sanitizedAt = Date.now();
+          return result;
+        }
+      );
+      const getPrompt = spyOn(env.services.mcpServerManager, "getPrompt");
+      const initWaits = observeInit(env);
+
+      const created = env.services.taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "Summarize durable workflows",
+        title: "Direct",
+      });
+      const held = await sanitizeEntered.promise;
+      const row = () =>
+        env.config
+          .loadConfigOrDefault()
+          .projects.get(repoPath)
+          ?.workspaces.find((w) => w.id === held.taskId);
+      // The window: the row is persisted as running while its sanitize is held.
+      expect(row()?.taskStatus).toBe("running");
+
+      // A renderer's prompt catalog request parks on the launch's init until sanitize is done;
+      // a listing that served now would record options that let the send below start MCP.
+      initWaits.target.workspaceId = held.taskId;
+      const catalog = listPrompts(env, held.taskId);
+      await initWaits.parked;
+      expect(initWaits.completed).not.toContain(held.taskId);
+      const racing = await sendMessage(env, held.taskId, "/mcp__recorder__recorded", {
+        model: HAIKU_MODEL,
+        muxMetadata: {
+          type: "normal",
+          rawCommand: "/mcp__recorder__recorded",
+          commandPrefix: "/mcp__recorder__recorded",
+          mcpPromptRefs: [
+            {
+              serverName: "recorder",
+              promptName: "recorded",
+              commandKey: "mcp__recorder__recorded",
+              source: "slash",
+            },
+          ],
+        },
+      });
+      // The send reached the prompt snapshot, and its expansion started nothing.
+      expect(getPrompt.mock.calls.some((call) => call[0] === held.taskId)).toBe(true);
+      expect(racing.success).toBe(false);
+      expect((await readRecord(recordFile)).filter((e) => e.cwd === held.checkout)).toEqual([]);
+
+      releaseSanitize.resolve();
+      expect((await created).success).toBe(true);
+      expect("prompts" in (await catalog)).toBe(true);
+      // Positive control: the launch's own turn starts the server in the checkout, after sanitize.
+      const deadline = Date.now() + 30_000;
+      let childEvents: RecordedEvent[] = [];
+      while (!childEvents.some((e) => e.event === "tools/list")) {
+        assert(Date.now() < deadline, "the launch never listed the checkout's MCP tools");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        childEvents = (await readRecord(recordFile)).filter((e) => e.cwd === held.checkout);
+      }
+      for (const event of childEvents) expect(event.at).toBeGreaterThanOrEqual(sanitizedAt);
+      // Let the child's turn finish before teardown: it reports, and a completed task's row
+      // may then be auto-deleted.
+      while (row() !== undefined && row()?.taskStatus !== "reported") {
+        assert(Date.now() < deadline, `the task never reported (${String(row()?.taskStatus)})`);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    } finally {
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(repoPath);
+    }
+  }, 120_000);
+});
