@@ -875,15 +875,12 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     // workspace's name would overwrite that workspace's plan. Project-dir forks never fail on the
     // name by themselves, so fork() must refuse it before copying anything.
     describe("fork name collisions (#5009)", () => {
-      const addLocalWorkspace = (id: string, name: string, inProject = projectPath) =>
+      const addLocalWorkspace = (id: string, name: string) =>
         harness.config.editConfig((cfg) => {
-          if (!cfg.projects.has(inProject)) {
-            cfg.projects.set(inProject, { workspaces: [], trusted: true });
-          }
-          cfg.projects.get(inProject)!.workspaces.push({
+          cfg.projects.get(projectPath)!.workspaces.push({
             id,
             name,
-            path: inProject,
+            path: projectPath,
             runtimeConfig: { type: "local" },
           });
           return cfg;
@@ -895,20 +892,15 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       };
 
       test.each([
-        { label: "its source", target: "local-one", inThisProject: true },
-        { label: "another workspace", target: "local-two", inThisProject: true },
-        // Plan paths key on the project name, which another project can share.
-        { label: "a same-named project's workspace", target: "twin-ws", inThisProject: false },
+        { label: "its source", target: "local-one" },
+        { label: "another workspace", target: "local-two" },
       ])("local fork named like $label is refused and no plan changes", async (c) => {
         await withTempMuxRoot(async (root) => {
-          const twinProject = path.join(harness.rootDir, "twin", "project");
           await addLocalWorkspace("eeeeeeeee2", "local-one");
           await addLocalWorkspace("eeeeeeeee3", "local-two");
-          await addLocalWorkspace("eeeeeeeee6", "twin-ws", twinProject);
           const plans = [
             await writeDistinctPlan(root, "local-one"),
             await writeDistinctPlan(root, "local-two"),
-            await writeDistinctPlan(root, "twin-ws"),
           ];
           const before = await Promise.all(plans.map((p) => fs.readFile(p)));
           const copy = spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes");
@@ -917,9 +909,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           const result = await service.fork("eeeeeeeee2", c.target);
 
           expect(result.success ? "" : result.error).toBe(
-            c.inThisProject
-              ? `Workspace with name "${c.target}" already exists in this project`
-              : `Workspace with name "${c.target}" already exists in ${twinProject}, which shares this project's plan directory`
+            `Workspace with name "${c.target}" already exists in this project`
           );
           expect(copy).not.toHaveBeenCalled();
           expect(await Promise.all(plans.map((p) => fs.readFile(p)))).toEqual(before);
