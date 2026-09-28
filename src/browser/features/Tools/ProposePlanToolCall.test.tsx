@@ -1,7 +1,7 @@
 import type { ComponentProps, ReactNode } from "react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -769,18 +769,20 @@ describe("ProposePlanToolCall", () => {
     async function renderWithEnforcedPolicy(sendMessageCalls: SendMessageArgs[]) {
       startInPlanMode(WORKSPACE_ID, PLAN_MODEL, "high");
       updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: EXEC_MODEL } });
-      let policyReads = 0;
+      let policyAnswer: Promise<typeof ONLY_ANTHROPIC_POLICY> | null = null;
       mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
       mockApi.policy = {
         get: () => {
-          policyReads += 1;
-          return Promise.resolve(ONLY_ANTHROPIC_POLICY);
+          policyAnswer = Promise.resolve(ONLY_ANTHROPIC_POLICY);
+          return policyAnswer;
         },
       };
       const view = renderCompletedPlan();
-      await waitFor(() => expect(policyReads).toBe(1));
-      // Let PolicyProvider commit the answer before the click reads it.
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await waitFor(() => expect(policyAnswer).not.toBeNull());
+      // Flush PolicyProvider's state update for the answer before the click reads it.
+      await act(async () => {
+        await policyAnswer;
+      });
       return view;
     }
 

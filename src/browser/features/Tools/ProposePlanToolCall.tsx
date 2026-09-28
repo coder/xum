@@ -52,9 +52,16 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
-import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import {
+  isModelAllowedByPolicyOnActiveRoute,
+  isProviderConfigured,
+} from "@/common/utils/ai/selectableModels";
+import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
+import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
+import type { EffectivePolicy } from "@/common/orpc/types";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
@@ -150,6 +157,26 @@ function isLegacyProposePlanResult(result: unknown): result is LegacyProposePlan
  */
 function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolArgs {
   return args !== null && typeof args === "object" && "title" in args && "plan" in args;
+}
+
+/**
+ * #4980: whether admin policy lets `model` run, checked on the route the backend would use (the
+ * model picker's check). Null while the providers or routing config is unknown: the route is
+ * unknown then (a gateway may be allowed), so the backend decides. Reads the shared stores at
+ * dispatch time instead of subscribing every plan card to them.
+ */
+function isPlanModelAllowedByPolicy(policy: EffectivePolicy | null, model: string): boolean | null {
+  const providersConfig = getProvidersConfigStore().getConfig();
+  const routing = getAppConfigStore().getSnapshot();
+  if (providersConfig === null || routing === null) return null;
+  return isModelAllowedByPolicyOnActiveRoute(
+    policy,
+    normalizeSelectedModel(model),
+    routing.routePriority ?? DEFAULT_ROUTE_PRIORITY,
+    routing.routeOverrides ?? {},
+    (provider) => isProviderConfigured(providersConfig, provider),
+    (gateway, modelId) => isGatewayModelAccessibleForUi(policy, providersConfig, gateway, modelId)
+  );
 }
 
 /** Resolved (not yet persisted) AI settings for a plan action's target agent. */
@@ -259,12 +286,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
-  // #4980: same route-aware policy check as the model picker. Until the first policy answer, the
-  // providers config and the routing config (`appConfig`) arrive, the active route is unknown,
-  // so the backend decides.
-  const { isAllowedByPolicyOnActiveRoute } = useModelsFromSettings();
-  const { loading: policyLoading } = usePolicy();
-  const { config: providersConfig } = useProvidersConfig();
+  // #4980: until the first policy answer arrives, the backend decides.
+  const policyState = usePolicy();
+  const effectivePolicy =
+    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -635,10 +660,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     // Refuse before any side effect and say why. The backend stays authoritative for policy
     // changes after this render; its rejection is shown below.
     if (
-      !policyLoading &&
-      providersConfig !== null &&
-      appConfig !== null &&
-      !isAllowedByPolicyOnActiveRoute(normalizeSelectedModel(settings.resolvedModel))
+      !policyState.loading &&
+      isPlanModelAllowedByPolicy(effectivePolicy, settings.resolvedModel) === false
     ) {
       const agentName =
         agents.find((agent) => agent.id === args.targetAgentId)?.name ?? args.targetAgentId;
