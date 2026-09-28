@@ -84,6 +84,32 @@ describe("agents.list (#4751)", () => {
   });
 });
 
+describe("plan implement setting (#4942)", () => {
+  test("projects only the plan-implement replace flag out of taskSettings", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        routePriority: ["direct"],
+        taskSettings: {
+          proposePlanImplementReplacesChatHistory: true,
+          maxParallelAgentTasks: 4,
+          bashOutputHint: "secret-ish",
+        },
+      })
+    ).toEqual({
+      routePriority: ["direct"],
+      taskSettings: { proposePlanImplementReplacesChatHistory: true },
+    });
+  });
+
+  test("omits taskSettings when the flag is not a boolean", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        taskSettings: { proposePlanImplementReplacesChatHistory: "yes", maxParallelAgentTasks: 4 },
+      })
+    ).toEqual({});
+  });
+});
+
 describe("held inputs (#4771)", () => {
   const known = new Set(["ws-1"]);
 

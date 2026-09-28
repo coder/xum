@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import assert from "@/common/utils/assert";
@@ -33,6 +34,40 @@ export function useTranscriptMutationAllowed(workspaceId: string | undefined): b
       workspaceId ? workspaceStore.subscribeKey(workspaceId, listener) : noopUnsubscribe,
     () => (workspaceId ? workspaceStore.isWorkspaceTranscriptCaughtUp(workspaceId) : false)
   );
+}
+
+/**
+ * Host-aware barrier for surfaces a host without WorkspaceStore supports (#4942): the VS Code
+ * webview supplies its own barrier through ChatHostContext; desktop falls back to the store.
+ * The store-only functions above stay as they are, so actions the webview cannot perform (Fork,
+ * message-level Start Here) keep reading the store and stay disabled there.
+ */
+export function useHostTranscriptMutationAllowed(workspaceId: string | undefined): boolean {
+  const hostBarrier = useChatHostContext().transcriptBarrier;
+  return useSyncExternalStore(
+    (listener) => {
+      if (!workspaceId) return noopUnsubscribe;
+      if (hostBarrier) return hostBarrier.subscribe(workspaceId, listener);
+      return workspaceStore.subscribeKey(workspaceId, listener);
+    },
+    () => {
+      if (!workspaceId) return false;
+      if (hostBarrier) return hostBarrier.isAllowed(workspaceId);
+      return workspaceStore.isWorkspaceTranscriptCaughtUp(workspaceId);
+    }
+  );
+}
+
+/** Dispatch-time check matching `useHostTranscriptMutationAllowed`; reads live state per call. */
+export function useHostTranscriptMutationCheck(): (workspaceId: string) => boolean {
+  const hostBarrier = useChatHostContext().transcriptBarrier;
+  if (hostBarrier) {
+    return (workspaceId) => {
+      assert(workspaceId.length > 0, "workspaceId required");
+      return hostBarrier.isAllowed(workspaceId);
+    };
+  }
+  return isTranscriptMutationAllowed;
 }
 
 /**

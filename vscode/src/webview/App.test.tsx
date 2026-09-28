@@ -570,6 +570,99 @@ describe("vscode webview held inputs (#4771)", () => {
   });
 });
 
+// #4942: the latest plan's actions gate on the transcript barrier. The webview provides its own
+// barrier (it never registers in WorkspaceStore) and cannot replace chat history.
+describe("vscode webview plan actions (#4942)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const planHistory = [
+    toolMessage("m1", 1, "propose_plan", {}, { success: true, planPath: "/home/alice/plan.md" }),
+  ];
+  const implementButton = (view: ReturnType<typeof render>) =>
+    view.getByRole("button", { name: /Implement/ }) as HTMLButtonElement;
+
+  test("enables Implement once the replay caught up and sends it without replacing history", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, planHistory);
+
+    // Start Here always replaces chat history, which the webview cannot do.
+    expect(view.queryByRole("button", { name: /Start Here/ })).toBeNull();
+    expect(implementButton(view).disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(implementButton(view));
+      await Promise.resolve();
+    });
+    // The webview's projected config carries no replace setting here.
+    await bridge.answer("config.getConfig", {});
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({
+      workspaceId: WORKSPACE.id,
+      message: "Implement the plan",
+      options: { agentId: "exec" },
+    });
+    expect(bridge.orpcCalls("workspace.replaceChatHistory")).toHaveLength(0);
+  });
+
+  test("disables Implement when the server connection drops", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, planHistory);
+    expect(implementButton(view).disabled).toBe(false);
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+    expect(implementButton(view).disabled).toBe(true);
+  });
+
+  test("keeps Implement disabled after a forced catch-up showed a partial transcript", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // More history than the replay buffer holds forces a catch-up before caught-up arrives.
+    const filler = Array.from({ length: 500 }, (_, index) => ({
+      type: "message",
+      id: `u${index}`,
+      role: "user",
+      parts: [{ type: "text", text: `filler ${index}` }],
+      metadata: { historySequence: index + 1, timestamp: index + 1 },
+    }));
+    await selectWorkspace(bridge, [
+      ...filler,
+      toolMessage("m1", 501, "propose_plan", {}, { success: true, planPath: "/home/alice/plan.md" }),
+    ]);
+
+    expect(view.container.textContent).toContain("did not finish loading");
+    expect(implementButton(view).disabled).toBe(true);
+  });
+
+  test("keeps Implement disabled when the user's setting says it replaces chat history", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, planHistory);
+    await bridge.answer("config.getConfig", {
+      taskSettings: { proposePlanImplementReplacesChatHistory: true },
+    });
+
+    expect(implementButton(view).disabled).toBe(true);
+    await act(async () => {
+      fireEvent.click(implementButton(view));
+      await Promise.resolve();
+    });
+    expect(bridge.orpcCalls("workspace.sendMessage")).toHaveLength(0);
+  });
+});
+
 describe("vscode webview AI settings persistence", () => {
   let cleanupDom: (() => void) | null = null;
 
