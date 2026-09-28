@@ -9,7 +9,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { waitFor } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -96,6 +96,70 @@ describe("Sending a draft whose attachment payloads are still loading", () => {
           ]),
         LOAD_TOLERANT_WAIT
       );
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("editing an older message while they load keeps them in the draft restored on cancel", async () => {
+    const app = await createAppHarness({ branchPrefix: "draft-payload-edit" });
+    try {
+      await app.chat.send("first message");
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("Mock response"),
+        LOAD_TOLERANT_WAIT
+      );
+      await app.chat.expectStreamComplete();
+
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const draftService = app.env.services.draftService;
+      const realGet = draftService.get.bind(draftService);
+      let releasePayloads: () => void = () => undefined;
+      const payloadGate = new Promise<void>((resolve) => {
+        releasePayloads = resolve;
+      });
+      const getSpy = jest.spyOn(draftService, "get").mockImplementation(async (requested) => {
+        await payloadGate;
+        return realGet(requested);
+      });
+      await app.env.orpc.drafts.update({
+        scope,
+        attachments: [
+          {
+            kind: "provider",
+            id: "file-late",
+            url: "data:text/plain;base64,bGF0ZQ==",
+            mediaType: "text/plain",
+            filename: "late.txt",
+          },
+        ],
+      });
+      await waitFor(() => {
+        expect(getDraftStore().getView(scope)).toMatchObject({ payloadsLoaded: false });
+        expect(getSpy).toHaveBeenCalled();
+      }, LOAD_TOLERANT_WAIT);
+
+      const editButton = await waitFor(() => {
+        const button = app.view.container.querySelector('button[aria-label="Edit"]');
+        if (!button) throw new Error("Edit button not found");
+        return button as HTMLElement;
+      }, LOAD_TOLERANT_WAIT);
+      fireEvent.click(editButton);
+      releasePayloads();
+      const editTextarea = await waitFor(() => {
+        const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Edit your last message"]'
+        );
+        if (!textarea) throw new Error("Edit textarea not found");
+        expect(textarea.value).toBe("first message");
+        return textarea;
+      }, LOAD_TOLERANT_WAIT);
+
+      fireEvent.keyDown(editTextarea, { key: "Escape" });
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
+      await getDraftStore().flush(scope);
+      expect((await realGet(scope)).attachments.map(({ id }) => id)).toEqual(["file-late"]);
+      getSpy.mockRestore();
     } finally {
       await app.dispose();
     }

@@ -1302,12 +1302,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // re-applying would clobber the in-progress edit text. The applied-id ref makes that
   // explicit instead of hiding the callbacks from the dependency list.
   const appliedEditIdRef = useRef<string | null>(null);
+  const draftPayloadsLoaded = draft.payloadsLoaded;
   useEffect(() => {
     if (!editingMessage) {
       appliedEditIdRef.current = null;
       return;
     }
     if (appliedEditIdRef.current === editingMessage.id) return;
+    if (!draftPayloadsLoaded) {
+      // Hydrated attachments have no payloads yet (the draft shows none). Snapshotting now would
+      // save an attachment-less draft on cancel, and the edit's full replacement would end the
+      // load. Enter edit mode once they load (re-requested here in case an earlier load failed).
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
+      return;
+    }
     appliedEditIdRef.current = editingMessage.id;
     preEditDraftRef.current = getDraft();
     preEditReviewsRef.current = draftReviews;
@@ -1324,6 +1334,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }, 0);
   }, [
     editingMessage,
+    draftPayloadsLoaded,
+    draftScope,
     getDraft,
     draftReviews,
     applyDraftFromPending,
