@@ -75,7 +75,6 @@ import {
   isAutoRetryStatusEvent,
   type AutoRetryStatus,
 } from "xum/browser/utils/messages/autoRetryStatus";
-import { isProviderConfigFixableError } from "xum/common/utils/messages/retryEligibility";
 
 import type {
   ExtensionToWebviewMessage,
@@ -176,6 +175,9 @@ function shouldBufferUntilCaughtUp(event: WorkspaceChatMessage): boolean {
     case "stream-delta":
     case "stream-end":
     case "stream-abort":
+    // The backend replays a turn's terminal error before caught-up; applied early, it would be
+    // dropped when history loads (as WorkspaceStore buffers it too).
+    case "stream-error":
     case "tool-call-start":
     case "tool-call-delta":
     case "tool-call-end":
@@ -394,27 +396,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     const unsubscribeSeed = appConfigStore.subscribe(() => {
       seedWebviewPreferences(appConfigStore.getSnapshot());
     });
-    // As WorkspaceStore does: a provider config change may fix the error that stopped auto-retry,
-    // so drop a provider-config-fixable "Auto-retry stopped" banner (never resume a stream here).
-    let previousProvidersConfig = providersConfigStore.getConfig();
-    const unsubscribeProvidersConfig = providersConfigStore.subscribe(() => {
-      const config = providersConfigStore.getConfig();
-      if (config === previousProvidersConfig) {
-        return;
-      }
-      previousProvidersConfig = config;
-      setAutoRetryState((current) =>
-        current?.status.type === "auto-retry-abandoned" &&
-        isProviderConfigFixableError(current.status.reason)
-          ? null
-          : current
-      );
-    });
+    // Unlike WorkspaceStore, the webview does not clear a provider-config-fixable "Auto-retry
+    // stopped" banner on a provider config change: its store cannot tell the first config load
+    // from a real change, so the banner would vanish at startup. The next stream clears it.
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
-      unsubscribeProvidersConfig();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
     };

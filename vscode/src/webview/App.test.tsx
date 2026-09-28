@@ -2434,6 +2434,24 @@ describe("vscode webview retry barrier (#5092)", () => {
     ]);
   });
 
+  test("a replayed terminal context_exceeded error survives history loading and shows no Retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The backend replays the turn's terminal error before caught-up (pre-stream failure).
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      {
+        type: "stream-error",
+        messageId: "a1",
+        error: "prompt is too long",
+        errorType: "context_exceeded",
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("prompt is too long");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
   test("without a server connection the retry barrier is not offered", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
@@ -2513,30 +2531,4 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 
-  // As WorkspaceStore does on desktop: new provider config may fix the error that stopped
-  // auto-retry, so that banner goes; any other stop reason stays.
-  for (const [reason, cleared] of [
-    ["authentication", true],
-    ["missing_retry_options", false],
-  ] as const) {
-    test(`a provider config change ${cleared ? "drops" : "keeps"} an "Auto-retry stopped: ${reason}" banner`, async () => {
-      const bridge = new TestBridge();
-      const view = render(<App bridge={bridge} />);
-      await selectWorkspace(bridge, [
-        ...failedTurn("authentication"),
-        { type: "auto-retry-abandoned", reason },
-      ]);
-      expect(view.container.textContent).toContain("Auto-retry stopped");
-
-      try {
-        await bridge.answer("providers.getConfig", {
-          anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
-        });
-        expect(view.container.textContent).toContain("Stream interrupted");
-        expect(view.container.textContent?.includes("Auto-retry stopped")).toBe(!cleared);
-      } finally {
-        await clearProvidersConfig(bridge);
-      }
-    });
-  }
 });
