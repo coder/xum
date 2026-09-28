@@ -319,6 +319,10 @@ async function waitForWebSocketOpen(websocket: WebSocket, wsUrl: string): Promis
 
     const timer = setTimeout(() => {
       cleanup();
+      // Bun >= 1.3.10 emits 'error' when a CONNECTING socket is terminated (like the ws
+      // package). No listener is left after cleanup(), so an unhandled 'error' would throw
+      // and skip the lockfile fallback; swallow it, the timeout rejection below reports.
+      websocket.on("error", () => undefined);
       websocket.terminate();
       reject(
         new Error(
