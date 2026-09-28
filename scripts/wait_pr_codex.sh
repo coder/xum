@@ -386,7 +386,6 @@ CHECK_CODEX_STATUS_ONCE() {
   local all_thumbs_up_reactions
   local should_scan_full_reactions
   local now_epoch
-  local resolved_ids
   local codex_response_count_comments
   local codex_response_count_threads
   local codex_response_count
@@ -479,16 +478,18 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  # Completed status/no-findings envelopes for the current head are neither
+  # Completed no-findings security envelopes for the current head are neither
   # approval nor a failed review; they are excluded so the poller keeps waiting
-  # for the approval signal. Unknown envelopes and account errors still count.
-  resolved_ids=$(echo "$all_threads" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; codex_resolved_discussions($bot)')
-  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" --argjson resolved "$resolved_ids" '
+  # for the approval signal. Summary boards never count: whether a board blocks
+  # depends on every review thread (resolved advisories), and only the paginated
+  # gate below sees them all. Other comments, including account errors, count.
+  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
       | select(
-          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
-            and codex_comment_is_informational($bot; $head; $resolved)) | not
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->"))
+            or ((.body | codex_without_help | startswith("Security review completed."))
+              and codex_comment_is_informational($bot; $head; []))) | not
         )] | length
   ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
