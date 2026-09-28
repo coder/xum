@@ -637,6 +637,12 @@ export const KEYBINDS = {
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
 
+  /**
+   * Run the latest plan's primary action (Implement, or Continue in Auto in Auto mode).
+   * Not while typing: only from an empty or unfocused field.
+   */
+  RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
+
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },
 

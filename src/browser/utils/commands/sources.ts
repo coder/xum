@@ -242,6 +242,9 @@ const getAnalyticsRebuildDatabase = (
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
 
+const NO_RUNNABLE_PLAN_MESSAGE =
+  "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
+
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
   message: string;
@@ -1272,6 +1275,26 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         run: () => {
           // Dispatch custom event; ChatInput listens for it
           window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT));
+        },
+      });
+      list.push({
+        id: CommandIds.chatRunLatestPlanAction(),
+        title: "Implement Latest Plan",
+        subtitle: "Continue in Auto when in Auto mode",
+        section: section.chat,
+        keywords: ["plan", "implement", "continue in auto", "propose_plan"],
+        shortcutHint: formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION),
+        run: () => {
+          // The latest plan card runs its enabled primary action and marks the request handled
+          // (#4963); listeners run synchronously inside dispatchEvent.
+          const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+          }
         },
       });
       list.push({

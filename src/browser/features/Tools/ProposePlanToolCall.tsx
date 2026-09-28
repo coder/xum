@@ -101,6 +101,7 @@ import {
   X,
 } from "lucide-react";
 import { getErrorMessage } from "@/common/utils/errors";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
@@ -177,6 +178,19 @@ function isPlanModelAllowedByPolicy(policy: EffectivePolicy | null, model: strin
     (provider) => isProviderConfigured(providersConfig, provider),
     (gateway, modelId) => isGatewayModelAccessibleForUi(policy, providersConfig, gateway, modelId)
   );
+}
+
+/**
+ * True while the user is typing in a field that has content. The plan-action shortcut must not
+ * fire then (#4963); from an empty composer it may.
+ */
+function isTypingInNonEmptyField(element: Element | null): boolean {
+  if (!element || !isEditableElement(element)) return false;
+  // input, textarea and select carry a string value; contentEditable hosts carry text.
+  if ("value" in element && typeof element.value === "string") {
+    return element.value.trim() !== "";
+  }
+  return (element.textContent ?? "").trim() !== "";
 }
 
 /** Resolved (not yet persisted) AI settings for a plan action's target agent. */
@@ -872,6 +886,43 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         }
       : null;
 
+  // #4963: keyboard shortcut and command palette entry for the latest plan's primary action.
+  // Both go through the visible button's own enablement (transcript barrier, including the VS
+  // Code webview's host barrier, in-flight guard, history-replacement refusal), so they can never
+  // do what a click could not. The listener lives in the card, not in a composer, so it works in
+  // the desktop app and in the webview alike.
+  const primaryPlanAction = implementButton ?? autoButton;
+  const selectedWorkspaceId = workspaceContext?.selectedWorkspace?.workspaceId;
+  useEffect(() => {
+    if (!primaryPlanAction || !workspaceId) return;
+    const runIfEnabled = (): boolean => {
+      if (primaryPlanAction.disabled) return false;
+      primaryPlanAction.onClick();
+      return true;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
+      // Only the selected workspace's transcript (a sub-agent transcript may show its own plan).
+      // Hosts without a workspace context (the webview) show one transcript.
+      if (selectedWorkspaceId !== undefined && selectedWorkspaceId !== workspaceId) return;
+      if (isTypingInNonEmptyField(document.activeElement)) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      runIfEnabled();
+    };
+    const handlePaletteRequest = (event: Event) => {
+      const { detail } = event as CustomEventType<typeof CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION>;
+      if (detail.workspaceId !== workspaceId) return;
+      if (runIfEnabled()) detail.handled = true;
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, handlePaletteRequest);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, handlePaletteRequest);
+    };
+  });
+
   // Start Here button: only for tool calls, not ephemeral previews, on hosts that can replace
   // chat history
   if (!isEphemeralPreview && workspaceId && canReplaceChatHistory) {
@@ -1051,6 +1102,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
                 </TooltipTrigger>
                 <TooltipContent align="center">
                   {implementButton.tooltip ?? implementButton.label}
+                  {/* Wide layout only, so the hint never shows on mobile widths. */}
+                  {!implementButton.disabled &&
+                    ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
                 </TooltipContent>
               </Tooltip>
             )}
@@ -1072,6 +1126,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
                 </TooltipTrigger>
                 <TooltipContent align="center">
                   {autoButton.tooltip ?? autoButton.label}
+                  {!autoButton.disabled && ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
                 </TooltipContent>
               </Tooltip>
             )}

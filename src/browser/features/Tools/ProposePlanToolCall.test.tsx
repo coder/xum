@@ -31,6 +31,7 @@ import {
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
 import { ProposePlanToolCall } from "./ProposePlanToolCall";
 
@@ -72,6 +73,10 @@ let startHereCalls: Array<{
 
 let selectableDiffRendererCalls: Array<{ filePath?: string }> = [];
 
+// Selected workspace reported by the optional workspace context; null means no context (the
+// VS Code webview has none).
+let selectedWorkspaceIdForTest: string | null = null;
+
 const useStartHereMock = mock(
   (
     workspaceId: string | undefined,
@@ -112,6 +117,13 @@ async function installProposePlanModuleMocks() {
     useWorkspaceContext: () => ({
       workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
     }),
+    useOptionalWorkspaceContext: () =>
+      selectedWorkspaceIdForTest === null
+        ? null
+        : {
+            workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
+            selectedWorkspace: { workspaceId: selectedWorkspaceIdForTest },
+          },
   }));
   await mock.module("@/browser/hooks/useReviews", () => ({
     ...actualUseReviewsModule,
@@ -340,6 +352,7 @@ describe("ProposePlanToolCall", () => {
   beforeEach(async () => {
     startHereCalls = [];
     selectableDiffRendererCalls = [];
+    selectedWorkspaceIdForTest = null;
     mockApi = null;
     transcriptCaughtUp = true;
     barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
@@ -878,6 +891,127 @@ describe("ProposePlanToolCall", () => {
     fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
     await waitFor(() => expect(sendMessageCalls).toHaveLength(2));
     await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+  });
+
+  describe("latest plan shortcut and palette request (#4963)", () => {
+    function pressShortcut(target: Element = document.body) {
+      fireEvent.keyDown(target, { key: "Enter", altKey: true });
+    }
+
+    function addComposer(value: string): HTMLTextAreaElement {
+      const composer = document.createElement("textarea");
+      composer.value = value;
+      document.body.appendChild(composer);
+      composer.focus();
+      return composer;
+    }
+
+    test("implements from an empty composer, never while typing", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+      const composer = addComposer("half-written reply");
+
+      pressShortcut(composer);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+
+      composer.value = "";
+      pressShortcut(composer);
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
+      expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
+      composer.remove();
+    });
+
+    test("continues in Auto in Auto mode", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderToolCall(
+        <ProposePlanToolCall
+          args={{}}
+          workspaceId={WORKSPACE_ID}
+          status="completed"
+          result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+          isLatest
+        />,
+        "auto"
+      );
+
+      pressShortcut();
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(sendMessageCalls[0]?.options.agentId).toBe("auto");
+    });
+
+    test("does nothing while the button is disabled (transcript not caught up)", async () => {
+      startInPlanMode();
+      transcriptCaughtUp = false;
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+
+      pressShortcut();
+      const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: WORKSPACE_ID,
+        handled: false,
+      });
+      window.dispatchEvent(request);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(request.detail.handled).toBe(false);
+      expect(sendMessageCalls).toHaveLength(0);
+    });
+
+    test("ignores the shortcut when another workspace is selected", async () => {
+      startInPlanMode();
+      selectedWorkspaceIdForTest = "some-other-workspace";
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      const view = renderCompletedPlan();
+
+      pressShortcut();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+
+      // Control: selecting the plan's workspace makes the same shortcut run.
+      selectedWorkspaceIdForTest = WORKSPACE_ID;
+      view.rerender(
+        wrapToolCall(
+          <ProposePlanToolCall
+            args={{}}
+            workspaceId={WORKSPACE_ID}
+            status="completed"
+            result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+            isLatest
+          />
+        )
+      );
+      pressShortcut();
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    });
+
+    test("a palette request for this workspace runs the action and is marked handled", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+
+      const otherWorkspace = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: "some-other-workspace",
+        handled: false,
+      });
+      window.dispatchEvent(otherWorkspace);
+      expect(otherWorkspace.detail.handled).toBe(false);
+
+      const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: WORKSPACE_ID,
+        handled: false,
+      });
+      window.dispatchEvent(request);
+      expect(request.detail.handled).toBe(true);
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    });
   });
 
   test("renders a plan table of contents derived from the plan's markdown headings", () => {

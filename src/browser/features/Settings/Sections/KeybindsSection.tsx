@@ -115,6 +115,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_FOCUS_NOTES: "Focus notes sidebar (immersive)",
   REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
+  RUN_LATEST_PLAN_ACTION: "Implement latest plan",
   // Transcript-menu-only actions show their shortcuts in that menu.
   COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
   // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
@@ -163,6 +164,7 @@ const KEYBIND_GROUPS: Array<{
       "FOCUS_INPUT_I",
       "FOCUS_INPUT_A",
       "TOGGLE_PLAN_ANNOTATE",
+      "RUN_LATEST_PLAN_ACTION",
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",

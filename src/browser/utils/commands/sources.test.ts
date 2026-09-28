@@ -1760,3 +1760,35 @@ describe("Open Server Window palette action", () => {
     }
   });
 });
+
+describe("Implement Latest Plan palette action (#4963)", () => {
+  test("asks the latest plan card to run, and says so when no card started it", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.chatRunLatestPlanAction()
+      );
+      expect(action).toBeDefined();
+      const events = collectCommandEvents();
+      try {
+        // No card handled the request (no plan, or its action is disabled).
+        await action!.run();
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["error"]);
+
+        // The selected workspace's card starts its action and marks the request handled.
+        const requests: string[] = [];
+        const card = (event: Event) => {
+          const { detail } = event as CustomEvent<{ workspaceId: string; handled: boolean }>;
+          requests.push(detail.workspaceId);
+          detail.handled = true;
+        };
+        window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        await action!.run();
+        window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        expect(requests).toEqual(["w1"]);
+        expect(events.receivedToasts).toHaveLength(1);
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+});

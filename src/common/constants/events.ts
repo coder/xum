@@ -36,6 +36,13 @@ export const CUSTOM_EVENTS = {
   HELD_INPUT_ACTION: "mux:heldInputAction",
 
   /**
+   * Event asking the workspace's latest plan card to run its primary action (Implement, or
+   * Continue in Auto) from the command palette. The card sets `handled` when it started it.
+   * Detail: { workspaceId: string; handled: boolean }
+   */
+  RUN_LATEST_PLAN_ACTION: "mux:runLatestPlanAction",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -166,6 +173,11 @@ export interface CustomEventPayloads {
     workspaceId: string;
     heldInputId: string;
     action: "send" | "discard";
+  };
+  [CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION]: {
+    workspaceId: string;
+    /** Set synchronously by the plan card that started the action. */
+    handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload

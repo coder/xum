@@ -67,6 +67,7 @@ export const CommandIds = {
   chatInterrupt: () => "chat:interrupt" as const,
   chatJumpBottom: () => "chat:jumpBottom" as const,
   chatVoiceInput: () => "chat:voiceInput" as const,
+  chatRunLatestPlanAction: () => "chat:runLatestPlanAction" as const,
   chatClearTimingStats: () => "chat:clearTimingStats" as const,
 
   // Mode commands
