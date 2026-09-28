@@ -57,11 +57,17 @@ describe("nameRestartBlockerWorkspaces", () => {
   test("adds the stable ID only to labels two workspaces share, sorted", () => {
     expect(
       nameRestartBlockerWorkspaces([
-        { id: "b2", label: "Fix validation" },
-        { id: "c3", label: "Archived work" },
-        { id: "a1", label: "Fix validation" },
+        { id: "b2", title: "Fix validation" },
+        { id: "c3", name: "archived-work" },
+        { id: "a1", title: "Fix validation", name: "fix" },
       ])
-    ).toEqual(["Archived work", "Fix validation (a1)", "Fix validation (b2)"]);
+    ).toEqual(["archived-work", "Fix validation (a1)", "Fix validation (b2)"]);
+  });
+
+  test("a non-string title or name from a hand-edited config falls back to the ID", () => {
+    expect(nameRestartBlockerWorkspaces([{ id: "d4", title: 42, name: { bad: true } }])).toEqual([
+      "d4",
+    ]);
   });
 });
 

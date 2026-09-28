@@ -99,9 +99,10 @@ export const BlockedPhone: Story = {
         {
           kind: "held-inputs",
           count: 4,
-          // Beyond three names the line collapses into a count, keeping the dialog bounded.
+          // Beyond three names the line collapses into a count and long names are cut, keeping
+          // the dialog bounded.
           workspaceNames: [
-            "Archived: migrate storage",
+            "Archived: migrate the storage layer to the new schema",
             "Fix settings validation",
             "Rename the CLI flags",
             "Update docs",
@@ -120,7 +121,7 @@ export const BlockedPhone: Story = {
     await expect(within(dialog).getByRole("button", { name: "Restart anyway" })).toBeEnabled();
     await expect(within(dialog).getByRole("status")).toBeVisible();
     await expect(within(dialog).getByRole("status")).toHaveTextContent(
-      "Sessions with unsent messages: 4 (Archived: migrate storage, Fix settings validation, Rename the CLI flags and 1 more)"
+      "Sessions with unsent messages: 4 (Archived: migrate the storage layer to…, Fix settings validation, Rename the CLI flags and 1 more)"
     );
     const npm = within(dialog).getByRole("radio", { name: "Newest npm" });
     await userEvent.click(npm);

@@ -514,15 +514,23 @@ function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
 }
 
 /**
- * Sorted display names for a restart blocker's workspaces (#4770). Titles may repeat (across
- * projects, repeated task titles), so a label shared by two workspaces gets its stable ID.
+ * Sorted display names for a restart blocker's workspaces (#4770): title, else name, else ID. A
+ * hand-edited config can hold a non-string title or name, so those count as missing. Titles may
+ * repeat (across projects, repeated task titles), so a label two workspaces share gets the ID.
  */
 export function nameRestartBlockerWorkspaces(
-  workspaces: ReadonlyArray<{ id: string; label: string }>
+  workspaces: ReadonlyArray<{ id: string; title?: unknown; name?: unknown }>
 ): string[] {
+  const labeled = workspaces.map((workspace) => ({
+    id: workspace.id,
+    label:
+      [workspace.title, workspace.name].find(
+        (value): value is string => typeof value === "string" && value.length > 0
+      ) ?? workspace.id,
+  }));
   const labelCounts = new Map<string, number>();
-  for (const { label } of workspaces) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
-  return workspaces
+  for (const { label } of labeled) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  return labeled
     .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
     .sort((a, b) => a.localeCompare(b));
 }
@@ -4930,7 +4938,7 @@ export class WorkspaceService
     const config = this.config.loadConfigOrDefault();
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
-    const heldInputWorkspaces: Array<{ id: string; label: string }> = [];
+    const heldInputWorkspaces: Array<{ id: string; title?: unknown; name?: unknown }> = [];
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
@@ -4940,10 +4948,7 @@ export class WorkspaceService
       // Named (#4770): an archived workspace shows its held input only when opened.
       if (session.getHeldInputs().length > 0) {
         const entry = findWorkspaceEntry(config, workspaceId)?.workspace;
-        heldInputWorkspaces.push({
-          id: workspaceId,
-          label: entry?.title ?? entry?.name ?? workspaceId,
-        });
+        heldInputWorkspaces.push({ id: workspaceId, title: entry?.title, name: entry?.name });
       }
       if (session.hasPendingAutoRetry()) autoRetries++;
     }

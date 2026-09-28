@@ -3,7 +3,12 @@ import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { cn } from "@/common/lib/utils";
@@ -134,6 +139,29 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
     return () => window.removeEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
   }, [api, props.workspaceId, props.heldInput.id]);
+
+  // Without Send there is no composer (transcript-only, #4770), so nothing dispatches the event
+  // above: the shortcut target listens for Discard itself, outside editable fields.
+  const ownsDiscardShortcut = props.canSend === false && props.isShortcutTarget;
+  useEffect(() => {
+    if (!ownsDiscardShortcut) return;
+    const handler = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) || isEditableElement(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      runHeldInputAction("discard", {
+        api,
+        workspaceId: props.workspaceId,
+        heldInputId: props.heldInput.id,
+        actionInFlightRef,
+        setActionError,
+        setPendingAction,
+      });
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id]);
 
   return (
     <ChatDockSurface>

@@ -2013,14 +2013,14 @@ const TranscriptOnlyNoticePane: React.FC<{
     <div className="bg-surface-primary border-border-light border-t pb-2">
       {/* #4770: held inputs (e.g. a queued follow-up Stop returned while archiving) would be
           invisible here, since the composer that shows them is not rendered. Discard only: a
-          transcript-only workspace cannot run a turn, and there is no composer for shortcuts.
+          transcript-only workspace cannot run a turn. The oldest banner owns the Discard shortcut.
           Outside the gutter below: HeldInput's ChatDockSurface applies its own. */}
-      {props.heldInputs.map((heldInput) => (
+      {props.heldInputs.map((heldInput, index) => (
         <HeldInput
           key={heldInput.id}
           workspaceId={props.workspaceId}
           heldInput={heldInput}
-          isShortcutTarget={false}
+          isShortcutTarget={index === 0}
           canSend={false}
         />
       ))}
