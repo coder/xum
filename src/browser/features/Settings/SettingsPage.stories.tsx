@@ -92,6 +92,9 @@ async function waitForSettingsClosed(): Promise<void> {
 }
 
 export const SectionsSmoke: AppStory = {
+  // Pixel budget: the App task, advisor, and compaction settings stories already capture this
+  // dialog on desktop, so this file's snapshot slot goes to PhoneFullScreen.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const dialog = await openSettings(canvasElement);
@@ -130,6 +133,7 @@ const LAYOUT_PRESET = {
 // Real-browser Escape routing: an inline editor inside the modal cancels its own edit without
 // closing settings, while an unclaimed Escape closes the modal.
 export const EscapeInInlineEditor: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({ layoutPresets: LAYOUT_PRESET })} />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const dialog = await openSettings(canvasElement);
@@ -198,6 +202,7 @@ export const FocusReturnsWhenOpenerUnmounts: AppStory = {
 
 const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
 
+// Ends with settings open so the phone capture shows the full-screen sheet.
 export const PhoneFullScreen: AppStory = {
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   globals: { viewport: { value: "mobile1", isRotated: false } },
@@ -217,8 +222,5 @@ export const PhoneFullScreen: AppStory = {
       const close = within(dialog).getByRole("button", { name: "Close settings" });
       await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     }
-
-    await userEvent.click(within(dialog).getByRole("button", { name: "Close settings" }));
-    await waitForSettingsClosed();
   },
 };
