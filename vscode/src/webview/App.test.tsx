@@ -508,10 +508,42 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
 
       const calls = bridge.orpcCalls("workspace.interruptStream");
       expect(calls).toHaveLength(1);
-      expect(calls[0].input).toEqual({ workspaceId: WORKSPACE.id });
+      // User-Stop semantics, as desktop stopStream sends them.
+      expect(calls[0].input).toEqual({
+        workspaceId: WORKSPACE.id,
+        options: { disableAutoRetry: true, retireBashMonitorAttention: true },
+      });
       expect(view.container.textContent).toContain("interrupting...");
+
+      // A Stop the backend refused is reported, not shown as success.
+      await bridge.answer("workspace.interruptStream", { success: false, error: "stop refused" });
+      expect(view.container.textContent).toContain("Failed to interrupt stream. (stop refused)");
     });
   }
+
+  test("Esc stops a turn that is still starting, like its Stop button", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: {
+        type: "stream-lifecycle",
+        workspaceId: WORKSPACE.id,
+        phase: "preparing",
+        hadAnyOutput: false,
+      },
+    });
+    expect(view.getByRole("button", { name: "Stop streaming" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await Promise.resolve();
+    });
+
+    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(1);
+  });
 
   test("an armed monitor with no stream shows the waiting status until it disarms or the workspace changes", async () => {
     const bridge = new TestBridge();
@@ -524,6 +556,11 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await activity(WORKSPACE.id, 1);
     expect(view.container.textContent).toContain(waiting);
     expect(view.queryByRole("button", { name: "Stop streaming" })).toBeNull();
+
+    // A resubscribe to the same workspace keeps the count until the host sends a new one.
+    await bridge.emit({ type: "chatReset", workspaceId: WORKSPACE.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+    expect(view.container.textContent).toContain(waiting);
 
     await activity(WORKSPACE.id, 0);
     expect(view.container.textContent).not.toContain(waiting);

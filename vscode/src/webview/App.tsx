@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -27,6 +27,7 @@ import {
 import { Button } from "xum/browser/components/Button/Button";
 import {
   formatKeybind,
+  isDialogOpen,
   isEditableElement,
   matchesKeybind,
   KEYBINDS,
@@ -195,6 +196,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
+  // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
+  // reads aggregator state that has no transcript row (stream lifecycle, startup breadcrumbs) (#4971).
+  const [, bumpAggregatorRevision] = useReducer((revision: number) => revision + 1, 0);
   const scheduledRenderRef = useRef<{ kind: "raf" | "timeout"; id: number } | null>(null);
   const isRenderScheduledRef = useRef(false);
 
@@ -225,6 +229,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     }
 
     setDisplayedMessages(aggregator.getDisplayedMessages());
+    bumpAggregatorRevision();
   };
 
   const flushDisplayedMessagesRef = useRef(flushDisplayedMessages);
@@ -246,6 +251,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       }
 
       setDisplayedMessages(aggregator.getDisplayedMessages());
+      bumpAggregatorRevision();
     };
 
     if (typeof requestAnimationFrame === "function") {
@@ -391,7 +397,8 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
-          setActiveBashMonitorCount(0);
+          // The monitor count is kept: a resubscribe to the same workspace posts a fresh count, but
+          // if the host cannot read it, the last one is better than hiding an armed monitor.
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           transcriptBarrier.reset(msg.workspaceId);
           setTranscriptCaughtUp(false);
@@ -575,9 +582,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bridge]);
 
-  // The one interrupt path for Esc and the barrier's Stop button (#4971). Stop also shows while a
-  // turn is starting, when there is no active stream to mark yet: then it only sends the request.
-  const interruptStream = () => {
+  // The one user-Stop path for Esc and the barrier's Stop button (#4971), with desktop stopStream's
+  // options: owed monitor output is dismissed instead of waking the agent, auto-retry is turned off,
+  // and a stopped compaction drops its partial summary. Stop also shows while a turn is starting,
+  // when there is no active stream to mark yet: then it only sends the request.
+  const interruptStream = (options: { abandonPartial: boolean }) => {
     if (!selectedWorkspaceId) {
       return;
     }
@@ -587,14 +596,23 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       flushDisplayedMessagesRef.current();
     }
 
-    apiClient.workspace.interruptStream({ workspaceId: selectedWorkspaceId }).catch((error) => {
-      bridge.debugLog("interruptStream failed", { error: String(error) });
-
-      pushNoticeRef.current({
-        level: "error",
-        message: `Failed to interrupt stream. (${error instanceof Error ? error.message : String(error)})`,
-      });
-    });
+    const reportFailure = (error: string) => {
+      bridge.debugLog("interruptStream failed", { error });
+      pushNoticeRef.current({ level: "error", message: `Failed to interrupt stream. (${error})` });
+    };
+    apiClient.workspace
+      .interruptStream({
+        workspaceId: selectedWorkspaceId,
+        options: {
+          ...(options.abandonPartial ? { abandonPartial: true } : {}),
+          disableAutoRetry: true,
+          retireBashMonitorAttention: true,
+        },
+      })
+      .then((result) => {
+        if (!result.success) reportFailure(result.error);
+      })
+      .catch((error) => reportFailure(error instanceof Error ? error.message : String(error)));
   };
   const interruptStreamRef = useRef(interruptStream);
   interruptStreamRef.current = interruptStream;
@@ -625,12 +643,16 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
         return;
       }
 
-      if (!aggregator.getActiveStreamMessageId()) {
+      // A starting turn (before stream-start) shows Stop and its Esc chip too, so Esc must reach it.
+      const isStarting =
+        aggregator.getPendingStreamStartTime() !== null ||
+        aggregator.getStreamLifecycle()?.phase === "preparing";
+      if (!aggregator.getActiveStreamMessageId() && !isStarting) {
         return;
       }
 
       e.preventDefault();
-      interruptStreamRef.current();
+      interruptStreamRef.current({ abandonPartial: aggregator.isCompacting() });
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -638,13 +660,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   }, [canChat, selectedWorkspaceId]);
 
   // Transcript-scoped Shift+G, as in desktop useAIViewKeybinds: capture phase, and never while
-  // typing so the composer still receives a capital G.
+  // typing (the composer still receives a capital G) or while a modal owns the keyboard.
   useEffect(() => {
     if (!selectedWorkspaceId) {
       return;
     }
     const handleKeyDownCapture = (e: KeyboardEvent) => {
-      if (isEditableElement(e.target) || !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
+      if (
+        isDialogOpen() ||
+        isEditableElement(e.target) ||
+        !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)
+      ) {
         return;
       }
       e.preventDefault();
@@ -842,7 +868,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                           workspaceId={selectedWorkspaceId}
                           aggregator={aggregatorRef.current}
                           activeBashMonitorCount={activeBashMonitorCount}
-                          onCancel={interruptStream}
+                          onCancel={(phase) =>
+                            interruptStream({ abandonPartial: phase === "compacting" })
+                          }
                         />
                       ) : null}
                       {selectedWorkspaceId ? (

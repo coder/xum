@@ -1,7 +1,10 @@
 import React from "react";
 
 import type { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
-import { StreamingBarrierContent } from "xum/browser/features/Messages/ChatBarrier/StreamingBarrier";
+import {
+  StreamingBarrierContent,
+  type StreamingBarrierCancelPhase,
+} from "xum/browser/features/Messages/ChatBarrier/StreamingBarrier";
 
 export interface VscodeStreamingBarrierProps {
   workspaceId: string;
@@ -9,7 +12,7 @@ export interface VscodeStreamingBarrierProps {
   /** Armed background bash monitors for this workspace, forwarded by the extension host. */
   activeBashMonitorCount: number;
   /** Interrupts the stream through the webview's single interrupt path (also used by Esc). */
-  onCancel: () => void;
+  onCancel: (phase: StreamingBarrierCancelPhase) => void;
   className?: string;
 }
 
@@ -53,7 +56,6 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
           : null
       }
       className={props.className}
-      // Every phase stops through the same webview interrupt path.
       onCancel={props.onCancel}
       // No onConfigureCompaction: the webview has no Settings surface, so the compaction
       // "configure" hint is intentionally not shown.

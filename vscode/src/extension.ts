@@ -1779,6 +1779,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         message: `Chat subscription error: ${formatError(error)}`,
       });
     } finally {
+      // Stops the sibling activity pump too, so an ended chat stream never leaves it running.
+      controller.abort();
       if (this.subscriptionAbort === controller) {
         this.subscriptionAbort = null;
         this.subscribedWorkspaceId = null;
