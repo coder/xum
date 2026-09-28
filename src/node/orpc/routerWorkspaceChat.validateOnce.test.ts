@@ -196,18 +196,25 @@ async function oracleRows(
   return { wire, rejectedIds };
 }
 
+/** Replay rows in wire order; `batchReplay` batches are flattened and counted. */
 async function collectReplay(
   client: ReturnType<typeof createClient>,
-  mode?: OnChatMode
-): Promise<{ rows: WorkspaceChatMessage[]; caughtUp: CaughtUpMessage }> {
-  const iterator = await client.workspace.onChat({ workspaceId, mode });
+  mode?: OnChatMode,
+  batchReplay?: boolean
+): Promise<{ rows: WorkspaceChatMessage[]; caughtUp: CaughtUpMessage; batches: number }> {
+  const iterator = await client.workspace.onChat({ workspaceId, mode, batchReplay });
   const rows: WorkspaceChatMessage[] = [];
+  let batches = 0;
   for await (const event of iterator) {
     if (event.type === "caught-up") {
       await iterator.return?.(undefined);
-      return { rows, caughtUp: event };
+      return { rows, caughtUp: event, batches };
     }
     if (event.type === "message") rows.push(event);
+    if (event.type === "message-batch") {
+      batches += 1;
+      rows.push(...event.messages);
+    }
   }
   throw new Error("onChat ended before caught-up");
 }
@@ -349,5 +356,76 @@ describe("onChat validates replay rows once (#4868)", () => {
     // Non-replay events are still validated; replayed rows are not.
     expect(validatedTypes).toContain("caught-up");
     expect(validatedTypes).not.toContain("message");
+  });
+
+  test("batchReplay batches flatten to the single-row bytes; other subscribers keep single rows", async () => {
+    harness = await createHarness();
+    const client = createClient(harness);
+    // The corpus alternates text and tool rows; give it consecutive text rows so batches form.
+    // The partial goes first: its sequence would otherwise be taken by an appended row.
+    await harness.historyService.deletePartial(workspaceId);
+    const textRow = (id: string) =>
+      ({
+        id,
+        role: "user",
+        parts: [{ type: "text", text: id, state: "done" }],
+        metadata: { timestamp: 2_000, stepStartPartIndices: "bad", unknownMetadataKey: 3 },
+      }) as unknown as MuxMessage;
+    for (const id of ["text-a", "text-b", "text-c"]) {
+      expect((await harness.historyService.appendToHistory(workspaceId, textRow(id))).success).toBe(
+        true
+      );
+    }
+
+    const full = await oracleRows(harness);
+    const validate = spyOn(WorkspaceChatMessageSchema["~standard"], "validate");
+    // Concurrent subscribers: one opted in, one (an ACP/VS Code/older client) not.
+    const [batched, single] = await Promise.all([
+      collectReplay(client, undefined, true),
+      collectReplay(client),
+    ]);
+    // Batches carry rows the session already parsed: neither they nor their rows are revalidated.
+    const validatedTypes = validate.mock.calls.map(
+      (call: unknown[]) => (call[0] as { type?: string }).type
+    );
+    validate.mockRestore();
+    expect(validatedTypes).toContain("caught-up");
+    expect(validatedTypes).not.toContain("message");
+    expect(validatedTypes).not.toContain("message-batch");
+    expect(batched.batches).toBeGreaterThan(0);
+    expect(single.batches).toBe(0);
+    expect(single.rows.map((row) => JSON.stringify(row))).toEqual(
+      full.wire.map((row) => JSON.stringify(row))
+    );
+    expect(batched.rows.map((row) => JSON.stringify(row))).toEqual(
+      full.wire.map((row) => JSON.stringify(row))
+    );
+
+    const cursor = single.caughtUp.cursor?.history;
+    if (!cursor) throw new Error("full replay must return a history cursor");
+    for (const id of ["text-d", "text-e"]) {
+      expect((await harness.historyService.appendToHistory(workspaceId, textRow(id))).success).toBe(
+        true
+      );
+    }
+    const since = await oracleRows(
+      harness,
+      (row) => (row.metadata?.historySequence ?? -1) >= cursor.historySequence
+    );
+    const sinceBatched = await collectReplay(
+      client,
+      { type: "since", cursor: { history: cursor } },
+      true
+    );
+    expect(sinceBatched.caughtUp.replay).toBe("since");
+    expect(sinceBatched.batches).toBe(1);
+    expect(sinceBatched.rows.map((row) => JSON.stringify(row))).toEqual(
+      since.wire.map((row) => JSON.stringify(row))
+    );
+    expect(sinceBatched.rows.map((row) => ("id" in row ? row.id : undefined))).toEqual([
+      "text-c",
+      "text-d",
+      "text-e",
+    ]);
   });
 });

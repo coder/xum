@@ -57,25 +57,33 @@ interface SSH2ConnectionEntry {
   openChannels: number;
 }
 
-function waitForAbortable<T>(promise: Promise<T>, abortSignal?: AbortSignal): Promise<T> {
-  if (!abortSignal) return promise;
-  if (abortSignal.aborted) return Promise.reject(new Error(SSH2_OPERATION_ABORTED_ERROR));
+/**
+ * Wait for `promise` until it settles, `abortSignal` fires, or `timeout` elapses. Giving up
+ * only stops this caller's wait; the promise itself keeps running for anyone else awaiting it.
+ */
+function waitForAbortable<T>(
+  promise: Promise<T>,
+  abortSignal?: AbortSignal,
+  timeout?: { ms: number; error: Error }
+): Promise<T> {
+  if (abortSignal?.aborted) return Promise.reject(new Error(SSH2_OPERATION_ABORTED_ERROR));
+  if (!abortSignal && !timeout) return promise;
 
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      abortSignal.removeEventListener("abort", onAbort);
-      reject(new Error(SSH2_OPERATION_ABORTED_ERROR));
+    const finish = (settle: () => void) => {
+      abortSignal?.removeEventListener("abort", onAbort);
+      clearTimeout(timer);
+      settle();
     };
-    abortSignal.addEventListener("abort", onAbort, { once: true });
+    const timer = timeout
+      ? setTimeout(() => finish(() => reject(timeout.error)), timeout.ms)
+      : undefined;
+    const onAbort = () => finish(() => reject(new Error(SSH2_OPERATION_ABORTED_ERROR)));
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
     void promise.then(
-      (value) => {
-        abortSignal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        abortSignal.removeEventListener("abort", onAbort);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
+      (value) => finish(() => resolve(value)),
+      (error: unknown) =>
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))))
     );
   });
 }
@@ -352,6 +360,18 @@ export class SSH2ConnectionPool {
         continue;
       }
 
+      // Waiting on a connect counts against the budget too, whether this caller starts it or
+      // joins it (#5033): only this caller's wait ends at its budget, not the connect, which
+      // keeps going for waiters with more time. The OpenSSH pool bounds shared probes the same way.
+      // maxWaitMs 0 means "do not wait through backoff", so those callers wait for the connect.
+      const budgetMs = maxWaitMs - (Date.now() - startTime);
+      const budgetExceeded = new Error(
+        `SSH connection to ${config.host} did not become ready within ${maxWaitMs}ms`
+      );
+      if (shouldWait && budgetMs <= 0) {
+        throw budgetExceeded;
+      }
+
       let inflight = this.inflight.get(key);
       if (!inflight) {
         inflight = this.connect(config, timeoutMs, options.abortSignal);
@@ -364,11 +384,15 @@ export class SSH2ConnectionPool {
       }
 
       try {
-        const entry = await waitForAbortable(inflight, options.abortSignal);
+        const entry = await waitForAbortable(
+          inflight,
+          options.abortSignal,
+          shouldWait ? { ms: budgetMs, error: budgetExceeded } : undefined
+        );
         return entry;
       } catch (error) {
         // connect() already recorded the failure and its backoff; a permanent one ends the wait.
-        if (!shouldWait || isPermanentSSHFailure(error)) {
+        if (!shouldWait || error === budgetExceeded || isPermanentSSHFailure(error)) {
           throw error;
         }
 

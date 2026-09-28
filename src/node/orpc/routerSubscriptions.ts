@@ -47,6 +47,7 @@ interface WorkspaceChatSubscriptionInput {
   workspaceId: string;
   mode?: OnChatMode;
   legacyAutoRetryEnabled?: boolean;
+  batchReplay?: boolean;
 }
 
 type WorkspaceActivityEvent =
@@ -390,7 +391,11 @@ export function subscribeWorkspaceChat(
           }
         },
         input.mode,
-        replayRelay.finishReplay
+        replayRelay.finishReplay,
+        // Batches (#4868) only travel the self-validating path: there the listener above adds a
+        // batch's `wireMessage` (parse output of every row) to validatedReplayRows, so mapValue
+        // does not validate it again. Direct callers (no validateOutput) always get single rows.
+        { batchReplay: options?.validateOutput === true && input.batchReplay === true }
       );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();

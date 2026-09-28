@@ -114,6 +114,18 @@ describe("findUnpreservedSubagentWork", () => {
     expect((await check({ base: null })).success).toBe(false);
   });
 
+  test("an mbox path that is not a regular file preserves nothing (#4761 gap 3)", async () => {
+    execSync("git commit --allow-empty -m work", { cwd: repo, stdio: "ignore" });
+    const head = git(repo, "rev-parse HEAD");
+    // task_apply_git_patch only reads a regular file, so a directory there cannot restore the commits.
+    const mbox = getSubagentGitPatchMboxPath(path.join(rootDir, "sessions"), "child", "repo");
+    await fsPromises.mkdir(mbox, { recursive: true });
+    expect(await check({ patchArtifact: readyArtifact(head) })).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: [], uncapturedCommitCount: 1 },
+    });
+  });
+
   test("a merge commit is never treated as captured, since format-patch drops merge resolutions", async () => {
     execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
     execSync("git checkout -q main && git commit -q --allow-empty -m main", { cwd: repo });
@@ -152,6 +164,27 @@ describe("findUnpreservedSubagentWork", () => {
     expect((await check()).success).toBe(false);
   });
 
+  test("a .git that only looks absent fails closed (#4761 gap 4)", async () => {
+    // A dangling symlink makes `[ -e .git ]` false although the checkout is not gone.
+    await fsPromises.rm(path.join(repo, ".git"), { recursive: true, force: true });
+    await fsPromises.symlink(path.join(rootDir, "missing-git-dir"), path.join(repo, ".git"));
+    await fsPromises.writeFile(path.join(repo, "notes.txt"), "draft\n");
+    expect((await check()).success).toBe(false);
+  });
+
+  test("a checkout hidden behind an unsearchable directory fails closed (#4761 gap 4)", async () => {
+    // Root bypasses directory permissions, so the lookup would not fail there.
+    if (process.getuid?.() === 0) return;
+    await fsPromises.writeFile(path.join(repo, "notes.txt"), "draft\n");
+    // Traversal fails with EACCES, which `[ -e ]` also reports as "does not exist".
+    await fsPromises.chmod(rootDir, 0o600);
+    try {
+      expect((await check()).success).toBe(false);
+    } finally {
+      await fsPromises.chmod(rootDir, 0o700);
+    }
+  });
+
   test("never runs checkout-configured repository automation", async () => {
     const marker = path.join(rootDir, "fsmonitor-ran");
     const hook = path.join(rootDir, "fsmonitor.sh");
@@ -166,7 +199,7 @@ describe("findUnpreservedSubagentWork", () => {
     await fsPromises.rm(repo, { recursive: true, force: true });
     expect(await check()).toEqual({ success: true, data: { kind: "none" } });
 
-    // Scratch sub-agents run in plain copied directories, which this check cannot judge.
+    // A plain directory has no git state this check can judge.
     await fsPromises.mkdir(repo);
     await fsPromises.writeFile(path.join(repo, "scratch.txt"), "notes\n");
     expect(await check()).toEqual({ success: true, data: { kind: "none" } });

@@ -2037,6 +2037,11 @@ export const workspace = {
       // One-shot migration hint: legacy renderer localStorage opt-out value.
       // Used only when backend auto-retry preference file is missing.
       legacyAutoRetryEnabled: z.boolean().optional(),
+      // The client can unpack `message-batch` events, so the server may group replayed history
+      // rows (#4868). Servers without this field strip it (the input object is not strict) and
+      // send single rows; clients that do not send it (ACP, VS Code, tests, older renderers)
+      // always get single rows.
+      batchReplay: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },

@@ -64,8 +64,10 @@ async function hasMbox(
   artifact: SubagentGitProjectPatchArtifact
 ): Promise<boolean> {
   const mboxPath = getSubagentGitPatchMboxPath(sessionDir, childTaskId, artifact.storageKey);
-  return fsPromises.access(mboxPath).then(
-    () => true,
+  // Same test as task_apply_git_patch's resolvePatchPath: only a regular file can be applied, so a
+  // directory (corrupted session state) at the mbox path preserves nothing (#4761 gap 3).
+  return fsPromises.stat(mboxPath).then(
+    (stat) => stat.isFile(),
     () => false
   );
 }
@@ -77,15 +79,24 @@ async function openGitRepo(
 ): Promise<GitRepo | null> {
   // Only a confirmed absence counts: an unreachable runtime makes this probe throw or misreport.
   const gitPath = expandTildeForSSH(`${repo.repoCwd.replace(/\/+$/, "")}/.git`);
-  const exists = await execBuffered(runtime, `[ -e ${gitPath} ] && echo yes || echo no`, {
-    cwd: "/",
-    timeout: 10,
-  });
+  // `[ -e ]` is also false for a dangling `.git` symlink and when an unsearchable directory makes
+  // the lookup fail with EACCES (#4761 gap 4). So "no" needs proof: the nearest existing ancestor
+  // must be a searchable directory, which makes the lookup's "not found" authoritative.
+  const exists = await execBuffered(
+    runtime,
+    `p=${gitPath}; if [ -e "$p" ] || [ -L "$p" ]; then echo yes; else ` +
+      `d=$(dirname "$p"); while [ ! -e "$d" ] && [ ! -L "$d" ]; do d=$(dirname "$d"); done; ` +
+      `if [ -d "$d" ] && [ -x "$d" ]; then echo no; else echo unknown; fi; fi`,
+    { cwd: "/", timeout: 10 }
+  );
   const answer = exists.stdout.trim();
   if (exists.exitCode !== 0 || (answer !== "yes" && answer !== "no")) {
-    throw new Error(`cannot inspect ${repo.projectName}: ${exists.stderr.trim()}`);
+    const reason = answer === "unknown" ? "the checkout is not readable" : exists.stderr.trim();
+    throw new Error(`cannot inspect ${repo.projectName}: ${reason}`);
   }
-  // Gone, or a plain directory (scratch sub-agents run in copies this check cannot judge).
+  // Gone, or a plain directory this check cannot judge. Scratch sub-agents never get here: they
+  // share their scratch ancestor's directory on a project-dir local runtime, which TaskService
+  // skips, and removal keeps that directory while another scratch workspace references it.
   if (answer === "no") return null;
   const probe = await execBuffered(
     runtime,

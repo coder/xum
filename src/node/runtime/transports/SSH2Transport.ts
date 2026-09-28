@@ -309,6 +309,11 @@ export class SSH2Transport implements SSHTransport {
 
     let entry;
     try {
+      // The pool reads maxWaitMs 0 as "fail fast in backoff" and would still wait out a pending
+      // connect, so an exec whose deadline has already passed stops here (#5033).
+      if (remainingWaitMs === 0) {
+        throw new Error("the exec deadline passed before a connection was available");
+      }
       entry = await ssh2ConnectionPool.acquireConnection(this.config, {
         abortSignal: options.abortSignal,
         timeoutMs: connectTimeoutSec * 1000,
