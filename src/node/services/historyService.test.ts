@@ -4344,14 +4344,16 @@ describe("HistoryService", () => {
           })
         );
       }
+      // truncateHistory(0.5) must cut exactly after this row, so it has to outweigh the 13 sealed
+      // rows under every tokenizer. A repeated single character only did so under the approximate
+      // tokenizer from tests/setup.ts: the real one (bun test without the bunfig preload, e.g. run
+      // from src/node/services, or XUM_FORCE_REAL_TOKENIZER=1) packs it into few tokens (#4910).
+      const displayFiller = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
       await service.appendToHistory(
         wsId,
-        createMuxMessage(
-          "workflow-display",
-          "user",
-          `workflow trigger display ${"x".repeat(2_000)}`,
-          { muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run-1" } }
-        )
+        createMuxMessage("workflow-display", "user", `workflow trigger display ${displayFiller}`, {
+          muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run-1" },
+        })
       );
       await service.appendToHistory(wsId, createMuxMessage("user-active", "user", "prompt"));
       await service.appendToHistory(
