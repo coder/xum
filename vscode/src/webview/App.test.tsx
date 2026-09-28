@@ -717,6 +717,11 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     });
     expect(view.getByText("List the repository files")).toBeDefined();
     expect(view.queryByText(script)).toBeNull();
+
+    // Another server's preferences are unknown until its config loads: back to the default mode,
+    // not the previous server's.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://y" } });
+    expect(view.queryByText(script)).not.toBeNull();
   });
 
   test("Implement uses the configured Exec default when the workspace has no Exec settings", async () => {

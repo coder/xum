@@ -13,13 +13,11 @@ import { normalizeAgentAiDefaults } from "xum/common/types/agentAiDefaults";
  * preferences back (config.saveConfig is blocked by the host allowlist).
  */
 export function seedWebviewPreferences(snapshot: AppConfigSnapshot | null): void {
-  if (snapshot === null) {
-    return;
-  }
-  // undefined removes the key, so an unset preference falls back to the default mode.
-  syncPersistedStateFromBackend(BASH_COLLAPSED_SUMMARY_MODE_KEY, snapshot.bashCollapsedSummaryMode);
+  // null (no config from the current server) removes both keys, so the defaults apply.
+  // An unset mode removes its key too, so it falls back to the default mode.
+  syncPersistedStateFromBackend(BASH_COLLAPSED_SUMMARY_MODE_KEY, snapshot?.bashCollapsedSummaryMode);
   syncPersistedStateFromBackend(
     AGENT_AI_DEFAULTS_KEY,
-    normalizeAgentAiDefaults(snapshot.agentAiDefaults)
+    snapshot === null ? undefined : normalizeAgentAiDefaults(snapshot.agentAiDefaults)
   );
 }

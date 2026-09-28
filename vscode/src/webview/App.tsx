@@ -308,13 +308,15 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     const unsubscribeSeed = appConfigStore.subscribe(() => {
       seedWebviewPreferences(appConfigStore.getSnapshot());
     });
-    seedWebviewPreferences(appConfigStore.getSnapshot());
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
+      // The store keeps this server's snapshot until the next server's config loads. Clear the
+      // seeded preferences so a send in that window never uses this server's agent defaults.
+      seedWebviewPreferences(null);
     };
   }, [apiClient, apiConnectionKey]);
 
