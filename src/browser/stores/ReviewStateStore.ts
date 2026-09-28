@@ -69,10 +69,10 @@ interface Entry {
    */
   hydrated: boolean;
   /**
-   * The legacy localStorage import failed. Every flush retries it first, so a user write
-   * cannot make a section present on the backend ahead of the (non-clobbering) import.
+   * Backend revision of `base` (see ReviewStateRevisionSchema). Reset by each subscription's
+   * first snapshot, so a restarted backend is never ignored.
    */
-  legacyImportPending: boolean;
+  baseRevision: number;
   ready: Promise<void>;
   resolveReady: () => void;
   refCount: number;
@@ -120,6 +120,38 @@ const LEGACY_SECTIONS: Record<
 function pickField(stored: unknown, field: string): unknown {
   if (typeof stored !== "object" || stored === null) return undefined;
   return (stored as Record<string, unknown>)[field];
+}
+
+let warnedLegacyStorageUnavailable = false;
+
+/**
+ * The legacy sections still in localStorage. An unparseable key is removed (nothing to
+ * migrate). When localStorage itself cannot be read (e.g. storage access denied), there is
+ * nothing to migrate either: hydration continues as if no key existed.
+ */
+function readLegacySections(
+  workspaceId: string
+): Array<{ section: ReviewStateSection; value: unknown }> {
+  try {
+    const legacy: Array<{ section: ReviewStateSection; value: unknown }> = [];
+    for (const section of REVIEW_STATE_SECTIONS) {
+      const key = LEGACY_SECTIONS[section].key(workspaceId);
+      if (readPersistedString(key) === undefined) continue;
+      const stored = readPersistedState<unknown>(key, undefined);
+      if (stored === undefined || stored === null) {
+        updatePersistedState(key, undefined);
+        continue;
+      }
+      legacy.push({ section, value: LEGACY_SECTIONS[section].extract(stored) });
+    }
+    return legacy;
+  } catch (error) {
+    if (!warnedLegacyStorageUnavailable) {
+      warnedLegacyStorageUnavailable = true;
+      console.warn("localStorage is unavailable; skipping the legacy review-state import:", error);
+    }
+    return [];
+  }
 }
 
 export class ReviewStateStore {
@@ -226,6 +258,13 @@ export class ReviewStateStore {
     };
     if (!entry.hydrated) {
       entry.queued.push(queued);
+      // A mutate-only caller (no mounted selector) would otherwise never hydrate, so the
+      // change would never be sent. flush retains the workspace, hydrates, then drains.
+      if (entry.refCount === 0) {
+        this.flush(workspaceId).catch((error: unknown) => {
+          console.warn("Failed to persist review state; it stays queued:", error);
+        });
+      }
       return;
     }
     const delta = queued(entry.view.sections);
@@ -286,7 +325,7 @@ export class ReviewStateStore {
       queued: [],
       isReady: false,
       hydrated: false,
-      legacyImportPending: false,
+      baseRevision: Number.NEGATIVE_INFINITY,
       ready,
       resolveReady,
       refCount: 0,
@@ -373,10 +412,13 @@ export class ReviewStateStore {
           entry.resubscribeAttempt = 0;
           if (first) {
             first = false;
+            entry.baseRevision = event.revision;
             this.setBase(entry, event.snapshot.sections);
             await this.importLegacy(workspaceId, entry, client);
             this.markHydrated(workspaceId, entry);
-          } else {
+          } else if (event.revision >= entry.baseRevision) {
+            // Older pushes can trail a write reply that already moved base forward.
+            entry.baseRevision = event.revision;
             this.setBase(entry, event.snapshot.sections);
           }
         }
@@ -422,69 +464,54 @@ export class ReviewStateStore {
   }
 
   /**
-   * One-way, non-clobbering migration of the legacy localStorage keys. Sections already
-   * present on the backend are newer, so their leftover keys are dropped without importing.
-   * A key is removed only after the server reports the section applied or present; on error
-   * it stays, `legacyImportPending` is set, and the next flush (or hydration) retries.
+   * One-way migration of the legacy localStorage keys. The backend merges per entry and never
+   * overwrites its own entries, so every legacy section is sent, even one the backend already
+   * has: localStorage is per origin (desktop app vs browser tab) while the backend is shared,
+   * and a key that still exists means this origin was never imported (keys are removed on
+   * import), so its missing entries are new data, not stale leftovers. A key is removed only
+   * after the server reports its section; on error it stays and the next hydration retries.
    */
   private async importLegacy(workspaceId: string, entry: Entry, client: APIClient): Promise<void> {
-    const toImport: Record<string, unknown> = {};
-    const importing: ReviewStateSection[] = [];
-    for (const section of REVIEW_STATE_SECTIONS) {
-      const key = LEGACY_SECTIONS[section].key(workspaceId);
-      if (readPersistedString(key) === undefined) continue;
-      const stored = readPersistedState<unknown>(key, undefined);
-      // An unparseable legacy value has nothing to migrate, and a section the backend already
-      // has is newer; drop the key either way so it cannot sit in localStorage forever.
-      if (stored === undefined || stored === null || entry.base[section] !== undefined) {
-        updatePersistedState(key, undefined);
-        continue;
-      }
-      toImport[section] = LEGACY_SECTIONS[section].extract(stored);
-      importing.push(section);
-    }
-    if (importing.length === 0) {
-      entry.legacyImportPending = false;
-      return;
-    }
+    const legacy = readLegacySections(workspaceId);
+    if (legacy.length === 0) return;
 
     // Drop malformed legacy entries up front: one bad entry must not fail request validation
     // and pin the legacy key forever.
+    const toImport = Object.fromEntries(legacy.map(({ section, value }) => [section, value]));
     const sections = sanitizeReviewStateSnapshot({ sections: toImport }).snapshot.sections;
-    for (const section of importing) {
+    for (const { section } of legacy) {
       if (sections[section] === undefined) {
         // Unusable legacy value (wrong shape): nothing to migrate.
         updatePersistedState(LEGACY_SECTIONS[section].key(workspaceId), undefined);
       }
     }
-    if (REVIEW_STATE_SECTIONS.every((section) => sections[section] === undefined)) {
-      entry.legacyImportPending = false;
-      return;
-    }
+    if (REVIEW_STATE_SECTIONS.every((section) => sections[section] === undefined)) return;
 
     try {
       const result = await client.workspace.reviewState.importLegacy({ workspaceId, sections });
-      entry.legacyImportPending = false;
-      // Subscription pushes are authoritative for base and may already be newer than this
-      // reply, so only fill sections the current base still lacks.
-      const next: ReviewStateSections = { ...entry.base };
+      this.applyWriteReply(entry, result.snapshot.sections, result.revision);
       for (const section of REVIEW_STATE_SECTIONS) {
-        if (next[section] === undefined && result.snapshot.sections[section] !== undefined) {
-          assignSection(next, section, result.snapshot.sections[section]);
-        }
         if (result.results[section] !== undefined) {
           updatePersistedState(LEGACY_SECTIONS[section].key(workspaceId), undefined);
         }
       }
-      entry.base = next;
-      this.recompute(entry);
     } catch (error) {
-      entry.legacyImportPending = true;
-      console.warn(
-        "Failed to import legacy review state; will retry before the next write:",
-        error
-      );
+      console.warn("Failed to import legacy review state; will retry on next load:", error);
     }
+  }
+
+  /**
+   * Apply a write's reply. When base already holds a snapshot at or after that write's
+   * revision (a subscription push overtook the reply), base already contains the write and is
+   * newer than the reply, so keep it; otherwise the reply is the newest known state.
+   */
+  private applyWriteReply(entry: Entry, sections: ReviewStateSections, revision: number): void {
+    if (entry.baseRevision >= revision) {
+      this.recompute(entry);
+      return;
+    }
+    entry.baseRevision = revision;
+    this.setBase(entry, sections);
   }
 
   private scheduleFlush(workspaceId: string, entry: Entry): void {
@@ -516,26 +543,16 @@ export class ReviewStateStore {
         settle = resolve;
       });
       try {
-        if (entry.legacyImportPending) {
-          // Import first: the server applies only absent sections, so this write must not
-          // make a section present before its legacy data landed. Failing keeps pending.
-          await this.importLegacy(workspaceId, entry, client);
-          if (entry.legacyImportPending) {
-            throw new Error("Review state flush failed: legacy import still pending");
-          }
-        }
         const batch = entry.pending.slice();
-        const delta = mergeReviewStateDeltas(batch);
-        await client.workspace.reviewState.update({ workspaceId, delta });
+        const reply = await client.workspace.reviewState.update({
+          workspaceId,
+          delta: mergeReviewStateDeltas(batch),
+        });
         entry.flushAttempt = 0;
         // Only local deltas are removed here and new ones are appended, so the sent ones
         // are exactly the first batch.length entries.
         entry.pending = entry.pending.slice(batch.length);
-        // The reply snapshot can be older than a subscription push already applied (another
-        // renderer's write), so apply exactly the acknowledged delta to the current base;
-        // pushes stay authoritative and re-applying an echoed delta is idempotent.
-        entry.base = applyReviewStateDelta(entry.base, delta);
-        this.recompute(entry);
+        this.applyWriteReply(entry, reply.sections, reply.revision);
       } catch (error) {
         // Keep pending (never silently drop a change) and retry with backoff.
         const delay = retryDelayMs(entry.flushAttempt++);

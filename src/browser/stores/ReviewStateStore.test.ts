@@ -39,6 +39,8 @@ function deferred() {
  */
 function createBackend(initial: ReviewStateSections = {}) {
   let sections = initial;
+  // Like the service: bumped on every persisted change, carried by pushes and replies.
+  let revision = 1_000;
   const streams = new Set<(event: ReviewStateEvent) => void>();
   const backend = {
     updates: 0,
@@ -48,6 +50,9 @@ function createBackend(initial: ReviewStateSections = {}) {
     failNextUpdate: false,
     failNextSubscribe: false,
     failImport: false,
+    /** Events the store has finished handling (counted when it pulls the next one). */
+    consumed: 0,
+    lastImport: null as ReviewStateSections | null,
     /** When set, the initial snapshot waits for it (keeps the store un-hydrated). */
     hydrationGate: null as Promise<void> | null,
     updateGate: null as Promise<void> | null,
@@ -62,7 +67,8 @@ function createBackend(initial: ReviewStateSections = {}) {
     /** A write from another client: persisted and pushed to every subscriber. */
     externalWrite(delta: ReviewStateDelta) {
       sections = applyReviewStateDelta(sections, delta);
-      for (const push of streams) push({ type: "snapshot", snapshot: { sections } });
+      revision++;
+      for (const push of streams) push({ type: "snapshot", snapshot: { sections }, revision });
     },
   };
   const reviewState = {
@@ -72,7 +78,7 @@ function createBackend(initial: ReviewStateSections = {}) {
         backend.failNextSubscribe = false;
         throw new Error("subscribe failed");
       }
-      const queue: ReviewStateEvent[] = [{ type: "snapshot", snapshot: { sections } }];
+      const queue: ReviewStateEvent[] = [{ type: "snapshot", snapshot: { sections }, revision }];
       let wake: (() => void) | null = null;
       const push = (event: ReviewStateEvent) => {
         queue.push(event);
@@ -85,6 +91,7 @@ function createBackend(initial: ReviewStateSections = {}) {
             const next = queue.shift();
             if (next) {
               yield next;
+              backend.consumed++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -108,7 +115,7 @@ function createBackend(initial: ReviewStateSections = {}) {
           throw new Error("update failed");
         }
         sections = applyReviewStateDelta(sections, input.delta);
-        const reply = { sections };
+        const reply = { sections, revision: ++revision };
         await backend.replyGate;
         return reply;
       } finally {
@@ -117,6 +124,7 @@ function createBackend(initial: ReviewStateSections = {}) {
     },
     importLegacy: (input: { workspaceId: string; sections: ReviewStateSections }) => {
       backend.importCalls++;
+      backend.lastImport = input.sections;
       if (backend.failImport) return Promise.reject(new Error("import failed"));
       const results: Record<string, "applied" | "present"> = {};
       for (const section of REVIEW_STATE_SECTIONS) {
@@ -129,7 +137,9 @@ function createBackend(initial: ReviewStateSections = {}) {
           results[section] = "applied";
         }
       }
-      return Promise.resolve({ snapshot: { sections }, results });
+      // Present sections are only reported: the per-entry merge is the service's contract.
+      if (Object.values(results).includes("applied")) revision++;
+      return Promise.resolve({ snapshot: { sections }, revision, results });
     },
   };
   const client = createTestApiClient({ workspace: { reviewState } });
@@ -251,16 +261,18 @@ describe("ReviewStateStore", () => {
 
     const reply = deferred();
     backend.replyGate = reply.promise;
-    store.mutate(WS, "hunkExpand", () => ({ set: { local: true } }));
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
     const flushed = store.flush(WS);
-    await waitUntil(() => backend.sections.hunkExpand?.local === true);
-    // Another renderer writes after our update was persisted but before its reply arrives.
-    backend.externalWrite({ hunkExpand: { set: { remote: true } } });
-    await waitUntil(() => store.getView(WS).sections.hunkExpand?.remote === true);
+    await waitUntil(() => backend.sections.hunkExpand?.h1 === true);
+    // Another renderer changes the SAME entry after our update was persisted but before its
+    // reply arrives; the push reaches the store first.
+    const consumed = backend.consumed;
+    backend.externalWrite({ hunkExpand: { set: { h1: false } } });
+    await waitUntil(() => backend.consumed > consumed);
 
     reply.resolve();
     await flushed;
-    expect(store.getView(WS).sections.hunkExpand).toEqual({ local: true, remote: true });
+    expect(store.getView(WS).sections.hunkExpand).toEqual({ h1: false });
   });
 
   test("a failed first subscription unblocks the UI but replays queued updaters only onto real data", async () => {
@@ -303,6 +315,32 @@ describe("ReviewStateStore", () => {
     expect(backend.openStreams).toBe(0);
   });
 
+  test("a change made with no mounted selector and no flush call is still persisted", async () => {
+    const { backend, client } = createBackend();
+    const store = new ReviewStateStore();
+    store.setClient(client);
+
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+
+    await waitUntil(() => backend.sections.hunkExpand?.h1 === true);
+    await waitUntil(() => backend.openStreams === 0);
+  });
+
+  test("hydrates and persists changes when localStorage cannot be read", async () => {
+    const { backend, client } = createBackend({ hunkExpand: { h0: true } });
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get() {
+        throw new Error("storage access denied");
+      },
+    });
+    const store = connect(client);
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+
+    await store.flush(WS);
+    expect(backend.sections.hunkExpand).toEqual({ h0: true, h1: true });
+  });
+
   test("reports restored notes durable only once the backend acknowledged them (#4448)", async () => {
     const { backend, client } = createBackend();
     const store = connect(client);
@@ -321,19 +359,20 @@ describe("ReviewStateStore", () => {
 });
 
 describe("ReviewStateStore legacy localStorage migration", () => {
-  test("drops a legacy key without importing when the backend section is already present", async () => {
+  test("sends a legacy section the backend already has (another origin's data), then removes the key", async () => {
     const { backend, client } = createBackend({ reviews: {} });
+    const legacyReviews = { other: makeReview("other", "attached") };
     updatePersistedState(getReviewsKey(WS), {
       workspaceId: WS,
-      reviews: { stale: makeReview("stale", "attached") },
+      reviews: legacyReviews,
       lastUpdated: 1,
     });
 
     const store = connect(client);
     await store.whenReady(WS);
 
-    expect(backend.importCalls).toBe(0);
-    expect(backend.sections.reviews).toEqual({});
+    // The backend merges the entries it lacks; the client must not drop them unsent.
+    expect(backend.lastImport?.reviews).toEqual(legacyReviews);
     expect(readPersistedState(getReviewsKey(WS), null)).toBeNull();
   });
 
@@ -359,34 +398,6 @@ describe("ReviewStateStore legacy localStorage migration", () => {
 
     expect(backend.importCalls).toBe(0);
     expect(window.localStorage.getItem(getReviewsKey(WS))).toBeNull();
-  });
-
-  test("a failed import is retried before the next write so that write cannot shadow it", async () => {
-    const { backend, client } = createBackend();
-    backend.failImport = true;
-    const h1 = { hunkId: "h1", isRead: true, timestamp: 5 };
-    updatePersistedState(getReviewStateKey(WS), {
-      workspaceId: WS,
-      readState: { h1 },
-      lastUpdated: 1,
-    });
-    const store = connect(client);
-    await store.whenReady(WS);
-
-    const h2 = { hunkId: "h2", isRead: true, timestamp: 6 };
-    store.mutate(WS, "readState", () => ({ set: { h2 } }));
-    // The import still fails: the write stays unsent instead of creating the section.
-    let flushError: unknown = null;
-    await store.flush(WS).catch((error: unknown) => {
-      flushError = error;
-    });
-    expect(flushError).not.toBeNull();
-    expect(backend.updates).toBe(0);
-
-    backend.failImport = false;
-    await store.flush(WS);
-    expect(backend.sections.readState).toEqual({ h1, h2 });
-    expect(readPersistedState(getReviewStateKey(WS), null)).toBeNull();
   });
 
   test("keeps the legacy key when the import fails", async () => {
