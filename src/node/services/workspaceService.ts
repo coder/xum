@@ -18820,8 +18820,22 @@ export class WorkspaceService
         agentInitiated: true,
         startStreamInBackground,
         onAcceptedPreStreamFailure: startStreamInBackground
-          ? () =>
-              this.workspaceGoalService?.requestPendingGoalContinuationDispatch(input.workspaceId)
+          ? () => {
+              // Request the re-dispatch without awaiting it (#5029). The idle dispatcher is
+              // usually running THIS continuation, and it never starts a workspace it is still
+              // dispatching; the session awaits this callback before the send settles, so
+              // awaiting here deadlocked the dispatch, and session disposal (which drains the
+              // preparation) hung workspace removal. The request queues and runs once this
+              // dispatch finishes.
+              this.workspaceGoalService
+                ?.requestPendingGoalContinuationDispatch(input.workspaceId)
+                .catch((error: unknown) => {
+                  log.warn("WorkspaceService: goal continuation re-dispatch failed", {
+                    workspaceId: input.workspaceId,
+                    error: getErrorMessage(error),
+                  });
+                });
+            }
           : undefined,
         requireIdle: true,
         goalKind,

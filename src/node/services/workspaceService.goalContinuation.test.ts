@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, mock } from "bun:test";
+import { afterEach, describe, expect, test, mock, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
@@ -12,6 +12,8 @@ import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { IdleDispatcher } from "./idleDispatcher";
 import { waitForCondition } from "./testDispatchHelpers";
+import { Err } from "@/common/types/result";
+import { createUnknownSendMessageError } from "./utils/sendMessageError";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -117,6 +119,69 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
 
       expect(execute).toHaveBeenCalledTimes(1);
       expect(execute).toHaveBeenCalledWith(expect.objectContaining({ workspaceId }));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a kickoff whose accepted send fails before streaming releases its dispatch", async () => {
+    // #5029: the idle dispatcher runs the kickoff continuation. When its accepted send failed
+    // before streaming (here: workspace removal disposing the session mid-preparation), the
+    // failure callback awaited a re-dispatch of the SAME workspace. The dispatcher never starts
+    // a workspace it is still dispatching, so both waits blocked forever and session disposal
+    // (which drains the preparation) hung workspace removal.
+    const workspaceId = "kickoff-pre-stream-failure";
+    const service = await makeService("success", workspaceId);
+
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    try {
+      await config.addWorkspace("/tmp/kickoff-proj", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "kickoff-proj",
+        projectPath: "/tmp/kickoff-proj",
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        `${config.rootDir}/kickoff-extension-metadata.json`
+      );
+      const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
+      service.setWorkspaceGoalService(goalService);
+
+      // The first send is accepted and then fails before streaming; AgentSession awaits the
+      // failure callback before the send settles (settlePreparationFailure). Later sends are
+      // refused before acceptance, like a closing session, so they run no callback.
+      const error = createUnknownSendMessageError("workspace is being removed");
+      const sendMessage = spyOn(service, "sendMessage").mockImplementation(
+        async (_workspaceId, _message, _options, internal) => {
+          if (sendMessage.mock.calls.length === 1) {
+            await internal?.onAcceptedPreStreamFailure?.(error);
+          }
+          return Err(error);
+        }
+      );
+      const settled: boolean[] = [];
+      const dispatcher = new IdleDispatcher();
+      goalService.registerGoalContinuationConsumer(dispatcher, {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
+        executeGoalContinuation: async (input) => {
+          const accepted = await service.executeGoalContinuation(input);
+          settled.push(accepted);
+          return accepted;
+        },
+        getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+      });
+
+      const result = await goalService.setGoal({ workspaceId, objective: "Ship the kickoff fix" });
+      expect(result.success).toBe(true);
+
+      await waitForCondition(() => sendMessage.mock.calls.length > 0, { timeoutMs: 2_000 });
+      // Before the fix this never settled: the kickoff dispatch waited on its own re-dispatch.
+      await waitForCondition(() => settled.length > 0, { timeoutMs: 2_000 });
+      expect(settled[0]).toBe(false);
+      // The requested re-dispatch still runs, once the failed dispatch has released.
+      await waitForCondition(() => sendMessage.mock.calls.length === 2, { timeoutMs: 2_000 });
     } finally {
       await cleanup();
     }

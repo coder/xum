@@ -47,11 +47,16 @@ describe("Goal slash command", () => {
       expect(textarea).not.toBeNull();
       fireEvent.keyDown(textarea!, { key: "Enter" });
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.objective).toBe("this is your new goal,");
-        expect(goal?.status).toBe("active");
-      });
+      // Each poll is a backend round trip, and under CI load one getGoal call can outlast
+      // waitFor's default 1 s budget on its own (#5029). Use the harness's 10 s bound.
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.objective).toBe("this is your new goal,");
+          expect(goal?.status).toBe("active");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }

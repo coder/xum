@@ -188,10 +188,14 @@ describe("Send dispatch modes (mock AI router)", () => {
       fireEvent.click(sendAfterTurnRow);
       await app.chat.expectStreamComplete();
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("paused");
-      });
+      // Backend round trip per poll: waitFor's default 1 s is too short under CI load (#5029).
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.status).toBe("paused");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
