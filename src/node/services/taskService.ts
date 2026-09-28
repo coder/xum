@@ -9483,17 +9483,36 @@ export class TaskService implements AgentTaskIntegration {
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
       const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
+      // A delegated workspace turn is just a busy turn: the recipient's consent already admits
+      // unrelated input, so an opted-in root receives peer messages mid-delegation the same way
+      // same-tree targets do, by CONTINUING the delegated turn (correlation resolved below).
+      // Only an unrelated wake that cannot carry the live turn's correlation is refused: a
+      // pending reservation (the owner's requireIdle send has not passed admission) or a live
+      // handle that differs from the resolved correlation. Dispatched uncorrelated, such a wake
+      // would steal the reserved turn or settle the owner's turn as superseded.
       // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
       // CONCURRENT BACKENDS in processLiveness.ts).
-      const delegatedRootUnavailable = (): boolean =>
-        unrelatedRoot &&
-        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null;
+      // "unresolved" until the correlation lookup below runs; undefined means no correlation.
+      let delegatedTurnCorrelation:
+        | { taskHandleId: string; ownerWorkspaceId: string }
+        | undefined
+        | "unresolved" = "unresolved";
+      const delegatedRootUnavailable = (): boolean => {
+        if (!unrelatedRoot) return false;
+        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
+        if (live == null) return false;
+        if (!live.accepted) return true;
+        // Before the correlation lookup, an accepted turn is still a candidate for continuation.
+        if (delegatedTurnCorrelation === "unresolved") return false;
+        return (
+          live.handleId !== delegatedTurnCorrelation?.taskHandleId ||
+          live.ownerWorkspaceId !== delegatedTurnCorrelation.ownerWorkspaceId
+        );
+      };
       const delegatedRootRefusal = {
         code: "refused" as const,
-        reason: "Retry after the target's delegated workspace turn finishes.",
+        reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
       };
-      // Persisted defaults describe a NEW synthetic turn, never someone else's delegated execution.
-      // Pending registrations count too: accepting peer input must not steal a reserved turn.
       if (delegatedRootUnavailable()) return Err(delegatedRootRefusal);
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
@@ -9658,12 +9677,12 @@ export class TaskService implements AgentTaskIntegration {
       // stream end settles the owner's delegated turn as interrupted/superseded. Peer
       // attribution stays on the assistant payload row, so no provenance is lost; the queue
       // still counts these entries by their dedupe-key prefix.
-      const workspaceTurnMuxMetadata = unrelatedRoot
-        ? null
-        : await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-            targetId,
-            { requireAcceptedRegistration: true }
-          );
+      const workspaceTurnMuxMetadata =
+        await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+          targetId,
+          { requireAcceptedRegistration: true }
+        );
+      delegatedTurnCorrelation = workspaceTurnMuxMetadata;
       // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
       // renders machine notifications from metadata, so a bare workspace-turn replacement would
       // present the backend trigger as a human prompt (and re-enter prompt navigation).
@@ -9690,6 +9709,9 @@ export class TaskService implements AgentTaskIntegration {
         assert(!targetIsAgentTask);
         // Honor the recipient's selected identity (including plan), not the sender's or an
         // older history row. Without a selection, the shared history → exec fallback applies.
+        // Known tradeoff: a continuation of a delegated turn also uses these persisted settings,
+        // not a per-turn agent override the owner chose (handle records do not store it). The
+        // ancestor path and manual input into a delegated turn behave the same way.
         const persistedAgentId = resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
         const resumeOptions = await this.resolveParentAutoResumeOptions(
           targetId,
