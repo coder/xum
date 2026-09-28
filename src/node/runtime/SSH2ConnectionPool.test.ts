@@ -236,5 +236,64 @@ describe.skipIf(process.platform === "win32")(
         }
       }, 30_000);
     }
+
+    // #5101: the caller that starts a shared connect must not take it down for everyone when it
+    // aborts. maxWaitMs 0 makes a joiner fail on the first error; 30 s lets it retry, which on
+    // the old code started a second connect (and a second login) instead of joining the first.
+    for (const joinerMaxWaitMs of [0, 30_000]) {
+      it(`a joiner (maxWaitMs ${joinerMaxWaitMs}) keeps the connect when its starter aborts`, async () => {
+        let releaseAuth!: () => void;
+        const authGate = new Promise<void>((resolve) => (releaseAuth = resolve));
+        let authRequested!: () => void;
+        const authSeen = new Promise<void>((resolve) => (authRequested = resolve));
+        let connections = 0;
+        const { config } = await startServer((conn) => {
+          connections++;
+          conn.on("authentication", (ctx) => {
+            authRequested();
+            void authGate.then(() => ctx.accept());
+          });
+          conn.on("error", () => undefined);
+        });
+        const pool = new SSH2ConnectionPool();
+        const starterAbort = new AbortController();
+        const settle = <T>(promise: Promise<T>): Promise<T | Error> =>
+          promise.then(
+            (entry) => entry,
+            (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+          );
+
+        const starter = settle(
+          pool.acquireConnection(config, {
+            timeoutMs: 15_000,
+            maxWaitMs: 30_000,
+            abortSignal: starterAbort.signal,
+          })
+        );
+        const joiner = settle(
+          pool.acquireConnection(config, { timeoutMs: 15_000, maxWaitMs: joinerMaxWaitMs })
+        );
+        try {
+          await authSeen; // the connect is in flight on the server
+          const abortedAt = Date.now();
+          starterAbort.abort();
+          const starterResult = await starter;
+          // The starter's own wait still ends at its abort, well before the connect timeout.
+          expect(starterResult).toBeInstanceOf(Error);
+          expect((starterResult as Error).message).toContain("aborted");
+          expect(Date.now() - abortedAt).toBeLessThan(3_000);
+
+          releaseAuth();
+          const entry = await joiner;
+          expect(entry).not.toBeInstanceOf(Error);
+          expect(connections).toBe(1); // the joiner got the original connect, not a new one
+        } finally {
+          releaseAuth();
+          for (const result of [await starter, await joiner]) {
+            if (!(result instanceof Error)) result.client.end();
+          }
+        }
+      }, 30_000);
+    }
   }
 );

@@ -374,7 +374,11 @@ export class SSH2ConnectionPool {
 
       let inflight = this.inflight.get(key);
       if (!inflight) {
-        inflight = this.connect(config, timeoutMs, options.abortSignal);
+        // The connect is shared, so it takes no caller's abort signal: one caller aborting
+        // must not fail every waiter (#5101). Each caller races only its own wait against its
+        // abort and budget below. A connect nobody waits for any more still finishes (bounded
+        // by readyTimeout) and is cached, then closes after the idle timeout like any other.
+        inflight = this.connect(config, timeoutMs);
         this.inflight.set(key, inflight);
         // Attach no-op catch to prevent unhandled rejection when singleflighted
         // promise rejects before any caller awaits it. Actual errors are
@@ -520,8 +524,7 @@ export class SSH2ConnectionPool {
 
   private async connect(
     config: SSHConnectionConfig,
-    timeoutMs: number,
-    abortSignal?: AbortSignal
+    timeoutMs: number
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     try {
@@ -557,9 +560,6 @@ export class SSH2ConnectionPool {
         };
 
         const readableKeys = await resolvePrivateKeys(resolvedConfigWithIdentities.identityFiles);
-        if (abortSignal?.aborted) {
-          throw new Error(SSH2_OPERATION_ABORTED_ERROR);
-        }
         const keysToTry: Array<Buffer | undefined> =
           readableKeys.length > 0 ? readableKeys : [undefined];
         // Keep the sshPromptService wiring in place so known_hosts-backed
@@ -639,8 +639,6 @@ export class SSH2ConnectionPool {
             }
           }
 
-          let aborted = false;
-
           const onClose = () => {
             if (entry.idleTimer) {
               clearTimeout(entry.idleTimer);
@@ -655,7 +653,7 @@ export class SSH2ConnectionPool {
             if (entry.idleTimer) {
               clearTimeout(entry.idleTimer);
             }
-            if (!aborted && (!isAuthFailure(err) || reportAuthFailure)) {
+            if (!isAuthFailure(err) || reportAuthFailure) {
               this.reportFailure(config, getErrorMessage(withProxyExitContext(err)));
             }
             this.connections.delete(key);
@@ -688,30 +686,15 @@ export class SSH2ConnectionPool {
               );
             };
 
-            const onAbort = () => {
-              aborted = true;
-              cleanup();
-              client.end();
-              cleanupProxy();
-              reject(new Error(SSH2_OPERATION_ABORTED_ERROR));
-            };
-
             const cleanup = () => {
               client.off("ready", onReady);
               client.off("error", onError);
               proxy?.process.off("close", onProxyClose);
-              abortSignal?.removeEventListener("abort", onAbort);
             };
 
             client.on("ready", onReady);
             client.on("error", onError);
             proxy?.process.once("close", onProxyClose);
-            abortSignal?.addEventListener("abort", onAbort, { once: true });
-
-            if (abortSignal?.aborted) {
-              onAbort();
-              return;
-            }
 
             const connectOptions = {
               host: resolvedConfig.hostName,
@@ -731,12 +714,6 @@ export class SSH2ConnectionPool {
 
             client.connect(connectOptions);
           });
-
-          if (abortSignal?.aborted) {
-            aborted = true;
-            client.end();
-            throw new Error(SSH2_OPERATION_ABORTED_ERROR);
-          }
 
           this.markHealthy(config);
           this.connections.set(key, entry);
@@ -775,12 +752,7 @@ export class SSH2ConnectionPool {
       const agentForFallback = shouldTryAgentOnly ? undefined : agent;
       return await attemptConnection(fallbackIdentityFiles, agentForFallback);
     } catch (error) {
-      const errorMessage = getErrorMessage(error);
-      const wasAborted =
-        (abortSignal?.aborted ?? false) || errorMessage === SSH2_OPERATION_ABORTED_ERROR;
-      if (!wasAborted) {
-        this.reportFailure(config, errorMessage);
-      }
+      this.reportFailure(config, getErrorMessage(error));
       throw error;
     }
   }
