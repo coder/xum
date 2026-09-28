@@ -1249,10 +1249,7 @@ function createWindow() {
     mainWindowFinishedLoading = true;
     flushBufferedXumDeepLinks();
 
-    // NOTE: Tokenizer modules are NOT loaded at startup anymore!
-    // The Proxy in tokenizer.ts loads them on-demand when first accessed.
-    // This reduces startup time from ~8s to <1s.
-    // First token count will use approximation, accurate count caches in background.
+    // Tokenizer encodings warm in background workers from loadServices (loadTokenizerModules).
   });
 
   // Diagnostic crash hooks — log only, no recovery side effects.
