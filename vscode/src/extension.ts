@@ -1815,9 +1815,6 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       }
 
       for await (const event of iterator) {
-        if (controller.signal.aborted) {
-          return;
-        }
         if (event.type === "activity" && event.workspaceId === workspaceId) {
           post(event.activity?.activeBashMonitorCount ?? 0);
         }

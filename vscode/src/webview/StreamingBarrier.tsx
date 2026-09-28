@@ -54,7 +54,7 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
       }
       className={props.className}
       // Every phase stops through the same webview interrupt path.
-      onCancel={() => props.onCancel()}
+      onCancel={props.onCancel}
       // No onConfigureCompaction: the webview has no Settings surface, so the compaction
       // "configure" hint is intentionally not shown.
     />
