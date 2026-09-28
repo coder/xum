@@ -398,8 +398,6 @@ export interface SendMessageInternalOptions {
    * inside another turn's PREPARING window (see AgentSession.sendMessage).
    */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
-  onPreTurnRowsPersisted?: () => void;
   /** Return once the user message is accepted; stream startup continues asynchronously. */
   startStreamInBackground?: boolean;
   /** When true, reject instead of queueing if the workspace is busy. */

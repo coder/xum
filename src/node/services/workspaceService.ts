@@ -14388,7 +14388,6 @@ export class WorkspaceService
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
-            onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
             // Thread the probe onto the queued entry: a Stop landing after dequeue is
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
@@ -14556,7 +14555,6 @@ export class WorkspaceService
         onAccepted,
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
-        onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
         skipOnSendCompaction: internal?.skipOnSendCompaction,
