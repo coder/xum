@@ -129,7 +129,7 @@ function encodingOf(modelName: ModelName): EncodingName {
 function resolveEncoding(modelName: ModelName): Promise<string> {
   let promise = encodingPromises.get(modelName);
   if (!promise) {
-    // "ready" spawns the encoding's worker on first use and answers once the encoding is loaded.
+    // run() spawns the encoding's worker on first use; "ready" answers once the encoding is loaded.
     promise = run<string>(encodingOf(modelName), "ready", modelName)
       .then((result: unknown) => {
         assert(

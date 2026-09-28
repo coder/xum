@@ -10,11 +10,6 @@ export interface TokenizerWorkerData {
   encoding: EncodingName;
 }
 
-export interface CountTokensInput {
-  modelName: ModelName;
-  input: string;
-}
-
 export interface CountTokensBatchInput {
   modelName: ModelName;
   inputs: string[];
