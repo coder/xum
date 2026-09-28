@@ -332,6 +332,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           setWorkspaces(msg.workspaces);
           return;
         case "setSelectedWorkspace": {
+          // The host re-sends the current selection (e.g. clicking the selected row) without a
+          // new subscription, so no held-inputs snapshot follows; keep the list then.
+          const selectionChanged = msg.workspaceId !== activeWorkspaceIdRef.current;
           activeWorkspaceIdRef.current = msg.workspaceId;
           setSelectedWorkspaceId(msg.workspaceId);
 
@@ -340,7 +343,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           cancelScheduledRender();
           aggregatorRef.current = null;
           liveBashOutput.reset(msg.workspaceId);
-          setHeldInputs([]);
+          if (selectionChanged) setHeldInputs([]);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;

@@ -523,14 +523,21 @@ describe("vscode webview held inputs (#4771)", () => {
     ]);
   });
 
-  test("clears held inputs when another workspace is selected", async () => {
+  test("clears held inputs when another workspace is selected, and keeps them on a reselect", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge);
     await bridge.emit(heldInputsChanged([held("held-1", "left behind")]));
     expect(view.container.textContent).toContain("left behind");
 
+    // Clicking the selected row makes the host re-send the same selection without a new
+    // subscription, so no held-inputs snapshot follows; the banner must stay.
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    expect(view.container.textContent).toContain("left behind");
+
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
     expect(view.container.textContent).not.toContain("left behind");
   });
 });
