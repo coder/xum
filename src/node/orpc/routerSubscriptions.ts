@@ -348,9 +348,9 @@ export function subscribeWorkspaceChat(
   signal?: AbortSignal,
   /**
    * Set by the onChat procedure, which disables oRPC output validation (#4868): yield the wire
-   * schema's parse output, validating every event the session did not already validate. Direct
-   * callers keep receiving the unvalidated events, as they did when oRPC validated at the
-   * procedure boundary.
+   * schema's parse output, sending the replay's already-parsed rows (`wireMessage`) as-is and
+   * validating every other event. Direct callers keep receiving the unvalidated events, as they
+   * did when oRPC validated at the procedure boundary.
    */
   options?: { validateOutput?: boolean }
 ): AsyncGenerator<WorkspaceChatMessage> {
@@ -381,9 +381,13 @@ export function subscribeWorkspaceChat(
     },
     initialize: async () => {
       await session.replayHistory(
-        ({ message, wireValidated }) => {
-          if (wireValidated) validatedReplayRows.add(message);
-          replayRelay.handleReplayMessage(message);
+        ({ message, wireMessage }) => {
+          if (options?.validateOutput && wireMessage) {
+            validatedReplayRows.add(wireMessage);
+            replayRelay.handleReplayMessage(wireMessage);
+          } else {
+            replayRelay.handleReplayMessage(message);
+          }
         },
         input.mode,
         replayRelay.finishReplay

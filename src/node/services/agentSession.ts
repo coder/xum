@@ -631,10 +631,11 @@ export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
   /**
-   * Set only by history replay for rows that passed the wire-schema self-healing check.
-   * `message` is then the schema's parse output, so onChat does not validate it again (#4868).
+   * Set only by history replay for rows that passed the wire-schema self-healing check: the
+   * schema's parse output for `message`, which onChat sends as-is instead of validating the row a
+   * second time (#4868). `message` stays the persisted row for every other listener.
    */
-  wireValidated?: true;
+  wireMessage?: WorkspaceChatMessage;
 }
 
 export interface AgentSessionMetadataEvent {
@@ -3059,12 +3060,11 @@ export class AgentSession {
     // brick workspace fetch. Skip such rows instead of letting one bad line take
     // down the whole transcript.
     //
-    // Emit the parse OUTPUT (not the raw row), flagged wireValidated, so onChat
-    // skips a second parse of every replayed row (#4868). The bytes on the wire
-    // stay identical: this schema is the wire union's `message` member, and the
-    // union's parse output is exactly what oRPC used to send. getFullReplay's
-    // array schema re-validates it idempotently, and src/cli/run.ts drops replay
-    // rows before caught-up.
+    // Also hand over the parse OUTPUT as `wireMessage` so onChat can send it
+    // without parsing every replayed row a second time (#4868). The bytes on the
+    // wire stay identical: this schema is the wire union's `message` member, and
+    // the union's parse output is exactly what oRPC used to send. Other listeners
+    // (getFullReplay, subscribeChat) keep receiving the persisted row.
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
       const validation = ChatMuxMessageSchema.safeParse(message);
       if (!validation.success) {
@@ -3078,7 +3078,7 @@ export class AgentSession {
         return false;
       }
       emittedReplayMessages = true;
-      listener({ workspaceId: this.workspaceId, message: validation.data, wireValidated: true });
+      listener({ workspaceId: this.workspaceId, message, wireMessage: validation.data });
       return true;
     };
 
