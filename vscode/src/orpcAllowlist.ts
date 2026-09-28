@@ -29,6 +29,10 @@ const ALLOWED_PROCEDURES = {
     "updateAgentAISettings",
     "answerAskUserQuestion",
     "getPlanContent",
+    // Send or drop a held input from its banner (#4771); limited to shown workspaces by
+    // sanitizeWebviewOrpcInput.
+    "sendHeldInput",
+    "discardHeldInput",
   ]),
   // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
@@ -175,6 +179,9 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  * agents.list: a free-form projectPath would let the webview read agent-file frontmatter from any
  * directory, so only a workspaceId the extension already sent to the webview is accepted, and only
  * {workspaceId, disableWorkspaceAgents} is forwarded (projectPath/includeDisabled are dropped).
+ *
+ * workspace.sendHeldInput / discardHeldInput (#4771): only for a workspace the extension sent, and
+ * only {workspaceId, heldInputId} is forwarded.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -183,7 +190,12 @@ export function sanitizeWebviewOrpcInput(
 ): SanitizedOrpcInput {
   assert(isAllowedOrpcPath(path), "sanitizeWebviewOrpcInput requires an allowed path");
 
-  if (path[0] !== "agents" || path[1] !== "list") {
+  const procedure = path.join(".");
+  if (procedure === "workspace.sendHeldInput" || procedure === "workspace.discardHeldInput") {
+    return sanitizeHeldInputAction(procedure, input, knownWorkspaceIds);
+  }
+
+  if (procedure !== "agents.list") {
     return { ok: true, input };
   }
 
@@ -202,4 +214,23 @@ export function sanitizeWebviewOrpcInput(
       ...(record.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
     },
   };
+}
+
+function sanitizeHeldInputAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (typeof record.heldInputId !== "string") {
+    return { ok: false, error: `${procedure} requires a heldInputId` };
+  }
+  return { ok: true, input: { workspaceId, heldInputId: record.heldInputId } };
 }

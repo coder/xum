@@ -84,6 +84,36 @@ describe("agents.list (#4751)", () => {
   });
 });
 
+describe("held inputs (#4771)", () => {
+  const known = new Set(["ws-1"]);
+
+  test("allows sending and discarding a held input of a known workspace, with only its IDs", () => {
+    for (const procedure of ["sendHeldInput", "discardHeldInput"]) {
+      expect(isAllowedOrpcPath(["workspace", procedure])).toBe(true);
+      expect(
+        sanitizeWebviewOrpcInput(
+          ["workspace", procedure],
+          { workspaceId: "ws-1", heldInputId: "held-1", extra: true },
+          known
+        )
+      ).toEqual({ ok: true, input: { workspaceId: "ws-1", heldInputId: "held-1" } });
+    }
+  });
+
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const procedure of ["sendHeldInput", "discardHeldInput"]) {
+      for (const input of [
+        { workspaceId: "ws-2", heldInputId: "held-1" },
+        { workspaceId: "ws-1" },
+        { workspaceId: "ws-1", heldInputId: 7 },
+        null,
+      ]) {
+        expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
+      }
+    }
+  });
+});
+
 describe("policy (#4739)", () => {
   test("allows reading the effective policy and its change signal only", () => {
     expect(isAllowedOrpcPath(["policy", "get"])).toBe(true);

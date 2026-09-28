@@ -6,6 +6,7 @@ import type { StreamingMessageAggregator } from "xum/browser/utils/messages/Stre
 import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOptions";
 
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
+import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
 import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
@@ -135,6 +136,8 @@ function ChatComposerInner(props: {
   aiSettingsLoaded: boolean;
   /** AgentProvider has a workspace scope; an unscoped toggle would write the global agent key. */
   agentScoped: boolean;
+  /** The oldest held input, which the held-input shortcuts act on (#4771). */
+  heldInputId?: string | undefined;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -457,6 +460,26 @@ function ChatComposerInner(props: {
             return;
           }
 
+          // Same held-input shortcuts as the desktop composer: only from an empty composer, and
+          // routed to the HeldInput banner so they share its in-flight guard and error display.
+          const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
+            ? "send"
+            : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
+              ? "discard"
+              : null;
+          if (heldAction != null && props.heldInputId != null && input.trim() === "") {
+            e.preventDefault();
+            if (e.repeat) return;
+            window.dispatchEvent(
+              createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
+                workspaceId: props.workspaceId,
+                heldInputId: props.heldInputId,
+                action: heldAction,
+              })
+            );
+            return;
+          }
+
           if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE)) {
             e.preventDefault();
             void onSend();
@@ -537,6 +560,7 @@ export function ChatComposer(props: {
   /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
   aiSettingsLoaded: boolean;
   agentScoped: boolean;
+  heldInputId?: string | undefined;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -550,6 +574,7 @@ export function ChatComposer(props: {
         aggregator={props.aggregator}
         aiSettingsLoaded={props.aiSettingsLoaded}
         agentScoped={props.agentScoped}
+        heldInputId={props.heldInputId}
         onSendComplete={props.onSendComplete}
         onNotice={props.onNotice}
       />

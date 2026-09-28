@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Pencil } from "lucide-react";
 
-import type { WorkspaceChatMessage } from "xum/common/orpc/types";
+import type { HeldInput as HeldInputData, WorkspaceChatMessage } from "xum/common/orpc/types";
 import type { DisplayedMessage } from "xum/common/types/message";
 import { createClient } from "xum/common/orpc/client";
 
@@ -34,6 +34,7 @@ import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
+import { HeldInput } from "xum/browser/features/Messages/HeldInput";
 
 import type {
   ExtensionToWebviewMessage,
@@ -174,6 +175,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const aggregatorRef = useRef<StreamingMessageAggregator | null>(null);
   // Running bash cards read their live output here; the webview does not feed WorkspaceStore.
   const [liveBashOutput] = useState(() => new WebviewLiveBashOutput());
+  // The backend's held inputs for the selected workspace (#4771): full list, replayed on each
+  // subscription while non-empty.
+  const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
@@ -336,6 +340,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           cancelScheduledRender();
           aggregatorRef.current = null;
           liveBashOutput.reset(msg.workspaceId);
+          setHeldInputs([]);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -361,6 +366,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             workspace?.unarchivedAt
           );
           liveBashOutput.reset(msg.workspaceId);
+          setHeldInputs([]);
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
@@ -395,6 +401,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               replayState = createChatReplayState(msg.workspaceId);
               chatReplayStateRef.current = replayState;
               liveBashOutput.reset(msg.workspaceId);
+              setHeldInputs([]);
               setTranscriptCaughtUp(false);
             }
 
@@ -449,6 +456,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             // The aggregator ignores bash-output; the live output feed takes it (and drops a
             // tool's buffer once its tool-call-end carries the final output).
             liveBashOutput.apply(msg.workspaceId, event);
+
+            // Held inputs render as banners with Send/Discard (#4771). The webview never applies
+            // restore-to-input to its composer, so it never acknowledges a restore's held inputs
+            // either: the backend keeps them and this list shows them.
+            if (event.type === "held-inputs-changed") {
+              setHeldInputs(event.heldInputs);
+              return;
+            }
 
             if (event.type === "caught-up") {
               flushReplayBuffer();
@@ -733,6 +748,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     </div>
 
                     <div className="border-t border-border bg-background-secondary p-3">
+                      {selectedWorkspaceId
+                        ? heldInputs.map((heldInput, index) => (
+                            <HeldInput
+                              key={heldInput.id}
+                              workspaceId={selectedWorkspaceId}
+                              heldInput={heldInput}
+                              // The composer's held-input shortcuts act on the oldest one.
+                              isShortcutTarget={index === 0}
+                            />
+                          ))
+                        : null}
                       {selectedWorkspaceId ? (
                         <ChatComposer
                           key={selectedWorkspaceId}
@@ -748,6 +774,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                           aggregator={aggregatorRef.current}
                           aiSettingsLoaded={selectedWorkspace?.ai != null}
                           agentScoped={agentScopeWorkspaceId != null}
+                          heldInputId={heldInputs[0]?.id}
                           onSendComplete={jumpToBottom}
                           onNotice={pushNotice}
                         />

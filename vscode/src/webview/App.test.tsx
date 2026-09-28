@@ -144,6 +144,41 @@ async function typeInto(textarea: HTMLTextAreaElement, value: string): Promise<v
   });
 }
 
+// Same happy-dom limitation as typeInto: fireEvent.keyDown reaches the textarea's native listeners
+// but not React's, so call the textarea's React onKeyDown with a minimal keyboard event.
+async function pressKey(
+  textarea: HTMLTextAreaElement,
+  init: { key: string; ctrlKey?: boolean; altKey?: boolean }
+): Promise<void> {
+  const propsKey = Object.keys(textarea).find((key) => key.startsWith("__reactProps"));
+  if (!propsKey) throw new Error("textarea does not expose React props");
+  const props = (textarea as unknown as Record<string, { onKeyDown?: (event: unknown) => void }>)[
+    propsKey
+  ];
+  if (!props.onKeyDown) throw new Error("textarea has no onKeyDown handler");
+  let defaultPrevented = false;
+  await act(async () => {
+    props.onKeyDown?.({
+      key: init.key,
+      code: "",
+      ctrlKey: init.ctrlKey ?? false,
+      altKey: init.altKey ?? false,
+      metaKey: false,
+      shiftKey: false,
+      repeat: false,
+      get defaultPrevented() {
+        return defaultPrevented;
+      },
+      preventDefault: () => {
+        defaultPrevented = true;
+      },
+      stopPropagation: () => undefined,
+      nativeEvent: { stopImmediatePropagation: () => undefined },
+    });
+    await Promise.resolve();
+  });
+}
+
 // Pins a scrollable geometry on the transcript scrollport; happy-dom has no layout, so every
 // element otherwise reports 0 heights and always reads as "at the bottom".
 function setScrollGeometry(element: HTMLElement, geometry: { scrollTop: number }) {
@@ -400,6 +435,106 @@ describe("vscode webview workspace selection", () => {
 
 // #4755: the webview never loads the workspace's AI settings, so a send must not persist its local
 // defaults onto the workspace.
+describe("vscode webview held inputs (#4771)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const held = (id: string, displayText: string) => ({
+    id,
+    reason: "interrupted",
+    displayText,
+    attachmentCount: 0,
+    reviewCount: 0,
+  });
+  const heldInputsChanged = (heldInputs: unknown[]) => ({
+    type: "chatEvent",
+    workspaceId: WORKSPACE.id,
+    event: { type: "held-inputs-changed", workspaceId: WORKSPACE.id, heldInputs },
+  });
+
+  test("shows held inputs with Send and Discard, and never takes a restore on its own", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+
+    // A Stop returns the queued input; the webview has no restore handling, so it must leave the
+    // backend's held copy alone (no discardHeldInput ack) and show that copy instead.
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: {
+        type: "restore-to-input",
+        workspaceId: WORKSPACE.id,
+        text: "run the migration",
+        heldInputIds: ["held-1"],
+      },
+    });
+    await bridge.emit(
+      heldInputsChanged([held("held-1", "run the migration"), held("held-2", "then deploy")])
+    );
+
+    expect(view.container.textContent).toContain("run the migration");
+    expect(view.container.textContent).toContain("then deploy");
+    expect(bridge.orpcCalls("workspace.discardHeldInput")).toHaveLength(0);
+
+    const sendButtons = view.getAllByRole("button", { name: /^Send/ });
+    await act(async () => {
+      fireEvent.click(sendButtons[0]);
+      await Promise.resolve();
+    });
+    expect(bridge.orpcCalls("workspace.sendHeldInput").map((call) => call.input)).toEqual([
+      { workspaceId: WORKSPACE.id, heldInputId: "held-1" },
+    ]);
+
+    const discardButtons = view.getAllByRole("button", { name: /^Discard/ });
+    await act(async () => {
+      fireEvent.click(discardButtons[1]);
+      await Promise.resolve();
+    });
+    expect(bridge.orpcCalls("workspace.discardHeldInput").map((call) => call.input)).toEqual([
+      { workspaceId: WORKSPACE.id, heldInputId: "held-2" },
+    ]);
+
+    // The backend's next list is authoritative.
+    await bridge.emit(heldInputsChanged([]));
+    expect(view.container.textContent).not.toContain("run the migration");
+  });
+
+  test("the held-input shortcuts act on the oldest held input from an empty composer", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.emit(heldInputsChanged([held("held-1", "first"), held("held-2", "second")]));
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await pressKey(textarea, { key: "Backspace", ctrlKey: true, altKey: true });
+    expect(bridge.orpcCalls("workspace.discardHeldInput").map((call) => call.input)).toEqual([
+      { workspaceId: WORKSPACE.id, heldInputId: "held-1" },
+    ]);
+  });
+
+  test("clears held inputs when another workspace is selected", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.emit(heldInputsChanged([held("held-1", "left behind")]));
+    expect(view.container.textContent).toContain("left behind");
+
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    expect(view.container.textContent).not.toContain("left behind");
+  });
+});
+
 describe("vscode webview AI settings persistence", () => {
   let cleanupDom: (() => void) | null = null;
 
