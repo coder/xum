@@ -460,6 +460,8 @@ describe("replacement history row evidence", () => {
     release.resolve();
     expect(await pending).toBe(false);
     expect(visits).toBe(1);
+    // spyOnOwnOpens records only opens under this test's directory; guard against a vacuous every([]).
+    expect(handles.length).toBeGreaterThan(0);
     expect(handles.every((handle) => handle.fd === -1)).toBe(true);
   });
 
