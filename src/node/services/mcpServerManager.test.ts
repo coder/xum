@@ -1,3 +1,4 @@
+import { log } from "@/node/services/log";
 import {
   afterEach,
   beforeEach,
@@ -2588,15 +2589,104 @@ describe("MCPServerManager", () => {
     const serve = manager.getToolsForWorkspace(request);
     await execStarted.promise;
     timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    // The timed-out startup surfaces once the late process is cleaned up (#4953).
+    spawned.resolve();
     const result = await serve;
     expect(result.stats.failedServerNames).toEqual(["stdio-aborted-after-exec"]);
-
-    spawned.resolve();
     await waitFor(() => stderrCancel.mock.calls.length > 0);
     expect(exec).toHaveBeenCalledTimes(1);
     expect(stdinClose).toHaveBeenCalledTimes(1);
     expect(stdoutCancel).toHaveBeenCalledTimes(1);
     expect(stderrCancel).toHaveBeenCalledTimes(1);
+  });
+
+  // #4953: the startup aborted while its exec was still pending. The process spawned anyway, and
+  // the abort kills it; the timed-out startup must surface only once that process exited (bounded
+  // by the startup cleanup wait), so a removal joining the caller cannot delete the checkout
+  // under a command that is still running.
+  test("a startup timeout waits for the exit of a process spawned after the abort", async () => {
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "stdio-exit-join": stdioConfig("never") })
+    );
+    const execStarted = Promise.withResolvers<AbortSignal | undefined>();
+    const spawned = Promise.withResolvers<void>();
+    const exited = Promise.withResolvers<number>();
+    const exec = mock(async (_command: string, options?: { abortSignal?: AbortSignal }) => {
+      execStarted.resolve(options?.abortSignal);
+      await spawned.promise;
+      return {
+        stdin: new WritableStream<Uint8Array>(),
+        stdout: new ReadableStream<Uint8Array>(),
+        stderr: new ReadableStream<Uint8Array>(),
+        exitCode: exited.promise,
+        duration: exited.promise,
+      };
+    });
+    const request = workspaceRequest("ws-exit-join", { runtime: { exec } as unknown as Runtime });
+    let settled = false;
+    const serve = manager.getToolsForWorkspace(request).finally(() => {
+      settled = true;
+    });
+
+    const processSignal = await execStarted.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    spawned.resolve();
+    // The abort reached the spawned process (the kill), but it has not exited yet.
+    await waitFor(() => processSignal?.aborted === true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    exited.resolve(143);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["stdio-exit-join"]);
+  });
+
+  // #4953, bounded: a killed process that never reports its exit (a lost remote exec) holds
+  // the timed-out startup only until the cleanup bound, and the unconfirmed exit is logged.
+  test.each([
+    { label: "never reports", exitCode: () => new Promise<number>(() => undefined) },
+    // A rejected observation (a remote child-process error) does not prove the process stopped.
+    { label: "fails to report", exitCode: () => Promise.reject(new Error("ssh: channel error")) },
+  ])("a startup timeout gives up on a killed process that $label its exit", async (variant) => {
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "stdio-exit-lost": stdioConfig("never") })
+    );
+    const warn = spyOn(log, "warn");
+    const execStarted = Promise.withResolvers<void>();
+    const spawned = Promise.withResolvers<void>();
+    const exec = mock(async (_command: string) => {
+      execStarted.resolve();
+      await spawned.promise;
+      return {
+        stdin: new WritableStream<Uint8Array>(),
+        stdout: new ReadableStream<Uint8Array>(),
+        stderr: new ReadableStream<Uint8Array>(),
+        exitCode: variant.exitCode(),
+        duration: new Promise<number>(() => undefined),
+      };
+    });
+    const request = workspaceRequest("ws-exit-lost", { runtime: { exec } as unknown as Runtime });
+    const serve = manager.getToolsForWorkspace(request);
+
+    await execStarted.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    spawned.resolve();
+    // The exit join and the startup cleanup wait share the bound; fire each as it is armed.
+    const loggedLostExit = () =>
+      warn.mock.calls.some((call) => String(call[0]).includes("did not report its exit"));
+    await waitFor(() => {
+      try {
+        timers.fire(STARTUP_CLEANUP_WAIT_MS);
+      } catch {
+        // Not armed yet.
+      }
+      return loggedLostExit();
+    });
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["stdio-exit-lost"]);
+    warn.mockRestore();
   });
 
   test("stdio spawn holds the override writer's lock and refuses a launch once the epoch moved", async () => {

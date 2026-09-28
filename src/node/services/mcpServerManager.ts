@@ -24,7 +24,7 @@ import {
   type MCPPrompt,
 } from "@/node/services/mcpClient";
 import { log } from "@/node/services/log";
-import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
+import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
   BearerChallenge,
   MCPHeaderValue,
@@ -6116,6 +6116,13 @@ export class MCPServerManager {
         this.config != null && workspaceId != null
           ? await workspaceUseLeasesFor(this.config).hold(workspaceId, "mcp")
           : undefined;
+      // #4953: a startup aborted while its exec is pending (the startup timeout) must not
+      // surface before a process the exec still hands back has been killed and has exited.
+      // The timeout waits (bounded) for a cleanup registered synchronously by the abort, so
+      // register the exec's settlement while it is pending; the abort branch below resolves it.
+      const execSettled = Promise.withResolvers<void>();
+      const registerExecCleanup = () => onAbortCleanup?.(execSettled.promise);
+      signal.addEventListener("abort", registerExecCleanup, { once: true });
       let execStream: ExecStream;
       try {
         execStream = await this.launchUnderOverrideFence(
@@ -6138,9 +6145,12 @@ export class MCPServerManager {
         );
       } catch (error) {
         // No process was handed back to watch; a launch that failed started nothing.
+        signal.removeEventListener("abort", registerExecCleanup);
+        execSettled.resolve();
         await useLease?.release();
         throw error;
       }
+      signal.removeEventListener("abort", registerExecCleanup);
       if (useLease != null) {
         const releaseUseLease = () =>
           useLease.release().catch((error: unknown) => {
@@ -6183,14 +6193,34 @@ export class MCPServerManager {
         } catch (error) {
           log.debug("[MCP] Error canceling stderr during startup abort cleanup", { name, error });
         }
+        // Join the killed process's exit, bounded like MCPStdioTransport.close(): on remote
+        // runtimes the abort only starts a SIGTERM-then-dispose sequence (#4953).
+        // A rejected exit observation does not prove the process stopped (as for the use lease
+        // above): keep waiting out the bound, then report the exit as unconfirmed.
+        const exited = await raceWithAbortAndTimeout(
+          execStream.exitCode.catch(() => new Promise<never>(() => undefined)),
+          { timeoutMs: MCP_STDIO_KILL_JOIN_MS }
+        );
+        if (exited.kind !== "ok") {
+          log.warn("[MCP] Killed stdio server did not report its exit after a startup abort", {
+            name,
+            workspaceId,
+            timeoutMs: MCP_STDIO_KILL_JOIN_MS,
+          });
+        }
       };
 
       if (signal.aborted) {
         // runtime.exec() can return after abort when the process was already spawned.
         // Explicitly close/cancel stdio so the spawned process is not left running.
-        await cleanupSpawnedExecStream();
+        try {
+          await cleanupSpawnedExecStream();
+        } finally {
+          execSettled.resolve();
+        }
         return null;
       }
+      execSettled.resolve();
 
       const transport = new MCPStdioTransport(execStream, { kill: () => processAbort.abort() });
 
