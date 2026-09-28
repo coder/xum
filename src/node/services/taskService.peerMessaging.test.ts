@@ -1187,6 +1187,7 @@ describe("TaskService", () => {
           fromWorkspaceId: "sender",
           fromTitle: "sender",
           relationship: "unrelated",
+          payloadMessageId: internal?.preTurnMessages?.[0]?.id,
         },
       });
       expect(internal?.workspaceTurnContinuation).toBe(true);
