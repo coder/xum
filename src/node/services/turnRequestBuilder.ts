@@ -135,7 +135,7 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
+import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -2610,6 +2610,7 @@ export class TurnRequestBuilder {
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
+      memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
       ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.

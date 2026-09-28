@@ -13,7 +13,8 @@
  *                with that workspace; sub-agents share their parent's store)
  * - session   -> <sessionDir>/session-memory/ of the ACTING workspace (host-local,
  *                deleted with that workspace; never shared with the parent or
- *                sub-agents). Token budget keeps its rollover checkpoint here.
+ *                sub-agents). Token budget keeps its rollover checkpoint here, and
+ *                agents see the scope only in token-budget mode.
  */
 
 import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";

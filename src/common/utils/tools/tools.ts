@@ -94,7 +94,7 @@ import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager"
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
-import type { MemoryScopeAccess } from "@/common/constants/memory";
+import type { MemoryScope, MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TimelineService } from "@/node/services/timelineService";
@@ -211,6 +211,8 @@ export interface ToolConfiguration {
   timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
+  /** Memory scopes the tool serves (see resolveMemoryScopes); defaults to no session scope. */
+  memoryScopes?: readonly MemoryScope[];
   /**
    * When set, every mutating memory command is limited to this exact virtual path
    * (context-budget flush turns may only write the workspace context notes).

@@ -204,7 +204,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.MEMORY,
     name: "Agent Memory",
     description:
-      "Enable the agent memory tool and memory index (global / project / workspace / session scopes)",
+      "Enable the agent memory tool and memory index (global / project / workspace scopes, plus a session scope in token-budget mode)",
     enabledByDefault: false,
     showInSettings: true,
   },

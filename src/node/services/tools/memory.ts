@@ -2,10 +2,12 @@ import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { TOOL_DEFINITIONS, buildMemoryToolDescription } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   MEMORY_MAX_FILE_BYTES,
+  MEMORY_SCOPES,
+  MEMORY_VIRTUAL_ROOT,
   type MemoryScope,
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
@@ -56,12 +58,26 @@ export function resolveMemoryAccessPolicy(options: {
 }
 
 /**
+ * The session scope only holds the rollover checkpoint, which has no purpose outside
+ * token-budget mode, so other agents never see it.
+ */
+export function resolveMemoryScopes(tokenBudgetEnabled: boolean): readonly MemoryScope[] {
+  return tokenBudgetEnabled ? MEMORY_SCOPES : MEMORY_SCOPES.filter((scope) => scope !== "session");
+}
+
+/** Safe default, like READ_ONLY_ACCESS: without an explicit list, the session scope stays hidden. */
+function toolMemoryScopes(config: ToolConfiguration): readonly MemoryScope[] {
+  return config.memoryScopes ?? resolveMemoryScopes(false);
+}
+
+/**
  * Build the dynamic memory tool description: the base description plus the
  * session-segment memory index (same disclosure mechanic as skills — index
  * advertised next to the tool schema, contents fetched on demand). Falls back
  * to the base description when no snapshot was resolved.
  */
 function buildMemoryDescription(config: ToolConfiguration): string {
+  const scopes = toolMemoryScopes(config);
   // Pinned mode (context-budget final flush) inverts the generic contract: one path, one write,
   // `create` replaces, updates create a missing file, no delete/rename. The model must not be
   // told the opposite during its only preservation step.
@@ -74,11 +90,14 @@ function buildMemoryDescription(config: ToolConfiguration): string {
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
         "view, delete, rename, and every other path are refused. " +
         `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget. Use a prepend or text replacement only when the full file is visible and sufficient space is known. Otherwise use create for a compact checkpoint of the essential known state; it replaces the entire file, including unshown content. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full saved file can be read in the next window.`
-      : TOOL_DEFINITIONS.memory.description;
+      : buildMemoryToolDescription({ sessionScope: scopes.includes("session") });
   if (config.memoryIndexEntries == null) {
     return baseDescription;
   }
-  return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(config.memoryIndexEntries)}`;
+  const entries = config.memoryIndexEntries.filter((entry) =>
+    scopes.some((scope) => entry.path.startsWith(`${MEMORY_VIRTUAL_ROOT}/${scope}/`))
+  );
+  return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(entries)}`;
 }
 
 /** Share exactly the same scope identity between direct and headless memory reads. */
@@ -94,6 +113,7 @@ export function memoryScopeContextFromToolConfig(config: ToolConfiguration): Mem
     // so "" disables project-keyed memory (same resolution as
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
+    scopes: toolMemoryScopes(config),
   };
 }
 

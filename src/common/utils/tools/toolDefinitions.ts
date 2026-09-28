@@ -2381,6 +2381,32 @@ interface ToolDefinition {
   ptcExcluded?: string;
 }
 
+/**
+ * The session scope only holds the token-budget rollover checkpoint, so the description lists it
+ * only when the memory tool serves it (see resolveMemoryScopes).
+ */
+export function buildMemoryToolDescription(options: { sessionScope: boolean }): string {
+  return (
+    "Manage your persistent memory directory (experiment). " +
+    "MEMORY PROTOCOL: consult relevant memories not already in context when prior context could affect your answer or actions; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
+    "Scopes (all paths are virtual):\n" +
+    "- /memories/global/... — personal, permanent, shared across all projects\n" +
+    "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
+    "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
+    (options.sessionScope
+      ? `- ${SESSION_MEMORY_VIRTUAL_DIR}... — your own checkpoint for this session; never shared with the parent or sub-agents, lasts across context windows, deleted with this workspace, and writable even when the other scopes are read-only\n`
+      : "") +
+    "Commands:\n" +
+    "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
+    "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
+    "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
+    "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
+    "- delete: delete a file or directory (recursive)\n" +
+    "- rename: move old_path to new_path within the same scope\n" +
+    "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index."
+  );
+}
+
 export const TOOL_DEFINITIONS = {
   bash: {
     resultSchema: BashToolResultSchema,
@@ -2584,22 +2610,7 @@ export const TOOL_DEFINITIONS = {
   memory: {
     resultSchema: MemoryToolResultSchema,
     ptcExcluded: "Top-level presence supplies the memory index and hot-set context",
-    description:
-      "Manage your persistent memory directory (experiment). " +
-      "MEMORY PROTOCOL: consult relevant memories not already in context when prior context could affect your answer or actions; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
-      "Scopes (all paths are virtual):\n" +
-      "- /memories/global/... — personal, permanent, shared across all projects\n" +
-      "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
-      "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
-      "- /memories/session/... — your own checkpoint for this session; never shared with the parent or sub-agents, lasts across context windows, deleted with this workspace, and writable even when the other scopes are read-only\n" +
-      "Commands:\n" +
-      "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
-      "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
-      "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
-      "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
-      "- delete: delete a file or directory (recursive)\n" +
-      "- rename: move old_path to new_path within the same scope\n" +
-      "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index.",
+    description: buildMemoryToolDescription({ sessionScope: false }),
     schema: z.preprocess(
       (value) => {
         // Compatibility shims (same mechanism as bash command->script): models

@@ -108,6 +108,15 @@ export interface MemoryScopeContext {
    * start (r77).
    */
   guardedWorkspaceId?: string;
+  /**
+   * Scopes this caller may use; defaults to every scope (the Memory tab). The memory tool
+   * narrows it so an agent outside token-budget mode never sees the session scope.
+   */
+  scopes?: readonly MemoryScope[];
+}
+
+function visibleScopes(ctx: MemoryScopeContext): readonly MemoryScope[] {
+  return ctx.scopes ?? MEMORY_SCOPES;
 }
 
 export type MemoryActor = "agent" | "user";
@@ -1159,6 +1168,13 @@ export class MemoryService extends EventEmitter {
   }
 
   private getStore(ctx: MemoryScopeContext, scope: MemoryScope): MemoryStore {
+    const scopes = visibleScopes(ctx);
+    if (!scopes.includes(scope)) {
+      // Same error as an unknown scope: a hidden scope does not exist for this caller.
+      throw new MemoryCommandError(
+        `Invalid memory scope '${scope}': expected one of ${scopes.join(", ")}`
+      );
+    }
     switch (scope) {
       case "global":
         return new LocalMemoryStore(path.join(this.config.rootDir, "memory", "global"));
@@ -3041,7 +3057,7 @@ export class MemoryService extends EventEmitter {
       if (parsed.scope === null) {
         // Virtual root: list every scope.
         const sections: string[] = [`Directory: ${MEMORY_VIRTUAL_ROOT}`];
-        for (const scope of MEMORY_SCOPES) {
+        for (const scope of visibleScopes(ctx)) {
           sections.push(`- ${scope}/`);
           try {
             const store = this.getStore(ctx, scope);
@@ -3743,7 +3759,7 @@ export class MemoryService extends EventEmitter {
    */
   async listIndexEntries(ctx: MemoryScopeContext): Promise<MemoryIndexEntry[]> {
     const entries: MemoryIndexEntry[] = [];
-    for (const scope of MEMORY_SCOPES) {
+    for (const scope of visibleScopes(ctx)) {
       // Per-scope buffer: the scope's entries join the result only once the
       // post-read gate below passed, so a tombstone published mid-enumeration
       // drops the whole scope rather than a prefix of it.

@@ -2563,6 +2563,32 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  it.each([true, false])(
+    "offers the session memory scope only in token-budget mode (tokenBudget=%p)",
+    async (tokenBudget) => {
+      using xumHome = new DisposableTempDir("ai-service-session-scope");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-session-scope";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget, memory: true },
+      });
+
+      expect(result.success).toBe(true);
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+      expect(toolConfig?.memoryScopes?.includes("session")).toBe(tokenBudget);
+    }
+  );
+
   it.each([
     { auth: "oauth", model: KNOWN_MODELS.GPT_53_CODEX.id },
     { auth: "oauth", model: "openai:team-codex" },

@@ -14,6 +14,7 @@ import {
   createMemoryTool,
   memoryScopeContextFromToolConfig,
   resolveMemoryAccessPolicy,
+  resolveMemoryScopes,
 } from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -54,6 +55,7 @@ function projectMemoryPath(xumHome: string, relPath: string): string {
 
 async function createFixture(options?: {
   memoryAccess?: MemoryScopeAccess;
+  memoryScopes?: readonly MemoryScope[];
   memoryWritePath?: string;
 }): Promise<MemoryToolFixture> {
   const tempDir = new TestTempDir("test-memory-tool");
@@ -71,6 +73,7 @@ async function createFixture(options?: {
     workspace: "readwrite",
     session: "readwrite",
   };
+  config.memoryScopes = options?.memoryScopes;
   config.memoryWritePath = options?.memoryWritePath;
   return {
     xumHome,
@@ -280,7 +283,10 @@ describe("memory tool", () => {
         const writable = access[scope] === "readwrite";
 
         it(`${name}: mutating commands on ${scope} scope are ${writable ? "allowed" : "rejected"}`, async () => {
-          using fixture = await createFixture({ memoryAccess: access });
+          using fixture = await createFixture({
+            memoryAccess: access,
+            memoryScopes: MEMORY_SCOPES,
+          });
           for (const makeInput of MUTATING_INPUTS) {
             const result = await run(fixture.tool, makeInput(scope));
             if (writable) {
@@ -299,7 +305,10 @@ describe("memory tool", () => {
         });
 
         it(`${name}: view on ${scope} scope is always allowed`, async () => {
-          using fixture = await createFixture({ memoryAccess: access });
+          using fixture = await createFixture({
+            memoryAccess: access,
+            memoryScopes: MEMORY_SCOPES,
+          });
           const result = await run(fixture.tool, { command: "view", path: `/memories/${scope}` });
           expect(result.success).toBe(true);
         });
@@ -626,6 +635,41 @@ describe("memory tool", () => {
       using fixture = await createFixture();
       expect(fixture.config.memoryIndexEntries).toBeUndefined();
       expect(fixture.tool.description).toBe(TOOL_DEFINITIONS.memory.description);
+    });
+  });
+
+  describe("session scope gating", () => {
+    const CHECKPOINT = "/memories/session/checkpoint.md";
+
+    it("hides the session scope outside token-budget mode", async () => {
+      using fixture = await createFixture({ memoryScopes: resolveMemoryScopes(false) });
+      fixture.config.memoryIndexEntries = [
+        { path: CHECKPOINT, description: "checkpoint" },
+        { path: "/memories/global/lesson.md", description: "a lesson" },
+      ];
+      const tool = createMemoryTool(fixture.config);
+      expect(tool.description).not.toContain("/memories/session/");
+      expect(tool.description).toContain("- /memories/global/lesson.md");
+
+      const created = await run(tool, { command: "create", path: CHECKPOINT, file_text: "x" });
+      expect(created).toMatchObject({ success: false });
+      if (!created.success) expect(created.error).toContain("Invalid memory scope 'session'");
+      const root = await run(tool, { command: "view", path: "/memories" });
+      expect(root.success).toBe(true);
+      if (root.success) expect(root.output).not.toContain("session/");
+    });
+
+    it("serves the session scope in token-budget mode", async () => {
+      using fixture = await createFixture({ memoryScopes: resolveMemoryScopes(true) });
+      fixture.config.memoryIndexEntries = [{ path: CHECKPOINT, description: "checkpoint" }];
+      const tool = createMemoryTool(fixture.config);
+      expect(tool.description).toContain(`- ${CHECKPOINT}`);
+
+      const created = await run(tool, { command: "create", path: CHECKPOINT, file_text: "x" });
+      expect(created.success).toBe(true);
+      const root = await run(tool, { command: "view", path: "/memories" });
+      expect(root.success).toBe(true);
+      if (root.success) expect(root.output).toContain("- session/");
     });
   });
 
