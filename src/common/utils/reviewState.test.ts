@@ -19,10 +19,6 @@ describe("mergeReviewStateDeltas", () => {
       deltas: [{ hunkExpand: { delete: ["a"] } }, { hunkExpand: { set: { a: false } } }],
     },
     {
-      name: "first-seen keeps the earliest report",
-      deltas: [{ firstSeen: { set: { n: 10, old: 5 } } }, { firstSeen: { set: { n: 20 } } }],
-    },
-    {
       name: "untouched sections stay absent",
       deltas: [{ readMore: { set: { h: { up: 30, down: 0 } } } }, {}],
     },
@@ -35,4 +31,19 @@ describe("mergeReviewStateDeltas", () => {
       expect(merged).toEqual(sequential);
     });
   }
+
+  it("first-seen keeps the earliest report whatever order the reports arrive in", () => {
+    const earlier: ReviewStateDelta = { firstSeen: { set: { n: 10, old: 5 } } };
+    const later: ReviewStateDelta = { firstSeen: { set: { n: 20, old: 0 } } };
+    for (const deltas of [
+      [earlier, later],
+      [later, earlier],
+    ]) {
+      const expected = { old: 0, n: 10 };
+      expect(deltas.reduce(applyReviewStateDelta, base).firstSeen).toEqual(expected);
+      expect(applyReviewStateDelta(base, mergeReviewStateDeltas(deltas)).firstSeen).toEqual(
+        expected
+      );
+    }
+  });
 });

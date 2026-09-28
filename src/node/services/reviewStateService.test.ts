@@ -5,6 +5,7 @@ import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import type { Review } from "@/common/types/review";
 import { MAX_READ_STATES } from "@/constants/reviewState";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { REVIEW_STATE_FILE_NAME, ReviewStateService } from "./reviewStateService";
 
 const WORKSPACE_ID = "review-ws";
@@ -138,5 +139,48 @@ describe("ReviewStateService", () => {
       () => false
     );
     expect(exists).toBe(false);
+  });
+
+  it("does not recreate the session dir of a workspace whose removal deleted it but has not deregistered it yet", async () => {
+    using tempDir = new TestTempDir("review-state-removing");
+    const { config } = await createHarness(tempDir);
+    const service = new ReviewStateService(config);
+    // Removal's order: tombstone, delete the session dir, and only then deregister from config.
+    const tombstone = workspaceRemovalTombstonePath(config.rootDir, WORKSPACE_ID);
+    await fs.mkdir(path.dirname(tombstone), { recursive: true });
+    await fs.writeFile(tombstone, "{}");
+
+    await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } });
+
+    const exists = await fs.stat(path.join(config.sessionsDir, WORKSPACE_ID)).then(
+      () => true,
+      () => false
+    );
+    expect(exists).toBe(false);
+  });
+
+  it("fails the update without announcing it when the config cannot be read", async () => {
+    using tempDir = new TestTempDir("review-state-unreadable-config");
+    const { config, filePath } = await createHarness(tempDir);
+    const service = new ReviewStateService(config);
+    let changes = 0;
+    service.on(ReviewStateService.changeEventName(WORKSPACE_ID), () => changes++);
+    await fs.writeFile(path.join(config.rootDir, "config.json"), "{not json");
+
+    let error: unknown = null;
+    await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } }).catch((e) => {
+      error = e;
+    });
+
+    // A rejection makes the client keep the change and retry; a skipped write reported as
+    // success would make it drop the change.
+    expect(error).not.toBeNull();
+    expect(changes).toBe(0);
+    expect(
+      await fs.stat(filePath).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
   });
 });

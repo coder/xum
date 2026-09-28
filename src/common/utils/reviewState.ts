@@ -115,22 +115,27 @@ export function withReviewStateSection<S extends ReviewStateSection>(
   return capReviewStateSections(next);
 }
 
+/** Combines a key present on both sides; absent means last write wins. */
+type EntryMerge<V> = ((existing: V, incoming: V) => V) | undefined;
+
 /**
- * Apply one section delta. Deletes run before sets, so a key present in both ends up set.
- * `keepExisting` implements the first-seen rule: an existing value always wins.
+ * First-seen rule: keep the earliest timestamp. A minimum (not "existing wins") makes the
+ * result independent of the order in which clients' reports arrive.
  */
+const earliest: EntryMerge<number> = (existing, incoming) => Math.min(existing, incoming);
+
+/** Apply one section delta. Deletes run before sets, so a key present in both ends up set. */
 function applySectionDelta<V>(
   existing: Record<string, V> | undefined,
   delta: { set?: Record<string, V>; delete?: string[] },
-  keepExisting: boolean
+  merge: EntryMerge<V>
 ): Record<string, V> {
   const next: Record<string, V> = { ...existing };
   for (const key of delta.delete ?? []) {
     delete next[key];
   }
   for (const [key, value] of Object.entries(delta.set ?? {})) {
-    if (keepExisting && key in next) continue;
-    next[key] = value;
+    next[key] = merge && key in next ? merge(next[key], value) : value;
   }
   return next;
 }
@@ -139,7 +144,7 @@ function applySectionDelta<V>(
  * Apply a delta to sections. Any section touched by the delta becomes present
  * (even if empty); untouched sections keep their object identity.
  *
- * Merge rule per entry: last write wins, except `firstSeen`, where the existing
+ * Merge rule per entry: last write wins, except `firstSeen`, where the earliest
  * timestamp is kept so a second client can never move first-seen later.
  */
 export function applyReviewStateDelta(
@@ -147,24 +152,25 @@ export function applyReviewStateDelta(
   delta: ReviewStateDelta
 ): ReviewStateSections {
   const next: ReviewStateSections = { ...sections };
-  if (delta.reviews) next.reviews = applySectionDelta(sections.reviews, delta.reviews, false);
+  if (delta.reviews) next.reviews = applySectionDelta(sections.reviews, delta.reviews, undefined);
   if (delta.readState) {
-    next.readState = applySectionDelta(sections.readState, delta.readState, false);
+    next.readState = applySectionDelta(sections.readState, delta.readState, undefined);
   }
   if (delta.firstSeen) {
-    next.firstSeen = applySectionDelta(sections.firstSeen, delta.firstSeen, true);
+    next.firstSeen = applySectionDelta(sections.firstSeen, delta.firstSeen, earliest);
   }
   if (delta.hunkExpand) {
-    next.hunkExpand = applySectionDelta(sections.hunkExpand, delta.hunkExpand, false);
+    next.hunkExpand = applySectionDelta(sections.hunkExpand, delta.hunkExpand, undefined);
   }
-  if (delta.readMore) next.readMore = applySectionDelta(sections.readMore, delta.readMore, false);
+  if (delta.readMore)
+    next.readMore = applySectionDelta(sections.readMore, delta.readMore, undefined);
   return capReviewStateSections(next);
 }
 
 function mergeSectionDeltas<V>(
   first: { set?: Record<string, V>; delete?: string[] } | undefined,
   second: { set?: Record<string, V>; delete?: string[] } | undefined,
-  keepExisting: boolean
+  merge: EntryMerge<V>
 ): { set?: Record<string, V>; delete?: string[] } | undefined {
   if (!first) return second;
   if (!second) return first;
@@ -173,7 +179,7 @@ function mergeSectionDeltas<V>(
     Object.entries(first.set ?? {}).filter(([key]) => !secondDeletes.has(key))
   );
   // Applying the merged delta (deletes, then sets) must equal applying `first` then `second`.
-  const set = keepExisting ? { ...second.set, ...firstSet } : { ...firstSet, ...second.set };
+  const set = applySectionDelta(firstSet, { set: second.set }, merge);
   const deletes = [...new Set([...(first.delete ?? []), ...secondDeletes])];
   return {
     ...(Object.keys(set).length > 0 ? { set } : {}),
@@ -182,18 +188,20 @@ function mergeSectionDeltas<V>(
 }
 
 /**
- * Combine deltas into one whose application equals applying them in order.
+ * Combine deltas into one whose application equals applying them in order, except for the
+ * caps: they apply once, after the whole batch, so an entry an intermediate cap would have
+ * evicted may survive (it is still valid data, and the final cap still bounds the result).
  * Used by the frontend store to flush all pending local changes in one request.
  */
 export function mergeReviewStateDeltas(deltas: readonly ReviewStateDelta[]): ReviewStateDelta {
   let merged: ReviewStateDelta = {};
   for (const delta of deltas) {
     merged = {
-      reviews: mergeSectionDeltas(merged.reviews, delta.reviews, false),
-      readState: mergeSectionDeltas(merged.readState, delta.readState, false),
-      firstSeen: mergeSectionDeltas(merged.firstSeen, delta.firstSeen, true),
-      hunkExpand: mergeSectionDeltas(merged.hunkExpand, delta.hunkExpand, false),
-      readMore: mergeSectionDeltas(merged.readMore, delta.readMore, false),
+      reviews: mergeSectionDeltas(merged.reviews, delta.reviews, undefined),
+      readState: mergeSectionDeltas(merged.readState, delta.readState, undefined),
+      firstSeen: mergeSectionDeltas(merged.firstSeen, delta.firstSeen, earliest),
+      hunkExpand: mergeSectionDeltas(merged.hunkExpand, delta.hunkExpand, undefined),
+      readMore: mergeSectionDeltas(merged.readMore, delta.readMore, undefined),
     };
   }
   return merged;

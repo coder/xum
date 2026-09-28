@@ -1,9 +1,11 @@
 import { EventEmitter } from "events";
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import { SessionFileManager } from "@/node/utils/sessionFile";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { log } from "@/node/services/log";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import {
   REVIEW_STATE_SECTIONS,
   type ReviewStateDelta,
@@ -32,9 +34,6 @@ export const REVIEW_STATE_FILE_NAME = "review-state.json";
 export class ReviewStateService extends EventEmitter {
   private readonly config: Config;
   private readonly file: SessionFileManager<unknown>;
-  // Read-modify-write must be serialized per workspace. SessionFileManager.write takes
-  // workspaceFileLocks itself and is not reentrant, so use a separate mutex around it.
-  private readonly workspaceLocks = new MutexMap<string>();
 
   constructor(config: Config) {
     super();
@@ -49,12 +48,13 @@ export class ReviewStateService extends EventEmitter {
   /** Sanitized snapshot; empty sections for an unknown workspace or a missing file. */
   async getSnapshot(workspaceId: string): Promise<ReviewStateSnapshot> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.getSnapshot requires a workspaceId");
-    return this.workspaceLocks.withLock(workspaceId, () => this.load(workspaceId));
+    // No lock: writes are atomic renames, so a read sees either the old or the new file.
+    return this.load(workspaceId);
   }
 
   async applyDelta(workspaceId: string, delta: ReviewStateDelta): Promise<ReviewStateSnapshot> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.applyDelta requires a workspaceId");
-    return this.workspaceLocks.withLock(workspaceId, async () => {
+    return this.withWriteLock(workspaceId, async () => {
       const current = await this.load(workspaceId);
       const snapshot: ReviewStateSnapshot = {
         sections: applyReviewStateDelta(current.sections, delta),
@@ -74,7 +74,7 @@ export class ReviewStateService extends EventEmitter {
     sections: ReviewStateSections
   ): Promise<ReviewStateImportLegacyOutput> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.importLegacy requires a workspaceId");
-    return this.workspaceLocks.withLock(workspaceId, async () => {
+    return this.withWriteLock(workspaceId, async () => {
       const current = await this.load(workspaceId);
       // Sanitize the untrusted legacy payload with the same rules as the file load.
       const incoming = sanitizeReviewStateSnapshot({ sections }).snapshot.sections;
@@ -113,11 +113,31 @@ export class ReviewStateService extends EventEmitter {
     return snapshot;
   }
 
+  /**
+   * Serialize a read-modify-write on the session dir's target mutation lock, the same
+   * in-process mutex + cross-process file lock that workspace removal holds while it publishes
+   * its tombstone and deletes the session dir (removeSessionDirUnderMemoryLocks), like the
+   * other session-dir writers (DevToolsService, SessionUsageService). It also serializes two
+   * backends sharing one Xum root, which an in-memory mutex alone cannot.
+   */
+  private withWriteLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+    return withTargetMutationLock(
+      this.config.rootDir,
+      path.join(this.config.sessionsDir, workspaceId),
+      fn
+    );
+  }
+
+  /** Call under withWriteLock, so a removal cannot start between this check and the write. */
   private async persist(workspaceId: string, snapshot: ReviewStateSnapshot): Promise<void> {
-    const result = await this.file.write(workspaceId, snapshot, {
-      // A late flush for a deleted workspace must not recreate `sessions/<deletedId>/`.
-      shouldWrite: () => this.config.findWorkspace(workspaceId) != null,
-    });
+    // A late flush for a removed workspace must not recreate `sessions/<removedId>/`. Removal
+    // publishes its tombstone under the same lock before deleting the dir, and deregisters from
+    // config only afterwards, so the tombstone (not config) is what closes that window.
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+    // Strict lookup: an unreadable config throws, failing the update so the client keeps its
+    // change and retries. Only a conclusive "not registered" skips the write.
+    if (this.config.findWorkspace(workspaceId, { throwOnError: true }) == null) return;
+    const result = await this.file.write(workspaceId, snapshot);
     if (!result.success) {
       throw new Error(result.error);
     }

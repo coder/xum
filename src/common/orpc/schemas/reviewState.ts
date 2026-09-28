@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { Review, ReviewNoteData, ReviewStatus } from "@/common/types/review";
 
 // Review data schema for queued message display and persisted review notes.
 export const ReviewNoteDataSchema = z.object({
@@ -20,6 +21,17 @@ export const ReviewSchema = z.object({
   createdAt: z.number(),
   statusChangedAt: z.number().optional(),
 });
+
+// Compile-time guard: the persisted schemas must describe exactly the shared Review types, so
+// adding a field (even an optional one) on only one side fails typecheck.
+type Exactly<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+export type ReviewSchemasMatchTypes = [
+  Assert<Exactly<z.infer<typeof ReviewNoteDataSchema>, ReviewNoteData>>,
+  Assert<Exactly<z.infer<typeof ReviewStatusSchema>, ReviewStatus>>,
+  Assert<Exactly<z.infer<typeof ReviewSchema>, Review>>,
+];
+type Assert<T extends true> = T;
 
 export const HunkReadStateSchema = z.object({
   hunkId: z.string(),
