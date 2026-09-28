@@ -581,6 +581,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const selectedWorkspace = selectedWorkspaceId
     ? workspaces.find((workspace) => workspace.id === selectedWorkspaceId)
     : undefined;
+  // Agent state is scoped to the selected workspace only once the extension has listed it and a
+  // server connection exists (see WebviewChatProviders below). Unscoped, AgentProvider writes the
+  // webview's global agent key, so the composer's agent toggle is disabled then (#4820).
+  const agentScopeWorkspaceId =
+    selectedWorkspace && connectionStatus?.mode === "api" ? selectedWorkspace.id : undefined;
 
   let latestProposePlanId: string | undefined;
   for (let i = displayedMessages.length - 1; i >= 0; i--) {
@@ -608,11 +613,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                   // it has not sent (#4751). It also requires a server connection: file mode lists
                   // workspaces but the host rejects agents.list there, and a recovery that keeps
                   // the same selection must change this prop so the lookup runs again (#4797).
-                  workspaceId={
-                    selectedWorkspace && connectionStatus?.mode === "api"
-                      ? selectedWorkspace.id
-                      : undefined
-                  }
+                  workspaceId={agentScopeWorkspaceId}
                   workspaceAi={selectedWorkspace?.ai}
                 >
                   <div className="flex h-screen flex-col">
@@ -734,6 +735,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                           }
                           aggregator={aggregatorRef.current}
                           aiSettingsLoaded={selectedWorkspace?.ai != null}
+                          agentScoped={agentScopeWorkspaceId != null}
                           onSendComplete={jumpToBottom}
                           onNotice={pushNotice}
                         />

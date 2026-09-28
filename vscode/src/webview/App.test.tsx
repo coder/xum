@@ -5,7 +5,12 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAgentIdKey, getModelKey, getThinkingLevelKey } from "xum/common/constants/storage";
+import {
+  GLOBAL_SCOPE_ID,
+  getAgentIdKey,
+  getModelKey,
+  getThinkingLevelKey,
+} from "xum/common/constants/storage";
 import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
 import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
@@ -608,6 +613,39 @@ describe("vscode webview agent lookup", () => {
     const lookups = bridge.orpcCalls("agents.list");
     expect(lookups).toHaveLength(1);
     expect(lookups[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+  });
+
+  test("keeps the agent toggle disabled while agent state has no workspace scope (#4820)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const toggle = () => view.getByRole("button", { name: "Exec" }) as HTMLButtonElement;
+
+    // File mode lists and selects the workspace, but agent state stays unscoped (#4797).
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    expect(toggle().disabled).toBe(true);
+
+    // With a server connection, the scope follows the listed selection.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    expect(toggle().disabled).toBe(false);
+  });
+
+  test("keeps the agent toggle disabled for a restored selection until the workspace list arrives (#4820)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+
+    const toggle = view.getByRole("button", { name: "Exec" }) as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+    await act(async () => {
+      fireEvent.click(toggle);
+      await Promise.resolve();
+    });
+    // An unscoped click would write the webview's global agent key.
+    expect(readPersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), null)).toBeNull();
   });
 
   test("looks up agents again when the connection recovers from file mode (#4797)", async () => {

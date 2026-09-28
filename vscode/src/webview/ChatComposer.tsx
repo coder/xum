@@ -78,7 +78,7 @@ function SimpleAgentToggle(props: {
           disabled={props.disabled}
           onClick={() => props.onChange(isPlan ? "exec" : "plan")}
           className={cn(
-            "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150",
+            "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50",
             isPlan
               ? "bg-plan-mode text-white hover:bg-plan-mode-hover"
               : "bg-exec-mode text-white hover:bg-exec-mode-hover"
@@ -133,6 +133,8 @@ function ChatComposerInner(props: {
   aggregator: StreamingMessageAggregator | null;
   /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
   aiSettingsLoaded: boolean;
+  /** AgentProvider has a workspace scope; an unscoped toggle would write the global agent key. */
+  agentScoped: boolean;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -496,7 +498,7 @@ function ChatComposerInner(props: {
             <SimpleAgentToggle
               agentId={agentId}
               onChange={setAgentId}
-              disabled={isAgentSelectionLocked === true}
+              disabled={isAgentSelectionLocked === true || !props.agentScoped}
             />
 
             <Tooltip>
@@ -534,6 +536,7 @@ export function ChatComposer(props: {
   aggregator: StreamingMessageAggregator | null;
   /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
   aiSettingsLoaded: boolean;
+  agentScoped: boolean;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -546,6 +549,7 @@ export function ChatComposer(props: {
         disabledReason={props.disabledReason}
         aggregator={props.aggregator}
         aiSettingsLoaded={props.aiSettingsLoaded}
+        agentScoped={props.agentScoped}
         onSendComplete={props.onSendComplete}
         onNotice={props.onNotice}
       />

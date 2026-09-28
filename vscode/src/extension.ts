@@ -1517,6 +1517,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
   private async pumpOrpcStream(
     streamId: string,
+    path: string[],
     iterator: AsyncIterator<unknown>,
     controller: AbortController
   ): Promise<void> {
@@ -1533,7 +1534,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.postMessage({
           type: "orpcStreamData",
           streamId,
-          value,
+          // Same redaction as value responses (#4820): the allowed streams emit only void change
+          // signals today, but a future structured stream on a redacted path must not bypass it.
+          value: redactWebviewOrpcResult(path, value),
         });
       }
 
@@ -1662,7 +1665,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           streamId,
         });
 
-        void this.pumpOrpcStream(streamId, iterator, controller);
+        void this.pumpOrpcStream(streamId, args.path, iterator, controller);
         return;
       }
 
