@@ -18806,6 +18806,9 @@ export class WorkspaceService
     const goalKind = input.kind ?? GOAL_CONTINUATION_KIND;
     const startStreamInBackground =
       input.startStreamInBackground === true && goalKind !== GOAL_BUDGET_LIMIT_KIND;
+    // Set once the send returns, so its failure callback can tell whether it runs inside it.
+    let sendSettled = false;
+    let failedBeforeStreamInSend = false;
     const sendResult = await this.sendMessage(
       input.workspaceId,
       input.message,
@@ -18820,21 +18823,19 @@ export class WorkspaceService
         agentInitiated: true,
         startStreamInBackground,
         onAcceptedPreStreamFailure: startStreamInBackground
-          ? () => {
-              // Request the re-dispatch without awaiting it (#5029). The idle dispatcher is
-              // usually running THIS continuation, and it never starts a workspace it is still
-              // dispatching; the session awaits this callback before the send settles, so
-              // awaiting here deadlocked the dispatch, and session disposal (which drains the
-              // preparation) hung workspace removal. The request queues and runs once this
-              // dispatch finishes.
-              this.workspaceGoalService
-                ?.requestPendingGoalContinuationDispatch(input.workspaceId)
-                .catch((error: unknown) => {
-                  log.warn("WorkspaceService: goal continuation re-dispatch failed", {
-                    workspaceId: input.workspaceId,
-                    error: getErrorMessage(error),
-                  });
-                });
+          ? async () => {
+              // A failure inside this send runs while the idle dispatcher is still dispatching
+              // this continuation. The dispatcher never starts a workspace it is dispatching,
+              // so awaiting a re-dispatch here deadlocked the send (and session disposal,
+              // which drains it, hung workspace removal: #5029). Report it as not dispatched
+              // below instead; the dispatching caller then retries with its own backoff.
+              if (!sendSettled) {
+                failedBeforeStreamInSend = true;
+                return;
+              }
+              await this.workspaceGoalService?.requestPendingGoalContinuationDispatch(
+                input.workspaceId
+              );
             }
           : undefined,
         requireIdle: true,
@@ -18846,11 +18847,19 @@ export class WorkspaceService
         admissionStale: input.admissionStale,
       }
     );
+    sendSettled = true;
 
     if (!sendResult.success) {
       log.info("WorkspaceService: goal continuation send skipped", {
         workspaceId: input.workspaceId,
         error: sendResult.error,
+      });
+      return false;
+    }
+    // Accepted, then canceled before streaming, yet the send returned Ok: no stream runs.
+    if (failedBeforeStreamInSend) {
+      log.info("WorkspaceService: goal continuation failed before streaming", {
+        workspaceId: input.workspaceId,
       });
       return false;
     }
