@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import * as os from "node:os";
@@ -83,77 +83,89 @@ describe("spawnProxyCommand", () => {
 // #5063: the pool's wait loop must not re-authenticate through its backoff after a permanent
 // failure (a rejected key). Every retry repeats a login that cannot succeed, and servers count
 // failed logins. Transient failures (nothing listening) keep waiting.
-describe("SSH2ConnectionPool wait loop vs permanent failures", () => {
-  let cleanup: (() => Promise<void>) | undefined;
-  afterEach(async () => {
-    await cleanup?.();
-    cleanup = undefined;
-  });
-
-  // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
-  const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
-
-  async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
-    const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-pool-"));
-    const identityFile = path.join(dir, "id_ecdsa");
-    await fs.writeFile(identityFile, newPrivateKey(), { mode: 0o600 });
-    const config: SSHConnectionConfig = {
-      host: "127.0.0.1",
-      port: (server.address() as AddressInfo).port,
-      identityFile,
-    };
-    const close = () => new Promise<void>((resolve) => server.close(() => resolve()));
-    cleanup = async () => {
-      await close().catch(() => undefined);
-      await fs.rm(dir, { recursive: true, force: true });
-    };
-    return { config, close };
-  }
-
-  function acquire(pool: SSH2ConnectionPool, config: SSHConnectionConfig, maxWaitMs: number) {
-    const waits: number[] = [];
-    const result = pool
-      .acquireConnection(config, { maxWaitMs, onWait: (ms) => waits.push(ms) })
-      .then(
-        () => new Error("acquisition unexpectedly succeeded"),
-        (error: unknown) => error
-      );
-    return { waits, result };
-  }
-
-  it("a rejected key fails at once instead of re-authenticating through the backoff", async () => {
-    let connections = 0;
-    const { config } = await startServer((conn) => {
-      connections++;
-      conn.on("authentication", (ctx) => ctx.reject());
-      conn.on("error", () => undefined);
+// Skipped on Windows: the pool always adds Pageant there, and a runner without it fails with
+// "Failed to retrieve identities from agent" before the server's rejection is seen.
+describe.skipIf(process.platform === "win32")(
+  "SSH2ConnectionPool wait loop vs permanent failures",
+  () => {
+    // Key-file authentication only: an ambient agent (working or broken) must not change the result.
+    const originalAuthSock = process.env.SSH_AUTH_SOCK;
+    beforeEach(() => {
+      delete process.env.SSH_AUTH_SOCK;
     });
-    const pool = new SSH2ConnectionPool();
+    let cleanup: (() => Promise<void>) | undefined;
+    afterEach(async () => {
+      if (originalAuthSock === undefined) delete process.env.SSH_AUTH_SOCK;
+      else process.env.SSH_AUTH_SOCK = originalAuthSock;
+      await cleanup?.();
+      cleanup = undefined;
+    });
 
-    const first = acquire(pool, config, 5_000);
-    expect(String(await first.result)).toContain("All configured authentication methods failed");
-    expect(first.waits).toEqual([]);
-    expect(connections).toBe(1);
+    // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
+    const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
 
-    // The pool still recorded the failure: a caller arriving during that backoff gets the
-    // permanent error without sleeping or logging in again.
-    const next = acquire(pool, config, 5_000);
-    const refusal = String(await next.result);
-    expect(refusal).toContain("backoff");
-    expect(refusal).toContain("All configured authentication methods failed");
-    expect(next.waits).toEqual([]);
-    expect(connections).toBe(1);
-  });
+    async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
+      const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-pool-"));
+      const identityFile = path.join(dir, "id_ecdsa");
+      await fs.writeFile(identityFile, newPrivateKey(), { mode: 0o600 });
+      const config: SSHConnectionConfig = {
+        host: "127.0.0.1",
+        port: (server.address() as AddressInfo).port,
+        identityFile,
+      };
+      const close = () => new Promise<void>((resolve) => server.close(() => resolve()));
+      cleanup = async () => {
+        await close().catch(() => undefined);
+        await fs.rm(dir, { recursive: true, force: true });
+      };
+      return { config, close };
+    }
 
-  it("a refused connection still waits through the backoff", async () => {
-    const { config, close } = await startServer((conn) => conn.on("error", () => undefined));
-    await close(); // Nothing listens on the port any more: ECONNREFUSED.
-    const pool = new SSH2ConnectionPool();
+    function acquire(pool: SSH2ConnectionPool, config: SSHConnectionConfig, maxWaitMs: number) {
+      const waits: number[] = [];
+      const result = pool
+        .acquireConnection(config, { maxWaitMs, onWait: (ms) => waits.push(ms) })
+        .then(
+          () => new Error("acquisition unexpectedly succeeded"),
+          (error: unknown) => error
+        );
+      return { waits, result };
+    }
 
-    const { waits, result } = acquire(pool, config, 2_500);
-    expect(String(await result)).toContain("ECONNREFUSED");
-    expect(waits.length).toBeGreaterThan(0);
-  });
-});
+    it("a rejected key fails at once instead of re-authenticating through the backoff", async () => {
+      let connections = 0;
+      const { config } = await startServer((conn) => {
+        connections++;
+        conn.on("authentication", (ctx) => ctx.reject());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+
+      const first = acquire(pool, config, 5_000);
+      expect(String(await first.result)).toContain("All configured authentication methods failed");
+      expect(first.waits).toEqual([]);
+      expect(connections).toBe(1);
+
+      // The pool still recorded the failure: a caller arriving during that backoff gets the
+      // permanent error without sleeping or logging in again.
+      const next = acquire(pool, config, 5_000);
+      const refusal = String(await next.result);
+      expect(refusal).toContain("backoff");
+      expect(refusal).toContain("All configured authentication methods failed");
+      expect(next.waits).toEqual([]);
+      expect(connections).toBe(1);
+    });
+
+    it("a refused connection still waits through the backoff", async () => {
+      const { config, close } = await startServer((conn) => conn.on("error", () => undefined));
+      await close(); // Nothing listens on the port any more: ECONNREFUSED.
+      const pool = new SSH2ConnectionPool();
+
+      const { waits, result } = acquire(pool, config, 2_500);
+      expect(String(await result)).toContain("ECONNREFUSED");
+      expect(waits.length).toBeGreaterThan(0);
+    });
+  }
+);
