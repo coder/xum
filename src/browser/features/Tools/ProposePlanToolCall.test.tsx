@@ -364,9 +364,7 @@ describe("ProposePlanToolCall", () => {
     // PolicyProvider's first answer re-renders the card; check the latest render's input.
     const startHere = startHereCalls.at(-1);
     expect(startHere?.content).toContain("*Plan saved to");
-    expect(startHere?.content).not.toContain(
-      "Note: This chat already contains the full plan"
-    );
+    expect(startHere?.content).not.toContain("Note: This chat already contains the full plan");
     expect(startHere?.content).toContain("Read the plan file below");
   });
   test("keeps plan file on disk and includes plan path note in Start Here content", () => {
@@ -793,9 +791,9 @@ describe("ProposePlanToolCall", () => {
       // Nothing was switched: the composer stays on the plan agent and its model.
       expect(readPersistedState(getAgentIdKey(WORKSPACE_ID), "")).toBe("plan");
       expect(readPersistedState(getModelKey(WORKSPACE_ID), "")).toBe(PLAN_MODEL);
-      expect(
-        (view.getByRole("button", { name: "Implement" }) as HTMLButtonElement).disabled
-      ).toBe(false);
+      expect((view.getByRole("button", { name: "Implement" }) as HTMLButtonElement).disabled).toBe(
+        false
+      );
     });
 
     test("leaves the decision to the backend until the providers config is known", async () => {
