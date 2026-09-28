@@ -73,7 +73,6 @@ import {
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
-  getReviewsKey,
 } from "@/common/constants/storage";
 import {
   prepareCompactionMessage,
@@ -105,6 +104,7 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -1504,19 +1504,33 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
         // takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
-        if (
-          heldInputIds.length > 0 &&
-          workspaceIdForComposerClear != null &&
-          isRestoredDraftDurable({
-            inputKey: storageKeys.inputKey,
-            expectedText: mergedText,
-            attachmentsKey: storageKeys.attachmentsKey,
-            restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
-            reviewsKey: getReviewsKey(workspaceIdForComposerClear),
-            restoredReviewIds,
-          })
-        ) {
-          onAcceptRestoredHeldInputs?.(heldInputIds);
+        if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
+          const reviewWorkspaceId = workspaceIdForComposerClear;
+          const restoredAttachmentIds = restoredAttachments.map(({ id }) => id);
+          const acceptIfDurable = (restoredReviewsDurable: boolean) => {
+            if (
+              isRestoredDraftDurable({
+                inputKey: storageKeys.inputKey,
+                expectedText: mergedText,
+                attachmentsKey: storageKeys.attachmentsKey,
+                restoredAttachmentIds,
+                restoredReviewIds,
+                restoredReviewsDurable,
+              })
+            ) {
+              onAcceptRestoredHeldInputs?.(heldInputIds);
+            }
+          };
+          if (restoredReviewIds !== null && restoredReviewIds.length > 0) {
+            // Restored notes live in the backend review-state store: flush them and require
+            // the server-acknowledged copy before releasing the held input. A failed flush
+            // leaves the input held (fail closed; a visible duplicate beats a loss).
+            getReviewStateStore()
+              .areReviewsDurable(reviewWorkspaceId, restoredReviewIds)
+              .then(acceptIfDurable, () => undefined);
+          } else {
+            acceptIfDurable(true);
+          }
         }
         focusMessageInput();
       } else if (mode === "replace") {
@@ -2400,8 +2414,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             ? fileParts
             : undefined;
 
-        // Prepare reviews data (used for both compaction continueMessage and normal send)
-        const reviewsData = reviewData;
+        // Prepare reviews data (used for both compaction continueMessage and normal send).
+        // Attached notes live in the backend review-state store; a send racing its first
+        // hydration waits for it (normally already resolved) and reads the notes from the store
+        // so they are never dropped.
+        let reviewsData = reviewData;
+        let reviewIdsToCheck = reviewIdsForCheck;
+        if (variant === "workspace" && workspaceId && !reviewOverrideActive) {
+          const reviewStateStore = getReviewStateStore();
+          if (!reviewStateStore.isReady(workspaceId)) {
+            await reviewStateStore.whenReady(workspaceId);
+            const attached = reviewStateStore.getAttachedReviews(workspaceId);
+            reviewsData = attached.length > 0 ? attached.map((review) => review.data) : undefined;
+            reviewIdsToCheck = attached.map((review) => review.id);
+          }
+        }
 
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;
@@ -2460,7 +2487,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           attachments: sendAttachments,
           fileParts,
           reviews: reviewsData,
-          reviewIds: reviewIdsForCheck,
+          reviewIds: reviewIdsToCheck,
           editMessageId: editMessageForSend?.id,
           // The refreshed candidate is sent exactly as handed back; nothing is re-captured here.
           historyEditPrecondition: editMessageForSend

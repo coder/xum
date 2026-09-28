@@ -1,6 +1,6 @@
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
-import { REVIEW_SORT_ORDER_KEY, getReviewStateKey } from "../../../src/common/constants/storage";
+import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   readReactProfileSnapshot,
@@ -27,7 +27,6 @@ test.describe("immersive review performance profiling", () => {
   }, testInfo) => {
     const diffSummary = seedLargeReviewDiff(workspace.demoProject.workspacePath);
     const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspace.demoProject.workspaceId);
-    const reviewStateKey = getReviewStateKey(workspace.demoProject.workspaceId);
 
     // The demo repo has no origin/main, so the perf scenario pins Review to HEAD before
     // the panel mounts. That keeps the scenario focused on a real local git diff.
@@ -82,22 +81,19 @@ test.describe("immersive review performance profiling", () => {
       await expect(immersiveReview.getByRole("button", { name: "Mark hunk as read" })).toBeVisible({
         timeout: 20_000,
       });
+      // Read state lives in the backend review-state store now; the completion bar reflects
+      // the composed store view the mark-read click updated.
       await expect
         .poll(
-          () =>
-            page.evaluate((key) => {
-              const raw = window.localStorage.getItem(key);
-              if (!raw) {
-                return 0;
-              }
-              const parsed = JSON.parse(raw) as {
-                readState?: Record<string, { isRead?: boolean }>;
-              };
-              return Object.values(parsed.readState ?? {}).filter((entry) => entry.isRead).length;
-            }, reviewStateKey),
+          async () =>
+            Number(
+              await immersiveReview
+                .getByRole("progressbar", { name: "Review completion by changed lines" })
+                .getAttribute("aria-valuenow")
+            ),
           { timeout: 20_000 }
         )
-        .toBe(1);
+        .toBeGreaterThan(0);
     });
 
     const reactProfileSnapshot = await readReactProfileSnapshot(page);

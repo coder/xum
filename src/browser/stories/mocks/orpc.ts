@@ -12,6 +12,7 @@ import type {
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
 import type { APIClient } from "@/browser/contexts/API";
+import { createMockReviewStateApi } from "./reviewState";
 import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
@@ -1932,6 +1933,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         },
         sendToBackground: () => Promise.resolve({ success: true, data: undefined }),
       },
+      reviewState: createMockReviewStateApi(),
       stats: {
         subscribe: async function* (input: { workspaceId: string }) {
           const snapshot = workspaceStatsSnapshots.get(input.workspaceId);

@@ -3,7 +3,6 @@
     { "file": "src/browser/features/Messages/AutoModelRoutingBadge.tsx", "symbol": "buildAutoModelRoutingTooltipLines", "reason": "production caller: AutoModelRoutingBadge in the same file" },
     { "file": "src/browser/features/Messages/ModelFallbackBadge.tsx", "symbol": "buildModelFallbackTooltipLines", "reason": "production caller: ModelFallbackBadge in the same file" },
     { "file": "src/browser/features/RightSidebar/StatsTab.tsx", "symbol": "formatModelBreakdownLabel", "reason": "production caller: ModelBreakdownView in the same file" },
-    { "file": "src/browser/hooks/useReviewState.ts", "symbol": "evictOldestReviews", "reason": "production caller: useReviewState's persistence effect in the same file" },
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "workspaceStore.addWorkspace", "reason": "production caller: App.tsx (workspace creation/restore paths)" },
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "workspaceStore.setActiveWorkspaceId", "reason": "production caller: WorkspaceContext.tsx active-workspace effect" },
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "findRenderedRefineProposalHash", "reason": "production caller: getDisplayedRefineProposalHash in the same file" },

@@ -14,7 +14,7 @@ jest.mock("lottie-react", () => ({
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputAttachmentsKey, getReviewsKey } from "@/common/constants/storage";
+import { getInputAttachmentsKey } from "@/common/constants/storage";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -40,15 +40,14 @@ const composerAttachmentNames = (app: AppHarness) =>
   readPersistedState<{ filename?: string }[]>(getInputAttachmentsKey(app.workspaceId), []).map(
     (attachment) => attachment.filename
   );
-/** Notes still attached in the workspace's review store (a send checks its notes off). */
-const attachedStoreReviewNotes = (app: AppHarness) =>
-  Object.values(
-    readPersistedState<{ reviews?: Record<string, { status: string; data: ReviewNoteData }> }>(
-      getReviewsKey(app.workspaceId),
-      {}
-    ).reviews ?? {}
-  )
+/** The workspace's reviews in the backend review-state store. */
+const storeReviews = async (app: AppHarness) =>
+  (await app.env.services.reviewStateService.getSnapshot(app.workspaceId)).sections.reviews ?? {};
+/** Notes still attached in the workspace's backend review store (a send checks its notes off). */
+const attachedStoreReviewNotes = async (app: AppHarness) =>
+  Object.values(await storeReviews(app))
     .filter((entry) => entry.status === "attached")
+    .sort((a, b) => a.createdAt - b.createdAt)
     .map((entry) => entry.data.userNote);
 /** Text of the mounted workspace composer (its review panel lives inside it). */
 const composerText = (app: AppHarness) =>
@@ -68,21 +67,11 @@ const detachButtonForNote = (app: AppHarness, note: string) => {
   return button;
 };
 
-/** Attach one note in the review store, as the review panel does, and wait for the composer. */
+/** Attach one note in the backend review store and wait for the composer to show it. */
 async function attachStoreReview(app: AppHarness, id: string, data: ReviewNoteData) {
-  act(() => {
-    const current = readPersistedState<{ reviews?: Record<string, unknown> }>(
-      getReviewsKey(app.workspaceId),
-      {}
-    );
-    updatePersistedState(getReviewsKey(app.workspaceId), {
-      workspaceId: app.workspaceId,
-      reviews: {
-        ...(current.reviews ?? {}),
-        [id]: { id, data, status: "attached", createdAt: Date.now() },
-      },
-      lastUpdated: Date.now(),
-    });
+  await app.env.orpc.workspace.reviewState.update({
+    workspaceId: app.workspaceId,
+    delta: { reviews: { set: { [id]: { id, data, status: "attached", createdAt: Date.now() } } } },
   });
   await waitFor(() => expect(composerText(app)).toContain(data.userNote), LOAD_TOLERANT_WAIT);
 }
@@ -118,7 +107,10 @@ async function queueRichComposerMessage(app: AppHarness) {
   await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), LOAD_TOLERANT_WAIT);
   await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
   // The queued send checked its note off; the composer holds nothing of it any more.
-  await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
+  await waitFor(
+    async () => expect(await attachedStoreReviewNotes(app)).toEqual([]),
+    LOAD_TOLERANT_WAIT
+  );
   expect(composerAttachmentNames(app)).toEqual([]);
   return { session, holding };
 }
@@ -172,7 +164,8 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       expect(composerAttachmentNames(app)).toEqual(["queued.txt", "draft.txt"]);
       // The restored note joins the draft's note in the review store (not a detached copy).
       await waitFor(
-        () => expect(attachedStoreReviewNotes(app)).toEqual(["draft note", "queued note"]),
+        async () =>
+          expect(await attachedStoreReviewNotes(app)).toEqual(["draft note", "queued note"]),
         LOAD_TOLERANT_WAIT
       );
       await waitFor(() => {
@@ -183,25 +176,22 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       // Later review actions keep working on every note: a new note attached afterwards shows,
       // an edit made in the review store shows, and detaching one from the composer removes it.
       await attachStoreReview(app, "review-late", review("late note"));
-      act(() => {
-        const state = readPersistedState<{
-          reviews: Record<string, { status: string; data: ReviewNoteData }>;
-        }>(getReviewsKey(app.workspaceId), { reviews: {} });
-        const [queuedId] = Object.entries(state.reviews).find(
-          // The queued send checked its original copy off; edit the restored, attached one.
-          ([, entry]) => entry.status === "attached" && entry.data.userNote === "queued note"
-        )!;
-        updatePersistedState(getReviewsKey(app.workspaceId), {
-          ...state,
+      const queuedEntry = Object.values(await storeReviews(app)).find(
+        // The queued send checked its original copy off; edit the restored, attached one.
+        (entry) => entry.status === "attached" && entry.data.userNote === "queued note"
+      )!;
+      await app.env.orpc.workspace.reviewState.update({
+        workspaceId: app.workspaceId,
+        delta: {
           reviews: {
-            ...state.reviews,
-            [queuedId]: {
-              ...state.reviews[queuedId],
-              data: { ...state.reviews[queuedId].data, userNote: "queued note, edited" },
+            set: {
+              [queuedEntry.id]: {
+                ...queuedEntry,
+                data: { ...queuedEntry.data, userNote: "queued note, edited" },
+              },
             },
           },
-          lastUpdated: Date.now(),
-        });
+        },
       });
       await waitFor(
         () => expect(composerText(app)).toContain("queued note, edited"),
@@ -231,7 +221,10 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       // Nothing the send consumed, and nothing the user removed, comes back into the composer.
       await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(composerAttachmentNames(app)).toEqual([]);
-      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
+      await waitFor(
+        async () => expect(await attachedStoreReviewNotes(app)).toEqual([]),
+        LOAD_TOLERANT_WAIT
+      );
       await waitFor(() => {
         for (const note of ["queued note", "late note", "draft note"]) {
           expect(composerText(app)).not.toContain(note);
@@ -252,7 +245,7 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       await app.chat.send("[mock:wait-start] in flight");
       await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
       await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
-      expect(attachedStoreReviewNotes(app)).toEqual(["in-flight note"]);
+      expect(await attachedStoreReviewNotes(app)).toEqual(["in-flight note"]);
 
       app.env.services.workspaceService.emitChatEvent(app.workspaceId, {
         type: "restore-to-input",
@@ -276,7 +269,7 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       }, LOAD_TOLERANT_WAIT);
       await app.chat.expectStreamComplete();
       await waitFor(
-        () => expect(attachedStoreReviewNotes(app)).toEqual(["restored note"]),
+        async () => expect(await attachedStoreReviewNotes(app)).toEqual(["restored note"]),
         LOAD_TOLERANT_WAIT
       );
       await waitFor(() => {
@@ -293,7 +286,10 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       }, LOAD_TOLERANT_WAIT);
       expect(countOccurrences(sent.text, formatReviewForModel(review("restored note")))).toBe(1);
       expect(countOccurrences(sent.text, formatReviewForModel(review("in-flight note")))).toBe(0);
-      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
+      await waitFor(
+        async () => expect(await attachedStoreReviewNotes(app)).toEqual([]),
+        LOAD_TOLERANT_WAIT
+      );
     } finally {
       await app.dispose();
     }

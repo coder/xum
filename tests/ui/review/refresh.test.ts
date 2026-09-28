@@ -3,7 +3,6 @@ import { fireEvent, waitFor } from "@testing-library/react";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
-import { getReviewsKey } from "@/common/constants/storage";
 import {
   cleanupSharedRepo,
   configureTestRetries,
@@ -21,7 +20,7 @@ import {
 } from "../helpers";
 import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 configureTestRetries(2);
 
@@ -604,12 +603,12 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC)", () => {
           if (stillThere) throw new Error("Review note input still visible after submit");
         });
 
-        // Ensure the review was persisted before asserting UI updates.
+        // Ensure the review was persisted to the backend review-state store before asserting
+        // UI updates.
         await waitFor(
-          () => {
-            const persisted = readPersistedState<unknown>(getReviewsKey(workspaceId), null);
-            if (!persisted) throw new Error("Review not persisted");
-            expect(JSON.stringify(persisted)).toContain(NOTE_TEXT);
+          async () => {
+            const snapshot = await env.services.reviewStateService.getSnapshot(workspaceId);
+            expect(JSON.stringify(snapshot.sections.reviews ?? {})).toContain(NOTE_TEXT);
           },
           { timeout: 10_000 }
         );

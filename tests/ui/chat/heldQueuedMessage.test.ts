@@ -9,7 +9,7 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { FilePart } from "@/common/orpc/types";
-import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
+import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
 import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { Err } from "@/common/types/result";
@@ -62,15 +62,13 @@ const composerAttachmentNames = (app: AppHarness) =>
     (attachment) => attachment.filename
   );
 const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
-/** Notes still attached in the workspace's review store (a send checks its notes off). */
-const attachedStoreReviewNotes = (app: AppHarness) =>
+/** Notes still attached in the workspace's backend review store (a send checks its notes off). */
+const attachedStoreReviewNotes = async (app: AppHarness) =>
   Object.values(
-    readPersistedState<{ reviews?: Record<string, { status: string; data: ReviewNoteData }> }>(
-      getReviewsKey(app.workspaceId),
-      {}
-    ).reviews ?? {}
+    (await app.env.services.reviewStateService.getSnapshot(app.workspaceId)).sections.reviews ?? {}
   )
     .filter((review) => review.status === "attached")
+    .sort((a, b) => a.createdAt - b.createdAt)
     .map((review) => review.data.userNote);
 /**
  * Bound for waits on work behind a composer send (the send's async preflight, the in-process IPC
@@ -111,19 +109,23 @@ async function queueTwoRefusedComposerMessages(app: AppHarness): Promise<ReviewN
   const reviews = [composerReview("first note"), composerReview("second note")];
   try {
     for (const [index, name] of ["first", "second"].entries()) {
-      act(() => {
-        updatePersistedState(getReviewsKey(app.workspaceId), {
-          workspaceId: app.workspaceId,
+      // Review notes live in the backend review-state store; the app picks this up live.
+      await app.env.orpc.workspace.reviewState.update({
+        workspaceId: app.workspaceId,
+        delta: {
           reviews: {
-            [`review-${name}`]: {
-              id: `review-${name}`,
-              data: reviews[index],
-              status: "attached",
-              createdAt: Date.now(),
+            set: {
+              [`review-${name}`]: {
+                id: `review-${name}`,
+                data: reviews[index],
+                status: "attached",
+                createdAt: Date.now(),
+              },
             },
           },
-          lastUpdated: Date.now(),
-        });
+        },
+      });
+      act(() => {
         updatePersistedState(getInputAttachmentsKey(app.workspaceId), [
           {
             kind: "provider",
@@ -323,7 +325,10 @@ describe("Held (refused) queued messages", () => {
       // The composer stays as the sends left it: empty, no attachments, no reviews attached.
       await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(composerAttachmentNames(app)).toEqual([]);
-      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
+      await waitFor(
+        async () => expect(await attachedStoreReviewNotes(app)).toEqual([]),
+        LOAD_TOLERANT_WAIT
+      );
       expect(heldBanners(app)[0].textContent).toContain("first authored");
       expect(heldBanners(app)[0].textContent).toContain("1 attachment · 1 review");
 

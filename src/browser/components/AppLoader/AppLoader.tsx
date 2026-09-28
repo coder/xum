@@ -10,6 +10,7 @@ import { useWorkspaceStoreRaw, workspaceStore } from "../../stores/WorkspaceStor
 import { useGitStatusStoreRaw } from "../../stores/GitStatusStore";
 import { useRuntimeStatusStoreRaw } from "../../stores/RuntimeStatusStore";
 import { useBackgroundBashStoreRaw } from "../../stores/BackgroundBashStore";
+import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
@@ -196,6 +197,7 @@ function AppLoaderInner() {
     getPRStatusStoreInstance().setClient(api ?? null);
     getProvidersConfigStore().setClient(api ?? null);
     getAppConfigStore().setClient(api ?? null);
+    getReviewStateStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {
       workspaceStoreInstance.syncWorkspaces(workspaceContext.workspaceMetadata);

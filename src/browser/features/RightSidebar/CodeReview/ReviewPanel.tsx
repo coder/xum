@@ -942,8 +942,15 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     workspaceMetadata,
   ]);
 
-  // Initialize review state hook
-  const { isRead, toggleRead, markAsRead, markAsUnread } = useReviewState(workspaceId);
+  // Initialize review state hook. `isLoaded` gates the hunk list: review state lives in the
+  // backend, and rendering before it hydrates would run auto-collapse against empty maps.
+  const {
+    isRead,
+    toggleRead,
+    markAsRead,
+    markAsUnread,
+    isLoaded: reviewStateLoaded,
+  } = useReviewState(workspaceId);
 
   // Refs for values that change frequently but are only read at callback invocation time.
   // Using refs allows callbacks to stay stable (same reference) while still accessing current values.
@@ -2310,7 +2317,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             )}
           </div>
         )
-      ) : diffState.status === "loading" ? (
+      ) : diffState.status === "loading" || !reviewStateLoaded ? (
         <div className="text-muted flex h-full items-center justify-center text-sm">
           Loading diff...
         </div>
@@ -2629,7 +2636,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               fileTree={fileTree}
               hunks={filteredHunks}
               allHunks={hunks}
-              isLoading={diffState.status === "loading" || isLoadingTree}
+              isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
               isRead={isRead}
               onToggleRead={handleToggleRead}
               onMarkFileAsRead={handleMarkFileAsRead}

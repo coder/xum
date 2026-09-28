@@ -79,6 +79,7 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
@@ -1395,6 +1396,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // 2. THEN handle side effects (cleanup, navigation) - these can't break data updates
           if (meta === null) {
             deleteWorkspaceStorage(event.workspaceId);
+            getReviewStateStore().removeWorkspace(event.workspaceId);
 
             // Navigate away only if the deleted workspace was selected
             const currentSelection = selectedWorkspaceRef.current;
@@ -1520,6 +1522,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (result.success) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
+          getReviewStateStore().removeWorkspace(workspaceId);
 
           // Optimistically remove from the local metadata map so the sidebar updates immediately.
           // Relying on the metadata subscription can leave the item visible until the next refresh.
