@@ -286,7 +286,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
-  // #4980: until the first policy answer arrives, the backend decides.
+  // #4980: before the first policy answer, PolicyProvider reports no policy, so nothing is refused.
   const policyState = usePolicy();
   const effectivePolicy =
     policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
@@ -659,10 +659,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     // the desktop composer has none, and substituting a model would silently change what runs.
     // Refuse before any side effect and say why. The backend stays authoritative for policy
     // changes after this render; its rejection is shown below.
-    if (
-      !policyState.loading &&
-      isPlanModelAllowedByPolicy(effectivePolicy, settings.resolvedModel) === false
-    ) {
+    if (isPlanModelAllowedByPolicy(effectivePolicy, settings.resolvedModel) === false) {
       const agentName =
         agents.find((agent) => agent.id === args.targetAgentId)?.name ?? args.targetAgentId;
       return `Admin policy does not allow ${settings.resolvedModel}, the model for ${agentName}. Choose an allowed model for that agent and try again.`;
