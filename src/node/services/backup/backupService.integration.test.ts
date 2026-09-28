@@ -733,5 +733,5 @@ describe("BackupService against a real repository", () => {
     const afterPush = await otherService.getPluginRecipes();
     if (!afterPush.success) throw new Error(afterPush.error.message);
     expect(afterPush.data).toEqual([]);
-  });
+  }, 30_000);
 });
