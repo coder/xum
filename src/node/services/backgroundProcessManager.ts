@@ -1,4 +1,4 @@
-import type { Dirent } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as nodePath from "node:path";
 import type {
@@ -125,13 +125,14 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
  * candidates.
  */
 async function recordDirIsFree(recordDir: string): Promise<boolean> {
+  let stat: Stats;
   try {
-    await fsPromises.lstat(recordDir);
+    stat = await fsPromises.lstat(recordDir);
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) return true;
     throw error;
   }
-  return await pruneOldSettledRecord(recordDir);
+  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir));
 }
 
 // A settled record is pruned only once its exit marker is at least this old (#4893).
@@ -158,10 +159,13 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  */
 async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
   try {
-    // lstat throughout: never follow a symlink planted in the shared temp records root.
-    if (!(await fsPromises.lstat(recordDir)).isDirectory()) return false;
+    // Regular files only (lstat): never follow a symlink planted in the shared temp records
+    // root, and never block on a FIFO while holding the spawn-name lock.
     const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
     if (!marker.isFile() || Date.now() - marker.mtimeMs < SETTLED_RECORD_PRUNE_AGE_MS) {
+      return false;
+    }
+    if (!(await fsPromises.lstat(nodePath.join(recordDir, BG_META_FILENAME))).isFile()) {
       return false;
     }
     const meta = parseSpawnRecordMeta(
