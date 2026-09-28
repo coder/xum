@@ -3497,20 +3497,11 @@ export class StreamingMessageAggregator {
       messagesById: Map<string, MuxMessage>;
       messageIndexById: Map<string, number>;
     } | null = null;
-    const getAnchorLookups = () => {
-      if (anchorLookups === null) {
-        const messagesById = new Map<string, MuxMessage>();
-        const messageIndexById = new Map<string, number>();
-        for (let index = 0; index < allMessages.length; index++) {
-          const message = allMessages[index];
-          // Later duplicates win, matching the previous `new Map(entries)` construction.
-          messagesById.set(message.id, message);
-          messageIndexById.set(message.id, index);
-        }
-        anchorLookups = { messagesById, messageIndexById };
-      }
-      return anchorLookups;
-    };
+    const getAnchorLookups = () =>
+      (anchorLookups ??= {
+        messagesById: new Map(allMessages.map((message) => [message.id, message])),
+        messageIndexById: new Map(allMessages.map((message, index) => [message.id, index])),
+      });
     const insertionsByTargetId = new Map<string, TranscriptInsertion[]>();
     const inlineMessageIds = new Set<string>();
 
