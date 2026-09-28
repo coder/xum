@@ -211,6 +211,27 @@ export function readPersistedString(key: string): string | undefined {
 }
 
 /**
+ * List persisted-state keys that start with any of the given prefixes.
+ * localStorage has no prefix query, so this is one pass over every key. Returns a snapshot,
+ * so callers may remove the returned keys without skipping any (index iteration would shift).
+ */
+export function listPersistedStateKeys(prefixes: readonly string[]): string[] {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+
+  const storage = window.localStorage;
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key !== null && prefixes.some((prefix) => key.startsWith(prefix))) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/**
  * Update a persisted state value from outside the hook.
  * This is useful when you need to update state from a different component/context
  * that doesn't have access to the setter (e.g., command palette updating workspace state).
