@@ -2124,18 +2124,17 @@ describe("bash tool - background execution", () => {
       expect(result.error).toContain("terminated because it could not be tracked");
     }
 
+    // The failure is returned only once the terminated command exited (#4805): until then a
+    // removal's cleanup() waits on the pending migration.
     const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     expect(pid).toBeGreaterThan(1);
-    const killDeadline = Date.now() + 5000;
     let alive = true;
-    while (alive && Date.now() < killDeadline) {
-      try {
-        process.kill(pid, 0);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      } catch {
-        alive = false;
-      }
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
     }
+    if (alive) process.kill(pid, "SIGKILL");
     expect(alive).toBe(false);
 
     tempDir[Symbol.dispose]();

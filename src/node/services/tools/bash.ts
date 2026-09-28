@@ -22,6 +22,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
 import {
@@ -1378,6 +1379,9 @@ ${scriptWithEnv}`;
       // normal completion path so we don't drop any last-millisecond output (especially
       // on Windows, where stream/exit events can arrive slightly out of order).
       const BACKGROUND_EXIT_GRACE_MS = 100;
+      // Bounded wait for a terminated command's exit after a failed migration (#4805), like the
+      // MCP stdio kill join: a removal's cleanup() waits on the migration until then.
+      const FAILED_MIGRATION_EXIT_JOIN_MS = 5_000;
 
       let exitCode: number;
       try {
@@ -1526,6 +1530,11 @@ ${scriptWithEnv}`;
             stderrForMigration.cancel().catch(() => {
               /* ignore */ return;
             });
+            // Keep the migration pending (the `using` above) until the terminated command exits,
+            // so a removal's cleanup() cannot delete the checkout while it is still stopping.
+            await raceWithAbortAndTimeout(execStream.exitCode, {
+              timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+            }).catch(() => undefined);
             return withNotice({
               success: false,
               error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
