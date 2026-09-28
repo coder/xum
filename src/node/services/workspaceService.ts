@@ -3501,28 +3501,18 @@ export class WorkspaceService
   }
 
   /**
-   * What a fork's failed checkout delete may have left (#4899). A multi-project fork owns one
-   * checkout per project plus its container, and its runtime deletes them one by one, so report
-   * the ones that still exist rather than only the container.
+   * The path a fork's failed checkout delete left (#4899). Not reported for multi-project forks:
+   * their runtime deletes one checkout per project plus the container, its workspace path is only
+   * the container, and a local project's path is the user's repository (follow-up #4936).
    */
-  private async listForkCleanupLeftovers(
+  private forkCleanupLeftovers(
     runtime: Runtime,
     projectPath: string,
     workspaceName: string
-  ): Promise<string[]> {
-    if (!(runtime instanceof MultiProjectRuntime)) {
-      return [runtime.getWorkspacePath(projectPath, workspaceName)];
-    }
-    const owned = runtime.getOwnedWorkspacePaths(workspaceName);
-    const present = await Promise.all(
-      owned.map((ownedPath) =>
-        fsPromises.lstat(ownedPath).then(
-          () => true,
-          () => false
-        )
-      )
-    );
-    return owned.filter((_, index) => present[index]);
+  ): string[] {
+    return runtime instanceof MultiProjectRuntime
+      ? []
+      : [runtime.getWorkspacePath(projectPath, workspaceName)];
   }
 
   /**
@@ -12705,7 +12695,7 @@ export class WorkspaceService
             `Failed to copy fork state: ${message}`,
             deleteResult.success
               ? []
-              : await this.listForkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
+              : this.forkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
           )
         );
       }
@@ -12795,11 +12785,7 @@ export class WorkspaceService
               error: deleteResult.error,
             });
             leftovers.push(
-              ...(await this.listForkCleanupLeftovers(
-                targetRuntime,
-                foundProjectPath,
-                resolvedName
-              ))
+              ...this.forkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
             );
           }
         }
