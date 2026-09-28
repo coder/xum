@@ -27,7 +27,6 @@ export interface RetryBarrierDerivationInput {
 export interface RetryBarrierDerivation {
   /** The last turn was interrupted by an error (not a user abort); drives keybinds and UI. */
   showRetryBarrier: boolean;
-  isAutoRetryActive: boolean;
   lastRetryCandidateMessage: DisplayedMessage | undefined;
   shouldMountRetryBarrier: boolean;
   showRetryBarrierUI: boolean;
@@ -100,7 +99,6 @@ export function getRetryBarrierDerivation(
 
   return {
     showRetryBarrier,
-    isAutoRetryActive,
     lastRetryCandidateMessage,
     shouldMountRetryBarrier: !suppressRetryBarrier,
     showRetryBarrierUI,

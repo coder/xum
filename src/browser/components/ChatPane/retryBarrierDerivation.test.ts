@@ -100,7 +100,6 @@ describe("getRetryBarrierDerivation", () => {
         messages: [user("u1"), partialAssistant("a1")],
         autoRetryStatus,
       });
-      expect(result.isAutoRetryActive).toBe(true);
       expect(result.interruptedBarrierMessageIds.size).toBe(0);
       expect(result.interruptedTailResumable).toBe(false);
     }
