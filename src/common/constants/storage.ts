@@ -484,7 +484,7 @@ export type TranscriptDensity = (typeof TRANSCRIPT_DENSITIES)[number];
 
 export const DEFAULT_TRANSCRIPT_DENSITY: TranscriptDensity = "normal";
 
-function isTranscriptDensity(value: unknown): value is TranscriptDensity {
+export function isTranscriptDensity(value: unknown): value is TranscriptDensity {
   return typeof value === "string" && TRANSCRIPT_DENSITIES.includes(value as TranscriptDensity);
 }
 

@@ -17,6 +17,24 @@ export interface VscodeStreamingBarrierProps {
 }
 
 /**
+ * The desktop WorkspaceStore's canInterrupt / isStreamStarting, derived from the webview's
+ * aggregator. Also feeds the transcript's turn-active bundle state (#4979).
+ */
+export function getAggregatorStreamState(aggregator: StreamingMessageAggregator): {
+  canInterrupt: boolean;
+  isStreamStarting: boolean;
+} {
+  const canInterrupt = aggregator.hasInterruptibleActiveStream();
+  return {
+    canInterrupt,
+    isStreamStarting:
+      !canInterrupt &&
+      (aggregator.getStreamLifecycle()?.phase === "preparing" ||
+        aggregator.getPendingStreamStartTime() !== null),
+  };
+}
+
+/**
  * Feeds the desktop barrier from the webview's aggregator (#4971). The webview does not feed
  * WorkspaceStore, so this mirrors its active-workspace derivation for a caught-up transcript. The
  * App re-renders on every transcript flush, so the live stats are re-read on each one.
@@ -27,7 +45,7 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
     return null;
   }
 
-  const canInterrupt = aggregator.hasInterruptibleActiveStream();
+  const { canInterrupt, isStreamStarting } = getAggregatorStreamState(aggregator);
   const messageId = aggregator.getActiveStreamMessageId();
 
   return (
@@ -36,10 +54,7 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
       state={{
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
-        isStreamStarting:
-          !canInterrupt &&
-          (aggregator.getStreamLifecycle()?.phase === "preparing" ||
-            aggregator.getPendingStreamStartTime() !== null),
+        isStreamStarting,
         isInterrupting: aggregator.hasInterruptingStream(),
         awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
         currentModel: aggregator.getCurrentModel() ?? null,

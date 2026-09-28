@@ -898,6 +898,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
     getAppConfigStore().updateOptimistically({
       bashCollapsedSummaryMode: undefined,
+      transcriptDensity: undefined,
       agentAiDefaults: undefined,
     });
     cleanupDom?.();
@@ -939,6 +940,91 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     // not the previous server's.
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://y" } });
     expect(view.queryByText(script)).not.toBeNull();
+  });
+
+  test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      {
+        type: "message",
+        id: "u1",
+        role: "user",
+        parts: [{ type: "text", text: "Audit the auth module" }],
+        metadata: { historySequence: 1, timestamp: 0 },
+      },
+      {
+        type: "message",
+        id: "a1",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "I'll gather context first." },
+          ...[
+            ["b1", "grep -rn verify src/auth.ts"],
+            ["b2", "make typecheck"],
+          ].map(([id, script]) => ({
+            type: "dynamic-tool",
+            toolCallId: id,
+            toolName: "bash",
+            state: "output-available",
+            input: { script, timeout_secs: 10, display_name: id },
+            output: { success: true, output: "ok", exitCode: 0, wall_duration_ms: 5 },
+          })),
+          { type: "text", text: "Implemented the auth audit fix." },
+        ],
+        metadata: { historySequence: 2, timestamp: 1_000 },
+      },
+    ]);
+    await bridge.answer("config.getConfig", {
+      userPreferences: { appearance: { transcriptDensity: "hyper" } },
+    });
+
+    const toggle = view.getByTestId("work-bundle");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryByText("Audit the auth module")).not.toBeNull();
+    expect(view.queryByText("Implemented the auth audit fix.")).not.toBeNull();
+    expect(view.queryByText("make typecheck")).toBeNull();
+    expect(view.queryByText("I'll gather context first.")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(toggle);
+      await Promise.resolve();
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(view.queryByText("I'll gather context first.")).not.toBeNull();
+    // Hyper density also groups the expanded bundle's tool rows, as on desktop.
+    expect(view.getByTestId("operational-bundle").textContent).toContain("2 shell commands");
+  });
+
+  test("consecutive task_await polls collapse into one operational bundle in the default density (#4979)", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(
+      bridge,
+      ["await-1", "await-2"].map((id, index) =>
+        toolMessage(
+          id,
+          index + 1,
+          "task_await",
+          { task_ids: ["task-1"], timeout_secs: 30 },
+          { results: [{ status: "running", taskId: "task-1" }] }
+        )
+      )
+    );
+
+    const bundles = view.getAllByTestId("operational-bundle");
+    expect(bundles).toHaveLength(1);
+    expect(bundles[0].textContent).toContain("Checked task status 2 times");
+    const toggle = bundles[0].querySelector("button");
+    expect(toggle?.getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryAllByText("Still waiting for 1 task")).toHaveLength(0);
+
+    await act(async () => {
+      fireEvent.click(toggle!);
+      await Promise.resolve();
+    });
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(view.queryAllByText("Still waiting for 1 task")).toHaveLength(2);
   });
 
   test("Implement uses the configured Exec default when the workspace has no Exec settings", async () => {
