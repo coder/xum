@@ -1181,12 +1181,11 @@ export class BackupRepoCache {
    * the streaming cap kills the read as soon as it passes the limit.
    */
   private async readProbedBlob(objectId: string): Promise<string | null> {
-    const read = () => this.readLocalBlob(objectId);
     const isOverLimit = (error: unknown) =>
       error instanceof Error &&
       error.message === `Command produced more than ${MAX_BACKUP_FILE_BYTES} bytes of output`;
     try {
-      return await read();
+      return await this.readLocalBlob(objectId);
     } catch (error) {
       // Over-limit is definitive: the blob exists locally and is too large, so fetching
       // it again could only re-buffer the same oversized bytes.
@@ -1207,7 +1206,7 @@ export class BackupRepoCache {
       await this.assertObjectStoreWithinBudget();
     }
     try {
-      return await read();
+      return await this.readLocalBlob(objectId);
     } catch {
       return null;
     }

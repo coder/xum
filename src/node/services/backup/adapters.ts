@@ -261,16 +261,6 @@ export function createBackupPayloadStore(options: {
 }): BackupPayloadStore {
   const muxRoot = options.config.rootDir;
 
-  /**
-   * Reported unsupported only when this store can apply experiments at all; without a service
-   * the block is ignored like any key this build does not read.
-   */
-  function readRestorableExperiments(document: unknown): BackupExperimentsRead {
-    return options.experiments === undefined
-      ? { experiments: undefined, unsupported: [] }
-      : readBackupExperiments(document);
-  }
-
   // Walks the chain so a symlinked ancestor is rejected before writeBackupPayload's
   // recursive removal could follow it out of the cache clone.
   async function managedDir(repositoryRoot: string, managedPath: string): Promise<string> {
@@ -287,14 +277,34 @@ export function createBackupPayloadStore(options: {
     return (await readPluginRegistryDocument(registryFile, "lenient")).rawEntries;
   }
 
-  /** Reads the recipes without writing any plugin state, and counts those not installed here. */
-  async function readRestorablePlugins(
-    document: unknown
-  ): Promise<{ pendingPlugins: number; unsupported: string[] }> {
-    const { recipes, unsupported } = readBackupPlugins(document);
+  /**
+   * The preferences-document blocks beyond userPreferences, read one way for preview and
+   * restore so both report the same entries. Experiments count as unsupported only when this
+   * store can apply them at all; without a service the block is ignored like any key this
+   * build does not read. Plugin recipes are only counted, never installed: Settings → Plugins
+   * offers each one to the install preview, where the user reviews and confirms it.
+   */
+  async function readRestorableBlocks(document: unknown) {
+    const settings = readBackupSettings(document);
+    const experiments: BackupExperimentsRead =
+      options.experiments === undefined
+        ? { experiments: undefined, unsupported: [] }
+        : readBackupExperiments(document);
+    const plugins = readBackupPlugins(document);
     const pending =
-      recipes.length === 0 ? [] : pendingBackupPlugins(recipes, await pluginRegistryEntries());
-    return { pendingPlugins: pending.length, unsupported };
+      plugins.recipes.length === 0
+        ? []
+        : pendingBackupPlugins(plugins.recipes, await pluginRegistryEntries());
+    return {
+      settings: settings.settings,
+      experiments: experiments.experiments,
+      pendingPlugins: pending.length,
+      unsupportedSettings: [
+        ...settings.unsupported,
+        ...experiments.unsupported,
+        ...plugins.unsupported,
+      ],
+    };
   }
 
   function backupSettingsDiffer(a: ProjectsConfig, b: ProjectsConfig): boolean {
@@ -636,29 +646,20 @@ export function createBackupPayloadStore(options: {
           const localConfig = options.config.loadConfigOrDefault();
           const local = localConfig.userPreferences;
           const merged = mergeBackupPreferences(local, document);
-          const backupSettings = readBackupSettings(document);
-          const backupExperiments = readRestorableExperiments(document);
-          const backupPlugins = await readRestorablePlugins(document);
-          pendingPlugins = backupPlugins.pendingPlugins;
-          unsupportedSettings = [
-            ...backupSettings.unsupported,
-            ...backupExperiments.unsupported,
-            ...backupPlugins.unsupported,
-          ];
+          const blocks = await readRestorableBlocks(document);
+          pendingPlugins = blocks.pendingPlugins;
+          unsupportedSettings = blocks.unsupportedSettings;
           // Plugin recipes are not a change: a restore offers them and writes nothing.
           if (
             !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
-            (backupSettings.settings !== undefined &&
+            (blocks.settings !== undefined &&
               backupSettingsDiffer(
                 localConfig,
-                mergeBackupSettings(localConfig, backupSettings.settings)
+                mergeBackupSettings(localConfig, blocks.settings)
               )) ||
-            (backupExperiments.experiments !== undefined &&
+            (blocks.experiments !== undefined &&
               options.experiments !== undefined &&
-              backupExperimentsDiffer(
-                await options.experiments.getOverrides(),
-                backupExperiments.experiments
-              ))
+              backupExperimentsDiffer(await options.experiments.getOverrides(), blocks.experiments))
           ) {
             changes.push({ status: "M", path: file.path });
           }
@@ -807,17 +808,9 @@ export function createBackupPayloadStore(options: {
         let unsupportedSettings: string[] = [];
         let pendingPlugins = 0;
         if (result.backupPreferences !== undefined) {
-          const backupSettings = readBackupSettings(result.backupPreferences);
-          const backupExperiments = readRestorableExperiments(result.backupPreferences);
-          // Recipes are only counted here, never installed: Settings → Plugins offers each one
-          // to the install preview, where the user reviews and confirms it.
-          const backupPlugins = await readRestorablePlugins(result.backupPreferences);
-          pendingPlugins = backupPlugins.pendingPlugins;
-          unsupportedSettings = [
-            ...backupSettings.unsupported,
-            ...backupExperiments.unsupported,
-            ...backupPlugins.unsupported,
-          ];
+          const blocks = await readRestorableBlocks(result.backupPreferences);
+          pendingPlugins = blocks.pendingPlugins;
+          unsupportedSettings = blocks.unsupportedSettings;
           let merged: ProjectsConfig | undefined;
           await options.config.editConfig(
             (current) => {
@@ -831,9 +824,7 @@ export function createBackupPayloadStore(options: {
                 ),
               };
               merged =
-                backupSettings.settings === undefined
-                  ? next
-                  : mergeBackupSettings(next, backupSettings.settings);
+                blocks.settings === undefined ? next : mergeBackupSettings(next, blocks.settings);
               return merged;
             },
             // Inside the project restore's registration window the edit must ride that
@@ -859,8 +850,8 @@ export function createBackupPayloadStore(options: {
           }
           // Through the service, whose acknowledged write is the check, so backend gates and
           // open renderers see the restored experiments at once.
-          if (backupExperiments.experiments !== undefined && options.experiments !== undefined) {
-            await options.experiments.applyOverrides(backupExperiments.experiments);
+          if (blocks.experiments !== undefined && options.experiments !== undefined) {
+            await options.experiments.applyOverrides(blocks.experiments);
           }
         }
         return { localOnlyFiles: result.localOnlyFiles, unsupportedSettings, pendingPlugins };
@@ -869,7 +860,7 @@ export function createBackupPayloadStore(options: {
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
-      let core: { localOnlyFiles: string[]; unsupportedSettings: string[]; pendingPlugins: number };
+      let core: Awaited<ReturnType<typeof restoreCore>>;
       // The bundle itself is read here — the repo lock holds the checkout stable — but its
       // plan is computed inside the memory lock below, where the inputs it depends on are.
       const bundle = contents.includeProjects ? await readProjectBundle(sourceDir) : null;

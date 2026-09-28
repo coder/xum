@@ -451,7 +451,7 @@ const AddPluginPanel: React.FC<{
       const result = await api.agentPlugins.preview({
         input: input.trim(),
         ref: ref.trim().length > 0 ? ref.trim() : null,
-        ...(recipe?.source.subpath !== undefined ? { subpath: recipe.source.subpath } : {}),
+        subpath: recipe?.source.subpath,
       });
       if (result.success) {
         setPreview(result.data);

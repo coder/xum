@@ -18,15 +18,6 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
  * not be a complete snapshot: an absent block, as in a backup an older build wrote, offers none.
  */
 
-function toRecipe(entry: AgentPluginInstallEntry): unknown {
-  return {
-    name: entry.name,
-    source: entry.source,
-    lockedSha: entry.lockedSha,
-    importedComponents: entry.importedComponents,
-  };
-}
-
 /** From the raw entries the registry's lenient reader returns, never a copy of the file. */
 export function projectBackupPlugins(rawEntries: readonly unknown[]): BackupPluginRecipe[] {
   const recipes: BackupPluginRecipe[] = [];
@@ -40,7 +31,13 @@ export function projectBackupPlugins(rawEntries: readonly unknown[]): BackupPlug
     // Through the schema a restore reads with, so every exported recipe is one a restore
     // accepts. A source that fails it (a URL with credentials, a local path, a remote helper)
     // must not be published, so that plugin stays off the backup.
-    const recipe = BackupPluginRecipeSchema.safeParse(toRecipe(entry.data));
+    const { name, source, lockedSha, importedComponents } = entry.data;
+    const recipe = BackupPluginRecipeSchema.safeParse({
+      name,
+      source,
+      lockedSha,
+      importedComponents,
+    });
     if (recipe.success) recipes.push(recipe.data);
   }
   return recipes;
