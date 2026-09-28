@@ -240,6 +240,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
   const flushDisplayedMessagesRef = useRef(flushDisplayedMessages);
   flushDisplayedMessagesRef.current = flushDisplayedMessages;
+  // Row callbacks for the shared MessageRenderer: they act on this webview's aggregator, since
+  // WorkspaceStore has none here. Created once so MessageRenderer's React.memo can skip unchanged
+  // rows (vscode/ is not React-Compiler compiled). plan-display rows only come from the desktop
+  // /plan command, so the webview cannot produce them yet; Close still works if one arrives (#4971).
+  const [messageRowActions] = useState(() => ({
+    closeEphemeral: (historyId: string) => {
+      aggregatorRef.current?.removeMessage(historyId);
+      flushDisplayedMessagesRef.current();
+    },
+    showAllHistory: () => {
+      aggregatorRef.current?.setShowAllMessages(true);
+      flushDisplayedMessagesRef.current();
+    },
+  }));
   const scheduleDisplayedMessages = () => {
     if (isRenderScheduledRef.current) {
       return;
@@ -824,6 +838,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                   message={msg}
                                   workspaceId={selectedWorkspaceId}
                                   isLatestProposePlan={msg.id === latestProposePlanId}
+                                  isCompacting={aggregatorRef.current?.isCompacting() ?? false}
+                                  onCloseEphemeral={messageRowActions.closeEphemeral}
+                                  onShowAllHistory={messageRowActions.showAllHistory}
                                 />
                               ))}
                             </LiveBashOutputSourceContext.Provider>

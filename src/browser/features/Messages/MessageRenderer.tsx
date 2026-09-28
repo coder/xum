@@ -41,6 +41,13 @@ interface MessageRendererProps {
   taskReportLinking?: TaskReportLinking;
   /** Navigation info for user messages (backward/forward between user messages) */
   userMessageNavigation?: UserMessageNavigation;
+  /**
+   * Closes an ephemeral row (plan-display). Hosts that keep their own aggregator (the VS Code
+   * webview) pass it because the default path acts on WorkspaceStore's aggregator.
+   */
+  onCloseEphemeral?: (historyId: string) => void;
+  /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
+  onShowAllHistory?: () => void;
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -89,6 +96,8 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     bashOutputGroup,
     taskReportLinking,
     userMessageNavigation,
+    onCloseEphemeral,
+    onShowAllHistory,
   }) => {
     const message = useStreamingMessageDelta(workspaceId, messageProp);
     let renderedMessage: React.ReactNode;
@@ -184,7 +193,12 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "history-hidden":
         renderedMessage = (
-          <HistoryHiddenMessage message={message} className={className} workspaceId={workspaceId} />
+          <HistoryHiddenMessage
+            message={message}
+            className={className}
+            workspaceId={workspaceId}
+            onShowAll={onShowAllHistory}
+          />
         );
         break;
       case "workspace-init":
@@ -199,7 +213,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
             path={message.path}
             workspaceId={workspaceId}
             onClose={() => {
-              if (workspaceId) {
+              if (onCloseEphemeral) {
+                onCloseEphemeral(message.historyId);
+              } else if (workspaceId) {
                 removeEphemeralMessage(workspaceId, message.historyId);
               }
             }}

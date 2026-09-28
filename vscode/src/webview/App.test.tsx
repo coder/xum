@@ -16,6 +16,8 @@ import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionInt
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
 import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
+import { createMuxMessage, type MuxMetadata } from "xum/common/types/message";
+import { formatAgentMessageEnvelope } from "xum/common/utils/agentMessageEnvelope";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -1890,5 +1892,133 @@ describe("vscode webview explicit AI-setting persistence", () => {
     });
     expect(String(retry.model)).toContain("sonnet");
     await reply(bridge, OK);
+  });
+});
+
+// The webview renders every row through the desktop MessageRenderer (#4971), so machine rows keep
+// their desktop presentation instead of degrading to plain user or assistant bubbles.
+describe("vscode webview message rows", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function historyMessage(
+    id: string,
+    role: "user" | "assistant",
+    text: string,
+    metadata: MuxMetadata
+  ) {
+    return { type: "message", ...createMuxMessage(id, role, text, metadata) };
+  }
+
+  test("machine rows render their desktop components, not chat bubbles", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const wakeText = "A background bash monitor matched.";
+    const warningText = "Record the current objective in the workspace notes.";
+    await selectWorkspace(bridge, [
+      historyMessage("summary", "assistant", "Older context summary", {
+        historySequence: 1,
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: { type: "compaction-summary" },
+      }),
+      historyMessage("wake", "user", wakeText, {
+        historySequence: 2,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "bash-monitor-wake",
+          records: [
+            { kind: "match", displayName: "Dev Server", filter: "ready", filterExclude: false },
+          ],
+        },
+      }),
+      historyMessage("warning", "user", warningText, {
+        historySequence: 3,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "context-budget-warning",
+          contextTokens: 800,
+          maxTokens: 1000,
+          budgetTokens: 700,
+        },
+      }),
+      historyMessage(
+        "peer",
+        "assistant",
+        formatAgentMessageEnvelope({ from: "ws-peer", relationship: "unrelated", message: "hello" }),
+        {
+          historySequence: 4,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "agent-peer-message",
+            fromWorkspaceId: "ws-peer",
+            relationship: "unrelated",
+          },
+        }
+      ),
+    ]);
+
+    const container = view.container;
+    expect(container.querySelector('[data-testid="compaction-boundary"]')).not.toBeNull();
+    expect(container.querySelector("[data-bash-monitor-wake]")).not.toBeNull();
+    expect(container.querySelector("[data-context-budget-warning]")).not.toBeNull();
+    expect(container.querySelector("[data-agent-peer-message]")).not.toBeNull();
+    // The machine prompts stay collapsed instead of showing as user bubbles.
+    expect(view.queryByText(wakeText)).toBeNull();
+    expect(view.queryByText(warningText)).toBeNull();
+  });
+
+  // plan-display rows only come from the desktop /plan command today; a replayed row still proves
+  // Close acts on the webview's own aggregator (WorkspaceStore has none for this workspace).
+  test("closing a plan-display preview removes it from the transcript", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      historyMessage("plan", "assistant", "# Plan\n\nShip the parity fix.", {
+        historySequence: 1,
+        muxMetadata: { type: "plan-display", path: "/home/alice/.xum/plans/xum/plan.md" },
+      }),
+    ]);
+
+    expect(view.queryByText("Ship the parity fix.")).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Close/ }));
+      await Promise.resolve();
+    });
+    expect(view.queryByText("Ship the parity fix.")).toBeNull();
+  });
+
+  test("Load all reveals history rows hidden by the display cap", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const replies = Array.from({ length: 80 }, (_, index) =>
+      historyMessage(`reply-${index}`, "assistant", `reply number ${index}`, {
+        historySequence: index + 2,
+      })
+    );
+    await selectWorkspace(bridge, [
+      historyMessage("prompt", "user", "start", { historySequence: 1 }),
+      ...replies,
+    ]);
+
+    expect(view.queryByText("reply number 0")).toBeNull();
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Load all" }));
+      await Promise.resolve();
+    });
+    expect(view.queryByText("reply number 0")).not.toBeNull();
   });
 });
