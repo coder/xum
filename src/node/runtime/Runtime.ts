@@ -770,6 +770,41 @@ export function isRuntimeTransportError(error: unknown): error is RuntimeError {
   return error instanceof RuntimeError && error.type === "network";
 }
 
+/**
+ * SSH failures that repeating the connection cannot fix: the server rejected every key or
+ * password, or the host key did not verify. OpenSSH prints these on the pool probe's stderr,
+ * and the pools repeat the text after "Last error:" while in backoff, so a substring match
+ * covers both. Deliberately narrow (#5034): anything unrecognized stays retryable.
+ */
+const PERMANENT_SSH_FAILURE_TEXTS = [
+  "Permission denied (", // OpenSSH: "user@host: Permission denied (publickey,password)."
+  "Too many authentication failures",
+  "Host key verification failed",
+  "REMOTE HOST IDENTIFICATION HAS CHANGED",
+  "All configured authentication methods failed", // ssh2
+  "SSH2 authentication failed", // SSH2ConnectionPool after the last key
+] as const;
+
+function isPermanentSSHFailure(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
+    // ssh2 tags authentication errors with a level (see SSH2ConnectionPool's isAuthFailure).
+    if ((current as { level?: unknown }).level === "client-authentication") return true;
+    const { message } = current;
+    if (PERMANENT_SSH_FAILURE_TEXTS.some((text) => message.includes(text))) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+/**
+ * A transport failure that one more attempt may get past (a reset, a refused channel, a backoff
+ * refusal). The bounded read retry (#4830) uses this; fallback callers keep using
+ * isRuntimeTransportError, since a permanent failure still means the host is unreachable.
+ */
+export function isRuntimeRetryableTransportError(error: unknown): error is RuntimeError {
+  return isRuntimeTransportError(error) && !isPermanentSSHFailure(error);
+}
+
 const ABSENT_PATH_CODES: ReadonlySet<unknown> = new Set(["ENOENT", "ENOTDIR"]);
 
 function errorCode(value: unknown): unknown {

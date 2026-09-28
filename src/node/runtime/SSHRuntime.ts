@@ -31,7 +31,11 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR, isRuntimeTransportError } from "./Runtime";
+import {
+  RuntimeError,
+  WORKSPACE_REPO_MISSING_ERROR,
+  isRuntimeRetryableTransportError,
+} from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
@@ -1143,7 +1147,7 @@ export class SSHRuntime extends RemoteRuntime {
     try {
       return await this.resolvePathOnce(filePath);
     } catch (error) {
-      if (!isRuntimeTransportError(error)) throw error;
+      if (!isRuntimeRetryableTransportError(error)) throw error;
       log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
       return this.resolvePathOnce(filePath).catch((retryError: unknown) => {
         log.debug(`Retry of SSH path resolution of ${filePath} failed too`, retryError);
