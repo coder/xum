@@ -1190,6 +1190,10 @@ describe("WorktreeArchiveSnapshotService", () => {
     await stage(".xum/user-attachments", unmirroredId, "lost.png");
     await stage(".xum/user-attachments", mismatchId, "partial.png", "image");
     await stage(".mux/user-attachments", legacyId, "legacy.png");
+    // Staging never nests deeper than <uuid>/<name>: a deeper directory is listed, not walked.
+    await fs.mkdir(path.join(ws, ".xum/user-attachments", mirroredId, "nested", "deep"), {
+      recursive: true,
+    });
 
     const result = await fixture.service.getUnsupportedUntrackedPaths({
       workspaceId: fixture.workspaceId,
@@ -1199,6 +1203,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(result).toEqual(
       Ok([
         `.mux/user-attachments/${legacyId}/legacy.png`,
+        `.xum/user-attachments/${mirroredId}/nested/`,
         `.xum/user-attachments/${unmirroredId}/lost.png`,
         `.xum/user-attachments/${mismatchId}/partial.png`,
       ])

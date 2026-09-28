@@ -23,7 +23,10 @@ import { log } from "@/node/services/log";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
-import { STAGED_ATTACHMENT_DIRS } from "@/common/constants/stagedAttachments";
+import {
+  MAX_STAGED_ATTACHMENT_SIZE_BYTES,
+  STAGED_ATTACHMENT_DIRS,
+} from "@/common/constants/stagedAttachments";
 import { resolveStagedAttachmentMirrorPath } from "@/node/utils/attachments/stageWorkspaceAttachment";
 
 const SNAPSHOT_VERSION = 1;
@@ -106,7 +109,8 @@ async function listUnmirroredStagedAttachments(
       return false;
     }
   };
-  const visit = async (relative: string): Promise<void> => {
+  // Staged uploads are `<stagingDir>/<uuid>/<name>`; anything deeper is listed, not walked.
+  const visit = async (relative: string, depth: number): Promise<void> => {
     let entries;
     try {
       entries = await fsPromises.readdir(path.join(workspacePath, relative), {
@@ -119,7 +123,8 @@ async function listUnmirroredStagedAttachments(
     for (const entry of entries) {
       const entryPath = `${relative}/${entry.name}`;
       if (entry.isDirectory()) {
-        await visit(entryPath);
+        if (depth === 0) await visit(entryPath, 1);
+        else lossy.push(`${entryPath}/`);
       } else if (!entry.isFile() || !(await hasValidMirror(entryPath))) {
         lossy.push(entryPath);
       }
@@ -133,7 +138,13 @@ async function listUnmirroredStagedAttachments(
         fsPromises.lstat(path.join(workspacePath, stagedPath)),
         fsPromises.lstat(mirrorPath),
       ]);
-      return mirror.isFile() && mirror.size === source.size;
+      // Rehydration skips mirror files over the staging cap, so those count as lost too.
+      return (
+        source.isFile() &&
+        mirror.isFile() &&
+        mirror.size === source.size &&
+        mirror.size <= MAX_STAGED_ATTACHMENT_SIZE_BYTES
+      );
     } catch {
       return false;
     }
@@ -147,7 +158,7 @@ async function listUnmirroredStagedAttachments(
     ) {
       continue;
     }
-    await visit(stagingDir);
+    await visit(stagingDir, 0);
   }
   return lossy;
 }

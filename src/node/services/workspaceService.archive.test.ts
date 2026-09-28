@@ -11,7 +11,10 @@ import path from "path";
 import os from "os";
 import { execFileSync } from "child_process";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
+import {
+  resolveStagedAttachmentMirrorPath,
+  stageWorkspaceAttachment,
+} from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -2811,7 +2814,9 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
     await fsPromises.rm(repo, { recursive: true, force: true });
   });
 
-  function useSnapshotService() {
+  function useSnapshotService(
+    getUnsupportedUntrackedPaths: () => Promise<Result<string[]>> = () => Promise.resolve(Ok([]))
+  ) {
     const snapshot: WorktreeArchiveSnapshot = {
       version: 1,
       capturedAt: "2026-03-30T00:00:00.000Z",
@@ -2836,7 +2841,7 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
         return Ok(snapshot);
       }),
       restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("restored" as const))),
-      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+      getUnsupportedUntrackedPaths: mock(getUnsupportedUntrackedPaths),
     });
   }
 
@@ -2943,6 +2948,24 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
     expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
 
     expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  // #4895: the lossy list counts a staged upload as kept only when its mirror copy exists, so the
+  // backfill must run before the list is computed, or a model-driven archive refuses.
+  test("mirrors a referenced pre-mirror upload before listing lossy files", async () => {
+    const stagedPath = await stagePreMirrorUpload(Buffer.from("referenced, not yet mirrored"));
+    const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
+    const mirrorPath = resolveStagedAttachmentMirrorPath(sessionDir, stagedPath)!;
+    useSnapshotService(async () => {
+      const mirrored = await fsPromises.access(mirrorPath).then(
+        () => true,
+        () => false
+      );
+      return Ok(mirrored ? [] : [stagedPath]);
+    });
+
+    expect(await harness.service.preflightArchive(workspaceId)).toEqual(Ok({ kind: "ready" }));
+    expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
   });
 
   test("a failed backfill copy does not block the archive", async () => {

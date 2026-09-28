@@ -9849,6 +9849,10 @@ export class WorkspaceService
         return Err(metadataResult.error);
       }
       const metadata = metadataResult.data;
+      // Same order as archive: mirror referenced uploads first, so they do not read as lost.
+      if (isWorktreeRuntime(metadata.runtimeConfig)) {
+        await this.backfillStagedAttachmentMirrorBeforeSnapshot(workspaceId, metadata);
+      }
 
       const confirmationResult = await this.getArchiveUntrackedFilesConfirmation({
         workspaceId,
@@ -11006,6 +11010,15 @@ export class WorkspaceService
       }
 
       if (needsSnapshotCapture && beforeArchiveMetadata) {
+        // The lossy list counts a staged attachment as kept only with a mirror copy (#4895), so
+        // backfill before asking; otherwise a pre-mirror upload the chat references reads as lost
+        // and a model-driven archive (no acknowledged paths) refuses. Repeated before capture.
+        if (isWorktreeRuntime(beforeArchiveMetadata.runtimeConfig)) {
+          await this.backfillStagedAttachmentMirrorBeforeSnapshot(
+            workspaceId,
+            beforeArchiveMetadata
+          );
+        }
         const initialArchiveConfirmationResult = await this.getArchiveUntrackedFilesConfirmation({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
