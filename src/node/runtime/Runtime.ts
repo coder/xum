@@ -785,7 +785,11 @@ const PERMANENT_SSH_FAILURE_TEXTS = [
   "SSH2 authentication failed", // SSH2ConnectionPool after the last key
 ] as const;
 
-function isPermanentSSHFailure(error: unknown): boolean {
+/**
+ * True for an SSH failure that another attempt cannot fix: a rejected key or password, or a
+ * failed host-key check. Both SSH pools stop their backoff wait loop on it (#5063).
+ */
+export function isPermanentSSHFailure(error: unknown): boolean {
   for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
     // ssh2 tags authentication errors with a level (see SSH2ConnectionPool's isAuthFailure).
     if ((current as { level?: unknown }).level === "client-authentication") return true;

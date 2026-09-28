@@ -30,6 +30,7 @@ import {
   type BaseSshAcquireConnectionOptions,
   withSshBackoffJitter,
 } from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
@@ -223,11 +224,14 @@ export class SSHConnectionPool {
         const remainingMs = health.backoffUntil.getTime() - Date.now();
         const remainingSecs = Math.ceil(remainingMs / 1000);
 
-        if (!shouldWait) {
-          throw new Error(
-            `SSH connection to ${config.host} is in backoff for ${remainingSecs}s. ` +
-              `Last error: ${health.lastError ?? "unknown"}`
-          );
+        const refusal = new Error(
+          `SSH connection to ${config.host} is in backoff for ${remainingSecs}s. ` +
+            `Last error: ${health.lastError ?? "unknown"}`
+        );
+        // Waiting out the backoff after a rejected key or host key only repeats a login that
+        // cannot succeed (#5063): fail at once, like maxWaitMs 0.
+        if (!shouldWait || isPermanentSSHFailure(refusal)) {
+          throw refusal;
         }
 
         const budgetMs = getRemainingWaitBudgetMs();
@@ -285,6 +289,7 @@ export class SSHConnectionPool {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
           if (
             !shouldWait ||
+            isPermanentSSHFailure(error) ||
             (error instanceof Error &&
               error.message.includes(`did not become healthy within ${maxWaitMs}ms`))
           ) {
@@ -327,7 +332,7 @@ export class SSHConnectionPool {
         if (!wasAborted && (!h?.backoffUntil || h.backoffUntil <= new Date())) {
           this.markFailedByKey(key, errorMessage);
         }
-        if (!shouldWait || wasAborted) {
+        if (!shouldWait || wasAborted || isPermanentSSHFailure(error)) {
           throw error;
         }
         continue;

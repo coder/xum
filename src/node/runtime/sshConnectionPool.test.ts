@@ -1,3 +1,4 @@
+import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { afterEach, describe, expect, jest, test, spyOn } from "bun:test";
@@ -687,3 +688,83 @@ describe("SSHConnectionPool", () => {
     });
   });
 });
+
+// #5063: after a permanent failure (rejected key, failed host-key check) the wait loop must not
+// probe again through its backoff: every probe repeats a login that cannot succeed, and servers
+// count failed logins. A PATH-shimmed `ssh` stands in for OpenSSH and counts its invocations.
+describe.skipIf(process.platform === "win32")(
+  "SSHConnectionPool wait loop vs permanent failures",
+  () => {
+    let restore: (() => Promise<void>) | undefined;
+    afterEach(async () => {
+      await restore?.();
+      restore = undefined;
+    });
+
+    /** Put an `ssh` on PATH that fails with `stderr` and exit code 255; returns its call count. */
+    async function shimSsh(stderr: string): Promise<() => Promise<number>> {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
+      const calls = path.join(dir, "calls");
+      await fs.writeFile(
+        path.join(dir, "ssh"),
+        `#!/bin/sh\necho call >> '${calls}'\nprintf '%s\\n' '${stderr}' >&2\nexit 255\n`,
+        { mode: 0o755 }
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
+      restore = async () => {
+        process.env.PATH = originalPath;
+        await fs.rm(dir, { recursive: true, force: true });
+      };
+      return async () =>
+        (await fs.readFile(calls, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+    }
+
+    function acquire(pool: SSHConnectionPool, config: SSHRuntimeConfig, maxWaitMs: number) {
+      const waits: number[] = [];
+      const result = pool
+        .acquireConnection(config, { timeoutMs: 5_000, maxWaitMs, onWait: (ms) => waits.push(ms) })
+        .then(
+          () => new Error("acquisition unexpectedly succeeded"),
+          (error: unknown) => error
+        );
+      return { waits, result };
+    }
+
+    test.each(["alice@shim.test: Permission denied (publickey).", "Host key verification failed."])(
+      "%s fails at once instead of probing again through the backoff",
+      async (stderr) => {
+        const calls = await shimSsh(stderr);
+        const pool = new SSHConnectionPool();
+        const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+
+        // The second caller shares the first one's probe.
+        const first = acquire(pool, config, 5_000);
+        const joined = acquire(pool, config, 5_000);
+        for (const attempt of [first, joined]) {
+          expect(String(await attempt.result)).toContain(stderr);
+          expect(attempt.waits).toEqual([]);
+        }
+        expect(await calls()).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("unhealthy");
+
+        // A caller arriving during the backoff gets the permanent error without another login.
+        const next = acquire(pool, config, 5_000);
+        expect(String(await next.result)).toContain(stderr);
+        expect(next.waits).toEqual([]);
+        expect(await calls()).toBe(1);
+      }
+    );
+
+    test("a transient failure still waits through the backoff", async () => {
+      const calls = await shimSsh("ssh: connect to host shim.test port 22: Connection refused");
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+
+      const { waits, result } = acquire(pool, config, 2_500);
+      expect(String(await result)).toContain("Connection refused");
+      expect(waits.length).toBeGreaterThan(0);
+      expect(await calls()).toBeGreaterThan(1);
+    });
+  }
+);

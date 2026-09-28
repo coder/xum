@@ -27,6 +27,7 @@ import {
   type BaseSshAcquireConnectionOptions,
   withSshBackoffJitter,
 } from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 let sshPromptService: SshPromptService | undefined;
 
@@ -329,11 +330,14 @@ export class SSH2ConnectionPool {
         const remainingMs = health.backoffUntil.getTime() - Date.now();
         const remainingSecs = Math.ceil(remainingMs / 1000);
 
-        if (!shouldWait) {
-          throw new Error(
-            `SSH connection to ${config.host} is in backoff for ${remainingSecs}s. ` +
-              `Last error: ${health.lastError ?? "unknown"}`
-          );
+        const refusal = new Error(
+          `SSH connection to ${config.host} is in backoff for ${remainingSecs}s. ` +
+            `Last error: ${health.lastError ?? "unknown"}`
+        );
+        // Waiting out the backoff after a rejected key or host key only repeats a login that
+        // cannot succeed (#5063): fail at once, like maxWaitMs 0.
+        if (!shouldWait || isPermanentSSHFailure(refusal)) {
+          throw refusal;
         }
 
         const elapsedMs = Date.now() - startTime;
@@ -366,7 +370,8 @@ export class SSH2ConnectionPool {
         const entry = await waitForAbortable(inflight, options.abortSignal);
         return entry;
       } catch (error) {
-        if (!shouldWait) {
+        // connect() already recorded the failure and its backoff; a permanent one ends the wait.
+        if (!shouldWait || isPermanentSSHFailure(error)) {
           throw error;
         }
 
