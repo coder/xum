@@ -463,6 +463,21 @@ describe("unsanitized task checkout whose reclaim failed", () => {
           return "fixture: sanitize failed";
         }
       );
+      // The persisted marker is written by the failed launch's markTaskLaunchFailed, which the
+      // launch schedules without awaiting it. The refusals below come from the in-memory record
+      // and can finish first, so the persisted assertions wait for this record (#4927).
+      const taskService = env.services.taskService as unknown as {
+        markTaskLaunchFailed: (taskId: string, ...rest: unknown[]) => Promise<void>;
+      };
+      const markTaskLaunchFailed = taskService.markTaskLaunchFailed.bind(taskService);
+      const launchFailureRecorded = Promise.withResolvers<string>();
+      spyOn(taskService, "markTaskLaunchFailed").mockImplementation(async (taskId, ...rest) => {
+        try {
+          return await markTaskLaunchFailed(taskId, ...rest);
+        } finally {
+          launchFailureRecorded.resolve(taskId);
+        }
+      });
       const initWaits = observeInit(env);
 
       const replacementId = await launchReplacement();
@@ -487,6 +502,7 @@ describe("unsanitized task checkout whose reclaim failed", () => {
       const events = await readRecord(recordFile);
       expect(events.some((e) => e.cwd !== checkout)).toBe(true);
       expect(events.filter((e) => e.cwd === checkout)).toEqual([]);
+      expect(await launchFailureRecorded.promise).toBe(replacementId);
       // The scenario: the row is still published and the unsanitized checkout still exists.
       expect(
         env.config
