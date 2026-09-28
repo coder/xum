@@ -290,7 +290,7 @@ import {
   runInlineAbandonedBranchSummary,
   type BranchSummaryAiService,
 } from "@/node/services/branchSummary";
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -11775,9 +11775,10 @@ export class AgentSession {
           }
         );
       } catch (error) {
-        // Inline refs skip unknown skills, but an unreachable host is not an unknown
-        // skill: refuse the send like a failed slash invocation (#4438).
-        if (ref.source === "slash" || isRuntimeTransportError(error)) {
+        // Inline refs skip unknown skills, but an unreadable skill (unreachable host,
+        // permission) is not an unknown skill: refuse the send like a failed slash
+        // invocation (#4438, #4827).
+        if (ref.source === "slash" || isRuntimeReadFailure(error)) {
           throw error;
         }
         continue;

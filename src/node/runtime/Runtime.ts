@@ -759,6 +759,42 @@ export function isRuntimeTransportError(error: unknown): error is RuntimeError {
   return error instanceof RuntimeError && error.type === "network";
 }
 
+const ABSENT_PATH_CODES: ReadonlySet<unknown> = new Set(["ENOENT", "ENOTDIR"]);
+
+function errorCode(value: unknown): unknown {
+  return value != null && typeof value === "object" && "code" in value ? value.code : undefined;
+}
+
+/**
+ * True when a runtime read or stat failed because the path positively does not
+ * exist (ENOENT/ENOTDIR). Local runtimes carry the fs error as `cause`;
+ * exec-backed runtimes attach the same code when the tool's own diagnostic says
+ * so (see execFileIO).
+ */
+export function isRuntimePathAbsentError(error: unknown): boolean {
+  if (ABSENT_PATH_CODES.has(errorCode(error))) return true;
+  // No `instanceof Error` check: fs errors can come from another realm (see RuntimeError).
+  const cause = error != null && typeof error === "object" && "cause" in error ? error.cause : null;
+  return ABSENT_PATH_CODES.has(errorCode(cause));
+}
+
+/**
+ * True when a runtime read failed for any reason other than positively
+ * identified absence: transport, permission denied, I/O error, not a regular
+ * file. A fallback chain that picks the next file when one is "missing" must
+ * stop on it instead of silently serving a lower-priority file (#4827).
+ * Errors that are not RuntimeErrors (parse and validation errors) are out of
+ * scope and keep their callers' fallback.
+ *
+ * Callers that own an abort signal check it first: an aborted read also fails.
+ */
+export function isRuntimeReadFailure(error: unknown): error is RuntimeError {
+  if (isRuntimeTransportError(error)) return true;
+  return (
+    error instanceof RuntimeError && error.type === "file_io" && !isRuntimePathAbsentError(error)
+  );
+}
+
 /**
  * Caller-facing text for a transport failure that ends an operation early. It
  * says the host was unreachable and the operation can be retried, so a model or

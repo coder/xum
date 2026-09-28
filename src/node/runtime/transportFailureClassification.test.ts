@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import { PassThrough } from "stream";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
-import { type ExecOptions, type ExecStream, isRuntimeTransportError } from "./Runtime";
+import {
+  type ExecOptions,
+  type ExecStream,
+  isRuntimePathAbsentError,
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+} from "./Runtime";
 import { ssh2ConnectionPool } from "./SSH2ConnectionPool";
 import { SSHRuntime } from "./SSHRuntime";
 import type { SSHRuntimeConfig } from "./sshConnectionPool";
@@ -89,6 +95,46 @@ describe("transport failure classification", () => {
   it("leaves remote runtimes without a transport classifier unchanged", async () => {
     const errors = await failures(new StubbedRemoteRuntime(), false);
     expect(errors.map(isRuntimeTransportError)).toEqual([false, false]);
+  });
+});
+
+// #4827: only a positively absent file may read as missing. Every other failed
+// read (permission denied, I/O error) must stop a fallback chain too.
+describe("read failure vs positive absence", () => {
+  const classify = async (stderr: string) =>
+    (await failures(new StubbedSSHRuntime([stderr, 1]), false)).map((error) => ({
+      absent: isRuntimePathAbsentError(error),
+      readFailure: isRuntimeReadFailure(error),
+    }));
+  const absent = { absent: true, readFailure: false };
+  const unreadable = { absent: false, readFailure: true };
+
+  it("treats the tool's own ENOENT/ENOTDIR diagnostics as absence", async () => {
+    expect(await classify(MISSING)).toEqual([absent, absent]);
+    expect(await classify("stat: cannot statx '/remote/AGENTS.md/x': Not a directory")).toEqual([
+      absent,
+      absent,
+    ]);
+  });
+
+  it("treats permission and other errors as read failures", async () => {
+    expect(await classify("cat: /remote/AGENTS.md: Permission denied")).toEqual([
+      unreadable,
+      unreadable,
+    ]);
+    // OpenSSH can warn about a missing identity file on a working connection:
+    // that line must not turn the permission error into "missing".
+    expect(
+      await classify(
+        "Warning: Identity file /k/id not accessible: No such file or directory.\n" +
+          "cat: /remote/AGENTS.md: Permission denied"
+      )
+    ).toEqual([unreadable, unreadable]);
+  });
+
+  it("keeps transport failures in the read-failure class", async () => {
+    const errors = await failures(new StubbedSSHRuntime([REFUSED, 255]), false);
+    expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
   });
 });
 

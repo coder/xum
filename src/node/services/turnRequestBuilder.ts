@@ -164,7 +164,7 @@ import type {
 
 import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isRuntimeTransportError } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
@@ -871,13 +871,12 @@ export class TurnRequestBuilder {
     try {
       return await this.prepareOrThrow(opts, context);
     } catch (error) {
-      // #4438: a transport failure while loading instructions, agents or skills
-      // means the remote could not be read, not that the files are missing. Fail
-      // the turn as retryable, like an unreachable host at ensureReady, before any
-      // provider request or assistant row exists.
-      if (!isRuntimeTransportError(error)) throw error;
-      // A canceled remote read is a Stop, not a failure: SSH2 reports aborted
-      // execs as "network", so end the turn as aborted like other startup cancels.
+      // #4438/#4827: a failed read while loading instructions, agents or skills
+      // means the file could not be read, not that it is missing. Fail the turn
+      // before any provider request or assistant row exists.
+      if (!isRuntimeReadFailure(error)) throw error;
+      // A canceled read is a Stop, not a failure: SSH2 reports aborted execs as
+      // "network", so end the turn as aborted like other startup cancels.
       if (context.abortSignal.aborted) {
         return {
           type: "finished",
@@ -888,6 +887,17 @@ export class TurnRequestBuilder {
             )
           ),
         };
+      }
+      if (!isRuntimeTransportError(error)) {
+        // Permission denied or an I/O error does not fix itself, so it is not
+        // retryable (unlike an unreachable host). The title is the text before
+        // the first "." (StreamErrorMessage), so it must not contain a path.
+        const errorMessage = `Startup file unreadable. ${getErrorMessage(error)}`;
+        context.startupState.logSlowStreamStartup?.({
+          outcome: "startup_file_unreadable",
+          errorMessage,
+        });
+        return this.finishWithPreStartError(opts, context, "runtime_not_ready", errorMessage);
       }
       const errorMessage = `Remote workspace unreachable while loading startup files: ${getErrorMessage(error)}`;
       context.startupState.logSlowStreamStartup?.({

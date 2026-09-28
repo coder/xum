@@ -268,6 +268,38 @@ describe("instructionFiles", () => {
       expect(error).toMatchObject({ type: "network" });
     });
 
+    // #4827: a remote permission error is not a missing file either.
+    it("rejects when AGENTS.md is unreadable instead of using CLAUDE.md", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "agents instructions");
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      const runtime = new LocalRuntime(tempDir);
+      const agentsPath = path.join(tempDir, "AGENTS.md");
+      const readFile = runtime.readFile.bind(runtime);
+      spyOn(runtime, "readFile").mockImplementation((filePath, ...rest) => {
+        if (filePath !== agentsPath) return readFile(filePath, ...rest);
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(
+              new RuntimeError(
+                `Failed to read file ${filePath}: cat: ${filePath}: Permission denied`,
+                "file_io"
+              )
+            );
+          },
+        });
+      });
+
+      const error: unknown = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      ).then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toMatchObject({ type: "file_io" });
+    });
+
     it("still falls back to CLAUDE.md when AGENTS.md is missing", async () => {
       await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
       const runtime = new LocalRuntime(tempDir);

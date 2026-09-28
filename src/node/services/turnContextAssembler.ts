@@ -28,7 +28,11 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { TaskSettings } from "@/common/types/tasks";
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
@@ -348,8 +352,8 @@ export async function buildPlanInstructions(
             });
             lastAgentIsPlanLike = isPlanLikeInResolvedChain(lastChain);
           } catch (error) {
-            // An unreachable host must not silently drop the plan handoff (#4438).
-            if (isRuntimeTransportError(error)) throw error;
+            // An unreadable definition must not silently drop the plan handoff (#4438, #4827).
+            if (isRuntimeReadFailure(error)) throw error;
             workspaceLog.warn("Failed to resolve last agent definition for plan handoff", {
               lastAgentId,
               error: getErrorMessage(error),
@@ -802,8 +806,8 @@ export async function buildStreamSystemContext(
         ).then(
           (resolvedFrontmatter) => resolvedFrontmatter.subagent?.append_prompt,
           (error: unknown) => {
-            // A transport failure must not run the sub-agent without its append prompt (#4438).
-            if (isRuntimeTransportError(error)) throw error;
+            // A failed read must not run the sub-agent without its append prompt (#4438, #4827).
+            if (isRuntimeReadFailure(error)) throw error;
             workspaceLog.debug("Failed to resolve agent frontmatter for subagent append_prompt", {
               agentId: agentDefinition.id,
               error: getErrorMessage(error),
@@ -1036,8 +1040,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           subagentRunnable: resolvedFrontmatter.subagent?.runnable ?? false,
         };
       } catch (error) {
-        // An unreachable host must not publish unverified sub-agent metadata (#4438).
-        if (isRuntimeTransportError(error)) throw error;
+        // A failed read must not publish unverified sub-agent metadata (#4438, #4827).
+        if (isRuntimeReadFailure(error)) throw error;
         // Best-effort: keep the descriptor if enablement or inheritance can't be resolved.
         return descriptor;
       }

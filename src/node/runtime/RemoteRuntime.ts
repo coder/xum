@@ -43,6 +43,7 @@ import { buildShellExport, buildShellPathExport } from "./shellEnv";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   buildRegularFileReadCommand,
+  CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
   readFileViaExec,
   statViaExec,
@@ -425,7 +426,7 @@ export abstract class RemoteRuntime implements Runtime {
         const quotedPath = this.quoteForRemote(resolvedPath);
         const command = options?.requireRegularFile
           ? buildRegularFileReadCommand(quotedPath)
-          : `cat ${quotedPath}`;
+          : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
         return this.exec(command, {
           cwd: this.getBasePath(),
           timeout: 300,

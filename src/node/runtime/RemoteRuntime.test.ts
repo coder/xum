@@ -85,7 +85,7 @@ describe("RemoteRuntime file path canonicalization", () => {
     await runtime.stat("nested/../stat.txt");
     await runtime.ensureDir("~/dir");
 
-    expect(runtime.commands).toContain("cat '/workspace/read.txt'");
+    expect(runtime.commands).toContain("LC_ALL=C cat '/workspace/read.txt'");
     expect(runtime.commands.some((command) => command.includes("'/home/test/write.txt'"))).toBe(
       true
     );

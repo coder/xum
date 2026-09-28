@@ -1,4 +1,4 @@
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 
 import type { AgentDefinitionPackage, AgentId } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
@@ -100,9 +100,9 @@ export async function resolveAgentInheritanceChain(
         ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
       });
     } catch (error) {
-      // Cancellation is the caller's decision, and an unreachable host is not a
-      // missing base (#4438): surface both instead of truncating the chain.
-      if (options.abortSignal?.aborted || isRuntimeTransportError(error)) throw error;
+      // Cancellation is the caller's decision, and an unreadable base is not a
+      // missing base (#4438, #4827): surface both instead of truncating the chain.
+      if (options.abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
       log.warn("Failed to load base agent definition; stopping inheritance resolution", {
         workspaceId,
         agentId,

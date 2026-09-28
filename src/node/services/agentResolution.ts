@@ -26,7 +26,7 @@ import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
@@ -275,9 +275,9 @@ export async function resolveAgentForStream(
         }
         fallbackDefinition ??= { definition, discovery };
       } catch (error) {
-        // An unreachable host is not an absent agent: fail instead of trying the next
-        // context or falling back to exec (#4438).
-        if (isRuntimeTransportError(error)) throw error;
+        // An unreadable agent (unreachable host, permission) is not an absent agent:
+        // fail instead of trying the next context or falling back to exec (#4438, #4827).
+        if (isRuntimeReadFailure(error)) throw error;
         // Parent-only project agents may be untracked and absent from child worktrees.
         // Try the next discovery context before moving to the next persisted agent id.
       }
@@ -415,9 +415,9 @@ export async function resolveAgentForStream(
         effectiveAgentId = agentDefinition.id;
       }
     } catch (error: unknown) {
-      // An unreachable host is neither an ineligible agent nor a skippable check:
-      // TurnRequestBuilder.prepare reports it as a retryable startup failure (#4831).
-      if (isRuntimeTransportError(error)) throw error;
+      // An unreadable definition is neither an ineligible agent nor a skippable check:
+      // TurnRequestBuilder.prepare reports it as a startup failure (#4831, #4827).
+      if (isRuntimeReadFailure(error)) throw error;
       // Strict sends fail closed when eligibility cannot be verified: a hook or edit
       // that breaks the definition (e.g. a base pointing at a missing definition) after
       // launch validation would otherwise stream a partially resolved prompt/tool policy.

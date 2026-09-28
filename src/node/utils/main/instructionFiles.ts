@@ -7,7 +7,7 @@ import {
   type InstructionSet,
 } from "@/common/types/instructions";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 
 export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
@@ -82,10 +82,10 @@ async function readSingleFile(
   try {
     raw = await reader.readFile(path.join(directory, filename));
   } catch (error) {
-    // Only a read the runtime cannot blame on its transport counts as missing.
-    // An SSH drop must fail loudly, not let AGENT.md/CLAUDE.md or the legacy
-    // .mux tree win over an unreadable AGENTS.md (#4438).
-    if (isRuntimeTransportError(error)) throw error;
+    // Only a positively absent file counts as missing. An SSH drop or a
+    // permission error must fail loudly, not let AGENT.md/CLAUDE.md or the
+    // legacy .mux tree win over an unreadable AGENTS.md (#4438, #4827).
+    if (isRuntimeReadFailure(error)) throw error;
     return { exists: false };
   }
   const sanitized = stripMarkdownComments(raw);

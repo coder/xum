@@ -2,7 +2,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -766,9 +770,10 @@ async function loadAgentDefinition(
 
       return validated.data;
     } catch (error) {
-      // An aborted or transport-failed read is not a missing candidate: stop
-      // probing instead of falling through to a lower scope (#4438).
-      if (abortSignal?.aborted || isRuntimeTransportError(error)) throw error;
+      // An aborted or failed read (transport, permission) is not a missing
+      // candidate: stop probing instead of falling through to a lower scope
+      // (#4438, #4827). Parse and validation errors still skip the candidate.
+      if (abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
       continue;
     }
   }

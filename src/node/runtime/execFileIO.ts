@@ -21,13 +21,35 @@ type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
  */
 export type ClassifyTransportExit = (exitCode: number, stderr: string) => boolean;
 
-function nonZeroExitErrorType(
+/**
+ * A failed exec-backed read or stat: transport first (host unreachable), then
+ * positively identified absence, then everything else (permission denied, I/O
+ * errors), which callers must not read as a missing file (#4827).
+ *
+ * Absence needs the tool's OWN diagnostic line (`cat: …`/`stat: …`, pinned to
+ * English by LC_ALL=C): OpenSSH can print `Warning: Identity file … not
+ * accessible: No such file or directory` on a connection that still works, so
+ * a bare substring match would turn a permission error into "missing".
+ */
+function nonZeroExitError(
+  message: string,
   exitCode: number,
   stderr: string,
   classifyExit: ClassifyTransportExit | undefined
-): "network" | "file_io" {
-  return classifyExit?.(exitCode, stderr) === true ? "network" : "file_io";
+): RuntimeError {
+  if (classifyExit?.(exitCode, stderr) === true) {
+    return new RuntimeError(message, "network");
+  }
+  const absence = /^(?:cat|stat): [^\n]*(No such file or directory|Not a directory)$/m.exec(stderr);
+  if (absence == null) {
+    return new RuntimeError(message, "file_io");
+  }
+  const code = absence[1] === "Not a directory" ? "ENOTDIR" : "ENOENT";
+  return new RuntimeError(message, "file_io", Object.assign(new Error(absence[0]), { code }));
 }
+
+/** `cat` with its diagnostics pinned to English, so absence stays recognizable. */
+export const CAT_VIA_EXEC_COMMAND = "LC_ALL=C cat";
 
 /**
  * Shell command for ReadFileOptions.requireRegularFile on exec-backed runtimes.
@@ -108,9 +130,11 @@ export function readFileViaExec(
         const code = await exitCodePromise;
         if (code !== 0) {
           const stderr = await streamToString(stream.stderr);
-          throw new RuntimeError(
+          throw nonZeroExitError(
             `Failed to read file ${filePath}: ${stderr}`,
-            nonZeroExitErrorType(code, stderr, classifyExit)
+            code,
+            stderr,
+            classifyExit
           );
         }
 
@@ -251,10 +275,7 @@ export async function statViaExec(
   ]);
 
   if (exitCode !== 0) {
-    throw new RuntimeError(
-      `Failed to stat ${filePath}: ${stderr}`,
-      nonZeroExitErrorType(exitCode, stderr, classifyExit)
-    );
+    throw nonZeroExitError(`Failed to stat ${filePath}: ${stderr}`, exitCode, stderr, classifyExit);
   }
 
   const parts = stdout.trim().split(" ");

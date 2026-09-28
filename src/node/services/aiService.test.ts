@@ -1165,17 +1165,23 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   describe("startup transport failures (#4438)", () => {
     const transportError = () => new RuntimeError("ssh: Connection refused", "network");
 
-    async function runStartup(prepared: boolean, abortInsideBuild = false) {
+    async function runStartup(
+      prepared: boolean,
+      abortInsideBuild = false,
+      readError: RuntimeError = transportError()
+    ) {
       using xumHome = new DisposableTempDir("ai-service-startup-transport");
       const metadata = createLocalWorkspaceMetadata("startup-transport", xumHome.path);
       const harness = createHarness(xumHome.path, metadata);
       const controller = new AbortController();
       spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation(() => {
         if (abortInsideBuild) controller.abort();
-        return Promise.reject(transportError());
+        return Promise.reject(readError);
       });
-      const events: Array<{ errorType?: string }> = [];
-      harness.service.on("error", (event: { errorType?: string }) => events.push(event));
+      const events: Array<{ errorType?: string; error?: string }> = [];
+      harness.service.on("error", (event: { errorType?: string; error?: string }) =>
+        events.push(event)
+      );
       const onPreStartError = mock(() => undefined);
       const options = {
         workspaceId: metadata.id,
@@ -1204,6 +1210,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(run.errorType).toBe("runtime_start_failed");
       expect(run.events).toHaveLength(0);
       expect(run.onPreStartError).toHaveBeenCalledTimes(1);
+    });
+
+    // #4827: permission denied does not fix itself, so it must not auto-retry.
+    it("fails an unreadable startup file as a visible, non-retryable runtime_not_ready", async () => {
+      const denied = new RuntimeError(
+        "Failed to read file /ws/AGENTS.md: cat: /ws/AGENTS.md: Permission denied",
+        "file_io"
+      );
+      const run = await runStartup(false, false, denied);
+      expect(run.errorType).toBe("runtime_not_ready");
+      expect(run.events.map((event) => event.errorType)).toEqual(["runtime_not_ready"]);
+      expect(run.events[0]?.error).toContain("Permission denied");
+      expect(run.harness.startStreamCalls).toHaveLength(0);
     });
 
     it("ends an aborted turn as a Stop, not a failure", async () => {

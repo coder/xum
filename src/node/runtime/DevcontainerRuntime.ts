@@ -40,6 +40,7 @@ import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import {
   buildRegularFileReadCommand,
+  CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
   readFileViaExec,
   statViaExec,
@@ -579,7 +580,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     // check must run there too (env-var quoting as for the plain cat).
     const command = options?.requireRegularFile
       ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
-      : `cat "$${FILE_PATH_ENV}"`;
+      : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`;
     return readFileViaExec(
       filePath,
       (signal) =>

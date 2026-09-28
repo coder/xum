@@ -1098,3 +1098,39 @@ describe("transport failures", () => {
     expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "network" });
   });
 });
+
+// #4827: a permission error is not a missing agent file either.
+test("an unreadable project agent or base neither falls back nor truncates the chain", async () => {
+  using tempDir = new DisposableTempDir("agent-unreadable");
+  const agentsDir = path.join(tempDir.path, ".xum", "agents");
+  await fs.mkdir(agentsDir, { recursive: true });
+  const agent = (name: string, base?: string) =>
+    `---\nname: ${name}\n${base ? `base: ${base}\n` : ""}---\n${name}`;
+  await fs.writeFile(path.join(agentsDir, "child.md"), agent("Child", "exec"));
+  await fs.writeFile(path.join(agentsDir, "exec.md"), agent("Project exec"));
+  const runtime = new LocalRuntime(tempDir.path);
+  const child = await readAgentDefinition(runtime, tempDir.path, "child");
+  const stat = runtime.stat.bind(runtime);
+  spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+    filePath.endsWith("exec.md")
+      ? Promise.reject(
+          new RuntimeError(
+            `Failed to stat ${filePath}: stat: ${filePath}: Permission denied`,
+            "file_io"
+          )
+        )
+      : stat(filePath, signal)
+  );
+
+  // Before #4827 this silently resolved the built-in exec.
+  const read = readAgentDefinition(runtime, tempDir.path, "exec");
+  expect(await read.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+  const chain = resolveAgentInheritanceChain({
+    runtime,
+    workspacePath: tempDir.path,
+    agentId: "child",
+    agentDefinition: child,
+    workspaceId: "ws",
+  });
+  expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+});

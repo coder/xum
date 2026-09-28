@@ -1,7 +1,11 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
@@ -1062,7 +1066,9 @@ export async function readAgentSkill(
         candidate.pluginRoot
       );
     } catch (error) {
-      if (isRuntimeTransportError(error)) throw error;
+      // An unreadable skill (transport, permission) must not let a lower-scope
+      // skill with the same name win (#4438, #4827).
+      if (isRuntimeReadFailure(error)) throw error;
       continue;
     }
   }
