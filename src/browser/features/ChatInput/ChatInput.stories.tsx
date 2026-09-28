@@ -125,6 +125,10 @@ export const ComposerTooltip: AppStory = {
  * read-only notice with Discard only (the workspace cannot run a turn).
  */
 export const TranscriptOnlyHeldInput: AppStory = {
+  // Mirrors the phone Pixel variant for local viewing.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   render: () => (
     <AppWithMocks
       setup={() => {

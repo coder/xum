@@ -2010,12 +2010,11 @@ const TranscriptOnlyNoticePane: React.FC<{
   const columnWidthClass = useChatDockColumnWidthClass();
 
   return (
-    <div
-      className={cn("bg-surface-primary border-border-light border-t pb-2", CHAT_DOCK_GUTTER_CLASS)}
-    >
+    <div className="bg-surface-primary border-border-light border-t pb-2">
       {/* #4770: held inputs (e.g. a queued follow-up Stop returned while archiving) would be
           invisible here, since the composer that shows them is not rendered. Discard only: a
-          transcript-only workspace cannot run a turn, and there is no composer for shortcuts. */}
+          transcript-only workspace cannot run a turn, and there is no composer for shortcuts.
+          Outside the gutter below: HeldInput's ChatDockSurface applies its own. */}
       {props.heldInputs.map((heldInput) => (
         <HeldInput
           key={heldInput.id}
@@ -2025,10 +2024,12 @@ const TranscriptOnlyNoticePane: React.FC<{
           canSend={false}
         />
       ))}
-      <div className={cn("py-4", columnWidthClass)}>
-        <p role="note" className="text-muted text-sm leading-6">
-          {TRANSCRIPT_ONLY_NOTICE}
-        </p>
+      <div className={CHAT_DOCK_GUTTER_CLASS}>
+        <div className={cn("py-4", columnWidthClass)}>
+          <p role="note" className="text-muted text-sm leading-6">
+            {TRANSCRIPT_ONLY_NOTICE}
+          </p>
+        </div>
       </div>
     </div>
   );

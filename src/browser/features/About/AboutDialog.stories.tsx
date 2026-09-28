@@ -98,8 +98,14 @@ export const BlockedPhone: Story = {
         // #4770: held inputs name their workspaces (an archived one shows them only when opened).
         {
           kind: "held-inputs",
-          count: 2,
-          workspaceNames: ["Fix settings validation", "Archived: migrate storage"],
+          count: 4,
+          // Beyond three names the line collapses into a count, keeping the dialog bounded.
+          workspaceNames: [
+            "Archived: migrate storage",
+            "Fix settings validation",
+            "Rename the CLI flags",
+            "Update docs",
+          ],
         },
       ],
     },
@@ -114,7 +120,7 @@ export const BlockedPhone: Story = {
     await expect(within(dialog).getByRole("button", { name: "Restart anyway" })).toBeEnabled();
     await expect(within(dialog).getByRole("status")).toBeVisible();
     await expect(within(dialog).getByRole("status")).toHaveTextContent(
-      "Sessions with unsent messages: 2 (Fix settings validation, Archived: migrate storage)"
+      "Sessions with unsent messages: 4 (Archived: migrate storage, Fix settings validation, Rename the CLI flags and 1 more)"
     );
     const npm = within(dialog).getByRole("radio", { name: "Newest npm" });
     await userEvent.click(npm);

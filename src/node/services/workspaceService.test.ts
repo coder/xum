@@ -3,6 +3,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import {
+  nameRestartBlockerWorkspaces,
   PLAN_FILE_DELETE_UNREACHABLE_MESSAGE,
   STARTUP_RECOVERY_CONCURRENCY,
 } from "./workspaceService";
@@ -50,6 +51,20 @@ function workspaceEntries(
 ): WorkspaceConfigEntry[] {
   return ids.map((id) => projectWorkspace(PROJECT_PATH, id, id, options));
 }
+
+
+// #4770: the restart blocker must tell the user which workspaces to open, even when titles repeat.
+describe("nameRestartBlockerWorkspaces", () => {
+  test("adds the stable ID only to labels two workspaces share, sorted", () => {
+    expect(
+      nameRestartBlockerWorkspaces([
+        { id: "b2", label: "Fix validation" },
+        { id: "c3", label: "Archived work" },
+        { id: "a1", label: "Fix validation" },
+      ])
+    ).toEqual(["Archived work", "Fix validation (a1)", "Fix validation (b2)"]);
+  });
+});
 
 describe("WorkspaceService initialize", () => {
   let harness: WorkspaceServiceHarness;

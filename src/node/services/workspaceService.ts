@@ -513,6 +513,20 @@ function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
   return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
 }
 
+/**
+ * Sorted display names for a restart blocker's workspaces (#4770). Titles may repeat (across
+ * projects, repeated task titles), so a label shared by two workspaces gets its stable ID.
+ */
+export function nameRestartBlockerWorkspaces(
+  workspaces: ReadonlyArray<{ id: string; label: string }>
+): string[] {
+  const labelCounts = new Map<string, number>();
+  for (const { label } of workspaces) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  return workspaces
+    .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -4916,7 +4930,7 @@ export class WorkspaceService
     const config = this.config.loadConfigOrDefault();
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
-    const heldInputWorkspaceNames: string[] = [];
+    const heldInputWorkspaces: Array<{ id: string; label: string }> = [];
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
@@ -4926,7 +4940,10 @@ export class WorkspaceService
       // Named (#4770): an archived workspace shows its held input only when opened.
       if (session.getHeldInputs().length > 0) {
         const entry = findWorkspaceEntry(config, workspaceId)?.workspace;
-        heldInputWorkspaceNames.push(entry?.title ?? entry?.name ?? workspaceId);
+        heldInputWorkspaces.push({
+          id: workspaceId,
+          label: entry?.title ?? entry?.name ?? workspaceId,
+        });
       }
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
@@ -4957,8 +4974,8 @@ export class WorkspaceService
       { kind: "queued-messages", count: queuedMessages },
       {
         kind: "held-inputs",
-        count: heldInputWorkspaceNames.length,
-        workspaceNames: heldInputWorkspaceNames.sort((a, b) => a.localeCompare(b)),
+        count: heldInputWorkspaces.length,
+        workspaceNames: nameRestartBlockerWorkspaces(heldInputWorkspaces),
       },
       { kind: "auto-retries", count: autoRetries },
       {
