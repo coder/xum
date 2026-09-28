@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-libra
 import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -12,24 +13,35 @@ import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup"
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
 
-function backupSectionTree(client: MockClient) {
+function backupSectionTree(client: MockClient, inSettingsDialog = false) {
+  const section = React.createElement(BackupSection);
+  const children = inSettingsDialog
+    ? React.createElement(
+        Dialog,
+        { open: true },
+        React.createElement(
+          DialogContent,
+          { "aria-describedby": undefined },
+          React.createElement(DialogTitle, null, "Settings"),
+          section
+        )
+      )
+    : section;
   return React.createElement(
     ThemeProvider,
     null,
     React.createElement(
       TooltipProvider,
       null,
-      React.createElement(APIProvider, {
-        client,
-        children: React.createElement(BackupSection),
-      })
+      React.createElement(APIProvider, { client, children })
     )
   );
 }
 
 function renderBackupSection(
   overrides: Partial<NonNullable<MockOptions>> = {},
-  setupClient?: (client: MockClient) => void
+  setupClient?: (client: MockClient) => void,
+  inSettingsDialog = false
 ) {
   const client = createMockORPCClient({
     backupSettings: {
@@ -66,7 +78,7 @@ function renderBackupSection(
 
   setupClient?.(client);
 
-  const view = render(backupSectionTree(client));
+  const view = render(backupSectionTree(client, inSettingsDialog));
 
   return { client, view };
 }
@@ -173,6 +185,17 @@ describe("BackupSection", () => {
         includeProjects: true,
       })
     );
+  });
+
+  test("keeps shortcuts working inside the settings dialog that hosts the section", async () => {
+    renderBackupSection({}, undefined, true);
+    const settings = await within(document.body).findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+
+    fireEvent.keyDown(settings, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
   });
 
   test("refreshes backup settings changed by another window", async () => {

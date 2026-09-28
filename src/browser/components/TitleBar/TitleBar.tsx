@@ -370,7 +370,7 @@ export function TitleBar(props: TitleBarProps) {
         </Tooltip>
         <SettingsButton
           // On touch/mobile, opening settings from the sidebar should also dismiss the
-          // off-canvas sidebar so users are not stuck with it covering the settings page.
+          // off-canvas sidebar so it is not left covering the page behind settings.
           onBeforeOpenSettings={props.onBeforeOpenSettings}
         />
       </div>

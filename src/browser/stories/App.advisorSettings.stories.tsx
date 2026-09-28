@@ -1,5 +1,6 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -39,8 +40,7 @@ function setupAdvisorSettings() {
 }
 
 async function exerciseAdvisorMode(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const canvas = within(await openSettingsDialog(canvasElement));
   await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
   const trigger = await canvas.findByRole("button", { name: "Reasoning" });
   await expect(trigger).toHaveTextContent("Low");

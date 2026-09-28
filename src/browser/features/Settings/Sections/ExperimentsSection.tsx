@@ -116,9 +116,9 @@ export function PortableDesktopExperimentWarning() {
     setError(null);
 
     try {
-      // This warning lives on /settings/experiments, where selectedWorkspace is intentionally
-      // URL-derived and null. Probe the machine-level desktop prerequisite instead of a
-      // workspace-scoped capability so the warning still renders on settings routes.
+      // Settings can open with no workspace behind it (cold links, project pages). Probe the
+      // machine-level desktop prerequisite instead of a workspace-scoped capability so the
+      // warning renders regardless of the background page.
       const nextStatus = await api.desktop.getPrereqStatus();
       if (requestIdRef.current !== requestId) {
         return;

@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
 import { createAppHarness, type AppHarness } from "./harness";
+import { openSettingsDialog } from "./helpers";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
@@ -40,9 +41,8 @@ function serverRow(canvas: Canvas, label: string): HTMLElement {
 }
 
 async function openMcpSettings(app: AppHarness) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "MCP" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${PLUGIN_LABEL} enabled` }, { timeout: 10000 });
   await canvas.findByRole("switch", { name: `Toggle ${REGULAR} enabled` });
   return canvas;

@@ -4,7 +4,7 @@ import * as VisuallyHiddenPrimitive from "@radix-ui/react-visually-hidden";
 import { X } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
-import { MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
+import { isEditableElement, MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
 
 /**
  * VisuallyHidden component for accessibility - hides content visually but keeps it available to screen readers.
@@ -51,6 +51,11 @@ const DialogContent = React.forwardRef<
     maxWidth?: string;
     /** Maximum height of the dialog */
     maxHeight?: string;
+    /**
+     * Let Escape pressed in an input/textarea/contentEditable reach that element (for example to
+     * cancel an inline edit) instead of dismissing the dialog.
+     */
+    allowEditableEscape?: boolean;
   }
 >(
   (
@@ -60,6 +65,7 @@ const DialogContent = React.forwardRef<
       showCloseButton = true,
       maxWidth,
       maxHeight,
+      allowEditableEscape = false,
       style,
       onEscapeKeyDown,
       ...props
@@ -71,6 +77,12 @@ const DialogContent = React.forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         onEscapeKeyDown={(e) => {
+          if (allowEditableEscape && isEditableElement(e.target)) {
+            // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
+            // own onKeyDown run. Global Escape handlers already ignore editable targets.
+            e.preventDefault();
+            return;
+          }
           // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
           // Radix uses capture phase for Escape, so we must use onEscapeKeyDown (not onKeyDown).
           e.stopPropagation();

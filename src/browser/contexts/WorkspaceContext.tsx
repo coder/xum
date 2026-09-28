@@ -784,16 +784,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const workspaceStore = useWorkspaceStoreRaw();
 
   useLayoutEffect(() => {
-    // When the user navigates to settings, currentWorkspaceId becomes null
-    // (URL is /settings/...). Preserve the active workspace subscription so
-    // chat messages aren't cleared. Only null it out when truly leaving a
-    // workspace context (for example, via the compatibility root route).
+    // Settings keeps the workspace it was opened over in currentWorkspaceId. Analytics and cold
+    // settings links carry none, but should still preserve the active workspace subscription
+    // so chat messages aren't cleared.
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);
     } else if (!currentSettingsSection && !isAnalyticsOpen) {
       // Only null out the active workspace when truly leaving a workspace
-      // context (for example, via the compatibility root route). Settings and
-      // analytics pages should preserve the subscription so chat messages aren't cleared.
+      // context (for example, via the compatibility root route).
       workspaceStore.setActiveWorkspaceId(null);
     }
   }, [workspaceStore, currentWorkspaceId, currentSettingsSection, isAnalyticsOpen]);

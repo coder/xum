@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
 import { createAppHarness, type AppHarness } from "./harness";
+import { openSettingsDialog } from "./helpers";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { CachedMCPTestResult, MCPTestResult } from "@/common/types/mcp";
@@ -41,9 +42,8 @@ function serverRow(canvas: Canvas, name: string): HTMLElement {
 }
 
 async function openMcpSettings(app: AppHarness) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "MCP" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${SERVER} enabled` }, { timeout: 10000 });
   return canvas;
 }

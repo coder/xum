@@ -2,6 +2,7 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
@@ -93,13 +94,14 @@ function serverRow(root: HTMLElement, name: string): HTMLElement {
 }
 
 async function openMcpSettings(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const dialog = await openSettingsDialog(canvasElement);
+  const canvas = within(dialog);
   await userEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${NOTION} enabled` });
   await expect(
     canvas.queryByRole("button", { name: /Server information:/ })
   ).not.toBeInTheDocument();
+  return dialog;
 }
 
 async function testBothServers(root: HTMLElement) {
@@ -132,17 +134,16 @@ export const SettingsBeforeTest: AppStory = {
 export const SettingsAfterTest: AppStory = {
   ...SettingsBeforeTest,
   play: async ({ canvasElement }) => {
-    await openMcpSettings(canvasElement);
-    await testBothServers(canvasElement);
+    await testBothServers(await openMcpSettings(canvasElement));
   },
 };
 
 export const SettingsServerDetails: AppStory = {
   ...SettingsBeforeTest,
   play: async ({ canvasElement }) => {
-    await openMcpSettings(canvasElement);
-    await testBothServers(canvasElement);
-    await userEvent.click(within(canvasElement).getByRole("button", { name: INFO_BUTTON }));
+    const dialog = await openMcpSettings(canvasElement);
+    await testBothServers(dialog);
+    await userEvent.click(within(dialog).getByRole("button", { name: INFO_BUTTON }));
     const popover = await within(document.body).findByRole("dialog", { name: `About ${NOTION}` });
     await expect(popover.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     await expect(popover).toHaveTextContent("Notion MCP");
@@ -160,9 +161,9 @@ export const SettingsAutoTransport: AppStory = {
   ...SettingsBeforeTest,
   render: () => <AppWithMocks setup={() => setupIdentityStory("auto")} />,
   play: async ({ canvasElement }) => {
-    await openMcpSettings(canvasElement);
-    await testBothServers(canvasElement);
-    await userEvent.click(within(canvasElement).getByRole("button", { name: INFO_BUTTON }));
+    const dialog = await openMcpSettings(canvasElement);
+    await testBothServers(dialog);
+    await userEvent.click(within(dialog).getByRole("button", { name: INFO_BUTTON }));
     const popover = await within(document.body).findByRole("dialog", { name: `About ${NOTION}` });
     await expect(popover).toHaveTextContent("auto · https://mcp.notion.com");
   },
@@ -177,8 +178,7 @@ export const SettingsPhone: AppStory = {
   parameters: phoneParameters,
   play: async (context) => {
     await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
-    await openMcpSettings(context.canvasElement);
-    await testBothServers(context.canvasElement);
+    await testBothServers(await openMcpSettings(context.canvasElement));
     // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
     if (window.innerWidth < 768) {
       await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);

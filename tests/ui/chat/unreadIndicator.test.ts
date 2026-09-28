@@ -17,6 +17,7 @@ import { fireEvent, waitFor } from "@testing-library/react";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSettingsDialog } from "../helpers";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
@@ -35,6 +36,14 @@ function getWorkspaceUnreadState(workspaceId: string): {
     isUnread: (lastReadTimestamp: number) =>
       state.recencyTimestamp !== null && state.recencyTimestamp > lastReadTimestamp,
   };
+}
+
+/**
+ * Open the settings modal and confirm the chat stays mounted underneath it.
+ */
+async function openSettingsOverChat(app: AppHarness): Promise<void> {
+  await openSettingsDialog(app.view.container);
+  expect(app.view.container.querySelector('[data-testid="message-window"]') !== null).toBe(true);
 }
 
 /**
@@ -232,27 +241,15 @@ describe("Unread indicator (mock AI router)", () => {
       expect(isUnread(pastTime)).toBe(true);
     });
 
-    test("stream completion does NOT mark read when settings page is active", async () => {
-      // Regression: stream completion should not advance lastRead when the user
-      // is on a non-chat route (e.g. settings). The workspace remains "selected"
-      // but the chat content is not visible.
+    test("stream completion does NOT mark read while the settings modal covers the chat", async () => {
+      // Regression: stream completion should not advance lastRead while settings
+      // covers the chat. The workspace remains selected and mounted but not visible.
 
       // Send a gated message so the stream stays pending while we navigate away.
       await app.chat.send("[mock:wait-start] completion while in settings");
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
-      // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
-      expect(settingsButton).not.toBeNull();
-      fireEvent.click(settingsButton);
-
-      // Verify chat view is no longer rendered.
-      await waitFor(() => {
-        const messageWindow = app.view.container.querySelector('[data-testid="message-window"]');
-        if (messageWindow) {
-          throw new Error("Expected settings to replace AIView");
-        }
-      });
+      await openSettingsOverChat(app);
 
       // Release the stream gate so the stream completes while settings are active.
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
@@ -270,26 +267,15 @@ describe("Unread indicator (mock AI router)", () => {
       });
     }, 60_000);
 
-    test("focus while on settings does NOT mark read", async () => {
-      // Regression: window focus should not advance lastRead when the user
-      // is on a non-chat route, even if a workspace is selected.
+    test("focus while the settings modal is open does NOT mark read", async () => {
+      // Regression: window focus should not advance lastRead while settings covers
+      // the chat, even though the workspace stays selected.
 
       // Send a gated message so the stream stays pending while we navigate away.
       await app.chat.send("[mock:wait-start] focus bypass test");
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
-      // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
-      expect(settingsButton).not.toBeNull();
-      fireEvent.click(settingsButton);
-
-      // Verify chat view is no longer rendered.
-      await waitFor(() => {
-        const messageWindow = app.view.container.querySelector('[data-testid="message-window"]');
-        if (messageWindow) {
-          throw new Error("Expected settings to replace AIView");
-        }
-      });
+      await openSettingsOverChat(app);
 
       // Release the stream gate so the stream completes while settings are active.
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);

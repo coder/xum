@@ -641,6 +641,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
+  const settingsDialog = page.getByRole("dialog", { name: "Settings" });
   const settings = {
     async open(): Promise<void> {
       // Click the settings gear button in the title bar.
@@ -651,53 +652,34 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async close(): Promise<void> {
-      const closeControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
+      const closeControl = settingsDialog.getByRole("button", { name: "Close settings" });
       await expect(closeControl).toBeVisible({ timeout: 5000 });
       await closeControl.click();
       await settings.expectClosed();
     },
 
     async expectOpen(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => (await dialog.isVisible()) || (await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeVisible({ timeout: 5000 });
     },
 
     async expectClosed(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => !(await dialog.isVisible()) && !(await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeHidden({ timeout: 5000 });
     },
 
     async selectSection(section: "General" | "Providers" | "Models"): Promise<void> {
-      const sectionButton = page.getByRole("button", { name: section, exact: true });
+      const sectionButton = settingsDialog.getByRole("button", { name: section, exact: true });
       await expect(sectionButton).toBeVisible();
       await sectionButton.click();
     },
 
     async expandProvider(providerName: string): Promise<void> {
-      const providerButton = page.getByRole("button", { name: new RegExp(providerName, "i") });
+      const providerButton = settingsDialog.getByRole("button", {
+        name: new RegExp(providerName, "i"),
+      });
       await expect(providerButton).toBeVisible();
       await providerButton.click();
       // Wait for expansion - look for the "Base URL" label which is more unique
-      await expect(page.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
+      await expect(settingsDialog.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
     },
   };
 

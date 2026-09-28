@@ -10,7 +10,7 @@ import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { waitForScrollStabilization } from "./storyPlayHelpers.js";
+import { openSettingsDialog, waitForScrollStabilization } from "./storyPlayHelpers.js";
 
 export default { ...appMeta, title: "App/TokenBudget" };
 
@@ -337,8 +337,8 @@ export const ExperimentSettings: AppStory = {
     if (!canvas.queryByTestId("settings-button")) {
       await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
     }
-    await userEvent.click(await canvas.findByTestId("settings-button"));
-    const strategy = await canvas.findByRole("combobox", { name: "Compaction strategy" });
+    const settings = within(await openSettingsDialog(canvasElement));
+    const strategy = await settings.findByRole("combobox", { name: "Compaction strategy" });
     strategy.scrollIntoView({ block: "center" });
     await expect(strategy).toHaveTextContent("Token Budget");
     const page = within(canvasElement.ownerDocument.body);

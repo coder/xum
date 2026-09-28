@@ -16,7 +16,7 @@ import {
   readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
-import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import { applyFastModeServiceTierChange, getFastModeProvider } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
@@ -177,13 +177,8 @@ function AppInner() {
     createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
-  const {
-    currentWorkspaceId,
-    currentSettingsSection,
-    isAnalyticsOpen,
-    navigateToAnalytics,
-    navigateFromAnalytics,
-  } = useRouter();
+  const { currentWorkspaceId, isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics } =
+    useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
   const { open: openAboutDialog } = useAboutDialog();
@@ -347,9 +342,14 @@ function AppInner() {
   // Ref for selectedWorkspace to access in callbacks without stale closures
   const selectedWorkspaceRef = useRef(selectedWorkspace);
   selectedWorkspaceRef.current = selectedWorkspace;
+  const isSettingsOpenRef = useRef(isSettingsOpen);
+  isSettingsOpenRef.current = isSettingsOpen;
+  // The settings modal covers the chat, so a workspace behind it is selected but not visible:
+  // keep lastRead from advancing and keep its completion notifications.
+  const visibleChatWorkspaceId = isSettingsOpen ? null : currentWorkspaceId;
   // Ref for route-level workspace visibility to avoid stale closure in response callbacks
-  const currentWorkspaceIdRef = useRef(currentWorkspaceId);
-  currentWorkspaceIdRef.current = currentWorkspaceId;
+  const visibleChatWorkspaceIdRef = useRef(visibleChatWorkspaceId);
+  visibleChatWorkspaceIdRef.current = visibleChatWorkspaceId;
   useEffect(() => {
     const prev = prevWorkspaceRef.current;
     if (prev && selectedWorkspace && prev.workspaceId !== selectedWorkspace.workspaceId) {
@@ -359,8 +359,8 @@ function AppInner() {
   }, [selectedWorkspace, telemetry]);
 
   // Track last-read timestamps for unread indicators.
-  // Read-marking is gated on chat-route visibility (currentWorkspaceId).
-  useUnreadTracking(selectedWorkspace, currentWorkspaceId);
+  // Read-marking is gated on chat visibility.
+  useUnreadTracking(selectedWorkspace, visibleChatWorkspaceId);
 
   const workspaceMetadataRef = useRef(workspaceMetadata);
   useEffect(() => {
@@ -1096,7 +1096,7 @@ function AppInner() {
         e.preventDefault();
         if (isCommandPaletteOpen) {
           closeCommandPalette();
-        } else {
+        } else if (!isDialogOpen()) {
           // Alternate palette shortcut opens in command mode (with ">") while the
           // primary Ctrl/Cmd+Shift+P shortcut opens default workspace-switch mode.
           const initialQuery = matchesKeybind(e, KEYBINDS.OPEN_COMMAND_PALETTE_ACTIONS)
@@ -1106,10 +1106,11 @@ function AppInner() {
         }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
-        toggleFastMode().catch(() => undefined);
+        // Modals trap focus and hide the page behind them; don't change hidden page UI.
+        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
-        setSidebarCollapsed((prev) => !prev);
+        if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
         openSettings();
@@ -1314,11 +1315,10 @@ function AppInner() {
       }
 
       // Only mark read when the user is actively viewing this workspace's chat.
-      // Checking currentWorkspaceIdRef ensures we don't advance lastRead when
-      // a non-chat route (e.g. /settings) is active — the workspace remains
-      // "selected" but the chat content is not visible.
+      // A non-chat route or the settings modal hides the chat even though the
+      // workspace remains "selected".
       const isChatVisible =
-        document.hasFocus() && currentWorkspaceIdRef.current === event.workspaceId;
+        document.hasFocus() && visibleChatWorkspaceIdRef.current === event.workspaceId;
       if (event.completedAt != null && isChatVisible) {
         updatePersistedState(getWorkspaceLastReadKey(event.workspaceId), event.completedAt);
       }
@@ -1328,9 +1328,11 @@ function AppInner() {
       }
 
       // Skip notification if the selected workspace is focused (Slack-like behavior).
-      // Notification suppression intentionally follows selection state, not chat-route visibility.
+      // Notification suppression follows selection state, except that settings covers the chat.
       const isWorkspaceFocused =
-        document.hasFocus() && selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
+        document.hasFocus() &&
+        !isSettingsOpenRef.current &&
+        selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
       if (isWorkspaceFocused) {
         return;
       }
@@ -1396,14 +1398,10 @@ function AppInner() {
           <WindowsToolchainBanner />
           <RosettaBanner />
           <div className="mobile-layout flex flex-1 overflow-hidden">
-            {/* Route-driven settings and analytics render in the main pane so project/workspace navigation stays visible. */}
+            {/* Route-driven analytics renders in the main pane so project/workspace navigation stays
+                visible. Settings is a modal over whatever page it was opened from. */}
             {isAnalyticsOpen ? (
               <AnalyticsDashboard
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
-            ) : currentSettingsSection ? (
-              <SettingsPage
                 leftSidebarCollapsed={sidebarCollapsed}
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
@@ -1494,6 +1492,7 @@ function AppInner() {
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <SettingsPage />
         <PopoverError
           error={paletteRemoveError.error}
           prefix="Failed to remove workspace"

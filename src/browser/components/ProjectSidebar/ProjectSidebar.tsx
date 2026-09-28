@@ -1324,8 +1324,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleOpenSecrets = useCallback(
     (projectPath: string) => {
-      // Collapse the off-canvas sidebar on mobile before navigating so the
-      // settings page is immediately accessible without a backdrop blocking it.
+      // Collapse the off-canvas sidebar on mobile before opening settings so its
+      // backdrop is not left blocking the page when settings closes.
       if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
         persistMobileSidebarScrollTop(mobileScrollTopRef.current);
         onToggleCollapsed();

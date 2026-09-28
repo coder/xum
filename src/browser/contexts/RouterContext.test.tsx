@@ -1,8 +1,8 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { StrictMode } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate, type NavigateFunction } from "react-router-dom";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
 import {
   LAST_VISITED_ROUTE_KEY,
@@ -55,77 +55,125 @@ function PathnameObserver() {
   return <div data-testid="pathname">{location.pathname}</div>;
 }
 
-describe("navigateFromSettings", () => {
-  beforeEach(() => {
-    installWindow("https://mux.example.com/workspace/test");
-  });
+describe("settings background location", () => {
+  let latestRouter: RouterContext | null = null;
+  let latestNavigate: NavigateFunction | null = null;
 
-  afterEach(() => {
-    cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-  });
+  function Observer() {
+    const router = useRouter();
+    const location = useLocation();
+    latestRouter = router;
+    latestNavigate = useNavigate();
 
-  test("restores the previous location.state when leaving settings", async () => {
-    let latestRouter: RouterContext | null = null;
+    return (
+      <div>
+        <div data-testid="pathname">{location.pathname}</div>
+        <div data-testid="search">{location.search}</div>
+        <div data-testid="settingsSection">{router.currentSettingsSection ?? ""}</div>
+        <div data-testid="workspaceId">{router.currentWorkspaceId ?? ""}</div>
+        <div data-testid="projectPathFromState">{router.currentProjectPathFromState ?? ""}</div>
+        <div data-testid="draftId">{router.pendingDraftId ?? ""}</div>
+      </div>
+    );
+  }
 
-    function Observer() {
-      const router = useRouter();
-      const location = useLocation();
-      latestRouter = router;
-
-      return (
-        <div>
-          <div data-testid="pathname">{location.pathname}</div>
-          <div data-testid="projectPathFromState">{router.currentProjectPathFromState ?? ""}</div>
-        </div>
-      );
-    }
-
+  async function renderRouter() {
     const view = render(
       <RouterProvider>
         <Observer />
       </RouterProvider>
     );
-
     await waitFor(() => {
       expect(latestRouter).not.toBeNull();
     });
+    return view;
+  }
+
+  afterEach(() => {
+    cleanup();
+    latestRouter = null;
+    latestNavigate = null;
+    globalThis.window = undefined as unknown as Window & typeof globalThis;
+    globalThis.document = undefined as unknown as Document;
+  });
+
+  test("keeps the workspace behind settings across section switches and redirects", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToSettings("general"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("general");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateToSettings("models"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("models");
+    });
+    act(() => latestRouter!.navigateToSettings("experiments", { replace: true }));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("experiments");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("settingsSection").textContent).toBe("");
+  });
+
+  test("keeps the project draft and its location.state behind settings and restores them", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
 
     // Use a project path that cannot be recovered from the URL alone, so losing
     // location.state would break the /project view.
     const projectPath = "/tmp/unconfigured-project";
-
-    act(() => {
-      latestRouter!.navigateToProject(projectPath);
-    });
-
+    act(() => latestRouter!.navigateToProject(projectPath, "draft-1"));
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/project");
-      expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
     });
 
-    // Allow effects to flush so RouterContext has a chance to snapshot the last
-    // non-settings location before we navigate into settings.
-    await act(async () => {
-      await Promise.resolve();
-    });
-
-    act(() => {
-      latestRouter!.navigateToSettings("general");
-    });
-
+    act(() => latestRouter!.navigateToSettings("providers"));
     await waitFor(() => {
-      expect(view.getByTestId("pathname").textContent).toBe("/settings/general");
+      expect(view.getByTestId("pathname").textContent).toBe("/settings/providers");
     });
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    expect(view.getByTestId("draftId").textContent).toBe("draft-1");
 
-    act(() => {
-      latestRouter!.navigateFromSettings();
-    });
-
+    act(() => latestRouter!.navigateFromSettings());
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/project");
-      expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    });
+    expect(view.getByTestId("search").textContent).toContain("draft=draft-1");
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+  });
+
+  test("treats cold settings links and malformed background state as the root page", async () => {
+    installWindow("https://mux.example.com/settings/providers");
+    const view = await renderRouter();
+
+    expect(view.getByTestId("settingsSection").textContent).toBe("providers");
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      void latestNavigate!("/settings/general", {
+        state: { settingsBackground: { pathname: 42, search: "?x", state: null } },
+      });
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("general");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
     });
   });
 });

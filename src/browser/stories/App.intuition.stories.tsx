@@ -8,6 +8,7 @@ import {
   UNCERTAIN_INTUITION,
 } from "@/browser/features/Tools/IntuitionToolCall.fixtures";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
@@ -190,16 +191,16 @@ export const ReasoningSettings: AppStory = {
     if (!canvas.queryByTestId("settings-button")) {
       await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
     }
-    await userEvent.click(await canvas.findByTestId("settings-button"));
-    await userEvent.click((await canvas.findAllByRole("button", { name: "Agents" }))[0]);
-    const name = await canvas.findByText("Intuition", { exact: true });
+    const settings = within(await openSettingsDialog(canvasElement));
+    await userEvent.click(await settings.findByRole("button", { name: "Agents" }));
+    const name = await settings.findByText("Intuition", { exact: true });
     const card = name.closest<HTMLElement>(".rounded-md");
     if (!card) throw new globalThis.Error("Expected Intuition settings card");
     card.scrollIntoView({ block: "center" });
     await expect(within(card).getByRole("combobox")).toBeVisible();
     await expect(within(card).getAllByRole("switch")).toHaveLength(1);
     await expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
-    await expect(canvas.getByLabelText("Toggle name_workspace advisor")).toBeInTheDocument();
+    await expect(settings.getByLabelText("Toggle name_workspace advisor")).toBeInTheDocument();
     const reasoning = within(card).getByRole("button", { name: "Reasoning" });
     await expect(reasoning).toHaveTextContent("High");
     await userEvent.click(reasoning);

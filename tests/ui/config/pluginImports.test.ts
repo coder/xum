@@ -7,6 +7,7 @@ import { shouldRunIntegrationTests } from "../../testUtils";
 import { preloadTestModules } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo } from "../../ipc/helpers";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSettingsDialog } from "../helpers";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
@@ -29,9 +30,8 @@ async function commit(remote: string) {
 }
 
 async function openPreview(app: AppHarness, remote: string) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "Plugins" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "Plugins" }));
   fireEvent.click(await canvas.findByRole("button", { name: "Add plugin" }));
   const user = userEvent.setup({ document: app.view.container.ownerDocument });
   await user.type(canvas.getByLabelText("Git URL or owner/repo"), remote);
@@ -442,15 +442,23 @@ describeIntegration("Selective plugin imports", () => {
   test.each(["button", "keyboard", "palette"] as const)(
     "reopening installation via %s clears prior success through the next failed attempt",
     async (entryPoint) => {
-      const { canvas, user } = await openPreview(app, remote);
+      const opened = await openPreview(app, remote);
+      let canvas = opened.canvas;
+      const user = opened.user;
       await user.click(canvas.getByRole("button", { name: "Install" }));
       await canvas.findByText("Plugin installed.");
 
       if (entryPoint === "palette") {
+        // The palette cannot open over the settings modal, so it reopens settings from the page.
+        await user.click(canvas.getByRole("button", { name: "Close settings" }));
+        const body = within(app.view.container.ownerDocument.body);
+        await waitFor(() =>
+          expect(body.queryByRole("dialog", { name: "Settings" }) === null).toBe(true)
+        );
         await user.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
-        const palette = within(app.view.container.ownerDocument.body);
-        await user.type(await palette.findByLabelText("Command palette"), "> Install Agent Plugin");
-        await user.click(await palette.findByRole("option", { name: "Install Agent Plugin…" }));
+        await user.type(await body.findByLabelText("Command palette"), "> Install Agent Plugin");
+        await user.click(await body.findByRole("option", { name: "Install Agent Plugin…" }));
+        canvas = within(await body.findByRole("dialog", { name: "Settings" }));
       } else {
         const add = canvas.getByRole("button", { name: "Add plugin" });
         if (entryPoint === "keyboard") {

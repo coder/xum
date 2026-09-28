@@ -2,6 +2,7 @@ import { expect, userEvent, within } from "@storybook/test";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
@@ -80,28 +81,29 @@ function serverRow(root: HTMLElement, label: string): HTMLElement {
 }
 
 async function openMcpSettingsAndTest(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const dialog = await openSettingsDialog(canvasElement);
+  const canvas = within(dialog);
   await userEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${PLUGIN_LABEL} enabled` });
   for (const label of [PLUGIN_LABEL, LOCAL]) {
     await userEvent.click(
-      within(serverRow(canvasElement, label)).getByRole("button", { name: "Test connection" })
+      within(serverRow(dialog, label)).getByRole("button", { name: "Test connection" })
     );
   }
-  await within(serverRow(canvasElement, PLUGIN_LABEL)).findByText("5 tools");
-  await within(serverRow(canvasElement, LOCAL)).findByText("2 tools");
+  await within(serverRow(dialog, PLUGIN_LABEL)).findByText("5 tools");
+  await within(serverRow(dialog, LOCAL)).findByText("2 tools");
+  return dialog;
 }
 
-async function expandBothToolSections(canvasElement: HTMLElement) {
-  const plugin = serverRow(canvasElement, PLUGIN_LABEL);
+async function expandBothToolSections(dialog: HTMLElement) {
+  const plugin = serverRow(dialog, PLUGIN_LABEL);
   await userEvent.click(within(plugin).getByRole("button", { name: /^Tools: 5\b/ }));
   for (const tool of PLUGIN_TOOLS) await within(plugin).findByText(tool);
   // Read-only: names only, no permission controls for plugin definitions.
   await expect(within(plugin).queryAllByRole("checkbox")).toHaveLength(0);
   await expect(within(plugin).queryByRole("button", { name: "All" })).not.toBeInTheDocument();
 
-  const local = serverRow(canvasElement, LOCAL);
+  const local = serverRow(dialog, LOCAL);
   await userEvent.click(within(local).getByRole("button", { name: /^Tools: 2\/2\b/ }));
   await expect(await within(local).findAllByRole("checkbox")).toHaveLength(2);
 }
@@ -119,8 +121,7 @@ export const SettingsCollapsed: AppStory = {
 export const SettingsExpanded: AppStory = {
   ...SettingsCollapsed,
   play: async ({ canvasElement }) => {
-    await openMcpSettingsAndTest(canvasElement);
-    await expandBothToolSections(canvasElement);
+    await expandBothToolSections(await openMcpSettingsAndTest(canvasElement));
   },
 };
 
@@ -133,8 +134,7 @@ export const SettingsExpandedPhone: AppStory = {
   parameters: phoneParameters,
   play: async (context) => {
     await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
-    await openMcpSettingsAndTest(context.canvasElement);
-    await expandBothToolSections(context.canvasElement);
+    await expandBothToolSections(await openMcpSettingsAndTest(context.canvasElement));
     // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
     if (window.innerWidth < 768) {
       await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);

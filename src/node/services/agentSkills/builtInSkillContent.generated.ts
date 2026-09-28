@@ -5273,7 +5273,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "  GitHub organization membership rules.",
       "</Note>",
       "",
-      "## Server Access settings page",
+      "## Server Access settings",
       "",
       "Open **Settings → Server Access** to manage browser sessions.",
       "",

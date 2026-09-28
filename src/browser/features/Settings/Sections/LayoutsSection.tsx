@@ -200,7 +200,7 @@ export function LayoutsSection() {
   const [capturingSlot, setCapturingSlot] = useState<LayoutSlotNumber | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
-  // selectedWorkspace is URL-derived and becomes null on /settings routes.
+  // selectedWorkspace is null when settings opens from a cold link or a non-workspace page.
   // Fall back to the last selected workspace so capture/apply actions remain usable.
   const persistedWorkspaceSelection = useMemo(() => {
     const raw = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);

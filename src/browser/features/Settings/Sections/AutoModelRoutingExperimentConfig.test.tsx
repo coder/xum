@@ -178,7 +178,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     cleanupDom = installDom();
     mockApi = createMockApi();
     mockProvidersConfig = null;
-    // Settings routes carry no workspace; the panel bills previews to the last selected one.
+    // Settings opened without a workspace behind it bills previews to the last selected one.
     // Stored in the legacy id-only shape: the label must come from metadata, not from here.
     updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: "ws-settings" });
     mockWorkspaceMetadata = new Map([[SETTINGS_WORKSPACE.id, SETTINGS_WORKSPACE]]);
