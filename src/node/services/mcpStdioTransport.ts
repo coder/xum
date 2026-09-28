@@ -7,7 +7,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 // After stdin closes, how long a server gets to exit on its own before close() kills it.
 const MCP_STDIO_EXIT_GRACE_MS = 2_000;
 // Upper bound on waiting for the killed process to report its exit (a remote exec may never).
-const MCP_STDIO_KILL_JOIN_MS = 5_000;
+export const MCP_STDIO_KILL_JOIN_MS = 5_000;
 
 /**
  * Minimal stdio transport for MCP servers using newline-delimited JSON (NDJSON).
