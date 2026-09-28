@@ -259,8 +259,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
-  // #4980: same route-aware policy check as the model picker. Until the first policy answer and
-  // the providers config arrive, the active route is unknown, so the backend decides.
+  // #4980: same route-aware policy check as the model picker. Until the first policy answer, the
+  // providers config and the routing config (`appConfig`) arrive, the active route is unknown,
+  // so the backend decides.
   const { isAllowedByPolicyOnActiveRoute } = useModelsFromSettings();
   const { loading: policyLoading } = usePolicy();
   const { config: providersConfig } = useProvidersConfig();
@@ -278,6 +279,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const [freshPath, setFreshPath] = useState<string | null>(cached?.path ?? null);
 
   useEffect(() => {
+    // Set on setup too: StrictMode replays effects (setup, cleanup, setup) in development, and
+    // plan-action errors are only shown while this is true.
+    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
     };
@@ -633,6 +637,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     if (
       !policyLoading &&
       providersConfig !== null &&
+      appConfig !== null &&
       !isAllowedByPolicyOnActiveRoute(normalizeSelectedModel(settings.resolvedModel))
     ) {
       const agentName =
@@ -1056,7 +1061,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
 
       {planActionError && (implementButton ?? autoButton) && (
         <ToolChrome className="mt-2">
-          <ErrorBox role="alert">{planActionError}</ErrorBox>
+          {/* Backend errors can hold long unbroken model IDs or URLs. */}
+          <ErrorBox role="alert" className="wrap-anywhere">
+            {planActionError}
+          </ErrorBox>
         </ToolChrome>
       )}
     </div>

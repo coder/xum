@@ -7,6 +7,7 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
@@ -753,12 +754,16 @@ describe("ProposePlanToolCall", () => {
       },
     };
 
-    // Both providers have credentials, so the exec model routes directly to openai.
+    const PROVIDERS_CONFIG = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+
+    // Both providers have credentials and routing is loaded (default priority), so the exec
+    // model routes directly to openai.
     function withProvidersConfig() {
-      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
-        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      });
+      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(PROVIDERS_CONFIG);
+      spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({});
     }
 
     async function renderWithEnforcedPolicy(sendMessageCalls: SendMessageArgs[]) {
@@ -796,18 +801,26 @@ describe("ProposePlanToolCall", () => {
       );
     });
 
-    test("leaves the decision to the backend until the providers config is known", async () => {
-      // Without the providers config the active route is unknown (a gateway may be allowed).
-      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(null);
-      const sendMessageCalls: SendMessageArgs[] = [];
-      const view = await renderWithEnforcedPolicy(sendMessageCalls);
+    // Without the providers config or the routing config, the active route is unknown (a
+    // gateway route may be allowed).
+    test.each([
+      ["providers", null, {}],
+      ["routing", PROVIDERS_CONFIG, null],
+    ] as const)(
+      "leaves the decision to the backend until the %s config is known",
+      async (_name, providersConfig, appConfig) => {
+        spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(providersConfig);
+        spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue(appConfig);
+        const sendMessageCalls: SendMessageArgs[] = [];
+        const view = await renderWithEnforcedPolicy(sendMessageCalls);
 
-      fireEvent.click(view.getByRole("button", { name: "Implement" }));
+        fireEvent.click(view.getByRole("button", { name: "Implement" }));
 
-      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
-      expect(sendMessageCalls[0]?.options.model).toBe(EXEC_MODEL);
-      expect(view.queryByRole("alert")).toBeNull();
-    });
+        await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+        expect(sendMessageCalls[0]?.options.model).toBe(EXEC_MODEL);
+        expect(view.queryByRole("alert")).toBeNull();
+      }
+    );
   });
 
   test("shows a rejected Implement send in the card", async () => {

@@ -7,6 +7,8 @@ import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createProposePlanTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAgentIdKey } from "@/common/constants/storage";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/ProposePlan" };
 export default meta;
@@ -196,7 +198,7 @@ export const ProposePlanImplementBlockedByPolicy: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem("agentId:ws-plan-policy", JSON.stringify("plan"));
+        updatePersistedState(getAgentIdKey("ws-plan-policy"), "plan");
 
         return setupSimpleChatStory({
           workspaceId: "ws-plan-policy",
