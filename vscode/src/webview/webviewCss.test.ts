@@ -52,7 +52,7 @@ async function getBundledSourceFiles(): Promise<string[]> {
       (input) => /\.tsx?$/.test(input) && !input.includes("node_modules") && !input.includes(":")
     )
     .map((input) => path.resolve(vscodeDir, input));
-  // Sanity check: an empty list would make both checks pass vacuously.
+  // Sanity check: an empty list would make every check pass vacuously.
   expect(files).toContain(path.join(vscodeDir, "src", "webview", "App.tsx"));
   return files;
 }
@@ -113,10 +113,10 @@ function loadWebviewCss(): Promise<string> {
 }
 
 /*
- * Classes the desktop stylesheet defines for desktop-only surfaces. Check C skips them
- * because the webview never renders those surfaces. Exact names, not prefixes: a new desktop
- * class used by an importable module fails the guard until someone decides whether the
- * webview needs it. Check C also fails when a listed name stops being desktop-only.
+ * Classes the desktop stylesheet defines for desktop-only surfaces. The class-selector check
+ * skips them because the webview never renders those surfaces. Exact names, not prefixes: a new
+ * desktop class used by an importable module fails the guard until someone decides whether the
+ * webview needs it. The check also fails when a listed name stops being desktop-only.
  */
 const DESKTOP_ONLY_CLASSES = new Set([
   // Electron titlebar insets and drag regions: VS Code owns the window chrome.
