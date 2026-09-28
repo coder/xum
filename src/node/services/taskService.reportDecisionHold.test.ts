@@ -300,6 +300,13 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const hostSessions = (workspaceService as unknown as { sessions: Map<string, unknown> })
         .sessions;
       await Promise.all([...hostSessions.keys()].map((id) => workspaceService.disposeSession(id)));
+      // Join the host's tracked cleanup as the app-scope finalizer does. Since #5058 that
+      // includes the stream listeners' streaming-status writes, which would otherwise land in
+      // hold-extension-metadata.json after the fixture deleted the root.
+      const pending = (
+        workspaceService as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> }
+      ).pendingWorkspaceCleanup;
+      while (pending.size > 0) await Promise.all([...pending]);
       await sessionHarness.cleanup();
     };
     return {
