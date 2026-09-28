@@ -272,6 +272,8 @@ describe("StreamingMessageAggregator - Agent Status", () => {
       }),
     });
     expect(aggregator.getAgentStatus()).toBeUndefined();
+    // The persisted copy is cleared too, so a reload does not resurrect the stale status.
+    expect(createAggregator(WORKSPACE_ID).getAgentStatus()).toBeUndefined();
   });
 
   const toolStatusScenarios = [
