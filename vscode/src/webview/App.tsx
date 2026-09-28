@@ -754,7 +754,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       />
                     </div>
 
-                    <div className="border-t border-border bg-background-secondary p-3">
+                    <div className="bg-surface-primary px-[15px] pt-2 pb-2">
                       {selectedWorkspaceId && heldInputs.length > 0 ? (
                         // Bounded scroll lane: many or long held inputs must not push the composer
                         // below the fixed-height layout or collapse the transcript.

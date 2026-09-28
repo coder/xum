@@ -187,6 +187,31 @@ function setScrollGeometry(element: HTMLElement, geometry: { scrollTop: number }
   element.scrollTop = geometry.scrollTop;
 }
 
+const AGENT_DESCRIPTORS = [
+  { id: "exec", scope: "built-in", name: "Exec", uiSelectable: true, subagentRunnable: true },
+  { id: "plan", scope: "built-in", name: "Plan", uiSelectable: true, subagentRunnable: false },
+];
+
+function agentPicker(view: ReturnType<typeof render>): HTMLButtonElement {
+  return view.getByRole("button", { name: "Select agent" }) as HTMLButtonElement;
+}
+
+// Switches the agent through the composer's agent picker (needs agents.list answered).
+async function pickAgent(view: ReturnType<typeof render>, agentId: string): Promise<void> {
+  await act(async () => {
+    fireEvent.click(agentPicker(view));
+    await Promise.resolve();
+  });
+  const option = view.container.querySelector(
+    `[data-testid="agent-option"][data-agent-id="${agentId}"]`
+  );
+  if (!option) throw new Error(`agent picker has no ${agentId} option`);
+  await act(async () => {
+    fireEvent.click(option);
+    await Promise.resolve();
+  });
+}
+
 describe("vscode webview transcript auto-scroll", () => {
   let cleanupDom: (() => void) | null = null;
 
@@ -691,7 +716,7 @@ describe("vscode webview workspace AI settings", () => {
       },
     });
 
-    expect(view.getByRole("button", { name: "Plan" })).toBeDefined();
+    expect(agentPicker(view).textContent).toBe("Plan");
     const options = await send(bridge, view);
     expect(options).toMatchObject({
       agentId: "plan",
@@ -715,8 +740,10 @@ describe("vscode webview workspace AI settings", () => {
       await Promise.resolve();
     });
 
-    const toggle = view.getByRole("button", { name: "Exec" });
-    expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    expect(agentPicker(view).textContent).toBe("Exec");
+    expect(agentPicker(view).disabled).toBe(true);
+    // Agent cycling is locked too, so the composer does not advertise it.
+    expect(view.queryByText("- change agent")).toBeNull();
     const options = await send(bridge, view);
     expect(options.agentId).toBe("exec");
   });
@@ -733,10 +760,8 @@ describe("vscode webview workspace AI settings", () => {
       },
     });
 
-    await act(async () => {
-      fireEvent.click(view.getByRole("button", { name: "Plan" }));
-      await Promise.resolve();
-    });
+    await bridge.answer("agents.list", AGENT_DESCRIPTORS);
+    await pickAgent(view, "exec");
     const options = await send(bridge, view);
     expect(options).toMatchObject({
       agentId: "exec",
@@ -766,12 +791,9 @@ describe("vscode webview workspace AI settings", () => {
       fireEvent.click(view.getByText("Sonnet 5"));
       await Promise.resolve();
     });
-    for (const name of ["Plan", "Exec"]) {
-      await act(async () => {
-        fireEvent.click(view.getByRole("button", { name }));
-        await Promise.resolve();
-      });
-    }
+    await bridge.answer("agents.list", AGENT_DESCRIPTORS);
+    await pickAgent(view, "exec");
+    await pickAgent(view, "plan");
 
     const options = await send(bridge, view);
     expect(options.agentId).toBe("plan");
@@ -840,9 +862,8 @@ describe("vscode webview workspace AI settings", () => {
       ai: { parentWorkspaceId: "ws-parent", agentId: "explore", agentType: "explore" },
     });
 
-    const toggle = view.getByRole("button", { name: "explore" });
-    expect((toggle as HTMLButtonElement).disabled).toBe(true);
-    expect(view.queryByRole("button", { name: "Exec" })).toBeNull();
+    expect(agentPicker(view).textContent).toBe("Explore");
+    expect(agentPicker(view).disabled).toBe(true);
     const options = await send(bridge, view);
     expect(options.agentId).toBe("explore");
   });
@@ -879,17 +900,19 @@ describe("vscode webview agent lookup", () => {
   test("keeps the agent toggle disabled while agent state has no workspace scope (#4820)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
-    const toggle = () => view.getByRole("button", { name: "Exec" }) as HTMLButtonElement;
+    const toggle = () => agentPicker(view);
 
     // File mode lists and selects the workspace, but agent state stays unscoped (#4797).
     await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
     await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
     expect(toggle().disabled).toBe(true);
+    expect(view.queryByText("- change agent")).toBeNull();
 
     // With a server connection, the scope follows the listed selection.
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(toggle().disabled).toBe(false);
+    expect(view.queryByText("- change agent")).not.toBeNull();
   });
 
   test("keeps the agent toggle disabled for a restored selection until the workspace list arrives (#4820)", async () => {
@@ -899,7 +922,7 @@ describe("vscode webview agent lookup", () => {
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
     await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
 
-    const toggle = view.getByRole("button", { name: "Exec" }) as HTMLButtonElement;
+    const toggle = agentPicker(view);
     expect(toggle.disabled).toBe(true);
     await act(async () => {
       fireEvent.click(toggle);
@@ -1394,7 +1417,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     ]);
     await pickModel(view, "Sonnet 5");
 
-    expect((view.getByRole("button", { name: "Exec" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(agentPicker(view).disabled).toBe(true);
     const options = await send(bridge, view);
     expect(options).toMatchObject({
       agentId: "exec",

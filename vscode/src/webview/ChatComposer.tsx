@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type CSSProperties } from "react";
 
 import { SendHorizontal } from "lucide-react";
 
@@ -32,14 +32,18 @@ import { VimTextArea } from "xum/browser/components/VimTextArea/VimTextArea";
 import { ModelSelector } from "xum/browser/components/ModelSelector/ModelSelector";
 import { ThinkingSelector } from "xum/browser/components/ThinkingSelector/ThinkingSelector";
 import { ContextUsageIndicatorButton } from "xum/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
+import { AgentModePicker } from "xum/browser/components/AgentModePicker/AgentModePicker";
+import { Button } from "xum/browser/components/Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "xum/browser/components/Tooltip/Tooltip";
-
-import type { AgentId } from "xum/common/types/agentDefinition";
 
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "xum/common/utils/tokens/usageAggregator";
 import { cn } from "xum/common/lib/utils";
+import {
+  COMPOSER_CONTROL_HEIGHT_CLASS,
+  COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
+} from "xum/constants/layout";
 import {
   VIM_ENABLED_KEY,
   getInputKey,
@@ -56,44 +60,6 @@ const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 // sends for that workspace do not persist until the webview reloads (fail closed; the picks still
 // apply to the turns). Module scope, because the composer remounts per workspace.
 const aiPersistenceByWorkspace = new Map<string, "in-flight" | "unknown">();
-
-/**
- * Simple agent toggle for VS Code extension (no agent discovery).
- * Just toggles between Exec and Plan agents.
- */
-function SimpleAgentToggle(props: {
-  agentId: AgentId;
-  onChange: (agentId: AgentId) => void;
-  /** Sub-agent workspaces keep the agent they were created with (#4738). */
-  disabled: boolean;
-}) {
-  const isPlan = props.agentId === "plan";
-  // Seeded workspace settings can name a custom agent (e.g. a sub-agent's "explore"); show it as
-  // is rather than mislabeling it as Exec.
-  const label = isPlan ? "Plan" : props.agentId === "exec" ? "Exec" : props.agentId;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          disabled={props.disabled}
-          onClick={() => props.onChange(isPlan ? "exec" : "plan")}
-          className={cn(
-            "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50",
-            isPlan
-              ? "bg-plan-mode text-white hover:bg-plan-mode-hover"
-              : "bg-exec-mode text-white hover:bg-exec-mode-hover"
-          )}
-        >
-          {label}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent align="center">
-        Click to switch to {isPlan ? "Exec" : "Plan"} agent
-      </TooltipContent>
-    </Tooltip>
-  );
-}
 
 function getLastContextUsage(
   aggregator: StreamingMessageAggregator,
@@ -144,7 +110,10 @@ function ChatComposerInner(props: {
   const apiState = useAPI();
   const api = apiState.api;
 
-  const { agentId, setAgentId, isAgentSelectionLocked } = useAgent();
+  const { agentId, currentAgent, isAgentSelectionLocked } = useAgent();
+  // #4820: without a workspace scope a pick would write the webview's global agent key.
+  const agentPickerUsable = props.agentScoped && isAgentSelectionLocked !== true;
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
 
@@ -203,7 +172,6 @@ function ChatComposerInner(props: {
   const [isSending, setIsSending] = useState(false);
 
   const aggregator = props.aggregator;
-  const canInterruptStream = Boolean(aggregator?.getActiveStreamMessageId());
   const isCompactingStream = aggregator?.isCompacting() ?? false;
   const usageModelFromAggregator = aggregator?.getCurrentModel() ?? null;
 
@@ -429,122 +397,170 @@ function ChatComposerInner(props: {
       return `Compacting... (${formatKeybind(interruptKeybind)} cancel | ${formatKeybind(KEYBINDS.SEND_MESSAGE)} to queue)`;
     }
 
-    const hints: string[] = [];
-    if (canInterruptStream) {
-      const interruptKeybind = vimEnabled
-        ? KEYBINDS.INTERRUPT_STREAM_VIM
-        : KEYBINDS.INTERRUPT_STREAM_NORMAL;
-      hints.push(`${formatKeybind(interruptKeybind)} to interrupt`);
-    }
-
-    hints.push(
-      `${formatKeybind(KEYBINDS.SEND_MESSAGE)} to ${canInterruptStream ? "queue" : "send"}`
-    );
-    hints.push(`Click model to choose, ${formatKeybind(KEYBINDS.CYCLE_MODEL)} to cycle`);
-    hints.push(`/vim to toggle Vim mode (${vimEnabled ? "on" : "off"})`);
-
-    return `Type a message... (${hints.join(", ")})`;
+    // Desktop's tip carousel advertises slash commands and symbol shortcuts the webview does not
+    // implement (it only handles /vim locally), so use desktop's plain placeholder instead.
+    return "Type a message...";
   })();
 
+  // Mirrors the desktop composer (ChatInput): same surface, hint row, and control row. Attach,
+  // voice, and send-mode menus are omitted because the webview does not support them.
+  const composerSurfaceStyle: CSSProperties & { "--composer-focus-border": string } = {
+    "--composer-focus-border": currentAgent?.uiColor ?? "var(--color-border-light)",
+  };
+
   return (
-    <div className="flex flex-col gap-2">
-      <VimTextArea
-        value={input}
-        onChange={setInput}
-        placeholder={placeholder}
-        disabled={props.disabled}
-        onKeyDown={(e) => {
-          if (matchesKeybind(e, KEYBINDS.CYCLE_MODEL)) {
-            e.preventDefault();
-            cycleToNextModel();
-            return;
-          }
+    <div className="flex flex-col gap-1">
+      {storedModelAllowed ? null : (
+        <div role="status" className="text-content-secondary text-[11px]">
+          {policyFallbackModel
+            ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
+            : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
+        </div>
+      )}
+      {/* Scope the focus border to the textarea so sibling controls do not trigger it. */}
+      <div
+        className="border-border-light rounded-md border p-2 has-[textarea:focus]:border-[var(--composer-focus-border)]"
+        style={composerSurfaceStyle}
+        data-component="ChatInputSurface"
+      >
+        <div className="relative flex items-end pb-1" data-component="ChatInputControls">
+          <VimTextArea
+            ref={textareaRef}
+            value={input}
+            onChange={setInput}
+            placeholder={placeholder}
+            disabled={props.disabled}
+            className="min-h-22"
+            onKeyDown={(e) => {
+              if (matchesKeybind(e, KEYBINDS.CYCLE_MODEL)) {
+                e.preventDefault();
+                cycleToNextModel();
+                return;
+              }
 
-          // Same held-input shortcuts as the desktop composer: only from an empty composer, and
-          // routed to the HeldInput banner so they share its in-flight guard and error display.
-          const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
-            ? "send"
-            : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
-              ? "discard"
-              : null;
-          if (heldAction != null && props.heldInputId != null && input.trim() === "") {
-            e.preventDefault();
-            if (e.repeat) return;
-            window.dispatchEvent(
-              createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
-                workspaceId: props.workspaceId,
-                heldInputId: props.heldInputId,
-                action: heldAction,
-              })
-            );
-            return;
-          }
+              // Same held-input shortcuts as the desktop composer: only from an empty composer, and
+              // routed to the HeldInput banner so they share its in-flight guard and error display.
+              const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
+                ? "send"
+                : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
+                  ? "discard"
+                  : null;
+              if (heldAction != null && props.heldInputId != null && input.trim() === "") {
+                e.preventDefault();
+                if (e.repeat) return;
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
+                    workspaceId: props.workspaceId,
+                    heldInputId: props.heldInputId,
+                    action: heldAction,
+                  })
+                );
+                return;
+              }
 
-          if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE)) {
-            e.preventDefault();
-            void onSend();
-          }
-        }}
-      />
-
-      <div className="flex flex-col gap-2">
-        {storedModelAllowed ? null : (
-          <div role="status" className="text-content-secondary text-[11px]">
-            {policyFallbackModel
-              ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
-              : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
-          </div>
-        )}
-        <div className="w-full min-w-0" data-component="ModelSelectorGroup">
-          <ModelSelector
-            value={baseModel}
-            onChange={onModelChange}
-            models={models}
-            hiddenModels={hiddenModels}
-            defaultModel={defaultModel}
-            onSetDefaultModel={setDefaultModel}
-            onHideModel={hideModel}
-            onUnhideModel={unhideModel}
+              if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE)) {
+                e.preventDefault();
+                void onSend();
+              }
+            }}
           />
+          {/* Only shortcuts the webview handles: no FOCUS_CHAT handler exists here, and agent
+              cycling is hinted only when the picker itself is usable. */}
+          {input.trim() === "" && (
+            <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
+              <span className="shrink-0">
+                <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_MODEL)}</span>
+                <span> - change model</span>
+              </span>
+              {agentPickerUsable && (
+                <span className="shrink-0 [@container(max-width:520px)]:hidden">
+                  <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_AGENT)}</span>
+                  <span> - change agent</span>
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
-        <div className="@container flex items-center justify-between gap-2">
-          <div className="flex shrink-0 items-center overflow-visible">
-            <ThinkingSelector modelString={baseModel} allowProMode={false} allowFastMode={false} />
-          </div>
+        <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
+          <div
+            className="@container flex flex-nowrap items-center gap-1.5"
+            data-component="ComposerControlRow"
+          >
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <div className="min-w-0 [@container(max-width:320px)]:hidden">
+                <AgentModePicker
+                  className="min-w-0"
+                  iconOnlyHideClassName={COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS}
+                  disabled={!props.agentScoped}
+                  onComplete={() => textareaRef.current?.focus()}
+                />
+              </div>
 
-          <div className="flex shrink-0 items-center gap-1.5">
-            <ContextUsageIndicatorButton
-              data={contextUsageData}
-              autoCompaction={autoCompactionSettings}
-            />
-            <SimpleAgentToggle
-              agentId={agentId}
-              onChange={setAgentId}
-              disabled={isAgentSelectionLocked === true || !props.agentScoped}
-            />
+              <div
+                className={cn(
+                  "outline-border-light flex min-w-0 items-center gap-1.5 rounded-md px-1.5 outline-1 -outline-offset-1",
+                  COMPOSER_CONTROL_HEIGHT_CLASS
+                )}
+                data-component="ModelSelectorGroup"
+              >
+                <ModelSelector
+                  value={baseModel}
+                  onChange={onModelChange}
+                  models={models}
+                  hiddenModels={hiddenModels}
+                  defaultModel={defaultModel}
+                  onSetDefaultModel={setDefaultModel}
+                  onHideModel={hideModel}
+                  onUnhideModel={unhideModel}
+                  className="h-full max-w-[8rem] min-w-0"
+                />
+                <span className="bg-border-light h-3.5 w-px shrink-0" aria-hidden="true" />
 
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => void onSend()}
-                  disabled={!canSend}
-                  aria-label="Send message"
-                  className={cn(
-                    "inline-flex items-center gap-1 rounded-sm border border-border-light px-1.5 py-0.5 text-[11px] font-medium text-white transition-colors duration-200 disabled:opacity-50",
-                    agentId === "plan"
-                      ? "bg-plan-mode hover:bg-plan-mode-hover disabled:hover:bg-plan-mode"
-                      : "bg-exec-mode hover:bg-exec-mode-hover disabled:hover:bg-exec-mode"
-                  )}
-                >
-                  <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent align="center">
-                Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})
-              </TooltipContent>
-            </Tooltip>
+                <div className="flex shrink-0 items-center" data-component="ThinkingSelectorGroup">
+                  <ThinkingSelector
+                    modelString={baseModel}
+                    allowProMode={false}
+                    allowFastMode={false}
+                  />
+                </div>
+              </div>
+
+              <ContextUsageIndicatorButton
+                data={contextUsageData}
+                autoCompaction={autoCompactionSettings}
+              />
+            </div>
+
+            <div
+              className="flex shrink-0 items-center justify-end gap-1"
+              data-component="ModelControls"
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    onClick={() => void onSend()}
+                    disabled={!canSend}
+                    aria-label="Send message"
+                    size="xs"
+                    variant="ghost"
+                    className={cn(
+                      "inline-flex h-7 w-7 items-center justify-center rounded-full p-0 font-medium transition-colors duration-200",
+                      // Pin text colors because the ghost variant otherwise overrides the glyph.
+                      canSend
+                        ? "bg-composer-send hover:bg-composer-send text-composer-send-foreground hover:text-composer-send-foreground hover:opacity-90"
+                        : "bg-surface-secondary text-composer-send-foreground"
+                    )}
+                  >
+                    <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent align="start">
+                  Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})
+                </TooltipContent>
+              </Tooltip>
+            </div>
           </div>
         </div>
       </div>
