@@ -20,6 +20,6 @@ export function seedWebviewPreferences(snapshot: AppConfigSnapshot | null): void
   syncPersistedStateFromBackend(BASH_COLLAPSED_SUMMARY_MODE_KEY, snapshot.bashCollapsedSummaryMode);
   syncPersistedStateFromBackend(
     AGENT_AI_DEFAULTS_KEY,
-    normalizeAgentAiDefaults(snapshot.agentAiDefaults ?? {})
+    normalizeAgentAiDefaults(snapshot.agentAiDefaults)
   );
 }

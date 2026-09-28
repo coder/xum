@@ -670,8 +670,6 @@ describe("vscode webview plan actions (#4942)", () => {
   });
 });
 
-// #4972, #4962: the webview seeds backend preferences that shared components read from
-// localStorage out of the (host-projected) app config.
 describe("vscode webview backend preferences (#4972, #4962)", () => {
   let cleanupDom: (() => void) | null = null;
 

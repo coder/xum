@@ -182,8 +182,7 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   }
   // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
   // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each
-  // entry from named fields only and drops invalid agent IDs, so fields added to the on-disk entry
-  // later stay in the host unless the normalizer is changed to read them.
+  // entry from named fields only, so unknown on-disk fields stay in the host.
   if (typeof config.agentAiDefaults === "object" && config.agentAiDefaults !== null) {
     projected.agentAiDefaults = normalizeAgentAiDefaults(config.agentAiDefaults);
   }
