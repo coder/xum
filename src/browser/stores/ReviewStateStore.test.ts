@@ -46,12 +46,18 @@ function createBackend(initial: ReviewStateSections = {}) {
     inFlight: 0,
     maxInFlight: 0,
     failNextUpdate: false,
+    failNextSubscribe: false,
     failImport: false,
     /** When set, the initial snapshot waits for it (keeps the store un-hydrated). */
     hydrationGate: null as Promise<void> | null,
     updateGate: null as Promise<void> | null,
+    /** When set, an update is persisted at once but its reply waits for it (a slow reply). */
+    replyGate: null as Promise<void> | null,
     get sections() {
       return sections;
+    },
+    get openStreams() {
+      return streams.size;
     },
     /** A write from another client: persisted and pushed to every subscriber. */
     externalWrite(delta: ReviewStateDelta) {
@@ -62,6 +68,10 @@ function createBackend(initial: ReviewStateSections = {}) {
   const reviewState = {
     subscribe: async (_input: { workspaceId: string }, opts?: { signal?: AbortSignal }) => {
       await backend.hydrationGate;
+      if (backend.failNextSubscribe) {
+        backend.failNextSubscribe = false;
+        throw new Error("subscribe failed");
+      }
       const queue: ReviewStateEvent[] = [{ type: "snapshot", snapshot: { sections } }];
       let wake: (() => void) | null = null;
       const push = (event: ReviewStateEvent) => {
@@ -98,7 +108,9 @@ function createBackend(initial: ReviewStateSections = {}) {
           throw new Error("update failed");
         }
         sections = applyReviewStateDelta(sections, input.delta);
-        return { sections };
+        const reply = { sections };
+        await backend.replyGate;
+        return reply;
       } finally {
         backend.inFlight--;
       }
@@ -232,6 +244,65 @@ describe("ReviewStateStore", () => {
     expect(backend.sections.hunkExpand).toEqual({ b: true });
   });
 
+  test("a slow update reply does not roll back a newer server push", async () => {
+    const { backend, client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    const reply = deferred();
+    backend.replyGate = reply.promise;
+    store.mutate(WS, "hunkExpand", () => ({ set: { local: true } }));
+    const flushed = store.flush(WS);
+    await waitUntil(() => backend.sections.hunkExpand?.local === true);
+    // Another renderer writes after our update was persisted but before its reply arrives.
+    backend.externalWrite({ hunkExpand: { set: { remote: true } } });
+    await waitUntil(() => store.getView(WS).sections.hunkExpand?.remote === true);
+
+    reply.resolve();
+    await flushed;
+    expect(store.getView(WS).sections.hunkExpand).toEqual({ local: true, remote: true });
+  });
+
+  test("a failed first subscription unblocks the UI but replays queued updaters only onto real data", async () => {
+    const { backend, client } = createBackend({
+      reviews: { r1: makeReview("r1", "attached"), r2: makeReview("r2", "pending") },
+    });
+    backend.failNextSubscribe = true;
+    const store = connect(client);
+    store.mutate(WS, "reviews", (prev) => ({
+      set: Object.fromEntries(
+        Object.values(prev)
+          .filter((review) => review.status === "attached")
+          .map((review) => [review.id, { ...review, status: "checked" as const }])
+      ),
+    }));
+
+    await store.whenReady(WS);
+    expect(store.isReady(WS)).toBe(true);
+    // Nothing was hydrated, so nothing may be reported as persisted.
+    expect(await store.areReviewsDurable(WS, [])).toBe(false);
+
+    // The mounted selector resubscribes; the queued updater then runs against the real reviews.
+    await waitUntil(() => backend.sections.reviews?.r1?.status === "checked");
+    expect(backend.sections.reviews?.r2?.status).toBe("pending");
+  });
+
+  test("imperative whenReady and flush hydrate a workspace with no mounted selector", async () => {
+    const { backend, client } = createBackend({ hunkExpand: { h0: true } });
+    const store = new ReviewStateStore();
+    store.setClient(client);
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("flush never settled")), 2_000)
+    );
+    await Promise.race([store.flush(WS), timeout]);
+
+    expect(backend.sections.hunkExpand).toEqual({ h0: true, h1: true });
+    // The temporary subscription is released once the operation settled.
+    expect(backend.openStreams).toBe(0);
+  });
+
   test("reports restored notes durable only once the backend acknowledged them (#4448)", async () => {
     const { backend, client } = createBackend();
     const store = connect(client);
@@ -288,6 +359,34 @@ describe("ReviewStateStore legacy localStorage migration", () => {
 
     expect(backend.importCalls).toBe(0);
     expect(window.localStorage.getItem(getReviewsKey(WS))).toBeNull();
+  });
+
+  test("a failed import is retried before the next write so that write cannot shadow it", async () => {
+    const { backend, client } = createBackend();
+    backend.failImport = true;
+    const h1 = { hunkId: "h1", isRead: true, timestamp: 5 };
+    updatePersistedState(getReviewStateKey(WS), {
+      workspaceId: WS,
+      readState: { h1 },
+      lastUpdated: 1,
+    });
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    const h2 = { hunkId: "h2", isRead: true, timestamp: 6 };
+    store.mutate(WS, "readState", () => ({ set: { h2 } }));
+    // The import still fails: the write stays unsent instead of creating the section.
+    let flushError: unknown = null;
+    await store.flush(WS).catch((error: unknown) => {
+      flushError = error;
+    });
+    expect(flushError).not.toBeNull();
+    expect(backend.updates).toBe(0);
+
+    backend.failImport = false;
+    await store.flush(WS);
+    expect(backend.sections.readState).toEqual({ h1, h2 });
+    expect(readPersistedState(getReviewStateKey(WS), null)).toBeNull();
   });
 
   test("keeps the legacy key when the import fails", async () => {

@@ -42,7 +42,10 @@ import {
 
 export interface ReviewStateView {
   sections: ReviewStateSections;
-  /** True once the first server snapshot (plus the legacy import) has been applied. */
+  /**
+   * True once the review UI may leave its loading state: the first server snapshot (plus the
+   * legacy import) was applied, or the subscription failed before one arrived (self-heal).
+   */
   isReady: boolean;
 }
 
@@ -57,7 +60,19 @@ interface Entry {
   pending: ReviewStateDelta[];
   /** Updaters issued before hydration; replayed onto the hydrated view. */
   queued: QueuedUpdater[];
+  /** UI unblocked (see ReviewStateView.isReady); `ready` resolves at the same moment. */
   isReady: boolean;
+  /**
+   * A real server snapshot was applied. Distinct from isReady: a failed first subscription
+   * unblocks the UI but must not replay queued updaters onto an empty base (they would then
+   * be computed from missing data), and flush must not claim durability without it.
+   */
+  hydrated: boolean;
+  /**
+   * The legacy localStorage import failed. Every flush retries it first, so a user write
+   * cannot make a section present on the backend ahead of the (non-clobbering) import.
+   */
+  legacyImportPending: boolean;
   ready: Promise<void>;
   resolveReady: () => void;
   refCount: number;
@@ -142,14 +157,33 @@ export class ReviewStateStore {
     if (entry.refCount === 1) this.ensureSubscribed(workspaceId);
     return () => {
       entry.listeners.delete(listener);
-      entry.refCount--;
-      if (entry.refCount > 0 || this.entries.get(workspaceId) !== entry) return;
-      // Keep base/view in memory so switching back does not flash empty; the next
-      // subscription refreshes it.
-      this.stopSubscription(entry);
-      this.flushInBackground(workspaceId);
+      this.release(workspaceId, entry);
     };
   };
+
+  private release(workspaceId: string, entry: Entry): void {
+    entry.refCount--;
+    if (entry.refCount > 0 || this.entries.get(workspaceId) !== entry) return;
+    // Keep base/view in memory so switching back does not flash empty; the next
+    // subscription refreshes it.
+    this.stopSubscription(entry);
+    this.flushInBackground(workspaceId);
+  }
+
+  /** Hold the workspace subscription open (hydrating it if needed) while `run` settles. */
+  private async withRetained<T>(
+    workspaceId: string,
+    run: (entry: Entry) => Promise<T>
+  ): Promise<T> {
+    const entry = this.getOrCreateEntry(workspaceId);
+    entry.refCount++;
+    if (entry.refCount === 1) this.ensureSubscribed(workspaceId);
+    try {
+      return await run(entry);
+    } finally {
+      this.release(workspaceId, entry);
+    }
+  }
 
   getView = (workspaceId: string): ReviewStateView => {
     if (workspaceId.length === 0) return EMPTY_READY_VIEW;
@@ -160,10 +194,13 @@ export class ReviewStateStore {
     return this.getView(workspaceId).isReady;
   }
 
-  /** Resolves once the workspace's state is hydrated (immediately for an empty ID). */
+  /**
+   * Resolves once the workspace's state is ready (immediately for an empty ID). Starts the
+   * subscription itself when no selector is mounted, so imperative callers never hang.
+   */
   whenReady(workspaceId: string): Promise<void> {
     if (workspaceId.length === 0) return Promise.resolve();
-    return this.getOrCreateEntry(workspaceId).ready;
+    return this.withRetained(workspaceId, (entry) => entry.ready);
   }
 
   getAttachedReviews(workspaceId: string): Review[] {
@@ -187,7 +224,7 @@ export class ReviewStateStore {
       const delta = updater(sectionOf(view, section));
       return delta && !isEmptyDelta(delta) ? sectionDelta(section, delta) : null;
     };
-    if (!entry.isReady) {
+    if (!entry.hydrated) {
       entry.queued.push(queued);
       return;
     }
@@ -198,12 +235,17 @@ export class ReviewStateStore {
     this.scheduleFlush(workspaceId, entry);
   }
 
-  /** Wait for hydration, then send every pending change. Rejects when a request fails. */
+  /**
+   * Wait for hydration, then send every pending change. Rejects when a request fails or the
+   * state could not be hydrated (queued changes are then still unsent).
+   */
   async flush(workspaceId: string): Promise<void> {
     if (workspaceId.length === 0) return;
-    const entry = this.getOrCreateEntry(workspaceId);
-    await entry.ready;
-    await this.drain(workspaceId, entry);
+    await this.withRetained(workspaceId, async (entry) => {
+      await entry.ready;
+      if (!entry.hydrated) throw new Error("Review state flush failed: not hydrated");
+      await this.drain(workspaceId, entry);
+    });
   }
 
   /**
@@ -243,6 +285,8 @@ export class ReviewStateStore {
       pending: [],
       queued: [],
       isReady: false,
+      hydrated: false,
+      legacyImportPending: false,
       ready,
       resolveReady,
       refCount: 0,
@@ -284,16 +328,25 @@ export class ReviewStateStore {
     this.recompute(entry);
   }
 
-  private markReady(workspaceId: string, entry: Entry): void {
+  /** Unblock the UI (and `ready`) without replaying queued updaters. */
+  private markReady(entry: Entry): void {
     if (entry.isReady) return;
     entry.isReady = true;
+    this.recompute(entry);
+    entry.resolveReady();
+  }
+
+  /** A real snapshot arrived: replay the queued updaters onto it, then unblock. */
+  private markHydrated(workspaceId: string, entry: Entry): void {
+    if (entry.hydrated) return;
+    entry.hydrated = true;
     for (const queued of entry.queued) {
       const delta = queued(entry.pending.reduce(applyReviewStateDelta, entry.base));
       if (delta) entry.pending.push(delta);
     }
     entry.queued = [];
     this.recompute(entry);
-    entry.resolveReady();
+    this.markReady(entry);
     if (entry.pending.length > 0) this.scheduleFlush(workspaceId, entry);
   }
 
@@ -322,7 +375,7 @@ export class ReviewStateStore {
             first = false;
             this.setBase(entry, event.snapshot.sections);
             await this.importLegacy(workspaceId, entry, client);
-            this.markReady(workspaceId, entry);
+            this.markHydrated(workspaceId, entry);
           } else {
             this.setBase(entry, event.snapshot.sections);
           }
@@ -330,9 +383,9 @@ export class ReviewStateStore {
       } catch (error) {
         if (!signal.aborted && !isAbortError(error)) {
           console.error("Failed to subscribe to review state:", error);
-          // Self-heal: never hold the review pane (or a send) on a broken subscription.
-          // Deltas are per entry, so later writes cannot clobber server data.
-          this.markReady(workspaceId, entry);
+          // Self-heal: never hold the review pane (or a send) on a broken subscription. Queued
+          // updaters stay queued until a resubscription delivers real data.
+          this.markReady(entry);
         }
       } finally {
         if (entry.subscription === controller) entry.subscription = null;
@@ -372,7 +425,7 @@ export class ReviewStateStore {
    * One-way, non-clobbering migration of the legacy localStorage keys. Sections already
    * present on the backend are newer, so their leftover keys are dropped without importing.
    * A key is removed only after the server reports the section applied or present; on error
-   * it stays and the next hydration retries.
+   * it stays, `legacyImportPending` is set, and the next flush (or hydration) retries.
    */
   private async importLegacy(workspaceId: string, entry: Entry, client: APIClient): Promise<void> {
     const toImport: Record<string, unknown> = {};
@@ -390,7 +443,10 @@ export class ReviewStateStore {
       toImport[section] = LEGACY_SECTIONS[section].extract(stored);
       importing.push(section);
     }
-    if (importing.length === 0) return;
+    if (importing.length === 0) {
+      entry.legacyImportPending = false;
+      return;
+    }
 
     // Drop malformed legacy entries up front: one bad entry must not fail request validation
     // and pin the legacy key forever.
@@ -401,18 +457,33 @@ export class ReviewStateStore {
         updatePersistedState(LEGACY_SECTIONS[section].key(workspaceId), undefined);
       }
     }
-    if (REVIEW_STATE_SECTIONS.every((section) => sections[section] === undefined)) return;
+    if (REVIEW_STATE_SECTIONS.every((section) => sections[section] === undefined)) {
+      entry.legacyImportPending = false;
+      return;
+    }
 
     try {
       const result = await client.workspace.reviewState.importLegacy({ workspaceId, sections });
-      this.setBase(entry, result.snapshot.sections);
+      entry.legacyImportPending = false;
+      // Subscription pushes are authoritative for base and may already be newer than this
+      // reply, so only fill sections the current base still lacks.
+      const next: ReviewStateSections = { ...entry.base };
       for (const section of REVIEW_STATE_SECTIONS) {
+        if (next[section] === undefined && result.snapshot.sections[section] !== undefined) {
+          assignSection(next, section, result.snapshot.sections[section]);
+        }
         if (result.results[section] !== undefined) {
           updatePersistedState(LEGACY_SECTIONS[section].key(workspaceId), undefined);
         }
       }
+      entry.base = next;
+      this.recompute(entry);
     } catch (error) {
-      console.warn("Failed to import legacy review state; will retry on next load:", error);
+      entry.legacyImportPending = true;
+      console.warn(
+        "Failed to import legacy review state; will retry before the next write:",
+        error
+      );
     }
   }
 
@@ -426,7 +497,7 @@ export class ReviewStateStore {
 
   private flushInBackground(workspaceId: string): void {
     const entry = this.entries.get(workspaceId);
-    if (!entry?.isReady || entry.pending.length === 0) return;
+    if (!entry?.hydrated || entry.pending.length === 0) return;
     // Failures already scheduled a retry inside drain(); nothing else to do here.
     this.drain(workspaceId, entry).catch(() => undefined);
   }
@@ -440,22 +511,31 @@ export class ReviewStateStore {
       }
       const client = this.client;
       if (!client) throw new Error("Review state flush failed: API not available");
-      const batch = entry.pending.slice();
-      const request = client.workspace.reviewState.update({
-        workspaceId,
-        delta: mergeReviewStateDeltas(batch),
+      let settle: () => void = () => undefined;
+      entry.inFlight = new Promise<void>((resolve) => {
+        settle = resolve;
       });
-      entry.inFlight = request.then(
-        () => undefined,
-        () => undefined
-      );
       try {
-        const snapshot = await request;
+        if (entry.legacyImportPending) {
+          // Import first: the server applies only absent sections, so this write must not
+          // make a section present before its legacy data landed. Failing keeps pending.
+          await this.importLegacy(workspaceId, entry, client);
+          if (entry.legacyImportPending) {
+            throw new Error("Review state flush failed: legacy import still pending");
+          }
+        }
+        const batch = entry.pending.slice();
+        const delta = mergeReviewStateDeltas(batch);
+        await client.workspace.reviewState.update({ workspaceId, delta });
         entry.flushAttempt = 0;
         // Only local deltas are removed here and new ones are appended, so the sent ones
         // are exactly the first batch.length entries.
         entry.pending = entry.pending.slice(batch.length);
-        this.setBase(entry, snapshot.sections);
+        // The reply snapshot can be older than a subscription push already applied (another
+        // renderer's write), so apply exactly the acknowledged delta to the current base;
+        // pushes stay authoritative and re-applying an echoed delta is idempotent.
+        entry.base = applyReviewStateDelta(entry.base, delta);
+        this.recompute(entry);
       } catch (error) {
         // Keep pending (never silently drop a change) and retry with backoff.
         const delay = retryDelayMs(entry.flushAttempt++);
@@ -467,6 +547,7 @@ export class ReviewStateStore {
         throw error;
       } finally {
         entry.inFlight = null;
+        settle();
       }
     }
   }
