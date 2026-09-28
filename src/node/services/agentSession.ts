@@ -630,6 +630,11 @@ const EMPTY_RESUME_HISTORY_ERROR =
 export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
+  /**
+   * Set only by history replay for rows that passed the wire-schema self-healing check.
+   * `message` is then the schema's parse output, so onChat does not validate it again (#4868).
+   */
+  wireValidated?: true;
 }
 
 export interface AgentSessionMetadataEvent {
@@ -3049,10 +3054,17 @@ export class AgentSession {
     let streamReplayed = false;
 
     // Self-healing: persisted rows can fail the current wire schema (older
-    // writers, schema drift, corruption). oRPC validates every event yielded to
-    // onChat subscribers and a single invalid row terminates the iterator,
-    // which would permanently brick workspace fetch. Skip such rows instead of
-    // letting one bad line take down the whole transcript.
+    // writers, schema drift, corruption). onChat validates every event it yields
+    // and a single invalid row terminates the iterator, which would permanently
+    // brick workspace fetch. Skip such rows instead of letting one bad line take
+    // down the whole transcript.
+    //
+    // Emit the parse OUTPUT (not the raw row), flagged wireValidated, so onChat
+    // skips a second parse of every replayed row (#4868). The bytes on the wire
+    // stay identical: this schema is the wire union's `message` member, and the
+    // union's parse output is exactly what oRPC used to send. getFullReplay's
+    // array schema re-validates it idempotently, and src/cli/run.ts drops replay
+    // rows before caught-up.
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
       const validation = ChatMuxMessageSchema.safeParse(message);
       if (!validation.success) {
@@ -3066,7 +3078,7 @@ export class AgentSession {
         return false;
       }
       emittedReplayMessages = true;
-      listener({ workspaceId: this.workspaceId, message });
+      listener({ workspaceId: this.workspaceId, message: validation.data, wireValidated: true });
       return true;
     };
 

@@ -395,7 +395,8 @@ describe("AgentSession edit precondition", () => {
       events.push(message);
     });
     const clientRows = events.filter(isMuxMessage);
-    expect(clientRows.find((row) => row.id === "a2")?.parts).toEqual(partial.parts);
+    // Replay emits the wire schema's parse output (#4868), as the client receives it.
+    expect(clientRows.find((row) => row.id === "a2")?.parts).toEqual(wire([partial])[0].parts);
     const result = await h.session.sendMessage("second, edited", {
       ...baseOptions,
       editMessageId: "u2",

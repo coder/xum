@@ -11,6 +11,7 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
+import { ChatMuxMessageSchema } from "@/common/orpc/schemas";
 import {
   isMuxMessage,
   type CaughtUpMessage,
@@ -24,9 +25,15 @@ import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSess
 
 const workspaceId = "ws-replay-cursor-golden";
 
+// replayHistory emits the wire schema's parse output (#4868), which drops keys the schema does not
+// know (createMuxMessage's text-part `state`), so compare schema-normalized parts.
 function digest(rows: readonly MuxMessage[]): string[] {
   return rows.map((row) =>
-    JSON.stringify({ id: row.id, seq: row.metadata?.historySequence, parts: row.parts })
+    JSON.stringify({
+      id: row.id,
+      seq: row.metadata?.historySequence,
+      parts: ChatMuxMessageSchema.parse({ ...row, type: "message" }).parts,
+    })
   );
 }
 

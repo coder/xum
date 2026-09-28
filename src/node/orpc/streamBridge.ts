@@ -106,6 +106,13 @@ export interface SubscriptionStreamOptions<T> {
    * the subscription (used to surface bootstrap errors to the client).
    */
   onEnd?: () => void | Promise<void>;
+  /**
+   * Applied to every delivered value (including `initial` and heartbeats) just before it is
+   * yielded. A throw fails the subscription like a failed pull and runs teardown. A plain hook
+   * rather than an extra wrapping async generator: a generator layer per value costs about 1 s
+   * of CPU on a 1.24M-row onChat replay (#4868).
+   */
+  mapValue?: (value: T) => T;
 }
 
 /**
@@ -223,7 +230,7 @@ export function subscriptionIterable<T>(options: SubscriptionStreamOptions<T>): 
       while (true) {
         const result = await iterator.next();
         if (result.done) return;
-        yield result.value;
+        yield options.mapValue ? options.mapValue(result.value) : result.value;
       }
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
