@@ -2644,7 +2644,11 @@ describe("MCPServerManager", () => {
 
   // #4953, bounded: a killed process that never reports its exit (a lost remote exec) holds
   // the timed-out startup only until the cleanup bound, and the unconfirmed exit is logged.
-  test("a startup timeout gives up on a killed process that never reports its exit", async () => {
+  test.each([
+    { label: "never reports", exitCode: () => new Promise<number>(() => undefined) },
+    // A rejected observation (a remote child-process error) does not prove the process stopped.
+    { label: "fails to report", exitCode: () => Promise.reject(new Error("ssh: channel error")) },
+  ])("a startup timeout gives up on a killed process that $label its exit", async (variant) => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
     configService.listServers = mock(() =>
       Promise.resolve({ "stdio-exit-lost": stdioConfig("never") })
@@ -2659,7 +2663,7 @@ describe("MCPServerManager", () => {
         stdin: new WritableStream<Uint8Array>(),
         stdout: new ReadableStream<Uint8Array>(),
         stderr: new ReadableStream<Uint8Array>(),
-        exitCode: new Promise<number>(() => undefined),
+        exitCode: variant.exitCode(),
         duration: new Promise<number>(() => undefined),
       };
     });

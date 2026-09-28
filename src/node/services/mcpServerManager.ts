@@ -6195,10 +6195,13 @@ export class MCPServerManager {
         }
         // Join the killed process's exit, bounded like MCPStdioTransport.close(): on remote
         // runtimes the abort only starts a SIGTERM-then-dispose sequence (#4953).
-        const exited = await raceWithAbortAndTimeout(execStream.exitCode, {
-          timeoutMs: MCP_STDIO_KILL_JOIN_MS,
-        }).catch(() => ({ kind: "rejected" as const }));
-        if (exited.kind === "timeout") {
+        // A rejected exit observation does not prove the process stopped (as for the use lease
+        // above): keep waiting out the bound, then report the exit as unconfirmed.
+        const exited = await raceWithAbortAndTimeout(
+          execStream.exitCode.catch(() => new Promise<never>(() => undefined)),
+          { timeoutMs: MCP_STDIO_KILL_JOIN_MS }
+        );
+        if (exited.kind !== "ok") {
           log.warn("[MCP] Killed stdio server did not report its exit after a startup abort", {
             name,
             workspaceId,
