@@ -2106,4 +2106,120 @@ describe("vscode webview message rows", () => {
     });
     expect(view.queryByText("reply number 0")).not.toBeNull();
   });
+
+  // ChatPane-level derivations the webview shares with desktop (#5002).
+  test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
+    const scrolled: Element[] = [];
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge, [
+        historyMessage("first", "user", "first prompt", { historySequence: 1 }),
+        historyMessage("wake", "user", "A monitor matched.", {
+          historySequence: 2,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [{ kind: "match", displayName: "Dev", filter: "ready", filterExclude: false }],
+          },
+        }),
+        historyMessage("second", "user", "second prompt", { historySequence: 3 }),
+      ]);
+
+      const firstRow = view.container.querySelector('[data-message-id="first"]');
+      const next = firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Next message"]');
+      expect(next).not.toBeNull();
+      expect(
+        firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Previous message"]')
+          ?.disabled
+      ).toBe(true);
+
+      await act(async () => {
+        fireEvent.click(next!);
+        await Promise.resolve();
+      });
+      expect(scrolled).toEqual([view.container.querySelector('[data-message-id="second"]')!]);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test("consecutive bash_output polls of one process collapse behind a toggle", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(
+      bridge,
+      ["out-1", "out-2", "out-3"].map((id, index) =>
+        toolMessage(
+          id,
+          index + 1,
+          "bash_output",
+          { process_id: "proc-1", timeout_secs: 5 },
+          { success: true, status: "running", output: `poll ${index + 1}`, elapsed_ms: 10 }
+        )
+      )
+    );
+
+    const middleRow = () => view.container.querySelector('[data-message-id="out-2"]');
+    expect(view.container.querySelector('[data-message-id="out-1"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-message-id="out-3"]')).not.toBeNull();
+    expect(middleRow()).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Show 1 more output check for proc-1/ }));
+      await Promise.resolve();
+    });
+    expect(middleRow()).not.toBeNull();
+    expect(view.queryByRole("button", { name: /Hide 1 more output check/ })).not.toBeNull();
+  });
+
+  test("task_await rows name a linked background bash by its spawn intent", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "spawn",
+        1,
+        "bash",
+        {
+          script: "./scripts/wait_pr_ready.sh 27330",
+          display_name: "PR ready watcher",
+          model_intent: "Watching PR 27330 until it is ready",
+          timeout_secs: 30,
+          run_in_background: true,
+        },
+        {
+          success: true,
+          output: "Started",
+          exitCode: 0,
+          wall_duration_ms: 10,
+          taskId: "bash:pr-ready-watcher-a1b2",
+          backgroundProcessId: "pr-ready-watcher-a1b2",
+        }
+      ),
+      toolMessage(
+        "await",
+        2,
+        "task_await",
+        { task_ids: ["bash:pr-ready-watcher-a1b2"] },
+        {
+          results: [
+            {
+              status: "completed",
+              taskId: "bash:pr-ready-watcher-a1b2",
+              title: "PR ready watcher",
+              reportMarkdown: "exit 0",
+            },
+          ],
+        }
+      ),
+    ]);
+
+    expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
+  });
 });

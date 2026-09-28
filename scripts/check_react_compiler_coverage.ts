@@ -30,6 +30,10 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
     "TranscriptBundleRows",
     "useTranscriptBundles",
   ],
+  "src/browser/components/ChatPane/transcriptRowDerivations.ts": [
+    "useTranscriptRowDerivations",
+    "useUserMessageNavigation",
+  ],
   "src/browser/features/Messages/MessageRenderer.tsx": ["MessageRenderer"],
   "src/browser/features/Messages/MessageWindow.tsx": ["MessageWindow"],
   "src/browser/features/Messages/AssistantMessage.tsx": ["AssistantMessage"],
