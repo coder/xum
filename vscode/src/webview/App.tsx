@@ -17,7 +17,7 @@ import { createClient } from "xum/common/orpc/client";
 
 import { ProviderOptionsProvider } from "xum/browser/contexts/ProviderOptionsContext";
 import { SettingsProvider } from "xum/browser/contexts/SettingsContext";
-import { APIProvider } from "xum/browser/contexts/API";
+import { APIProvider, type APIClient } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
@@ -64,6 +64,18 @@ import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
 import { HeldInput } from "xum/browser/features/Messages/HeldInput";
+import { RetryBarrierContent } from "xum/browser/features/Messages/ChatBarrier/RetryBarrier";
+import { InterruptedBarrier } from "xum/browser/features/Messages/ChatBarrier/InterruptedBarrier";
+import {
+  getRetryBarrierDerivation,
+  type RetryBarrierDerivation,
+} from "xum/browser/components/ChatPane/retryBarrierDerivation";
+import { useResumeStream } from "xum/browser/hooks/useResumeStream";
+import {
+  isAutoRetryStatusEvent,
+  type AutoRetryStatus,
+} from "xum/browser/utils/messages/autoRetryStatus";
+import { isProviderConfigFixableError } from "xum/common/utils/messages/retryEligibility";
 
 import type {
   ExtensionToWebviewMessage,
@@ -193,6 +205,19 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     return createClient(link);
   }, [bridge]);
 
+  // The API context wraps the whole webview app: its body calls shared hooks that read it
+  // (useResumeStream for the interrupted divider and its keybind).
+  return (
+    <APIProvider client={apiClient}>
+      <WebviewApp bridge={bridge} apiClient={apiClient} />
+    </APIProvider>
+  );
+}
+
+function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.Element {
+  const bridge = props.bridge;
+  const apiClient = props.apiClient;
+
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
@@ -221,6 +246,13 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
   // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
   const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
+  // The latest auto-retry banner event, as WorkspaceStore tracks it on desktop: set by
+  // auto-retry-*, cleared by stream-start/stream-end and by every reset (new selection, chatReset,
+  // new replay). Stored with its workspace so it never reaches another workspace's first render.
+  const [autoRetryState, setAutoRetryState] = useState<{
+    workspaceId: string;
+    status: AutoRetryStatus;
+  } | null>(null);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
   // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
@@ -362,10 +394,27 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     const unsubscribeSeed = appConfigStore.subscribe(() => {
       seedWebviewPreferences(appConfigStore.getSnapshot());
     });
+    // As WorkspaceStore does: a provider config change may fix the error that stopped auto-retry,
+    // so drop a provider-config-fixable "Auto-retry stopped" banner (never resume a stream here).
+    let previousProvidersConfig = providersConfigStore.getConfig();
+    const unsubscribeProvidersConfig = providersConfigStore.subscribe(() => {
+      const config = providersConfigStore.getConfig();
+      if (config === previousProvidersConfig) {
+        return;
+      }
+      previousProvidersConfig = config;
+      setAutoRetryState((current) =>
+        current?.status.type === "auto-retry-abandoned" &&
+        isProviderConfigFixableError(current.status.reason)
+          ? null
+          : current
+      );
+    });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
+      unsubscribeProvidersConfig();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
     };
@@ -422,6 +471,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
           setActiveBashMonitorCount(0);
+          setAutoRetryState(null);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -449,6 +499,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setAutoRetryState(null);
           // The monitor count is kept: a resubscribe to the same workspace posts a fresh count, but
           // if the host cannot read it, the last one is better than hiding an armed monitor.
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
@@ -487,9 +538,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               chatReplayStateRef.current = replayState;
               liveBashOutput.reset(msg.workspaceId);
               setHeldInputs([]);
+              setAutoRetryState(null);
               transcriptBarrier.reset(msg.workspaceId);
               setTranscriptCaughtUp(false);
             }
+
+            // Auto-retry banner transitions, applied in stream order (replayed events from the
+            // flush loop, live ones below), so a buffered stream-start never clears a later status.
+            const applyAutoRetryTransition = (chatEvent: WorkspaceChatMessage) => {
+              if (isAutoRetryStatusEvent(chatEvent)) {
+                setAutoRetryState({ workspaceId: msg.workspaceId, status: chatEvent });
+              } else if (chatEvent.type === "stream-start" || chatEvent.type === "stream-end") {
+                setAutoRetryState(null);
+              }
+            };
 
             const flushReplayBuffer = () => {
               const hasActiveStream = replayState.pendingStreamEvents.some(
@@ -502,6 +564,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               }
 
               for (const bufferedEvent of replayState.pendingStreamEvents) {
+                applyAutoRetryTransition(bufferedEvent);
                 applyWorkspaceChatEventToAggregator(aggregator, bufferedEvent);
               }
               replayState.pendingStreamEvents.length = 0;
@@ -566,13 +629,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                 return;
               }
 
-              if (shouldBufferUntilCaughtUp(event)) {
+              if (shouldBufferUntilCaughtUp(event) || isAutoRetryStatusEvent(event)) {
                 replayState.pendingStreamEvents.push(event);
                 forceCatchUp();
                 return;
               }
             }
 
+            applyAutoRetryTransition(event);
             const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
 
             if (hint === "ignored") {
@@ -668,6 +732,10 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   };
   const interruptStreamRef = useRef(interruptStream);
   interruptStreamRef.current = interruptStream;
+  // The window key listeners read the latest retry derivation and resume through these refs,
+  // which are updated where both are computed below.
+  const retryBarrierRef = useRef<RetryBarrierDerivation | null>(null);
+  const resumeInterruptedStreamRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -706,10 +774,15 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       }
 
       // A starting turn (before stream-start) shows Stop and its Esc chip too, so Esc must reach it.
+      // As on desktop, it also stops while the retry barrier shows (turning auto-retry off).
       const isStarting =
         aggregator.getPendingStreamStartTime() !== null ||
         aggregator.getStreamLifecycle()?.phase === "preparing";
-      if (!aggregator.getActiveStreamMessageId() && !isStarting) {
+      if (
+        !aggregator.getActiveStreamMessageId() &&
+        !isStarting &&
+        !retryBarrierRef.current?.showRetryBarrier
+      ) {
         return;
       }
 
@@ -721,18 +794,26 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [canChat, selectedWorkspaceId]);
 
-  // Transcript-scoped Shift+G, as in desktop useAIViewKeybinds: capture phase, and never while
-  // typing (the composer still receives a capital G) or while a modal owns the keyboard.
+  // Transcript-scoped Shift+G and Shift+R, as in desktop useAIViewKeybinds: capture phase, and
+  // never while typing (the composer still receives a capital G/R) or while a modal owns the
+  // keyboard. Shift+R resumes only when the interrupted divider on the tail offers resume.
   useEffect(() => {
     if (!selectedWorkspaceId) {
       return;
     }
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (isDialogOpen() || isEditableElement(e.target)) {
+        return;
+      }
       if (
-        isDialogOpen() ||
-        isEditableElement(e.target) ||
-        !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)
+        matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        retryBarrierRef.current?.interruptedTailResumable
       ) {
+        e.preventDefault();
+        resumeInterruptedStreamRef.current();
+        return;
+      }
+      if (!matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
         return;
       }
       e.preventDefault();
@@ -785,6 +866,42 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     transcriptDensity,
     isTurnActive: streamState ? streamState.isStreamStarting || streamState.canInterrupt : false,
   });
+  // Retry barrier and interrupted dividers, with desktop ChatPane's shared derivation fed from this
+  // webview's aggregator. Its rows are never deferred, so both message inputs are the same rows.
+  const aggregator = aggregatorRef.current;
+  const autoRetryStatus =
+    autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
+  const retryBarrier =
+    selectedWorkspaceId && aggregator && streamState
+      ? getRetryBarrierDerivation({
+          messages: displayedMessages,
+          renderedMessages: displayedMessages,
+          pendingStreamStartTime: aggregator.getPendingStreamStartTime(),
+          runtimeStatus: aggregator.getRuntimeStatus(),
+          lastAbortReason: aggregator.getLastAbortReason(),
+          autoRetryStatus,
+          isHydratingTranscript: !transcriptCaughtUp,
+          isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
+          transcriptOnly: false,
+        })
+      : null;
+  // Retry and resume send as the composer does: a sub-agent's locked agent, not a stored pick
+  // (#4738). Same resolution as WebviewChatProviders' workspaceMetaFallback.
+  const lockedAgentId =
+    selectedWorkspace?.ai?.parentWorkspaceId != null
+      ? resolvePersistedAgentId(selectedWorkspace.ai, "") || undefined
+      : undefined;
+  // Shared by the divider's resume button and Shift+R, as in ChatPane.
+  const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
+    selectedWorkspaceId ?? "",
+    retryBarrier?.lastRetryCandidateMessage?.id,
+    displayedMessages,
+    lockedAgentId
+  );
+  const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
+  retryBarrierRef.current = retryBarrier;
+  resumeInterruptedStreamRef.current = resumeInterruptedStream;
+
   // bash_output grouping, task report linking and prompt navigation, as in ChatPane (#5002).
   const transcriptRowDerivations = useTranscriptRowDerivations({
     workspaceId: selectedWorkspaceId ?? "",
@@ -815,240 +932,260 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // navigations become no-ops instead of crashing the mount or rewriting the webview URL.
     <RouterProvider embedded>
       <ChatHostContextProvider value={chatHostContextValue}>
-        <APIProvider client={apiClient}>
-          <SettingsProvider>
-            <ProviderOptionsProvider>
-              <ThemeProvider forcedTheme="dark">
-                <WebviewChatProviders
-                  // Scope agent state (and its agents.list lookup) to the selected workspace only
-                  // once the extension has listed it: on a fresh extension host the restored
-                  // selection arrives before the list, and the host rejects lookups for workspaces
-                  // it has not sent (#4751). It also requires a server connection: file mode lists
-                  // workspaces but the host rejects agents.list there, and a recovery that keeps
-                  // the same selection must change this prop so the lookup runs again (#4797).
-                  workspaceId={agentScopeWorkspaceId}
-                  workspaceAi={selectedWorkspace?.ai}
-                >
-                  <div className="flex h-screen flex-col">
-                    <div className="border-b border-border bg-background-secondary p-3">
-                      <div className="flex items-center gap-2">
-                        <WorkspacePicker
-                          workspaces={workspaces}
-                          selectedWorkspaceId={selectedWorkspaceId}
-                          onSelectWorkspace={(workspaceId) => {
-                            bridge.postMessage({ type: "selectWorkspace", workspaceId });
-                          }}
-                          onRequestRefresh={requestRefreshWorkspaces}
-                        />
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span
-                              className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
-                              aria-label="Preview feature"
-                            >
-                              Preview
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent align="center">
-                            Preview feature — under active development; may contain bugs.
-                          </TooltipContent>
-                        </Tooltip>
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              onClick={onOpenWorkspace}
-                              disabled={!selectedWorkspaceId}
-                              aria-label="Open workspace"
-                              className="text-muted hover:text-foreground h-8 w-8 shrink-0"
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent align="center">Open workspace</TooltipContent>
-                        </Tooltip>
-                      </div>
-                    </div>
-
-                    <div
-                      ref={contentRef}
-                      className="flex-1 overflow-y-auto p-3"
-                      onScroll={handleScroll}
-                      onWheel={handleScrollContainerWheel}
-                      onMouseDown={handleScrollContainerMouseDown}
-                      onMouseMove={handleScrollContainerMouseMove}
-                      onMouseUp={handleScrollContainerMouseUp}
-                      onKeyDown={handleScrollContainerKeyDown}
-                      onTouchMove={markUserScrollIntent}
-                    >
-                      <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
-                        {selectedWorkspaceId ? (
-                          <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
-                            <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
-                              <TranscriptBundleRows
-                                workspaceId={selectedWorkspaceId}
-                                messages={displayedMessages}
-                                indexOffset={0}
-                                bundles={transcriptBundles}
-                                renderMessageAtIndex={(msg, index, options) => {
-                                  const rowProps = getTranscriptRowProps({
-                                    derivations: transcriptRowDerivations,
-                                    userMessageNavigationByHistoryId,
-                                    messages: displayedMessages,
-                                    message: msg,
-                                    index,
-                                  });
-                                  if (rowProps.hidden) {
-                                    return null;
-                                  }
-                                  const { bashOutputGroup, bashGroupKey } = rowProps;
-                                  const row = (
-                                    <DisplayedMessageRenderer
-                                      message={msg}
-                                      workspaceId={selectedWorkspaceId}
-                                      isLatestProposePlan={msg.id === latestProposePlanId}
-                                      isCompacting={aggregatorRef.current?.isCompacting() ?? false}
-                                      onCloseEphemeral={messageRowActions.closeEphemeral}
-                                      onShowAllHistory={messageRowActions.showAllHistory}
-                                      bashOutputGroup={bashOutputGroup}
-                                      taskReportLinking={rowProps.taskReportLinking}
-                                      userMessageNavigation={rowProps.userMessageNavigation}
-                                    />
-                                  );
-                                  return (
-                                    <Fragment key={options.key}>
-                                      {options.className ? (
-                                        <div className={options.className}>{row}</div>
-                                      ) : (
-                                        row
-                                      )}
-                                      {bashOutputGroup?.position === "first" && bashGroupKey ? (
-                                        <BashOutputCollapsedIndicator
-                                          processId={bashOutputGroup.processId}
-                                          collapsedCount={bashOutputGroup.collapsedCount}
-                                          isExpanded={rowProps.isBashGroupExpanded}
-                                          onToggle={() =>
-                                            transcriptRowDerivations.toggleBashOutputGroup(
-                                              bashGroupKey
-                                            )
-                                          }
-                                        />
-                                      ) : null}
-                                    </Fragment>
-                                  );
-                                }}
-                              />
-                            </LiveBashOutputSourceContext.Provider>
-                          </BackgroundBashProvider>
-                        ) : null}
-
-                        {notices.map((notice) => (
-                          <div
-                            key={notice.id}
-                            className={
-                              notice.level === "error"
-                                ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
-                                : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
-                            }
-                          >
-                            {notice.message}
-                          </div>
-                        ))}
-
-                        {!selectedWorkspaceId && notices.length === 0 ? (
-                          <div className="text-muted text-sm">
-                            Select a Xum workspace to view messages.
-                          </div>
-                        ) : null}
-                      </div>
-                      {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
-                      <div
-                        ref={sentinelRef}
-                        data-testid="transcript-bottom-sentinel"
-                        aria-hidden="true"
-                        className="h-0 w-full"
-                        style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
+        <SettingsProvider>
+          <ProviderOptionsProvider>
+            <ThemeProvider forcedTheme="dark">
+              <WebviewChatProviders
+                // Scope agent state (and its agents.list lookup) to the selected workspace only
+                // once the extension has listed it: on a fresh extension host the restored
+                // selection arrives before the list, and the host rejects lookups for workspaces
+                // it has not sent (#4751). It also requires a server connection: file mode lists
+                // workspaces but the host rejects agents.list there, and a recovery that keeps
+                // the same selection must change this prop so the lookup runs again (#4797).
+                workspaceId={agentScopeWorkspaceId}
+                workspaceAi={selectedWorkspace?.ai}
+              >
+                <div className="flex h-screen flex-col">
+                  <div className="border-b border-border bg-background-secondary p-3">
+                    <div className="flex items-center gap-2">
+                      <WorkspacePicker
+                        workspaces={workspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={(workspaceId) => {
+                          bridge.postMessage({ type: "selectWorkspace", workspaceId });
+                        }}
+                        onRequestRefresh={requestRefreshWorkspaces}
                       />
-                    </div>
 
-                    {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
-                        desktop ChatInput textarea; other editors keep Escape to themselves. */}
-                    <div
-                      className="relative bg-surface-primary px-[15px] pt-2 pb-2"
-                      data-escape-interrupts-stream="true"
-                    >
-                      {selectedWorkspaceId && !autoScroll ? (
-                        // Same pill as desktop ChatPane, just above the dock.
-                        <button
-                          onClick={jumpToBottom}
-                          type="button"
-                          className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
-                        >
-                          Jump to bottom{" "}
-                          <span className="mobile-hide-shortcut-hints">
-                            ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span
+                            className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
+                            aria-label="Preview feature"
+                          >
+                            Preview
                           </span>
-                        </button>
-                      ) : null}
-                      {selectedWorkspaceId && heldInputs.length > 0 ? (
-                        // Bounded scroll lane: many or long held inputs must not push the composer
-                        // below the fixed-height layout or collapse the transcript.
-                        <div className="max-h-[40vh] overflow-y-auto">
-                          {heldInputs.map((heldInput, index) => (
-                            <HeldInput
-                              key={heldInput.id}
-                              workspaceId={selectedWorkspaceId}
-                              heldInput={heldInput}
-                              // The composer's held-input shortcuts act on the oldest one.
-                              isShortcutTarget={index === 0}
-                            />
-                          ))}
-                        </div>
-                      ) : null}
-                      {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
-                      {selectedWorkspaceId ? (
-                        <VscodeStreamingBarrier
-                          workspaceId={selectedWorkspaceId}
-                          aggregator={aggregatorRef.current}
-                          activeBashMonitorCount={activeBashMonitorCount}
-                          onCancel={(phase) =>
-                            interruptStream({ abandonPartial: phase === "compacting" })
-                          }
-                        />
-                      ) : null}
-                      {selectedWorkspaceId ? (
-                        <ChatComposer
-                          key={selectedWorkspaceId}
-                          workspaceId={selectedWorkspaceId}
-                          disabled={!canChat || !transcriptCaughtUp}
-                          disabledReason={
-                            !canChat
-                              ? "Chat requires Xum server connection."
-                              : !transcriptCaughtUp
-                                ? "Loading chat history..."
-                                : undefined
-                          }
-                          aggregator={aggregatorRef.current}
-                          aiSettingsLoaded={selectedWorkspace?.ai != null}
-                          agentScoped={agentScopeWorkspaceId != null}
-                          heldInputId={heldInputs[0]?.id}
-                          onSendComplete={jumpToBottom}
-                          onNotice={pushNotice}
-                        />
-                      ) : (
-                        <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
-                      )}
+                        </TooltipTrigger>
+                        <TooltipContent align="center">
+                          Preview feature — under active development; may contain bugs.
+                        </TooltipContent>
+                      </Tooltip>
+
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            onClick={onOpenWorkspace}
+                            disabled={!selectedWorkspaceId}
+                            aria-label="Open workspace"
+                            className="text-muted hover:text-foreground h-8 w-8 shrink-0"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent align="center">Open workspace</TooltipContent>
+                      </Tooltip>
                     </div>
                   </div>
-                </WebviewChatProviders>
-              </ThemeProvider>
-            </ProviderOptionsProvider>
-          </SettingsProvider>
-        </APIProvider>
+
+                  <div
+                    ref={contentRef}
+                    className="flex-1 overflow-y-auto p-3"
+                    onScroll={handleScroll}
+                    onWheel={handleScrollContainerWheel}
+                    onMouseDown={handleScrollContainerMouseDown}
+                    onMouseMove={handleScrollContainerMouseMove}
+                    onMouseUp={handleScrollContainerMouseUp}
+                    onKeyDown={handleScrollContainerKeyDown}
+                    onTouchMove={markUserScrollIntent}
+                  >
+                    <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
+                      {selectedWorkspaceId ? (
+                        <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
+                          <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
+                            <TranscriptBundleRows
+                              workspaceId={selectedWorkspaceId}
+                              messages={displayedMessages}
+                              indexOffset={0}
+                              bundles={transcriptBundles}
+                              renderMessageAtIndex={(msg, index, options) => {
+                                const rowProps = getTranscriptRowProps({
+                                  derivations: transcriptRowDerivations,
+                                  userMessageNavigationByHistoryId,
+                                  messages: displayedMessages,
+                                  message: msg,
+                                  index,
+                                });
+                                if (rowProps.hidden) {
+                                  return null;
+                                }
+                                const { bashOutputGroup, bashGroupKey } = rowProps;
+                                const row = (
+                                  <DisplayedMessageRenderer
+                                    message={msg}
+                                    workspaceId={selectedWorkspaceId}
+                                    isLatestProposePlan={msg.id === latestProposePlanId}
+                                    isCompacting={aggregatorRef.current?.isCompacting() ?? false}
+                                    onCloseEphemeral={messageRowActions.closeEphemeral}
+                                    onShowAllHistory={messageRowActions.showAllHistory}
+                                    bashOutputGroup={bashOutputGroup}
+                                    taskReportLinking={rowProps.taskReportLinking}
+                                    userMessageNavigation={rowProps.userMessageNavigation}
+                                  />
+                                );
+                                return (
+                                  <Fragment key={options.key}>
+                                    {options.className ? (
+                                      <div className={options.className}>{row}</div>
+                                    ) : (
+                                      row
+                                    )}
+                                    {bashOutputGroup?.position === "first" && bashGroupKey ? (
+                                      <BashOutputCollapsedIndicator
+                                        processId={bashOutputGroup.processId}
+                                        collapsedCount={bashOutputGroup.collapsedCount}
+                                        isExpanded={rowProps.isBashGroupExpanded}
+                                        onToggle={() =>
+                                          transcriptRowDerivations.toggleBashOutputGroup(
+                                            bashGroupKey
+                                          )
+                                        }
+                                      />
+                                    ) : null}
+                                    {retryBarrier?.interruptedBarrierMessageIds.has(msg.id) ? (
+                                      <InterruptedBarrier
+                                        resumable={
+                                          retryBarrier.interruptedTailResumable &&
+                                          msg.id === retryBarrier.lastRetryCandidateMessage?.id
+                                        }
+                                        onResume={resumeInterruptedStream}
+                                        error={resumeInterruptedError}
+                                      />
+                                    ) : null}
+                                  </Fragment>
+                                );
+                              }}
+                            />
+                            {/* Transcript tail, after the rows, as in desktop ChatPane. */}
+                            {retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                              <RetryBarrierContent
+                                workspaceId={selectedWorkspaceId}
+                                visible={retryBarrier.showRetryBarrierUI}
+                                messages={displayedMessages}
+                                autoRetryStatus={autoRetryStatus}
+                                isStreamStarting={streamState.isStreamStarting}
+                                canInterrupt={streamState.canInterrupt}
+                                agentId={lockedAgentId}
+                              />
+                            ) : null}
+                          </LiveBashOutputSourceContext.Provider>
+                        </BackgroundBashProvider>
+                      ) : null}
+
+                      {notices.map((notice) => (
+                        <div
+                          key={notice.id}
+                          className={
+                            notice.level === "error"
+                              ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
+                              : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
+                          }
+                        >
+                          {notice.message}
+                        </div>
+                      ))}
+
+                      {!selectedWorkspaceId && notices.length === 0 ? (
+                        <div className="text-muted text-sm">
+                          Select a Xum workspace to view messages.
+                        </div>
+                      ) : null}
+                    </div>
+                    {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
+                    <div
+                      ref={sentinelRef}
+                      data-testid="transcript-bottom-sentinel"
+                      aria-hidden="true"
+                      className="h-0 w-full"
+                      style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
+                    />
+                  </div>
+
+                  {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
+                      desktop ChatInput textarea; other editors keep Escape to themselves. */}
+                  <div
+                    className="relative bg-surface-primary px-[15px] pt-2 pb-2"
+                    data-escape-interrupts-stream="true"
+                  >
+                    {selectedWorkspaceId && !autoScroll ? (
+                      // Same pill as desktop ChatPane, just above the dock.
+                      <button
+                        onClick={jumpToBottom}
+                        type="button"
+                        className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
+                      >
+                        Jump to bottom{" "}
+                        <span className="mobile-hide-shortcut-hints">
+                          ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                        </span>
+                      </button>
+                    ) : null}
+                    {selectedWorkspaceId && heldInputs.length > 0 ? (
+                      // Bounded scroll lane: many or long held inputs must not push the composer
+                      // below the fixed-height layout or collapse the transcript.
+                      <div className="max-h-[40vh] overflow-y-auto">
+                        {heldInputs.map((heldInput, index) => (
+                          <HeldInput
+                            key={heldInput.id}
+                            workspaceId={selectedWorkspaceId}
+                            heldInput={heldInput}
+                            // The composer's held-input shortcuts act on the oldest one.
+                            isShortcutTarget={index === 0}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                    {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
+                    {selectedWorkspaceId ? (
+                      <VscodeStreamingBarrier
+                        workspaceId={selectedWorkspaceId}
+                        aggregator={aggregatorRef.current}
+                        activeBashMonitorCount={activeBashMonitorCount}
+                        onCancel={(phase) =>
+                          interruptStream({ abandonPartial: phase === "compacting" })
+                        }
+                      />
+                    ) : null}
+                    {selectedWorkspaceId ? (
+                      <ChatComposer
+                        key={selectedWorkspaceId}
+                        workspaceId={selectedWorkspaceId}
+                        disabled={!canChat || !transcriptCaughtUp}
+                        disabledReason={
+                          !canChat
+                            ? "Chat requires Xum server connection."
+                            : !transcriptCaughtUp
+                              ? "Loading chat history..."
+                              : undefined
+                        }
+                        aggregator={aggregatorRef.current}
+                        aiSettingsLoaded={selectedWorkspace?.ai != null}
+                        agentScoped={agentScopeWorkspaceId != null}
+                        heldInputId={heldInputs[0]?.id}
+                        onSendComplete={jumpToBottom}
+                        onNotice={pushNotice}
+                      />
+                    ) : (
+                      <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
+                    )}
+                  </div>
+                </div>
+              </WebviewChatProviders>
+            </ThemeProvider>
+          </ProviderOptionsProvider>
+        </SettingsProvider>
       </ChatHostContextProvider>
     </RouterProvider>
   );
