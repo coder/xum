@@ -12583,7 +12583,7 @@ export class WorkspaceService
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
       let abandonedBranchMessages: MuxMessage[] | null = null;
-      // The plan file this fork wrote, which its registration rollback deletes (#4775).
+      // The plan file this fork created, which its registration rollback deletes (#4775).
       let copiedPlanPath: string | undefined;
       try {
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(

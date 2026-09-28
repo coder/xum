@@ -254,7 +254,7 @@ export async function movePlanFile(
  * Silently succeeds if no regular source file exists at either location. Throws
  * when a source read fails in transport or the target write fails, so a fork
  * never proceeds without a plan it could not copy (#4826). Returns the target path
- * it wrote, so a rollback deletes only a copy it made (#4775).
+ * only when this copy created it, so a rollback deletes only a file it made (#4775).
  */
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
@@ -283,8 +283,14 @@ export async function copyPlanFileAcrossRuntimes(
       if (isRuntimeTransportError(error)) throw error;
       continue; // Missing (or not a regular file): try the next candidate.
     }
+    // A plan already at the target is not this copy's: a project-dir fork may reuse an existing
+    // workspace's name, even the source's. A probe that fails in transport counts as existing.
+    const targetExisted = await targetRuntime.stat(targetPath).then(
+      () => true,
+      (error: unknown) => isRuntimeTransportError(error)
+    );
     await writeFileString(targetRuntime, targetPath, content);
-    return targetPath;
+    return targetExisted ? undefined : targetPath;
   }
   return undefined;
 }

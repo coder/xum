@@ -871,6 +871,25 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       });
     });
 
+    // A project-dir fork may reuse a name, even its source's: the plan at the target is not its own.
+    test("local fork named like its source keeps the source's plan", async () => {
+      await withTempMuxRoot(async (root) => {
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push({
+            id: "eeeeeeeee2",
+            name: "local-one",
+            path: projectPath,
+            runtimeConfig: { type: "local" },
+          });
+          return cfg;
+        });
+        const sourcePlan = await writePlanFile(root, "project", "local-one");
+
+        await expectFailsWithSaveError(() => service.fork("eeeeeeeee2", "local-one"));
+        expect(await exists(sourcePlan)).toBe(true);
+      });
+    });
+
     // A devcontainer stores the fork's plan inside its container; the host file at the same path is
     // someone else's.
     test("devcontainer fork rollback leaves the host plan path alone", async () => {
