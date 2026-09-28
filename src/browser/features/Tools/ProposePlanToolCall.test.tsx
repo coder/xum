@@ -5,6 +5,8 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
+import { PolicyProvider } from "@/browser/contexts/PolicyContext";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
@@ -53,8 +55,9 @@ interface MockApi {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
     }) => Promise<ResultVoid>;
-    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: Record<string, never> }>;
+    sendMessage: (args: SendMessageArgs) => ReturnType<APIClient["workspace"]["sendMessage"]>;
   };
+  policy?: { get: () => ReturnType<APIClient["policy"]["get"]> };
 }
 
 let mockApi: MockApi | null = null;
@@ -226,6 +229,7 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks into later-evaluated suites. The wrapper reads mockApi at render time (tests assign
 // it after beforeEach) and view.rerender() keeps it. A null mockApi means no backend client.
+// PolicyProvider answers "no policy" unless the mock supplies policy.get.
 function ApiWrapper(props: { children: ReactNode }) {
   if (mockApi === null) {
     return (
@@ -238,11 +242,15 @@ function ApiWrapper(props: { children: ReactNode }) {
           retry: () => undefined,
         }}
       >
-        {props.children}
+        <PolicyProvider>{props.children}</PolicyProvider>
       </APIContext.Provider>
     );
   }
-  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+  return (
+    <APIProvider client={createTestApiClient(mockApi)}>
+      <PolicyProvider>{props.children}</PolicyProvider>
+    </APIProvider>
+  );
 }
 
 function renderToolCall(content: JSX.Element, agentId = "plan") {
@@ -353,12 +361,13 @@ describe("ProposePlanToolCall", () => {
   test("does not claim plan is in chat when Start Here content is a placeholder", () => {
     renderPlanToolCall({ result: { success: true, planPath: PLAN_PATH } });
 
-    expect(startHereCalls.length).toBe(1);
-    expect(startHereCalls[0]?.content).toContain("*Plan saved to");
-    expect(startHereCalls[0]?.content).not.toContain(
+    // PolicyProvider's first answer re-renders the card; check the latest render's input.
+    const startHere = startHereCalls.at(-1);
+    expect(startHere?.content).toContain("*Plan saved to");
+    expect(startHere?.content).not.toContain(
       "Note: This chat already contains the full plan"
     );
-    expect(startHereCalls[0]?.content).toContain("Read the plan file below");
+    expect(startHere?.content).toContain("Read the plan file below");
   });
   test("keeps plan file on disk and includes plan path note in Start Here content", () => {
     renderPlanToolCall({
@@ -367,14 +376,14 @@ describe("ProposePlanToolCall", () => {
       result: { success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT },
     });
 
-    expect(startHereCalls.length).toBe(1);
-    expect(startHereCalls[0]?.options).toEqual({ sourceAgentId: "plan" });
-    expect(startHereCalls[0]?.isCompacted).toBe(false);
+    const startHere = startHereCalls.at(-1);
+    expect(startHere?.options).toEqual({ sourceAgentId: "plan" });
+    expect(startHere?.isCompacted).toBe(false);
 
     // The Start Here message should explicitly tell the user the plan file remains on disk.
-    expect(startHereCalls[0]?.content).toContain("*Plan file preserved at:*");
-    expect(startHereCalls[0]?.content).toContain("Note: This chat already contains the full plan");
-    expect(startHereCalls[0]?.content).toContain(PLAN_PATH);
+    expect(startHere?.content).toContain("*Plan file preserved at:*");
+    expect(startHere?.content).toContain("Note: This chat already contains the full plan");
+    expect(startHere?.content).toContain(PLAN_PATH);
   });
 
   test.each([
@@ -730,6 +739,132 @@ describe("ProposePlanToolCall", () => {
     fireEvent.click(implementAgain);
     await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
     expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
+  });
+
+  describe("admin policy excludes the target agent's model (#4980)", () => {
+    const EXEC_MODEL = "openai:gpt-5.2";
+    const PLAN_MODEL = "anthropic:claude-sonnet-4-5";
+    const ONLY_ANTHROPIC_POLICY = {
+      source: "governor" as const,
+      status: { state: "enforced" as const },
+      policy: {
+        policyFormatVersion: "0.1" as const,
+        providerAccess: [{ id: "anthropic" as const, allowedModels: null }],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    };
+
+    // Both providers have credentials, so the exec model routes directly to openai.
+    function withProvidersConfig() {
+      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      });
+    }
+
+    async function renderWithEnforcedPolicy(sendMessageCalls: SendMessageArgs[]) {
+      startInPlanMode(WORKSPACE_ID, PLAN_MODEL, "high");
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: EXEC_MODEL } });
+      let policyReads = 0;
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      mockApi.policy = {
+        get: () => {
+          policyReads += 1;
+          return Promise.resolve(ONLY_ANTHROPIC_POLICY);
+        },
+      };
+      const view = renderCompletedPlan();
+      await waitFor(() => expect(policyReads).toBe(1));
+      // Let PolicyProvider commit the answer before the click reads it.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return view;
+    }
+
+    test("refuses Implement before switching agents and says why", async () => {
+      withProvidersConfig();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      const view = await renderWithEnforcedPolicy(sendMessageCalls);
+
+      fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+      await waitFor(() => expect(view.getByRole("alert").textContent).toContain(EXEC_MODEL));
+      expect(sendMessageCalls).toHaveLength(0);
+      // Nothing was switched: the composer stays on the plan agent and its model.
+      expect(readPersistedState(getAgentIdKey(WORKSPACE_ID), "")).toBe("plan");
+      expect(readPersistedState(getModelKey(WORKSPACE_ID), "")).toBe(PLAN_MODEL);
+      expect(
+        (view.getByRole("button", { name: "Implement" }) as HTMLButtonElement).disabled
+      ).toBe(false);
+    });
+
+    test("leaves the decision to the backend until the providers config is known", async () => {
+      // Without the providers config the active route is unknown (a gateway may be allowed).
+      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(null);
+      const sendMessageCalls: SendMessageArgs[] = [];
+      const view = await renderWithEnforcedPolicy(sendMessageCalls);
+
+      fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(sendMessageCalls[0]?.options.model).toBe(EXEC_MODEL);
+      expect(view.queryByRole("alert")).toBeNull();
+    });
+  });
+
+  test("shows a rejected Implement send in the card", async () => {
+    startInPlanMode();
+    let sends = 0;
+    mockApi = createMockApi({
+      sendMessage: () => {
+        sends += 1;
+        return Promise.resolve({
+          success: false,
+          error: { type: "policy_denied", message: "Model openai:gpt-5.2 is not allowed" },
+        });
+      },
+    });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toContain("Model openai:gpt-5.2 is not allowed")
+    );
+    expect(sends).toBe(1);
+  });
+
+  test("shows a failed Continue in Auto send in the card and clears it on retry", async () => {
+    startInPlanMode();
+    let failNext = true;
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error("connection lost"));
+        }
+        return Promise.resolve({ success: true, data: {} });
+      },
+    });
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        workspaceId={WORKSPACE_ID}
+        status="completed"
+        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+        isLatest
+      />,
+      "auto"
+    );
+    fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("connection lost"));
+
+    fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
+    await waitFor(() => expect(sendMessageCalls).toHaveLength(2));
+    await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
   });
 
   test("renders a plan table of contents derived from the plan's markdown headings", () => {

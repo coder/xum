@@ -13,6 +13,7 @@ import {
   ToolName,
   StatusIndicator,
   ToolDetails,
+  ErrorBox,
 } from "./Shared/ToolPrimitives";
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
@@ -51,7 +52,9 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
+import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
@@ -91,6 +94,8 @@ import {
   X,
 } from "lucide-react";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
+import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
 /**
  * Check if the result is a successful file-based propose_plan result.
@@ -199,6 +204,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const [annotateMode, setAnnotateMode] = useState(false);
   const [isImplementing, setIsImplementing] = useState(false);
   const [isContinuingInAuto, setIsContinuingInAuto] = useState(false);
+  // Why the last Implement / Continue in Auto did not start (#4980); cleared on the next click.
+  const [planActionError, setPlanActionError] = useState<string | null>(null);
 
   // On small screens, render the primary plan actions (Implement / Continue in Auto) as
   // shortcut icons alongside the other action buttons to avoid right-side overflow.
@@ -252,6 +259,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
+  // #4980: same route-aware policy check as the model picker. Until the first policy answer and
+  // the providers config arrive, the active route is unknown, so the backend decides.
+  const { isAllowedByPolicyOnActiveRoute } = useModelsFromSettings();
+  const { loading: policyLoading } = usePolicy();
+  const { config: providersConfig } = useProvidersConfig();
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -589,14 +601,15 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
    * every await and the final barrier check come BEFORE the irreversible steps (the optional
    * history replacement, the workspace mode switch, the send), so a barrier that closes during
    * the waits leaves the workspace exactly as it was instead of replaced-but-not-implemented.
+   * Resolves to the message the card shows when the action did not start, or null.
    */
   const runPlanAction = async (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
     replacementIdPrefix: string;
     replacementErrorContext: string;
-  }): Promise<void> => {
-    if (!api) return;
+  }): Promise<string | null> => {
+    if (!api) return null;
     const { workspaceId } = args;
     let shouldReplaceChatHistory = false;
 
@@ -606,12 +619,26 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     } catch {
       // Ignore config read errors (we'll default to old behavior).
     }
-    if (shouldReplaceChatHistory && !canReplaceChatHistory) return;
+    if (shouldReplaceChatHistory && !canReplaceChatHistory) return null;
 
     const settings = resolveTargetAgentSettings({
       workspaceId,
       targetAgentId: args.targetAgentId,
     });
+    // #4980: a target model the admin policy excludes would switch the workspace (and maybe
+    // replace history) and then be rejected by the backend. There is no policy fallback here:
+    // the desktop composer has none, and substituting a model would silently change what runs.
+    // Refuse before any side effect and say why. The backend stays authoritative for policy
+    // changes after this render; its rejection is shown below.
+    if (
+      !policyLoading &&
+      providersConfig !== null &&
+      !isAllowedByPolicyOnActiveRoute(normalizeSelectedModel(settings.resolvedModel))
+    ) {
+      const agentName =
+        agents.find((agent) => agent.id === args.targetAgentId)?.name ?? args.targetAgentId;
+      return `Admin policy does not allow ${settings.resolvedModel}, the model for ${agentName}. Choose an allowed model for that agent and try again.`;
+    }
     // Same barrier as the composer: the backend reads the send model's auto-compaction
     // threshold from persisted preferences, so a slider move right before this click must
     // reach config.json first. A failed save lands in the handlers' best-effort catch.
@@ -621,7 +648,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     );
 
     // Final re-check after every await; nothing has been changed yet.
-    if (!isTranscriptMutationAllowed(workspaceId)) return;
+    if (!isTranscriptMutationAllowed(workspaceId)) return null;
     if (shouldReplaceChatHistory) {
       await replaceChatHistoryWithPlan({
         idPrefix: args.replacementIdPrefix,
@@ -630,7 +657,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
     persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, settings });
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
-    await api.workspace.sendMessage({
+    const sendResult = await api.workspace.sendMessage({
       workspaceId,
       message: "Implement the plan",
       options: {
@@ -645,6 +672,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         autoThinkingLevel: false,
       },
     });
+    if (sendResult.success) return null;
+    const formatted = formatSendMessageError(sendResult.error);
+    return formatted.resolutionHint
+      ? `${formatted.message} ${formatted.resolutionHint}`
+      : formatted.message;
   };
 
   const handleImplement = async () => {
@@ -656,17 +688,20 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     isImplementingRef.current = true;
     if (isMountedRef.current) {
       setIsImplementing(true);
+      setPlanActionError(null);
     }
 
     try {
-      await runPlanAction({
+      const error = await runPlanAction({
         workspaceId,
         targetAgentId: "exec",
         replacementIdPrefix: "start-here",
         replacementErrorContext: "Failed to replace chat history before implementing:",
       });
-    } catch {
-      // Best-effort: user can retry manually if sending fails.
+      if (isMountedRef.current) setPlanActionError(error);
+    } catch (error) {
+      // The user retries after reading why it failed.
+      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
     } finally {
       isImplementingRef.current = false;
       if (isMountedRef.current) {
@@ -682,17 +717,19 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     isContinuingInAutoRef.current = true;
     if (isMountedRef.current) {
       setIsContinuingInAuto(true);
+      setPlanActionError(null);
     }
 
     try {
-      await runPlanAction({
+      const error = await runPlanAction({
         workspaceId,
         targetAgentId: "auto",
         replacementIdPrefix: "continue-auto",
         replacementErrorContext: "Failed to replace chat history before continuing in auto:",
       });
-    } catch {
-      // Best-effort: user can retry manually if sending fails.
+      if (isMountedRef.current) setPlanActionError(error);
+    } catch (error) {
+      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
     } finally {
       isContinuingInAutoRef.current = false;
       if (isMountedRef.current) {
@@ -1016,6 +1053,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           </div>
         )}
       </ToolChrome>
+
+      {planActionError && (implementButton ?? autoButton) && (
+        <ToolChrome className="mt-2">
+          <ErrorBox role="alert">{planActionError}</ErrorBox>
+        </ToolChrome>
+      )}
     </div>
   );
 
