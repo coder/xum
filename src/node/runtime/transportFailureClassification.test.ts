@@ -207,6 +207,15 @@ describe("container exec failures", () => {
     const errors = await failures(new StubbedDockerRuntime([noBash, 126]), false);
     expect(errors.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
     expect(errors.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
+    // #4985: permanent daemon refusals need a configuration change, not a retry.
+    for (const refusal of [
+      "Error response from daemon: client version 1.52 is too new. Maximum supported API version is 1.47\n",
+      "Error response from daemon: authorization denied by plugin opa-docker-authz: request rejected by administrative policy\n",
+    ]) {
+      const refused = await failures(new StubbedDockerRuntime([refusal, 1]), false);
+      expect(refused.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
+      expect(refused.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
+    }
     // #4985: a daemon line does not make an uninvokable command (exit 126/127) transport.
     const daemonNoBash = `Error response from daemon: ${noBash}`;
     for (const exitCode of [126, 127]) {

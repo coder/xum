@@ -18,7 +18,7 @@ import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
  * Each pattern is anchored at a line start so a probe's own output cannot match
  * mid-line (our probes are cat/stat/find/mv, which never print these).
  *
- * Never transport: exit 126/127, docker's "command cannot be invoked" / "not
+ * Never transport: permanent daemon refusals (see PERMANENT_DAEMON_REFUSAL) and exit 126/127, docker's "command cannot be invoked" / "not
  * found" statuses (e.g. no bash in the image, "OCI runtime exec failed"), which
  * retrying cannot fix, even when a daemon line accompanies them. They still
  * fail loudly as unreadable reads. Podman's wording is not covered.
@@ -32,6 +32,15 @@ const CONTAINER_UNAVAILABLE_PATTERNS: readonly RegExp[] = [
   /^(?:\[[^\]]*\] )?Error: Dev container not found\./m,
 ];
 
+/**
+ * Daemon refusals that only a configuration change fixes, so retrying is
+ * pointless: an API version mismatch (moby daemon/server/middleware/version.go)
+ * and an authorization plugin denial (moby daemon/pkg/authorization/authz.go).
+ * They stay non-transport and fail loudly as unreadable reads.
+ */
+const PERMANENT_DAEMON_REFUSAL =
+  /^(?:docker: )?Error response from daemon: (?:client version \S+ is too (?:new|old)\b|authorization denied by plugin )/m;
+
 /** docker exec statuses for a command that could not be invoked or was not found. */
 const COMMAND_NOT_INVOKABLE_EXITS: ReadonlySet<number> = new Set([126, 127]);
 
@@ -41,5 +50,6 @@ export function isContainerUnavailableExit(exitCode: number, stderr: string): bo
   // with empty stderr. SSHRuntime treats its timeouts the same way (#4825).
   if (exitCode === EXIT_CODE_TIMEOUT) return true;
   if (exitCode === 0 || COMMAND_NOT_INVOKABLE_EXITS.has(exitCode)) return false;
+  if (PERMANENT_DAEMON_REFUSAL.test(stderr)) return false;
   return CONTAINER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(stderr));
 }
