@@ -30,17 +30,14 @@ describe("context budget warnings", () => {
     sessionHistoryAvailable: true,
   };
 
-  test("publishes a visible advisory with optional backward-compatible handoff metadata", () => {
-    const warning = createContextBudgetWarning(options);
-    expect(warning.role).toBe("user");
-    expect(warning.metadata).toMatchObject({ synthetic: true, uiVisible: true });
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoff");
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoffTokens");
+  test("publishes a visible advisory with backward-compatible stage metadata", () => {
     const handoff = createContextBudgetWarning({
       ...options,
       handoff: true,
       handoffTokens: 89_600,
     });
+    expect(handoff.role).toBe("user");
+    expect(handoff.metadata).toMatchObject({ synthetic: true, uiVisible: true });
     expect(handoff.metadata?.muxMetadata).toMatchObject({
       handoff: true,
       handoffTokens: 89_600,
@@ -61,7 +58,6 @@ describe("context budget warnings", () => {
     // Policy permission cannot prove advertising: unknown and permitted use conditional guidance.
     expect(parts({ newContextAvailable: "unknown" })).toEqual(parts({ newContextAvailable: true }));
     expect(parts({ newContextAvailable: false })).not.toEqual(parts({ newContextAvailable: true }));
-    expect(parts({ memoryWritable: false })).not.toEqual(parts({ memoryWritable: true }));
     // History recovery takes precedence over a tool that would discard the active window.
     expect(parts({ sessionHistoryAvailable: false, newContextAvailable: true })).toEqual(
       parts({ sessionHistoryAvailable: false, newContextAvailable: false })
@@ -82,6 +78,7 @@ describe("context window rollover recovery", () => {
       budgetTokens: 96_000,
       memoryWritable: true,
       sessionHistoryAvailable: true,
+      handoff: true,
     });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
     expect(
@@ -110,6 +107,7 @@ describe("context window rollover recovery", () => {
           budgetTokens: 96_000,
           memoryWritable: true,
           sessionHistoryAvailable: true,
+          handoff: true,
         }),
       ])
     ).toBe("w:12");

@@ -132,7 +132,6 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     memoryWritable,
     sessionHistoryAvailable,
     handoff,
-    handoffTokens,
   } = options;
   assert(
     handoffTokens == null ||
@@ -162,17 +161,18 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
       "If the task is already complete, finish the reply instead.",
     ].join(" ");
   }
-  const target =
-    handoffTokens != null && !handoff
-      ? ` The upcoming handoff target is ${handoffTokens} tokens; prepare to finish a small unit of work and save your checkpoint there.`
-      : "";
-  return `${usage}${target} ${
-    !sessionHistoryAvailable
-      ? "History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
-      : memoryWritable
-        ? `If your checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} is stale, update it now, then continue the current task without commentary.`
-        : "Memory writes are unavailable for this turn. If session_history is available after rollover, use it to retrieve prior windows; continue the current task."
-  }`;
+  return [
+    usage,
+    "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.",
+    memoryWritable
+      ? `Before starting a new context window, save ${checkpoint}. Clean up old notes that are obsolete. Future context windows will not include the current conversation.`
+      : "Memory writes are unavailable for this turn; skip the checkpoint.",
+    // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
+    options.newContextAvailable === false
+      ? "new_context is not available under the current tool policy. Continue; Xum will attempt a rollover at the usable limit or pause safely."
+      : "After saving your checkpoint, call new_context in a later step to continue in a fresh context window. If new_context is not available to you, continue.",
+    "If the task is already complete, finish the reply instead.",
+  ].join(" ");
 }
 
 export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {

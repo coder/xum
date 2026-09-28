@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { tool, jsonSchema } from "ai";
 import { z } from "zod";
 import {
+  FINAL_HANDOFF_RESERVE_TOKENS,
+  FLUSH_RESERVE_TOKENS,
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
   WARNING_RESERVE_TOKENS,
@@ -33,8 +35,8 @@ function evaluate(overrides: Partial<StepBudgetInput> = {}) {
     imageParts: 0,
     modelContextLimit: 100_000,
     threshold: 0.7,
-    warningEmitted: false,
     handoffRequested: false,
+    finalHandoffAvailable: false,
     ...overrides,
   });
 }
@@ -71,9 +73,7 @@ describe("handoff point", () => {
 
 describe("step budget decisions", () => {
   test.each([
-    [59_999, "continue"],
-    [60_000, "warn"],
-    [69_999, "warn"],
+    [69_999, "continue"],
     [70_000, "handoff"],
     [89_759, "handoff"],
     [89_760, "continue"],
@@ -85,17 +85,14 @@ describe("step budget decisions", () => {
 
   test("projects output, rounded tool text, and media without dropping the context baseline", () => {
     const result = evaluate({
-      contextTokens: 55_000,
+      contextTokens: 65_000,
       outputTokens: 4_000,
       toolResultChars: 5,
       imageParts: 1,
     });
-    expect(result.projected).toBe(55_000 + 4_000 + 2 + IMAGE_TOKEN_ESTIMATE);
-    expect(result.decision).toBe("warn");
-    expect(evaluate({ contextTokens: result.projected, warningEmitted: true }).decision).toBe(
-      "continue"
-    );
-    expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("handoff");
+    expect(result.projected).toBe(65_000 + 4_000 + 2 + IMAGE_TOKEN_ESTIMATE);
+    expect(result.decision).toBe("handoff");
+    expect(evaluate({ contextTokens: 65_000 }).decision).toBe("continue");
   });
 
   // #4855: provider usage can sit well below the assembled estimate the next step's preflight
@@ -128,7 +125,7 @@ describe("step budget decisions", () => {
   });
 
   test.each([60_000, 75_000, 89_000])(
-    "a delivered handoff suppresses both advisories at %d",
+    "a delivered handoff request is not repeated at %d",
     (contextTokens) => {
       expect(evaluate({ contextTokens, handoffRequested: true }).decision).toBe("continue");
     }
@@ -157,10 +154,7 @@ describe("step budget decisions", () => {
   });
 
   test("hard ceiling overrides a higher configured target", () => {
-    expect(evaluate({ contextTokens: 91_808, threshold: 0.99 })).toMatchObject({
-      decision: "rollover",
-      flushOpportunity: false,
-    });
+    expect(evaluate({ contextTokens: 91_808, threshold: 0.99 }).decision).toBe("rollover");
     expect(evaluate({ contextTokens: 91_807, threshold: 0.99 }).decision).toBe("continue");
   });
 
@@ -170,7 +164,6 @@ describe("step budget decisions", () => {
       expect(evaluate({ modelContextLimit, contextTokens: 1_000_000 })).toMatchObject({
         decision: "continue",
         hardCeiling: undefined,
-        flushOpportunity: false,
       });
     }
   );
@@ -232,12 +225,10 @@ describe("small-model context budgets", () => {
       expect(
         estimateFreshRequestTokens({ ...freshInput, userText: "x".repeat(modelContextLimit * 4) })
       ).toBeGreaterThan(hardCeiling);
-      expect(
-        evaluate({ modelContextLimit, contextTokens: hardCeiling, warningEmitted: true })
-      ).toMatchObject({ decision: "rollover", flushOpportunity: false });
-      expect(
-        evaluate({ modelContextLimit, contextTokens: hardCeiling - 1, warningEmitted: true })
-      ).toMatchObject({ decision: "continue" });
+      expect(evaluate({ modelContextLimit, contextTokens: hardCeiling }).decision).toBe("rollover");
+      expect(evaluate({ modelContextLimit, contextTokens: hardCeiling - 1 }).decision).toBe(
+        "continue"
+      );
     }
   );
 
@@ -261,31 +252,12 @@ describe("small-model context budgets", () => {
     (modelContextLimit) => {
       expect(
         evaluate({ modelContextLimit, contextTokens: Math.ceil(modelContextLimit * 0.6) })
-      ).toMatchObject({
-        decision: "continue",
-        flushOpportunity: false,
-      });
+      ).toMatchObject({ decision: "continue" });
     }
   );
 });
 
-describe("absolute warning advance floor", () => {
-  test.each([
-    [128_000, 0.7, 76_800],
-    [32_768, 0.7, 16_793],
-    [128_000, 0.1, 6400],
-  ])(
-    "warns ahead of the handoff target for %d tokens at %s",
-    (modelContextLimit, threshold, warnAt) => {
-      expect(evaluate({ modelContextLimit, threshold, contextTokens: warnAt - 1 }).decision).toBe(
-        "continue"
-      );
-      expect(evaluate({ modelContextLimit, threshold, contextTokens: warnAt }).decision).toBe(
-        "warn"
-      );
-    }
-  );
-
+describe("targets near the usable ceiling", () => {
   test("does not pull a target earlier when it exceeds the usable ceiling", () => {
     expect(
       evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: 54_656 }).decision
@@ -298,10 +270,7 @@ describe("absolute warning advance floor", () => {
   test.each([1434, 2867, 3071])(
     "a tiny window skips advisories at %d without resetting",
     (contextTokens) => {
-      expect(evaluate({ modelContextLimit: 4096, contextTokens })).toMatchObject({
-        decision: "continue",
-        flushOpportunity: false,
-      });
+      expect(evaluate({ modelContextLimit: 4096, contextTokens }).decision).toBe("continue");
     }
   );
 });
@@ -309,10 +278,46 @@ describe("absolute warning advance floor", () => {
 test("measured dense tool tokens enforce the hard ceiling while ordinary proactive estimates remain conservative", () => {
   expect(
     evaluate({ threshold: 1, contextTokens: 1000, toolResultChars: 100, toolResultTokens: 100000 })
-  ).toMatchObject({ decision: "block", flushOpportunity: false });
+  ).toMatchObject({ decision: "block" });
   expect(
-    evaluate({ contextTokens: 55000, toolResultChars: 20000, toolResultTokens: 10 }).decision
-  ).toBe("warn");
+    evaluate({ contextTokens: 65000, toolResultChars: 20000, toolResultTokens: 10 }).decision
+  ).toBe("handoff");
+});
+
+describe("final handoff step", () => {
+  const hardCeiling = 91_808;
+  const firstFinal = hardCeiling - FINAL_HANDOFF_RESERVE_TOKENS;
+  const lastFinal = hardCeiling - FLUSH_RESERVE_TOKENS - 1;
+
+  test.each([
+    [firstFinal - 1, "handoff"],
+    [firstFinal, "final"],
+    [lastFinal, "final"],
+    [lastFinal + 1, "handoff"],
+    [hardCeiling, "rollover"],
+  ] as const)("ladder at %d", (contextTokens, decision) => {
+    expect(evaluate({ contextTokens, finalHandoffAvailable: true }).decision).toBe(decision);
+  });
+
+  test("runs once per window even after the handoff request, and never at 100%", () => {
+    expect(evaluate({ contextTokens: firstFinal }).decision).toBe("handoff");
+    expect(
+      evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true, handoffRequested: true })
+        .decision
+    ).toBe("final");
+    expect(
+      evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true, threshold: 1 }).decision
+    ).toBe("continue");
+  });
+
+  test.each([4096, 8192])("a %d-token window has no room for it", (modelContextLimit) => {
+    const ceiling = getContextBudgetHardCeiling(modelContextLimit);
+    for (const contextTokens of [1, Math.floor(ceiling / 2), ceiling - 1]) {
+      expect(
+        evaluate({ modelContextLimit, contextTokens, finalHandoffAvailable: true }).decision
+      ).not.toBe("final");
+    }
+  });
 });
 
 describe("request estimates", () => {

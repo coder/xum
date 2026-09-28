@@ -278,11 +278,6 @@ export class TokenBudgetStrategy {
     ) {
       this.clearContextBudgetState();
     }
-    this.contextBudgetWarningClaimed = history.data.some(
-      (row) =>
-        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
-        row.metadata.muxMetadata.handoff !== true
-    );
     this.contextBudgetHandoffClaimed = history.data.some(
       (row) =>
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
@@ -369,12 +364,12 @@ export class TokenBudgetStrategy {
             toolResultTokens,
             modelContextLimit: maxTokens,
             threshold,
-            warningEmitted: this.contextBudgetWarningClaimed,
             handoffRequested: this.contextBudgetHandoffClaimed,
+            // Only a settled step can queue the final handoff step; a send never becomes one.
+            finalHandoffAvailable: false,
           })
         : {
             decision: "continue",
-            flushOpportunity: true,
             projected: contextTokens + newRequestTokens,
             hardCeiling: undefined,
           };
@@ -405,7 +400,7 @@ export class TokenBudgetStrategy {
             reason: "on-send",
             ...(modelRequested ? { requestedBy: "model" as const } : {}),
             previousWindowId: currentContextWindowId(history.data),
-            flushOpportunity: decision.flushOpportunity,
+            flushOpportunity: this.contextBudgetFlushClaimed,
             contextTokens: decision.projected,
             maxTokens: recordedLimit,
             budgetTokens: getContextBudgetHardCeiling(recordedLimit),
@@ -428,7 +423,6 @@ export class TokenBudgetStrategy {
       const captured = await this.captureRolloverRequestAssembly();
       if (!captured.success) return captured;
       this.pendingRollover = rollover;
-      this.pendingBudgetPrompt = undefined;
       userMessage.metadata = {
         ...userMessage.metadata,
         muxMetadata: {
@@ -450,7 +444,6 @@ export class TokenBudgetStrategy {
       this.pendingRollover = undefined;
     }
     if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
-      this.pendingBudgetPrompt = undefined;
       return Ok({ prefix: [] });
     }
     // Advisory capabilities come from the dispatching agent, policy and experiments, so the first
@@ -466,7 +459,7 @@ export class TokenBudgetStrategy {
         permissions &&
         this.validatePreparation(receipt) &&
         this.isActive(options) &&
-        (advisory.decision === "warn" || advisory.decision === "handoff")
+        advisory.decision === "handoff"
       ) {
         return Ok({
           prefix: [
@@ -475,7 +468,7 @@ export class TokenBudgetStrategy {
               maxTokens: recordedLimit,
               budgetTokens: getContextBudgetHardCeiling(recordedLimit),
               handoffTokens: getContextBudgetHandoffPoint(recordedLimit, threshold),
-              handoff: advisory.decision === "handoff",
+              handoff: true,
               ...permissions,
             }),
           ],
@@ -524,15 +517,15 @@ export class TokenBudgetStrategy {
           nextRequestTokens: step.nextRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
-          warningEmitted: this.contextBudgetWarningClaimed,
           handoffRequested: this.contextBudgetHandoffClaimed,
+          // The final step must be able to hand off, and its sealing reset needs history access.
+          finalHandoffAvailable:
+            !this.contextBudgetFlushClaimed &&
+            step.newContextAvailable &&
+            step.sessionHistoryAvailable &&
+            this.host.continuations.isEmpty(),
         })
-      : {
-          decision: "continue",
-          flushOpportunity: true,
-          projected: contextTokens,
-          hardCeiling: undefined,
-        };
+      : { decision: "continue", projected: contextTokens, hardCeiling: undefined };
     // Rollover metadata records the limit the window was measured against; an unknown limit is
     // recorded as the observed usage so the row stays valid for display and downgrade parsing.
     const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
@@ -542,7 +535,8 @@ export class TokenBudgetStrategy {
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
     if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
-    if (decision.decision === "rollover" || modelRequested) {
+    const finalStep = decision.decision === "final" && !modelRequested;
+    if (decision.decision === "rollover" || modelRequested || finalStep) {
       const history = await this.deps.historyService.getHistoryFromLatestBoundary(
         this.host.workspaceId
       );
@@ -557,50 +551,41 @@ export class TokenBudgetStrategy {
         reason: "mid-stream",
         ...(modelRequested ? { requestedBy: "model" as const } : {}),
         previousWindowId: currentContextWindowId(history.data),
-        flushOpportunity: decision.flushOpportunity,
+        flushOpportunity: this.contextBudgetFlushClaimed,
         contextTokens: decision.projected,
         maxTokens: recordedLimit,
         budgetTokens: getContextBudgetHardCeiling(recordedLimit),
       };
     } else {
-      assert(
-        decision.decision === "warn" || decision.decision === "handoff",
-        "Expected a budget advisory"
-      );
-      this.pendingBudgetPrompt = decision.decision;
+      assert(decision.decision === "handoff", "Expected a handoff request");
     }
-    // Keep the continuation's delegated-turn/goal attribution; the warning
+    // Keep the continuation's delegated-turn/goal attribution; the prompt
     // itself is a separate durable prefix row when this entry dispatches.
     // Capture the exact successor before publishing the queue so handoff stops retain
     // upstream queue-cut attribution.
     let continuationEntryId: string | undefined;
     if (this.host.continuations.isEmpty()) {
-      const entry: ContinuationEntry = {
-        admissionCapture: context.admissionCapture,
-        text: "Continue",
-        dedupeKey:
-          this.pendingBudgetPrompt != null
-            ? CONTEXT_WARNING_DEDUPE_KEY
-            : CONTEXT_CONTINUE_DEDUPE_KEY,
-        options: context.options,
-        model: step.model,
-        muxMetadata: {
-          ...(context.workspaceTurnMetadata ?? { type: "normal" }),
-          contextBudgetContinuation: true,
-        },
-        autoModelRouting: context.autoModelRouting,
-        goalKind: context.goalKind,
-        goalId: context.goalId,
-      };
-      continuationEntryId = this.host.continuations.enqueue([entry], true);
+      continuationEntryId = this.host.continuations.enqueue(
+        finalStep
+          ? [
+              entry("Call new_context now.", CONTEXT_WARNING_DEDUPE_KEY, true),
+              entry("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false),
+            ]
+          : [
+              entry(
+                "Continue",
+                decision.decision === "handoff"
+                  ? CONTEXT_WARNING_DEDUPE_KEY
+                  : CONTEXT_CONTINUE_DEDUPE_KEY,
+                false
+              ),
+            ],
+        true
+      );
     }
     // Nothing enqueued (unrelated input already queued): the stop designates no successor.
     return {
-      decision: modelRequested
-        ? "rollover"
-        : decision.decision === "handoff"
-          ? "warn"
-          : decision.decision,
+      decision: decision.decision === "handoff" && !modelRequested ? "warn" : "rollover",
       ...(continuationEntryId != null ? { continuationEntryId } : {}),
     };
   }
@@ -631,11 +616,6 @@ export class TokenBudgetStrategy {
 
   onSendAccepted(userMessage: MuxMessage, prefixRows: readonly MuxMessage[]): void {
     const published = [...prefixRows, userMessage];
-    this.contextBudgetWarningClaimed ||= published.some(
-      (row) =>
-        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
-        row.metadata.muxMetadata.handoff !== true
-    );
     this.contextBudgetHandoffClaimed ||= published.some(
       (row) =>
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&

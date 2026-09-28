@@ -33,8 +33,8 @@ function evaluateAt(
     modelContextLimit: options.modelContextLimit ?? 1_000_000,
     // Both backend callers clamp the stored slider value the same way before syncing it.
     threshold: getEffectiveThreshold(config) / 100,
-    warningEmitted: true,
     handoffRequested: options.handoffRequested ?? false,
+    finalHandoffAvailable: false,
   });
 }
 

@@ -345,11 +345,14 @@ describe("settled context hard ceiling", () => {
             toolResultTokens: step.toolResultTokens,
             modelContextLimit: 128000,
             threshold: 1,
-            warningEmitted: false,
             handoffRequested: false,
+            finalHandoffAvailable: false,
           });
-          // The session maps the internal handoff decision onto the callback's "warn" stop.
-          return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+          // The session maps the internal handoff and final decisions onto callback stops.
+          return Promise.resolve({
+            decision:
+              decision === "handoff" ? "warn" : decision === "final" ? "rollover" : decision,
+          });
         },
       });
       expect(started.success).toBe(true);
@@ -481,10 +484,13 @@ describe("settled context hard ceiling", () => {
               nextRequestTokens: step.nextRequestTokens,
               modelContextLimit: limit,
               threshold: 0.9,
-              warningEmitted: true,
               handoffRequested: true,
+              finalHandoffAvailable: false,
             });
-            return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+            return Promise.resolve({
+              decision:
+                decision === "handoff" ? "warn" : decision === "final" ? "rollover" : decision,
+            });
           },
         });
         if (!started.success) throw new Error("Expected stream startup");

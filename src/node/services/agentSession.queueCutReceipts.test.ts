@@ -182,7 +182,6 @@ describe("AgentSession queue-cut receipts", () => {
   });
 
   test.each([
-    { usage: 85_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 90_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 120_000, decision: "rollover", dedupeKey: CONTEXT_CONTINUE_DEDUPE_KEY },
   ])("a budget stop at $usage designates only its single continuation", async (fixture) => {
@@ -209,11 +208,38 @@ describe("AgentSession queue-cut receipts", () => {
     }
   });
 
+  test("a final handoff stop designates the final step first, the paired rollover only once that step ends for it", async () => {
+    const h = await setup();
+    try {
+      await h.startBudgetTurn();
+      const first = await h.requests[0].onStepSettled!(step(110_000));
+      const finalEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
+      const rolloverEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY);
+      expect(finalEntryId).toBeDefined();
+      expect(rolloverEntryId).toBeDefined();
+      expect(first).toEqual({ decision: "rollover", continuationEntryId: finalEntryId });
+      expect(h.session.getQueueCutReceipt(finalEntryId!)?.successor).toBe("pending");
+      // B has cut nothing yet: no receipt is invented for it.
+      expect(h.session.getQueueCutReceipt(rolloverEntryId!)).toBeUndefined();
+
+      // The final step (A) dispatches and ends after one step for B.
+      h.settleStream(0);
+      await h.secondRequest;
+      expect(h.requests[1].muxMetadata?.contextBudgetFlush).toBe(true);
+      expect(h.session.getQueueCutReceipt(finalEntryId!)?.successor).toBe("streaming");
+      const second = await h.requests[1].onStepSettled!(step(5_000));
+      expect(second).toEqual({ decision: "rollover", continuationEntryId: rolloverEntryId });
+      expect(h.session.getQueueCutReceipt(rolloverEntryId!)?.successor).toBe("pending");
+    } finally {
+      await teardown(h);
+    }
+  });
+
   test("the captured successor survives a head reorder or removal after the decision", async () => {
     const h = await setup();
     try {
       await h.startBudgetTurn();
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       const continueEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
       expect(outcome).toEqual({ decision: "warn", continuationEntryId: continueEntryId });
 
@@ -240,7 +266,7 @@ describe("AgentSession queue-cut receipts", () => {
       await h.startBudgetTurn();
       h.session.queueMessage("Unrelated follow-up", { model: TEST_MODEL, agentId: "exec" });
       const unrelatedEntryId = queueOf(h).getNextQueueCutCandidate()!.entryId;
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       expect(outcome).toEqual({ decision: "warn" });
       expect(h.session.getQueueCutReceipt(unrelatedEntryId)).toBeUndefined();
     } finally {

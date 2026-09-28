@@ -71,7 +71,6 @@ function trackedFilePaths(h: AgentSessionHarness): string[] {
 function budgetOf(h: AgentSessionHarness) {
   return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
     contextBudgetGeneration: number;
-    contextBudgetWarningClaimed: boolean;
     contextBudgetHandoffClaimed: boolean;
   };
 }
@@ -109,13 +108,9 @@ function isHandoffRow(row: MuxMessage): boolean {
   return meta?.type === "context-budget-warning" && meta.handoff === true;
 }
 
-/** Per-window advisory claims; set only once a row is durable, never by pending intent. */
-function budgetClaims(h: AgentSessionHarness): { warning: boolean; handoff: boolean } {
-  const budget = budgetOf(h);
-  return {
-    warning: budget.contextBudgetWarningClaimed,
-    handoff: budget.contextBudgetHandoffClaimed,
-  };
+/** Per-window handoff claim; set only once a row is durable, never by pending intent. */
+function handoffClaimed(h: AgentSessionHarness): boolean {
+  return budgetOf(h).contextBudgetHandoffClaimed;
 }
 
 async function emitUsageDelta(h: AgentSessionHarness & { requests: unknown[] }) {
@@ -1346,6 +1341,84 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
+  test.each([
+    { label: "an editing agent", toolPolicy: undefined },
+    {
+      // Explore-like: no memory writes, so a notes-file handoff would be impossible.
+      label: "a read-only agent",
+      toolPolicy: [
+        { regex_match: "memory|file_edit_.*|bash", action: "disable" },
+      ] satisfies SendMessageOptions["toolPolicy"],
+    },
+  ])(
+    "near the ceiling $label gets one new_context-only final step whose handoff seals the window",
+    async ({ toolPolicy }) => {
+      const h = await setup();
+      const sendOptions = toolPolicy ? { ...options, toolPolicy } : options;
+      expect((await h.session.sendMessage("Work", sendOptions)).success).toBe(true);
+      expect(
+        (await h.requests[0].onStepSettled?.(step(110_000, { memoryWritable: !toolPolicy })))
+          ?.decision
+      ).toBe("rollover");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+      h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+      const final = await h.waitForRequest(2);
+      // The request builder derives the new_context-only ceiling from this flag.
+      expect(final.muxMetadata).toMatchObject({ contextBudgetFlush: true });
+      expect(
+        (
+          await final.onStepSettled?.(
+            step(112_000, { newContextRequested: true, newContextHandoff: "Resume at step 3" })
+          )
+        )?.decision
+      ).toBe("rollover");
+      h.settleStream(1);
+      await h.waitForRequest(3);
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isFinalFlushRow)).toEqual([true]);
+      const resets = rolloverRows(rows);
+      expect(resets).toHaveLength(1);
+      expect(resets[0].metadata?.muxMetadata).toMatchObject({
+        reason: "mid-stream",
+        flushOpportunity: true,
+        handoff: { text: "Resume at step 3" },
+        request: { text: "Work" },
+      });
+      expect(resets[0].metadata?.muxMetadata).not.toHaveProperty("requestedBy");
+      expect(text(rows.at(-1)!)).toBe("Continue");
+    }
+  );
+
+  test("a final step that does not call new_context seals the window with the carried handoff", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      (
+        await h.requests[0].onStepSettled?.(
+          step(20_000, { newContextRequested: true, newContextHandoff: "Earlier handoff" })
+        )
+      )?.decision
+    ).toBe("rollover");
+    await h.finishAndDispatch();
+    // The fresh window does real work and runs into the ceiling without handing off itself.
+    const work = createMuxMessage("second-window-work", "assistant", "More work", { model });
+    expect((await h.historyService.appendToHistory(workspaceId, work)).success).toBe(true);
+    expect((await h.requests[1].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
+    h.settleStream(1, { contextUsage: { inputTokens: 110_000 } });
+    const final = await h.waitForRequest(3);
+    expect(final.muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect((await final.onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
+    h.settleStream(2);
+    await h.waitForRequest(4);
+    const resets = rolloverRows(await allRows(h));
+    expect(resets).toHaveLength(2);
+    expect(resets[1].metadata?.muxMetadata).toMatchObject({
+      handoff: { text: "Earlier handoff" },
+      request: { text: "Work" },
+    });
+  });
+
   test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
     // #4855: provider usage far below the ceiling, but the next step's assembled estimate (what
     // the per-step preflight enforces) reaches it. Rollover must win before that hard stop.
@@ -1820,17 +1893,6 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test.each([
     {
-      label: "warning with full capabilities",
-      usage: 85_000,
-      sendOptions: options,
-      expected: {
-        handoff: false,
-        memoryWritable: true,
-        sessionHistoryAvailable: true,
-        newContextAvailable: true,
-      },
-    },
-    {
       label: "handoff with degraded capabilities",
       usage: 90_000,
       sendOptions: {
@@ -1864,7 +1926,7 @@ describe("AgentSession token-budget lifecycle", () => {
       );
       expect(rolloverRows(rows)).toHaveLength(0);
       expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
-      expect(budgetClaims(h)).toEqual({ warning: !expected.handoff, handoff: expected.handoff });
+      expect(handoffClaimed(h)).toBe(expected.handoff);
       // A text-only reply never runs the settled-step callback; the next send repeats nothing.
       h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: usage } });
       await h.session.waitForIdle();
@@ -1897,7 +1959,7 @@ describe("AgentSession token-budget lifecycle", () => {
         budgetTokens: 119_808,
         handoffTokens: 89_600,
       });
-      for (const usage of [95_000, 105_000, 115_000]) {
+      for (const usage of [95_000, 105_000]) {
         expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
       }
       expect((await h.requests[1].onStepSettled?.(step(120_000)))?.decision).toBe("rollover");
@@ -1910,7 +1972,7 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([85_000, 90_000])(
+  test.each([90_000])(
     "a settled advisory at %d tokens is durable once per window and retains delegated continuation attribution",
     async (usage) => {
       const h = await setup();
@@ -1943,7 +2005,7 @@ describe("AgentSession token-budget lifecycle", () => {
         budgetTokens: 119_808,
         handoffTokens: 89_600,
       });
-      expect(isHandoffRow(warnings[0])).toBe(usage >= 89_600);
+      expect(isHandoffRow(warnings[0])).toBe(true);
       const continuation = rows.at(-1)!;
       expect(continuation.metadata).toMatchObject({
         synthetic: true,
@@ -2109,56 +2171,39 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([
-    { label: "after an advance warning", first: 85_000, warnings: 2 },
-    { label: "on a direct jump into the handoff band", first: 90_000, warnings: 1 },
-  ])(
-    "the handoff is published once $label and suppresses later warnings",
-    async ({ first, warnings }) => {
-      const h = await setup();
-      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
-      // The external stop type stays "warn"; the published row tells the advisories apart.
-      expect((await h.requests[0].onStepSettled?.(step(first)))?.decision).toBe("warn");
-      h.settleStream(0, { contextUsage: { inputTokens: first } });
-      await h.waitForRequest(2);
-      let rows = await allRows(h);
-      expect(warningRows(rows)).toHaveLength(1);
-      expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
-        budgetTokens: 119_808,
-        handoffTokens: 89_600,
-      });
-      expect(isHandoffRow(warningRows(rows)[0])).toBe(first >= 89_600);
-      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: first >= 89_600 });
-      if (first < 89_600) {
-        // A delivered warning does not consume the handoff that follows it.
-        expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-        h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
-        await h.waitForRequest(3);
-        rows = await allRows(h);
-      }
-      expect(warningRows(rows)).toHaveLength(warnings);
-      expect(warningRows(rows).filter(isHandoffRow)).toHaveLength(1);
-      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: true });
-      // Nothing else is advertised in this window until the usable ceiling forces a rollover;
-      // near the ceiling the advisory row itself would no longer fit.
-      const active = h.requests.at(-1)!;
-      for (const usage of [85_000, 95_000, 118_000])
-        expect((await active.onStepSettled?.(step(usage)))?.decision).toBe("continue");
-      expect(h.session.hasQueuedMessages()).toBe(false);
-      expect(rolloverRows(rows)).toHaveLength(0);
-    }
-  );
+  test("the handoff is published once and suppresses later handoff requests", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    // The external stop type stays "warn"; the published row is the handoff request.
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(1);
+    expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+      handoff: true,
+      budgetTokens: 119_808,
+      handoffTokens: 89_600,
+    });
+    expect(handoffClaimed(h)).toBe(true);
+    // Outside the final step's band nothing else is advertised in this window until the usable
+    // ceiling forces a rollover; near the ceiling the final step itself would no longer fit.
+    const active = h.requests.at(-1)!;
+    for (const usage of [85_000, 95_000, 105_000, 118_000])
+      expect((await active.onStepSettled?.(step(usage)))?.decision).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    expect(rolloverRows(rows)).toHaveLength(0);
+  });
 
-  test("a pending warning is upgraded by the queued user input that dispatches it", async () => {
+  test("a pending handoff is published ahead of the queued user input that dispatches it", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect(h.session.queueMessage("Later question", options)).not.toBeNull();
-    expect((await h.requests[0].onStepSettled?.(step(85_000)))?.decision).toBe("warn");
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Real queued input owns the dispatch: no Continue is added behind it.
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    // Usage reported at stream end crossed the handoff target: the pending intent never pins
-    // the advisory to the level it was computed at.
+    // The advisory is recomputed at dispatch from the usage reported at stream end.
     h.settleStream(0, { contextUsage: { inputTokens: 92_000 } });
     await h.waitForRequest(2);
     const rows = await allRows(h);
@@ -2168,7 +2213,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(warningRows(rows)[0].metadata!.historySequence!).toBeLessThan(
       rows.at(-1)!.metadata!.historySequence!
     );
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(handoffClaimed(h)).toBe(true);
   });
 
   test.each([
@@ -2266,7 +2311,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      expect(handoffClaimed(h)).toBe(true);
       expect(text(rows.at(-1)!)).toBe("Next request");
     }
   );
@@ -2283,7 +2328,7 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     await h.waitForRequest(2);
     expect(warningRows(await allRows(h))).toHaveLength(0);
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect(handoffClaimed(h)).toBe(false);
     expect(text(h.requests[1].messages.at(-1)!)).toBe("Continue");
 
     expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
@@ -2291,7 +2336,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.waitForRequest(3);
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(handoffClaimed(h)).toBe(true);
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
@@ -2311,7 +2356,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(0);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      expect(handoffClaimed(h)).toBe(false);
       if (change === "mode-inactive") {
         // The ordinary auto-compaction path owns that send; no budget callback is installed.
         expect(h.requests[1].onStepSettled).toBeUndefined();
@@ -2338,7 +2383,7 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
     expect(text(rows.at(-1)!)).toBe("Follow-up");
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(handoffClaimed(h)).toBe(true);
   });
 
   test.each(["stop", "failed-publication", "restart-before", "restart-after"] as const)(
@@ -2349,7 +2394,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
       expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
       // Intent alone claims nothing; only a durable row does.
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      expect(handoffClaimed(h)).toBe(false);
       // The committed partial keeps the usage the interrupted stream reached.
       const persistUsage = () =>
         h.historyService.appendToHistory(
@@ -2419,7 +2464,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      expect(handoffClaimed(h)).toBe(true);
       const latest = h.requests.at(-1)!;
       for (const usage of [85_000, 95_000])
         expect((await latest.onStepSettled?.(step(usage)))?.decision).toBe("continue");
@@ -2481,7 +2526,7 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(text(rows.at(-1)!)).toBe("Continue");
       }
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h).handoff).toBe(advisory);
+      expect(handoffClaimed(h)).toBe(advisory);
     }
   );
 
@@ -2524,7 +2569,7 @@ describe("AgentSession token-budget lifecycle", () => {
     const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
     expect(warningRows(fresh)).toHaveLength(0);
     expect(text(fresh.findLast((row) => row.role === "user")!)).toBe("Continue");
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect(handoffClaimed(h)).toBe(false);
     expect((await h.requests[2].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     expect(h.requests).toHaveLength(3);
   });
@@ -3879,13 +3924,13 @@ describe("AgentSession token-budget lifecycle", () => {
   test.each([
     {
       label: "degraded recovery",
-      usage: 85_000,
+      usage: 90_000,
       toolPolicy: [
         { regex_match: "memory|session_.*", action: "disable" },
       ] satisfies SendMessageOptions["toolPolicy"],
       settled: { memoryWritable: false, sessionHistoryAvailable: false },
       expected: {
-        handoff: false,
+        handoff: true,
         memoryWritable: false,
         sessionHistoryAvailable: false,
         newContextAvailable: true,
