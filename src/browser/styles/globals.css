@@ -1,6 +1,15 @@
 @import "tailwindcss";
 
-@import "./focus-reset.css";
+/* Disable the default browser focus outline (the blue ring).
+   Components can still use intentional focus styles like border-color changes.
+   Kept in the base layer (#4718) so component utilities such as
+   focus-visible:outline-* win without !important. */
+@layer base {
+  *:focus,
+  *:focus-visible {
+    outline: none;
+  }
+}
 
 @source "../node_modules/streamdown/dist/index.js";
 

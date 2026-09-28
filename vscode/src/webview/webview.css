@@ -32,7 +32,6 @@
  * the composer redesign (#4970) removes the white-text fill instead.
  */
 @import "../../../src/browser/styles/theme-dark.css";
-@import "../../../src/browser/styles/focus-reset.css";
 
 /* Webview overrides. These come after theme-dark.css so they win. */
 @theme {
@@ -66,6 +65,19 @@
     "Courier New",
     monospace
   );
+}
+
+/*
+ * Deliberately narrower than the desktop focus reset (globals.css removes the outline for every
+ * focus). Hide Chromium's outline only when the focus is not keyboard-visible, so mouse clicks and
+ * programmatic focus stay ring-free like desktop, but keyboard users keep a visible indicator on
+ * webview-only controls that have no focus-visible style of their own (WorkspacePicker rows,
+ * ChatComposer buttons). Kept in the base layer, like desktop, so component focus utilities win.
+ */
+@layer base {
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
 }
 
 /* The webview fills the VS Code panel and follows the editor's font size. */
