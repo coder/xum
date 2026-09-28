@@ -95,6 +95,12 @@ export const BlockedPhone: Story = {
       blockers: [
         { kind: "pending-turns", count: 2 },
         { kind: "terminals", count: 1 },
+        // #4770: held inputs name their workspaces (an archived one shows them only when opened).
+        {
+          kind: "held-inputs",
+          count: 2,
+          workspaceNames: ["Fix settings validation", "Archived: migrate storage"],
+        },
       ],
     },
   },
@@ -107,6 +113,9 @@ export const BlockedPhone: Story = {
     await expect(retry).toBeEnabled();
     await expect(within(dialog).getByRole("button", { name: "Restart anyway" })).toBeEnabled();
     await expect(within(dialog).getByRole("status")).toBeVisible();
+    await expect(within(dialog).getByRole("status")).toHaveTextContent(
+      "Sessions with unsent messages: 2 (Fix settings validation, Archived: migrate storage)"
+    );
     const npm = within(dialog).getByRole("radio", { name: "Newest npm" });
     await userEvent.click(npm);
     await expect(npm).toHaveAttribute("aria-checked", "true");

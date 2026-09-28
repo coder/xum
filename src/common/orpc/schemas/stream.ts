@@ -816,6 +816,12 @@ export const RestartBlockerSchema = z.object({
     "background-processes",
   ]),
   count: z.number().int().positive(),
+  /**
+   * Display names of the workspaces behind the blocker, so the user knows which one to open.
+   * Set for held-inputs only (#4770): unsent messages of an archived workspace are otherwise
+   * visible only in that workspace.
+   */
+  workspaceNames: z.array(z.string()).optional(),
 });
 
 export const UpdateStatusSchema = z.discriminatedUnion("type", [

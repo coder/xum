@@ -367,6 +367,13 @@ export function AboutDialog() {
                         <li key={blocker.kind}>
                           {blockerLabels[blocker.kind]}:{" "}
                           <span className="counter-nums">{blocker.count}</span>
+                          {/* Which workspaces to open, e.g. an archived one (#4770). */}
+                          {blocker.workspaceNames != null && blocker.workspaceNames.length > 0 && (
+                            <span className="break-words">
+                              {" "}
+                              ({blocker.workspaceNames.join(", ")})
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>

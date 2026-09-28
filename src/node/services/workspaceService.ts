@@ -4913,16 +4913,21 @@ export class WorkspaceService
 
   collectRestartBlockers(): RestartBlocker[] {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const config = this.config.loadConfigOrDefault();
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
-    let heldInputs = 0;
+    const heldInputWorkspaceNames: string[] = [];
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
       if (session.hasQueuedMessages()) queuedMessages++;
       // Held inputs are not queued work, but they live only in session memory: a restart would
       // silently drop the user's unsent text, attachments and reviews.
-      if (session.getHeldInputs().length > 0) heldInputs++;
+      // Named (#4770): an archived workspace shows its held input only when opened.
+      if (session.getHeldInputs().length > 0) {
+        const entry = findWorkspaceEntry(config, workspaceId)?.workspace;
+        heldInputWorkspaceNames.push(entry?.title ?? entry?.name ?? workspaceId);
+      }
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
     const blockers: RestartBlocker[] = [
@@ -4950,7 +4955,11 @@ export class WorkspaceService
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
-      { kind: "held-inputs", count: heldInputs },
+      {
+        kind: "held-inputs",
+        count: heldInputWorkspaceNames.length,
+        workspaceNames: heldInputWorkspaceNames.sort((a, b) => a.localeCompare(b)),
+      },
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",

@@ -693,7 +693,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
 
   test("a session holding refused input blocks an app restart until the input is sent or discarded (it lives only in memory)", async () => {
     const childId = "holdrestart001";
-    const stack = await createStack(childId);
+    // The blocker names the workspace by its title (#4770).
+    const stack = await createStack(childId, { title: "Rescue the report" });
     const { config, taskService, workspaceService, sendOptions } = stack;
     const heldBlockers = () =>
       workspaceService.collectRestartBlockers().filter((blocker) => blocker.kind === "held-inputs");
@@ -711,7 +712,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => !stack.sessionHarness.session.isBusy(), "turn settled");
       // Not queued work, yet a restart would lose it.
       expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
-      expect(heldBlockers()).toEqual([{ kind: "held-inputs", count: 1 }]);
+      expect(heldBlockers()).toEqual([
+        { kind: "held-inputs", count: 1, workspaceNames: ["Rescue the report"] },
+      ]);
 
       const [held] = stack.heldInputs();
       expect(workspaceService.discardHeldInput(childId, held.id)).toEqual(Ok(undefined));

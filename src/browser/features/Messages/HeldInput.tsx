@@ -13,6 +13,11 @@ interface HeldInputProps {
   heldInput: HeldInputData;
   /** The composer's held-input shortcuts act on this banner (the oldest held input). */
   isShortcutTarget: boolean;
+  /**
+   * False where the workspace cannot run a turn (transcript-only: its worktree is gone, #4770).
+   * The banner then offers Discard only; the backend would refuse a Send there anyway.
+   */
+  canSend?: boolean;
 }
 
 const SHORTCUT_HINT_CLASS =
@@ -184,23 +189,27 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 </kbd>
               )}
             </button>
-            <button
-              type="button"
-              aria-label="Send unsent message"
-              disabled={pendingAction != null}
-              onClick={() => runAction("send")}
-              className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {pendingAction === "send" ? (
-                <Loader2 className="size-3 animate-spin" />
-              ) : (
-                <Send className="size-3" />
-              )}
-              Send
-              {props.isShortcutTarget && (
-                <kbd className={SHORTCUT_HINT_CLASS}>{formatKeybind(KEYBINDS.SEND_HELD_INPUT)}</kbd>
-              )}
-            </button>
+            {props.canSend !== false && (
+              <button
+                type="button"
+                aria-label="Send unsent message"
+                disabled={pendingAction != null}
+                onClick={() => runAction("send")}
+                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pendingAction === "send" ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Send className="size-3" />
+                )}
+                Send
+                {props.isShortcutTarget && (
+                  <kbd className={SHORTCUT_HINT_CLASS}>
+                    {formatKeybind(KEYBINDS.SEND_HELD_INPUT)}
+                  </kbd>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>
