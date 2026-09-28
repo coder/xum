@@ -2641,6 +2641,8 @@ export class WorkspaceService
   // Serialize todo snapshot refreshes so back-to-back todo_write/propose_plan updates cannot
   // finish out of order and briefly restore stale progress in workspace activity metadata.
   private readonly todoStatusUpdateQueue = new Map<string, Promise<void>>();
+  /** Latest streaming=true metadata write per workspace; see updateStreamingStatus. */
+  private readonly pendingStreamingStartWrites = new Map<string, Promise<void>>();
 
   // AbortControllers for in-progress workspace initialization (postCreateSetup + initWorkspace).
   //
@@ -4235,26 +4237,33 @@ export class WorkspaceService
         } else {
           this.compactionStreamGenerations.delete(data.workspaceId);
         }
-        void this.updateStreamingStatus(data.workspaceId, true, {
-          model: data.model,
-          thinkingLevel: data.thinkingLevel,
-          generation,
-        });
+        // These metadata writes stay unawaited (EventEmitter does not await listeners) but go
+        // through the cleanup tracker so the shutdown join waits for them (#5055). The tracker
+        // calls each one synchronously, so updateStreamingStatus still queues them in event order.
+        void this.trackWorkspaceCleanup(() =>
+          this.updateStreamingStatus(data.workspaceId, true, {
+            model: data.model,
+            thinkingLevel: data.thinkingLevel,
+            generation,
+          })
+        );
       }
     });
 
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
-        void this.handleStreamCompletion(data.workspaceId, {
-          hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
-        });
+        void this.trackWorkspaceCleanup(() =>
+          this.handleStreamCompletion(data.workspaceId, {
+            hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
+          })
+        );
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
       }
     });
 
     this.aiService.on("stream-abort", (data: unknown) => {
       if (isStreamAbortEvent(data)) {
-        void this.stopStreamingStatus(data.workspaceId);
+        void this.trackWorkspaceCleanup(() => this.stopStreamingStatus(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         // Goal mutations are drained by AgentSession after any abort accounting
         // runs. Draining here would race ahead of AgentSession's stream-abort
@@ -4274,7 +4283,7 @@ export class WorkspaceService
             modelNotFound: data.errorType === "model_not_found",
           });
         }
-        void this.stopStreamingStatus(data.workspaceId);
+        void this.trackWorkspaceCleanup(() => this.stopStreamingStatus(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         void this.workspaceGoalService?.applyPendingAfterStreamEnd(data.workspaceId);
       }
@@ -4691,6 +4700,35 @@ export class WorkspaceService
     workspaceId: string,
     streaming: boolean,
     update: ExtensionMetadataStreamingUpdate = {}
+  ): Promise<void> {
+    // Each write awaits file I/O before ExtensionMetadataService queues it, so a stream-start
+    // write could land after the stop that followed it and leave the workspace "streaming"
+    // (#5055). Starts run in call order and every stop waits for the start writes before it.
+    // A start never waits for a stop: a stale stop parked in its todo read must not delay a
+    // newer stream's start (the generation check then drops that stop).
+    // writeStreamingStatus never rejects.
+    const previousStart = this.pendingStreamingStartWrites.get(workspaceId);
+    if (!streaming) {
+      await previousStart;
+      return this.writeStreamingStatus(workspaceId, false, update);
+    }
+    const write = (previousStart ?? Promise.resolve()).then(() =>
+      this.writeStreamingStatus(workspaceId, true, update)
+    );
+    this.pendingStreamingStartWrites.set(workspaceId, write);
+    try {
+      await write;
+    } finally {
+      if (this.pendingStreamingStartWrites.get(workspaceId) === write) {
+        this.pendingStreamingStartWrites.delete(workspaceId);
+      }
+    }
+  }
+
+  private async writeStreamingStatus(
+    workspaceId: string,
+    streaming: boolean,
+    update: ExtensionMetadataStreamingUpdate
   ): Promise<void> {
     const streamGeneration = update.generation ?? this.streamingGenerations.get(workspaceId) ?? 0;
     try {

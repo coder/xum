@@ -15,6 +15,8 @@ import {
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
+import { Effect, Exit, Scope } from "effect";
+import { defaultEffectRunner as runner } from "./di/effectRunner";
 
 describe("WorkspaceService metadata listeners", () => {
   let harness: WorkspaceServiceHarness;
@@ -91,6 +93,92 @@ describe("WorkspaceService metadata listeners", () => {
       );
     } finally {
       readTodosSpy.mockRestore();
+    }
+  });
+});
+
+// #5055: the stream listeners' streaming-status writes must be part of the shutdown join, or
+// a write can land after teardown (ENOENT on a deleted root in tests, detached work in the app).
+describe("WorkspaceService metadata listener writes vs the shutdown join", () => {
+  const workspaceId = "ws-shutdown-join";
+  const events = [
+    ["stream-start", { messageId: "m", model: "openai:gpt-4o", historySequence: 1 }],
+    ["stream-end", { messageId: "m", metadata: {} }],
+    ["stream-abort", { messageId: "m", metadata: { duration: 1 } }],
+    ["error", { messageId: "m", error: "boom", errorType: "unknown" }],
+  ] as const;
+
+  async function createScopedHarness() {
+    const appFiberScope = Scope.makeUnsafe("parallel");
+    const aiEvents = new EventEmitter();
+    const harness = await createWorkspaceServiceHarness({
+      appFiberScope,
+      aiService: createMockAIService({
+        on: aiEvents.on.bind(aiEvents) as AIService["on"],
+        off: aiEvents.off.bind(aiEvents) as AIService["off"],
+      }),
+    });
+    return {
+      harness,
+      aiEvents,
+      close: () => runner.runPromise(Scope.close(appFiberScope, Exit.void)),
+    };
+  }
+
+  test.each(events)("app-scope close waits for the %s write to settle", async (event, payload) => {
+    const { harness, aiEvents, close } = await createScopedHarness();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let writeSettled = false;
+    const setStreaming = harness.extensionMetadata.setStreaming.bind(harness.extensionMetadata);
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      try {
+        return await setStreaming(...args);
+      } finally {
+        writeSettled = true;
+      }
+    });
+    let closing: Promise<void> | undefined;
+    try {
+      aiEvents.emit(event, { type: event, workspaceId, ...payload });
+      await entered.promise;
+      let closed = false;
+      closing = close().then(() => {
+        closed = true;
+      });
+      await runner.runPromise(Effect.yieldNow);
+      expect(closed).toBe(false);
+      release.resolve();
+      await closing;
+      // Nothing is left to land after the join returned.
+      expect(writeSettled).toBe(true);
+    } finally {
+      release.resolve();
+      await (closing ?? close());
+      await harness.cleanup();
+    }
+  });
+
+  test("a stop emitted after a start wins even when the start write is slower", async () => {
+    const { harness, aiEvents, close } = await createScopedHarness();
+    const setStreaming = harness.extensionMetadata.setStreaming.bind(harness.extensionMetadata);
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(async (...args) => {
+      // Stand in for slow I/O ahead of the start write (a sidecar probe, a busy disk). The stop
+      // cannot be observed from inside this write without deadlocking a correct FIFO, so a
+      // short delay is the only lever; it can only hide the bug, never fail a correct build.
+      if (args[1]) await new Promise((resolve) => setTimeout(resolve, 30));
+      return setStreaming(...args);
+    });
+    try {
+      aiEvents.emit("stream-start", { type: "stream-start", workspaceId, ...events[0][1] });
+      aiEvents.emit("stream-abort", { type: "stream-abort", workspaceId, ...events[2][1] });
+      await close();
+      expect((await harness.extensionMetadata.getSnapshot(workspaceId))?.streaming).toBe(false);
+    } finally {
+      await close();
+      await harness.cleanup();
     }
   });
 });

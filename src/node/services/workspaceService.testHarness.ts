@@ -123,6 +123,8 @@ export interface WorkspaceServiceForTestOptions {
   sessionTimingService?: WorkspaceServiceArgs[11];
   streamManager?: WorkspaceServiceArgs[12];
   secretsStore?: WorkspaceServiceArgs[13];
+  /** App fiber scope whose close runs the service's shutdown join. */
+  appFiberScope?: WorkspaceServiceArgs[17];
 }
 
 /**
@@ -157,7 +159,11 @@ export function createWorkspaceServiceForTest(
     options.experimentsService,
     options.sessionTimingService,
     options.streamManager,
-    options.secretsStore
+    options.secretsStore,
+    undefined,
+    undefined,
+    undefined,
+    options.appFiberScope
   );
 }
 
