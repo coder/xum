@@ -164,7 +164,7 @@ describe("bounded retry of idempotent SSH reads (#4830)", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "retries only a regular file, never a FIFO the failed attempt may have drained",
+    "retries only a regular file, never a FIFO the failed attempt may have drained, and keeps the first error",
     async () => {
       // The first attempt fails in transport (before any remote process); the
       // retry runs in a real local shell against a FIFO that has a writer.
@@ -195,9 +195,11 @@ describe("bounded retry of idempotent SSH reads (#4830)", () => {
       try {
         const runtime = new BlipThenLocalShell();
         const result = await settle(new Response(runtime.readFile(fifo)).text());
-        expect(result).toBeInstanceOf(RuntimeError);
-        expect(String(result)).toContain("not a regular file");
+        // The retry ran, refused the FIFO without reading the writer's data,
+        // and the caller still gets the original, retryable transport error.
         expect(runtime.spawns).toBe(2);
+        expect(isRuntimeTransportError(result)).toBe(true);
+        expect(String(result)).toContain("Connection reset");
       } finally {
         writer.kill("SIGKILL");
         await fs.rm(dir, { recursive: true, force: true });

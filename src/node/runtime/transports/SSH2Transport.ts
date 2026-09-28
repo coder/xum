@@ -8,6 +8,7 @@ import { log } from "@/node/services/log";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
 import { expandTildeForSSH } from "../tildeExpansion";
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
+import { DEFAULT_SSH_MAX_WAIT_MS } from "../sshBackoff";
 import type { SpawnResult } from "../RemoteRuntime";
 import type {
   SSHTransport,
@@ -298,11 +299,20 @@ export class SSH2Transport implements SSHTransport {
     const connectTimeoutSec =
       options.timeout !== undefined ? Math.min(Math.ceil(options.timeout), 15) : 15;
 
+    // Waiting through the pool's backoff counts against the exec deadline, as
+    // for OpenSSH: otherwise a short read retry (#4830) could still wait out
+    // the pool's default two-minute budget on a persistent outage.
+    const remainingWaitMs =
+      options.deadlineMs != null
+        ? Math.min(Math.max(0, options.deadlineMs - Date.now()), DEFAULT_SSH_MAX_WAIT_MS)
+        : undefined;
+
     let entry;
     try {
       entry = await ssh2ConnectionPool.acquireConnection(this.config, {
         abortSignal: options.abortSignal,
         timeoutMs: connectTimeoutSec * 1000,
+        maxWaitMs: remainingWaitMs,
       });
     } catch (error) {
       // An abort (e.g. while waiting out a backoff) is not a transport failure.

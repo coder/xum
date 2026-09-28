@@ -1138,13 +1138,17 @@ export class SSHRuntime extends RemoteRuntime {
   async resolvePath(filePath: string): Promise<string> {
     // One bounded retry on a transport failure (#4830), as for reads and
     // stats: each attempt is already capped at 10 s, so a persistent outage
-    // still fails fast. A login-shell timeout is not transport and never retries.
+    // still fails fast. A login-shell timeout is not transport and never
+    // retries. If the retry fails too, callers see the first failure.
     try {
       return await this.resolvePathOnce(filePath);
     } catch (error) {
       if (!isRuntimeTransportError(error)) throw error;
       log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
-      return this.resolvePathOnce(filePath);
+      return this.resolvePathOnce(filePath).catch((retryError: unknown) => {
+        log.debug(`Retry of SSH path resolution of ${filePath} failed too`, retryError);
+        throw error;
+      });
     }
   }
 

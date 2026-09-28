@@ -41,6 +41,26 @@ function shouldRetryRead(error: unknown, abortSignal: AbortSignal | undefined): 
 }
 
 /**
+ * Runs the one retry. When it fails too, the FIRST failure is what callers
+ * see, so a retry never turns a retryable transport error into something
+ * else (for example "not a regular file" for a FIFO, which the retry refuses
+ * to re-read): the result is never worse than without the retry.
+ */
+async function retryOrRethrow<T>(
+  firstError: unknown,
+  what: string,
+  retry: () => Promise<T>
+): Promise<T> {
+  log.debug(`Retrying ${what} after a transport failure`, firstError);
+  try {
+    return await retry();
+  } catch (retryError) {
+    log.debug(`Retry of ${what} failed too`, retryError);
+    throw firstError;
+  }
+}
+
+/**
  * Whether a non-zero exit is the transport's own failure (e.g. OpenSSH exit
  * 255) rather than the command's. Such failures become RuntimeError
  * "network" so callers never read an unreachable host as a missing file.
@@ -173,8 +193,7 @@ export function readFileViaExec(
           await readOnce(0);
         } catch (err) {
           if (delivered || !shouldRetryRead(err, readAbort.signal)) throw err;
-          log.debug(`Retrying read of ${filePath} after a transport failure`, err);
-          await readOnce(1);
+          await retryOrRethrow(err, `read of ${filePath}`, () => readOnce(1));
         }
 
         controller.close();
@@ -311,8 +330,9 @@ export async function statViaExec(
     return await statOnce(filePath, await startExec(0), classifyExit);
   } catch (err) {
     if (!shouldRetryRead(err, abortSignal)) throw err;
-    log.debug(`Retrying stat of ${filePath} after a transport failure`, err);
-    return statOnce(filePath, await startExec(1), classifyExit);
+    return retryOrRethrow(err, `stat of ${filePath}`, async () =>
+      statOnce(filePath, await startExec(1), classifyExit)
+    );
   }
 }
 

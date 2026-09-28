@@ -253,3 +253,23 @@ describe("SSH2Transport.acquireConnection failures (#4438)", () => {
     }
   });
 });
+
+describe("SSH2Transport exec deadline during backoff (#4830)", () => {
+  test("stops waiting out the pool's backoff at the exec deadline", async () => {
+    // A host deep in backoff (~10 s): an exec with a short deadline, such as
+    // the one read retry, must fail by that deadline instead of waiting out
+    // the pool's default two-minute budget.
+    const config = { host: "ws4830-backoff.invalid" };
+    for (let i = 0; i < 5; i++) ssh2ConnectionPool.reportFailure(config, "Connection reset");
+    try {
+      const started = Date.now();
+      const failure: unknown = await new SSH2Transport(config)
+        .spawnRemoteProcess("true", { timeout: 1, deadlineMs: Date.now() + 200 })
+        .catch((e: unknown) => e);
+      expect(isRuntimeTransportError(failure)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      ssh2ConnectionPool.clearAllHealthForTests();
+    }
+  });
+});
