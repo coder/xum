@@ -4,8 +4,9 @@ import { installDom } from "../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import {
   createControllableAsyncIterable,
+  createTestApiClient,
   type ControllableAsyncIterable,
-  type RecursivePartial,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import { UILayoutsProvider, useUILayouts } from "./UILayoutsContext";
@@ -52,7 +53,7 @@ describe("UILayoutsProvider", () => {
     onConfigChanged: () => Promise<AsyncIterable<void>> = () =>
       Promise.resolve(configChanges.iterable)
   ) {
-    const client: RecursivePartial<APIClient> = {
+    const client: TestApiOverrides<APIClient> = {
       uiLayouts: {
         getAll: () =>
           new Promise<LayoutPresetsConfig>((resolve, reject) => {
@@ -65,12 +66,10 @@ describe("UILayoutsProvider", () => {
           });
         },
       },
-      config: {
-        onConfigChanged: onConfigChanged as unknown as APIClient["config"]["onConfigChanged"],
-      },
+      config: { onConfigChanged },
     };
     render(
-      <APIProvider client={client as APIClient}>
+      <APIProvider client={createTestApiClient(client)}>
         <UILayoutsProvider>
           <Capture />
         </UILayoutsProvider>
