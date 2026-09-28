@@ -375,5 +375,17 @@ describe("tokenizer", () => {
         expect(warmed.has((await realTokenizer(DEFAULT_MODEL)).encoding)).toBe(true);
       }, 120_000);
     });
+
+    test("a worker that fails to start fails only its own encoding's requests", async () => {
+      // A worker dies at startup when workerData names no loader; that is the only failure the
+      // pool can provoke without a test-only hook.
+      const broken = "not-an-encoding" as EncodingName;
+      await expect(workerPool.run(broken, "ready", "x")).rejects.toThrow("workerData.encoding");
+      // Later calls reject at once instead of posting to the dead worker (or hanging).
+      await expect(workerPool.run(broken, "ready", "x")).rejects.toThrow("workerData.encoding");
+
+      const tokenizer = await realTokenizer(DEFAULT_MODEL);
+      expect(await tokenizer.countTokens("hello world")).toBeGreaterThan(0);
+    }, 120_000);
   });
 });

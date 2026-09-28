@@ -1,7 +1,7 @@
 import { describe, expect, test } from "@jest/globals";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { Tokenizer, type Encoding } from "ai-tokenizer";
+import { Tokenizer, models, type Encoding } from "ai-tokenizer";
 
 import type { TokenizerWorkerData } from "./tokenizer.worker";
 
@@ -38,6 +38,9 @@ describe("tokenizer worker", () => {
         "anthropic/claude-sonnet-4.5",
         "anthropic/claude-3.5-haiku",
       ];
+      // The misroute below only exercises the routing guard if its model exists and uses
+      // another encoding (otherwise the unknown-model guard would reject it instead).
+      expect(models["openai/gpt-5"].encoding).not.toBe(workerData.encoding);
       const texts = ["", "hello world", "function f() {\n  return 1;\n}", "漢字 🙂 <|endoftext|>"];
 
       // Everything below is posted synchronously after spawning, i.e. while the worker is still
