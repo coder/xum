@@ -87,12 +87,63 @@ isolated_unit_tests=(
 # Isolated files are spread round-robin across shards.
 # The shared-process shards use the same retry: a shard hit "Bun has crashed" (exit 132,
 # segfault) with no failing assertion on PR #4351, just as the isolated files do.
+#
+# Stall watchdog (#4957): a merge-queue shard printed nothing for 17 minutes in the
+# middle of src/node/orpc/server.test.ts until GitHub cancelled the step. Bun's own
+# per-test timeout never fired. It does fire for a pending promise, so the process
+# itself was stuck (a blocked JS thread or a native hang), and `bun test --timeout`
+# cannot catch that. Healthy shards never go quiet for longer than their slowest
+# single test (~11 s in CI), so BUN_TEST_STALL_SECS of silence means a hang: name the
+# file and last test, dump the process state for diagnosis, and SIGKILL it so the
+# signal-exit retry below handles it like a crash.
+BUN_TEST_STALL_SECS="${BUN_TEST_STALL_SECS:-180}"
+bun_test_with_stall_watchdog() {
+  local out pid size last_size=-1 quiet=0 exit_code=0
+  out=$(mktemp)
+  bun test --max-concurrency=1 "$@" > >(tee "$out") 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    size=$(wc -c <"$out")
+    if [[ "$size" -ne "$last_size" ]]; then
+      last_size=$size
+      quiet=0
+      continue
+    fi
+    quiet=$((quiet + 1))
+    if ((quiet >= BUN_TEST_STALL_SECS)); then
+      echo "::error::bun test printed nothing for ${BUN_TEST_STALL_SECS}s; killing it (pid $pid). Last file and output:"
+      grep -E '^(##\[group\])?[^ ]+\.test\.tsx?:$' "$out" | tail -n 1 || true
+      tail -n 2 "$out"
+      if [[ -r "/proc/$pid/status" ]]; then
+        # Distinguishes a busy JS thread (State R, CPU ticks rising) from a deadlock
+        # (State S, threads parked in futex_wait) or memory pressure.
+        grep -E '^(State|VmRSS|Threads):' "/proc/$pid/status" || true
+        echo "utime+stime ticks: $(awk '{print $14 + $15}' "/proc/$pid/stat")"
+        sleep 2
+        echo "utime+stime ticks after 2s: $(awk '{print $14 + $15}' "/proc/$pid/stat")"
+        echo "thread wait channels:"
+        for task in /proc/"$pid"/task/*; do
+          cat "$task/wchan" 2>/dev/null || true
+          echo
+        done | sort | uniq -c
+        free -m || true
+      fi
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+  done
+  wait "$pid" || exit_code=$?
+  rm -f "$out"
+  return "$exit_code"
+}
+
 bun_test_retrying_crashes() {
   local label=$1 attempt exit_code
   shift
   for attempt in 1 2 3; do
     exit_code=0
-    bun test --max-concurrency=1 "$@" || exit_code=$?
+    bun_test_with_stall_watchdog "$@" || exit_code=$?
     if [[ "$exit_code" -eq 0 ]]; then
       return 0
     fi
