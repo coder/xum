@@ -3490,8 +3490,27 @@ export class StreamingMessageAggregator {
     allMessages: readonly MuxMessage[],
     shouldHideMessageFromTranscript: (message: MuxMessage) => boolean
   ): TranscriptInsertionPlan {
-    const messagesById = new Map(allMessages.map((message) => [message.id, message]));
-    const messageIndexById = new Map(allMessages.map((message, index) => [message.id, index]));
+    // Only completed sub-agent report rows resolve anchors, so the id lookups are built on first
+    // need (#4869: two N-entry maps on every rebuild cost ~300 ms at 1.24M rows in chats with no
+    // report rows at all).
+    let anchorLookups: {
+      messagesById: Map<string, MuxMessage>;
+      messageIndexById: Map<string, number>;
+    } | null = null;
+    const getAnchorLookups = () => {
+      if (anchorLookups === null) {
+        const messagesById = new Map<string, MuxMessage>();
+        const messageIndexById = new Map<string, number>();
+        for (let index = 0; index < allMessages.length; index++) {
+          const message = allMessages[index];
+          // Later duplicates win, matching the previous `new Map(entries)` construction.
+          messagesById.set(message.id, message);
+          messageIndexById.set(message.id, index);
+        }
+        anchorLookups = { messagesById, messageIndexById };
+      }
+      return anchorLookups;
+    };
     const insertionsByTargetId = new Map<string, TranscriptInsertion[]>();
     const inlineMessageIds = new Set<string>();
 
@@ -3508,8 +3527,12 @@ export class StreamingMessageAggregator {
         shouldHideMessageFromTranscript
       );
       const anchor = message.metadata?.transcriptAnchor;
-      const anchoredTarget = anchor ? messagesById.get(anchor.messageId) : undefined;
-      const anchoredTargetIndex = anchor ? messageIndexById.get(anchor.messageId) : undefined;
+      const anchoredTarget = anchor
+        ? getAnchorLookups().messagesById.get(anchor.messageId)
+        : undefined;
+      const anchoredTargetIndex = anchor
+        ? getAnchorLookups().messageIndexById.get(anchor.messageId)
+        : undefined;
       const anchorSharesContextEpoch =
         anchoredTargetIndex !== undefined &&
         anchoredTargetIndex < messageIndex &&
