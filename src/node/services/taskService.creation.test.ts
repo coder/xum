@@ -992,64 +992,88 @@ describe("TaskService", () => {
   });
 
   // #5028: same shape as #4747 for a reservation that is canceled or fails after its commit wrote
-  // the row: the fence write that interrupts the row rejects, nothing launches it, and the row
-  // stays "starting". A waiter must still settle at its timeout.
+  // the rows: the fence write that interrupts a row rejects, nothing launches it, and the row
+  // stays "starting". Its waiters must still settle at their timeout, for every task of a batch;
+  // a row another writer re-admitted meanwhile is that writer's, and its waiters are left alone.
   test.each([
-    { label: "canceled after its commit", commitRejectsAfterWrite: false },
-    { label: "whose commit rejects after writing", commitRejectsAfterWrite: true },
+    { label: "canceled after its commit", commitRejects: false, tasks: 1, readmitted: false },
+    {
+      label: "whose commit rejects after writing",
+      commitRejects: true,
+      tasks: 1,
+      readmitted: false,
+    },
+    {
+      label: "of two tasks canceled after its commit",
+      commitRejects: false,
+      tasks: 2,
+      readmitted: false,
+    },
+    {
+      label: "canceled after another writer re-admitted it",
+      commitRejects: false,
+      tasks: 1,
+      readmitted: true,
+    },
   ])(
-    "a reservation $label whose fence write rejects still settles its waiters at the timeout",
-    async ({ commitRejectsAfterWrite }) => {
+    "a reservation $label whose fence write rejects: waiters settle only for its own rows",
+    async ({ commitRejects, tasks, readmitted }) => {
       const config = await createTestConfig(rootDir);
-      stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
-      const taskId = "aaaaaaaaaa";
+      const taskIds = ["aaaaaaaaaa", "cccccccccc"].slice(0, tasks);
+      stubStableIds(config, taskIds, "bbbbbbbbbb");
 
       const { parentId } = await saveLocalParentWorkspace(config, rootDir);
       const { workspaceService } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const controller = new AbortController();
       const realEditConfig = config.editConfig.bind(config);
+      let committed = false;
       let failedFenceWrites = 0;
       spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
-        let commitsRow = false;
+        let commitsRows = false;
         await realEditConfig((cfg) => {
-          const hadRow = findWorkspaceEntry(cfg, taskId) != null;
+          const hadRows = findWorkspaceEntry(cfg, taskIds[0]) != null;
           const next = fn(cfg);
-          const row = findWorkspaceEntry(next, taskId)?.workspace;
-          commitsRow = !hadRow && row != null;
-          if (row?.taskStatus === "interrupted") {
+          commitsRows = !hadRows && findWorkspaceEntry(next, taskIds[0]) != null;
+          const fences = taskIds.some(
+            (id) => findWorkspaceEntry(next, id)?.workspace.taskStatus === "interrupted"
+          );
+          // After a re-admission the fence changes nothing; its write still rejects.
+          if (fences || (committed && readmitted)) {
             failedFenceWrites++;
             throw new Error("EACCES: permission denied");
           }
           return next;
         }, options);
-        if (!commitsRow) return;
+        if (!commitsRows) return;
+        committed = true;
+        if (readmitted) {
+          await realEditConfig((cfg) => {
+            findWorkspaceEntry(cfg, taskIds[0])!.workspace.taskAttemptId = "att_other_backend";
+            return cfg;
+          });
+        }
         // The commit landed; the caller cancels now, or the write reports a failure anyway.
         controller.abort();
-        if (commitRejectsAfterWrite) throw new Error("config lock lost after the write");
+        if (commitRejects) throw new Error("config lock lost after the write");
       });
 
       const result = await taskService
         .createMany(
-          [
-            {
-              parentWorkspaceId: parentId,
-              kind: "agent",
-              agentId: "explore",
-              prompt: "never launched",
-              title: "Canceled task",
-            },
-          ],
+          taskIds.map((_, index) => ({
+            parentWorkspaceId: parentId,
+            kind: "agent" as const,
+            agentId: "explore",
+            prompt: "never launched",
+            title: `Canceled task ${index}`,
+          })),
           { abortSignal: controller.signal }
         )
         .catch((error: unknown) => Err(String(error)));
       expect(result.success).toBe(false);
-      expect(failedFenceWrites).toBeGreaterThan(0);
-      expect(findWorkspaceEntry(config.loadConfigOrDefault(), taskId)?.workspace.taskStatus).toBe(
-        "starting"
-      );
+      expect(failedFenceWrites).toBe(tasks);
 
-      const awaitOutcome = () =>
+      const awaitOutcome = (taskId: string) =>
         Promise.race([
           taskService
             .waitForAgentReport(taskId, { timeoutMs: 200, requestingWorkspaceId: parentId })
@@ -1058,9 +1082,15 @@ describe("TaskService", () => {
               (error: unknown) =>
                 error instanceof AgentReportWaitTimeoutError ? "timed out" : error
             ),
-          new Promise((resolve) => setTimeout(() => resolve("never settled"), 3_000)),
+          new Promise((resolve) => setTimeout(() => resolve("never settled"), 1_500)),
         ]);
-      expect(await awaitOutcome()).toBe("timed out");
+      for (const taskId of taskIds) {
+        expect(findWorkspaceEntry(config.loadConfigOrDefault(), taskId)?.workspace.taskStatus).toBe(
+          "starting"
+        );
+        // A re-admitted row is still starting under the other writer: its waiter keeps waiting.
+        expect(await awaitOutcome(taskId)).toBe(readmitted ? "never settled" : "timed out");
+      }
     }
   );
 

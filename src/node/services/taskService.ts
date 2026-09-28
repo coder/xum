@@ -6328,26 +6328,36 @@ export class TaskService implements AgentTaskIntegration {
     // write (never detached).
     if (canceledInsideCommit || signal?.aborted) {
       this.closeReservedAttempts(plans, "reservation-canceled");
+      // The first fence write that rejected; thrown once every plan was handled (#5028).
+      let fenceFailure: { error: unknown } | undefined;
       for (const plan of plans) {
         const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
         let transitioned = canceledInsideCommit;
         let superseded = false;
         if (!canceledInsideCommit) {
-          await this.editWorkspaceEntry(
-            plan.taskId,
-            (ws) => {
-              superseded = rowSupersedes(ws, plan.attemptId);
-              if (ws.taskStatus !== plan.status || superseded) return;
-              ws.taskStatus = "interrupted";
-              ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
-              transitioned = true;
-            },
-            { allowMissing: true }
-          ).catch((error: unknown) => {
-            // Nothing launches this row now (#5028); see armWaitersOfUnendedTask.
-            this.armWaitersOfUnendedTask(plan.taskId);
-            throw error;
-          });
+          let rowMoved = false;
+          try {
+            await this.editWorkspaceEntry(
+              plan.taskId,
+              (ws) => {
+                superseded = rowSupersedes(ws, plan.attemptId);
+                if (ws.taskStatus !== plan.status || superseded) {
+                  rowMoved = true;
+                  return;
+                }
+                ws.taskStatus = "interrupted";
+                ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
+                transitioned = true;
+              },
+              { allowMissing: true }
+            );
+          } catch (error: unknown) {
+            // Nothing launches this row now (#5028), unless the row already moved on (another
+            // writer's attempt, whose waiters this cancel must not touch).
+            if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+            fenceFailure ??= { error };
+            continue;
+          }
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
         // Waiters are keyed by the stable task id: once another writer re-admitted the row under
@@ -6366,6 +6376,7 @@ export class TaskService implements AgentTaskIntegration {
         );
         await this.emitWorkspaceMetadata(plan.taskId);
       }
+      if (fenceFailure != null) throw fenceFailure.error;
       return interrupted();
     }
 
@@ -6540,6 +6551,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
       if (committed) {
+        let rowMoved = false;
         try {
           let transitioned = false;
           let superseded = false;
@@ -6547,7 +6559,10 @@ export class TaskService implements AgentTaskIntegration {
             plan.taskId,
             (ws) => {
               superseded = rowSupersedes(ws, plan.attemptId);
-              if (ws.taskStatus !== plan.status || superseded) return;
+              if (ws.taskStatus !== plan.status || superseded) {
+                rowMoved = true;
+                return;
+              }
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = message;
               transitioned = true;
@@ -6563,8 +6578,8 @@ export class TaskService implements AgentTaskIntegration {
             taskId: plan.taskId,
             error: fenceError,
           });
-          // Nothing launches this row now (#5028); see armWaitersOfUnendedTask.
-          this.armWaitersOfUnendedTask(plan.taskId);
+          // Nothing launches this row now (#5028), unless it already moved on (see above).
+          if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
           continue;
         }
       }
