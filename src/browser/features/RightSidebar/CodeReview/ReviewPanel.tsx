@@ -170,6 +170,8 @@ const LARGE_REVIEW_COLLAPSE_OUTPUT_BYTES = 250_000;
 
 const REVIEW_PANEL_CACHE_MAX_ENTRIES = 20;
 const REVIEW_PANEL_CACHE_MAX_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
+/** Stable empty list for the immersive view while review state hydrates. */
+const NO_HUNKS: DiffHunk[] = [];
 
 /**
  * Preserve object references for unchanged hunks to prevent re-renders.
@@ -2634,8 +2636,11 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             <ImmersiveReviewView
               workspaceId={workspaceId}
               fileTree={fileTree}
-              hunks={filteredHunks}
-              allHunks={hunks}
+              // Withhold hunks until review state hydrates: the immersive view ignores
+              // isLoading once it has hunks, and would render (and accept keyboard actions)
+              // against empty read/note maps that then snap to the persisted ones.
+              hunks={reviewStateLoaded ? filteredHunks : NO_HUNKS}
+              allHunks={reviewStateLoaded ? hunks : NO_HUNKS}
               isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
               isRead={isRead}
               onToggleRead={handleToggleRead}
