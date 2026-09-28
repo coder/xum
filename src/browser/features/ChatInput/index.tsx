@@ -1771,7 +1771,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const renderTime: ReviewsForSend = { data: reviewData, ids: reviewIdsForCheck };
     if (variant !== "workspace" || !workspaceId || reviewOverrideActive) return renderTime;
     const reviewStateStore = getReviewStateStore();
-    if (reviewStateStore.isReady(workspaceId)) return renderTime;
+    // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
+    // hold this send in flight and fire it after reconnect; let the send path report
+    // "Not connected to server" instead.
+    if (!api || reviewStateStore.isReady(workspaceId)) return renderTime;
     await reviewStateStore.whenReady(workspaceId);
     const attached = reviewStateStore.getAttachedReviews(workspaceId);
     return {

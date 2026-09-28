@@ -4,6 +4,7 @@ import type {
   ReviewStateImportLegacyOutput,
   ReviewStateSections,
   ReviewStateSnapshot,
+  ReviewStateUpdateOutput,
 } from "@/common/orpc/schemas/reviewState";
 import { REVIEW_STATE_SECTIONS } from "@/common/orpc/schemas/reviewState";
 import { applyReviewStateDelta, withReviewStateSection } from "@/common/utils/reviewState";
@@ -23,12 +24,15 @@ export function createMockReviewStateApi() {
   const states = new Map(pendingSeeds);
   pendingSeeds.clear();
   const listeners = new Map<string, Set<() => void>>();
+  // Like the backend's in-memory revision: bumped on every committed change.
+  let revision = 0;
 
   const snapshotOf = (workspaceId: string): ReviewStateSnapshot => ({
     sections: states.get(workspaceId) ?? {},
   });
   const commit = (workspaceId: string, sections: ReviewStateSections): ReviewStateSnapshot => {
     states.set(workspaceId, sections);
+    revision++;
     for (const listener of listeners.get(workspaceId) ?? []) listener();
     return { sections };
   };
@@ -48,7 +52,7 @@ export function createMockReviewStateApi() {
       listeners.set(input.workspaceId, set);
       set.add(listener);
       try {
-        yield { type: "snapshot", snapshot: snapshotOf(input.workspaceId) };
+        yield { type: "snapshot", snapshot: snapshotOf(input.workspaceId), revision };
         while (!opts?.signal?.aborted) {
           if (!changed) {
             await new Promise<void>((resolve) => {
@@ -59,7 +63,7 @@ export function createMockReviewStateApi() {
           }
           if (opts?.signal?.aborted) break;
           changed = false;
-          yield { type: "snapshot", snapshot: snapshotOf(input.workspaceId) };
+          yield { type: "snapshot", snapshot: snapshotOf(input.workspaceId), revision };
         }
       } finally {
         set.delete(listener);
@@ -68,13 +72,13 @@ export function createMockReviewStateApi() {
     update: (input: {
       workspaceId: string;
       delta: ReviewStateDelta;
-    }): Promise<ReviewStateSnapshot> =>
-      Promise.resolve(
-        commit(
-          input.workspaceId,
-          applyReviewStateDelta(snapshotOf(input.workspaceId).sections, input.delta)
-        )
-      ),
+    }): Promise<ReviewStateUpdateOutput> => {
+      const snapshot = commit(
+        input.workspaceId,
+        applyReviewStateDelta(snapshotOf(input.workspaceId).sections, input.delta)
+      );
+      return Promise.resolve({ ...snapshot, revision });
+    },
     importLegacy: (input: {
       workspaceId: string;
       sections: ReviewStateSections;
@@ -93,7 +97,7 @@ export function createMockReviewStateApi() {
         results[section] = "applied";
       }
       const snapshot = next === current ? { sections: current } : commit(input.workspaceId, next);
-      return Promise.resolve({ snapshot, results });
+      return Promise.resolve({ snapshot, revision, results });
     },
   };
 }
