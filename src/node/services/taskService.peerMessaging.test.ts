@@ -1275,6 +1275,95 @@ describe("TaskService", () => {
       expect(internal?.admissionStale?.()).toBe(true);
     });
 
+    test("withdraws a queued continuation once its delegated turn settled", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "target", "target", {
+            agentId: "exec",
+            unrelatedWorkspaceConsent: "consent",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_done", "owner", "accepted");
+      expect((await taskService.sendAgentTreeMessage("sender", "target", "Queued")).success).toBe(
+        true
+      );
+      const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+        WorkspaceHost["sendMessage"]
+      >;
+      // The owner's result is final, so the reply could no longer continue it.
+      workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+        "target"
+      );
+      expect(internal?.admissionStale?.()).toBe(true);
+      // A new send reaches the now-idle root as an ordinary wake.
+      expect((await taskService.sendAgentTreeMessage("sender", "target", "Retry")).success).toBe(
+        true
+      );
+      const [, , retryOptions, retryInternal] = sendMessage.mock.calls[1] as Parameters<
+        WorkspaceHost["sendMessage"]
+      >;
+      expect(retryOptions?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
+      expect(retryInternal?.workspaceTurnContinuation).toBe(false);
+    });
+
+    // A queued continuation can defer the delegated stream's settlement to itself, so a withdrawn
+    // one must settle the owner's turn, unless the correlated stream is still running.
+    test.each([
+      { streaming: false, expectedStatus: "interrupted" },
+      { streaming: true, expectedStatus: "running" },
+    ])(
+      "a withdrawn continuation leaves the owner's turn $expectedStatus (streaming=$streaming)",
+      async ({ streaming, expectedStatus }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", {
+              agentId: "exec",
+              unrelatedWorkspaceConsent: "consent",
+            }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { aiService } = createAIServiceMocks(config, {
+          isStreaming: mock(() => streaming),
+        });
+        const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+        await registerLiveWorkspaceTurnHandle(
+          taskService,
+          "target",
+          "wst_deferred",
+          "owner",
+          "accepted"
+        );
+        expect((await taskService.sendAgentTreeMessage("sender", "target", "Queued")).success).toBe(
+          true
+        );
+        const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+          WorkspaceHost["sendMessage"]
+        >;
+        assert(internal?.onCanceled != null);
+        await internal.onCanceled("Consent was revoked");
+        const record = await workspaceTurnManagerInternals(
+          taskService
+        ).taskHandleStore.getWorkspaceTurn("owner", "wst_deferred");
+        expect(record?.status).toBe(expectedStatus);
+      }
+    );
+
     test.each(["pre-admission", "queued"] as const)(
       "withdraws when delegation starts %s",
       async (phase) => {

@@ -9500,7 +9500,11 @@ export class TaskService implements AgentTaskIntegration {
       const delegatedRootUnavailable = (): boolean => {
         if (!unrelatedRoot) return false;
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        if (live == null) return false;
+        if (live == null) {
+          // The correlated turn settled before dispatch: its owner's result is final, so the
+          // reply could not continue it. Refuse so the sender retries as an idle-root wake.
+          return delegatedTurnCorrelation !== "unresolved" && delegatedTurnCorrelation != null;
+        }
         if (!live.accepted) return true;
         // Before the correlation lookup, an accepted turn is still a candidate for continuation.
         if (delegatedTurnCorrelation === "unresolved") return false;
@@ -9868,6 +9872,23 @@ export class TaskService implements AgentTaskIntegration {
       );
       sendOptions = { ...sendOptions, queueDispatchMode: effectiveDispatchMode };
 
+      // A queued continuation can defer the delegated stream's settlement to itself. If it is
+      // withdrawn (probe refusal, stop) or fails before streaming, no replacement stream-end
+      // arrives, so settle the owner's turn here. A still-running correlated stream is left
+      // alone: its own stream-end settles the turn once this entry has left the queue.
+      const settleContinuationFailure = async (
+        status: "interrupted" | "error",
+        reason: string
+      ): Promise<void> => {
+        if (workspaceTurnMuxMetadata == null || this.aiService.isStreaming(targetId)) return;
+        await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+          targetId,
+          workspaceTurnMuxMetadata,
+          status,
+          reason
+        );
+      };
+
       let accepted = false;
       // Admission classification: parent guidance into a live child continues its attempt (no
       // rotation); the fence at the handoff refuses it once the attempt closed.
@@ -9889,6 +9910,13 @@ export class TaskService implements AgentTaskIntegration {
         onAccepted: () => {
           accepted = true;
         },
+        ...(workspaceTurnMuxMetadata != null
+          ? {
+              onCanceled: (reason: string) => settleContinuationFailure("interrupted", reason),
+              onAcceptedPreStreamFailure: (error: SendMessageError) =>
+                settleContinuationFailure("error", formatSendMessageError(error).message),
+            }
+          : {}),
       });
       if (!sendResult.success) {
         // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
@@ -14562,7 +14590,8 @@ export class TaskService implements AgentTaskIntegration {
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||
-          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
+          // A reserved delegated turn refuses peer input; an accepted one is continued by it.
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id)?.accepted === false ||
           // Match peer-path predicates, not a new raw-tag rule. The current index contains
           // only task children, so ordinary roots cannot match these task restrictions.
           this.isWorkflowOwnedTaskUsingIndex(index, id) ||
