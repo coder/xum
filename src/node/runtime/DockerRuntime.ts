@@ -11,6 +11,7 @@
  * Extends RemoteRuntime for shared exec/file operations.
  */
 
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as path from "path";
@@ -361,6 +362,10 @@ export class DockerRuntime extends RemoteRuntime {
 
   protected cdCommand(cwd: string): string {
     return `cd ${shescape.quote(cwd)}`;
+  }
+
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
   }
 
   protected async spawnRemoteProcess(

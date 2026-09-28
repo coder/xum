@@ -18,6 +18,7 @@ import type {
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
 import { shescape, streamToString } from "./streamUtils";
 import {
@@ -590,7 +591,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
           timeout: 300,
           abortSignal: signal,
         }),
-      abortSignal
+      abortSignal,
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
   }
 
@@ -623,14 +625,22 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.stat(hostPath, abortSignal);
     }
-    return statViaExec(filePath, () =>
-      this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
-        cwd: this.getContainerBasePath(),
-        pathEnv: { [FILE_PATH_ENV]: filePath },
-        timeout: 10,
-        abortSignal,
-      })
+    return statViaExec(
+      filePath,
+      () =>
+        this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
+          cwd: this.getContainerBasePath(),
+          pathEnv: { [FILE_PATH_ENV]: filePath },
+          timeout: 10,
+          abortSignal,
+        }),
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
+  }
+
+  /** See Runtime.isTransportFailureExit: a stopped or missing container is not a missing file. */
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
   }
 
   override ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
