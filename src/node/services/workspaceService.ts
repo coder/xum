@@ -3468,8 +3468,6 @@ export class WorkspaceService
         workspaceId,
         runtime: args.runtimeConfig.type,
       });
-      // Deliberately kept, but a retry under the same name still collides with it (#4899).
-      leftovers.push(args.runtime.getWorkspacePath(args.projectPath, args.workspaceName));
     } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
       const deleteResult = await args.runtime
         .deleteWorkspace(
