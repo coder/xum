@@ -1982,6 +1982,10 @@ export class TaskService implements AgentTaskIntegration {
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
+  // Tasks whose launch failed but whose failure write rejected (#4747): the row still says
+  // queued/starting and nothing will move it to running, so waiters arm their timeout at once.
+  // A later move to running or a recorded launch failure clears the mark.
+  private readonly unpersistedLaunchFailureTaskIds = new Set<string>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
   // agent_report). Used to avoid scheduler deadlocks when maxParallelAgentTasks is low and tasks
   // spawn nested tasks in the foreground.
@@ -6947,27 +6951,38 @@ export class TaskService implements AgentTaskIntegration {
     let transitionedToInterrupted = false;
     let superseded = false;
     let parentWorkspaceId: string | undefined;
-    await this.editWorkspaceEntry(
-      taskId,
-      (ws) => {
-        // The failure belongs to the attempt this process owned; a row re-admitted by another
-        // writer meanwhile is that writer's to end (see ownedAttemptSuperseded).
-        if (this.ownedAttemptSuperseded(taskId, ws)) {
-          superseded = true;
-          return;
-        }
-        transitionedToInterrupted = ws.taskStatus !== "interrupted";
-        parentWorkspaceId = ws.parentWorkspaceId;
-        ws.taskStatus = "interrupted";
-        ws.taskLaunchError = message;
-        // Survives a restart: the in-memory record alone is lost with the process (#4674).
-        if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
-          ws.taskCheckoutUnsanitized = true;
-        }
-        this.closeAttemptAdmission(taskId, ws.taskAttemptId, ownedAttempt, "launch-failed");
-      },
-      { allowMissing: true }
-    );
+    try {
+      await this.editWorkspaceEntry(
+        taskId,
+        (ws) => {
+          // The failure belongs to the attempt this process owned; a row re-admitted by another
+          // writer meanwhile is that writer's to end (see ownedAttemptSuperseded).
+          if (this.ownedAttemptSuperseded(taskId, ws)) {
+            superseded = true;
+            return;
+          }
+          transitionedToInterrupted = ws.taskStatus !== "interrupted";
+          parentWorkspaceId = ws.parentWorkspaceId;
+          ws.taskStatus = "interrupted";
+          ws.taskLaunchError = message;
+          // Survives a restart: the in-memory record alone is lost with the process (#4674).
+          if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
+            ws.taskCheckoutUnsanitized = true;
+          }
+          this.closeAttemptAdmission(taskId, ws.taskAttemptId, ownedAttempt, "launch-failed");
+        },
+        { allowMissing: true }
+      );
+    } catch (error) {
+      // Fail closed (#4747): an unpersisted failure is not delivered to waiters, whose owner is
+      // unknown when the updater never ran. But a waiter that attached while the task was
+      // queued/starting arms its timeout only on the move to running, which this failed launch
+      // never makes; arm it now (and for later waiters) so they settle at their timeout.
+      this.unpersistedLaunchFailureTaskIds.add(taskId);
+      this.startPendingStartWaiters(taskId);
+      throw error;
+    }
+    this.unpersistedLaunchFailureTaskIds.delete(taskId);
     if (superseded) {
       log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
         taskId,
@@ -13496,11 +13511,13 @@ export class TaskService implements AgentTaskIntegration {
           this.pendingStartWaitersByTaskId.set(taskId, currentStartWaiters);
 
           // Close the race where the task starts between the initial config read and registering the waiter.
+          // A launch whose failure could not be written never starts: arm the timeout now (#4747).
           const cfgAfterRegister = this.config.loadConfigOrDefault();
           const afterEntry = findWorkspaceEntry(cfgAfterRegister, taskId);
           if (
-            afterEntry?.workspace.taskStatus !== "queued" &&
-            afterEntry?.workspace.taskStatus !== "starting"
+            (afterEntry?.workspace.taskStatus !== "queued" &&
+              afterEntry?.workspace.taskStatus !== "starting") ||
+            this.unpersistedLaunchFailureTaskIds.has(taskId)
           ) {
             cleanupStartWaiter();
             startReportTimeout();
@@ -15454,18 +15471,24 @@ export class TaskService implements AgentTaskIntegration {
     await this.emitWorkspaceMetadata(workspaceId);
 
     if (status === "running") {
-      const waiters = this.pendingStartWaitersByTaskId.get(workspaceId);
-      if (!waiters || waiters.length === 0) return true;
-      this.pendingStartWaitersByTaskId.delete(workspaceId);
-      for (const waiter of waiters) {
-        try {
-          waiter.start();
-        } catch (error: unknown) {
-          log.error("Task start waiter callback failed", { workspaceId, error });
-        }
-      }
+      this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
+      this.startPendingStartWaiters(workspaceId);
     }
     return true;
+  }
+
+  /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
+  private startPendingStartWaiters(workspaceId: string): void {
+    const waiters = this.pendingStartWaitersByTaskId.get(workspaceId);
+    if (!waiters || waiters.length === 0) return;
+    this.pendingStartWaitersByTaskId.delete(workspaceId);
+    for (const waiter of waiters) {
+      try {
+        waiter.start();
+      } catch (error: unknown) {
+        log.error("Task start waiter callback failed", { workspaceId, error });
+      }
+    }
   }
 
   /**

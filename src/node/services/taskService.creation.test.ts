@@ -8,6 +8,7 @@ import { existsSync } from "fs";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { TaskService } from "@/node/services/taskService";
+import { AgentReportWaitTimeoutError } from "@/node/services/taskService";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
@@ -926,6 +927,68 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === taskId);
     expect(taskEntry?.taskStatus).toBe("interrupted");
     expect(taskEntry?.taskLaunchError).toBe("Forbidden");
+  });
+
+  // #4747: a waiter that attached while the task was still starting has no timeout armed (it
+  // starts on the transition to running, which a failed launch never makes). If the
+  // launch-failure write then rejects, nothing rejected or started it: it waited forever.
+  test("a launch whose failure write rejects still settles its starting-time waiter at the timeout", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Err("Forbidden")));
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const realEditConfig = config.editConfig.bind(config);
+    let failedLaunchWrites = 0;
+    spyOn(config, "editConfig").mockImplementation((fn, options) =>
+      realEditConfig((cfg) => {
+        const next = fn(cfg);
+        const recordsLaunchFailure = [...next.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .some((workspace) => workspace.taskLaunchError === "Forbidden");
+        if (recordsLaunchFailure) {
+          failedLaunchWrites++;
+          throw new Error("EACCES: permission denied");
+        }
+        return next;
+      }, options)
+    );
+
+    const result = await taskService.createMany([
+      {
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "launch should fail",
+        title: "Failing task",
+      },
+    ]);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const taskId = result.data[0]?.taskId;
+    assert(typeof taskId === "string" && taskId.length > 0, "created task id is required");
+
+    const awaitOutcome = () =>
+      Promise.race([
+        taskService
+          .waitForAgentReport(taskId, { timeoutMs: 200, requestingWorkspaceId: parentId })
+          .then(
+            () => "resolved",
+            (error: unknown) => (error instanceof AgentReportWaitTimeoutError ? "timed out" : error)
+          ),
+        new Promise((resolve) => setTimeout(() => resolve("never settled"), 3_000)),
+      ]);
+
+    // Fail-closed decision (#4747): the waiter is not rejected with the unpersisted failure.
+    expect(await awaitOutcome()).toBe("timed out");
+    expect(failedLaunchWrites).toBeGreaterThan(0);
+    // The row still says "starting"; a later await (the parent retrying) must not hang either.
+    expect(findWorkspaceEntry(config.loadConfigOrDefault(), taskId)?.workspace.taskStatus).toBe(
+      "starting"
+    );
+    expect(await awaitOutcome()).toBe("timed out");
   });
 
   test("queues tasks when maxParallelAgentTasks is reached and starts them when a slot frees", async () => {
