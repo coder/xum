@@ -13228,9 +13228,6 @@ export class WorkspaceService
             });
             throw registrationErrorWithLeftovers(error, rollback);
           });
-        if (sourceRuntimeConfigUpdated) {
-          await emitSourceMetadata();
-        }
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
         const abortForkRegistrationUnlessInUse = () =>
@@ -13241,6 +13238,10 @@ export class WorkspaceService
             new Set(["init"])
           );
         rollBackForkRegistration = abortForkRegistrationUnlessInUse;
+        // After the rollback is armed: a throwing metadata listener must still undo the fork.
+        if (sourceRuntimeConfigUpdated) {
+          await emitSourceMetadata();
+        }
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,

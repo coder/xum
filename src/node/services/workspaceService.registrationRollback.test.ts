@@ -1277,6 +1277,20 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
       });
 
+      test("a throwing source-metadata listener still rolls the fork back", async () => {
+        const deleteWorkspace = await setUpCoderFork();
+        service.on("metadata", (event: { workspaceId: string }) => {
+          if (event.workspaceId === sourceId) throw new Error("listener failed");
+        });
+
+        const result = await service.fork(sourceId, "coder-fork");
+
+        expect(result.success ? "" : result.error).toContain("listener failed");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
       test("the source stays marked while another workspace shares its Coder workspace", async () => {
         const sibling = {
           ...sourceRuntimeConfig,

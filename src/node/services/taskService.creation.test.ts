@@ -1606,6 +1606,82 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
+  // #5114: a Coder fork marks its parent as sharing the Coder workspace. A fork rollback elsewhere
+  // restores that mark only while no row uses the workspace, so the mark must never be visible
+  // without the task's row.
+  test("a direct task launch writes the parent's runtime update together with its row", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "cccccccccc");
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings(1, 3)
+    );
+
+    const sourceSrcBaseDir = path.join(config.srcDir, "source-runtime");
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- intentionally capturing prototype method for spy
+    const originalFork = WorktreeRuntime.prototype.forkWorkspace;
+    const forkSpy = spyOn(WorktreeRuntime.prototype, "forkWorkspace").mockImplementation(
+      async function (this: WorktreeRuntime, params: WorkspaceForkParams) {
+        const result = await originalFork.call(this, params);
+        return result.success
+          ? { ...result, sourceRuntimeConfig: { ...runtimeConfig, srcBaseDir: sourceSrcBaseDir } }
+          : result;
+      }
+    );
+    const rows = () =>
+      Array.from(config.loadConfigOrDefault().projects.values()).flatMap((p) => p.workspaces);
+    const markedWithoutChild: string[] = [];
+    const realEditConfig = config.editConfig.bind(config);
+    const editSpy = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+      await realEditConfig(fn, options);
+      const all = rows();
+      const parent = all.find((w) => w.id === parentId);
+      if (
+        parent?.runtimeConfig?.type === "worktree" &&
+        parent.runtimeConfig.srcBaseDir === sourceSrcBaseDir &&
+        !all.some((w) => w.parentWorkspaceId === parentId)
+      ) {
+        markedWithoutChild.push("parent marked before the task row");
+      }
+    });
+
+    try {
+      const { taskService } = createTaskServiceHarness(config);
+      const running = await createAgentTask(taskService, parentId, "task 1");
+      expect(running.success).toBe(true);
+
+      expect(rows().find((w) => w.id === parentId)?.runtimeConfig).toMatchObject({
+        srcBaseDir: sourceSrcBaseDir,
+      });
+      expect(markedWithoutChild).toEqual([]);
+    } finally {
+      editSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
   test("configures MultiProjectRuntime envResolver before queued task background init", async () => {
     const config = await createTestConfig(rootDir);
 

@@ -8069,6 +8069,9 @@ export class TaskService implements AgentTaskIntegration {
       let runtimeForTaskWorkspace: Runtime;
       let forkedFromSource: boolean;
       let inheritedProjects: ProjectRef[] | undefined;
+      // Written with the task's row below, never before it: a fork rollback elsewhere restores
+      // this parent mark only while no row uses the shared workspace (#5114).
+      let sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
 
       if (useSharedWorkspace) {
         // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
@@ -8123,14 +8126,6 @@ export class TaskService implements AgentTaskIntegration {
           ),
         });
 
-        if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
-          await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
-            runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
-          });
-          // Ensure UI gets the updated runtimeConfig for the parent workspace.
-          await this.emitWorkspaceMetadata(parentWorkspaceId);
-        }
-
         if (!forkResult.success) {
           initLogger.logComplete(-1);
           return Err(`Task fork failed: ${forkResult.error}`);
@@ -8139,6 +8134,7 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath = forkResult.data.workspacePath;
         trunkBranch = forkResult.data.trunkBranch;
         forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
+        sourceRuntimeConfigUpdate = forkResult.data.sourceRuntimeConfigUpdate;
         runtimeForTaskWorkspace = forkResult.data.targetRuntime;
         forkedFromSource = forkResult.data.forkedFromSource;
         inheritedProjects = forkResult.data.projects;
@@ -8175,6 +8171,15 @@ export class TaskService implements AgentTaskIntegration {
           requireRow: parentEntry != null,
           legacyRow: legacyParentRow,
         });
+        if (sourceRuntimeConfigUpdate != null) {
+          const parentRow = Array.from(config.projects.values())
+            .flatMap((project) => project.workspaces)
+            .find((workspace) => workspace.id === parentWorkspaceId);
+          if (parentRow == null) {
+            throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
+          }
+          parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
+        }
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
@@ -8225,6 +8230,10 @@ export class TaskService implements AgentTaskIntegration {
         attemptId,
         receiptEligible: true,
       });
+      if (sourceRuntimeConfigUpdate != null) {
+        // Ensure UI gets the updated runtimeConfig for the parent workspace.
+        await this.emitWorkspaceMetadata(parentWorkspaceId);
+      }
 
       return Ok({
         initLogger,
