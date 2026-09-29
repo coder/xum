@@ -92,10 +92,12 @@ describe("Send after a failed review-state subscription", () => {
         reviews: { set: { r1: attachedReview() } },
       });
 
+      expect(app.view.container.querySelector('[role="alert"]')).toBeNull();
       await app.chat.send("send without notes");
+      // The user is told (an error toast), not left to find the notes missing.
       await waitFor(
         () => {
-          expect(app.view.container.textContent).toContain("Review notes could not be loaded");
+          expect(app.view.container.querySelector('[role="alert"]')).not.toBeNull();
         },
         { timeout: 10_000 }
       );

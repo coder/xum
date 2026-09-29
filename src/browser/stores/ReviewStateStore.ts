@@ -192,7 +192,7 @@ export class ReviewStateStore {
       this.stopSubscription(entry);
       if (!client) continue;
       if (entry.refCount > 0) this.ensureSubscribed(workspaceId);
-      if (entry.pending.length > 0) this.flushInBackground(workspaceId);
+      if (entry.pending.length > 0 || entry.queued.length > 0) this.flushInBackground(workspaceId);
     }
   }
 
@@ -304,12 +304,8 @@ export class ReviewStateStore {
     if (!entry.hydrated) {
       entry.queued.push(queued);
       // A mutate-only caller (no mounted selector) would otherwise never hydrate, so the
-      // change would never be sent. flush retains the workspace, hydrates, then drains.
-      if (entry.refCount === 0) {
-        this.flush(workspaceId).catch((error: unknown) => {
-          console.warn("Failed to persist review state; it stays queued:", error);
-        });
-      }
+      // change would never be sent. flushInBackground retains, hydrates, then drains.
+      this.flushInBackground(workspaceId);
       return;
     }
     const delta = queued(entry.view.sections);
@@ -464,7 +460,18 @@ export class ReviewStateStore {
   private ensureSubscribed(workspaceId: string): void {
     const entry = this.entries.get(workspaceId);
     const client = this.client;
-    if (!entry || !client || entry.subscription) return;
+    if (!entry) return;
+    if (!client) {
+      // No client can hydrate. A workspace that was ready before (released since) settles its
+      // waiters now, as before per-retention readiness, so flush rejects instead of hanging.
+      // A never-ready one keeps waiting: setClient subscribes it once the client arrives.
+      if (entry.isReady) {
+        entry.resolveReady();
+        this.settleHydrationWaiters(entry, false);
+      }
+      return;
+    }
+    if (entry.subscription) return;
     if (entry.resubscribeTimer) {
       clearTimeout(entry.resubscribeTimer);
       entry.resubscribeTimer = null;
@@ -600,19 +607,32 @@ export class ReviewStateStore {
 
   private flushInBackground(workspaceId: string): void {
     const entry = this.entries.get(workspaceId);
-    if (!entry || entry.pending.length === 0) return;
+    if (!entry || (entry.pending.length === 0 && entry.queued.length === 0)) return;
     if (!entry.hydrated) {
-      // A released workspace (e.g. a write that failed after its last subscriber left):
-      // flush retains it, rehydrates and sends. A mounted one sends once markHydrated runs.
+      // A released workspace (e.g. a write that failed after its last subscriber left, or a
+      // mutate with no mounted selector): flush retains it, rehydrates and sends, and a failed
+      // attempt is retried with backoff. A mounted one sends once markHydrated runs.
       if (entry.refCount === 0) {
         this.flush(workspaceId).catch((error: unknown) => {
-          console.warn("Failed to persist review state; it stays pending:", error);
+          console.warn("Failed to persist review state; retrying:", error);
+          if (this.entries.get(workspaceId) === entry && !entry.flushTimer) {
+            this.scheduleRetry(workspaceId, entry);
+          }
         });
       }
       return;
     }
     // Failures already scheduled a retry inside drain(); nothing else to do here.
     this.drain(workspaceId, entry).catch(() => undefined);
+  }
+
+  private scheduleRetry(workspaceId: string, entry: Entry): void {
+    const delay = retryDelayMs(entry.flushAttempt++);
+    if (entry.flushTimer) clearTimeout(entry.flushTimer);
+    entry.flushTimer = setTimeout(() => {
+      entry.flushTimer = null;
+      this.flushInBackground(workspaceId);
+    }, delay);
   }
 
   /** Send pending deltas, at most one request in flight per workspace. */
@@ -641,12 +661,7 @@ export class ReviewStateStore {
         this.applyWriteReply(entry, reply.sections, reply.revision);
       } catch (error) {
         // Keep pending (never silently drop a change) and retry with backoff.
-        const delay = retryDelayMs(entry.flushAttempt++);
-        if (entry.flushTimer) clearTimeout(entry.flushTimer);
-        entry.flushTimer = setTimeout(() => {
-          entry.flushTimer = null;
-          this.flushInBackground(workspaceId);
-        }, delay);
+        this.scheduleRetry(workspaceId, entry);
         throw error;
       } finally {
         entry.inFlight = null;

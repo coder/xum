@@ -408,6 +408,44 @@ describe("ReviewStateStore", () => {
     expect(backend.sections.hunkExpand).toEqual({ h1: true });
   });
 
+  test("a write that fails after release keeps retrying through a failed rehydration", async () => {
+    const { backend, client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    backend.failNextUpdate = true;
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+    unsubscribe?.();
+    unsubscribe = undefined;
+    // The retry has to rehydrate first, and that first rehydration fails too.
+    backend.failNextSubscribe = true;
+
+    await waitUntil(() => backend.sections.hunkExpand?.h1 === true);
+    await waitUntil(() => backend.openStreams === 0);
+  });
+
+  test("a flush after release without an API client rejects instead of hanging", async () => {
+    const { client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+    store.setClient(null);
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("flush never settled")), 1_000)
+    );
+    let flushError: unknown = null;
+    await Promise.race([
+      store.flush(WS).catch((error: unknown) => {
+        flushError = error;
+      }),
+      timeout,
+    ]);
+    expect(flushError).toBeInstanceOf(Error);
+    expect((flushError as Error).message).not.toBe("flush never settled");
+  });
+
   test("removing a workspace settles a pending whenReady and flush (#5011)", async () => {
     const { backend, client } = createBackend();
     backend.hydrationGate = new Promise<void>(() => undefined);
