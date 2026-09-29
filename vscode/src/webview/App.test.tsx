@@ -2568,6 +2568,53 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
   });
 
+  test("does not offer sending a running foreground bash to the background", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-fg", workspaceName: "bash-fg" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    const chat = (event: Record<string, unknown>) =>
+      bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
+    await chat({
+      type: "stream-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    await chat({
+      type: "tool-call-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      toolCallId: "call-fg",
+      toolName: "bash",
+      args: { script: "make build", timeout_secs: 60, display_name: "Build" },
+      tokens: 1,
+      timestamp: 2,
+    });
+    // The backend reports the call as a foreground bash that could be backgrounded, but the
+    // bridge refuses sendToBackground (bashForegroundControls is unsupported in the webview).
+    const call = bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0];
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId: "stream-fg",
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId: "stream-fg",
+      value: { processes: [], foregroundToolCallIds: ["call-fg"] },
+    });
+    await settle();
+
+    expect(view.container.textContent).toContain("make build");
+    expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
+  });
+
   test("does not show another workspace's processes after a switch", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);

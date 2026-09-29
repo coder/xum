@@ -173,10 +173,25 @@ const EMPTY_DISPLAYED_ROWS: { messages: DisplayedMessage[]; rendered: DisplayedM
 // Cleared on a workspace switch, as desktop ChatPane does, so it never shows under another chat.
 function BackgroundBashErrorPopover(props: { workspaceId: string | null }): JSX.Element {
   const { error, clearError } = useBackgroundBashError();
+  // The error belongs to the workspace it was raised in. Hide it during the render that switches
+  // workspaces (a post-render clear alone would paint it over the new chat for a frame), then
+  // clear it and follow the new workspace.
+  const [errorWorkspaceId, setErrorWorkspaceId] = useState(props.workspaceId);
+  const switched = errorWorkspaceId !== props.workspaceId;
   useEffect(() => {
+    if (!switched) {
+      return;
+    }
     clearError();
-  }, [clearError, props.workspaceId]);
-  return <PopoverError error={error} prefix="Failed to terminate:" onDismiss={clearError} />;
+    setErrorWorkspaceId(props.workspaceId);
+  }, [clearError, props.workspaceId, switched]);
+  return (
+    <PopoverError
+      error={switched ? null : error}
+      prefix="Failed to terminate:"
+      onDismiss={clearError}
+    />
+  );
 }
 
 const MAX_BUFFERED_HISTORICAL_MESSAGES = CHAT_BUFFER_LIMITS.MAX_HISTORICAL_MESSAGES;
