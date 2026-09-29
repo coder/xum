@@ -1189,11 +1189,15 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         carry over to another workspace. Without a server connection the store has
                         no client, so its last-known processes are not offered. */}
                     {selectedWorkspaceId && canChat ? (
-                      <BackgroundProcessesBanner
-                        // Sibling of the composer, which is keyed by the bare workspace ID.
-                        key={`background-processes-${selectedWorkspaceId}`}
-                        workspaceId={selectedWorkspaceId}
-                      />
+                      // The shared banner brings its own dock gutter (desktop's composer has the
+                      // same one); cancel this dock's padding so it lines up with the composer.
+                      <div className="-mx-[15px]">
+                        <BackgroundProcessesBanner
+                          // Sibling of the composer, which is keyed by the bare workspace ID.
+                          key={`background-processes-${selectedWorkspaceId}`}
+                          workspaceId={selectedWorkspaceId}
+                        />
+                      </div>
                     ) : null}
                     {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
                     {selectedWorkspaceId ? (
