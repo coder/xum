@@ -16,7 +16,7 @@ const meta = {
   parameters: { ...lightweightMeta.parameters, pixel: PIXEL_DISABLED },
   args: {
     workspaceId: "orphan",
-    workspaceName: "fix-login-redirect",
+    workspace: { name: "fix-login-redirect" },
     confirm: fn(() => Promise.resolve(false)),
     removeWorkspace: fn(() => Promise.resolve({ success: true })),
   },

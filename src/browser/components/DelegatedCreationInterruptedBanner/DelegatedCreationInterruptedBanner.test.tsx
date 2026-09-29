@@ -27,7 +27,7 @@ function renderNotice(options: {
     <APIProvider client={createTestApiClient({ workspace: { keepInterruptedDelegatedWorkspace } })}>
       <DelegatedCreationInterruptedNotice
         workspaceId={workspaceId}
-        workspaceName="fix-login-redirect"
+        workspace={{ name: "fix-login-redirect" }}
         confirm={confirm}
         removeWorkspace={removeWorkspace}
       />

@@ -6,8 +6,14 @@ import {
   useConfirmDialog,
   type ConfirmDialogOptions,
 } from "@/browser/contexts/ConfirmDialogContext";
-import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
-import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
+import {
+  useOptionalWorkspaceMetadata,
+  useWorkspaceActionsOptional,
+} from "@/browser/contexts/WorkspaceContext";
+import {
+  removeWorkspaceConfirmOptions,
+  type RemovableWorkspace,
+} from "@/browser/utils/commands/removeWorkspaceConfirm";
 
 /**
  * Copy stays neutral about the cause: a crash, a failed rollback and a failed cleanup all land
@@ -20,7 +26,8 @@ type BannerAction = "remove" | "keep";
 
 export interface DelegatedCreationInterruptedNoticeProps {
   workspaceId: string;
-  workspaceName: string;
+  /** Names what the removal deletes on this workspace's runtime (#5204). */
+  workspace: RemovableWorkspace;
   confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
   /** The normal user removal: never forced, so a dirty checkout or a busy workspace refuses. */
   removeWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
@@ -63,7 +70,7 @@ export const DelegatedCreationInterruptedNotice: React.FC<
   const remove = () =>
     run("remove", async () => {
       const confirmed = await props.confirm(
-        removeWorkspaceConfirmOptions("Remove current workspace?", props.workspaceName)
+        removeWorkspaceConfirmOptions("Remove current workspace?", props.workspace)
       );
       if (!confirmed) return null;
       const result = await props.removeWorkspace(props.workspaceId);
@@ -139,11 +146,16 @@ export const DelegatedCreationInterruptedBanner: React.FC<{
 }> = (props) => {
   const { confirm } = useConfirmDialog();
   const removeWorkspace = useWorkspaceActionsOptional()?.removeWorkspace;
+  const meta = useOptionalWorkspaceMetadata()?.workspaceMetadata.get(props.workspaceId);
   if (removeWorkspace == null) return null;
   return (
     <DelegatedCreationInterruptedNotice
       workspaceId={props.workspaceId}
-      workspaceName={props.workspaceName}
+      workspace={{
+        name: props.workspaceName,
+        runtimeConfig: meta?.runtimeConfig,
+        projects: meta?.projects,
+      }}
       confirm={confirm}
       removeWorkspace={(workspaceId) => removeWorkspace(workspaceId)}
     />

@@ -490,7 +490,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               selected.namedWorkspacePath.split("/").pop() ??
               selected.namedWorkspacePath;
             const ok = await p.confirmDialog(
-              removeWorkspaceConfirmOptions("Remove current workspace?", branchName)
+              removeWorkspaceConfirmOptions("Remove current workspace?", {
+                name: branchName,
+                runtimeConfig: selectedMeta?.runtimeConfig,
+                projects: selectedMeta?.projects,
+              })
             );
             if (ok) await p.onRemoveWorkspace(selected.workspaceId);
           },
@@ -731,7 +735,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             const workspaceName = meta ? `${meta.projectName}/${meta.name}` : vals.workspaceId;
             const branchName = meta?.name ?? workspaceName.split("/").pop() ?? workspaceName;
             const ok = await p.confirmDialog(
-              removeWorkspaceConfirmOptions(`Remove workspace ${workspaceName}?`, branchName)
+              removeWorkspaceConfirmOptions(`Remove workspace ${workspaceName}?`, {
+                name: branchName,
+                runtimeConfig: meta?.runtimeConfig,
+                projects: meta?.projects,
+              })
             );
             if (ok) {
               await p.onRemoveWorkspace(vals.workspaceId);

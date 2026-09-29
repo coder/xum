@@ -1,5 +1,7 @@
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
+import { removeWorkspaceConfirmOptions } from "./removeWorkspaceConfirm";
+import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ProjectConfig } from "@/node/config";
@@ -578,6 +580,39 @@ test("sub-agents get the confirmed sub-agent removal instead of the plain remove
   await removeAny?.prompt?.onSubmit({ workspaceId: "child" });
   expect(onRemoveSubagent).toHaveBeenCalledTimes(2);
   expect(onRemoveWorkspace).not.toHaveBeenCalled();
+});
+
+test("palette removal confirms with the workspace's runtime (#5204)", async () => {
+  const confirmDialog = mock((_options: ConfirmDialogOptions) => Promise.resolve(false));
+  const remote: FrontendWorkspaceMetadata = {
+    id: "remote",
+    name: "feature",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/feature",
+    runtimeConfig: { type: "ssh", host: "build-box", srcBaseDir: "~/xum" },
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["remote", remote]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: remote.namedWorkspacePath,
+      workspaceId: "remote",
+    },
+    confirmDialog,
+  });
+
+  await actions.find((action) => action.id === CommandIds.workspaceRemove())?.run();
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "remote" });
+
+  const expected = removeWorkspaceConfirmOptions("", remote).description;
+  expect(expected).not.toBe(removeWorkspaceConfirmOptions("", { name: "feature" }).description);
+  expect(confirmDialog.mock.calls.map(([options]) => options.description)).toEqual([
+    expected,
+    expected,
+  ]);
 });
 
 test("buildCoreSources includes archive merged workspaces in project action", () => {
