@@ -724,11 +724,12 @@ check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_G
 	@bun test ./scripts/check-startup-imports.test.ts
 	@bun scripts/check-startup-imports.ts
 
-# Post-build complement to check-startup-imports (#4423): loads dist/desktop/main.js in
-# plain Node with a stubbed `electron` and fails if a banned package is in require.cache.
+# Post-build complement to check-startup-imports (#4423): launches package.json `main`
+# (the CLI shim, which routes to desktop main) like `electron .` in plain Node with a
+# stubbed `electron` and fails if a banned package is in require.cache.
 # Catches what the static walk cannot (module-scope import(), computed require()).
 # Needs a build, so it runs in CI's Smoke / Server job rather than static-check.
-check-startup-imports-runtime: build-main ## Check the built desktop main process loads no banned package
+check-startup-imports-runtime: build-main ## Check package.json main (CLI shim -> desktop main) loads no banned package at startup
 	@bun scripts/check-startup-imports-runtime.ts
 
 # ~3 s: compiles only the hot-path files listed in the script, so it runs in static-check.

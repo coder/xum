@@ -1,6 +1,6 @@
 // Runtime harness for scripts/check-startup-imports-runtime.ts (#4423). Plain Node
-// CommonJS so it loads the build output exactly like Electron's main process would,
-// minus Electron itself.
+// CommonJS so it loads the build output exactly like Electron's main process would
+// (`electron .`), minus Electron itself.
 //
 // Usage: node scripts/check-startup-imports-runtime.cjs <absolute target.js> <absolute out.json>
 // Env: STARTUP_CHECK_APP_DATA, the directory the stubbed `app.getPath()` returns paths in.
@@ -89,6 +89,13 @@ function stub() {
     construct: () => stub(),
   });
 }
+
+// Launch the target the way Electron launches package.json `main` in development
+// (`electron .`): the CLI shim routes to desktop main only when it sees Electron, and
+// otherwise takes its help path and exits before module-scope code has run (#4423).
+process.versions.electron = "0.0.0"; // eager readers only test presence (commander, cli/argv)
+process.defaultApp = true;
+process.argv = [process.execPath, "."];
 
 const electron = stub();
 const originalLoad = Module._load;
