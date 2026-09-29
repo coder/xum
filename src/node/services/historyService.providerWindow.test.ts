@@ -357,6 +357,39 @@ describe("HistoryService bounded active-epoch reads", () => {
       });
       expect(ids(capOnPrompt.messages)).toEqual(ids(result.messages));
 
+      // A cluster that is already complete at the bound keeps its prompt: the older row that ends
+      // the cluster is outside the window and must not count against the extension.
+      const completeWs = "window-complete-at-bound";
+      await writeLayout(completeWs, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 3),
+        row("u4", "user", 4),
+        ...assistants(5, 8),
+      ]);
+      const promptAtBound = await window(completeWs, {
+        maxRows: 3,
+        maxBytes: BIG,
+        extensionMaxRows: 2,
+        extensionMaxBytes: BIG,
+      });
+      expect(ids(promptAtBound.messages)).toEqual(["u4", "a1005", "a1006", "a1007", "a1008"]);
+      const snapshotLayoutWs = "window-complete-cluster-zero-extension";
+      await writeLayout(snapshotLayoutWs, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 1),
+        fileSnapshot("s2", 2),
+        row("u3", "user", 3),
+        ...assistants(4, 4),
+      ]);
+      const capOnOldestSnapshot = await window(snapshotLayoutWs, {
+        maxRows: 3,
+        maxBytes: BIG,
+        extensionMaxRows: 0,
+        extensionMaxBytes: 0,
+      });
+      expect(ids(capOnOldestSnapshot.messages)).toEqual(["s2", "u3", "a1004"]);
+      expectSuffix(await full(snapshotLayoutWs), capOnOldestSnapshot.messages);
+
       // A prompt that is the only projected row stays, even without its whole cluster.
       const onlyPromptWs = "window-only-prompt";
       await writeLayout(onlyPromptWs, null, [

@@ -991,6 +991,13 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         }
         return false;
       }
+      // Checked before the bound: a row that ends the cluster lies outside the window, so it must
+      // not consume extension capacity (nor roll back a prompt whose cluster is complete).
+      if (phase === "cluster" && endsCluster(message)) {
+        // The snapshot cluster ended: this row belongs to an older turn.
+        phase = "done";
+        return true;
+      }
       if (
         (projected && extensionRows + 1 > caps.extensionMaxRows) ||
         extensionBytes + row.size > caps.extensionMaxBytes
@@ -1000,11 +1007,6 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         // the window never starts on a prompt that lost its snapshots, unless the prompt is the
         // only projected row left.
         if (phase === "cluster" && projectedBeforeTurnStart > 0) keep = keepBeforeTurnStart;
-        phase = "done";
-        return true;
-      }
-      if (phase === "cluster" && endsCluster(message)) {
-        // The snapshot cluster ended: this row belongs to an older turn.
         phase = "done";
         return true;
       }
