@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { getPlanFilePath } from "@/common/utils/planStorage";
+import { formatBranchWorkspaceNameConflict } from "@/common/utils/validation/workspaceValidation";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
@@ -214,6 +215,70 @@ describe("same-basename projects share the plan-directory name namespace (#5139)
       expect(persistedNames().filter((name) => name === "race")).toHaveLength(1);
       const forkId = newIds.mock.results[0]?.value as string;
       expect(await exists(path.join(harness.config.sessionsDir, forkId))).toBe(false);
+    });
+  });
+
+  describe("create", () => {
+    const createLocal = (projectPath: string, branchName: string | undefined) =>
+      service.create(projectPath, branchName, "main", undefined, { type: "local" });
+
+    test("/new skips a name a same-basename project uses on the same plan storage, so it inherits no plan", async () => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa11", "workspace-1");
+        const otherPlan = await writePlan(root, "workspace-1", "# A's workspace-1 plan\n");
+
+        const result = await createLocal(projectB, undefined);
+
+        expect(result.success ? result.data.metadata.name : result.error).toBe("workspace-2");
+        expect(await exists(getPlanFilePath("workspace-2", "project", root))).toBe(false);
+        expect(await fs.readFile(otherPlan, "utf8")).toBe("# A's workspace-1 plan\n");
+      });
+    });
+
+    // Like a worktree whose checkout directory is occupied: the name gets the collision suffix.
+    test.each([
+      { label: "a same-basename project", owner: () => projectA },
+      { label: "the same project", owner: () => projectB },
+    ])(
+      "an explicit create name a workspace in $label already uses for its plan gets the collision suffix",
+      async (c) => {
+        await withTempMuxRoot(async (root) => {
+          await addWorkspace(c.owner(), "aaaaaaaa12", "shared");
+          const otherPlan = await writePlan(root, "shared", "# the other workspace's plan\n");
+
+          const result = await createLocal(projectB, "shared");
+
+          const name = result.success ? result.data.metadata.name : result.error;
+          expect(name).toMatch(/^shared-[a-z0-9]+$/);
+          expect(await fs.readFile(otherPlan, "utf8")).toBe("# the other workspace's plan\n");
+        });
+      }
+    );
+
+    test("an explicit create keeps its name next to a same-named workspace on another host", async () => {
+      await withTempMuxRoot(async () => {
+        await addWorkspace(projectA, "aaaaaaaa13", "hosted", {
+          type: "ssh",
+          host: "remote-box",
+          srcBaseDir: "~/xum",
+        });
+
+        const result = await createLocal(projectB, "hosted");
+
+        expect(result.success ? result.data.metadata.name : result.error).toBe("hosted");
+      });
+    });
+
+    test("a sanitized branch whose workspace name another workspace's plan uses is refused", async () => {
+      await withTempMuxRoot(async () => {
+        await addWorkspace(projectA, "aaaaaaaa14", "feat-x");
+
+        const result = await createLocal(projectB, "feat/x");
+
+        expect(result.success ? result.data.metadata.name : result.error).toBe(
+          formatBranchWorkspaceNameConflict("feat/x")
+        );
+      });
     });
   });
 });
