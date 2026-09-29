@@ -366,10 +366,13 @@ export function listPersistedStateKeys(prefixes: readonly string[]): string[] {
  * For keys whose on-disk format must stay raw so older builds can still read them.
  */
 export function readPersistedRawString(key: string): string | null {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return null;
-  }
+  // The availability check is inside the try: browsers that deny storage access throw from the
+  // window.localStorage getter itself, and callers (e.g. the auth token read during render) expect
+  // null then.
   try {
+    if (typeof window === "undefined" || !window.localStorage) {
+      return null;
+    }
     return getStoredRaw(key);
   } catch {
     return null;
@@ -385,10 +388,11 @@ export function readPersistedRawString(key: string): string | null {
  * migration deletes the source afterwards), so a session-only copy is not a success.
  */
 export function writePersistedRawString(key: string, value: string): boolean {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return false;
-  }
   try {
+    // Inside the try for the same reason as readPersistedRawString.
+    if (typeof window === "undefined" || !window.localStorage) {
+      return false;
+    }
     return writeSerializedValue(key, value) === "stored";
   } catch (error) {
     reportWriteFailureOnce(key, error);
