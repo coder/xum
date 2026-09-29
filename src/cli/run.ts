@@ -42,7 +42,7 @@ import {
   type SendMessageOptions,
   type WorkspaceChatMessage,
 } from "../common/orpc/types";
-import type { ServiceTier } from "../common/config/schemas/providersConfig";
+import { ServiceTierSchema, type ServiceTier } from "../common/config/schemas/providersConfig";
 import { createDisplayUsage } from "../common/utils/tokens/displayUsage";
 import {
   getTotalCost,
@@ -412,7 +412,11 @@ program
   .option("--goal <objective>", "drive an ephemeral CLI Goal Run until complete")
   .option("--goal-budget <budget>", "goal budget, e.g. $5, 5.00, or 500c")
   .option("--goal-turns <turns>", "maximum automatic goal continuation turns")
-  .option("--service-tier <tier>", "OpenAI service tier: auto, default, flex, priority")
+  .option(
+    "--service-tier <tier>",
+    // Derived from the schema so new tiers (e.g. ultrafast) cannot drift from the help text.
+    `OpenAI service tier: ${ServiceTierSchema.options.join(", ")}`
+  )
   .option("--use-1m", "enable 1M context window for supported Anthropic models")
   .option(
     "--keep-background-processes",

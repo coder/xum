@@ -652,6 +652,10 @@ describe("OpenAI service-tier pricing (#4352)", () => {
     const unknown = cost("openai:gpt-6-sol", 100_000, "hyperfast");
     expect(unknown).toBeGreaterThan(cost("openai:gpt-6-sol", 100_000));
     expect(unknown).toBeGreaterThanOrEqual(cost("openai:gpt-6-sol", 100_000, "fast"));
+    // A published Ultrafast card is part of the highest-published-rate fallback.
+    expect(cost("openai:gpt-6-astra", 100_000, "hyperfast")).toBeGreaterThanOrEqual(
+      cost("openai:gpt-6-astra", 100_000, "ultrafast")
+    );
   });
 
   test("prices Ultrafast at 6x Standard in both context bands", () => {

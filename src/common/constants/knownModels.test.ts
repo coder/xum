@@ -65,6 +65,7 @@ describe("Known Models Integration", () => {
     ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
     ["openai:gpt-5.6-sol", "openai/gpt-5"],
     ["openai:gpt-5.6-luna", "openai/gpt-5"],
+    ["openai:gpt-6-sol", "openai/gpt-5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

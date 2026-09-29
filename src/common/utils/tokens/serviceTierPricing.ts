@@ -273,6 +273,12 @@ export function withServiceTierPricing(
   if (tier === "fast" && fastCard !== undefined) {
     return fastCard;
   }
-  // Fast without published rates, or a tier we do not know.
-  return highestPublishedRates(fastCard !== undefined ? [stats, fastCard] : [stats]);
+  // Fast without published rates, or a tier we do not know: every published card
+  // counts, including Ultrafast, so an unknown future tier never prices below it.
+  const publishedCards = [stats];
+  if (fastCard !== undefined) publishedCards.push(fastCard);
+  if (factors?.ultrafast !== undefined) {
+    publishedCards.push(scaleRates(stats, "ultrafast", factors.ultrafast));
+  }
+  return highestPublishedRates(publishedCards);
 }

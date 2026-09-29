@@ -324,6 +324,7 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
   "openai:gpt-5.6-sol": "openai/gpt-5",
   "openai:gpt-5.6-luna": "openai/gpt-5",
+  "openai:gpt-6-sol": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
