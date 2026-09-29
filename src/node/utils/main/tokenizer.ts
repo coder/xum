@@ -77,17 +77,8 @@ function normalizeModelKey(modelName: string): ModelName | null {
  * Optionally logs a warning when falling back.
  */
 function resolveModelName(modelString: string): ModelName {
-  return resolveModelNameWithFallback(modelString).modelName;
-}
-
-function resolveModelNameWithFallback(modelString: string): {
-  modelName: ModelName;
-  /** True when an unknown provider fell through to the catch-all OpenAI tokenizer. */
-  guessed: boolean;
-} {
   const normalized = normalizeToCanonical(modelString);
   let modelName = normalizeModelKey(normalized);
-  let guessed = false;
 
   if (!modelName) {
     const provider = normalized.split(":")[0] || "anthropic";
@@ -113,12 +104,6 @@ function resolveModelNameWithFallback(modelString: string): {
         : effectiveProvider === "google"
           ? "google/gemini-2.5-pro"
           : "openai/gpt-5";
-    // The catch-all branch for a provider with no tokenizer family of its own.
-    guessed =
-      effectiveProvider !== "anthropic" &&
-      effectiveProvider !== "google" &&
-      provider !== "openai" &&
-      provider !== "github-copilot";
 
     // Only warn once per unknown model to avoid log spam
     if (!warnedModels.has(modelString)) {
@@ -131,7 +116,7 @@ function resolveModelNameWithFallback(modelString: string): {
     modelName = fallbackModel as ModelName;
   }
 
-  return { modelName, guessed };
+  return modelName;
 }
 
 // Each encoding has its own worker, so requests are routed by the model's encoding.
@@ -141,17 +126,9 @@ function encodingOf(modelName: ModelName): EncodingName {
   return model.encoding;
 }
 
-/**
- * The encoding counting uses for a model id (same overrides and provider fallbacks).
- * `guessed` marks an unknown provider (e.g. a custom-named Coder instance whose type lives in
- * providers.jsonc) that fell through to the catch-all tokenizer, so the encoding may be wrong.
- */
-export function encodingForModel(modelString: string): {
-  encoding: EncodingName;
-  guessed: boolean;
-} {
-  const { modelName, guessed } = resolveModelNameWithFallback(modelString);
-  return { encoding: encodingOf(modelName), guessed };
+/** The encoding counting uses for a model id (same overrides and provider fallbacks). */
+export function encodingForModel(modelString: string): EncodingName {
+  return encodingOf(resolveModelName(modelString));
 }
 
 function resolveEncoding(modelName: ModelName): Promise<string> {

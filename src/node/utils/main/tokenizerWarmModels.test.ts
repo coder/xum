@@ -19,7 +19,7 @@ function configWith(workspaces: unknown[], extra: Record<string, unknown> = {}):
 
 function warmedEncodings(config: ProjectsConfig): string[] {
   const models = deriveWarmModels(config);
-  const encodings = models.map((model) => encodingForModel(model).encoding);
+  const encodings = models.map((model) => encodingForModel(model));
   // One representative model per encoding.
   expect(new Set(encodings).size).toBe(models.length);
   return encodings.sort();
@@ -61,6 +61,23 @@ describe("deriveWarmModels", () => {
       }),
     ],
     ["a coder gateway id", configWith([{ aiSettings: { model: "coder:openai/gpt-5.5-pro" } }])],
+    [
+      "an auto-routing tier",
+      configWith([], { autoModelRouting: { tiers: [{ id: "hard", model: OPENAI }] } }),
+    ],
+    [
+      "a refusal fallback target",
+      configWith([], { modelFallbacks: { [CLAUDE]: { models: [OPENAI] } } }),
+    ],
+    ["the evaluation defaults", configWith([], { evaluationDefaults: { model: OPENAI } })],
+    [
+      "the auto-routing classifier",
+      configWith([], { autoModelRouting: { evaluationModel: OPENAI } }),
+    ],
+    [
+      "subagentAiDefaults",
+      configWith([], { subagentAiDefaults: { explore: { modelString: OPENAI } } }),
+    ],
   ];
   test.each(openaiSources)("an OpenAI model in %s adds o200k_base", (_source, config) => {
     config.defaultModel = CLAUDE;
@@ -68,7 +85,7 @@ describe("deriveWarmModels", () => {
   });
 
   const defaultEncodings = () =>
-    [...new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))].sort();
+    [...new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model)))].sort();
 
   test("a Coder gateway id keeps the default warm set", () => {
     // The instance's upstream type lives in providers.jsonc, which startup does not read, so
@@ -79,23 +96,36 @@ describe("deriveWarmModels", () => {
     expect(warmedEncodings(config)).toEqual(defaultEncodings());
   });
 
-  test("a model whose encoding is only a guess also keeps the default warm set", () => {
-    // An unknown provider falls through to the catch-all tokenizer (o200k_base). Using it as the
-    // default too means only the guess fallback can add the claude encoding.
-    const custom = "my-proxy:claude-opus-4-6";
-    const config = configWith([{ aiSettings: { model: custom } }], { defaultModel: custom });
-    expect(warmedEncodings(config)).toEqual(defaultEncodings());
-    // A known provider's fallback is not a guess, so it does not widen the set.
+  test("a known provider's unlisted model uses the provider fallback without widening the set", () => {
     const known = configWith([{ aiSettings: { model: "anthropic:claude-unreleased-9" } }], {
       defaultModel: CLAUDE,
     });
     expect(warmedEncodings(known)).toEqual(["claude"]);
   });
 
+  test("claude stays warm for an OpenAI-only config, since history truncation counts with it", () => {
+    const config = configWith([{ aiSettings: { model: OPENAI } }], { defaultModel: OPENAI });
+    expect(warmedEncodings(config)).toEqual(["claude", "o200k_base"]);
+  });
+
+  test("model ids outside model keys, and non-model strings under them, do not widen the set", () => {
+    const config = configWith(
+      [
+        {
+          aiSettings: { model: CLAUDE },
+          notes: OPENAI,
+          runtimeConfig: { model: "https://x.test/y" },
+        },
+      ],
+      { defaultModel: CLAUDE, hiddenModels: [OPENAI], taskModelString: [OPENAI] }
+    );
+    expect(warmedEncodings(config)).toEqual(["claude"]);
+  });
+
   test("the default model's encoding is warmed even when no model uses it yet", () => {
     const config = configWith([{ aiSettings: { model: OPENAI } }]);
     expect(warmedEncodings(config)).toEqual(
-      [...new Set([encodingForModel(DEFAULT_MODEL).encoding, "o200k_base"])].sort()
+      [...new Set([encodingForModel(DEFAULT_MODEL), "o200k_base"])].sort()
     );
   });
 
@@ -175,7 +205,7 @@ describe("warmConfiguredTokenizers", () => {
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
     // "ready" is sent per model, so compare the distinct encodings.
     expect(new Set(readyEncodings())).toEqual(
-      new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))
+      new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model)))
     );
   });
 });
