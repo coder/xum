@@ -163,6 +163,10 @@ function finiteNonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // perf-summary.json / react-profile.json (tests/e2e/utils/perfProfile.ts, schemaVersion 1)
 // ---------------------------------------------------------------------------
@@ -322,11 +326,7 @@ export function readScenario(summary: unknown, reactProfile: unknown): ScenarioR
     typeof testInfo.title === "string" && typeof testInfo.file === "string"
       ? testKey(testInfo.file, testInfo.title)
       : undefined;
-  const rawRetry = testInfo.retry;
-  const retry =
-    typeof rawRetry === "number" && Number.isInteger(rawRetry) && rawRetry >= 0
-      ? rawRetry
-      : undefined;
+  const retry = nonNegativeInteger(testInfo.retry);
   const identity: ScenarioIdentity = { label, testKey: key, retry };
 
   if (summary.schemaVersion !== 1) {
@@ -399,13 +399,8 @@ export function parsePlaywrightResults(json: unknown): PlaywrightResults {
         if (!TEST_STATUSES.has(status)) continue;
         const results = Array.isArray(test.results) ? test.results : [];
         const last: unknown = results[results.length - 1];
-        const lastRetry = isRecord(last) ? last.retry : undefined;
-        const finalRetry =
-          results.length === 0
-            ? undefined
-            : typeof lastRetry === "number" && Number.isInteger(lastRetry) && lastRetry >= 0
-              ? lastRetry
-              : results.length - 1;
+        const lastRetry = isRecord(last) ? nonNegativeInteger(last.retry) : undefined;
+        const finalRetry = results.length === 0 ? undefined : (lastRetry ?? results.length - 1);
         tests.push({
           key: testKey(specFile, title),
           title,
