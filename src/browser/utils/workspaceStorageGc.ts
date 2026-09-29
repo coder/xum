@@ -17,9 +17,8 @@
  *   the backend returns a new id, i.e. after its config entry is persisted, so a workspace created
  *   after the snapshot either has no candidate keys or is in the backend set.
  * - Only keys of stable-format workspace ids are ever collected (see
- *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected: the drafts map is
- *   not authoritative (a routed draft id can be in use without a map entry, and a malformed or
- *   newer-format bucket hides live drafts), and drafts move to the backend in a follow-up.
+ *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected here; the
+ *   creation-draft pass (creationDraftStorageGc.ts) checks them against the backend draft list.
  * - Keys are removed through removePersistedStateKeys so mounted usePersistedState consumers and
  *   write listeners observe the removal instead of writing a stale value back.
  *

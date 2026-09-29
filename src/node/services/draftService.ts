@@ -115,8 +115,12 @@ export class DraftService extends EventEmitter {
    * The creation draft list, read from disk every time: it is small, and a sibling backend on the
    * same root may have changed it (no lock: writes are atomic renames).
    */
-  async getList(): Promise<DraftList> {
-    const { entries } = await this.readListFile();
+  async getList(options?: { strict?: boolean }): Promise<DraftList> {
+    const { entries, state } = await this.readListFile();
+    // Strict readers (the renderer's storage GC) must never mistake a damaged list for the truth.
+    if (options?.strict === true && state === "damaged") {
+      throw new Error(`Creation draft list ${this.listFile} is damaged`);
+    }
     return { entries, revision: this.listRevision };
   }
 

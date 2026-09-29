@@ -77,6 +77,7 @@ export function createMockDraftsApi() {
       }
       return Promise.resolve(result);
     },
+    getList: () => Promise.resolve({ entries: listEntries, revision }),
     putListEntry: (entry: DraftListEntry) => {
       const existing = listEntries.find((listed) => isSame(listed, entry));
       return Promise.resolve(

@@ -683,3 +683,24 @@ describe("DraftService creation draft list compatibility", () => {
     expect((await service.getList()).entries).toEqual([future]);
   });
 });
+
+describe("DraftService strict list read", () => {
+  it("rejects a damaged list for strict readers and serves its valid rows otherwise", async () => {
+    using tempDir = new TestTempDir("drafts-list-strict");
+    const { config, projectPath } = await createHarness(tempDir);
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.mkdir(path.dirname(listFile), { recursive: true });
+    const valid = { projectPath, draftId: "ok", subProjectPath: null, createdAt: 1 };
+    await fs.writeFile(listFile, JSON.stringify({ version: 1, entries: [valid, { draftId: 7 }] }));
+    const service = new DraftService(config);
+
+    expect((await service.getList()).entries).toEqual([valid]);
+    let error: unknown;
+    try {
+      await service.getList({ strict: true });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+  });
+});

@@ -76,6 +76,7 @@ import {
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
+import { collectOrphanedCreationDraftStorage } from "@/browser/utils/creationDraftStorageGc";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 import {
@@ -766,6 +767,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [workspaceStore]
   );
+  // The routed creation draft, for the startup creation-draft storage GC (never collected).
+  const routedDraftRef = useRef<{ projectPath: string; draftId: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -944,6 +947,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // pendingNewWorkspaceProject is derived from current project in URL/state
   const pendingNewWorkspaceProject = currentProjectPath;
   const pendingNewWorkspaceDraftId = pendingNewWorkspaceProject ? pendingDraftId : null;
+  routedDraftRef.current =
+    pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
+      ? { projectPath: pendingNewWorkspaceProject, draftId: pendingNewWorkspaceDraftId }
+      : null;
   const pendingNewWorkspaceSubProjectPathRaw =
     pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
       ? ((workspaceDraftsByProject[pendingNewWorkspaceProject] ?? []).find(
@@ -1131,6 +1138,25 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         }).catch((error: unknown) => {
           console.error("Failed to collect orphaned workspace storage:", error);
         });
+        // Creation-draft settings keys, against the backend draft list (see
+        // creationDraftStorageGc.ts); only after a real drafts snapshot, never after its timeout.
+        getDraftStore()
+          .whenReady()
+          .then(() => {
+            if (cancelled || !getDraftStore().isHydrated()) return;
+            return collectOrphanedCreationDraftStorage({
+              listCreationDrafts: () => api.drafts.getList(),
+              isLive: (projectPath, draftId) =>
+                (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).some(
+                  (draft) => draft.draftId === draftId
+                ) ||
+                (routedDraftRef.current?.projectPath === projectPath &&
+                  routedDraftRef.current.draftId === draftId),
+            });
+          })
+          .catch((error: unknown) => {
+            console.error("Failed to collect orphaned creation draft storage:", error);
+          });
       }
     };
 

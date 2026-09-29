@@ -3,6 +3,8 @@
  * These keys are used for persisting state in localStorage
  */
 
+import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
+
 /**
  * Scope ID Helpers
  * These create consistent scope identifiers for storage keys
@@ -34,8 +36,10 @@ export function getPendingScopeId(projectPath: string): string {
  * Format: "__draft__/{projectPath}/{draftId}"
  */
 export function getDraftScopeId(projectPath: string, draftId: string): string {
-  return `__draft__/${projectPath}/${draftId}`;
+  return `${DRAFT_SCOPE_ID_PREFIX}${projectPath}/${draftId}`;
 }
+
+const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 
 /**
  * Global scope ID for workspace-independent preferences
@@ -1376,5 +1380,41 @@ export function findOrphanedWorkspaceStorageKeys(
   return candidateKeys.filter((key) => {
     const ownerId = getWorkspaceStorageGcOwnerId(key);
     return ownerId !== null && !knownWorkspaceIds.has(ownerId);
+  });
+}
+
+/**
+ * The listed creation draft that owns a registered draft-scope key (`<key>:__draft__/<project>/<id>`),
+ * or null for every other key, including the default composer's fixed draft id and ids the
+ * backend would never list.
+ */
+function getCreationDraftStorageOwner(
+  key: string
+): { projectPath: string; draftId: string } | null {
+  const scopeId = getWorkspaceScopeIdFromKey(key);
+  if (scopeId?.startsWith(DRAFT_SCOPE_ID_PREFIX) !== true) return null;
+  const rest = scopeId.slice(DRAFT_SCOPE_ID_PREFIX.length);
+  const separator = rest.lastIndexOf("/");
+  const projectPath = rest.slice(0, separator);
+  const draftId = rest.slice(separator + 1);
+  if (separator <= 0 || !DRAFT_ID_PATTERN.test(draftId) || draftId === DEFAULT_CREATION_DRAFT_ID) {
+    return null;
+  }
+  return { projectPath, draftId };
+}
+
+/** Whether the creation-draft storage GC could ever collect `key` (see creationDraftStorageGc.ts). */
+export function isCreationDraftStorageGcCandidateKey(key: string): boolean {
+  return getCreationDraftStorageOwner(key) !== null;
+}
+
+/** Pick the candidate keys whose creation draft `isKept` rejects. */
+export function findOrphanedCreationDraftStorageKeys(
+  candidateKeys: readonly string[],
+  isKept: (projectPath: string, draftId: string) => boolean
+): string[] {
+  return candidateKeys.filter((key) => {
+    const owner = getCreationDraftStorageOwner(key);
+    return owner !== null && !isKept(owner.projectPath, owner.draftId);
   });
 }

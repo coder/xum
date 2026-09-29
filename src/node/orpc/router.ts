@@ -631,6 +631,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
         ),
+      getList: t
+        .input(schemas.drafts.getList.input)
+        .output(schemas.drafts.getList.output)
+        .handler(({ context }) => context.draftService.getList({ strict: true })),
       putListEntry: t
         .input(schemas.drafts.putListEntry.input)
         .output(schemas.drafts.putListEntry.output)

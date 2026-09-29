@@ -109,6 +109,7 @@ import {
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
   DraftListEntrySchema,
+  DraftListSchema,
   DraftRevisionOutputSchema,
   DraftScopeSchema,
   DraftSummarySchema,
@@ -3312,6 +3313,14 @@ export const drafts = {
   importLegacy: {
     input: DraftUpdateInputSchema,
     output: DraftImportLegacyOutputSchema,
+  },
+  /**
+   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
+   * falls back to an empty list instead). For the renderer's storage GC.
+   */
+  getList: {
+    input: z.void(),
+    output: DraftListSchema,
   },
   /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
   putListEntry: {
