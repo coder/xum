@@ -1472,6 +1472,36 @@ describe("TerminalService.openNative", () => {
       }
     });
 
+    // #4909: this backend's own rename and removal refuse only while the open is counted, so the
+    // count must last until the launcher has spawned the terminal, not just until the marker write.
+    it("keeps the open counted until the launcher returns", async () => {
+      const reached = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<void>();
+      fsStatSpy.mockImplementation((async (statPath: string) => {
+        // The launcher's first command-discovery probe, after the lease and the marker write.
+        if (statPath.includes("Ghostty.app")) {
+          reached.resolve();
+          await held.promise;
+        }
+        throw new Error("ENOENT");
+      }) as unknown as typeof fs.stat);
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      try {
+        const opening = service.openNative(workspaceId);
+        await reached.promise;
+        expect(service.hasPendingNativeTerminalOpen(workspaceId)).toBe(true);
+        expect(spawnSpy).not.toHaveBeenCalled();
+
+        held.resolve();
+        await opening;
+        expect(spawnSpy).toHaveBeenCalled();
+        expect(service.hasPendingNativeTerminalOpen(workspaceId)).toBe(false);
+      } finally {
+        held.resolve();
+        await service.releaseNativeTerminalUseLease(workspaceId);
+      }
+    });
+
     // #4913: lease directories are never pruned, so an unknown ID must not create one.
     it("publishes no lease for an unknown workspace", async () => {
       const unknownId = "ws-native-lease-unknown";

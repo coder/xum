@@ -10279,7 +10279,8 @@ export class WorkspaceService
    * rechecking, so hasExternalEditorOpen counts these alongside durable evidence — a
    * concurrent failed launch's rollback may collapse the shared marker and cache entry, and
    * without this count that collapse would make a still-recording sibling invisible to an
-   * archive that then removes the environment beneath the launching editor.
+   * archive that then removes the environment beneath the launching editor. For editors this
+   * backend launches itself, the count lasts until the launcher returns (launchExternalEditor).
    */
   private readonly pendingExternalEditorRecordings = new Map<string, number>();
 
@@ -10359,7 +10360,10 @@ export class WorkspaceService
     // Deep-link opens launch in the renderer immediately after this returns; the rollback
     // entry lets the renderer report a launch that provably never happened so the marker
     // cannot outlive it (see externalEditorLaunchRollbacks for why the token is
-    // client-generated).
+    // client-generated). The in-flight count has already ended here, so this backend's own
+    // rename or removal may still run before the client's hand-off. That is accepted (#4909):
+    // the launch runs in another process, and the editor opens the folder asynchronously even
+    // after the hand-off, which is the outcome those mutations already tolerate for an open editor.
     this.externalEditorLaunchRollbacks.set(launchToken, {
       workspaceId,
       rollback: admitted.data.rollbackAfterFailedLaunch,
@@ -10411,6 +10415,41 @@ export class WorkspaceService
   async recordExternalEditorOpenForLaunch(
     workspaceId: string
   ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
+    return this.withPendingExternalEditorOpen(workspaceId, () =>
+      this.recordExternalEditorOpenAdmitted(workspaceId)
+    );
+  }
+
+  /**
+   * Records an editor open that this backend launches itself (a custom command) and runs
+   * `launch` while the open still counts as in flight. This backend's own rename, removal and
+   * checkout-deleting archive ignore its editor lease, so without the count they could move or
+   * delete the checkout between the recording and the spawn (#4909), as for native terminals.
+   * Deep-link opens cannot use this: they launch in the client after recordExternalEditorOpen.
+   */
+  async launchExternalEditor(
+    workspaceId: string,
+    launch: () => Promise<Result<void>>
+  ): Promise<Result<void>> {
+    return this.withPendingExternalEditorOpen(workspaceId, async () => {
+      const recorded = await this.recordExternalEditorOpenAdmitted(workspaceId);
+      if (!recorded.success) {
+        // Refused (for example while a mutation holds the gate): never launch, never queue.
+        return recorded;
+      }
+      const launched = await launch();
+      if (!launched.success) {
+        // Pre-spawn failures must not leave a marker that permanently blocks later archives.
+        await recorded.data.rollbackAfterFailedLaunch();
+      }
+      return launched;
+    });
+  }
+
+  private async withPendingExternalEditorOpen<T>(
+    workspaceId: string,
+    run: () => Promise<T>
+  ): Promise<T> {
     // Pending-recording admission pairing (mirrors TerminalService.openNative): the count is
     // registered before any await — including the marker-lock wait, where a concurrent
     // failed launch's rollback may collapse the shared marker and cache entry — so
@@ -10421,7 +10460,7 @@ export class WorkspaceService
       (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) + 1
     );
     try {
-      return await this.recordExternalEditorOpenAdmitted(workspaceId);
+      return await run();
     } finally {
       const remaining = (this.pendingExternalEditorRecordings.get(workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
