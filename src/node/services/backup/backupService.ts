@@ -89,6 +89,7 @@ export interface BackupPayloadStore {
     commandApprovals: BackupCommandApproval[];
     projectImports: BackupProjectImport[];
     projectBundleSkipped: boolean;
+    unsupportedSettings: string[];
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -118,6 +119,7 @@ export interface BackupPayloadStore {
     changedFiles: string[];
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
+    unsupportedSettings: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -554,6 +556,7 @@ export class BackupService {
         commandApprovals: BackupCommandApproval[];
         projectImports: BackupProjectImport[];
         projectBundleSkipped: boolean;
+        unsupportedSettings: string[];
         pushError: string | null;
       },
       BackupOperationError
@@ -595,6 +598,7 @@ export class BackupService {
         commandApprovals: restorePreview.commandApprovals,
         projectImports: restorePreview.projectImports,
         projectBundleSkipped: restorePreview.projectBundleSkipped,
+        unsupportedSettings: restorePreview.unsupportedSettings,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
@@ -682,6 +686,7 @@ export class BackupService {
         localOnlyFiles: string[];
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
+        unsupportedSettings: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -799,6 +804,7 @@ export class BackupService {
               localOnlyFiles: restored.localOnlyFiles,
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
+              unsupportedSettings: restored.unsupportedSettings,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>

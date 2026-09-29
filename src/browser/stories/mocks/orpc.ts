@@ -668,6 +668,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     commandApprovals: [],
     projectImports: [],
     projectBundleSkipped: false,
+    unsupportedSettings: [],
     pushError: null,
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
@@ -683,6 +684,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     localOnlyFiles: [],
     projectImportResults: [],
     projectBundleSkipped: false,
+    unsupportedSettings: [],
     unapprovedProjectImports: [],
   };
 
