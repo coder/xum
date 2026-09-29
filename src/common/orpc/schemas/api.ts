@@ -2381,9 +2381,15 @@ export const tasks = {
       z.string()
     ),
   },
-  /** #5106: user-confirmed sub-agent removal; never exposed as a model tool. */
+  /**
+   * #5106: user-confirmed sub-agent removal; never exposed as a model tool. `acknowledgedWork` is
+   * the preview the user confirmed: removal refuses if the work changed since.
+   */
   remove: {
-    input: z.object({ taskId: z.string() }),
+    input: z.object({
+      taskId: z.string(),
+      acknowledgedWork: z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+    }),
     output: ResultSchema(z.void(), z.string()),
   },
 };

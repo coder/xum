@@ -13,7 +13,7 @@ function setup(options: {
   removal?: WorkspaceRemoveResult;
 }) {
   const confirm = mock((_options: ConfirmDialogOptions) => Promise.resolve(options.confirmed));
-  const removeSubagent = mock((_workspaceId: string) =>
+  const removeSubagent = mock((_workspaceId: string, _acknowledged: unknown) =>
     Promise.resolve(options.removal ?? { success: true })
   );
   const api = createTestApiClient({
@@ -27,7 +27,7 @@ function setup(options: {
       workspaceId: "child",
       title: "Child",
     });
-  return { confirm, removeSubagent, run };
+  return { api, confirm, removeSubagent, run };
 }
 
 describe("confirmAndRemoveSubagent (#5106)", () => {
@@ -46,7 +46,8 @@ describe("confirmAndRemoveSubagent (#5106)", () => {
 
     const confirmed = setup({ preview: { success: true, data: preview }, confirmed: true });
     expect(await confirmed.run()).toBeNull();
-    expect(confirmed.removeSubagent).toHaveBeenCalledWith("child");
+    // The removal carries the confirmed preview, so the backend can refuse if the work changed.
+    expect(confirmed.removeSubagent).toHaveBeenCalledWith("child", preview);
   });
 
   test("reports a failed preview without asking, and a refused removal after confirming", async () => {
@@ -56,6 +57,10 @@ describe("confirmAndRemoveSubagent (#5106)", () => {
     });
     expect(await failedPreview.run()).toBe("This is not a sub-agent.");
     expect(failedPreview.confirm).not.toHaveBeenCalled();
+
+    const rejected = setup({ preview: { success: false, error: "unused" }, confirmed: true });
+    rejected.api.tasks.previewRemoval = () => Promise.reject(new Error("connection lost"));
+    expect(await rejected.run()).toBe("connection lost");
 
     const refused = setup({
       preview: { success: true, data: { summary: null, paths: [] } },

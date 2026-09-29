@@ -918,19 +918,16 @@ function AppInner() {
     },
     [removeWorkspace, paletteRemoveError]
   );
-  const removeSubagentFromPalette = useCallback(
-    async (workspaceId: string, title: string) => {
-      const error = await confirmAndRemoveSubagent({
-        api,
-        confirm: confirmDialog,
-        removeSubagent,
-        workspaceId,
-        title,
-      });
-      if (error != null) paletteRemoveError.showError(workspaceId, error);
-    },
-    [api, confirmDialog, removeSubagent, paletteRemoveError]
-  );
+  const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
+    const error = await confirmAndRemoveSubagent({
+      api,
+      confirm: confirmDialog,
+      removeSubagent,
+      workspaceId,
+      title,
+    });
+    if (error != null) paletteRemoveError.showError(workspaceId, error);
+  };
 
   const updateTitleFromPalette = useCallback(
     async (workspaceId: string, newTitle: string) => updateWorkspaceTitle(workspaceId, newTitle),

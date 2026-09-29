@@ -402,8 +402,21 @@ describe("TaskService", () => {
     expect(preview.data.paths).toEqual(["notes.txt"]);
     expect(remove).not.toHaveBeenCalled();
 
+    // Work that appears after the confirmation was shown refuses the removal: the user never
+    // loses what the dialog did not list.
+    await fsPromises.writeFile(path.join(childPath, "later.txt"), "written after preview\n");
+    expect(await taskService.removeSubagentForUser(childTaskId, preview.data)).toMatchObject({
+      success: false,
+    });
+    expect(remove).not.toHaveBeenCalled();
+
     // Only the user-confirmed path force-removes it.
-    expect(await taskService.removeSubagentForUser(childTaskId)).toEqual(Ok(undefined));
+    const current = await taskService.previewSubagentRemoval(childTaskId);
+    assert(current.success, "preview must succeed");
+    expect(current.data.paths).toEqual(["later.txt", "notes.txt"]);
+    expect(await taskService.removeSubagentForUser(childTaskId, current.data)).toEqual(
+      Ok(undefined)
+    );
     expect(remove).toHaveBeenCalledTimes(1);
   });
 
@@ -414,7 +427,8 @@ describe("TaskService", () => {
       parentWorkspaceId,
       childTaskId
     );
-    expect(await taskService.removeSubagentForUser(parentWorkspaceId)).toMatchObject({
+    const nothing = { summary: null, paths: [] };
+    expect(await taskService.removeSubagentForUser(parentWorkspaceId, nothing)).toMatchObject({
       success: false,
     });
     expect(await taskService.previewSubagentRemoval(parentWorkspaceId)).toMatchObject({
@@ -433,7 +447,7 @@ describe("TaskService", () => {
     expect(await taskService.previewSubagentRemoval(childTaskId)).toMatchObject({
       success: false,
     });
-    expect(await taskService.removeSubagentForUser(childTaskId)).toMatchObject({
+    expect(await taskService.removeSubagentForUser(childTaskId, nothing)).toMatchObject({
       success: false,
     });
     expect(remove).not.toHaveBeenCalled();

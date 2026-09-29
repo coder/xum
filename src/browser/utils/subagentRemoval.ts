@@ -1,6 +1,7 @@
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import type { WorkspaceRemoveResult } from "@/common/types/workspace";
+import { getErrorMessage } from "@/common/utils/errors";
 
 /**
  * #5106: user-confirmed removal of one sub-agent. The confirmation lists what removal would
@@ -11,12 +12,21 @@ import type { WorkspaceRemoveResult } from "@/common/types/workspace";
 export async function confirmAndRemoveSubagent(params: {
   api: APIClient | null;
   confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
-  removeSubagent: (workspaceId: string) => Promise<WorkspaceRemoveResult>;
+  removeSubagent: (
+    workspaceId: string,
+    acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+  ) => Promise<WorkspaceRemoveResult>;
   workspaceId: string;
   title: string;
 }): Promise<string | null> {
   if (params.api == null) return "API not connected";
-  const preview = await params.api.tasks.previewRemoval({ taskId: params.workspaceId });
+  // Palette actions run fire-and-forget, so a transport failure must come back as an error too.
+  let preview: Awaited<ReturnType<APIClient["tasks"]["previewRemoval"]>>;
+  try {
+    preview = await params.api.tasks.previewRemoval({ taskId: params.workspaceId });
+  } catch (error) {
+    return getErrorMessage(error);
+  }
   if (!preview.success) return preview.error;
   const confirmed = await params.confirm({
     title: `Remove sub-agent "${params.title}"?`,
@@ -27,6 +37,7 @@ export async function confirmAndRemoveSubagent(params: {
     confirmVariant: "destructive",
   });
   if (!confirmed) return null;
-  const result = await params.removeSubagent(params.workspaceId);
+  // The backend refuses if the work changed since this preview (#5106).
+  const result = await params.removeSubagent(params.workspaceId, preview.data);
   return result.success ? null : (result.error ?? "Failed to remove the sub-agent");
 }

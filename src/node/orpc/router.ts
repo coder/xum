@@ -2249,7 +2249,9 @@ export const router = (authToken?: string) => {
       remove: t
         .input(schemas.tasks.remove.input)
         .output(schemas.tasks.remove.output)
-        .handler(({ context, input }) => context.taskService.removeSubagentForUser(input.taskId)),
+        .handler(({ context, input }) =>
+          context.taskService.removeSubagentForUser(input.taskId, input.acknowledgedWork)
+        ),
     },
     window: {
       setTitle: t

@@ -316,6 +316,16 @@ export interface SubagentRemovalOptions {
   mutationGateHeld?: boolean;
   /** Receives what the forced removal left behind, for the parent removal's result (#5143). */
   onRemovalWarnings?: (warnings: WorkspaceRemoveWarning[]) => void;
+  /**
+   * #5106: the unpreserved work the user confirmed in the preview. Removal refuses if the work
+   * found under the locks differs, so it never deletes what the confirmation did not list.
+   */
+  acknowledgedWork?: SubagentRemovalPreview;
+}
+
+export interface SubagentRemovalPreview {
+  summary: string | null;
+  paths: string[];
 }
 
 interface TaskParentAiMeta {
@@ -13947,6 +13957,25 @@ export class TaskService implements AgentTaskIntegration {
         if (refusal != null)
           return Ok({ status: "error", action: "remove", ...target, ...refusal });
       }
+      if (options?.acknowledgedWork != null) {
+        const current = await this.describeSubagentRemovalPreview(
+          taskId,
+          entry,
+          patchArtifact ?? null
+        );
+        if (
+          current.summary !== options.acknowledgedWork.summary ||
+          current.paths.join("\0") !== options.acknowledgedWork.paths.join("\0")
+        ) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error:
+              "The sub-agent's unsaved work changed after the confirmation was shown, so it was not removed. Review it again.",
+          });
+        }
+      }
 
       const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
       if (!tombstoneResult.success) {
@@ -14059,6 +14088,9 @@ export class TaskService implements AgentTaskIntegration {
             `${otherRefCommitCount} commit(s) on other local branches or in the stash that nothing shows exist outside this checkout`,
           ]
         : []),
+      ...(work.commitCheckError != null
+        ? [`any commits, which could not be checked (${work.commitCheckError})`]
+        : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
     return {
@@ -14068,9 +14100,7 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** #5106: what a user-confirmed removal would lose, for the confirmation dialog. */
-  async previewSubagentRemoval(
-    taskId: string
-  ): Promise<Result<{ summary: string | null; paths: string[] }, string>> {
+  async previewSubagentRemoval(taskId: string): Promise<Result<SubagentRemovalPreview, string>> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (entry == null) return Err("This sub-agent no longer exists.");
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
@@ -14093,13 +14123,21 @@ export class TaskService implements AgentTaskIntegration {
     if (patchArtifact?.status === "pending") {
       return Err("Cannot remove the sub-agent while its git patch artifact is still pending.");
     }
+    return Ok(await this.describeSubagentRemovalPreview(taskId, entry, patchArtifact));
+  }
+
+  private async describeSubagentRemovalPreview(
+    taskId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    patchArtifact: SubagentGitPatchArtifact | null
+  ): Promise<SubagentRemovalPreview> {
     const lost = await this.describeUnpreservedSubagentWork(
       taskId,
       entry,
       patchArtifact,
       "listed below"
     );
-    return Ok({ summary: lost?.summary ?? null, paths: lost?.paths ?? [] });
+    return { summary: lost?.summary ?? null, paths: lost?.paths ?? [] };
   }
 
   /**
@@ -14107,12 +14145,17 @@ export class TaskService implements AgentTaskIntegration {
    * parent deletion cascade (no lossy-work refusal), so it still refuses active sub-agents,
    * sub-agents with descendants and pending patch artifacts.
    */
-  async removeSubagentForUser(taskId: string): Promise<Result<void, string>> {
+  async removeSubagentForUser(
+    taskId: string,
+    acknowledgedWork: SubagentRemovalPreview
+  ): Promise<Result<void, string>> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (entry == null) return Err("This sub-agent no longer exists.");
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
     if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
-    const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId);
+    const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
+      acknowledgedWork,
+    });
     if (!result.success) return Err(result.error);
     switch (result.data.status) {
       case "removed":

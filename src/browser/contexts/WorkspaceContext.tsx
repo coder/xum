@@ -481,7 +481,10 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
   ) => Promise<WorkspaceRemoveResult>;
   /** User-confirmed removal of a sub-agent, even one holding unpreserved work (#5106). */
-  removeSubagent: (workspaceId: string) => Promise<WorkspaceRemoveResult>;
+  removeSubagent: (
+    workspaceId: string,
+    acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+  ) => Promise<WorkspaceRemoveResult>;
   updateWorkspaceTitle: (
     workspaceId: string,
     newTitle: string
@@ -1583,9 +1586,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const removeSubagent = useCallback(
-    (workspaceId: string): Promise<WorkspaceRemoveResult> =>
+    (
+      workspaceId: string,
+      acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+    ): Promise<WorkspaceRemoveResult> =>
       runWorkspaceRemoval(workspaceId, async (client) => {
-        const result = await client.tasks.remove({ taskId: workspaceId });
+        const result = await client.tasks.remove({ taskId: workspaceId, acknowledgedWork });
         return result.success ? { success: true } : { success: false, error: result.error };
       }),
     [runWorkspaceRemoval]
