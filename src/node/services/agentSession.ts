@@ -10330,6 +10330,7 @@ export class AgentSession {
         displayText: send.displayText,
         attachmentCount: send.attachmentCount,
         reviewCount: send.reviewCount,
+        ...(send.options.acpPromptId != null ? { acpPromptId: send.options.acpPromptId } : {}),
       })),
     };
   }

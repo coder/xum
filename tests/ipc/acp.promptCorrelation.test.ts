@@ -1798,3 +1798,55 @@ describe("ACP held inputs (#4944)", () => {
     await harness.connectionClosed;
   });
 });
+
+describe("ACP prompt refused while queued (#5171)", () => {
+  function heldChanged(
+    workspaceId: string,
+    reason: "reported" | "indeterminate" | "interrupted",
+    acpPromptId: string
+  ): WorkspaceChatMessage {
+    return {
+      type: "held-inputs-changed",
+      workspaceId,
+      heldInputs: [
+        {
+          id: "held-1",
+          reason,
+          displayText: "hello",
+          attachmentCount: 0,
+          reviewCount: 0,
+          acpPromptId,
+        },
+      ],
+    };
+  }
+
+  it.each([
+    ["reported", "refusal"],
+    ["indeterminate", "refusal"],
+    ["interrupted", "cancelled"],
+  ] as const)(
+    "settles a queued prompt at once when the backend holds it (%s -> %s)",
+    async (reason, stopReason) => {
+      const harness = createHarness();
+      const { newSessionResponse, promptPromise, promptCorrelationId } =
+        await createDefaultPromptTurn(harness);
+      const sessionId = newSessionResponse.sessionId;
+      const isSettled = trackSettled(promptPromise);
+
+      // Another prompt's held input is not this turn's.
+      harness.pushChatEvent(heldChanged(sessionId, reason, "another-prompt"));
+      await sleep(50);
+      expect(isSettled()).toBe(false);
+
+      // The dequeue gate refused this prompt's queued send and kept it as held input: no stream
+      // will ever start for it, so the turn settles now instead of at the correlation timeout.
+      harness.pushChatEvent(heldChanged(sessionId, reason, promptCorrelationId));
+      await waitForCondition(isSettled);
+      await expect(promptPromise).resolves.toMatchObject({ stopReason });
+
+      harness.closeConnection();
+      await harness.connectionClosed;
+    }
+  );
+});

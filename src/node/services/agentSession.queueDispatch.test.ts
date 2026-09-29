@@ -592,6 +592,43 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // #5171: an ACP prompt that waits in the queue settles only on events carrying its correlation
+  // id. A dequeue refusal starts no stream, so the held list must name the refused prompt.
+  test("a queued send refused at dequeue is held with its ACP prompt correlation id", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-refused-acp-held",
+      captureEvents: true,
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        { model: TEST_MODEL, agentId: "exec", acpPromptId: "acp-prompt-1" },
+        {
+          acceptanceOrigin: "manual",
+          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+
+      expect(stream).not.toHaveBeenCalled();
+      expect(h.events.findLast((event) => event.type === "held-inputs-changed")).toMatchObject({
+        heldInputs: [{ displayText: "acp prompt", acpPromptId: "acp-prompt-1" }],
+      });
+    } finally {
+      stream.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
     let calls = 0;

@@ -1854,6 +1854,11 @@ export class MuxAgent implements Agent {
 
     this.refreshTurnInactivityTimeoutFromEvent(sessionId, event);
 
+    if (event.type === "held-inputs-changed") {
+      this.settleTurnHeldBeforeStart(sessionId, event.heldInputs);
+      return;
+    }
+
     if (event.type === "usage-delta") {
       if (!this.isActiveTurnMessage(sessionId, event.messageId)) {
         return;
@@ -1958,6 +1963,32 @@ export class MuxAgent implements Agent {
       }
       this.rejectTurn(sessionId, new Error(`prompt stream failed: ${event.error}`));
     }
+  }
+
+  /**
+   * A queued prompt that the backend refused at dequeue (or a Stop returned from the queue) is
+   * kept as held input and never starts a stream, so no terminal event would settle its turn
+   * (#5171). The held list names that prompt by its correlation id: settle the turn from it.
+   */
+  private settleTurnHeldBeforeStart(
+    sessionId: string,
+    heldInputs: Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }>["heldInputs"]
+  ): void {
+    const completion = this.turnCompletions.get(sessionId);
+    // A turn bound to its stream-start was dispatched: its input was sent, so it is not held.
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const held = heldInputs.find(
+      (heldInput) => heldInput.acpPromptId === completion.promptCorrelationId
+    );
+    if (held == null) {
+      return;
+    }
+    this.resolveTurn(sessionId, {
+      stopReason: held.reason === "interrupted" ? "cancelled" : "refusal",
+      usage: this.latestUsageBySessionId.get(sessionId),
+    });
   }
 
   private async maybeDelegateToolCallToEditor(
