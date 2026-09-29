@@ -9,6 +9,12 @@ export const CHAT_UI_FEATURE_IDS = [
   "jsonRawView",
   // Replacing the chat history with a message (Start Here, plan implement with replacement).
   "chatHistoryReplacement",
+  // Composer dock decorations (#5092): the sub-agent tasks strip, the context switch warning, the
+  // Chat Instructions decoration and the queued follow-up.
+  "subAgentTasks",
+  "contextSwitchWarning",
+  "chatInstructions",
+  "queuedMessage",
 ] as const;
 
 export type ChatUiFeatureId = (typeof CHAT_UI_FEATURE_IDS)[number];
