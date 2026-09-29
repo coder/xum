@@ -140,8 +140,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setInput(next.text);
     setAttachments(next.attachments);
   };
-  const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
-  const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {
     draftScope,
     input,
@@ -154,8 +152,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setDraftReviews,
     getDraft,
     setDraft,
-    preEditDraftRef,
-    preEditReviewsRef,
     reviewOverrideActive,
     reviewData,
     reviewIdsForCheck,

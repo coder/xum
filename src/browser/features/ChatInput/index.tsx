@@ -303,6 +303,37 @@ function pendingChatAttachments(
   return [...providerAttachments, ...stagedAttachments];
 }
 
+/** Draft texts joined as a restore merges them: non-blank parts, one blank line apart. */
+function joinDraftText(...parts: string[]): string {
+  return parts.filter((part) => part.trim().length > 0).join("\n\n");
+}
+
+/**
+ * The composer text after a send took `sent` out of it. Anything restored or typed meanwhile
+ * stays: remove the sent text once, and leave the text as is when it is not found (a visible
+ * duplicate beats a loss).
+ */
+function removeSentText(current: string, sent: string): string {
+  if (current === sent) return "";
+  const at = sent.trim().length > 0 ? current.indexOf(sent) : -1;
+  if (at === -1) return current;
+  return joinDraftText(current.slice(0, at).trimEnd(), current.slice(at + sent.length).trimStart());
+}
+
+/**
+ * One edit, from entering edit mode until it is cancelled or its send is accepted (#5226).
+ * A pending edit send keeps its own session, so a newer edit or review notes attached meanwhile
+ * do not change which draft it gives back.
+ */
+interface EditSession {
+  id: string;
+  /** The unsent draft from before the edit, restored when the edit ends. */
+  preEditDraft: { text: string; attachments: ChatAttachment[] };
+  preEditReviews: ReviewNoteDataForDisplay[] | null;
+  /** Its draft was given back (cancel, or accepted send); it restores nothing again. */
+  settled: boolean;
+}
+
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { waitForPreferencePersisted } = useUserPreferencePersistence();
@@ -499,7 +530,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     pushToast,
   });
   const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
-  const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
+  const { getDraft, setDraft } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
   const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
   const {
@@ -1219,32 +1250,78 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [applyDraftFromPending, focusMessageInput, setDraftReviews]
   );
 
-  // The edit whose draft a cancel restored. Recorded explicitly: the edit target also leaves the
-  // live transcript when the accepted edit replaces it (possibly before the send returns), and
-  // that is not a cancel.
-  const cancelledEditIdRef = useRef<string | null>(null);
-  const restorePreEditDraft = useCallback(() => {
-    cancelledEditIdRef.current = editingMessageIdRef.current ?? null;
-    setDraft(preEditDraftRef.current);
-    setDraftReviews(preEditReviewsRef.current);
-  }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
+  // The latest edit's session. Settled explicitly: the edit target also leaves the live
+  // transcript when the accepted edit replaces it (possibly before the send returns), and that
+  // is not a cancel.
+  const editSessionRef = useRef<EditSession | null>(null);
+  // Live review override for completions that settle after the render they started in.
+  const draftReviewsRef = useRef(draftReviews);
+  useLayoutEffect(() => {
+    draftReviewsRef.current = draftReviews;
+  });
+  /** The session of the edit the composer shows, if that edit entered edit mode. */
+  const currentEditSession = (): EditSession | null => {
+    const session = editSessionRef.current;
+    return session && !session.settled && session.id === editingMessageIdRef.current
+      ? session
+      : null;
+  };
+  const restorePreEditDraft = () => {
+    const session = currentEditSession();
+    if (!session) return;
+    session.settled = true;
+    setDraft(session.preEditDraft);
+    setDraftReviews(session.preEditReviews);
+  };
 
   // Completing an edit sends the edited message; the unsent draft from before the edit comes
   // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
-  // typed while the send was in flight, after the restored draft. Not for an edit the user
-  // cancelled meanwhile: that one already got its draft back. Returns whether it restored.
-  const restorePreEditDraftAfterSend = (editMessageId: string | undefined): boolean => {
-    if (editMessageId === undefined || cancelledEditIdRef.current === editMessageId) return false;
-    const preEdit = preEditDraftRef.current;
-    setInput((current) =>
-      [preEdit.text, current].filter((part) => part.trim().length > 0).join("\n\n")
-    );
-    if (preEdit.attachments.length > 0) {
-      setAttachments((current) => [...preEdit.attachments, ...current]);
+  // typed while the send was in flight, after the restored draft; restored notes join notes
+  // attached meanwhile, like a restore-to-input. Not for an edit the user cancelled meanwhile:
+  // that one already got its draft back. If a newer edit owns the composer now, the draft joins
+  // that edit's pre-edit draft instead, and comes back when it ends (#5226). Returns whether
+  // it restored. `dropEditReviews`: the composer still shows the sent edit's own notes (an
+  // editing command, whose send does not clear them); they are replaced, not merged.
+  const restorePreEditDraftAfterSend = (
+    session: EditSession | null,
+    dropEditReviews = false
+  ): boolean => {
+    if (!session || session.settled) return false;
+    session.settled = true;
+    const { preEditDraft, preEditReviews } = session;
+    const newer = currentEditSession();
+    if (!newer && dropEditReviews) setDraftReviews(null);
+    if (newer) {
+      newer.preEditDraft = {
+        text: joinDraftText(preEditDraft.text, newer.preEditDraft.text),
+        attachments: [...preEditDraft.attachments, ...newer.preEditDraft.attachments],
+      };
+    } else {
+      setInput((current) => joinDraftText(preEditDraft.text, current));
+      if (preEditDraft.attachments.length > 0) {
+        setAttachments((current) => [...preEditDraft.attachments, ...current]);
+      }
     }
-    setDraftReviews(preEditReviewsRef.current);
+    if (preEditReviews !== null) {
+      const liveOverride = newer
+        ? newer.preEditReviews
+        : dropEditReviews
+          ? null
+          : draftReviewsRef.current;
+      if (liveOverride === null && onAddReviewForRestore) {
+        // The notes in effect live in the review store: add the restored ones there too.
+        for (const review of preEditReviews) onAddReviewForRestore(review);
+      } else if (newer) {
+        newer.preEditReviews = [...preEditReviews, ...(liveOverride ?? [])];
+      } else {
+        setDraftReviews((current) => [...preEditReviews, ...(current ?? [])]);
+      }
+    }
     return true;
   };
+  /** An accepted edit send leaves edit mode only if no newer edit owns the composer now. */
+  const isEditStillCurrent = (editMessageId: string) =>
+    editingMessageIdRef.current === undefined || editingMessageIdRef.current === editMessageId;
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
@@ -1358,9 +1435,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
     appliedEditIdRef.current = editingMessage.id;
-    cancelledEditIdRef.current = null;
-    preEditDraftRef.current = getDraft();
-    preEditReviewsRef.current = draftReviews;
+    editSessionRef.current = {
+      id: editingMessage.id,
+      preEditDraft: getDraft(),
+      preEditReviews: draftReviews,
+      settled: false,
+    };
     applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
     setDraftReviews(editingMessage.pending.reviews);
     // Auto-resize textarea and focus
@@ -1380,8 +1460,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     draftReviews,
     applyDraftFromPending,
     setDraftReviews,
-    preEditDraftRef,
-    preEditReviewsRef,
   ]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
@@ -1943,11 +2021,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // A completed edit restored its pre-edit draft, review notes included: keep them.
     let restoredPreEditDraft = false;
-    // An editing command whose edit the user cancelled meanwhile: the composer holds the restored
-    // draft now, not the command, so the command's clears must not touch it.
-    const editCancelled = () =>
+    // Bound now: a newer edit can replace the current session while the command runs.
+    const commandEditSession =
       commandEnv.editMessageId !== undefined &&
-      cancelledEditIdRef.current === commandEnv.editMessageId;
+      editSessionRef.current?.id === commandEnv.editMessageId
+        ? editSessionRef.current
+        : null;
+    // An editing command whose edit already gave its draft back (the user cancelled it): the
+    // composer holds the restored draft now, not the command, so the command's clears must not
+    // touch it.
+    const editCancelled = () => commandEditSession?.settled === true;
     // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
     const applyCommandActions = (actions: CommandAction[]) => {
       for (const action of actions) {
@@ -1988,8 +2071,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             break;
           case "cancel-edit":
             // Emitted once an editing command (/compact) was accepted: the edit is complete.
-            restoredPreEditDraft = restorePreEditDraftAfterSend(commandEnv.editMessageId);
-            commandOnCancelEdit?.();
+            restoredPreEditDraft = restorePreEditDraftAfterSend(commandEditSession, true);
+            if (
+              commandEnv.editMessageId === undefined ||
+              isEditStillCurrent(commandEnv.editMessageId)
+            ) {
+              commandOnCancelEdit?.();
+            }
             break;
           case "edit-history-changed":
             startEditTranscriptRefresh(action.editMessageId, action.precondition);
@@ -2525,6 +2613,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const preSendDraft = { ...getDraft(), attachments: sendAttachments };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
+      // Bound to this send: a newer edit can start before it returns (#5226).
+      const editSessionForSend =
+        editMessageForSend && editSessionRef.current?.id === editMessageForSend.id
+          ? editSessionRef.current
+          : null;
 
       const sendPreparedMessage = async () => {
         // Prepare file parts if any
@@ -2678,9 +2771,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear input, images, and hide reviews immediately for responsive UI
         // Text/images are restored if send fails; reviews remain "attached" in state
         // so they'll reappear naturally on failure (we only call onCheckReviews on success)
-        setInput("");
+        // Clear only what this send took: a draft restored meanwhile (an edit completing while
+        // this send resolved its options) stays in the composer (#5226).
+        const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
+        setInput((current) => removeSentText(current, input));
         setDraftReviews(null);
-        setAttachments([]);
+        setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
@@ -2751,11 +2847,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
-          restorePreEditDraftAfterSend(editMessageForSend?.id);
-          if (editMessageForSend && props.onCancelEdit) {
-            props.onCancelEdit();
-          } else if (editMessageForSend) {
-            setOptimisticallyDismissedEditId(null);
+          restorePreEditDraftAfterSend(editSessionForSend);
+          if (editMessageForSend && isEditStillCurrent(editMessageForSend.id)) {
+            if (props.onCancelEdit) {
+              props.onCancelEdit();
+            } else {
+              setOptimisticallyDismissedEditId(null);
+            }
           }
           props.onMessageSent?.(overrides?.queueDispatchMode ?? "tool-end");
         }
