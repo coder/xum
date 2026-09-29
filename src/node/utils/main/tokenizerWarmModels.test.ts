@@ -19,7 +19,7 @@ function configWith(workspaces: unknown[], extra: Record<string, unknown> = {}):
 
 function warmedEncodings(config: ProjectsConfig): string[] {
   const models = deriveWarmModels(config);
-  const encodings = models.map((model) => encodingForModel(model));
+  const encodings = models.map((model) => encodingForModel(model).encoding);
   // One representative model per encoding.
   expect(new Set(encodings).size).toBe(models.length);
   return encodings.sort();
@@ -54,6 +54,12 @@ describe("deriveWarmModels", () => {
       configWith([], { agentAiDefaults: { exec: { subagent: { modelString: OPENAI } } } }),
     ],
     ["advisorModelString", configWith([], { advisorModelString: OPENAI })],
+    [
+      "a project creation default",
+      configWith([], {
+        userPreferences: { ai: { projectDefaults: { "/repo": { model: OPENAI } } } },
+      }),
+    ],
     ["a coder gateway id", configWith([{ aiSettings: { model: "coder:openai/gpt-5.5-pro" } }])],
   ];
   test.each(openaiSources)("an OpenAI model in %s adds o200k_base", (_source, config) => {
@@ -73,10 +79,26 @@ describe("deriveWarmModels", () => {
     expect(warmedEncodings(config)).toEqual(["claude"]);
   });
 
+  test("a model whose encoding is only a guess also keeps the default warm set", () => {
+    // A custom-named Coder instance's upstream type lives in providers.jsonc, which startup
+    // does not read, so its encoding falls through to the catch-all guess (o200k_base). Using it
+    // as the default too means only the guess fallback can add the claude encoding.
+    const custom = "coder:prod-anthropic/claude-opus-4-6";
+    const config = configWith([{ aiSettings: { model: custom } }], { defaultModel: custom });
+    expect(warmedEncodings(config)).toEqual(
+      [...new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))].sort()
+    );
+    // A known provider's fallback is not a guess, so it does not widen the set.
+    const known = configWith([{ aiSettings: { model: "anthropic:claude-unreleased-9" } }], {
+      defaultModel: CLAUDE,
+    });
+    expect(warmedEncodings(known)).toEqual(["claude"]);
+  });
+
   test("the default model's encoding is warmed even when no model uses it yet", () => {
     const config = configWith([{ aiSettings: { model: OPENAI } }]);
     expect(warmedEncodings(config)).toEqual(
-      [...new Set([encodingForModel(DEFAULT_MODEL), "o200k_base"])].sort()
+      [...new Set([encodingForModel(DEFAULT_MODEL).encoding, "o200k_base"])].sort()
     );
   });
 
@@ -156,7 +178,7 @@ describe("warmConfiguredTokenizers", () => {
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
     // "ready" is sent per model, so compare the distinct encodings.
     expect(new Set(readyEncodings())).toEqual(
-      new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model)))
+      new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))
     );
   });
 });

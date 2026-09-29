@@ -29,6 +29,13 @@ function collectConfiguredModels(config: ProjectsConfig): string[] {
 
   add(config.defaultModel);
   add(config.advisorModelString);
+  // Per-project creation defaults: a new workspace in that project starts on this model.
+  const ai: unknown = isRecord(config.userPreferences) ? config.userPreferences.ai : undefined;
+  for (const defaults of recordValues(isRecord(ai) ? ai.projectDefaults : undefined)) {
+    if (isRecord(defaults)) {
+      add(defaults.model);
+    }
+  }
   for (const entry of recordValues(config.agentAiDefaults)) {
     if (isRecord(entry)) {
       add(entry.modelString);
@@ -79,17 +86,29 @@ export function deriveWarmModels(config: ProjectsConfig): string[] {
   const candidates = [nonEmptyModel(config.defaultModel) ?? DEFAULT_MODEL, ...configured];
 
   const byEncoding = new Map<string, string>();
+  let guessed = false;
+  const keep = (model: string) => {
+    // No providers config: reading providers.jsonc would cost disk I/O at startup, and
+    // coder:<provider>/<model> gateway ids still resolve by provider name without it.
+    const metadataModel = resolveModelForMetadata(model, null);
+    const resolved = encodingForModel(metadataModel);
+    guessed ||= resolved.guessed;
+    if (!byEncoding.has(resolved.encoding)) {
+      byEncoding.set(resolved.encoding, metadataModel);
+    }
+  };
   for (const model of candidates) {
     try {
-      // No providers config: reading providers.jsonc would cost disk I/O at startup, and
-      // coder:<provider>/<model> gateway ids still resolve by provider name without it.
-      const metadataModel = resolveModelForMetadata(model, null);
-      const encoding = encodingForModel(metadataModel);
-      if (!byEncoding.has(encoding)) {
-        byEncoding.set(encoding, metadataModel);
-      }
+      keep(model);
     } catch (error) {
       log.debug(`Skipping tokenizer warm-up for '${model}':`, error);
+    }
+  }
+  if (guessed) {
+    // Without providers.jsonc an unknown provider's encoding is only a guess (e.g. a
+    // custom-named Coder instance), so keep today's default set warm as well.
+    for (const model of DEFAULT_WARM_MODELS) {
+      keep(model);
     }
   }
   return Array.from(byEncoding.values());
