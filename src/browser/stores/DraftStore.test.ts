@@ -512,6 +512,10 @@ describe("DraftStore", () => {
     expect(control.updates).toBe(updates);
     expect(errors).toHaveLength(1);
     expect(store.getText(WS_SCOPE)).toBe("x".repeat(400));
+
+    // Another client removes the big attachment: the refused edit fits now and must be saved.
+    await service.update({ scope: WS_SCOPE, attachments: [] });
+    await waitFor(async () => (await service.get(WS_SCOPE)).text === "x".repeat(400));
   });
 
   test("reports a save failure to the next composer when none was listening", async () => {

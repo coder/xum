@@ -649,6 +649,10 @@ export class DraftStore {
       }
     }
     this.recompute(entry);
+    // A change elsewhere can make a refused (too large) unconfirmed edit fit again; that refusal
+    // schedules no retry, so try once more. A no-op without an unconfirmed field or when a save
+    // is already scheduled.
+    if (this.hydrated) this.scheduleFlush(entry);
   }
 
   private applySnapshot(drafts: DraftSummary[]): void {

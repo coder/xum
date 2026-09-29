@@ -37,22 +37,20 @@ export function isDraftEmpty(draft: Draft): boolean {
   return draft.text.length === 0 && draft.attachments.length === 0;
 }
 
-/** UTF-8 byte length of a string, without allocating an encoded copy of a multi-MB draft. */
+// Code units that take more than one UTF-8 byte: 2-byte ones, a surrogate pair (4 bytes for two
+// units), and the rest of the BMP (3 bytes; JSON.stringify escapes lone surrogates).
+const MULTI_BYTE_UTF16 = /[\u0080-\u07ff]|[\ud800-\udbff][\udc00-\udfff]|[\u0800-\uffff]/g;
+
+/**
+ * UTF-8 byte length of a string without allocating an encoded copy of a multi-MB draft. The
+ * native regex scan skips ASCII (base64 payloads are all ASCII), so a near-limit draft does not
+ * cost a per-character JavaScript loop on the renderer thread.
+ */
 function utf8ByteLength(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (code < 0x80) bytes += 1;
-    else if (code < 0x800) bytes += 2;
-    else if (
-      code >= 0xd800 &&
-      code <= 0xdbff &&
-      (value.charCodeAt(index + 1) & 0xfc00) === 0xdc00
-    ) {
-      // A surrogate pair is one 4-byte code point.
-      bytes += 4;
-      index++;
-    } else bytes += 3;
+  let bytes = value.length;
+  for (const match of value.matchAll(MULTI_BYTE_UTF16)) {
+    const unit = match[0];
+    bytes += unit.length === 2 ? 2 : unit.charCodeAt(0) < 0x800 ? 1 : 2;
   }
   return bytes;
 }

@@ -1,3 +1,4 @@
+import cjsFs from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { describe, expect, it, spyOn } from "bun:test";
@@ -192,20 +193,33 @@ describe("DraftService", () => {
     const service = new DraftService(config);
 
     // The write lands while the scan runs (between its sessions-dir listing and its reads) and
-    // fails, like ENOSPC/EACCES: a read-only session dir refuses the atomic write's temp file.
+    // fails like ENOSPC: the atomic write's rename onto draft.json is refused.
     const realReaddir = fs.readdir.bind(fs);
+    const realRename = cjsFs.rename.bind(cjsFs);
     let failedWrite = null as Promise<unknown> | null;
     const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
       ...args: Parameters<typeof fs.readdir>
     ) => {
       const listing = await (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
       if (failedWrite === null && args[0] === config.sessionsDir) {
-        await fs.chmod(path.dirname(workspaceFile), 0o500);
+        const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+          from: cjsFs.PathLike,
+          to: cjsFs.PathLike,
+          callback: cjsFs.NoParamCallback
+        ) => {
+          if (String(to) === workspaceFile) {
+            callback(
+              Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" })
+            );
+            return;
+          }
+          realRename(from, to, callback);
+        }) as typeof cjsFs.rename);
         failedWrite = service
           .update({ scope: WORKSPACE_SCOPE, text: "lost write" })
           .catch((error: unknown) => error);
         await failedWrite;
-        await fs.chmod(path.dirname(workspaceFile), 0o700);
+        renameSpy.mockRestore();
       }
       return listing;
     }) as typeof fs.readdir);
