@@ -1,5 +1,5 @@
 import { shellQuote } from "@/common/utils/shell";
-import { buildShellExport } from "./shellEnv";
+import { buildShellExport, groupShellCommand } from "./shellEnv";
 export { shellQuote };
 
 /** Exit code for process killed by SIGKILL (128 + 9) */
@@ -48,7 +48,7 @@ export interface WrapperScriptOptions {
 
 /**
  * Build the wrapper script that captures exit code and sets up environment.
- * Pattern: trap 'echo $? > exit_code' EXIT && cd /path && export K=V && script
+ * Pattern: trap 'echo $? > exit_code' EXIT && cd /path && export K=V && { script\n}
  */
 export function buildWrapperScript(options: WrapperScriptOptions): string {
   const parts: string[] = [];
@@ -80,8 +80,8 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
     }
   }
 
-  // Add the actual script
-  parts.push(options.script);
+  // Add the actual script, grouped so a failed cd/export skips all of its lines (#5192)
+  parts.push(groupShellCommand(options.script));
 
   return parts.join(" && ");
 }

@@ -52,6 +52,7 @@ import { runFullInit } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
 import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWorkCheck";
+import { MULTI_LINE_COMMAND_CASES } from "@/node/runtime/testRemoteRuntime";
 
 const SSH_TEST_CWD = "/home/testuser";
 const execSSH = (runtime: Runtime, command: string, timeout = 30) =>
@@ -194,6 +195,43 @@ describeIntegration("Runtime integration tests", () => {
           const result = await execWorkspace(runtime, workspace, "exit 42");
 
           expect(result.exitCode).toBe(42);
+        });
+
+        testForRuntime(
+          "a multi-line command with a missing cwd fails without running later lines",
+          async () => {
+            const runtime = createRuntime();
+            await using workspace = await TestWorkspace.create(runtime, type);
+
+            const run = execWorkspace(runtime, workspace, 'echo line1\npwd\necho "var=$TEST_VAR"', {
+              cwd: `${workspace.path}/missing`,
+              env: { TEST_VAR: "set" },
+            });
+            if (type === "local") {
+              // Local runtimes check the cwd before spawning.
+              await expect(run).rejects.toThrow("Working directory does not exist");
+              return;
+            }
+            const result = await run;
+            expect({ failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+              failed: true,
+              stdout: "",
+            });
+          }
+        );
+
+        testForRuntime("multi-line commands keep their output and exit codes", async () => {
+          const runtime = createRuntime();
+          await using workspace = await TestWorkspace.create(runtime, type);
+
+          for (const c of MULTI_LINE_COMMAND_CASES) {
+            const result = await execWorkspace(runtime, workspace, c.command);
+            expect({ name: c.name, exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+              name: c.name,
+              exitCode: c.exitCode,
+              stdout: c.stdout,
+            });
+          }
         });
 
         testLocalOnly("handles stdin input", async () => {

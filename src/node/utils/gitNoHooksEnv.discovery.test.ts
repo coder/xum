@@ -6,13 +6,12 @@
  * are injected with a PATH-first git shim.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { SpawnResult } from "@/node/runtime/RemoteRuntime";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
-import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { ShellRemoteRuntime, TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import * as disposableExec from "@/node/utils/disposableExec";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -258,33 +257,6 @@ const exists = (file: string) =>
 
 const appendConfig = (repo: string, text: string | Buffer) =>
   fs.appendFile(path.join(repo, ".git", "config"), text);
-
-/**
- * Runs the real RemoteRuntime.exec command string (`timeout -s KILL ... bash -c 'cd <cwd> &&
- * export ... && <command>'`) in a local shell. Its working directory stands in for the SSH login
- * directory, where lines outside the cd && export chain would run.
- */
-class ShellRemoteRuntime extends TestRemoteRuntime {
-  private readonly loginDir: string;
-
-  constructor(loginDir: string) {
-    super();
-    this.loginDir = loginDir;
-  }
-
-  // TestRemoteRuntime declares this without parameters; RemoteRuntime.exec passes the full
-  // command first.
-  protected override spawnRemoteProcess(...args: unknown[]): Promise<SpawnResult> {
-    const [fullCommand] = args;
-    if (typeof fullCommand !== "string") throw new Error("Expected the full remote command");
-    return Promise.resolve({
-      process: spawn("/bin/sh", ["-c", fullCommand], {
-        cwd: this.loginDir,
-        stdio: ["pipe", "pipe", "pipe"],
-      }),
-    });
-  }
-}
 
 // The remote shell transport needs GNU-style `timeout` and bash.
 const RUNTIME_TRANSPORTS: Array<{ name: string; create: (loginDir: string) => Runtime }> = [

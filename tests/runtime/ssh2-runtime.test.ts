@@ -84,6 +84,22 @@ describeIntegration("SSH2 Transport integration tests", () => {
       expect(result.exitCode).toBe(42);
     });
 
+    test("a multi-line command with a missing cwd fails without running later lines", async () => {
+      const runtime = createSSH2Runtime(sshConfig!);
+      await using workspace = await TestWorkspace.create(runtime, "ssh");
+
+      const result = await execBuffered(runtime, 'echo line1\npwd\necho "var=$TEST_VAR"', {
+        cwd: `${workspace.path}/missing`,
+        env: { TEST_VAR: "set" },
+        timeout: 30,
+      });
+
+      expect({ failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+        failed: true,
+        stdout: "",
+      });
+    });
+
     test("captures stderr separately", async () => {
       const runtime = createSSH2Runtime(sshConfig!);
       await using workspace = await TestWorkspace.create(runtime, "ssh");

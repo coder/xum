@@ -31,3 +31,15 @@ export function buildShellPathExport(
     `export ${key}`,
   ].join(" && ");
 }
+
+/**
+ * Groups a caller's command so all of it depends on the `cd … && export …` chain before it.
+ * `&&` binds only the first line of a multi-line command; without the group, a missing cwd
+ * skips line 1 and the later lines run in the shell's starting directory without the exported
+ * env (#5192). With it, a failed `cd` or export fails the whole command.
+ * - The newline before `}` keeps a trailing comment or a heredoc terminator from absorbing it.
+ * - The command starts on the `{` line, so bash line numbers in error messages do not shift.
+ */
+export function groupShellCommand(command: string): string {
+  return `{ ${command}\n}`;
+}
