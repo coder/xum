@@ -529,8 +529,9 @@ describe("delegated target default consent (#4453)", () => {
 
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
 
-    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace.pendingRemoval)
-      .toBeDefined();
+    expect(
+      findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace.pendingRemoval
+    ).toBeDefined();
     expect(mark(a.config)?.interruptedAt).toBeUndefined();
     await a.finish();
   });

@@ -8820,7 +8820,11 @@ export class WorkspaceService
     const isUnconfirmedMark = (entry: Workspace | undefined) =>
       entry?.delegatedCreation?.handleId === handleId &&
       entry.delegatedCreation.interruptedAt == null;
-    if (!isUnconfirmedMark(findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace)) {
+    if (
+      !isUnconfirmedMark(
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+      )
+    ) {
       return;
     }
     try {
