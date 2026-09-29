@@ -617,25 +617,30 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   // Rollover mode evaluates the clamped threshold, so the chat-input bar's visibility and
   // text must use the same effective value the slider label advertises.
-  const effectiveAutoCompactionThreshold = getEffectiveThreshold({
-    threshold: autoCompactionThreshold,
+  const autoCompactionResult = useMemo(() => {
+    const effectiveAutoCompactionThreshold = getEffectiveThreshold({
+      threshold: autoCompactionThreshold,
+      rolloverEnabled,
+      modelContextLimit: pendingModel
+        ? getEffectiveContextLimit(pendingModel, use1M, providersConfig)
+        : null,
+    });
+    return checkAutoCompaction(
+      workspaceUsage,
+      pendingModel,
+      use1M,
+      effectiveAutoCompactionThreshold / 100,
+      undefined,
+      providersConfig
+    );
+  }, [
+    workspaceUsage,
+    pendingModel,
+    use1M,
+    providersConfig,
+    autoCompactionThreshold,
     rolloverEnabled,
-    modelContextLimit: pendingModel
-      ? getEffectiveContextLimit(pendingModel, use1M, providersConfig)
-      : null,
-  });
-  const autoCompactionResult = useMemo(
-    () =>
-      checkAutoCompaction(
-        workspaceUsage,
-        pendingModel,
-        use1M,
-        effectiveAutoCompactionThreshold / 100,
-        undefined,
-        providersConfig
-      ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, effectiveAutoCompactionThreshold]
-  );
+  ]);
 
   // Show warning when: shouldShowWarning flag is true AND not currently compacting.
   // Context-switch warning takes priority so we don't show competing banners.
