@@ -57,6 +57,8 @@ interface BulkOperationState {
   completed: number;
   current: string | null;
   errors: string[];
+  /** What forced removals left behind (#5143); kept in the dialog so Done does not clear it. */
+  warnings?: string[];
 }
 
 function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
@@ -286,6 +288,18 @@ const BulkProgressModal: React.FC<{
           </div>
         )}
 
+        {/* Leftovers of successful forced removals */}
+        {operation.warnings != null && operation.warnings.length > 0 && (
+          <div
+            role="status"
+            className="bg-warning-overlay text-warning-text max-h-32 overflow-y-auto rounded p-2 text-xs break-words whitespace-pre-wrap"
+          >
+            {operation.warnings.map((warning, i) => (
+              <div key={i}>{warning}</div>
+            ))}
+          </div>
+        )}
+
         {isComplete && (
           <DialogFooter className="justify-center">
             <Button variant="secondary" onClick={onClose} className="w-full">
@@ -330,8 +344,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
-  // Bulk delete and Shift-click force the removal without the Force Delete dialog, so what it
-  // left behind (e.g. a devcontainer that may still hold the plan) is shown here (#5143).
+  // Shift-click forces the removal without the Force Delete dialog, so what it left behind (e.g.
+  // a devcontainer that may still hold the plan) is shown here (#5143). Bulk delete shows it in
+  // its progress dialog instead: that modal would hide this popover from assistive technology.
   const removeWarning = usePopoverError();
 
   // Bulk selection state
@@ -532,7 +547,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       current: null,
       errors: [],
     });
-    const leftoverLines: string[] = [];
 
     for (let i = 0; i < idsToDelete.length; i++) {
       const id = idsToDelete[i];
@@ -542,8 +556,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       try {
         const result = await removeWorkspace(id, { force: true });
         if (result.success && result.warnings?.length) {
-          leftoverLines.push(
-            `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`
+          const line = `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`;
+          setBulkOperation((prev) =>
+            prev ? { ...prev, warnings: [...(prev.warnings ?? []), line] } : prev
           );
         }
         if (!result.success) {
@@ -568,9 +583,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setBulkOperation((prev) => (prev ? { ...prev, completed: i + 1 } : prev));
     }
 
-    if (leftoverLines.length > 0) {
-      removeWarning.showError("bulk-delete", leftoverLines.join("\n"));
-    }
     setSelectedIds(new Set());
     onWorkspacesChanged?.();
   };

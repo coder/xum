@@ -6986,6 +6986,8 @@ export class WorkspaceService
           return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
+        // What the acknowledged descendants' forced removals left behind (#5143).
+        let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
           if (options?.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
@@ -7015,6 +7017,7 @@ export class WorkspaceService
                 gatedIds
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
+            descendantWarnings = descendantsResult.warnings ?? [];
           }
           const result = await this.removeUnlocked(
             workspaceId,
@@ -7022,7 +7025,9 @@ export class WorkspaceService
             binding,
             releaseTreeGate != null ? { mutationGateHeld: true } : undefined
           );
-          return result.success ? result : failure(result.error);
+          if (!result.success) return failure(result.error);
+          const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
+          return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
           return failure(getErrorMessage(error));
         } finally {
@@ -7051,7 +7056,7 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 

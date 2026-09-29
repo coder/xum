@@ -8,6 +8,7 @@ import {
   render,
   waitFor,
   waitForElementToBeRemoved,
+  within,
 } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
@@ -547,10 +548,12 @@ describe("ArchivedWorkspaces", () => {
     fireEvent.click(view.getByLabelText("Delete selected"));
     fireEvent.click(view.getByRole("button", { name: "Yes, delete 1" }));
 
-    // hidden: the bulk progress dialog marks the rest of the page aria-hidden.
-    const alert = await view.findByRole("alert", { hidden: true });
-    expect(alert.textContent).toContain(leftover);
-    expect(alert.textContent).toContain(workspace.name);
+    // Inside the progress dialog: a popover beside it would be aria-hidden by the modal and
+    // cleared by the click on Done.
+    const dialog = await view.findByRole("dialog");
+    const status = await within(dialog).findByRole("status");
+    expect(status.textContent).toContain(leftover);
+    expect(status.textContent).toContain(workspace.name);
   });
 
   test("Shift-click shows what the forced removal left behind", async () => {

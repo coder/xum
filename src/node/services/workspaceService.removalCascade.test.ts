@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "path";
@@ -6,6 +6,7 @@ import * as path from "path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
 import { HistoryService } from "@/node/services/historyService";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { TaskService } from "@/node/services/taskService";
 import {
   createTaskServiceStack,
@@ -141,6 +142,31 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
       expect(findWorkspaceInConfig(b.config, id)).toBeUndefined();
       expect(await exists(checkouts.get(id)!)).toBe(false);
     }
+  });
+
+  // #5143: Shift-click forces the parent removal together with its acknowledged sub-agents, so
+  // what a descendant's forced removal left behind reaches the user with the parent's result.
+  test("a descendant's leftovers are returned with the parent removal", async () => {
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- applied with the runtime as this
+    const deleteWorkspace = WorktreeRuntime.prototype.deleteWorkspace;
+    spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockImplementation(function (
+      this: WorktreeRuntime,
+      ...args: Parameters<WorktreeRuntime["deleteWorkspace"]>
+    ) {
+      if (args[1] !== childId) return deleteWorkspace.apply(this, args);
+      return Promise.resolve({
+        success: false,
+        error: "teardown failed",
+        leftoverPaths: ["/leftover/child"],
+      });
+    });
+
+    const result = await removeRootWithTree();
+
+    expect(result.success).toBe(true);
+    expect(result.warnings).toEqual([
+      { kind: "leftover", description: "/leftover/child was left behind; remove it manually." },
+    ]);
   });
 
   // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and

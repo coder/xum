@@ -178,6 +178,7 @@ import type {
   ProjectRef,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
@@ -313,6 +314,8 @@ export interface SubagentRemovalOptions {
   lossyWorkPolicy?: "refuse";
   /** The caller holds the sub-agent's mutation gate (a parent removal gates its tree, #4477). */
   mutationGateHeld?: boolean;
+  /** Receives what the forced removal left behind, for the parent removal's result (#5143). */
+  onRemovalWarnings?: (warnings: WorkspaceRemoveWarning[]) => void;
 }
 
 interface TaskParentAiMeta {
@@ -13957,6 +13960,7 @@ export class TaskService implements AgentTaskIntegration {
         { expectedAttemptId: entry.workspace.taskAttemptId },
         options?.mutationGateHeld === true ? { mutationGateHeld: true } : undefined
       );
+      if (result.success && result.warnings?.length) options?.onRemovalWarnings?.(result.warnings);
       return Ok(
         result.success
           ? { status: "removed", action: "remove", ...target }
@@ -14063,7 +14067,7 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string,
     acknowledgedIds: string[],
     gatedIds?: ReadonlySet<string>
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     const descendants = this.listWorkspaceRemovalDescendants(workspaceId);
     const acknowledged = new Set(acknowledgedIds);
     const current = new Set(descendants.map((descendant) => descendant.workspaceId));
@@ -14084,6 +14088,7 @@ export class TaskService implements AgentTaskIntegration {
     if (descendants.some((descendant) => descendant.active)) {
       return Err("Stop active descendant sub-agents before removing this workspace.");
     }
+    const warnings: WorkspaceRemoveWarning[] = [];
     for (const descendant of descendants) {
       const failure = (error: string) =>
         Err(`Cannot remove ${descendant.title} (${descendant.workspaceId}): ${error}`);
@@ -14091,7 +14096,10 @@ export class TaskService implements AgentTaskIntegration {
         const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
           workspaceId,
           descendant.workspaceId,
-          { mutationGateHeld: gatedIds?.has(descendant.workspaceId) === true }
+          {
+            mutationGateHeld: gatedIds?.has(descendant.workspaceId) === true,
+            onRemovalWarnings: (descendantWarnings) => warnings.push(...descendantWarnings),
+          }
         );
         if (!result.success) return failure(result.error);
         if (result.data.status !== "removed" && result.data.status !== "already_removed") {
@@ -14105,7 +14113,7 @@ export class TaskService implements AgentTaskIntegration {
         return failure(getErrorMessage(error));
       }
     }
-    return Ok(undefined);
+    return { ...Ok(undefined), ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
   private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {
