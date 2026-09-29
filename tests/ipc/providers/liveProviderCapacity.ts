@@ -15,6 +15,14 @@ import assert from "node:assert";
 /** Waits between attempts: 3 attempts with about 60 s of waiting in total. */
 export const PROVIDER_CAPACITY_BACKOFF_MS: readonly number[] = [20_000, 40_000];
 
+/** Test timeout for a check whose every capacity attempt can use `attemptMs`, plus the waits. */
+export function withProviderCapacityRetryBudget(attemptMs: number): number {
+  return (
+    attemptMs * (PROVIDER_CAPACITY_BACKOFF_MS.length + 1) +
+    PROVIDER_CAPACITY_BACKOFF_MS.reduce((total, ms) => total + ms, 0)
+  );
+}
+
 /** The fields of a `stream-error` event this rule reads. */
 export interface StreamErrorLike {
   error: string;
@@ -28,6 +36,14 @@ export interface StreamErrorLike {
  * only inside `server_error`, to keep a plain 500 failing.
  */
 const XAI_CAPACITY = /\bcurrently at capacity\b/i;
+/**
+ * OpenAI's overload response (#5128), matched as the provider's whole message, so the word
+ * "overloaded" inside other text does not count. The backend reports it as `server_error`
+ * when it arrives before any output (the AI SDK throws a 503/500 APICallError) and as
+ * `unknown` mid-stream (the SDK's provider stream error is a plain object that
+ * StreamManager.categorizeError does not classify), so only those two classes qualify.
+ */
+const OPENAI_OVERLOADED = /^Our servers are currently overloaded\. Please try again later\.$/;
 const SERVER_ERROR_CAPACITY = [
   /\bservice unavailable\b/i, // HTTP 503 status text
   /\boverloaded \(HTTP 529\)/i, // StreamManager's normalized Anthropic overload
@@ -36,6 +52,12 @@ const SERVER_ERROR_CAPACITY = [
 export function isProviderCapacityError(event: StreamErrorLike): boolean {
   if (event.errorType === "rate_limit") return true;
   if (XAI_CAPACITY.test(event.error)) return true;
+  if (
+    (event.errorType === "server_error" || event.errorType === "unknown") &&
+    OPENAI_OVERLOADED.test(event.error.trim())
+  ) {
+    return true;
+  }
   return (
     event.errorType === "server_error" &&
     SERVER_ERROR_CAPACITY.some((pattern) => pattern.test(event.error))

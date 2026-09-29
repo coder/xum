@@ -11,10 +11,10 @@ import {
 } from "../helpers";
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
 import {
-  PROVIDER_CAPACITY_BACKOFF_MS,
   ProviderCapacityError,
   isProviderCapacityError,
   retryOnProviderCapacity,
+  withProviderCapacityRetryBudget,
 } from "./liveProviderCapacity";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -62,14 +62,6 @@ async function waitForTerminal(
     throw new Error(`Expected stream-end event, received ${terminalEvent.type}`);
   }
   return terminalEvent;
-}
-
-/** Every capacity attempt can use the whole per-attempt budget, plus the waits between. */
-function withCapacityRetryBudget(attemptMs: number): number {
-  return (
-    attemptMs * (PROVIDER_CAPACITY_BACKOFF_MS.length + 1) +
-    PROVIDER_CAPACITY_BACKOFF_MS.reduce((total, ms) => total + ms, 0)
-  );
 }
 
 describeIntegration("xAI Grok 4.7 integration", () => {
@@ -121,7 +113,7 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         }
       });
     },
-    withCapacityRetryBudget(90_000)
+    withProviderCapacityRetryBudget(90_000)
   );
 
   test(
@@ -213,6 +205,6 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         }
       });
     },
-    withCapacityRetryBudget(180_000)
+    withProviderCapacityRetryBudget(180_000)
   );
 });
