@@ -35,9 +35,11 @@ export const CLAUDE_TOOL_PREAMBLE_TOKENS = 400;
 
 /**
  * Claude model ids counted with the older tokenizer: the pre-3 families (claude-2.x, claude-v2 and
- * claude-instant on Bedrock), the 3.x family, Opus/Sonnet 4.x up to 4.6
- * and Haiku 4.x up to 4.5, with optional date/"latest"/Bedrock version suffixes and dotted
- * versions. Any other Claude id, newer or unknown, gets the conservative new-tokenizer ratio.
+ * claude-instant on Bedrock), the 3.x family, Opus/Sonnet 4.x up to 4.6 and Haiku 4.x up to 4.5.
+ * Versions may be dotted, dashed or joined (Copilot's "claude-opus-41"), and may carry
+ * letter-led or date qualifiers ("-fast", "-latest", "-20250929", Bedrock "-v1"); a digit-led
+ * qualifier never matches, so "claude-opus-4-7" is not read as 4 plus a suffix. Any other Claude
+ * id, newer or unknown, gets the conservative new-tokenizer ratio.
  */
 export const OLDER_CLAUDE_TOKENIZER_MODEL_ID =
-  /^claude-(?:v\d+|instant|2(?:[.-]\d)?|3(?:[.-][57])?-(?:haiku|sonnet|opus)|(?:sonnet|opus)-4(?:[.-][0-6])?|haiku-4(?:[.-][0-5])?)(?:-(?:\d{8}|latest))?(?:-v\d+)?$/;
+  /^claude-(?:v\d+|instant|2(?:[.-]\d)?|3(?:[.-]?[57])?-(?:haiku|sonnet|opus)|(?:sonnet|opus)-4(?:[.-]?[0-6])?|haiku-4(?:[.-]?[0-5])?)(?:-(?:\d{8}|[a-z][a-z0-9]*))*$/;
