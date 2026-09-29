@@ -31,6 +31,14 @@ if (
   process.exit(2);
 }
 
+// Startup branches on the OS (e.g. main.ts's macOS-only PATH fix), so the driver runs
+// the target once per desktop platform. Only `process.platform` changes: `path` and
+// other Node internals keep the host's behavior.
+const platform = process.env.STARTUP_CHECK_PLATFORM;
+if (platform != null) {
+  Object.defineProperty(process, "platform", { value: platform });
+}
+
 const exit = process.exit.bind(process);
 let error = null;
 let snapshotTaken = false;

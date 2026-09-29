@@ -4,7 +4,11 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
-import { findBannedModules, loadEagerModules } from "./check-startup-imports-runtime";
+import {
+  type DesktopPlatform,
+  findBannedModules,
+  loadEagerModules,
+} from "./check-startup-imports-runtime";
 
 const BANNED = ["ai", "@ai-sdk/*"];
 
@@ -68,19 +72,35 @@ test.each([
 });
 
 test("code that waits for Electron to be ready does not run", async () => {
-  const modules = await loadMain(
-    [
+  await writeFiles({
+    "main.js": [
       'const { app } = require("electron");',
       'require("ok-pkg");',
       'app.whenReady().then(() => require("ai"));',
       '(async () => { await app.whenReady(); require("@ai-sdk/openai"); })();',
       "",
-    ].join("\n")
-  );
+    ].join("\n"),
+  });
+  const { trigger, modules } = await loadEagerModules(path.join(rootDir, "main.js"));
 
+  // The driver requires the real entry to end here, not at an idle event loop.
+  expect(trigger).toBe("app.whenReady()");
   expect(findBannedModules(modules, BANNED)).toEqual([]);
   // The load really ran past the Electron calls.
   expect(modules).toContain(path.join(rootDir, "node_modules/ok-pkg/index.js"));
+});
+
+test("startup branches run for the simulated platform", async () => {
+  await writeFiles({ "main.js": 'if (process.platform === "darwin") require("ai");\n' });
+  const target = path.join(rootDir, "main.js");
+
+  const banned = async (platform: DesktopPlatform) =>
+    findBannedModules((await loadEagerModules(target, platform)).modules, BANNED).map(
+      (m) => m.packageName
+    );
+
+  expect(await banned("darwin")).toEqual(["ai"]);
+  expect(await banned("linux")).toEqual([]);
 });
 
 test("top-level Electron calls and constructors do not throw", async () => {

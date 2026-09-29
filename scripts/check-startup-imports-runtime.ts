@@ -9,8 +9,9 @@
  * (scripts/check-startup-imports-runtime.cjs), so Electron's ready event never fires,
  * and fails when a BANNED_PACKAGES package is in require.cache anyway. The module list
  * is taken when startup reaches `app.whenReady()` (or goes idle first), so it includes
- * code that runs after real I/O. The CLI shim and the preload are covered by the static
- * guard only (#4423 tracks running the CLI shim here too).
+ * code that runs after real I/O. It runs once per desktop platform (simulated
+ * `process.platform`), because startup branches on the OS. The CLI shim and the preload
+ * are covered by the static guard only (#4423 tracks running the CLI shim here too).
  *
  * Limitation: only `app.getPath()` returns a real value (a path in a temp dir); other
  * Electron values are stubs, so startup code that needs e.g. a real string from another
@@ -36,6 +37,9 @@ import {
 
 const HARNESS = path.join(import.meta.dir, "check-startup-imports-runtime.cjs");
 const LOAD_TIMEOUT_MS = 60_000;
+/** Desktop platforms whose startup branches the check runs (`process.platform` values). */
+export const DESKTOP_PLATFORMS = ["linux", "darwin", "win32"] as const;
+export type DesktopPlatform = (typeof DESKTOP_PLATFORMS)[number];
 
 interface HarnessResult {
   error: string | null;
@@ -61,7 +65,10 @@ export interface BannedModule {
  * require.cache once startup reaches the ready gate (see the harness for the triggers).
  * Throws when the load throws, so a broken harness can never pass vacuously.
  */
-export async function loadEagerModules(requestedTarget: string): Promise<EagerModules> {
+export async function loadEagerModules(
+  requestedTarget: string,
+  platform?: DesktopPlatform
+): Promise<EagerModules> {
   assert(path.isAbsolute(requestedTarget), `target must be absolute: ${requestedTarget}`);
   assert(existsSync(requestedTarget), `target does not exist: ${requestedTarget}`);
   // require.cache is keyed by real path.
@@ -69,9 +76,9 @@ export async function loadEagerModules(requestedTarget: string): Promise<EagerMo
 
   const workDir = await mkdtemp(path.join(tmpdir(), "startup-imports-runtime-"));
   try {
-    // Startup now runs its home/userData migrations, so point every location it can
-    // touch (HOME, XUM_ROOT, Electron's app paths) into the temp dir: the check must never
-    // touch the developer's real ~/.xum.
+    // Startup runs its home/userData migrations, so point every location it can touch
+    // (HOME and its Windows equivalents, XUM_ROOT, Electron's app paths) into the temp
+    // dir: the check must never touch the developer's real ~/.xum.
     const xumRoot = path.join(workDir, "xum-root");
     const home = path.join(workDir, "home");
     const appData = path.join(workDir, "app-data");
@@ -89,9 +96,13 @@ export async function loadEagerModules(requestedTarget: string): Promise<EagerMo
         env: {
           ...process.env,
           HOME: home,
+          USERPROFILE: home,
+          APPDATA: path.join(appData, "roaming"),
+          LOCALAPPDATA: path.join(appData, "local"),
           XUM_ROOT: xumRoot,
           MUX_ROOT: xumRoot,
           STARTUP_CHECK_APP_DATA: appData,
+          ...(platform != null ? { STARTUP_CHECK_PLATFORM: platform } : {}),
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -172,27 +183,36 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  const { trigger, modules } = await loadEagerModules(target);
-  const packages = new Set(modules.map(packageOfLoadedFile).filter((p) => p != null));
-  console.log(
-    `${desktopMain.dist}: ${modules.length} modules loaded (${packages.size} packages) until ${trigger}`
-  );
-
-  const violations = findBannedModules(modules, BANNED_PACKAGES);
-  if (violations.length === 0) {
-    console.log("✅ No banned packages loaded before Electron is ready");
-    return 0;
+  let failed = false;
+  for (const platform of DESKTOP_PLATFORMS) {
+    const { trigger, modules } = await loadEagerModules(target, platform);
+    const packages = new Set(modules.map(packageOfLoadedFile).filter((p) => p != null));
+    console.log(
+      `${desktopMain.dist} (${platform}): ${modules.length} modules loaded` +
+        ` (${packages.size} packages) until ${trigger}`
+    );
+    // Startup that ends anywhere else (e.g. a swallowed error ended it early) would
+    // check only part of the pre-splash path, so it fails instead of passing.
+    if (trigger !== "app.whenReady()") {
+      console.error(`❌ ${desktopMain.dist} (${platform}) did not reach app.whenReady()`);
+      failed = true;
+    }
+    for (const { packageName, file } of findBannedModules(modules, BANNED_PACKAGES)) {
+      console.error(
+        `\n❌ ${desktopMain.dist} (${platform}) loads "${packageName}" at startup, e.g.:`
+      );
+      console.error(`   ${path.relative(rootDir, file)}`);
+      console.error(
+        "   Load it with `await import()` inside the function that needs it." +
+          " `bun scripts/check-startup-imports.ts` prints the static import chain; if it" +
+          " passes, look for a module-scope import() or a computed require()."
+      );
+      failed = true;
+    }
   }
-  for (const { packageName, file } of violations) {
-    console.error(`\n❌ ${desktopMain.dist} loads "${packageName}" at startup, e.g.:`);
-    console.error(`   ${path.relative(rootDir, file)}`);
-  }
-  console.error(
-    "\nLoad it with `await import()` inside the function that needs it." +
-      " `bun scripts/check-startup-imports.ts` prints the static import chain; if it passes," +
-      " look for a module-scope import() or a computed require()."
-  );
-  return 1;
+  if (failed) return 1;
+  console.log("✅ No banned packages loaded before Electron is ready");
+  return 0;
 }
 
 if (import.meta.main) {
