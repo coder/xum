@@ -1797,6 +1797,21 @@ describe("untrusted bash repo discovery paths", () => {
     return createBashTool(config);
   }
 
+  // Same layout as the multi-project container: one symlink per project; only b plants a filter.
+  function createMultiProjectTool() {
+    const repoA = createRepo("repo-a", { plantedFilter: false });
+    const repoB = createRepo("repo-b", { plantedFilter: true });
+    const container = path.join(root.path, "_workspaces", "ws");
+    fs.mkdirSync(container, { recursive: true });
+    fs.symlinkSync(repoA, path.join(container, "a"));
+    fs.symlinkSync(repoB, path.join(container, "b"));
+    const tool = createUntrustedLocalTool(container, [
+      { projectName: "a", projectPath: "/projects/a" },
+      { projectName: "b", projectPath: "/projects/b" },
+    ]);
+    return { tool, repoB };
+  }
+
   async function runScript(
     tool: ReturnType<typeof createBashTool>,
     script: string
@@ -1851,17 +1866,7 @@ describe("untrusted bash repo discovery paths", () => {
   });
 
   it("untrusted multi-project local workspace inspects each project checkout", async () => {
-    const repoA = createRepo("repo-a", { plantedFilter: false });
-    const repoB = createRepo("repo-b", { plantedFilter: true });
-    // Same layout as the multi-project container: one symlink per project.
-    const container = path.join(root.path, "_workspaces", "ws");
-    fs.mkdirSync(container, { recursive: true });
-    fs.symlinkSync(repoA, path.join(container, "a"));
-    fs.symlinkSync(repoB, path.join(container, "b"));
-    const tool = createUntrustedLocalTool(container, [
-      { projectName: "a", projectPath: "/projects/a" },
-      { projectName: "b", projectPath: "/projects/b" },
-    ]);
+    const { tool } = createMultiProjectTool();
 
     const result = await runScript(tool, 'git -C b config --get filter.probe.smudge; echo "rc=$?"');
 
@@ -1873,18 +1878,9 @@ describe("untrusted bash repo discovery paths", () => {
   });
 
   it("untrusted local workspace fails when a project directory is missing", async () => {
-    const repoA = createRepo("repo-a", { plantedFilter: false });
-    const repoB = createRepo("repo-b", { plantedFilter: true });
-    const container = path.join(root.path, "_workspaces", "ws");
-    fs.mkdirSync(container, { recursive: true });
-    fs.symlinkSync(repoA, path.join(container, "a"));
-    fs.symlinkSync(repoB, path.join(container, "b"));
+    const { tool, repoB } = createMultiProjectTool();
     fs.rmSync(repoB, { recursive: true, force: true });
     const marker = path.join(root.path, "command-ran");
-    const tool = createUntrustedLocalTool(container, [
-      { projectName: "a", projectPath: "/projects/a" },
-      { projectName: "b", projectPath: "/projects/b" },
-    ]);
 
     let rejection: unknown;
     try {

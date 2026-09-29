@@ -872,29 +872,24 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
 }
 
 /**
- * Bash execution tool factory for AI assistant
- * Creates a bash tool that can execute commands with a configurable timeout
- * @param config Required configuration including working directory
- */
-/**
  * Local discovery treats `git -C <path>` exit 128 as "not a repository" and returns only the
  * static env, so a missing directory would silently skip the repo's driver config. Fail
  * instead; remote discovery already fails on a missing cwd.
  */
 async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
-  let isDirectory = false;
-  try {
-    isDirectory = (await fs.promises.stat(repoPath)).isDirectory();
-  } catch {
-    // Missing or unreadable: handled below like a non-directory.
-  }
-  if (!isDirectory) {
+  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  if (!stats?.isDirectory()) {
     throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
       cause: new Error(`Repository directory does not exist: ${repoPath}`),
     });
   }
 }
 
+/**
+ * Bash execution tool factory for AI assistant
+ * Creates a bash tool that can execute commands with a configurable timeout
+ * @param config Required configuration including working directory
+ */
 export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
   // Select limits based on overflow policy
   // truncate = IPC calls (generous limits for UI features, no line limit, no per-line limit)
@@ -940,12 +935,10 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // selected by highest-precedence .git/info/attributes on every runtime.
       let hooksEnv: Record<string, string> = {};
       if (!gitHooksAllowed(config.trusted)) {
-        // Inspect the directories the checkout really uses. getProjects() returns one entry
-        // even for a single-project workspace, whose cwd is the checkout itself (or a
-        // directory inside it), so joining the projectName there inspects the wrong
-        // directory. A multi-project cwd is the container (_workspaces/<name>) holding one
-        // symlink per project, <container>/<projectName> -> that project's checkout
-        // (containerManager.ts). The threshold matches isMultiProject().
+        // getProjects() returns one entry even for a single-project workspace, whose cwd is
+        // the checkout itself (or a directory inside it). Only a multi-project cwd (the
+        // _workspaces/<name> container with one <projectName> symlink per checkout) is joined
+        // with project names. The threshold matches isMultiProject().
         const repoPaths =
           config.projects != null && config.projects.length > 1
             ? [
@@ -958,11 +951,10 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         for (const repoPath of repoPaths) {
           if (config.runtime instanceof LocalBaseRuntime) {
             await assertLocalRepoDirectoryExists(repoPath);
-          }
-          repoEnvs.push(
-            config.runtime instanceof LocalBaseRuntime
-              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
-              : config.runtime != null
+            repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
+          } else {
+            repoEnvs.push(
+              config.runtime != null
                 ? await gitNoRepoAutomationEnvForRuntimeRepo(
                     config.runtime,
                     repoPath,
@@ -970,7 +962,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
                     true
                   )
                 : gitNoRepoAutomationEnv()
-          );
+            );
+          }
         }
         hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
       }
