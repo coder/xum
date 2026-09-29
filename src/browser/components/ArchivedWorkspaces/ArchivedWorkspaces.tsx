@@ -12,6 +12,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { ChevronDown, ChevronRight, FolderX, Loader2, Search, Trash2 } from "lucide-react";
 import { ArchiveIcon, ArchiveRestoreIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -329,6 +330,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
+  // Bulk delete and Shift-click force the removal without the Force Delete dialog, so what it
+  // left behind (e.g. a devcontainer that may still hold the plan) is shown here (#5143).
+  const removeWarning = usePopoverError();
 
   // Bulk selection state
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
@@ -528,6 +532,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       current: null,
       errors: [],
     });
+    const leftoverLines: string[] = [];
 
     for (let i = 0; i < idsToDelete.length; i++) {
       const id = idsToDelete[i];
@@ -536,6 +541,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
       try {
         const result = await removeWorkspace(id, { force: true });
+        if (result.success && result.warnings?.length) {
+          leftoverLines.push(
+            `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`
+          );
+        }
         if (!result.success) {
           setBulkOperation((prev) =>
             prev
@@ -558,6 +568,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setBulkOperation((prev) => (prev ? { ...prev, completed: i + 1 } : prev));
     }
 
+    if (leftoverLines.length > 0) {
+      removeWarning.showError("bulk-delete", leftoverLines.join("\n"));
+    }
     setSelectedIds(new Set());
     onWorkspacesChanged?.();
   };
@@ -735,6 +748,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             : {}),
         });
         if (forced.success) {
+          if (forced.warnings?.length) {
+            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
+          }
           onWorkspacesChanged?.();
           return;
         }
@@ -799,6 +815,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         error={deleteWorktreeError.error}
         prefix="Failed to delete managed worktree"
         onDismiss={deleteWorktreeError.clearError}
+      />
+      <PopoverError
+        error={removeWarning.error}
+        prefix="Workspace deleted, but something was left behind"
+        onDismiss={removeWarning.clearError}
       />
       {bulkOperation && (
         <BulkProgressModal operation={bulkOperation} onClose={() => setBulkOperation(null)} />

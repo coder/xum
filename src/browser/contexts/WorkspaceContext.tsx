@@ -1556,7 +1556,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             navigateToProject(projectPath);
           }
           // If not selected, don't navigate at all - stay where we are
-          return { success: true };
+          // Keep the warnings: forced callers show what the removal left behind (#5143).
+          return { success: true, ...(result.warnings ? { warnings: result.warnings } : {}) };
         } else {
           console.error("Failed to remove workspace:", result.error);
           return result;

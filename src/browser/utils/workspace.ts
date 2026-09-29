@@ -1,4 +1,4 @@
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceRemoveWarning } from "@/common/types/workspace";
 
 /**
  * Generate a comparison key for workspace sidebar display.
@@ -28,4 +28,16 @@ export function getWorkspaceSidebarKey(meta: FrontendWorkspaceMetadata): string 
     meta.workflowTask?.stepId ?? "", // Workflow step identity for grouped rows
     meta.workflowTask?.workflowName ?? "", // Workflow group header label
   ].join("|");
+}
+
+/** One line per warning a forced workspace removal returned (#5143). */
+export function formatWorkspaceRemoveWarnings(warnings: readonly WorkspaceRemoveWarning[]): string {
+  return warnings
+    .map((warning) => {
+      switch (warning.kind) {
+        case "leftover":
+          return warning.description;
+      }
+    })
+    .join("\n");
 }

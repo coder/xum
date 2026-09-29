@@ -77,7 +77,7 @@ export interface DevcontainerRuntimeOptions {
  * - ensureReady → devcontainer up (starts/rebuilds container as needed)
  */
 /** Names a workspace's devcontainer by the host-path label Docker matches it with. */
-function containerLabel(workspacePath: string): string {
+export function containerLabel(workspacePath: string): string {
   return `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
 }
 

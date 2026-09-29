@@ -524,6 +524,62 @@ describe("ArchivedWorkspaces", () => {
     expect(modalProps).toBeUndefined();
   });
 
+  // #5143: forced paths that skip the Force Delete dialog show what the removal left behind.
+  const leftover = "The devcontainer container labeled x was left behind";
+  const successWithLeftover: WorkspaceRemoveResult = {
+    success: true,
+    warnings: [{ kind: "leftover", description: leftover }],
+  };
+
+  test("bulk deletion shows what a forced removal left behind", async () => {
+    const workspace = createWorkspace({ id: "ws-left", name: "left" });
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Select left")));
+    fireEvent.click(view.getByLabelText("Delete selected"));
+    fireEvent.click(view.getByRole("button", { name: "Yes, delete 1" }));
+
+    // hidden: the bulk progress dialog marks the rest of the page aria-hidden.
+    const alert = await view.findByRole("alert", { hidden: true });
+    expect(alert.textContent).toContain(leftover);
+    expect(alert.textContent).toContain(workspace.name);
+  });
+
+  test("Shift-click shows what the forced removal left behind", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Container teardown failed",
+    });
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+
+    const alert = await view.findByRole("alert");
+    expect(alert.textContent).toContain(leftover);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, { force: true });
+    expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
+    expect(modalProps).toBeUndefined();
+  });
+
   test("shows delete worktree for archived worktree workspaces and calls the API", async () => {
     const workspace = createWorkspace({
       id: "ws-worktree",

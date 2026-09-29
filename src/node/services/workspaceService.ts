@@ -180,7 +180,7 @@ import {
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { containerLabel, DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import {
   getDevcontainerContainerName,
@@ -236,6 +236,7 @@ import type {
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
@@ -6966,7 +6967,12 @@ export class WorkspaceService
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
     }
-  ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
+  ): Promise<
+    Result<void> & {
+      descendants?: WorkspaceRemovalDescendant[];
+      warnings?: WorkspaceRemoveWarning[];
+    }
+  > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
         const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
@@ -7128,7 +7134,7 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
     const { mutationGateHeld, ...checkoutOptions } = options ?? {};
@@ -7143,6 +7149,8 @@ export class WorkspaceService
     // Set when the runtime deletion ran and succeeded; for a devcontainer that confirms its
     // container, which holds the plan, is gone (#5043).
     let containerRemovalConfirmed = false;
+    // What a forced removal left behind, returned with its success for the user (#5143).
+    let removalWarnings: WorkspaceRemoveWarning[] = [];
     // Set once this attempt published the durable removal tombstone (sealed
     // sub-agent handover, or the session-dir teardown). If the removal then
     // ends with the workspace STILL REGISTERED — a refused checkout deletion,
@@ -7730,12 +7738,25 @@ export class WorkspaceService
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
             // A container left behind still holds this workspace's plan (#5143): the plan step
-            // below cannot reach it once the worktree is gone. Name it for the user's logs.
+            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
+            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
+            // cancel-creation, shift-click) never saw the non-forced error that names it.
             if (deleteResult.leftoverPaths?.length) {
               log.warn("Forced removal left these behind; a container may still hold the plan", {
                 workspaceId,
                 leftovers: deleteResult.leftoverPaths,
               });
+              const planContainer =
+                runtime instanceof DevcontainerRuntime
+                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
+                  : undefined;
+              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
+                kind: "leftover",
+                description:
+                  leftover === planContainer
+                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+                    : `${leftover} was left behind; remove it manually.`,
+              }));
             }
           }
 
@@ -8067,7 +8088,10 @@ export class WorkspaceService
         ...(parentWorkspaceId ? { removedParentWorkspaceId: parentWorkspaceId } : {}),
       });
 
-      return Ok(undefined);
+      return {
+        ...Ok(undefined),
+        ...(removalWarnings.length > 0 ? { warnings: removalWarnings } : {}),
+      };
     } catch (error) {
       // An abort before the workspace left the config leaves it usable, so undo the timeline close:
       // otherwise every later event for it would be dropped for the rest of the process.

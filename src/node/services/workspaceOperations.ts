@@ -221,7 +221,7 @@ export async function removeWorkspace(
     acknowledgedDescendantIds: input.options?.acknowledgedDescendantIds,
   });
   return result.success
-    ? { success: true as const }
+    ? { success: true as const, ...(result.warnings ? { warnings: result.warnings } : {}) }
     : { success: false as const, error: result.error, descendants: result.descendants };
 }
 
