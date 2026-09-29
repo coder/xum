@@ -361,10 +361,9 @@ printf '\000drivers %s\n' "$rc"
 `;
 
 /**
- * The discovery script with its variables assigned. Shared by the local and runtime variants;
- * the local call passes shellQuote(repoPath), so its script bytes are unchanged. Only these
- * values are interpolated: the patterns are shell-quoted here, and callers pass either a
- * shell-quoted path or `.`.
+ * The discovery script with its variables assigned, shared by the local and runtime variants.
+ * Only these values are interpolated: the patterns are shell-quoted here, and callers pass
+ * either a shell-quoted path or `.`.
  */
 function repoAutomationDiscoveryScript(repoExpression: string): string {
   return [

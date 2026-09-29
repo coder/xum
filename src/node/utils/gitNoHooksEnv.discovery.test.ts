@@ -294,7 +294,6 @@ const RUNTIME_TRANSPORTS: Array<{ name: string; create: (loginDir: string) => Ru
     : [{ name: "remote shell", create: (loginDir: string) => new ShellRemoteRuntime(loginDir) }]),
 ];
 
-/** Runs one runtime discovery and returns its outcome plus the number of runtime execs. */
 async function discoverRuntimeCountingExecs(
   runtime: Runtime,
   repo: string,
@@ -316,7 +315,7 @@ async function discoverRuntimeCountingExecs(
  * How the runtime outcome relates to the local one: "same" (byte-identical env, or the same
  * message and refusal cause), "both throw" (process-level failures, where the wording comes
  * from the transport), or "runtime throws" (a missing path with allowNonRepository: the
- * runtimes cannot cd into it, as before one-exec discovery).
+ * runtimes cannot cd into it).
  */
 type RuntimeRelation = "same" | "both throw" | "runtime throws";
 
