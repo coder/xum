@@ -218,6 +218,7 @@ import { PROJECT_METADATA_DIR_NAMES } from "@/common/compat/legacyMux";
 
 import type { PostCompactionExclusions } from "@/common/types/attachment";
 import type {
+  AcpPromptCorrelation,
   SendMessageOptions,
   DeleteMessage,
   FilePart,
@@ -16098,11 +16099,14 @@ export class WorkspaceService
    */
   async sendHeldInput(
     workspaceId: string,
-    heldInputId: string
+    heldInputId: string,
+    acpCorrelation?: AcpPromptCorrelation
   ): Promise<Result<void, SendMessageError>> {
     assert(heldInputId.length > 0, "sendHeldInput requires a heldInputId");
     const session = this.sessions.get(workspaceId.trim());
-    const claim = session?.claimHeldInputSend(heldInputId) ?? { kind: "missing" as const };
+    const claim = session?.claimHeldInputSend(heldInputId, acpCorrelation) ?? {
+      kind: "missing" as const,
+    };
     if (claim.kind === "missing") {
       return Err({ type: "unknown", raw: "This unsent message is no longer held." });
     }

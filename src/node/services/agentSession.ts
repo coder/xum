@@ -95,6 +95,7 @@ import type {
   OnChatDowngradeReason,
   ProvidersConfigMap,
   StreamErrorMessage,
+  AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
@@ -10357,13 +10358,35 @@ export class AgentSession {
    * double-click cannot send it twice; the caller must {@link releaseHeldInputSend} afterwards.
    */
   claimHeldInputSend(
-    id: string
+    id: string,
+    acpCorrelation?: AcpPromptCorrelation
   ): { kind: "claimed"; send: RefusedManualSend } | { kind: "missing" } | { kind: "busy" } {
     const held = this.heldInputs.find((input) => input.id === id);
     if (held == null) return { kind: "missing" };
     if (this.sendingHeldInputIds.has(id)) return { kind: "busy" };
     this.sendingHeldInputIds.add(id);
-    return { kind: "claimed", send: held.send };
+    if (acpCorrelation == null) return { kind: "claimed", send: held.send };
+    // An ACP /send-held re-sends as a NEW prompt (#5170): replace the correlation the input was
+    // queued with, in options and in the metadata fallback that stream correlation also reads,
+    // on a copy. The held copy stays exactly as queued, so a failed re-send keeps the original.
+    const heldMetadata: unknown = held.send.options.muxMetadata;
+    const muxMetadata: Record<string, unknown> = {
+      ...(typeof heldMetadata === "object" && heldMetadata != null && !Array.isArray(heldMetadata)
+        ? (heldMetadata as Record<string, unknown>)
+        : {}),
+      [ACP_PROMPT_ID_METADATA_KEY]: acpCorrelation.acpPromptId,
+    };
+    delete muxMetadata[ACP_DELEGATED_TOOLS_METADATA_KEY];
+    if (acpCorrelation.delegatedToolNames != null) {
+      muxMetadata[ACP_DELEGATED_TOOLS_METADATA_KEY] = [...acpCorrelation.delegatedToolNames];
+    }
+    const options = {
+      ...held.send.options,
+      acpPromptId: acpCorrelation.acpPromptId,
+      delegatedToolNames: acpCorrelation.delegatedToolNames,
+      muxMetadata,
+    };
+    return { kind: "claimed", send: { ...held.send, options } };
   }
 
   releaseHeldInputSend(id: string): void {

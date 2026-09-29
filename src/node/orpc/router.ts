@@ -1880,7 +1880,11 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)
         .handler(({ context, input }) =>
-          context.workspaceService.sendHeldInput(input.workspaceId, input.heldInputId)
+          context.workspaceService.sendHeldInput(
+            input.workspaceId,
+            input.heldInputId,
+            input.acpCorrelation
+          )
         ),
       discardHeldInput: t
         .input(schemas.workspace.discardHeldInput.input)

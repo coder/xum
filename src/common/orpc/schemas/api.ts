@@ -74,6 +74,7 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -1812,7 +1813,12 @@ export const workspace = {
    * unless the send is accepted; the error explains why it was not.
    */
   sendHeldInput: {
-    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      heldInputId: z.string(),
+      /** ACP /send-held only: re-send as this prompt instead of the one it was queued as. */
+      acpCorrelation: AcpPromptCorrelationSchema.optional(),
+    }),
     output: ResultSchema(z.void(), SendMessageErrorSchema),
   },
   /** Drop a held input without sending it. */

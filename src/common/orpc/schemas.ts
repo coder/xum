@@ -140,6 +140,7 @@ export {
   ReasoningEndEventSchema,
   RuntimeStatusEventSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
   HistoryEditPreconditionSchema,
   StreamAbortReasonSchema,
   StreamAbortEventSchema,

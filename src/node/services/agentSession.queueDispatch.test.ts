@@ -629,6 +629,69 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
+  // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
+  test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "held-acp-correlation" });
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          acpPromptId: "old-prompt",
+          delegatedToolNames: ["file_read"],
+          muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"], keep: 1 },
+        },
+        {
+          acceptanceOrigin: "manual",
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+      const [held] = h.session.getHeldInputs();
+      const claimOptions = (correlation?: {
+        acpPromptId: string;
+        delegatedToolNames?: string[];
+      }) => {
+        const claim = h.session.claimHeldInputSend(held.id, correlation);
+        h.session.releaseHeldInputSend(held.id);
+        return claim.kind === "claimed" ? claim.send.options : undefined;
+      };
+
+      expect(claimOptions({ acpPromptId: "new-prompt" })).toMatchObject({
+        acpPromptId: "new-prompt",
+        delegatedToolNames: undefined,
+        muxMetadata: { acpPromptId: "new-prompt", keep: 1 },
+      });
+      expect(claimOptions({ acpPromptId: "new-prompt" })?.muxMetadata).not.toHaveProperty(
+        "acpDelegatedTools"
+      );
+      expect(
+        claimOptions({ acpPromptId: "new-prompt", delegatedToolNames: ["bash"] })
+      ).toMatchObject({
+        delegatedToolNames: ["bash"],
+        muxMetadata: { acpPromptId: "new-prompt", acpDelegatedTools: ["bash"] },
+      });
+      // Without a correlation (desktop Send) the send is exactly what was queued.
+      expect(claimOptions()).toMatchObject({ acpPromptId: "old-prompt" });
+      // The held copy itself is never rewritten: a failed re-send keeps the original.
+      expect(h.session.getHeldInputs()[0].send.options).toMatchObject({
+        acpPromptId: "old-prompt",
+        muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"] },
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
     let calls = 0;

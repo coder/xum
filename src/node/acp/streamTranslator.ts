@@ -8,7 +8,7 @@ import type {
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
-import { DISCARD_HELD_COMMAND_NAME } from "./slashCommands";
+import { DISCARD_HELD_COMMAND_NAME, SEND_HELD_COMMAND_NAME } from "./slashCommands";
 
 interface ActiveToolCall {
   toolCallId: string;
@@ -301,8 +301,8 @@ export class StreamTranslator {
     const count = heldInputs.length;
     const header = `Xum kept ${count} unsent message${count === 1 ? "" : "s"}. Nothing was lost:`;
     const footer =
-      "To send one, use the Xum app or copy its text into a new prompt. " +
-      `To drop one, use /${DISCARD_HELD_COMMAND_NAME} <number>.`;
+      `Send one with /${SEND_HELD_COMMAND_NAME} <number>, or drop it with ` +
+      `/${DISCARD_HELD_COMMAND_NAME} <number>.`;
     return this.toSingleChunkUpdate(
       "agent_message_chunk",
       `\n\n${header}\n\n${formatHeldInputList(listed, heldInputs)}\n\n${footer}\n`
@@ -330,7 +330,7 @@ export class StreamTranslator {
       if (current.length > 1) {
         return {
           kind: "refused",
-          message: `${current.length} unsent messages are held. Pick one by number, for example /${DISCARD_HELD_COMMAND_NAME} 1:\n\n${listing}`,
+          message: `${current.length} unsent messages are held. Name one by its number:\n\n${listing}`,
         };
       }
       number = state.listed.findIndex((heldInput) => heldInput.id === current[0].id) + 1;
