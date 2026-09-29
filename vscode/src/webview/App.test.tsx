@@ -2803,7 +2803,15 @@ describe("vscode webview background processes strip (#5092)", () => {
     const firstErrorFree = commits.findIndex((commit) => !commit.error);
     expect(firstErrorFree).toBeGreaterThanOrEqual(0);
     expect(commits.slice(firstErrorFree).filter((commit) => commit.error)).toEqual([]);
-    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe").length).toBeGreaterThan(1);
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.length).toBeGreaterThan(1);
+
+    // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
+    await emitProcesses(bridge, subscriptions[subscriptions.length - 1], "stream-server-2", [
+      runningProcess,
+    ]);
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+    expect(view.container.querySelectorAll('[title="sleep 600"]')).toHaveLength(0);
   });
 
   test("does not show another workspace's processes after a switch", async () => {
