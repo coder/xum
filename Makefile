@@ -538,7 +538,8 @@ test-e2e: ## Run end-to-end tests
 
 test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build
-	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts $(PLAYWRIGHT_ARGS)
+	@# One worker: parallel Electron apps contend on CPU, so a scenario measures its neighbours' startup (#5209).
+	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
 
 ## Distribution
 dist: build ## Build distributable packages
