@@ -216,7 +216,11 @@ describeIntegration("Draft workspace behavior", () => {
         { timeout: 5_000 }
       );
       const draftIds = await waitForDraftCount(normalizedProjectPath, 2);
-      createdScopes.push({ kind: "creation", projectPath: normalizedProjectPath, draftId: draftIds[1] });
+      createdScopes.push({
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId: draftIds[1],
+      });
       expect(
         getDraftStore().getView({
           kind: "creation",

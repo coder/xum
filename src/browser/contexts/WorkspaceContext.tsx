@@ -2017,7 +2017,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         getDraftStore()
           .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
           .catch(() => undefined);
-        migrateWorkspaceStorage(getPendingScopeId(projectPath), getDraftScopeId(projectPath, draftId));
+        migrateWorkspaceStorage(
+          getPendingScopeId(projectPath),
+          getDraftScopeId(projectPath, draftId)
+        );
       }
 
       if (existingEmptyDraftId) {
