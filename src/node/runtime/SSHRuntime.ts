@@ -505,6 +505,9 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
  *
  * Extends RemoteRuntime for shared exec/file operations.
  */
+/** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
+const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -3402,7 +3405,6 @@ export class SSHRuntime extends RemoteRuntime {
         // that re-forking with the same workspace name can use the fast worktree
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
-        const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
         // keepBranch: the caller undoes a creation that reused this branch (#4819).
         if (
           branchToDelete &&
@@ -3537,6 +3539,19 @@ export class SSHRuntime extends RemoteRuntime {
         { cwd: "/tmp", timeout: 30 }
       ).catch(() => undefined);
       await removeStaging(reason);
+      // Callers run only after this fork's `worktree add -b` succeeded, and that refuses an
+      // existing branch, so the fork made `newWorkspaceName` and nothing has committed to it.
+      // Leaving it would make a retry of the name miss the fast path and the copy fallback check
+      // out the stale branch (#5125). This runs after the staging removal: `branch -D` refuses a
+      // branch any registered worktree still uses (even one whose dir is gone), so when the
+      // removal failed or another worktree took the branch, it is kept.
+      if (!PROTECTED_BRANCHES.includes(newWorkspaceName)) {
+        await execBuffered(
+          this,
+          `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(newWorkspaceName)} 2>/dev/null || true`,
+          { cwd: "/tmp", timeout: 10 }
+        ).catch(() => undefined);
+      }
     };
 
     // Hoisted outside the try block so the catch handler can reach them when
