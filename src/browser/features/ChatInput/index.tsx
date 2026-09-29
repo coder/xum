@@ -199,6 +199,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
+import { joinDraftText, removeSentText } from "./composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -301,23 +302,6 @@ function pendingChatAttachments(
     id: `${attachmentKeyPrefix}-staged-${index}`,
   }));
   return [...providerAttachments, ...stagedAttachments];
-}
-
-/** Draft texts joined as a restore merges them: non-blank parts, one blank line apart. */
-function joinDraftText(...parts: string[]): string {
-  return parts.filter((part) => part.trim().length > 0).join("\n\n");
-}
-
-/**
- * The composer text after a send took `sent` out of it. Anything restored or typed meanwhile
- * stays: remove the sent text once, and leave the text as is when it is not found (a visible
- * duplicate beats a loss).
- */
-function removeSentText(current: string, sent: string): string {
-  if (current === sent) return "";
-  const at = sent.trim().length > 0 ? current.indexOf(sent) : -1;
-  if (at === -1) return current;
-  return joinDraftText(current.slice(0, at).trimEnd(), current.slice(at + sent.length).trimStart());
 }
 
 /**
@@ -2775,7 +2759,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
         setInput((current) => removeSentText(current, input));
-        setDraftReviews(null);
+        // Likewise for notes: drop the override this send captured, keeping notes an edit's
+        // completion put into it meanwhile.
+        setDraftReviews((current) => {
+          if (current === null || current === preSendReviews) return null;
+          const remaining = current.filter((review) => !preSendReviews?.includes(review));
+          return remaining.length > 0 ? remaining : null;
+        });
         setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing

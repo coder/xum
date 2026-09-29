@@ -243,6 +243,109 @@ async function sendEdit(app: AppHarness, scope: DraftScope, text: string, replac
   await app.chat.expectTranscriptNotContains(replaced, LOAD_TOLERANT_WAIT.timeout);
 }
 
+async function attachStoreReview(app: AppHarness, id: string, note: string) {
+  await app.env.orpc.workspace.reviewState.update({
+    workspaceId: app.workspaceId,
+    delta: {
+      reviews: {
+        set: { [id]: { id, data: review(note), status: "attached", createdAt: Date.now() } },
+      },
+    },
+  });
+}
+
+/** Click a visible button found by `find`, waiting for it to render. */
+async function clickWhenShown(find: () => Element | undefined, what: string) {
+  const button = await waitFor(() => {
+    const element = find();
+    if (!element) throw new Error(`${what} not found`);
+    return element as HTMLElement;
+  }, LOAD_TOLERANT_WAIT);
+  fireEvent.click(button);
+}
+
+/** The queued message's Edit action moves it (text and notes) back into the composer. */
+const editQueuedMessage = (app: AppHarness) =>
+  clickWhenShown(
+    () =>
+      [
+        ...app.view.container.querySelectorAll('[data-component="QueuedMessageActions"] button'),
+      ].find((element) => element.textContent?.includes("Edit")),
+    "Queued message Edit button"
+  );
+
+async function editRow(app: AppHarness, rowText: string) {
+  await clickWhenShown(
+    () =>
+      [
+        ...app.view.container.querySelectorAll('[data-message-block] button[aria-label="Edit"]'),
+      ].find((element) => element.closest("[data-message-block]")?.textContent?.includes(rowText)),
+    `Edit button of "${rowText}"`
+  );
+  await waitFor(() => expect(editTextarea(app)?.value).toBe(rowText), LOAD_TOLERANT_WAIT);
+}
+
+/**
+ * Put a queued message with a note back into the composer, so it has its own note list (the
+ * review override). Returns the restored composer text.
+ */
+async function restoreQueuedMessageWithNote(app: AppHarness, scope: DraftScope, note: string) {
+  const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+  const holding = app.env.orpc.workspace.sendMessage({
+    workspaceId: app.workspaceId,
+    message: "[mock:wait-start] hold the workspace busy",
+    options: { model: "openai:gpt-5.2", agentId: "exec" },
+  });
+  await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
+  await attachStoreReview(app, "review-queued", note);
+  await waitFor(() => expect(composerText(app)).toContain(note), LOAD_TOLERANT_WAIT);
+  await app.chat.send("queued follow-up");
+  await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), LOAD_TOLERANT_WAIT);
+  await editQueuedMessage(app);
+  await waitFor(
+    () => expect(getDraftStore().getText(scope)).toContain("queued follow-up"),
+    LOAD_TOLERANT_WAIT
+  );
+  app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+  await holding;
+  await app.chat.expectStreamComplete();
+  return getDraftStore().getText(scope);
+}
+
+/**
+ * Hold the next send between capturing its composer input and clearing it: it waits for a
+ * pending settings save first. Only that save is held; later config writes go through.
+ */
+async function holdNextSendBeforeClear(app: AppHarness) {
+  const realSave = app.env.config.saveUserConfig.bind(app.env.config);
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const spy = jest
+    .spyOn(app.env.config, "saveUserConfig")
+    .mockImplementationOnce(async (...args: Parameters<typeof realSave>) => {
+      await gate;
+      return realSave(...args);
+    });
+  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), 80);
+  await waitFor(() => expect(spy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+  return { release, spy };
+}
+
+/** Press Enter in the workspace composer that holds `value`. */
+function pressEnterInComposer(app: AppHarness, value: string) {
+  const composer = [
+    ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
+      'textarea[aria-label="Message Claude"]'
+    ),
+  ].find((textarea) => textarea.value === value);
+  fireEvent.keyDown(composer!, { key: "Enter" });
+}
+
+const sentMessages = (spy: ReturnType<typeof holdSendReplies>["spy"], message: string) =>
+  spy.mock.calls.filter(([, sent]) => sent === message).length;
+
 describe("Edit sends racing newer composer input (#5226)", () => {
   beforeAll(async () => {
     await preloadTestModules();
@@ -258,14 +361,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       await app.chat.expectStreamComplete();
 
       // The first edit's reply is still pending: edit its replacement row.
-      fireEvent.click(
-        await waitFor(() => {
-          const button = app.view.container.querySelector('button[aria-label="Edit"]');
-          if (!button) throw new Error("Edit button not found");
-          return button as HTMLElement;
-        }, LOAD_TOLERANT_WAIT)
-      );
-      await waitFor(() => expect(editTextarea(app)?.value).toBe("edited message"));
+      await editRow(app, "edited message");
       expect(sendButton(app)?.disabled).toBe(true);
 
       replies.release();
@@ -286,91 +382,17 @@ describe("Edit sends racing newer composer input (#5226)", () => {
     const app = await createAppHarness({ branchPrefix: "edit-pending-keeps-notes" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
       await app.chat.send("first message");
       await app.chat.expectTranscriptContains("Mock response", LOAD_TOLERANT_WAIT.timeout);
       await app.chat.expectStreamComplete();
+      const restoredText = await restoreQueuedMessageWithNote(app, scope, "queued note");
 
-      // A queued message with a note, moved back into the composer by its Edit action, gives the
-      // composer its own note list (the review override) before the edit starts.
-      const holding = app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: "[mock:wait-start] hold the workspace busy",
-        options: { model: "openai:gpt-5.2", agentId: "exec" },
-      });
-      await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
-      await app.env.orpc.workspace.reviewState.update({
-        workspaceId: app.workspaceId,
-        delta: {
-          reviews: {
-            set: {
-              "review-queued": {
-                id: "review-queued",
-                data: review("queued note"),
-                status: "attached",
-                createdAt: Date.now(),
-              },
-            },
-          },
-        },
-      });
-      await waitFor(() => expect(composerText(app)).toContain("queued note"), LOAD_TOLERANT_WAIT);
-      await app.chat.send("queued follow-up");
-      await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), LOAD_TOLERANT_WAIT);
-      fireEvent.click(
-        await waitFor(() => {
-          const button = [
-            ...app.view.container.querySelectorAll(
-              '[data-component="QueuedMessageActions"] button'
-            ),
-          ].find((element) => element.textContent?.includes("Edit"));
-          if (!button) throw new Error("Queued message Edit button not found");
-          return button as HTMLElement;
-        }, LOAD_TOLERANT_WAIT)
-      );
-      await waitFor(
-        () => expect(getDraftStore().getText(scope)).toContain("queued follow-up"),
-        LOAD_TOLERANT_WAIT
-      );
-      const restoredText = getDraftStore().getText(scope);
-      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
-      await holding;
-      await app.chat.expectStreamComplete();
-
-      const firstRowEdit = await waitFor(() => {
-        const button = [
-          ...app.view.container.querySelectorAll('[data-message-block] button[aria-label="Edit"]'),
-        ].find((element) =>
-          element.closest("[data-message-block]")?.textContent?.includes("first message")
-        );
-        if (!button) throw new Error("Edit button of the first message not found");
-        return button as HTMLElement;
-      }, LOAD_TOLERANT_WAIT);
-      fireEvent.click(firstRowEdit);
-      await waitFor(
-        () => expect(editTextarea(app)?.value).toBe("first message"),
-        LOAD_TOLERANT_WAIT
-      );
-
+      await editRow(app, "first message");
       const replies = holdSendReplies(app);
       await sendEdit(app, scope, "edited message", "first message");
       await app.chat.expectStreamComplete();
       // A note attached while the edit's reply is pending.
-      await app.env.orpc.workspace.reviewState.update({
-        workspaceId: app.workspaceId,
-        delta: {
-          reviews: {
-            set: {
-              "review-late": {
-                id: "review-late",
-                data: review("late note"),
-                status: "attached",
-                createdAt: Date.now(),
-              },
-            },
-          },
-        },
-      });
+      await attachStoreReview(app, "review-late", "late note");
       replies.release();
 
       await app.chat.expectInputValue(restoredText, LOAD_TOLERANT_WAIT.timeout);
@@ -395,29 +417,9 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       const replies = holdSendReplies(app);
       await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
 
-      // Hold the follow-up between capturing its text and clearing it: it waits for a pending
-      // settings save first. Only that save is held; later config writes (the edit's stream
-      // start) go through.
-      const realSave = app.env.config.saveUserConfig.bind(app.env.config);
-      let releaseSave: () => void = () => undefined;
-      const saveGate = new Promise<void>((resolve) => {
-        releaseSave = resolve;
-      });
-      const saveSpy = jest
-        .spyOn(app.env.config, "saveUserConfig")
-        .mockImplementationOnce(async (...args: Parameters<typeof realSave>) => {
-          await saveGate;
-          return realSave(...args);
-        });
-      updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), 80);
-      await waitFor(() => expect(saveSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+      const save = await holdNextSendBeforeClear(app);
       await app.chat.typeWithoutSending("follow-up");
-      const composer = [
-        ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
-          'textarea[aria-label="Message Claude"]'
-        ),
-      ].find((textarea) => textarea.value === "follow-up");
-      fireEvent.keyDown(composer!, { key: "Enter" });
+      pressEnterInComposer(app, "follow-up");
 
       // The edit completes while the follow-up waits: the pre-edit draft comes back.
       replies.release();
@@ -426,9 +428,9 @@ describe("Edit sends racing newer composer input (#5226)", () => {
         LOAD_TOLERANT_WAIT
       );
 
-      releaseSave();
+      save.release();
       await waitFor(
-        () => expect(replies.spy.mock.calls.map(([, message]) => message)).toContain("follow-up"),
+        () => expect(sentMessages(replies.spy, "follow-up")).toBe(1),
         LOAD_TOLERANT_WAIT
       );
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
@@ -438,7 +440,60 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       );
       await expectUnsentDraftKept(app, scope);
       replies.spy.mockRestore();
-      saveSpy.mockRestore();
+      save.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("notes restored while a follow-up waits survive its send", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-followup-keeps-notes" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      await app.chat.send("first message");
+      await app.chat.expectTranscriptContains("Mock response", LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      // The edit's pre-edit draft has its own note list.
+      const restoredText = await restoreQueuedMessageWithNote(app, scope, "pre-edit note");
+
+      await editRow(app, "first message");
+      const replies = holdSendReplies(app);
+      await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
+
+      // While the edit's stream starts, a queued message without notes goes back into the
+      // composer: its note list is empty, and that is what the follow-up send captures.
+      await app.chat.send("second follow-up");
+      await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), LOAD_TOLERANT_WAIT);
+      await editQueuedMessage(app);
+      await app.chat.expectInputValue("second follow-up", LOAD_TOLERANT_WAIT.timeout);
+      const save = await holdNextSendBeforeClear(app);
+      pressEnterInComposer(app, "second follow-up");
+
+      // The edit completes while the follow-up waits: its draft and note come back.
+      replies.release();
+      await waitFor(
+        () => expect(getDraftStore().getText(scope)).toBe(`${restoredText}\n\nsecond follow-up`),
+        LOAD_TOLERANT_WAIT
+      );
+
+      save.release();
+      await waitFor(
+        () => expect(sentMessages(replies.spy, "second follow-up")).toBe(2),
+        LOAD_TOLERANT_WAIT
+      );
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectTranscriptContains(
+        "Mock response: second follow-up",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      await app.chat.expectInputValue(restoredText, LOAD_TOLERANT_WAIT.timeout);
+      await waitFor(
+        () => expect(reviewPanelNotes(app).join("\n")).toContain("pre-edit note"),
+        LOAD_TOLERANT_WAIT
+      );
+      replies.spy.mockRestore();
+      save.spy.mockRestore();
     } finally {
       await app.dispose();
     }
