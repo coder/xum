@@ -293,12 +293,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
               lines: filteredLines,
             };
             if (isStreaming) {
-              writeHighlightCache(
-                cacheKey,
-                result,
-                cacheWriter,
-                lastWrittenCacheKeyRef.current
-              );
+              writeHighlightCache(cacheKey, result, cacheWriter, lastWrittenCacheKeyRef.current);
               lastWrittenCacheKeyRef.current = cacheKey;
             }
             setHighlighted(result);
