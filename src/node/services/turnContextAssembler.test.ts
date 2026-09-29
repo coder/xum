@@ -581,6 +581,17 @@ describe("assemblePromptPayload", () => {
       JSON.stringify(shortPayload.messages)
     );
   });
+
+  test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
+    const snapshot = createMuxMessage("snapshot", "user", "file snapshot", {
+      historySequence: 11,
+      synthetic: true,
+    });
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 12 });
+    const payload = await assemble({ history: [snapshot, request], tagHistoryItemIds: true });
+    expect(JSON.stringify(payload.messages)).not.toContain("[id: 11]");
+    expect(JSON.stringify(payload.messages)).toContain("[id: 12]");
+  });
 });
 
 describe("buildPlanInstructions", () => {

@@ -1,6 +1,10 @@
 import { describe, it, expect, spyOn } from "bun:test";
 
-import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
+import {
+  MEMORY_MAX_FILES_PER_SCOPE,
+  MEMORY_MAX_FILE_BYTES,
+  MEMORY_SCOPES,
+} from "@/common/constants/memory";
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1012,9 +1016,15 @@ describe("MemoryService", () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const checkpoint = "/memories/session/checkpoint.md";
+      // Only token-budget agents and the Memory tab opt in to the session scope.
+      const sessionCtx = (workspaceId: string) => ({
+        ...fixture.ctx,
+        workspaceId,
+        scopes: MEMORY_SCOPES,
+      });
       for (const workspaceId of ["ws-owner", "ws-child"]) {
         const created = await fixture.service.create(
-          { ...fixture.ctx, workspaceId },
+          sessionCtx(workspaceId),
           checkpoint,
           `${workspaceId} state`,
           "agent"
@@ -1026,7 +1036,7 @@ describe("MemoryService", () => {
         ["ws-owner", "ws-child"],
         ["ws-child", "ws-owner"],
       ]) {
-        const viewed = await fixture.service.view({ ...fixture.ctx, workspaceId }, checkpoint);
+        const viewed = await fixture.service.view(sessionCtx(workspaceId), checkpoint);
         expect(viewed.success).toBe(true);
         if (viewed.success) {
           expect(viewed.output).toContain(`${workspaceId} state`);
@@ -1034,11 +1044,14 @@ describe("MemoryService", () => {
         }
       }
       // The grandchild shares the owner's workspace scope but not its checkpoint.
-      const grandchild = await fixture.service.view(
-        { ...fixture.ctx, workspaceId: "ws-grandchild" },
+      const grandchild = await fixture.service.view(sessionCtx("ws-grandchild"), checkpoint);
+      expect(grandchild.success).toBe(false);
+      // Background agents (consolidation, refinement) use the default scopes and never see it.
+      const background = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
         checkpoint
       );
-      expect(grandchild.success).toBe(false);
+      expect(background.success).toBe(false);
       const ownerWorkspaceScope = await fixture.service.view(
         { ...fixture.ctx, workspaceId: "ws-owner" },
         "/memories/workspace"

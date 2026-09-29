@@ -6,6 +6,17 @@ export function getHistoryItemId(message: MuxMessage): string {
   const sequence = message.metadata?.historySequence;
   return Number.isSafeInteger(sequence) && sequence! >= 0 ? String(sequence) : `m:${message.id}`;
 }
+/** Rows session_history never returns, so no prompt may advertise their item IDs. */
+export function isHiddenFromSessionHistory(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  if (metadata == null) return false;
+  return (
+    metadata.contextBudgetRejected === true ||
+    metadata.muxMetadata?.type === "compaction-request" ||
+    (metadata.synthetic === true && metadata.uiVisible !== true) ||
+    metadata.rlmPreservedTailCopy === true
+  );
+}
 export function getContextWindowId(message?: MuxMessage): string {
   return message && isDurableContextBoundaryMarker(message)
     ? `w:${getHistoryItemId(message)}`

@@ -33,6 +33,7 @@ import {
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_SCOPES,
+  SHARED_MEMORY_SCOPES,
   MEMORY_VIEW_MAX_DEPTH,
   MEMORY_VIRTUAL_ROOT,
   type MemoryScope,
@@ -109,14 +110,15 @@ export interface MemoryScopeContext {
    */
   guardedWorkspaceId?: string;
   /**
-   * Scopes this caller may use; defaults to every scope (the Memory tab). The memory tool
-   * narrows it so an agent outside token-budget mode never sees the session scope.
+   * Scopes this caller may use; defaults to the shared scopes. Only the Memory tab and a
+   * token-budget agent's memory tool opt in to the session scope, so background agents
+   * (consolidation, refinement) never read another agent's checkpoint.
    */
   scopes?: readonly MemoryScope[];
 }
 
 function visibleScopes(ctx: MemoryScopeContext): readonly MemoryScope[] {
-  return ctx.scopes ?? MEMORY_SCOPES;
+  return ctx.scopes ?? SHARED_MEMORY_SCOPES;
 }
 
 export type MemoryActor = "agent" | "user";

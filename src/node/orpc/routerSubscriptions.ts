@@ -237,6 +237,9 @@ export function subscribeMemoryChanges(
           )
             return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
+          // Session stores are private to the acting workspace, and every
+          // workspace uses the same virtual session paths.
+          if (event.scope === "session" && event.workspaceId !== workspaceId) return;
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>

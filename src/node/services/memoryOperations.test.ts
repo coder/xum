@@ -439,7 +439,7 @@ describe("memory operations", () => {
     expect(result).toEqual({ success: false, error: expect.stringContaining("No memory file") });
   });
 
-  test("onChange drops workspace/project events from other workspaces/projects", async () => {
+  test("onChange drops workspace/project/session events from other workspaces/projects", async () => {
     const client = createClient({ enabled: true });
     const iterator = await client.memory.onChange({ workspaceId: "ws-mem" });
 
@@ -447,7 +447,7 @@ describe("memory operations", () => {
     const consumer = (async () => {
       for await (const event of iterator) {
         received.push(event);
-        if (received.length >= 3) break;
+        if (received.length >= 4) break;
       }
     })();
     // The route attaches its service listener lazily (on first pull).
@@ -456,6 +456,14 @@ describe("memory operations", () => {
     }
 
     const emit = (event: MemoryChangeEvent) => memoryService.emit("change", event);
+    // Dropped: another workspace's private session checkpoint (same virtual path).
+    emit({
+      scope: "session",
+      path: "/memories/session/checkpoint.md",
+      actor: "agent",
+      workspaceId: "ws-other",
+      projectPath,
+    });
     // Dropped: another workspace's workspace-scope file (same virtual path,
     // different physical file).
     emit({
@@ -498,6 +506,14 @@ describe("memory operations", () => {
       workspaceId: "ws-other",
       projectPath,
     });
+    // Delivered: own session checkpoint.
+    emit({
+      scope: "session",
+      path: "/memories/session/checkpoint.md",
+      actor: "agent",
+      workspaceId: "ws-mem",
+      projectPath,
+    });
     await consumer;
     expect(
       received.map((event) => {
@@ -508,6 +524,7 @@ describe("memory operations", () => {
       ["global", "ws-other"],
       ["workspace", "ws-mem"],
       ["project", "ws-other"],
+      ["session", "ws-mem"],
     ]);
   });
 

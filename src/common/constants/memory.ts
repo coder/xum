@@ -25,6 +25,11 @@ export const MEMORY_VIRTUAL_ROOT = "/memories";
 export const MEMORY_SCOPES = ["global", "project", "workspace", "session"] as const;
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
 
+/** Scopes every memory caller may use; the session scope needs an explicit opt-in. */
+export const SHARED_MEMORY_SCOPES: readonly MemoryScope[] = MEMORY_SCOPES.filter(
+  (scope) => scope !== "session"
+);
+
 /** Directory of the session scope inside the acting workspace's session dir. */
 export const SESSION_MEMORY_DIR_NAME = "session-memory";
 

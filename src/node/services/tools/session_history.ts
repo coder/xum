@@ -21,7 +21,10 @@ import {
   SESSION_HISTORY_DEFAULT_READ_CHARS,
   SESSION_HISTORY_MAX_RESULT_BYTES,
 } from "@/common/constants/contextBudget";
-import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
+import {
+  getHistoryItemId,
+  isHiddenFromSessionHistory,
+} from "@/common/utils/messages/contextWindows";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import type { HistoryScanState } from "@/node/services/historyCursor";
@@ -39,13 +42,7 @@ export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_histo
  */
 function projectHistory(message: MuxMessage): { text: string; toolNames: Set<string> } {
   const toolNames = new Set<string>();
-  if (
-    message.metadata?.contextBudgetRejected ||
-    message.metadata?.muxMetadata?.type === "compaction-request" ||
-    (message.metadata?.synthetic && !message.metadata.uiVisible) ||
-    message.metadata?.rlmPreservedTailCopy
-  )
-    return { text: "", toolNames };
+  if (isHiddenFromSessionHistory(message)) return { text: "", toolNames };
   const sanitize = (
     value: unknown,
     depth: number,

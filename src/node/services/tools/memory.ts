@@ -8,6 +8,7 @@ import {
   MEMORY_MAX_FILE_BYTES,
   MEMORY_SCOPES,
   MEMORY_VIRTUAL_ROOT,
+  SHARED_MEMORY_SCOPES,
   type MemoryScope,
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
@@ -62,7 +63,7 @@ export function resolveMemoryAccessPolicy(options: {
  * token-budget mode, so other agents never see it.
  */
 export function resolveMemoryScopes(tokenBudgetEnabled: boolean): readonly MemoryScope[] {
-  return tokenBudgetEnabled ? MEMORY_SCOPES : MEMORY_SCOPES.filter((scope) => scope !== "session");
+  return tokenBudgetEnabled ? MEMORY_SCOPES : SHARED_MEMORY_SCOPES;
 }
 
 /** Safe default, like READ_ONLY_ACCESS: without an explicit list, the session scope stays hidden. */

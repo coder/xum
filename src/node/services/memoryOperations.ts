@@ -12,6 +12,7 @@
 import { ORPCError } from "@orpc/server";
 import { Effect, Result, Schema } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MEMORY_SCOPES } from "@/common/constants/memory";
 import type * as schemas from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -84,6 +85,8 @@ function resolveMemoryScope(
       checkoutCwd: "",
       workspaceId,
       projectPath,
+      // The Memory tab shows the workspace's own session checkpoint too.
+      scopes: MEMORY_SCOPES,
     };
     return {
       projectPath,
@@ -108,11 +111,19 @@ export function listMemoryEffect(context: MemoryContext, input: Input<typeof sch
     );
     const meta = yield* context.memoryMetaService.effects.getEntries();
     const ids = { projectPath: resolved.projectPath, workspaceId: resolved.ownerWorkspaceId };
+    // Session sidecar keys follow the acting workspace, not the owner (logicalKeyFor).
+    const sessionIds = { ...ids, workspaceId: resolved.scopeCtx.workspaceId };
     return {
       success: true as const,
       data: {
         files: entries.map((entry) => {
-          const stats = meta.get(memoryLogicalKey(entry.scope, entry.relPath, ids));
+          const stats = meta.get(
+            memoryLogicalKey(
+              entry.scope,
+              entry.relPath,
+              entry.scope === "session" ? sessionIds : ids
+            )
+          );
           return {
             path: entry.path,
             scope: entry.scope,

@@ -10,7 +10,10 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
 import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
-import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
+import {
+  getHistoryItemId,
+  isHiddenFromSessionHistory,
+} from "@/common/utils/messages/contextWindows";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import {
@@ -141,8 +144,8 @@ export interface AssemblePromptPayloadOptions {
 /**
  * Codex parity: the model records the item ID of each relevant user request in its checkpoint and
  * later passes it to session_history read_item. The ID is the persisted history sequence, so the
- * tag never changes between requests and the prompt cache stays stable. Budget-internal rows and
- * request-only rows (no sequence) get no tag.
+ * tag never changes between requests and the prompt cache stays stable. Budget-internal rows,
+ * rows session_history hides, and request-only rows (no sequence) get no tag.
  */
 function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
   return messages.map((message) => {
@@ -152,13 +155,25 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
       sequence == null ||
       !Number.isSafeInteger(sequence) ||
       sequence < 0 ||
-      isTokenBudgetInternalMessage(message)
+      isTokenBudgetInternalMessage(message) ||
+      isHiddenFromSessionHistory(message)
     ) {
       return message;
     }
+    const tag = `[id: ${getHistoryItemId(message)}]`;
+    // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
+    // message, so a separate tag part is dropped when this row merges with a neighbour.
+    const lastText = message.parts.findLastIndex((part) => part.type === "text");
     return {
       ...message,
-      parts: [...message.parts, { type: "text", text: `[id: ${getHistoryItemId(message)}]` }],
+      parts:
+        lastText === -1
+          ? [...message.parts, { type: "text", text: tag }]
+          : message.parts.map((part, index) =>
+              index === lastText && part.type === "text"
+                ? { ...part, text: `${part.text}\n${tag}` }
+                : part
+            ),
     };
   });
 }
