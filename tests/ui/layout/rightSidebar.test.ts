@@ -764,9 +764,9 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("closes a new terminal whose tab would not fit the persisted layout", async () => {
-    // Pad the tabset id so the layout sits just under its budget: a terminal tab (~45 chars)
-    // no longer fits, and a refused layout write would drop the tab but keep the shell running.
+  test("a new terminal gets its tab even when the layout no longer fits its budget", async () => {
+    // Pad the tabset id so the layout sits just under its budget: with a terminal tab (~45 chars)
+    // it no longer fits. That layout write used to be refused, so the terminal never got a tab.
     const base = getDefaultRightSidebarLayoutState("costs");
     const padding = "p".repeat(
       Math.floor((RIGHT_SIDEBAR_LAYOUT_MAX_CHARS - 20 - JSON.stringify(base).length) / 2)
@@ -777,8 +777,9 @@ describeIntegration("RightSidebar (UI)", () => {
       focusedTabsetId: tabsetId,
       root: { ...base.root, id: tabsetId } as RightSidebarLayoutState["root"],
     };
+    const layoutKey = getRightSidebarLayoutKey(workspaceId);
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
-      expect(updatePersistedState(getRightSidebarLayoutKey(workspaceId), paddedLayout)).toBe(true);
+      expect(updatePersistedState(layoutKey, paddedLayout)).toBe(true);
     });
 
     try {
@@ -792,19 +793,14 @@ describeIntegration("RightSidebar (UI)", () => {
 
       await waitFor(
         () => {
-          const alert = document.body.querySelector('[role="alert"]');
-          expect(alert?.textContent).toContain("Too many terminals");
+          expect(sidebar.querySelector('[role="tab"][aria-controls*="terminal:"]')).toBeTruthy();
         },
         { timeout: 10_000 }
       );
-      expect(sidebar.querySelector('[role="tab"][aria-controls*="terminal:"]')).toBeNull();
-      // The shell created for the refused tab is closed instead of orphaned.
-      await waitFor(
-        async () => {
-          expect(await env.orpc.terminal.listSessions({ workspaceId })).toEqual([]);
-        },
-        { timeout: 10_000 }
-      );
+      expect(await env.orpc.terminal.listSessions({ workspaceId })).toHaveLength(1);
+      // The oversized layout lives in memory only; localStorage keeps the last layout that fit.
+      expect(window.localStorage.getItem(layoutKey)).toContain(tabsetId);
+      expect(window.localStorage.getItem(layoutKey)).not.toContain("terminal:");
     } finally {
       await cleanup();
     }

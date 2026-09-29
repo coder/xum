@@ -3,7 +3,6 @@ import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   getReviewImmersiveKey,
-  RIGHT_SIDEBAR_LAYOUT_MAX_CHARS,
   TERMINAL_TITLES_MAX_CHARS,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
@@ -247,11 +246,6 @@ const DragAwarePanelResizeHandle: React.FC<{
 
   return <PanelResizeHandle className={className} />;
 };
-
-/** Whether the layout fits its key budget, so persisting it is not refused. */
-function rightSidebarLayoutFits(layout: RightSidebarLayoutState): boolean {
-  return JSON.stringify(layout).length <= RIGHT_SIDEBAR_LAYOUT_MAX_CHARS;
-}
 
 /** Longest title kept per terminal in the persisted map (deep working directories get long). */
 const PERSISTED_TERMINAL_TITLE_MAX_CHARS = 96;
@@ -1551,18 +1545,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       void createTerminalSession(api, workspaceId, options)
         .then((session) => {
           const newTab = makeTerminalTabType(session.sessionId);
-          // The layout cannot be trimmed, and a refused layout write would drop the new tab
-          // while its shell keeps running. Close the session instead when the tab won't fit.
-          if (!rightSidebarLayoutFits(addTabToFocusedTabset(getBaseLayout(), newTab))) {
-            api.terminal.close({ sessionId: session.sessionId }).catch((err: unknown) => {
-              console.warn("[RightSidebar] Failed to close terminal session:", err);
-            });
-            terminalCreateError.showError(
-              "terminal-create",
-              "Too many terminals in this workspace. Close one to open another."
-            );
-            return;
-          }
           setLayout((prev) => addTabToFocusedTabset(prev, newTab));
           // Schedule focus for this terminal (will be consumed when the tab mounts)
           setAutoFocusTerminalSession(session.sessionId);
@@ -1572,7 +1554,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           terminalCreateError.showError("terminal-create", getErrorMessage(err));
         });
     },
-    [api, workspaceId, getBaseLayout, setLayout, setCollapsed, terminalCreateError]
+    [api, workspaceId, setLayout, setCollapsed, terminalCreateError]
   );
 
   // Expose handleAddTerminal to parent via ref (for Cmd/Ctrl+T keybind)

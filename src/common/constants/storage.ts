@@ -976,7 +976,8 @@ export const AUTO_EXPAND_PREFS_MAX_CHARS = 512;
 export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
 /**
  * right-sidebar:layout:{workspaceId}: dock layout tree, ~200 chars plus ~45 per terminal tab, so
- * about 35 terminals. The layout cannot be trimmed; RightSidebar refuses a terminal that won't fit.
+ * about 35 terminals. The layout cannot be trimmed; a larger layout lives in memory for the
+ * session (see usePersistedState), and on reload terminal tabs are restored from the backend.
  */
 export const RIGHT_SIDEBAR_LAYOUT_MAX_CHARS = 1792;
 /** right-sidebar:terminal-titles:{workspaceId}: RightSidebar keeps the newest titles that fit. */

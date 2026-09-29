@@ -15,6 +15,7 @@ import {
   getTimelineFilterKey,
 } from "@/common/constants/storage";
 import {
+  readPersistedState,
   removePersistedStateKeys,
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
@@ -183,26 +184,37 @@ describe("persisted state key budgets", () => {
     cleanupDom = null;
   });
 
-  test("accepts a value at its budget and refuses one char more, logging once", () => {
+  test("stores a value at its budget; one char more stays in memory only, logged once", () => {
     const key = getTimelineFilterKey("budget0001");
     const atBudget = valueOfLength(TIMELINE_FILTER_BUDGET);
 
     expect(updatePersistedState(key, atBudget)).toBe(true);
     const overBudget = valueOfLength(TIMELINE_FILTER_BUDGET + 1);
-    expect(updatePersistedState(key, overBudget)).toBe(false);
-    expect(updatePersistedState(key, overBudget)).toBe(false);
+    expect(updatePersistedState(key, overBudget)).toBe(true);
+    expect(updatePersistedState(key, overBudget)).toBe(true);
 
+    // Readers see the new value for this session; localStorage keeps the last value that fit.
+    expect(readPersistedState(key, "")).toBe(overBudget);
     expect(window.localStorage.getItem(key)).toBe(JSON.stringify(atBudget));
     expect(refusalLogsFor(key)).toHaveLength(1);
+
+    // A value that fits again is stored and replaces the in-memory one; removal clears both.
+    expect(updatePersistedState(key, "tools")).toBe(true);
+    expect(window.localStorage.getItem(key)).toBe(JSON.stringify("tools"));
+    expect(updatePersistedState(key, overBudget)).toBe(true);
+    expect(updatePersistedState(key, null)).toBe(true);
+    expect(readPersistedState(key, "all")).toBe("all");
   });
 
-  test("an over-budget hook update leaves the UI state and stored value unchanged", () => {
+  test("an over-budget hook update changes the UI state but not the stored value", () => {
     const key = getTimelineFilterKey("budget0002");
     const { result } = renderHook(() => usePersistedState(key, "all"));
+    const overBudget = valueOfLength(TIMELINE_FILTER_BUDGET + 1);
 
-    act(() => result.current[1](valueOfLength(TIMELINE_FILTER_BUDGET + 1)));
+    // A refused write used to leave the UI unchanged, which froze whatever wrote it.
+    act(() => result.current[1](overBudget));
 
-    expect(result.current[0]).toBe("all");
+    expect(result.current[0]).toBe(overBudget);
     expect(window.localStorage.getItem(key)).toBeNull();
     expect(refusalLogsFor(key)).toHaveLength(1);
   });
@@ -213,6 +225,9 @@ describe("persisted state key budgets", () => {
 
     expect(updatePersistedState(unregistered, true)).toBe(false);
     syncPersistedStateFromBackend(overlongKey, "all");
+    // Unlike over-budget values, these are not kept in memory either.
+    expect(readPersistedState(unregistered, null)).toBeNull();
+    expect(readPersistedState(overlongKey, null)).toBeNull();
     expect(window.localStorage.getItem(unregistered)).toBeNull();
     expect(window.localStorage.getItem(overlongKey)).toBeNull();
     expect(refusalLogsFor(unregistered)).toHaveLength(1);
