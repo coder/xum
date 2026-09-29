@@ -497,20 +497,22 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Missing list.json: empty and not existing. Unparseable, a malformed structure or dropped
-   * malformed entries: the valid entries, treated as not existing (with a warning), so the next
-   * write relists the bodies of lost rows (see mutateList). Other read failures throw, so a write
-   * never replaces a list it could not read.
+   * "missing": no list.json yet. "damaged": unparseable, a malformed structure or dropped malformed
+   * entries (the valid entries are kept, with a warning); the next mutation rebuilds it (see
+   * mutateList). Other read failures throw, so a write never replaces a list it could not read.
    */
-  private async readListFile(): Promise<{ entries: DraftListEntry[]; exists: boolean }> {
+  private async readListFile(): Promise<{
+    entries: DraftListEntry[];
+    state: "ok" | "missing" | "damaged";
+  }> {
     let raw: unknown;
     try {
       raw = JSON.parse(await fs.readFile(this.listFile, "utf-8"));
     } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) return { entries: [], exists: false };
+      if (hasErrorCode(error, "ENOENT")) return { entries: [], state: "missing" };
       if (!(error instanceof SyntaxError)) throw error;
-      log.warn(`Ignoring unparseable creation draft list ${this.listFile}`, { error });
-      return { entries: [], exists: false };
+      log.warn(`Rebuilding unparseable creation draft list ${this.listFile}`, { error });
+      return { entries: [], state: "damaged" };
     }
     const rawEntries = (raw as { entries?: unknown } | null)?.entries;
     const entries: DraftListEntry[] = [];
@@ -520,13 +522,15 @@ export class DraftService extends EventEmitter {
     }
     const intact = Array.isArray(rawEntries) && entries.length === rawEntries.length;
     if (!intact) log.warn(`Rebuilding malformed creation draft list ${this.listFile}`);
-    return { entries, exists: intact };
+    return { entries, state: intact ? "ok" : "damaged" };
   }
 
   /**
    * Read-modify-write list.json under its own lock (taken inside a body lock only by `delete`,
-   * never the other way round). `change` returns the new entries, or null for no change. The first
-   * write of a missing or damaged list also lists every non-empty creation body without an entry.
+   * never the other way round). `change` returns the new entries, or null for no change. Writing a
+   * missing list, and every mutation of a damaged one (even a no-op), also lists each owned,
+   * non-empty creation body without an entry. A missing list is not created by a no-op: on
+   * upgrade the startup GC runs before the renderer's legacy import, whose sub-projects must win.
    * Returns the (new) list revision.
    */
   private mutateList(
@@ -536,12 +540,11 @@ export class DraftService extends EventEmitter {
     ) => DraftListEntry[] | null | Promise<DraftListEntry[] | null>
   ): Promise<number> {
     return withTargetMutationLock(this.config.rootDir, this.listFile, async () => {
-      const { entries, exists } = await this.readListFile();
-      const changed = await change(entries, exists);
-      if (changed === null) return this.listRevision;
-      const next = exists
-        ? changed
-        : [...changed, ...(await this.findUnlistedCreationDrafts(changed))];
+      const { entries, state } = await this.readListFile();
+      let next = await change(entries, state === "ok");
+      if (next === null && state !== "damaged") return this.listRevision;
+      next ??= entries;
+      if (state !== "ok") next = [...next, ...(await this.findUnlistedCreationDrafts(next))];
       await fs.mkdir(this.creationRoot, { recursive: true });
       await writeFileAtomic(
         this.listFile,
@@ -567,13 +570,18 @@ export class DraftService extends EventEmitter {
     });
   }
 
-  /** Non-empty creation draft bodies without a list entry (never the default draft), oldest first. */
+  /**
+   * Non-empty creation draft bodies of owned projects without a list entry (never the default
+   * draft), oldest first.
+   */
   private async findUnlistedCreationDrafts(listed: DraftListEntry[]): Promise<DraftListEntry[]> {
     await this.ensureIndex();
+    const owned = this.configuredProjectDirNames();
     const found: DraftListEntry[] = [];
     for (const { summary, filePath } of [...this.index.values()]) {
       const scope = summary.scope;
       if (scope.kind !== "creation" || scope.draftId === DEFAULT_CREATION_DRAFT_ID) continue;
+      if (!owned.has(projectDraftsDirName(scope.projectPath))) continue;
       if (listed.some((entry) => isSameListEntry(entry, scope))) continue;
       let createdAt: number;
       try {

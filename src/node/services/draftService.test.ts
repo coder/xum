@@ -610,3 +610,45 @@ describe("DraftService creation draft list self-healing", () => {
     expect(snapshot.list.entries).toEqual([]);
   });
 });
+
+describe("DraftService creation draft list repair", () => {
+  it("rebuilds a damaged list even when the requested change is a no-op", async () => {
+    using tempDir = new TestTempDir("drafts-list-noop-repair");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    const kept = { projectPath, draftId: "kept", subProjectPath: null, createdAt: 1 };
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.writeFile(listFile, JSON.stringify({ version: 1, entries: [kept, { draftId: 7 }] }));
+
+    await service.putListEntry(kept);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      "kept",
+      "lost",
+    ]);
+  });
+
+  it("never relists the bodies of unconfigured projects", async () => {
+    using tempDir = new TestTempDir("drafts-list-unowned-bodies");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const removed = path.join(tempDir.path, "removed");
+    await config.editConfig((current) => {
+      current.projects.set(removed, { workspaces: [] });
+      return current;
+    });
+    await service.update({
+      scope: { kind: "creation", projectPath: removed, draftId: "gone" },
+      text: "a",
+    });
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "mine" }, text: "b" });
+    // Removed without its cleanup (e.g. it failed): the body is still on disk.
+    await config.editConfig((current) => {
+      current.projects.delete(removed);
+      return current;
+    });
+
+    await new DraftService(config).importLegacyList([]);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["mine"]);
+  });
+});
