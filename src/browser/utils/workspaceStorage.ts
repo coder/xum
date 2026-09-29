@@ -20,16 +20,19 @@ import {
  * Copy all workspace-specific localStorage keys from source to destination workspace.
  * Includes registry keys marked copyOnFork (model, review state, etc). Composer drafts are not
  * here: they live on the backend, whose fork copies the draft (DraftService).
+ * Returns false when any present value could not be written to the destination.
  */
-export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): void {
+export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): boolean {
+  let copiedAll = true;
   for (const { getKey, copyOnFork } of WORKSPACE_KEY_REGISTRATIONS) {
     if (!copyOnFork) continue;
     const value = readPersistedRawString(getKey(sourceWorkspaceId));
-    if (value !== null) {
-      // Copy the serialized value verbatim so the destination is byte-identical to the source.
-      writePersistedRawString(getKey(destWorkspaceId), value);
+    // Copy the serialized value verbatim so the destination is byte-identical to the source.
+    if (value !== null && !writePersistedRawString(getKey(destWorkspaceId), value)) {
+      copiedAll = false;
     }
   }
+  return copiedAll;
 }
 
 /**
@@ -57,9 +60,11 @@ export function listWorkspaceStorageGcCandidateKeys(): string[] {
 
 /**
  * Migrate all workspace-specific localStorage keys from old to new workspace ID
- * Should be called when a workspace is renamed to preserve settings
+ * Should be called when a workspace is renamed to preserve settings.
+ * If any copy fails (e.g. the quota is full), the old keys are kept: the write helpers report
+ * failure instead of throwing, and deleting anyway would erase the only persisted copy.
  */
 export function migrateWorkspaceStorage(oldWorkspaceId: string, newWorkspaceId: string): void {
-  copyWorkspaceStorage(oldWorkspaceId, newWorkspaceId);
+  if (!copyWorkspaceStorage(oldWorkspaceId, newWorkspaceId)) return;
   deleteWorkspaceStorage(oldWorkspaceId);
 }
