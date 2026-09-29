@@ -652,3 +652,41 @@ describe("DraftService creation draft list repair", () => {
     expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["mine"]);
   });
 });
+
+describe("DraftService creation draft list compatibility", () => {
+  it("keeps the data of a newer list file version when it writes the list", async () => {
+    using tempDir = new TestTempDir("drafts-list-newer-version");
+    const { config, projectPath } = await createHarness(tempDir);
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.mkdir(path.dirname(listFile), { recursive: true });
+    const future = {
+      projectPath,
+      draftId: "future",
+      subProjectPath: null,
+      createdAt: 1,
+      pinned: true,
+    };
+    await fs.writeFile(
+      listFile,
+      JSON.stringify({ version: 2, order: ["future"], entries: [future] })
+    );
+
+    await new DraftService(config).putListEntry({
+      projectPath,
+      draftId: "added",
+      subProjectPath: null,
+      createdAt: 2,
+    });
+    const written = JSON.parse(await fs.readFile(listFile, "utf-8")) as {
+      version: number;
+      order: string[];
+      entries: Array<{ draftId: string; pinned?: boolean }>;
+    };
+    expect(written.version).toBe(2);
+    expect(written.order).toEqual(["future"]);
+    expect(written.entries.map(({ draftId, pinned }) => [draftId, pinned])).toEqual([
+      ["future", true],
+      ["added", undefined],
+    ]);
+  });
+});

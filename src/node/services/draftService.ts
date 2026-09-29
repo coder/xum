@@ -324,8 +324,13 @@ export class DraftService extends EventEmitter {
       // be registered again (with a new creation draft) by now; its drafts are owned again.
       if (this.configuredProjectDirNames().has(dirName)) return;
       await this.clearProjectDir(projectDir);
+      // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the bodies
+      // are gone the rows go too, even if the path is registered again right after.
+      await this.mutateList((entries) => {
+        const next = entries.filter((entry) => entry.projectPath !== projectPath);
+        return next.length === entries.length ? null : next;
+      });
     });
-    await this.removeUnownedListEntries();
   }
 
   /**
@@ -504,25 +509,29 @@ export class DraftService extends EventEmitter {
   private async readListFile(): Promise<{
     entries: DraftListEntry[];
     state: "ok" | "missing" | "damaged";
+    /** Other top-level fields of the file (a newer version's data), written back unchanged. */
+    extra: Record<string, unknown>;
   }> {
     let raw: unknown;
     try {
       raw = JSON.parse(await fs.readFile(this.listFile, "utf-8"));
     } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) return { entries: [], state: "missing" };
+      if (hasErrorCode(error, "ENOENT")) return { entries: [], state: "missing", extra: {} };
       if (!(error instanceof SyntaxError)) throw error;
       log.warn(`Rebuilding unparseable creation draft list ${this.listFile}`, { error });
-      return { entries: [], state: "damaged" };
+      return { entries: [], state: "damaged", extra: {} };
     }
-    const rawEntries = (raw as { entries?: unknown } | null)?.entries;
+    const { entries: rawEntries, ...extra } =
+      typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
     const entries: DraftListEntry[] = [];
     for (const rawEntry of Array.isArray(rawEntries) ? rawEntries : []) {
-      const parsed = DraftListEntrySchema.safeParse(rawEntry);
+      // passthrough: fields a newer version added to an entry survive a rewrite by this one.
+      const parsed = DraftListEntrySchema.passthrough().safeParse(rawEntry);
       if (parsed.success) entries.push(parsed.data);
     }
     const intact = Array.isArray(rawEntries) && entries.length === rawEntries.length;
     if (!intact) log.warn(`Rebuilding malformed creation draft list ${this.listFile}`);
-    return { entries, state: intact ? "ok" : "damaged" };
+    return { entries, state: intact ? "ok" : "damaged", extra };
   }
 
   /**
@@ -540,16 +549,18 @@ export class DraftService extends EventEmitter {
     ) => DraftListEntry[] | null | Promise<DraftListEntry[] | null>
   ): Promise<number> {
     return withTargetMutationLock(this.config.rootDir, this.listFile, async () => {
-      const { entries, state } = await this.readListFile();
+      const { entries, state, extra } = await this.readListFile();
       let next = await change(entries, state === "ok");
       if (next === null && state !== "damaged") return this.listRevision;
       next ??= entries;
       if (state !== "ok") next = [...next, ...(await this.findUnlistedCreationDrafts(next))];
       await fs.mkdir(this.creationRoot, { recursive: true });
-      await writeFileAtomic(
-        this.listFile,
-        JSON.stringify({ version: LIST_FILE_VERSION, entries: next })
-      );
+      // A newer version's file keeps its version and data (downgrade, then upgrade again).
+      const version =
+        typeof extra.version === "number" && extra.version > LIST_FILE_VERSION
+          ? extra.version
+          : LIST_FILE_VERSION;
+      await writeFileAtomic(this.listFile, JSON.stringify({ ...extra, version, entries: next }));
       this.listRevision++;
       const event: DraftEvent = { type: "list", entries: next, revision: this.listRevision };
       this.emit(DraftService.CHANGE_EVENT, event);
