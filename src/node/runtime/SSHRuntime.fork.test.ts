@@ -599,7 +599,11 @@ describe("SSHRuntime.forkWorkspace finalize-failure branch cleanup", () => {
         stderr: "fatal: a branch named 'feature-new' already exists\n",
         exitCode: 128,
       },
-      { matches: (c) => c.includes("MUX_FORK_MV_FAILED"), stdout: "MUX_FORK_MV_FAILED\n", exitCode: 8 }
+      {
+        matches: (c) => c.includes("MUX_FORK_MV_FAILED"),
+        stdout: "MUX_FORK_MV_FAILED\n",
+        exitCode: 8,
+      }
     );
 
     const result = await runtime.forkWorkspace(buildForkParams());
