@@ -73,6 +73,7 @@ import {
   type ParsedAcpSlashCommand,
 } from "./slashCommands";
 import { StreamTranslator } from "./streamTranslator";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { ToolRouter } from "./toolRouter";
 
 const DEFAULT_AGENT_ID = "exec";
@@ -918,7 +919,9 @@ export class MuxAgent implements Agent {
         // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
         // the one it was queued with, so the turn binds only its own stream. A resend that is
         // queued and then refused at dequeue is held again under this id and settles the turn
-        // (settleTurnHeldBeforeStart). A refused resend stays held and the user is told why.
+        // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
+        // which says whether the input is still held (it may have been sent or discarded
+        // elsewhere since the notice).
         let refusal: string | undefined;
         const response = await this.dispatchAndAwaitTurn(
           { sessionId, workspaceId, requiresExactCorrelation: true },
@@ -933,7 +936,7 @@ export class MuxAgent implements Agent {
               },
             });
             if (!sendResult.success) {
-              refusal = stringifyUnknown(sendResult.error);
+              refusal = formatSendMessageError(sendResult.error).message;
               throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
             }
           }
@@ -947,7 +950,7 @@ export class MuxAgent implements Agent {
         assert(refusal != null, "send-held: a failed resend records its refusal");
         return this.respondToCommand(
           sessionId,
-          `Could not send unsent message ${lookup.number}; it is still held: ${refusal}`
+          `Could not send unsent message ${lookup.number}: ${refusal}`
         );
       }
 

@@ -1982,11 +1982,12 @@ describe("ACP /send-held (#5170)", () => {
       }),
     });
     await expect(prompt("/send-held 1")).resolves.toMatchObject({ stopReason: "end_turn" });
-    expect(
-      harness.sessionUpdates.some(({ update }) =>
-        JSON.stringify(update).includes("This unsent message is no longer held.")
-      )
-    ).toBe(true);
+    const replies = harness.sessionUpdates
+      .map(({ update }) => JSON.stringify(update))
+      .filter((text) => text.includes("This unsent message is no longer held."));
+    expect(replies).toHaveLength(1);
+    // The backend knows whether the input is still held; the reply must not contradict it.
+    expect(replies[0]).not.toContain("still held");
     // The failed resend left no pending turn: a later command still runs.
     await expect(prompt("/discard-held 2")).resolves.toMatchObject({ stopReason: "end_turn" });
     expect(harness.discardHeldInputCalls).toEqual([
