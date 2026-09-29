@@ -8,6 +8,8 @@ import {
 
 import {
   readPersistedRawString,
+  readPersistedState,
+  readPersistedString,
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
   updatePersistedState,
@@ -40,6 +42,9 @@ describe("raw persisted strings when storage access is denied", () => {
 
     expect(readPersistedRawString("mux:auth-token")).toBeNull();
     expect(writePersistedRawString("mux:auth-token", "token")).toBe(false);
+    // JSON reads (e.g. palette recents, experiment flags in state initializers) use defaults.
+    expect(readPersistedState("commandPalette:recent", ["none"])).toEqual(["none"]);
+    expect(readPersistedString("uiTheme")).toBeUndefined();
   });
 });
 
