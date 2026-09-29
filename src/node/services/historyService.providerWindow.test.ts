@@ -224,6 +224,24 @@ describe("HistoryService bounded active-epoch reads", () => {
       });
       expect(ids(result.messages)).toEqual(["a1003", "big", "u5", "a1006", "a1007", "a1008"]);
       expectSuffix(fullRead, result.messages);
+
+      // An oversized row that turns out to be malformed projects nothing, so it must not use up
+      // the row cap: the window still returns the newest readable row instead of nothing.
+      const malformedWs = "window-oversized-malformed";
+      await writeLayout(malformedWs, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 2),
+        `{"broken": "${"y".repeat(OVERSIZED)}`,
+      ]);
+      const afterMalformed = await window(malformedWs, {
+        maxRows: 1,
+        maxBytes: BIG,
+        extensionMaxRows: 0,
+        extensionMaxBytes: 0,
+      });
+      expect(ids(afterMalformed.messages)).toEqual(["a1002"]);
+      expect(afterMalformed.reachedEpochStart).toBe(false);
+      expectSuffix(await full(malformedWs), afterMalformed.messages);
     });
 
     test("starts on a real user turn and keeps its snapshot cluster", async () => {
@@ -259,6 +277,24 @@ describe("HistoryService bounded active-epoch reads", () => {
       // A turn start on the fill row itself still pulls in its cluster.
       const atStart = await window(ws, { maxRows: 5, maxBytes: BIG, ...UNBOUNDED_EXTENSION });
       expect(atStart.messages[0].id).toBe("s3");
+    });
+
+    test("a cap that lands inside a prompt's snapshot cluster stops after that cluster", async () => {
+      const ws = "window-cap-in-cluster";
+      await writeLayout(ws, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 3),
+        fileSnapshot("s4", 4),
+        fileSnapshot("s5", 5),
+        row("u6", "user", 6),
+        ...assistants(7, 7),
+      ]);
+      // Newest first: a1007, u6, then the cap lands on s5, which belongs to u6's cluster. The
+      // window must take s4 and stop, not extend through the older turn to u0.
+      const result = await window(ws, { maxRows: 3, maxBytes: BIG, ...UNBOUNDED_EXTENSION });
+      expect(ids(result.messages)).toEqual(["s4", "s5", "u6", "a1007"]);
+      expect(result.reachedEpochStart).toBe(false);
+      expectSuffix(await full(ws), result.messages);
     });
 
     test("oversized prompt and snapshot rows keep the turn's snapshot cluster", async () => {
@@ -504,6 +540,38 @@ describe("HistoryService bounded active-epoch reads", () => {
       const toStart = await page(ws, { beforeHistorySequence: 6, throughHistorySequence: 3 });
       expect(ids(toStart.messages)).toEqual(["b3", "a1004", "a1005"]);
       expect(toStart.reachedEpochStart).toBe(true);
+    });
+
+    test("rows with an equal sequence survive a page boundary when the cursor names its row", async () => {
+      const ws = "page-equal-sequence";
+      // Duplicate sequences (an old multi-backend race or a repaired file) must stay browsable:
+      // the cursor row's id tells rows at or before the cursor apart from rows after it.
+      await writeLayout(ws, null, [
+        ...assistants(0, 3),
+        row("d4a", "assistant", 4),
+        row("d4b", "assistant", 4),
+        row("d4c", "assistant", 4),
+        ...assistants(5, 7),
+      ]);
+      const expected = await full(ws);
+      for (const maxRows of [1, 2]) {
+        const pages: MuxMessage[][] = [];
+        let cursor: { beforeHistorySequence: number; beforeMessageId?: string } = {
+          beforeHistorySequence: 8,
+        };
+        for (let guard = 0; guard < 50; guard++) {
+          const result = await page(ws, { ...cursor, maxRows });
+          expect(result.messages.length).toBeGreaterThan(0);
+          pages.unshift(result.messages);
+          if (result.reachedEpochStart) break;
+          const oldest = result.messages[0];
+          cursor = {
+            beforeHistorySequence: oldest.metadata!.historySequence!,
+            beforeMessageId: oldest.id,
+          };
+        }
+        expect(ids(pages.flat())).toEqual(ids(expected));
+      }
     });
 
     test("honors the byte cap", async () => {

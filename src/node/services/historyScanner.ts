@@ -904,11 +904,6 @@ async function projectActiveEpochRows(rows: readonly ActiveEpochRow[]): Promise<
   return messages;
 }
 
-/** Rows the full read may project: readable rows, and oversized rows (parsed only at the end). */
-function mayProjectRow(row: ScannedHistoryRow): boolean {
-  return row.message !== null || row.size > SESSION_HISTORY_MAX_LINE_BYTES;
-}
-
 /**
  * A row's message as a window cut sees it: during the scan an oversized row's type is unknown
  * (the locator does not parse it); the final cut re-reads it.
@@ -949,10 +944,12 @@ export interface HistoryWindowCaps {
  * Chooses how many newest-first rows a replay window keeps. Rows are pushed newest first; `push`
  * returns true once the cut is decided, which always happens on a row outside the window (the
  * row past a snapshot cluster or past the extension bound), so `keep` never counts it.
- * Rows count only when the full read may project them; bytes count every row read.
+ * Rows count only when they project a message ("unknown" counts, since an oversized row may);
+ * bytes count every row read.
  * An "unknown" (oversized, unparsed) row never starts a turn and never ends a snapshot cluster,
- * so the scan over-visits; the final cut, which knows every type, then decides at or before the
- * scan's cut, within the rows the scan visited.
+ * so the scan over-visits. The final cut knows every type: it cuts within the rows the scan
+ * visited, and when an oversized row parsed to nothing it may use them all and keep fewer rows
+ * than the caps (the scan stopped conservatively early).
  */
 function createHistoryWindowCutter(caps: HistoryWindowCaps) {
   let phase: "fill" | "extend" | "cluster" | "done" = "fill";
@@ -961,19 +958,28 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
   let bytes = 0;
   let extensionRows = 0;
   let extensionBytes = 0;
+  // Whether the rows pushed so far end inside a turn start's snapshot cluster, so a cap that
+  // lands on one of its snapshot rows keeps only the rest of that cluster.
+  let inCluster = false;
+  const endsCluster = (message: WindowCutMessage) =>
+    message !== null && message !== "unknown" && !isTurnSnapshotRow(message);
   return {
     get keep() {
       return keep;
     },
     push(row: ScannedHistoryRow, message: WindowCutMessage): boolean {
       if (phase === "done") return true;
-      const projected = mayProjectRow(row);
+      // A malformed row projects nothing even when oversized, so it must not use up the caps'
+      // row count (the final cut passes the parsed message; the scan passes "unknown").
+      const projected = message !== null;
       if (phase === "fill") {
         keep++;
         if (projected) rows++;
         bytes += row.size;
+        if (isTurnStartRow(message)) inCluster = true;
+        else if (endsCluster(message)) inCluster = false;
         if (rows > 0 && (rows >= caps.maxRows || bytes >= caps.maxBytes)) {
-          phase = isTurnStartRow(message) ? "cluster" : "extend";
+          phase = inCluster ? "cluster" : "extend";
         }
         return false;
       }
@@ -985,12 +991,7 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         phase = "done";
         return true;
       }
-      if (
-        phase === "cluster" &&
-        projected &&
-        message !== "unknown" &&
-        !isTurnSnapshotRow(message)
-      ) {
+      if (phase === "cluster" && endsCluster(message)) {
         // The snapshot cluster ended: this row belongs to an older turn.
         phase = "done";
         return true;
@@ -1086,6 +1087,13 @@ export function readProviderHistorySinceFloor(
 export interface HistoryPageOptions {
   /** Only rows with an integer historySequence below this are returned. */
   beforeSequence: number;
+  /**
+   * The id of the cursor row (the oldest row the caller holds, with sequence `beforeSequence`).
+   * When set, rows with that same sequence that sit before the cursor row in the file are
+   * returned too, so duplicate sequences (an old multi-backend race, a repaired file) never
+   * fall between two pages. Without it, or when the cursor row is gone, they are left out.
+   */
+  beforeMessageId?: string;
   maxRows: number;
   maxBytes: number;
   /**
@@ -1095,10 +1103,24 @@ export interface HistoryPageOptions {
   throughSequence?: number;
 }
 
-/** Whether a page may include this row at all (its sequence is an integer below `before`). */
-function isPageCandidate(message: MuxMessage | null, options: HistoryPageOptions): boolean {
-  const sequence = message?.metadata?.historySequence;
-  return isNonNegativeInteger(sequence) && sequence < options.beforeSequence;
+/**
+ * Whether a page may include a row at all: its sequence is an integer below `before`, or equal to
+ * it and the row sits before the cursor row (see `beforeMessageId`). Rows must be passed newest
+ * first; asking twice about the same row gives the same answer.
+ */
+function createPageCandidateFilter(options: HistoryPageOptions) {
+  let cursorSeen = false;
+  return (message: MuxMessage | null): boolean => {
+    const sequence = message?.metadata?.historySequence;
+    if (!isNonNegativeInteger(sequence)) return false;
+    if (sequence < options.beforeSequence) return true;
+    if (sequence !== options.beforeSequence || options.beforeMessageId === undefined) return false;
+    if (message!.id === options.beforeMessageId) {
+      cursorSeen = true;
+      return false;
+    }
+    return cursorSeen;
+  };
 }
 
 /**
@@ -1106,13 +1128,16 @@ function isPageCandidate(message: MuxMessage | null, options: HistoryPageOptions
  * includes, "skip" for a row it filters out, and "full" for the first row it would include past
  * its caps. A row that would exceed `maxBytes` is left out unless the page is still empty.
  */
-function createHistoryPageSelector(options: HistoryPageOptions) {
+function createHistoryPageSelector(
+  options: HistoryPageOptions,
+  isPageCandidate: (message: MuxMessage | null) => boolean
+) {
   let rows = 0;
   let bytes = 0;
   let throughReached = false;
   return (message: MuxMessage | "unknown", size: number): "take" | "skip" | "full" => {
     const sequence = message === "unknown" ? undefined : message.metadata?.historySequence;
-    if (message !== "unknown" && !isPageCandidate(message, options)) return "skip";
+    if (message !== "unknown" && !isPageCandidate(message)) return "skip";
     const rowCapped = options.throughSequence === undefined && rows >= options.maxRows;
     if (throughReached || rowCapped || (rows > 0 && bytes + size > options.maxBytes)) return "full";
     rows++;
@@ -1125,8 +1150,8 @@ function createHistoryPageSelector(options: HistoryPageOptions) {
 
 /**
  * The newest rows of readProviderHistory(paths) whose historySequence is an integer below
- * `beforeSequence` (rows with a missing or non-numeric sequence are left out, as in
- * getHistoryBoundaryWindow), up to `maxRows`/`maxBytes`; with `throughSequence`, every such row
+ * `beforeSequence`, or equal to it and older than the `beforeMessageId` row (rows with a missing
+ * or non-numeric sequence are left out, as in getHistoryBoundaryWindow), up to `maxRows`/`maxBytes`; with `throughSequence`, every such row
  * down to the first with sequence <= it, up to `maxBytes`. Chronological. In-epoch paging (#4961)
  * passes the oldest sequence it holds; `reachedEpochStart` is true when no older such row exists.
  * Cost: every page scans from EOF, so its time grows with its distance from EOF (rows newer than
@@ -1149,14 +1174,19 @@ export function readProviderHistoryBefore(
         options.throughSequence < options.beforeSequence),
     "page through must be a non-negative integer below before"
   );
-  // No row has an integer sequence below 0: skip the scan.
-  if (options.beforeSequence === 0)
+  assert(
+    options.beforeMessageId === undefined || options.beforeMessageId.length > 0,
+    "page beforeMessageId must be a non-empty string when set"
+  );
+  // No row has an integer sequence below 0 (and without a cursor id none at 0 qualifies either).
+  if (options.beforeSequence === 0 && options.beforeMessageId === undefined)
     return Promise.resolve({ messages: [], reachedEpochStart: true });
   return withVerifiedHistorySnapshot(paths, async (files) => {
     // The visitor cannot parse oversized rows, so it counts them as page rows once the page has
     // begun (a conservative early stop only shortens the page). It starts counting at the first
     // readable page row, so a scan that stops always holds at least one page row.
-    const select = createHistoryPageSelector(options);
+    const isScanCandidate = createPageCandidateFilter(options);
+    const select = createHistoryPageSelector(options, isScanCandidate);
     let begun = false;
     const scan = await scanActiveEpochNewestFirst(
       files,
@@ -1171,11 +1201,15 @@ export function readProviderHistoryBefore(
       },
       undefined,
       // Rows the page filters out (e.g. every row newer than `beforeSequence`) are never
-      // projected; drop their messages so a deep page does not hold the epoch in memory.
-      (row) => row.size > SESSION_HISTORY_MAX_LINE_BYTES || isPageCandidate(row.message, options)
+      // projected; drop their messages so a deep page does not hold the epoch in memory. Keep
+      // rows at the cursor's sequence: the final pass must see the cursor row itself.
+      (row) =>
+        row.size > SESSION_HISTORY_MAX_LINE_BYTES ||
+        isScanCandidate(row.message) ||
+        row.message?.metadata?.historySequence === options.beforeSequence
     );
     // Choose the page exactly now that oversized rows can be parsed.
-    const choose = createHistoryPageSelector(options);
+    const choose = createHistoryPageSelector(options, createPageCandidateFilter(options));
     const page: MuxMessage[] = [];
     let hasOlder = false;
     for (const entry of scan.rows) {

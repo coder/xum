@@ -2706,6 +2706,8 @@ export class HistoryService {
     workspaceId: string,
     options: {
       beforeHistorySequence: number;
+      /** The cursor row's id, so rows sharing its sequence are not skipped (see HistoryPageOptions). */
+      beforeMessageId?: string;
       throughHistorySequence?: number;
       maxRows?: number;
       maxBytes?: number;
@@ -2714,6 +2716,7 @@ export class HistoryService {
     const through = options.throughHistorySequence;
     const page: HistoryPageOptions = {
       beforeSequence: options.beforeHistorySequence,
+      beforeMessageId: options.beforeMessageId,
       throughSequence: through,
       maxRows: options.maxRows ?? HISTORY_PAGE_MAX_ROWS,
       maxBytes:
