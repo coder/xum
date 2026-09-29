@@ -1660,6 +1660,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       {/* A failed cleanup can leave a flagged row whose checkout is gone (#4983). */}
                       {meta?.delegatedCreationInterrupted === true && (
                         <DelegatedCreationInterruptedBanner
+                          key={workspaceId}
                           workspaceId={workspaceId}
                           workspaceName={workspaceName}
                         />
@@ -1954,6 +1955,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       key: "delegated-creation-interrupted",
       node: (
         <DelegatedCreationInterruptedBanner
+          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+          // pending Remove/Keep or its error must not carry over to another's banner.
+          key={props.workspaceId}
           workspaceId={props.workspaceId}
           workspaceName={props.workspaceName}
         />

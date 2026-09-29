@@ -8879,29 +8879,30 @@ export class WorkspaceService
     if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
       return Err("Workspace not found");
     }
-    let kept = false;
     try {
       await this.config.editConfig((freshConfig) => {
         const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
         if (entry?.delegatedCreation?.interruptedAt != null) {
           delete entry.delegatedCreation;
-          kept = true;
+          // Without the mark no later startup trusts the row's tags, so a pending consent default
+          // the resolver failed to clear would never be cleared: drop it in the same write.
+          delete entry.unrelatedWorkspaceConsentPending;
         }
         return freshConfig;
       });
     } catch (error) {
       return Err(`Failed to keep workspace: ${getErrorMessage(error)}`);
     }
-    if (kept) {
-      try {
-        await this.emitCurrentWorkspaceMetadata(workspaceId);
-      } catch (error) {
-        // The mark is gone either way; the next metadata load shows it.
-        log.warn("Failed to publish a kept delegated workspace", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
+    // Published even when the mark was already gone (#5199): another backend may have kept it, or
+    // an earlier publish failed, and a retry must still clear this renderer's banner.
+    try {
+      await this.emitCurrentWorkspaceMetadata(workspaceId);
+    } catch (error) {
+      // The mark is gone either way; the next metadata load shows it.
+      log.warn("Failed to publish a kept delegated workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
     return Ok(undefined);
   }
