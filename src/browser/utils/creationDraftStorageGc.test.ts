@@ -8,6 +8,7 @@ import {
 } from "@/browser/utils/creationDraftStorageGc";
 import {
   getDraftScopeId,
+  getInputKey,
   getModelKey,
   getPendingScopeId,
   getProjectScopeId,
@@ -49,10 +50,13 @@ describe("collectOrphanedCreationDraftStorage", () => {
     // Deleted (or turned into a workspace) by another origin, or its project was removed.
     const orphans = [
       getModelKey(getDraftScopeId(PROJECT, "gone")),
-      getWorkspaceNameStateKey(getDraftScopeId(PROJECT, "gone")),
       getThinkingLevelKey(getDraftScopeId("/removed/project", "old")),
     ];
     const kept = [
+      // Typed input is never collected: a typed workspace name, and legacy draft text that its
+      // migration keeps until the backend confirms the import.
+      getWorkspaceNameStateKey(getDraftScopeId(PROJECT, "gone")),
+      getInputKey(getDraftScopeId(PROJECT, "gone")),
       getModelKey(getDraftScopeId(PROJECT, "listed")),
       // Not confirmed by the backend yet (an optimistic row) or the routed draft.
       getModelKey(getDraftScopeId(PROJECT, "live")),

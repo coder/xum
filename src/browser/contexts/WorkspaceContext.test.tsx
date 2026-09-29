@@ -2091,6 +2091,43 @@ describe("WorkspaceContext", () => {
     }
   });
 
+  test("never collects the settings of the draft a cold start routes to (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc-route");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    // Routed but unlisted (e.g. its list write never landed).
+    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [routedKey]: JSON.stringify("m") },
+      locationPath: `/project?project=${encodeURIComponent(getProjectRouteId(projectPath))}&draft=routed`,
+    });
+    const service = new DraftService(config);
+    currentClientMock.drafts = createDraftServiceClient(service);
+    const getList = mock(() => service.getList({ strict: true }));
+    currentClientMock.drafts.getList = getList;
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(getList).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(localStorage.getItem(routedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
   test.each([
     { name: "project", linkedPath: "/alpha", subProjectPath: null },
     { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },

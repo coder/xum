@@ -767,8 +767,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [workspaceStore]
   );
-  // The routed creation draft, for the startup creation-draft storage GC (never collected).
-  const routedDraftRef = useRef<{ projectPath: string; draftId: string } | null>(null);
+  // The routed creation draft id, for the startup creation-draft storage GC (never collected).
+  const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -947,10 +947,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // pendingNewWorkspaceProject is derived from current project in URL/state
   const pendingNewWorkspaceProject = currentProjectPath;
   const pendingNewWorkspaceDraftId = pendingNewWorkspaceProject ? pendingDraftId : null;
-  routedDraftRef.current =
-    pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
-      ? { projectPath: pendingNewWorkspaceProject, draftId: pendingNewWorkspaceDraftId }
-      : null;
+  // The route's draft id, set on the first render: on a cold start the route's project path
+  // resolves only after the projects load, and draft ids are unique across projects.
+  routedDraftIdRef.current = pendingDraftId;
   const pendingNewWorkspaceSubProjectPathRaw =
     pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
       ? ((workspaceDraftsByProject[pendingNewWorkspaceProject] ?? []).find(
@@ -1149,9 +1148,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               isLive: (projectPath, draftId) =>
                 (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).some(
                   (draft) => draft.draftId === draftId
-                ) ||
-                (routedDraftRef.current?.projectPath === projectPath &&
-                  routedDraftRef.current.draftId === draftId),
+                ) || routedDraftIdRef.current === draftId,
             });
           })
           .catch((error: unknown) => {

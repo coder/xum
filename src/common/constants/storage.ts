@@ -1384,13 +1384,15 @@ export function findOrphanedWorkspaceStorageKeys(
 }
 
 /**
- * The listed creation draft that owns a registered draft-scope key (`<key>:__draft__/<project>/<id>`),
- * or null for every other key, including the default composer's fixed draft id and ids the
- * backend would never list.
+ * The listed creation draft that owns a registered draft-scope settings key
+ * (`<key>:__draft__/<project>/<id>`), or null for every other key: the default composer's fixed
+ * draft id, ids the backend would never list, and "draft"-kind keys, which hold typed input (the
+ * legacy draft text its migration still owns, a typed workspace name) and are never collected.
  */
 function getCreationDraftStorageOwner(
   key: string
 ): { projectPath: string; draftId: string } | null {
+  if (getPersistedKeyKind(key) === "draft") return null;
   const scopeId = getWorkspaceScopeIdFromKey(key);
   if (scopeId?.startsWith(DRAFT_SCOPE_ID_PREFIX) !== true) return null;
   const rest = scopeId.slice(DRAFT_SCOPE_ID_PREFIX.length);
