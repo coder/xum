@@ -262,21 +262,19 @@ export class ReviewStateStore {
   }
 
   /**
-   * The attached notes for a send (#5011). Waits like whenReady; when that left the state
-   * unhydrated (the subscription failed), retries the subscription at once and waits up to
-   * `timeoutMs` for real data. Returns null when there is still none, so the caller can tell
-   * the user the notes were not attached (they stay attached on the backend).
+   * The attached notes for a send (#5011). Waits up to `timeoutMs` in total for real data,
+   * retrying a failed subscription at once instead of after the backoff. Returns null when
+   * there is still none, so the caller can tell the user the notes were not attached (they
+   * stay attached on the backend).
    */
   async readAttachedReviewsForSend(
     workspaceId: string,
     timeoutMs = SEND_HYDRATION_TIMEOUT_MS
   ): Promise<Review[] | null> {
     if (workspaceId.length === 0) return [];
-    const hydrated = await this.withRetained(workspaceId, async (entry) => {
-      await entry.ready;
-      if (entry.hydrated) return true;
-      return this.waitForHydration(workspaceId, entry, timeoutMs);
-    });
+    const hydrated = await this.withRetained(workspaceId, (entry) =>
+      this.waitForHydration(workspaceId, entry, timeoutMs)
+    );
     return hydrated ? this.getAttachedReviews(workspaceId) : null;
   }
 
@@ -394,17 +392,35 @@ export class ReviewStateStore {
     for (const settle of [...entry.hydrationWaiters]) settle(hydrated);
   }
 
-  /** Retry the subscription now (not after the backoff) and wait up to timeoutMs for data. */
+  /**
+   * Wait up to timeoutMs (the whole wait, including a stalled first snapshot) for data. A
+   * failed attempt is retried once right away instead of after the backoff: the attempt this
+   * call starts, or else the retry after the attempt already in flight.
+   */
   private waitForHydration(workspaceId: string, entry: Entry, timeoutMs: number): Promise<boolean> {
+    if (entry.hydrated) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
-      const settle = (hydrated: boolean) => {
+      let retried = false;
+      const finish = (hydrated: boolean) => {
         clearTimeout(timer);
         entry.hydrationWaiters.delete(settle);
         resolve(hydrated);
       };
-      const timer = setTimeout(() => settle(false), timeoutMs);
+      const settle = (hydrated: boolean) => {
+        if (!hydrated && !retried && this.entries.get(workspaceId) === entry) {
+          retried = true;
+          // The failed attempt already cleared its subscription (see ensureSubscribed).
+          this.ensureSubscribed(workspaceId);
+          return;
+        }
+        finish(hydrated);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
       entry.hydrationWaiters.add(settle);
-      this.ensureSubscribed(workspaceId);
+      if (!entry.subscription) {
+        retried = true;
+        this.ensureSubscribed(workspaceId);
+      }
     });
   }
 
@@ -482,6 +498,7 @@ export class ReviewStateStore {
 
     const run = async () => {
       let iterator: AsyncIterator<unknown> | null = null;
+      let failed = false;
       try {
         const events = await client.workspace.reviewState.subscribe({ workspaceId }, { signal });
         iterator = events;
@@ -509,7 +526,7 @@ export class ReviewStateStore {
           // Self-heal: never hold the review pane (or a send) on a broken subscription. Queued
           // updaters stay queued until a resubscription delivers real data.
           this.markReady(entry);
-          this.settleHydrationWaiters(entry, false);
+          failed = true;
         }
       } finally {
         if (entry.subscription === controller) entry.subscription = null;
@@ -525,6 +542,8 @@ export class ReviewStateStore {
             this.ensureSubscribed(workspaceId);
           }, delay);
         }
+        // After the subscription is cleared, so a waiter can retry it right away.
+        if (failed) this.settleHydrationWaiters(entry, false);
         try {
           // Close the iterator so the backend drops its listener.
           await iterator?.return?.();

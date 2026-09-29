@@ -373,6 +373,22 @@ describe("ReviewStateStore", () => {
     gate.resolve();
   });
 
+  test("a send bounds a stalled first snapshot after a revisit (#5011)", async () => {
+    const { backend, client } = createBackend({ reviews: { r1: makeReview("r1", "attached") } });
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+
+    // Revisit while the backend's first snapshot never arrives.
+    backend.hydrationGate = new Promise<void>(() => undefined);
+    unsubscribe = store.subscribe(WS, () => undefined);
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("send read never settled")), 1_000)
+    );
+    expect(await Promise.race([store.readAttachedReviewsForSend(WS, 50), timeout])).toBeNull();
+  });
+
   test("a mutate after the last subscriber left runs against fresh server data (#5011)", async () => {
     const { backend, client } = createBackend({ readMore: {} });
     const store = connect(client);

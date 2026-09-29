@@ -79,6 +79,29 @@ describe("Send after a failed review-state subscription", () => {
     }
   }, 60_000);
 
+  test("a command that sends nothing shows no missing-notes error", async () => {
+    const app = await createAppHarness({
+      branchPrefix: "review-sub-vim",
+      beforeRenderEnvironment: (env) => {
+        breakReviewStateSubscription(env);
+      },
+    });
+
+    try {
+      await app.env.services.reviewStateService.applyDelta(app.workspaceId, {
+        reviews: { set: { r1: attachedReview() } },
+      });
+
+      await app.chat.send("/vim");
+      // The command ran (it clears the input) after the bounded review read settled.
+      await app.chat.expectInputValue("", 10_000);
+      expect(app.view.container.querySelector('[role="alert"]')).toBeNull();
+      expect(await reviewStatus(app.env, app.workspaceId)).toBe("attached");
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("sends without notes and says so when the notes still cannot be loaded", async () => {
     const app = await createAppHarness({
       branchPrefix: "review-sub-broken",
