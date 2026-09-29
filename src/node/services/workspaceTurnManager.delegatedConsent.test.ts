@@ -608,6 +608,43 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
+  test("Keep also drops a pending consent default the resolver failed to clear (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    spyOn(b.config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    await b.manager.resolveOrphanedDelegatedTargets();
+    expect(targetRow(a.config).pending).toBe(true);
+
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+
+    expect(mark(a.config)).toBeUndefined();
+    expect(targetRow(a.config).pending).toBeUndefined();
+    await a.finish();
+  });
+
+  test("Keep republishes an already kept workspace, so a retry clears a stale banner (#5199)", async () => {
+    const a = await crashBeforeRecord();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    // Another backend kept it: this backend's renderer never saw the cleared flag.
+    expect((await (await backend()).real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(
+      true
+    );
+    const published: unknown[] = [];
+    a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId !== TARGET) return;
+      published.push(
+        (event.metadata as { delegatedCreationInterrupted?: true } | null)
+          ?.delegatedCreationInterrupted
+      );
+    });
+
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+
+    expect(published).toHaveLength(1);
+    expect(published[0]).toBeUndefined();
+    await a.finish();
+  });
+
   test("a failed flag write never fails startup and is retried next time (#4983)", async () => {
     const a = await crashBeforeRecord({ disposable: true }); // No consent write comes first.
     const b = await backend();
