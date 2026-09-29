@@ -68,5 +68,16 @@ describe("confirmAndRemoveSubagent (#5106)", () => {
       removal: { success: false, error: "Stop the sub-agent before removing it." },
     });
     expect(await refused.run()).toBe("Stop the sub-agent before removing it.");
+
+    // A forced removal that left something behind says so instead of passing silently.
+    const leftover = setup({
+      preview: { success: true, data: { summary: null, paths: [] } },
+      confirmed: true,
+      removal: {
+        success: true,
+        warnings: [{ kind: "leftover", description: "Container xum-child is still running." }],
+      },
+    });
+    expect(await leftover.run()).toContain("Container xum-child is still running.");
   });
 });

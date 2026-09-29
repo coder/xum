@@ -116,6 +116,7 @@ import {
   AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
+  WorkspaceRemoveWarningSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
@@ -2390,7 +2391,11 @@ export const tasks = {
       taskId: z.string(),
       acknowledgedWork: z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
     }),
-    output: ResultSchema(z.void(), z.string()),
+    // Warnings name what the forced removal left behind (#5143), as workspace.remove does.
+    output: ResultSchema(
+      z.object({ warnings: z.array(WorkspaceRemoveWarningSchema).optional() }),
+      z.string()
+    ),
   },
 };
 

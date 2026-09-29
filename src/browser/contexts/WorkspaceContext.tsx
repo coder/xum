@@ -1592,7 +1592,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     ): Promise<WorkspaceRemoveResult> =>
       runWorkspaceRemoval(workspaceId, async (client) => {
         const result = await client.tasks.remove({ taskId: workspaceId, acknowledgedWork });
-        return result.success ? { success: true } : { success: false, error: result.error };
+        return result.success
+          ? { success: true, ...(result.data.warnings ? { warnings: result.data.warnings } : {}) }
+          : { success: false, error: result.error };
       }),
     [runWorkspaceRemoval]
   );

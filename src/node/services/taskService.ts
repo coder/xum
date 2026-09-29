@@ -14148,19 +14148,21 @@ export class TaskService implements AgentTaskIntegration {
   async removeSubagentForUser(
     taskId: string,
     acknowledgedWork: SubagentRemovalPreview
-  ): Promise<Result<void, string>> {
+  ): Promise<Result<{ warnings?: WorkspaceRemoveWarning[] }, string>> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (entry == null) return Err("This sub-agent no longer exists.");
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
     if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    const warnings: WorkspaceRemoveWarning[] = [];
     const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
       acknowledgedWork,
+      onRemovalWarnings: (removalWarnings) => warnings.push(...removalWarnings),
     });
     if (!result.success) return Err(result.error);
     switch (result.data.status) {
       case "removed":
       case "already_removed":
-        return Ok(undefined);
+        return Ok(warnings.length > 0 ? { warnings } : {});
       case "active":
         return Err("Stop the sub-agent before removing it.");
       case "invalid_scope":

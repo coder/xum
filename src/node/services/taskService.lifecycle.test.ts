@@ -414,9 +414,7 @@ describe("TaskService", () => {
     const current = await taskService.previewSubagentRemoval(childTaskId);
     assert(current.success, "preview must succeed");
     expect(current.data.paths).toEqual(["later.txt", "notes.txt"]);
-    expect(await taskService.removeSubagentForUser(childTaskId, current.data)).toEqual(
-      Ok(undefined)
-    );
+    expect(await taskService.removeSubagentForUser(childTaskId, current.data)).toEqual(Ok({}));
     expect(remove).toHaveBeenCalledTimes(1);
   });
 
