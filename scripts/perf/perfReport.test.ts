@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildReport,
+  CHAT_SWITCH_METRICS,
   formatLogLine,
   METRICS,
+  MILESTONES,
   parsePlaywrightResults,
   readScenario,
   renderSummary,
@@ -377,7 +379,7 @@ describe("renderSummary", () => {
       report,
     });
     const [row] = tableRows(markdown, "Scenario metrics");
-    expect(row?.slice(2)).toEqual(METRICS.map(() => "unavailable"));
+    expect(row?.slice(2)).toEqual([...METRICS, ...MILESTONES].map(() => "unavailable"));
 
     const ok = renderSummary({
       runUrl: "https://example.test/run",
@@ -387,6 +389,8 @@ describe("renderSummary", () => {
     const [okRow] = tableRows(ok, "Scenario metrics");
     expect(okRow).not.toContain("unavailable");
     expect(okRow?.[2 + metricColumn("hunkStepMedianMs")]).toBe("—"); // not recorded by this scenario
+    // Milestones apply to workspace-open scenarios only.
+    expect(okRow?.slice(2 + METRICS.length)).toEqual(MILESTONES.map(() => "—"));
   });
 });
 
@@ -422,23 +426,61 @@ function companionSummary(retry = 0): Record<string, unknown> {
   );
 }
 
-function chatSwitchReport(chatSwitch: unknown, extra: ScenarioRead[] = []): Report {
+function chatSwitchReport(
+  chatSwitch: unknown,
+  extra: ScenarioRead[] = [],
+  expectChatSwitchXl = false
+): Report {
   return buildReport(
     input({
       results: playwright([
         { file: "scenarios/perf.chatSwitch.spec.ts", title: CHAT_SWITCH_TITLE },
       ]),
       reads: [readScenario(chatSwitchSummary(chatSwitch), undefined), ...extra],
+      expectChatSwitchXl,
     })
+  );
+}
+
+const TRANSPORTS = ["in-process", "server-window"];
+const CORE_LEGS = ["cold-open-small", "cold-open-large", "switch-back-small", "switch-back-large"];
+const XL_LEGS = ["cold-open-xl", "switch-back-xl"];
+
+/** A current-format `chatSwitch`: every given leg for every given transport. */
+function fullChatSwitch(legs = CORE_LEGS, transports = TRANSPORTS) {
+  const byTransport: Record<string, Record<string, Record<string, number | null>>> = {};
+  for (const transport of transports) {
+    byTransport[transport] = Object.fromEntries(legs.map((leg) => [leg, legMedians(105.4)]));
+  }
+  return { medians: byTransport["in-process"] ?? {}, mediansByTransport: byTransport };
+}
+
+/** `fullChatSwitch()` with one leg's medians changed (or removed with `undefined`). */
+function withLeg(
+  transport: string,
+  leg: string,
+  medians: Record<string, unknown> | undefined,
+  base = fullChatSwitch()
+) {
+  const legs: Record<string, unknown> = { ...base.mediansByTransport[transport] };
+  if (medians === undefined) delete legs[leg];
+  else legs[leg] = medians;
+  return { ...base, mediansByTransport: { ...base.mediansByTransport, [transport]: legs } };
+}
+
+function chatRow(report: Report, leg: string, transport: string): string[] | undefined {
+  return tableRows(render(report), "Chat switch").find(
+    (row) => row[1] === `\`${leg}\`` && row[2] === `\`${transport}\``
   );
 }
 
 describe("chat-switch scenarios", () => {
   test("a primary and a metrics-less companion are one test with two scenarios, outside the metrics table", () => {
-    const report = chatSwitchReport({ medians: { "cold-open-small": legMedians(105.4) } }, [
+    const report = chatSwitchReport(fullChatSwitch(), [
       readScenario(companionSummary(), undefined),
     ]);
     expect(report.problems).toEqual([]);
+    expect(report.warnings).toEqual([]);
     expect(report.rows).toHaveLength(1);
     expect(report.rows[0]?.scenarios.map((scenario) => scenario.label)).toEqual([
       "chat-switch-mid-stream",
@@ -447,8 +489,23 @@ describe("chat-switch scenarios", () => {
     const markdown = render(report);
     expect(tableRows(markdown, "Tests")).toHaveLength(1);
     expect(tableRows(markdown, "Scenario metrics")).toEqual([]);
-    // Per-leg medians are deferred (#4442): no Chat switch section is rendered.
-    expect(markdown).not.toContain("### Chat switch");
+    // Only the primary holds medians: one row per leg × transport, legs in the harness's order.
+    const chatRows = tableRows(markdown, "Chat switch");
+    expect(chatRows.map((row) => `${row[1]} ${row[2]}`)).toEqual(
+      CORE_LEGS.flatMap((leg) => TRANSPORTS.map((t) => `\`${leg}\` \`${t}\``))
+    );
+    expect(chatRows[0]).toEqual([
+      "`chat-switch-mid-stream`",
+      "`cold-open-small`",
+      "`in-process`",
+      "3",
+      "105.4",
+      "91.5",
+      "47.4",
+      "0",
+      "19.4",
+      "24",
+    ]);
   });
 
   test("an earlier attempt's chat-switch summaries are never used", () => {
@@ -474,6 +531,262 @@ describe("chat-switch scenarios", () => {
     expect(keys(report)).toEqual([`summary-missing:${CHAT_SWITCH_KEY}`]);
     expect(report.rows[0]?.scenarios).toEqual([]);
     expect(tableRows(render(report), "Chat switch")).toEqual([]);
+  });
+});
+
+describe("chat-switch coverage checks", () => {
+  test("legacy files with only in-process medians expect only in-process", () => {
+    const report = chatSwitchReport({
+      medians: Object.fromEntries(CORE_LEGS.map((leg) => [leg, legMedians(1)])),
+    });
+    expect(report.problems).toEqual([]);
+    expect(tableRows(render(report), "Chat switch")).toHaveLength(CORE_LEGS.length);
+  });
+
+  test("mediansByTransport wins over the duplicated in-process medians", () => {
+    const report = chatSwitchReport({
+      ...fullChatSwitch(),
+      medians: { "cold-open-small": legMedians(999) },
+    });
+    expect(chatRow(report, "cold-open-small", "in-process")?.[4]).toBe("105.4");
+  });
+
+  test("a missing core leg or a missing transport is a problem", () => {
+    const noLeg = chatSwitchReport(withLeg("server-window", "switch-back-large", undefined));
+    expect(keys(noLeg)).toEqual([
+      `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/server-window`,
+    ]);
+    const noTransport = chatSwitchReport(fullChatSwitch(CORE_LEGS, ["in-process"]));
+    expect(keys(noTransport)).toEqual([
+      `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/server-window`,
+    ]);
+    expect(noTransport.problems[0]?.text).toContain("`switch-back-large`");
+  });
+
+  test("xl legs are required with the XL setting, and without it once either xl leg exists", () => {
+    const withXl = fullChatSwitch([...CORE_LEGS, ...XL_LEGS]);
+    expect(chatSwitchReport(withXl, [], true).problems).toEqual([]);
+    // Neither xl leg and no setting: a default local run, nothing lost.
+    expect(chatSwitchReport(fullChatSwitch(), [], false).problems).toEqual([]);
+    // The setting without xl legs: both transports lost them.
+    expect(keys(chatSwitchReport(fullChatSwitch(), [], true))).toEqual(
+      TRANSPORTS.map(
+        (t) => `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/${t}`
+      )
+    );
+    // No setting, but one xl leg present: the other one is required everywhere.
+    const oneXl = withLeg("server-window", "switch-back-xl", undefined, withXl);
+    for (const expectXl of [false, true]) {
+      const report = chatSwitchReport(oneXl, [], expectXl);
+      expect(keys(report)).toEqual([
+        `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/server-window`,
+      ]);
+      expect(report.problems[0]?.text).toContain("`switch-back-xl`");
+    }
+  });
+
+  test.each([0, -1, 2.5, "3", null, undefined, 1e999])(
+    "count %p is a problem and the row is unavailable",
+    (count) => {
+      const medians: Record<string, unknown> = { ...legMedians(1), count };
+      const report = chatSwitchReport(withLeg("in-process", "cold-open-large", medians));
+      expect(keys(report)).toEqual([
+        `chat-switch-count-invalid:${CHAT_SWITCH_KEY}/chat-switch-mid-stream`,
+      ]);
+      expect(chatRow(report, "cold-open-large", "in-process")?.slice(3)).toEqual(
+        [0, ...CHAT_SWITCH_METRICS].map(() => "unavailable")
+      );
+      // The leg is present, so it is not also reported as missing.
+      expect(report.warnings).toEqual([]);
+    }
+  );
+
+  // Every median the table shows, with each kind of absent or invalid value.
+  function everyMetric(values: unknown[]): Array<[string, string, number, unknown]> {
+    return CHAT_SWITCH_METRICS.flatMap((metric, index) =>
+      values.map((value): [string, string, number, unknown] => [
+        metric.label,
+        metric.key,
+        index,
+        value,
+      ])
+    );
+  }
+
+  test.each(everyMetric([null, undefined]))(
+    "a missing median (%s = %p) is a warning and its cell is unavailable",
+    (label, key, index, median) => {
+      const medians: Record<string, unknown> = { ...legMedians(1), [key]: median };
+      const report = chatSwitchReport(withLeg("server-window", "switch-back-small", medians));
+      expect(report.problems).toEqual([]);
+      expect(report.warnings).toHaveLength(1);
+      expect(report.warnings[0]).toContain(`${label} (${median === null ? "null" : "missing"})`);
+      const row = chatRow(report, "switch-back-small", "server-window");
+      expect(row?.[3]).toBe("3");
+      row?.slice(4).forEach((cell, column) => {
+        expect(cell === "unavailable").toBe(column === index);
+      });
+    }
+  );
+
+  test.each(everyMetric(["12", -1, 1e999, true, {}]))(
+    "an invalid median (%s = %p) is a problem and its cell is unavailable",
+    (label, key, index, median) => {
+      const medians: Record<string, unknown> = { ...legMedians(1), [key]: median };
+      const report = chatSwitchReport(withLeg("in-process", "switch-back-small", medians));
+      expect(keys(report)).toEqual([
+        `chat-switch-value-invalid:${CHAT_SWITCH_KEY}/chat-switch-mid-stream`,
+      ]);
+      expect(report.problems[0]?.text).toContain(`${label} (invalid)`);
+      expect(report.warnings).toEqual([]);
+      expect(chatRow(report, "switch-back-small", "in-process")?.[4 + index]).toBe("unavailable");
+    }
+  );
+
+  test("unknown transports and legs are warned about and never satisfy a required one", () => {
+    // Sanitizes to a known name but is not the raw key the harness writes.
+    const renamed = withLeg("in-process", "cold-open-small", undefined);
+    const report = chatSwitchReport({
+      ...renamed,
+      mediansByTransport: {
+        ...renamed.mediansByTransport,
+        "in-process": {
+          ...renamed.mediansByTransport["in-process"],
+          "Cold-Open-Small": legMedians(1),
+        },
+        "IN-PROCESS": { "cold-open-small": legMedians(1) },
+      },
+    });
+    expect(keys(report)).toEqual([
+      `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/in-process`,
+    ]);
+    expect(report.warnings).toHaveLength(1);
+    expect(report.warnings[0]).toContain("`in-process/cold-open-small`, `in-process`");
+    expect(tableRows(render(report), "Chat switch")).toHaveLength(2 * CORE_LEGS.length - 1);
+  });
+
+  test.each([
+    ["chatSwitch", "x"],
+    ["no medians", {}],
+    ["mediansByTransport", { mediansByTransport: [] }],
+    ["transport", { mediansByTransport: { "in-process": 1 } }],
+    ["leg", { mediansByTransport: { "in-process": { "cold-open-small": [] } } }],
+  ])("a malformed %s makes the summary unusable", (_name, chatSwitch) => {
+    const report = chatSwitchReport(chatSwitch, [readScenario(companionSummary(), undefined)]);
+    expect(keys(report)).toEqual([`summary-invalid:${CHAT_SWITCH_KEY}`]);
+    expect(tableRows(render(report), "Chat switch")).toEqual([]);
+  });
+
+  test("a chat-switch test whose final attempt wrote no medians is a problem", () => {
+    const report = buildReport(
+      input({
+        results: playwright([
+          { file: "scenarios/perf.chatSwitch.spec.ts", title: CHAT_SWITCH_TITLE },
+        ]),
+        reads: [
+          readScenario(
+            summary(
+              { runLabel: "chat-switch-mid-stream" },
+              { title: CHAT_SWITCH_TITLE, file: CHAT_SWITCH_SPEC }
+            ),
+            { sampleCount: 1 }
+          ),
+        ],
+      })
+    );
+    expect(keys(report)).toEqual([`chat-switch-missing:${CHAT_SWITCH_KEY}`]);
+  });
+});
+
+const WORKSPACE_OPEN_TITLE = "perf: open workspace with small history profile";
+const WORKSPACE_OPEN_KEY = `perf.workspaceOpen.spec.ts › ${WORKSPACE_OPEN_TITLE}`;
+
+function workspaceOpenReport(milestones: unknown): Report {
+  return buildReport(
+    input({
+      results: playwright([
+        { file: "scenarios/perf.workspaceOpen.spec.ts", title: WORKSPACE_OPEN_TITLE },
+      ]),
+      reads: [
+        readScenario(
+          summary(
+            { runLabel: "workspace-open-small", milestones },
+            {
+              title: WORKSPACE_OPEN_TITLE,
+              file: "/w/tests/e2e/scenarios/perf.workspaceOpen.spec.ts",
+            }
+          ),
+          { sampleCount: 26 }
+        ),
+      ],
+    })
+  );
+}
+
+const MILESTONE_KEY = `milestones-unavailable:${WORKSPACE_OPEN_KEY}/workspace-open-small`;
+
+function milestoneCells(report: Report): string[] | undefined {
+  return tableRows(render(report), "Scenario metrics")[0]?.slice(2 + METRICS.length);
+}
+
+describe("workspace-open milestones", () => {
+  test("are shown for workspace-open scenarios", () => {
+    const report = workspaceOpenReport({
+      firstMessageMs: 364.3,
+      fullyLoadedMs: 448.3,
+      longestTaskMs: 0,
+    });
+    expect(report.problems).toEqual([]);
+    expect(milestoneCells(report)).toEqual(["364", "448", "0"]);
+  });
+
+  test.each(
+    MILESTONES.flatMap((milestone, index) =>
+      [null, undefined, "12", -1, 1e999].map((value): [string, unknown, number] => [
+        milestone.id,
+        value,
+        index,
+      ])
+    )
+  )("milestone %s = %p is a problem; the other values stay", (id, value, index) => {
+    const milestones: Record<string, unknown> = {
+      firstMessageMs: 364.3,
+      fullyLoadedMs: 448.3,
+      longestTaskMs: 95,
+      [id]: value,
+    };
+    const report = workspaceOpenReport(milestones);
+    expect(keys(report)).toEqual([MILESTONE_KEY]);
+    const expected = ["364", "448", "95"];
+    expected[index] = "unavailable";
+    expect(milestoneCells(report)).toEqual(expected);
+    expect(tableRows(render(report), "Scenario metrics")[0]?.[2]).toBe("900");
+  });
+
+  test("each missing milestone is named with its reason", () => {
+    const report = workspaceOpenReport({
+      firstMessageMs: 1,
+      fullyLoadedMs: null,
+      longestTaskMs: "5",
+    });
+    expect(report.problems[0]?.text).toContain("Fully loaded ms (null), Longest task ms (invalid)");
+    expect(milestoneCells(report)).toEqual(["1", "unavailable", "unavailable"]);
+  });
+
+  test.each([undefined, null, "x", [1]])("milestones of %p are a problem", (milestones) => {
+    const report = workspaceOpenReport(milestones);
+    expect(keys(report)).toEqual([MILESTONE_KEY]);
+    expect(milestoneCells(report)).toEqual(MILESTONES.map(() => "unavailable"));
+  });
+
+  test("other scenarios ignore milestones, so their cells are not applicable", () => {
+    const report = buildReport(
+      input({
+        reads: [readScenario(summary({ milestones: { firstMessageMs: 5 } }), { sampleCount: 1 })],
+      })
+    );
+    expect(report.problems).toEqual([]);
+    expect(milestoneCells(report)).toEqual(MILESTONES.map(() => "—"));
   });
 });
 
@@ -529,7 +842,10 @@ describe("sink safety", () => {
                 runLabel: HOSTILE,
                 chatSwitch: {
                   medians: {},
-                  mediansByTransport: { [HOSTILE]: { [HOSTILE]: legMedians(1) } },
+                  mediansByTransport: {
+                    [HOSTILE]: { [HOSTILE]: legMedians(1) },
+                    "in-process": { "cold-open-small": legMedians(1), [HOSTILE]: legMedians(1) },
+                  },
                 },
               },
               { title: HOSTILE, file }
@@ -590,7 +906,7 @@ describe("sink safety", () => {
     for (const line of markdown.split("\n").filter((l) => l.startsWith("- "))) {
       expect((line.match(/`/g) ?? []).length % 2).toBe(0);
     }
-    for (const heading of ["Tests", "Scenario metrics"]) {
+    for (const heading of ["Tests", "Scenario metrics", "Chat switch"]) {
       const rows = tableRows(markdown, heading);
       expect(rows.length).toBeGreaterThan(0);
       expect(new Set(rows.map((row) => row.length)).size).toBe(1);
@@ -601,7 +917,7 @@ describe("sink safety", () => {
 
   // The CLI owns the job-log sink, so these run it the way the workflow does. The environment is
   // explicit: in CI the test process itself has GITHUB_STEP_SUMMARY set.
-  function runCli(current: string, env: Record<string, string>) {
+  function runCli(current: string, env: Record<string, string>, args: string[] = []) {
     const proc = Bun.spawnSync(
       [
         process.execPath,
@@ -610,6 +926,7 @@ describe("sink safety", () => {
         current,
         "--perf-result",
         "failure",
+        ...args,
       ],
       { env: { PATH: process.env.PATH ?? "", GITHUB_ACTIONS: "true", ...env } }
     );
@@ -656,6 +973,40 @@ describe("sink safety", () => {
       }
       // The report itself still reached the summary.
       expect(readFileSync(summaryPath, "utf8")).toContain(file);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the CLI requires the xl legs only when the workflow's XL setting is 1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "perf-report-cli-"));
+    try {
+      mkdirSync(join(dir, "perf", "electron", "chat-switch"), { recursive: true });
+      writeFileSync(
+        join(dir, "perf", "electron", "chat-switch", "perf-summary.json"),
+        JSON.stringify(chatSwitchSummary(fullChatSwitch()))
+      );
+      writeFileSync(
+        join(dir, "perf", "playwright-results.json"),
+        JSON.stringify({
+          suites: [
+            {
+              file: "scenarios/perf.chatSwitch.spec.ts",
+              specs: [{ title: CHAT_SWITCH_TITLE, tests: [{ status: "expected", results: [{}] }] }],
+            },
+          ],
+        })
+      );
+      const summaryPath = join(dir, "summary.md");
+      const report = (args: string[]) => {
+        rmSync(summaryPath, { force: true });
+        expect(runCli(dir, { GITHUB_STEP_SUMMARY: summaryPath }, args).exitCode).toBe(0);
+        return readFileSync(summaryPath, "utf8");
+      };
+      expect(report(["--chat-switch-xl", "1"])).toContain("has no medians for `cold-open-xl`");
+      for (const args of [["--chat-switch-xl", "0"], ["--chat-switch-xl", ""], []]) {
+        expect(report(args)).not.toContain("cold-open-xl");
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

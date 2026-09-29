@@ -8,9 +8,11 @@
  * attempt wrote no usable summary, the row shows "unavailable". An earlier attempt's numbers are
  * never used instead, because the final attempt is the one that decided the run. One test may
  * write several summaries in its final attempt (the chat-switch test writes a server-window
- * companion); each becomes its own scenario. Chat-switch scenarios are listed but their Chrome
- * totals are not reported; per-leg medians and workspace-open milestones are deferred (#4442)
- * because reporting them without coverage checks would hide lost measurements.
+ * companion); each becomes its own scenario. Chat-switch scenarios report per-leg medians instead
+ * of their Chrome totals, and workspace-open scenarios add page milestones.
+ *
+ * Coverage rule (#4442): every value shown either has a check that turns lost data into
+ * "unavailable" plus a problem or warning, or it is not shown. Missing data is never silent.
  *
  * Artifact text is untrusted: it only goes into the Markdown summary, sanitized inside code spans.
  * The job log gets a counts-only line (`formatLogLine`) or a sanitized crash message
@@ -53,6 +55,52 @@ export const METRICS: readonly MetricSpec[] = [
   // Only the immersive-review hunk iteration scenario records it.
   { id: "hunkStepMedianMs", label: "Hunk step ms", decimals: 1, required: false },
 ];
+
+/** Page milestones (`milestones` in perf-summary.json, tests/e2e/utils/pageMilestones.ts). */
+export type MilestoneId = "firstMessageMs" | "fullyLoadedMs" | "longestTaskMs";
+
+export const MILESTONES: ReadonlyArray<{ id: MilestoneId; label: string; decimals: number }> = [
+  // A transcript that never renders still passes the spec (it asserts only fullyLoadedMs), so a
+  // missing first message must be visible here.
+  { id: "firstMessageMs", label: "First message ms", decimals: 0 },
+  { id: "fullyLoadedMs", label: "Fully loaded ms", decimals: 0 },
+  { id: "longestTaskMs", label: "Longest task ms", decimals: 0 },
+];
+
+/** Tests identified by spec file (the basename in the Playwright results), not by label. */
+const WORKSPACE_OPEN_SPEC = "perf.workspaceOpen.spec.ts";
+const CHAT_SWITCH_SPEC = "perf.chatSwitch.spec.ts";
+
+/** Leg medians shown for chat-switch scenarios (keys of `chatSwitch.mediansByTransport[t][leg]`). */
+export const CHAT_SWITCH_METRICS = [
+  { key: "dom.firstRowFromClickMs", label: "Click to first row ms", decimals: 1 },
+  { key: "renderer.firstRowMs", label: "Renderer first row ms", decimals: 1 },
+  { key: "renderer.caughtUpMs", label: "Caught up ms", decimals: 1 },
+  { key: "dom.longestTaskMs", label: "Longest task ms", decimals: 0 },
+  { key: "server.totalMs", label: "Server replay ms", decimals: 1 },
+  { key: "server.sentRowCount", label: "Rows sent", decimals: 0 },
+] as const;
+
+export type ChatSwitchMetricKey = (typeof CHAT_SWITCH_METRICS)[number]["key"];
+
+// The harness's legs and transports, in display order (tests/e2e/utils/chatSwitchSummary.ts).
+// Matching uses the raw keys, so a crafted key can never pass for a known one after sanitizing.
+const CHAT_SWITCH_LEGS: readonly string[] = [
+  "cold-open-small",
+  "cold-open-large",
+  "cold-open-xl",
+  "switch-back-small",
+  "switch-back-large",
+  "switch-back-xl",
+];
+const CHAT_SWITCH_XL_LEGS: readonly string[] = CHAT_SWITCH_LEGS.filter((leg) =>
+  leg.endsWith("-xl")
+);
+const CHAT_SWITCH_CORE_LEGS: readonly string[] = CHAT_SWITCH_LEGS.filter(
+  (leg) => !CHAT_SWITCH_XL_LEGS.includes(leg)
+);
+// The test measures both transports in every run (#4846).
+const CHAT_SWITCH_TRANSPORTS: readonly string[] = ["in-process", "server-window"];
 
 // ---------------------------------------------------------------------------
 // Sanitizing: every string taken from an artifact is untrusted.
@@ -139,6 +187,15 @@ function nonNegativeInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+/** Why a value the report shows is absent: not written, written as null, or not a valid number. */
+export type ValueGap = "missing" | "null" | "invalid";
+
+function valueGap(value: unknown): ValueGap | undefined {
+  if (finiteNonNegative(value) !== undefined) return undefined;
+  if (value === undefined) return "missing";
+  return value === null ? "null" : "invalid";
+}
+
 // ---------------------------------------------------------------------------
 // perf-summary.json / react-profile.json (tests/e2e/utils/perfProfile.ts, schemaVersion 1)
 // ---------------------------------------------------------------------------
@@ -165,6 +222,110 @@ export type MetricsRead =
     }
   | { ok: false; reason: string };
 
+/** A value that is present and valid, or why it is not. */
+export interface ValuesRead<K extends string> {
+  values: Partial<Record<K, number>>;
+  gaps: Array<{ key: K; gap: ValueGap }>;
+}
+
+function readValues<K extends string>(
+  record: Record<string, unknown>,
+  keys: readonly K[]
+): ValuesRead<K> {
+  const result: ValuesRead<K> = { values: {}, gaps: [] };
+  for (const key of keys) {
+    const gap = valueGap(record[key]);
+    if (gap === undefined) result.values[key] = record[key] as number;
+    else result.gaps.push({ key, gap });
+  }
+  return result;
+}
+
+export interface ChatSwitchLegRow extends ValuesRead<ChatSwitchMetricKey> {
+  /** A known transport (raw key, so safe to print). */
+  transport: string;
+  /** A known leg (raw key, so safe to print). */
+  leg: string;
+  /** Switches behind the medians; undefined when `count` is not a positive integer (row unusable). */
+  count?: number;
+}
+
+export type ChatSwitchRead =
+  | {
+      ok: true;
+      /** Pre-#4846 file with only in-process `medians`, so only in-process is expected. */
+      legacy: boolean;
+      rows: ChatSwitchLegRow[];
+      /** Sanitized transports (`t`) and legs (`t/leg`) the report does not know; not shown. */
+      unknown: string[];
+    }
+  | { ok: false; reason: string };
+
+/** One row per known leg × transport from `chatSwitch` (tests/e2e/utils/chatSwitchSummary.ts). */
+function readChatSwitch(value: unknown): ChatSwitchRead {
+  if (!isRecord(value)) return { ok: false, reason: "chatSwitch is not an object" };
+  let byTransport: Record<string, unknown>;
+  const legacy = value.mediansByTransport === undefined || value.mediansByTransport === null;
+  if (legacy) {
+    if (!isRecord(value.medians)) return { ok: false, reason: "chatSwitch has no medians" };
+    byTransport = { "in-process": value.medians };
+  } else if (isRecord(value.mediansByTransport)) {
+    // `medians` duplicates the in-process entry for older readers; mediansByTransport wins.
+    byTransport = value.mediansByTransport;
+  } else {
+    return { ok: false, reason: "chatSwitch.mediansByTransport is not an object" };
+  }
+  const rows: ChatSwitchLegRow[] = [];
+  const unknown: string[] = [];
+  const metricKeys = CHAT_SWITCH_METRICS.map((metric) => metric.key);
+  for (const [transport, legs] of Object.entries(byTransport)) {
+    if (!CHAT_SWITCH_TRANSPORTS.includes(transport)) {
+      unknown.push(sanitizeLabel(transport));
+      continue;
+    }
+    if (!isRecord(legs)) {
+      return { ok: false, reason: `chatSwitch medians for ${transport} are not an object` };
+    }
+    for (const [leg, medians] of Object.entries(legs)) {
+      if (!CHAT_SWITCH_LEGS.includes(leg)) {
+        unknown.push(`${transport}/${sanitizeLabel(leg)}`);
+        continue;
+      }
+      if (!isRecord(medians)) {
+        return {
+          ok: false,
+          reason: `chatSwitch medians for ${leg} (${transport}) are not an object`,
+        };
+      }
+      const count = nonNegativeInteger(medians.count);
+      rows.push({
+        transport,
+        leg,
+        count: count === undefined || count === 0 ? undefined : count,
+        ...readValues(medians, metricKeys),
+      });
+    }
+  }
+  rows.sort(
+    (a, b) =>
+      CHAT_SWITCH_LEGS.indexOf(a.leg) - CHAT_SWITCH_LEGS.indexOf(b.leg) ||
+      CHAT_SWITCH_TRANSPORTS.indexOf(a.transport) - CHAT_SWITCH_TRANSPORTS.indexOf(b.transport)
+  );
+  return { ok: true, legacy, rows, unknown };
+}
+
+/** Additive in schemaVersion 1; judged only for workspace-open tests, which always write it. */
+function readMilestones(value: unknown): ValuesRead<MilestoneId> {
+  const ids = MILESTONES.map((milestone) => milestone.id);
+  if (value === undefined || value === null) {
+    return { values: {}, gaps: ids.map((key) => ({ key, gap: "missing" as const })) };
+  }
+  if (!isRecord(value)) {
+    return { values: {}, gaps: ids.map((key) => ({ key, gap: "invalid" as const })) };
+  }
+  return readValues(value, ids);
+}
+
 /**
  * `ok: true` means the summary is readable and attributable to a test attempt. Whether its Chrome
  * metrics are required depends on its siblings (chat-switch tests skip them), so a metrics
@@ -174,8 +335,9 @@ export type ScenarioRead =
   | ({
       ok: true;
       metrics: MetricsRead;
-      /** The summary has a `chatSwitch` key (the chat-switch test's primary summary). */
-      chatSwitch: boolean;
+      milestones: ValuesRead<MilestoneId>;
+      /** Present when the summary has a `chatSwitch` key (the chat-switch test's primary summary). */
+      chatSwitch?: ChatSwitchRead;
     } & ScenarioIdentity & { testKey: string; retry: number })
   | ({ ok: false; reason: string } & ScenarioIdentity);
 
@@ -257,7 +419,8 @@ export function readScenario(summary: unknown, reactProfile: unknown): ScenarioR
     testKey: key,
     retry,
     metrics: readMetrics(summary, reactProfile),
-    chatSwitch: "chatSwitch" in summary,
+    milestones: readMilestones(summary.milestones),
+    ...("chatSwitch" in summary ? { chatSwitch: readChatSwitch(summary.chatSwitch) } : {}),
   };
 }
 
@@ -269,6 +432,8 @@ export type TestStatus = "expected" | "unexpected" | "flaky" | "skipped";
 
 export interface TestOutcome {
   key: string;
+  /** Spec file basename, e.g. `perf.workspaceOpen.spec.ts`. */
+  spec: string;
   title: string;
   status: TestStatus;
   attempts: number;
@@ -315,6 +480,7 @@ export function parsePlaywrightResults(json: unknown): PlaywrightResults {
         const finalRetry = results.length === 0 ? undefined : (lastRetry ?? results.length - 1);
         tests.push({
           key: testKey(specFile, title),
+          spec: basename(specFile),
           title,
           status: status as TestStatus,
           attempts: results.length,
@@ -349,6 +515,10 @@ export interface ReportScenario {
   values?: Partial<Record<MetricId, number>>;
   /** Metrics that should exist but could not be read; shown as "unavailable". */
   unavailable?: MetricId[];
+  /** Page milestones; only workspace-open scenarios have them (others show "—"). */
+  milestones?: ValuesRead<MilestoneId>;
+  /** Leg × transport medians; only on the summary that holds `chatSwitch`, not its companions. */
+  chatSwitch?: ChatSwitchLegRow[];
 }
 
 export interface ReportRow {
@@ -378,6 +548,100 @@ export interface ReportInput {
   /** undefined = the results file was not found. */
   results?: PlaywrightResults;
   reads: readonly ScenarioRead[];
+  /**
+   * The run set XUM_E2E_CHAT_SWITCH_XL=1, so the xl legs are required. Without it they are
+   * required only when either xl leg is present.
+   */
+  expectChatSwitchXl?: boolean;
+}
+
+function gapList<K extends string>(
+  gaps: ReadonlyArray<{ key: K; gap: ValueGap }>,
+  label: (key: K) => string
+): string {
+  return gaps.map((entry) => `${label(entry.key)} (${entry.gap})`).join(", ");
+}
+
+const MILESTONE_LABEL = (id: MilestoneId) =>
+  MILESTONES.find((milestone) => milestone.id === id)?.label ?? id;
+const CHAT_SWITCH_LABEL = (key: ChatSwitchMetricKey) =>
+  CHAT_SWITCH_METRICS.find((metric) => metric.key === key)?.label ?? key;
+
+/**
+ * Coverage checks for one chat-switch summary. Problems: a required transport or leg is missing,
+ * a leg's `count` is not a positive integer, or a median is not a valid number. A median the
+ * harness wrote as null (no switch recorded that value) or left out is a warning; its cell says
+ * "unavailable" either way.
+ */
+function checkChatSwitch(
+  test: TestOutcome,
+  label: string,
+  read: Extract<ChatSwitchRead, { ok: true }>,
+  expectXl: boolean
+): { problems: Problem[]; warnings: string[] } {
+  const problems: Problem[] = [];
+  const warnings: string[] = [];
+  const where = `Chat switch ${code(label)} of ${code(test.key)}`;
+  const xlRequired = expectXl || read.rows.some((row) => CHAT_SWITCH_XL_LEGS.includes(row.leg));
+  const requiredLegs = xlRequired ? CHAT_SWITCH_LEGS : CHAT_SWITCH_CORE_LEGS;
+  const transports = read.legacy ? ["in-process"] : CHAT_SWITCH_TRANSPORTS;
+  for (const transport of transports) {
+    const legs = new Set(
+      read.rows.filter((row) => row.transport === transport).map((row) => row.leg)
+    );
+    const missing = requiredLegs.filter((leg) => !legs.has(leg));
+    if (missing.length > 0) {
+      problems.push({
+        key: `chat-switch-legs-missing:${test.key}/${label}/${transport}`,
+        text: `${where} has no medians for ${missing.map(code).join(", ")} (${code(transport)}).`,
+      });
+    }
+  }
+  const badCount = read.rows.filter((row) => row.count === undefined);
+  if (badCount.length > 0) {
+    problems.push({
+      key: `chat-switch-count-invalid:${test.key}/${label}`,
+      text: `${where} has no positive integer \`count\` for ${badCount
+        .map((row) => `${code(row.leg)} (${code(row.transport)})`)
+        .join(", ")}, so those rows are unavailable.`,
+    });
+  }
+  const usable = read.rows.filter((row) => row.count !== undefined);
+  const invalid = usable.filter((row) => row.gaps.some((entry) => entry.gap === "invalid"));
+  if (invalid.length > 0) {
+    problems.push({
+      key: `chat-switch-value-invalid:${test.key}/${label}`,
+      text: `${where} has invalid medians: ${invalid
+        .map(
+          (row) =>
+            `${code(row.leg)} (${code(row.transport)}): ${gapList(
+              row.gaps.filter((entry) => entry.gap === "invalid"),
+              CHAT_SWITCH_LABEL
+            )}`
+        )
+        .join("; ")}.`,
+    });
+  }
+  for (const row of usable) {
+    const absent = row.gaps.filter((entry) => entry.gap !== "invalid");
+    if (absent.length > 0) {
+      warnings.push(
+        `${where} ${code(row.leg)} (${code(row.transport)}) has no median for ${gapList(
+          absent,
+          CHAT_SWITCH_LABEL
+        )}.`
+      );
+    }
+  }
+  if (read.unknown.length > 0) {
+    warnings.push(
+      `${where} has transports or legs this report does not know, not shown: ${read.unknown
+        .slice(0, 10)
+        .map(code)
+        .join(", ")}${read.unknown.length > 10 ? ` (and ${read.unknown.length - 10} more)` : ""}.`
+    );
+  }
+  return { problems, warnings };
 }
 
 /**
@@ -449,7 +713,8 @@ export function buildReport(input: ReportInput): Report {
     const final = input.reads.filter(
       (read) => read.testKey === test.key && read.retry === test.finalRetry
     );
-    const chatSwitch = final.some((read) => read.ok && read.chatSwitch);
+    const chatSwitch = final.some((read) => read.ok && read.chatSwitch !== undefined);
+    const workspaceOpen = test.spec === WORKSPACE_OPEN_SPEC;
     const scenarios: ReportScenario[] = [];
     const invalid: string[] = [];
     for (const read of final) {
@@ -458,19 +723,49 @@ export function buildReport(input: ReportInput): Report {
       } else if (!chatSwitch) {
         if (read.metrics.ok) {
           const { values, unavailable } = read.metrics;
-          scenarios.push({ label: read.label, values, unavailable });
+          const milestones = workspaceOpen ? read.milestones : undefined;
+          scenarios.push({ label: read.label, values, unavailable, milestones });
           if (unavailable.includes("reactRenders")) {
             problems.push({
               key: `react-profile-unreadable:${test.key}/${read.label}`,
               text: `Scenario ${code(read.label)} has no readable React profile (\`react-profile.json\` is missing or malformed), so React renders are unavailable.`,
             });
           }
+          if (milestones && milestones.gaps.length > 0) {
+            problems.push({
+              key: `milestones-unavailable:${test.key}/${read.label}`,
+              text: `Scenario ${code(read.label)} has no usable page milestones for ${gapList(
+                milestones.gaps,
+                MILESTONE_LABEL
+              )}, so those cells are unavailable.`,
+            });
+          }
         } else {
           invalid.push(read.metrics.reason);
         }
+      } else if (read.chatSwitch?.ok === false) {
+        invalid.push(read.chatSwitch.reason);
       } else {
-        scenarios.push({ label: read.label });
+        scenarios.push({ label: read.label, chatSwitch: read.chatSwitch?.rows });
+        if (read.chatSwitch) {
+          const checked = checkChatSwitch(
+            test,
+            read.label,
+            read.chatSwitch,
+            input.expectChatSwitchXl === true
+          );
+          problems.push(...checked.problems);
+          warnings.push(...checked.warnings);
+        }
       }
+    }
+    // The chat-switch test must write its medians; without them it would look like an ordinary
+    // scenario with nothing lost.
+    if (test.spec === CHAT_SWITCH_SPEC && !chatSwitch && final.some((read) => read.ok)) {
+      problems.push({
+        key: `chat-switch-missing:${test.key}`,
+        text: `Test ${code(test.key)} wrote no chat-switch medians in its final attempt.`,
+      });
     }
     scenarios.sort((a, b) => a.label.localeCompare(b.label));
 
@@ -594,7 +889,7 @@ export function renderSummary(input: {
   const metricRows: string[] = [];
   for (const row of rows.filter((entry) => !entry.chatSwitch)) {
     if (row.scenarios.length === 0) {
-      const cells = METRICS.map(() => "unavailable");
+      const cells = [...METRICS, ...MILESTONES].map(() => "unavailable");
       metricRows.push(`| ${code(row.test.key)} | ${unavailable(row)} | ${cells.join(" | ")} |`);
     }
     for (const scenario of row.scenarios) {
@@ -603,6 +898,16 @@ export function renderSummary(input: {
           ? "unavailable"
           : formatValue(scenario.values?.[spec.id], spec.decimals)
       );
+      const { milestones } = scenario;
+      for (const spec of MILESTONES) {
+        cells.push(
+          milestones === undefined
+            ? "—"
+            : milestones.values[spec.id] === undefined
+              ? "unavailable"
+              : formatValue(milestones.values[spec.id], spec.decimals)
+        );
+      }
       metricRows.push(`| ${code(row.test.key)} | ${code(scenario.label)} | ${cells.join(" | ")} |`);
     }
   }
@@ -613,19 +918,62 @@ export function renderSummary(input: {
     lines.push("### Scenario metrics", "");
     if (metricRows.length > 0) {
       lines.push(
-        ...tableHeader(["Test", "Scenario", ...METRICS.map((spec) => spec.label)], 2),
+        ...tableHeader(
+          [
+            "Test",
+            "Scenario",
+            ...METRICS.map((spec) => spec.label),
+            ...MILESTONES.map((spec) => spec.label),
+          ],
+          2
+        ),
         ...metricRows,
         ""
       );
     }
-    lines.push("— means the scenario does not record that metric.");
+    lines.push(
+      "— means the scenario does not record that metric. Page milestones (the last three columns) are recorded by workspace-open scenarios only."
+    );
     if (chatSwitchLabels.length > 0) {
       lines.push(
         "",
-        `Chat-switch scenarios (${chatSwitchLabels.join(", ")}) are not listed: their whole-scenario Chrome totals changed scope when server-window switches were added, so they are not comparable over time. Per-leg chat-switch medians and workspace-open milestones are not reported yet (#4442).`
+        `Chat-switch scenarios (${chatSwitchLabels.join(", ")}) are not listed: their whole-scenario Chrome totals changed scope when server-window switches were added, so they are not comparable over time. See Chat switch.`
       );
     }
     lines.push("");
+  }
+
+  const chatSwitchRows: string[] = [];
+  for (const row of rows) {
+    for (const scenario of row.scenarios) {
+      for (const leg of scenario.chatSwitch ?? []) {
+        const usable = leg.count !== undefined;
+        const cells = CHAT_SWITCH_METRICS.map((metric) =>
+          usable && leg.values[metric.key] !== undefined
+            ? formatValue(leg.values[metric.key], metric.decimals)
+            : "unavailable"
+        );
+        chatSwitchRows.push(
+          `| ${code(scenario.label)} | ${code(leg.leg)} | ${code(leg.transport)} | ${
+            usable ? formatValue(leg.count, 0) : "unavailable"
+          } | ${cells.join(" | ")} |`
+        );
+      }
+    }
+  }
+  if (chatSwitchRows.length > 0) {
+    lines.push(
+      "### Chat switch",
+      "",
+      ...tableHeader(
+        ["Scenario", "Leg", "Transport", "Count", ...CHAT_SWITCH_METRICS.map((m) => m.label)],
+        3
+      ),
+      ...chatSwitchRows,
+      "",
+      "Medians over each leg's switches, per transport.",
+      ""
+    );
   }
 
   if (warnings.length > 0) {

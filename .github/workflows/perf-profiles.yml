@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # One xl chat-switch round per transport (~2.7 MB history, crosses the 1 MiB WebSocket send window).
+  # Workflow-level so the perf report requires the xl legs from the same setting the test reads.
+  XUM_E2E_CHAT_SWITCH_XL: 1
+
 jobs:
   perf-profiles:
     name: Performance Profiles
@@ -39,8 +44,6 @@ jobs:
         env:
           ELECTRON_DISABLE_SANDBOX: 1
           MUX_E2E_PERF_PROFILES: ${{ github.event.inputs.perf_profiles || '' }}
-          # One xl chat-switch round per transport (~2.7 MB history, crosses the 1 MiB WebSocket send window).
-          XUM_E2E_CHAT_SWITCH_XL: 1
       - name: Upload perf artifacts
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -108,4 +111,6 @@ jobs:
       - name: Write perf report summary
         env:
           PERF_RESULT: ${{ needs.perf-profiles.result }}
-        run: bun scripts/perf/perfReport.ts --current perf-current --perf-result "$PERF_RESULT"
+        run: >-
+          bun scripts/perf/perfReport.ts --current perf-current --perf-result "$PERF_RESULT"
+          --chat-switch-xl "$XUM_E2E_CHAT_SWITCH_XL"
