@@ -34,11 +34,13 @@ export const normalizeWhitespace = (text: string) => text.replace(/\s+/gu, " ").
 // Blank lines, or a newline before an unindented list item (nested items stay with their parent).
 const BLOCK_BOUNDARY = /\r?\n[ \t]*\r?\n|\r?\n(?=(?:[-*+]|\d+[.)])[ \t])/u;
 const HEADING_ONLY = /^#{1,6}[ \t][^\n]*$/u;
+// End of a sentence: terminal punctuation (plus closing quotes/brackets) followed by whitespace.
+const SENTENCE_END = /[.!?][)"'`\]]*(?=\s)/gu;
 
 /**
  * Verbatim chunks of memory text, each at most MEMORY_INTUITION_MAX_EXCERPT_CHARS.
- * Long blocks become consecutive windows cut at whitespace, so evidence past the
- * excerpt cap is still reachable instead of being truncated away.
+ * Long blocks become consecutive windows, so evidence past the excerpt cap is still
+ * reachable instead of being truncated away.
  */
 export function chunkMemoryText(text: string): string[] {
   const chunks: string[] = [];
@@ -47,8 +49,19 @@ export function chunkMemoryText(text: string): string[] {
     // A lone heading has no evidence of its own.
     if (block.length === 0 || HEADING_ONLY.test(block)) continue;
     while (block.length > MEMORY_INTUITION_MAX_EXCERPT_CHARS) {
-      // Last whitespace inside the window; otherwise hard-cut, keeping surrogate pairs whole.
-      let cut = block.slice(0, MEMORY_INTUITION_MAX_EXCERPT_CHARS + 1).search(/\s\S*$/u);
+      const window = block.slice(0, MEMORY_INTUITION_MAX_EXCERPT_CHARS + 1);
+      // Prefer the last sentence end in the window so a fact near the cap is not split
+      // across two windows, where neither may be recognized alone (#4405). Overlapping
+      // windows would repeat text in stage 2's fixed chunk budget instead. The half-window
+      // floor keeps the window count (and so that budget) about the same as whitespace cuts.
+      let cut = -1;
+      for (const match of window.matchAll(SENTENCE_END)) {
+        const end = match.index + match[0].length;
+        if (end <= MEMORY_INTUITION_MAX_EXCERPT_CHARS) cut = end;
+      }
+      // Otherwise the last whitespace inside the window; otherwise hard-cut, keeping
+      // surrogate pairs whole.
+      if (cut < MEMORY_INTUITION_MAX_EXCERPT_CHARS / 2) cut = window.search(/\s\S*$/u);
       if (cut <= 0) {
         cut = MEMORY_INTUITION_MAX_EXCERPT_CHARS;
         const code = block.charCodeAt(cut - 1);
