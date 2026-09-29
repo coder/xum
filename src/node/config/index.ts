@@ -77,7 +77,7 @@ import {
 import { PlatformPaths } from "@/common/utils/paths";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import { PendingRemovalSchema } from "@/common/schemas/project";
+import { DelegatedCreationMarkSchema, PendingRemovalSchema } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
@@ -749,13 +749,19 @@ function normalizePersistedWorkspace(
   const hasMalformedConsentPending =
     Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
     persisted.unrelatedWorkspaceConsentPending !== true;
+  // A malformed delegated-creation mark reads as absent: the startup resolver then leaves the row
+  // alone, as it does every row without the creator's mark (#4983).
+  const hasMalformedDelegatedCreation =
+    Object.hasOwn(persisted, "delegatedCreation") &&
+    !DelegatedCreationMarkSchema.safeParse(persisted.delegatedCreation).success;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
-    !hasMalformedConsentPending
+    !hasMalformedConsentPending &&
+    !hasMalformedDelegatedCreation
   ) {
     return workspace;
   }
@@ -765,6 +771,7 @@ function normalizePersistedWorkspace(
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
+  if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -4360,6 +4367,7 @@ export class Config {
           taskTerminalFailure: existing.taskTerminalFailure,
           pendingRemoval: existing.pendingRemoval,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          delegatedCreation: existing.delegatedCreation,
         };
       } else {
         // Add new workspace

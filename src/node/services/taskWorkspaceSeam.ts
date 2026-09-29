@@ -748,11 +748,15 @@ export interface WorkspaceProvisioningHost {
     options?: {
       awaitMaterialization?: boolean;
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
   /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
   grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;
+  /** A delegated target's creation mark (#4983): drop it (never throws) or flag it (CAS). */
+  clearDelegatedCreationMark(workspaceId: string, handleId: string): Promise<void>;
+  markDelegatedCreationInterrupted(workspaceId: string, handleId: string): Promise<boolean>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
     workspacePath: string,

@@ -187,6 +187,21 @@ export class TaskHandleStore {
     return record?.ownerWorkspaceId === ownerWorkspaceId ? record : null;
   }
 
+  /**
+   * Whether a record file exists for the handle, readable or not (#4983). getWorkspaceTurn()
+   * answers null for a corrupt record and for one a newer build wrote (strict schema), so only
+   * this proves a handle never persisted. Errors other than ENOENT propagate (fail closed).
+   */
+  async hasWorkspaceTurnFile(ownerWorkspaceId: string, handleId: string): Promise<boolean> {
+    try {
+      await fsPromises.lstat(this.getHandlePath(ownerWorkspaceId, handleId));
+      return true;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return false;
+      throw error;
+    }
+  }
+
   async listWorkspaceTurns(
     ownerWorkspaceId: string,
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}

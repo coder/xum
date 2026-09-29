@@ -67,6 +67,12 @@ describe("delegated target default consent (#4453)", () => {
         (...args: Parameters<WorkspaceHost["removeWhileTaskTreeLocked"]>) =>
           real.removeWhileTaskTreeLocked(...args)
       ),
+      clearDelegatedCreationMark: mock((id: string, handleId: string) =>
+        real.clearDelegatedCreationMark(id, handleId)
+      ),
+      markDelegatedCreationInterrupted: mock((id: string, handleId: string) =>
+        real.markDelegatedCreationInterrupted(id, handleId)
+      ),
     });
     const { taskService: manager } = createWorkspaceTurnManagerHarness(config, {
       aiService,
@@ -466,7 +472,8 @@ describe("delegated target default consent (#4453)", () => {
 
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
 
-    expect(mark(a.config)).toEqual({ handleId: "wst_handle", ownerWorkspaceId: a.parentId });
+    // Not flagged; the mark is a leftover beside a persisted record and is dropped.
+    expect(mark(a.config)).toBeUndefined();
     await fsPromises.rm(handleRecordPath(a.parentId));
     await a.finish();
   });
@@ -511,8 +518,10 @@ describe("delegated target default consent (#4453)", () => {
         row.pendingRemoval = {
           removalId: "removal",
           instanceId: "other",
-          pid: process.pid,
+          // Another live process (init), so no self-heal takes the marker over.
+          pid: 1,
           identity: { ...identity, platform: process.platform, hostname: null },
+          at: new Date().toISOString(),
         };
       }
       return cfg;
@@ -520,6 +529,8 @@ describe("delegated target default consent (#4453)", () => {
 
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
 
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace.pendingRemoval)
+      .toBeDefined();
     expect(mark(a.config)?.interruptedAt).toBeUndefined();
     await a.finish();
   });
