@@ -6015,11 +6015,12 @@ export class WorkspaceService
     }
 
     const initialWorkspaceName = sanitizeBranchNameForWorkspace(resolvedBranchName);
-    // Sanitized collisions must fail so distinct Git branches cannot share one workspace identity.
-    const initialConflict = getBranchWorkspaceNameConflict(
-      resolvedBranchName,
-      (projectConfig.workspaces ?? []).map((workspace) => workspace.name)
-    );
+    // Sanitized collisions must fail so distinct Git branches cannot share one workspace identity,
+    // or one plan file (#5139). Checked before any per-workspace state exists.
+    const initialConflict = getBranchWorkspaceNameConflict(resolvedBranchName, [
+      ...(projectConfig.workspaces ?? []).map((workspace) => workspace.name),
+      ...planDirectoryNames,
+    ]);
     if (initialConflict) {
       return Err(initialConflict);
     }

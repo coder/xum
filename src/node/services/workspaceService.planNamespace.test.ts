@@ -272,12 +272,15 @@ describe("same-basename projects share the plan-directory name namespace (#5139)
     test("a sanitized branch whose workspace name another workspace's plan uses is refused", async () => {
       await withTempMuxRoot(async () => {
         await addWorkspace(projectA, "aaaaaaaa14", "feat-x");
+        const newIds = spyOn(harness.config, "generateStableId");
 
         const result = await createLocal(projectB, "feat/x");
 
         expect(result.success ? result.data.metadata.name : result.error).toBe(
           formatBranchWorkspaceNameConflict("feat/x")
         );
+        // Refused before any per-workspace state (session, init state) is created.
+        expect(newIds).not.toHaveBeenCalled();
       });
     });
   });
