@@ -9,8 +9,8 @@ import { createTestHistoryService } from "./testHistoryService";
 // #4790: on POSIX the sidebar status read holds the history lock only for truncate recovery,
 // open and fstat, then scans the pinned descriptors unlocked and verifies their stamps. These
 // cases pause that scan at its first positional read (a gated FileHandle.read, no timers) and
-// check that writers proceed, that every concurrent change fails closed, and that descriptors
-// never leak. Windows keeps the whole scan locked (open handles make rename fail there).
+// check that writers proceed, that every concurrent change fails the unlocked scan closed and
+// falls back once to a fully locked read of the current files, and that descriptors never leak. Windows keeps the whole scan locked (open handles make rename fail there).
 const posix = process.platform !== "win32";
 const everyRow = () => true;
 
@@ -126,7 +126,7 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     expect(result.success ? result.data.map((m) => m.id) : result.error).toEqual(expected);
   });
 
-  test.skipIf(!posix)("an append during the paused scan fails the read closed", async () => {
+  test.skipIf(!posix)("an append during the paused scan falls back to a fresh read", async () => {
     const workspaceId = "lock-append";
     await writeLayout(workspaceId, null, rows("m", 5));
     const paused = instrumentOpen(workspaceId, { gate: true });
@@ -139,12 +139,15 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     expect(appended.success).toBe(true);
     paused.release();
     const result = await read;
-    expect(result.success ? "ok" : result.error).toContain("History changed during provider read");
-    expect((await statusIds(workspaceId)).at(-1)).toBe("late");
+    // The pinned snapshot ends before "late", so only the locked fallback can return it.
+    expect(result.success ? result.data.map((m) => m.id) : result.error).toEqual(
+      await statusIds(workspaceId)
+    );
+    expect(result.success && result.data.at(-1)?.id).toBe("late");
   });
 
   test.skipIf(!posix)(
-    "truncate recovery by another reader during the paused scan fails the read closed",
+    "truncate recovery by another reader during the paused scan falls back to a fresh read",
     async () => {
       // Chat has no boundary and fewer rows than the window, so the scan also reads the archive.
       const workspaceId = "lock-recovery";
@@ -164,15 +167,12 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       expect(recovered.slice(0, 2)).toEqual(["old0", "old1"]);
       paused.release();
       const result = await read;
-      expect(result.success ? "ok" : result.error).toContain(
-        "History changed during provider read"
-      );
-      expect(await statusIds(workspaceId)).toEqual(await fullIds(workspaceId));
+      expect(result.success ? result.data.map((m) => m.id) : result.error).toEqual(recovered);
     }
   );
 
   test.skipIf(!posix)(
-    "a foreign in-place shrink the stamp check misses still fails the read closed",
+    "a foreign in-place shrink the stamp check misses still fails the unlocked scan closed",
     async () => {
       const workspaceId = "lock-shrink";
       const chat = rows("m", 40);
@@ -183,20 +183,24 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       const read = status(workspaceId);
       await paused.reached;
       await fs.truncate(paths.chat, Math.floor(before.size / 2));
-      // Hide the shrink from the stamp check, so only the short positional read can catch it.
+      // Hide the shrink from the unlocked scan's stamp check (taken while only its own chat
+      // descriptor is open), so only the short positional read can catch it.
+      const chatOpens = () => paused.handles.filter((handle) => handle.file === paths.chat).length;
       const stat = fs.stat;
       const statSpy = spyOn(fs, "stat").mockImplementation((async (
         ...args: Parameters<typeof fs.stat>
-      ) => (args[0] === paths.chat ? before : stat(...args))) as typeof fs.stat);
+      ) =>
+        args[0] === paths.chat && chatOpens() === 1 ? before : stat(...args)) as typeof fs.stat);
       restores.push(() => statSpy.mockRestore());
       paused.release();
       const result = await read;
       statSpy.mockRestore();
-      expect(result.success ? "ok" : result.error).toContain(
-        "History changed during provider read"
+      // A second chat descriptor means the unlocked scan failed and the locked fallback read
+      // the shrunk file, matching an ungated read of the same bytes (never a partial parse).
+      expect(chatOpens()).toBe(2);
+      expect(result.success ? result.data.map((m) => m.id) : result.error).toEqual(
+        await statusIds(workspaceId)
       );
-      await fs.writeFile(paths.chat, rowsToBytes(chat));
-      expect(await statusIds(workspaceId)).toEqual(await fullIds(workspaceId));
     }
   );
 
@@ -218,8 +222,8 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       const statSpy = spyOn(fs, "stat").mockImplementation((async (
         ...args: Parameters<typeof fs.stat>
       ) => {
-        // The stamp check stats chat.jsonl after both descriptors are open.
-        if (c.failStat && args[0] === paths.chat && tracked.handles.length === 2) {
+        // The stamp check stats chat.jsonl after both descriptors of an attempt are open.
+        if (c.failStat && args[0] === paths.chat && tracked.handles.length >= 2) {
           checkedAfterOpen = true;
           throw Object.assign(new Error("injected stat failure"), { code: "EIO" });
         }
@@ -230,7 +234,8 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       tracked.restore();
       if (result.success !== c.expectOk) problems.push(`${c.name}: success=${result.success}`);
       if (c.failStat && !checkedAfterOpen) problems.push(`${c.name}: stamp check not reached`);
-      const expectedHandles = c.options.failOpen ? 1 : 2;
+      // A failed scan or stamp check retries once under the lock with two new descriptors.
+      const expectedHandles = c.options.failOpen ? 1 : c.expectOk ? 2 : 4;
       if (tracked.handles.length !== expectedHandles)
         problems.push(`${c.name}: opened ${tracked.handles.length}`);
       for (const handle of tracked.handles)

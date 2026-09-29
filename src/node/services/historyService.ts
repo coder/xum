@@ -2614,7 +2614,9 @@ export class HistoryService {
    *   read stays within the captured sizes.
    * - A foreign in-place shrink makes a positional read come back short, which fails closed;
    *   any append, rotation or replacement fails the stamp check.
-   * - A failure returns Err: the status tick keeps the current status and retries at its normal
+   * - A failed unlocked scan falls back once to the fully locked read (today's cost, paid only
+   *   on a conflict), so an in-process writer never makes status skip a tick. If that read
+   *   fails too, Err: the status tick keeps the current status and retries at its normal
    *   interval, the path cross-process races already take today.
    */
   async getStatusHistorySuffix(
@@ -2637,20 +2639,25 @@ export class HistoryService {
         await snapshot.close();
       }
     };
-    if (!STATUS_SCAN_RELEASES_HISTORY_LOCK) {
-      return this.withRecoveredHistoryResultLock(
-        workspaceId,
-        STATUS_SUFFIX_ERROR_PREFIX,
-        async () => read(await openHistorySnapshot(paths))
+    const lockedRead = () =>
+      this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
+        read(await openHistorySnapshot(paths))
       );
-    }
+    if (!STATUS_SCAN_RELEASES_HISTORY_LOCK) return lockedRead();
     // Only truncate recovery + open + fstat need the lock (see the doc comment).
+    let snapshot: OpenHistorySnapshot;
     try {
-      return await read(
-        await this.withRecoveredHistoryLock(workspaceId, () => openHistorySnapshot(paths))
-      );
+      snapshot = await this.withRecoveredHistoryLock(workspaceId, () => openHistorySnapshot(paths));
     } catch (error) {
       return Err(`${STATUS_SUFFIX_ERROR_PREFIX}: ${getErrorMessage(error)}`);
+    }
+    try {
+      return await read(snapshot);
+    } catch {
+      // A writer changed history mid-scan. Skipping made status miss 7/50 ticks under
+      // continuous appends (#4790 UAT), so fall back once to the whole-read lock: base's cost,
+      // paid only on a conflict, and in-process writers cannot change the files under it.
+      return lockedRead();
     }
   }
 

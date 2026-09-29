@@ -196,18 +196,23 @@ describe("HistoryService.getStatusHistorySuffix", () => {
     expect(check("long", await full(workspaceId), tail, 80)).toEqual([]);
   });
 
-  test("fails closed if chat.jsonl changes during the read", async () => {
+  test("fails closed if chat.jsonl changes during every read attempt", async () => {
+    // One mid-scan change is absorbed by the locked fallback read (historyService.statusLock
+    // tests); a change during that read too must still fail closed, never return stale rows.
     const workspaceId = "suffix-replaced";
     await writeLayout(workspaceId, null, [json(createMuxMessage("u", "user", "hello"))]);
     const paths = pathsFor(workspaceId);
     const stat = fs.stat;
-    let changed = false;
+    let changes = 0;
     const spy = spyOn(fs, "stat").mockImplementation((async (
       ...args: Parameters<typeof fs.stat>
     ) => {
-      if (args[0] === paths.chat && !changed) {
-        changed = true;
-        await fs.appendFile(paths.chat, `${json(createMuxMessage("late", "user", "late"))}\n`);
+      if (args[0] === paths.chat) {
+        changes++;
+        await fs.appendFile(
+          paths.chat,
+          `${json(createMuxMessage(`late${changes}`, "user", "late"))}\n`
+        );
       }
       return stat(...args);
     }) as typeof fs.stat);
