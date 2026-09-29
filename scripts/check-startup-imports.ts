@@ -97,6 +97,10 @@ export const BANNED_PACKAGES: readonly string[] = [
   "@openrouter/ai-sdk-provider",
   "ollama-ai-provider-v2",
   "typescript",
+  // Load only once services run (~170 ms together plus the zod-built schema modules);
+  // desktop main imports them lazily in loadServices() so they stay after the splash (#4423).
+  "effect",
+  "zod",
 ];
 
 export interface EagerImportViolation {
