@@ -28,10 +28,8 @@
  * workspace keys. Desktop remote windows use per-URL partitions and are unaffected.
  */
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  findOrphanedWorkspaceStorageKeys,
-  listWorkspaceStorageGcCandidateKeys,
-} from "@/common/constants/storage";
+import { findOrphanedWorkspaceStorageKeys } from "@/common/constants/storage";
+import { listWorkspaceStorageGcCandidateKeys } from "@/browser/utils/workspaceStorage";
 
 let gcStarted = false;
 

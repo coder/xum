@@ -18,7 +18,6 @@ import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/Pro
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
-  deleteWorkspaceStorage,
   getAgentIdKey,
   getDraftScopeId,
   getModelKey,
@@ -29,7 +28,6 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
-  migrateWorkspaceStorage,
   AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
   DEFAULT_RUNTIME_KEY,
@@ -42,6 +40,7 @@ import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
+import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI } from "@/browser/contexts/API";
@@ -49,6 +48,7 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   readPersistedState,
   readPersistedString,
+  isPersistedStateStorageEvent,
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
   updatePersistedState,
@@ -688,7 +688,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     });
     const storageWindow = window;
     const onStorage = (event: StorageEvent) => {
-      if (event.storageArea === storageWindow.localStorage) markDirty(event.key);
+      if (isPersistedStateStorageEvent(event)) markDirty(event.key);
     };
     storageWindow.addEventListener("storage", onStorage);
     const stopTrackingWrites = () => {

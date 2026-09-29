@@ -4,6 +4,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import {
+  getPersistedStateStorage,
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
 } from "@/browser/hooks/usePersistedState";
@@ -26,13 +27,9 @@ import { assert } from "@/common/utils/assert";
 import { normalizeOrder } from "@/common/utils/projectOrdering";
 import { stableStringify } from "@/common/utils/stableStringify";
 
-function getLocalStorage(): Storage | null {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return null;
-  }
-
-  return window.localStorage;
-}
+// Tests inject their own Storage; production reads the persisted-state storage and writes to it
+// only through syncPersistedStateFromBackend (see writeBackendEntryToLocalStorage).
+const getLocalStorage = getPersistedStateStorage;
 
 function writeBackendEntryToLocalStorage(entry: { key: string; value: unknown }, storage: Storage) {
   if (storage === getLocalStorage()) {

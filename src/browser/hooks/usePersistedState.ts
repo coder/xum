@@ -113,13 +113,16 @@ function evictCacheKeys(storage: Storage): number {
  * not be stored; callers skip change notifications then, because nothing changed on disk.
  */
 function writePersistedValue(key: string, newValue: unknown): boolean {
-  const storage = window.localStorage;
   if (newValue === undefined || newValue === null) {
-    storage.removeItem(key);
+    window.localStorage.removeItem(key);
     return true;
   }
+  return writeSerializedValue(key, JSON.stringify(newValue));
+}
 
-  const serialized = JSON.stringify(newValue);
+/** Store an already-serialized value (see writePersistedValue for the quota handling). */
+function writeSerializedValue(key: string, serialized: string): boolean {
+  const storage = window.localStorage;
   try {
     storage.setItem(key, serialized);
     return true;
@@ -243,6 +246,80 @@ export function listPersistedStateKeys(prefixes: readonly string[]): string[] {
     }
   }
   return keys;
+}
+
+/**
+ * Read a stored value exactly as written (no JSON parsing), or null when absent/unavailable.
+ * For keys whose on-disk format must stay raw so older builds can still read them.
+ */
+export function readPersistedRawString(key: string): string | null {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Store `value` verbatim (no JSON encoding) through the shared write path. Used for raw-format
+ * keys and for copying already-serialized values (workspace fork). Does not notify subscribers:
+ * raw keys have no hook consumers, and fork copies target a scope nothing has mounted yet.
+ * Returns false when the value could not be stored.
+ */
+export function writePersistedRawString(key: string, value: string): boolean {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return false;
+  }
+  try {
+    return writeSerializedValue(key, value);
+  } catch (error) {
+    reportWriteFailureOnce(key, error);
+    return false;
+  }
+}
+
+/**
+ * Remove many keys in one pass (startup cleanups, workspace deletion, orphan GC), then notify
+ * write listeners and hook subscribers once per key so mounted consumers do not write a stale
+ * value back. Unlike updatePersistedState it dispatches no per-key window CustomEvent: the only
+ * key-specific window listeners (sidebar last-read keys of listed workspaces, resizable sidebar
+ * widths, experiment flags) never watch keys these callers remove.
+ */
+export function removePersistedStateKeys(keys: readonly string[]): void {
+  if (typeof window === "undefined" || !window.localStorage || keys.length === 0) {
+    return;
+  }
+  const storage = window.localStorage;
+  // Absent keys are skipped so callers that pass every possible key (workspace deletion) do not
+  // wake listeners, e.g. the preferences sync, for values that never existed.
+  const removed = keys.filter((key) => storage.getItem(key) !== null);
+  for (const key of removed) {
+    storage.removeItem(key);
+  }
+  for (const key of removed) {
+    notifyWriteListeners({ key, newValue: undefined, source: "local" });
+    notifySubscribers(key);
+  }
+}
+
+/** True when a cross-tab `storage` event came from the persisted-state storage area. */
+export function isPersistedStateStorageEvent(event: StorageEvent): boolean {
+  return typeof window !== "undefined" && event.storageArea === window.localStorage;
+}
+
+/**
+ * The persisted-state Storage, or null outside a browser. Only for reads and identity checks by
+ * code that takes an injectable Storage (tests pass their own); writes must go through
+ * updatePersistedState/syncPersistedStateFromBackend/removePersistedStateKeys.
+ */
+export function getPersistedStateStorage(): Storage | null {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  return window.localStorage;
 }
 
 /**

@@ -78,21 +78,8 @@ function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | un
     return true;
   }
 
-  const key = getExperimentKey(experimentId);
-
-  try {
-    const stored = window.localStorage.getItem(key);
-    // Check for literal "undefined" string defensively - this can occur if
-    // JSON.stringify(undefined) is accidentally stored (it returns "undefined")
-    if (stored === null || stored === "undefined") {
-      return undefined;
-    }
-
-    const parsed = JSON.parse(stored) as unknown;
-    return typeof parsed === "boolean" ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  const parsed = readPersistedState<unknown>(getExperimentKey(experimentId), undefined);
+  return typeof parsed === "boolean" ? parsed : undefined;
 }
 
 function getExplicitLocalExperimentOverrides(): Partial<Record<ExperimentId, boolean>> {
@@ -125,8 +112,6 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
   const key = getExperimentKey(experimentId);
 
   try {
-    window.localStorage.setItem(key, JSON.stringify(enabled));
-
     // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): a downgraded
     // renderer reads the pre-merge exclusive key as an explicit override that
     // wins over the mirrored backend value in its send options, so a stale
@@ -134,16 +119,14 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
     // after the user turned it off (stale true). Keep it equal to PTC.
     // Routed through updatePersistedState so the mirror participates in the
     // shared write-listener/subscriber notification path like other
-    // persisted preferences.
+    // persisted preferences. Written before the PTC key: the PTC key's change
+    // event makes subscribers re-read the snapshot, which consults this mirror.
     if (experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) {
       updatePersistedState(getLegacyPtcExclusiveExperimentKey(), enabled);
     }
 
-    // Dispatch custom event for same-tab synchronization
-    const customEvent = new CustomEvent(getStorageChangeEvent(key), {
-      detail: { key, newValue: enabled },
-    });
-    window.dispatchEvent(customEvent);
+    // Also dispatches the same-tab storage-change event subscribeToExperiment listens to.
+    updatePersistedState(key, enabled);
   } catch (error) {
     console.warn(`Error writing experiment state for "${experimentId}":`, error);
   }

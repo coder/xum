@@ -6,7 +6,8 @@ import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimation
 import { installViewportHeightSync } from "@/browser/utils/viewportHeight";
 import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
-import { initTelemetry, trackAppStarted } from "@/common/telemetry";
+import { initTelemetry } from "@/common/telemetry";
+import { trackAppStarted } from "@/browser/utils/telemetryLifecycle";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 

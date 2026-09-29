@@ -15,9 +15,9 @@ import {
   getPendingScopeId,
   getProjectScopeId,
   GLOBAL_SCOPE_ID,
-  migrateWorkspaceStorage,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
+import { migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import type {
   DraftAttachment,
   DraftAttachmentMetadata,

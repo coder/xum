@@ -66,7 +66,9 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
+import { getRuntimeKey } from "@/common/constants/storage";
+import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { readPersistedRawString } from "@/browser/hooks/usePersistedState";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -1410,7 +1412,7 @@ export async function createNewWorkspace(
   let effectiveRuntime = options.runtime;
   if (effectiveRuntime === undefined) {
     const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = localStorage.getItem(runtimeKey);
+    const savedRuntime = readPersistedRawString(runtimeKey);
     if (savedRuntime) {
       effectiveRuntime = savedRuntime;
     }

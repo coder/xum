@@ -16,11 +16,8 @@ import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  deleteWorkspaceStorage,
-  getDraftScopeId,
-} from "@/common/constants/storage";
+import { WORKSPACE_DRAFTS_BY_PROJECT_KEY, getDraftScopeId } from "@/common/constants/storage";
+import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";

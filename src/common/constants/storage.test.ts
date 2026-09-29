@@ -1,73 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
   PERSISTED_KEY_REGISTRY,
-  deleteWorkspaceStorage,
-  getDesktopPopoutKey,
-  getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getInputAttachmentsKey,
-  getMCPTestResultsKey,
-  getPinnedTodoExpandedKey,
-  getReasoningModeKey,
-  getReviewFileFilterKey,
-  getRightSidebarLayoutKey,
-  getSubAgentTasksExpandedKey,
-  getTerminalTitlesKey,
-  getTimelineFilterKey,
   getWorkspaceKeyPrefix,
   normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
   type TerminalBadgeConfig,
 } from "@/common/constants/storage";
 
-class MemoryStorage implements Storage {
-  private readonly map = new Map<string, string>();
-
-  get length(): number {
-    return this.map.size;
-  }
-
-  clear(): void {
-    this.map.clear();
-  }
-
-  getItem(key: string): string | null {
-    return this.map.get(key) ?? null;
-  }
-
-  key(index: number): string | null {
-    const keys = Array.from(this.map.keys());
-    return keys[index] ?? null;
-  }
-
-  removeItem(key: string): void {
-    this.map.delete(key);
-  }
-
-  setItem(key: string, value: string): void {
-    this.map.set(key, value);
-  }
-}
-
 describe("storage workspace-scoped keys", () => {
-  let originalLocalStorage: Storage | undefined;
-
-  beforeEach(() => {
-    // The helpers in src/common/constants/storage.ts rely on global localStorage.
-    // In tests we install a minimal in-memory implementation.
-    originalLocalStorage = globalThis.localStorage;
-    globalThis.localStorage = new MemoryStorage();
-  });
-
-  afterEach(() => {
-    if (originalLocalStorage) {
-      globalThis.localStorage = originalLocalStorage;
-    } else {
-      delete (globalThis as { localStorage?: unknown }).localStorage;
-    }
-  });
-
   test("getDraftScopeId formats scope id", () => {
     expect(getDraftScopeId("/Users/me/repo", "draft-123")).toBe(
       "__draft__//Users/me/repo/draft-123"
@@ -82,51 +25,6 @@ describe("storage workspace-scoped keys", () => {
     expect(normalizeTranscriptDensity("hyper")).toBe("hyper");
     expect(normalizeTranscriptDensity("compact")).toBe("normal");
     expect(normalizeTranscriptDensity(null)).toBe("normal");
-  });
-
-  // These per-workspace keys were missing from the delete lists, so every deleted workspace
-  // left them behind until they filled the origin quota.
-  test("deleteWorkspaceStorage removes per-workspace keys the old lists missed", () => {
-    const workspaceId = "ws-delete-missing";
-    const otherWorkspaceKey = getReasoningModeKey("ws-other");
-    const keys = [
-      getReasoningModeKey,
-      getDisableWorkspaceAgentsKey,
-      getPinnedTodoExpandedKey,
-      getSubAgentTasksExpandedKey,
-      getRightSidebarLayoutKey,
-      getTerminalTitlesKey,
-      getReviewFileFilterKey,
-      getTimelineFilterKey,
-      getDesktopPopoutKey,
-    ].map((getKey) => getKey(workspaceId));
-    for (const key of [...keys, otherWorkspaceKey]) localStorage.setItem(key, "value");
-
-    deleteWorkspaceStorage(workspaceId);
-
-    for (const key of keys) expect(localStorage.getItem(key)).toBeNull();
-    expect(localStorage.getItem(otherWorkspaceKey)).toBe("value");
-  });
-
-  // Workspace-scoped MCP test results embed the project path before the id, so the registry loop
-  // cannot address them.
-  test("deleteWorkspaceStorage removes the workspace's mcpTestResults keys in every project", () => {
-    const workspaceId = "ws-delete-mcp";
-    const removed = [
-      getMCPTestResultsKey("/repo/a", workspaceId),
-      getMCPTestResultsKey("/repo/b", workspaceId),
-    ];
-    const kept = [
-      getMCPTestResultsKey("/repo/a"),
-      getMCPTestResultsKey("/repo/a", "ws-other"),
-      getMCPTestResultsKey("/repo/a", `x${workspaceId}`),
-    ];
-    for (const key of [...removed, ...kept]) localStorage.setItem(key, "value");
-
-    deleteWorkspaceStorage(workspaceId);
-
-    for (const key of removed) expect(localStorage.getItem(key)).toBeNull();
-    for (const key of kept) expect(localStorage.getItem(key)).toBe("value");
   });
 
   // A prefix that is a prefix of another would give keys the wrong kind, so quota eviction could

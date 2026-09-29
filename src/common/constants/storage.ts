@@ -127,6 +127,21 @@ export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
 export const DEFAULT_RUNTIME_KEY = "defaultRuntime";
 
 /**
+ * Browser-mode server auth token. Stored as a raw string (not JSON): older builds read it with a
+ * raw getItem, so the format must stay raw for downgrades.
+ */
+export const AUTH_TOKEN_KEY = "mux:auth-token";
+
+/** Recently used command palette action ids (string[], most recent first). */
+export const COMMAND_PALETTE_RECENT_KEY = "commandPalette:recent";
+
+/** Most recent command palette actions kept in COMMAND_PALETTE_RECENT_KEY. */
+export const COMMAND_PALETTE_RECENT_MAX_ENTRIES = 20;
+
+/** Telemetry first-launch flag (true once the app has started before). */
+export const FIRST_LAUNCH_KEY = "mux_first_launch_complete";
+
+/**
  * Get the localStorage key for cached MCP server test results (per project)
  * Format: "mcpTestResults:{projectPath}"
  * Stores: Record<serverName, CachedMCPTestResult>
@@ -936,7 +951,7 @@ export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft" | "
  */
 export type PersistedKeyScope = "global" | "workspaceId";
 
-interface WorkspaceKeyRegistration {
+export interface WorkspaceKeyRegistration {
   scope: "workspaceId";
   getKey: (scopeId: string) => string;
   kind: PersistedKeyKind;
@@ -1027,7 +1042,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalCacheKey(getWorkspaceKeyPrefix(getMCPTestResultsKey), "prefix"),
 ];
 
-const WORKSPACE_KEY_REGISTRATIONS = PERSISTED_KEY_REGISTRY.filter(
+export const WORKSPACE_KEY_REGISTRATIONS = PERSISTED_KEY_REGISTRY.filter(
   (entry): entry is WorkspaceKeyRegistration => entry.scope === "workspaceId"
 );
 
@@ -1045,7 +1060,7 @@ function getWorkspaceScopeIdFromKey(key: string): string | null {
   return null;
 }
 
-const MCP_TEST_RESULTS_KEY_PREFIX = getWorkspaceKeyPrefix(getMCPTestResultsKey);
+export const MCP_TEST_RESULTS_KEY_PREFIX = getWorkspaceKeyPrefix(getMCPTestResultsKey);
 
 /**
  * Trailing segment of an "mcpTestResults:{projectPath}[:{workspaceId}]" key (text after the last
@@ -1072,46 +1087,6 @@ export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
 }
 
 /**
- * Copy all workspace-specific localStorage keys from source to destination workspace.
- * Includes registry keys marked copyOnFork (model, review state, etc). Composer drafts are not
- * here: they live on the backend, whose fork copies the draft (DraftService).
- */
-export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): void {
-  for (const { getKey, copyOnFork } of WORKSPACE_KEY_REGISTRATIONS) {
-    if (!copyOnFork) continue;
-    const sourceKey = getKey(sourceWorkspaceId);
-    const destKey = getKey(destWorkspaceId);
-    const value = localStorage.getItem(sourceKey);
-    if (value !== null) {
-      localStorage.setItem(destKey, value);
-    }
-  }
-}
-
-/**
- * Delete all workspace-specific localStorage keys for a workspace
- * Should be called when a workspace is deleted to prevent orphaned data
- */
-export function deleteWorkspaceStorage(workspaceId: string): void {
-  for (const { getKey } of WORKSPACE_KEY_REGISTRATIONS) {
-    localStorage.removeItem(getKey(workspaceId));
-  }
-  // Workspace-scoped MCP test results embed the project path before the id, so they cannot be
-  // addressed by id alone; scan for them. Collect first: removing while indexing shifts keys.
-  const mcpTestResultsSuffix = `:${workspaceId}`;
-  const mcpTestResultsKeys: string[] = [];
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index);
-    if (key?.startsWith(MCP_TEST_RESULTS_KEY_PREFIX) && key.endsWith(mcpTestResultsSuffix)) {
-      mcpTestResultsKeys.push(key);
-    }
-  }
-  for (const key of mcpTestResultsKeys) {
-    localStorage.removeItem(key);
-  }
-}
-
-/**
  * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
  * collects keys whose scope id has this shape, so legacy-format ids, creation-draft, pending,
  * project and global scopes and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
@@ -1131,16 +1106,11 @@ function getWorkspaceStorageGcOwnerId(key: string): string | null {
 }
 
 /**
- * Every localStorage key the orphan GC could ever collect: registered workspace-scoped keys and
+ * Whether the orphan GC could ever collect `key`: registered workspace-scoped keys and
  * workspace-scoped mcpTestResults keys of stable workspace ids.
  */
-export function listWorkspaceStorageGcCandidateKeys(): string[] {
-  const keys: string[] = [];
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index);
-    if (key !== null && getWorkspaceStorageGcOwnerId(key) !== null) keys.push(key);
-  }
-  return keys;
+export function isWorkspaceStorageGcCandidateKey(key: string): boolean {
+  return getWorkspaceStorageGcOwnerId(key) !== null;
 }
 
 /** Pick the candidate keys whose stable workspace id is not in `knownWorkspaceIds`. */
@@ -1152,13 +1122,4 @@ export function findOrphanedWorkspaceStorageKeys(
     const ownerId = getWorkspaceStorageGcOwnerId(key);
     return ownerId !== null && !knownWorkspaceIds.has(ownerId);
   });
-}
-
-/**
- * Migrate all workspace-specific localStorage keys from old to new workspace ID
- * Should be called when a workspace is renamed to preserve settings
- */
-export function migrateWorkspaceStorage(oldWorkspaceId: string, newWorkspaceId: string): void {
-  copyWorkspaceStorage(oldWorkspaceId, newWorkspaceId);
-  deleteWorkspaceStorage(oldWorkspaceId);
 }

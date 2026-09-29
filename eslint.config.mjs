@@ -544,8 +544,7 @@ const localPlugin = {
       meta: {
         type: "problem",
         docs: {
-          description:
-            "Disallow clearing DOM globals (globalThis.window = undefined) in tests",
+          description: "Disallow clearing DOM globals (globalThis.window = undefined) in tests",
         },
         messages: {
           clear:
@@ -1163,6 +1162,60 @@ const localPlugin = {
                 if (!covered && !allowed.has(specifier)) {
                   context.report({ node, messageId: "unrestored", data: { specifier } });
                 }
+              }
+            }
+          },
+        };
+      },
+    },
+    "no-direct-web-storage": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow direct localStorage/sessionStorage access outside the persisted-state helpers",
+        },
+        messages: {
+          direct:
+            "Do not access {{name}} directly. Use the persisted-state helpers in src/browser/hooks/usePersistedState.ts: every write must go through the shared write path, which evicts caches on quota errors and enforces the key registry.",
+        },
+      },
+      create(context) {
+        // localStorage is one ~5 MB origin quota shared by every feature. Direct access bypassed
+        // the key registry and filled the quota (drafts stopped persisting), so all access goes
+        // through usePersistedState.ts. A local variable or parameter named `storage` is fine.
+        const STORAGE_GLOBALS = new Set(["localStorage", "sessionStorage"]);
+        const GLOBAL_OBJECTS = new Set(["window", "globalThis", "self"]);
+        const report = (node, name) =>
+          context.report({ node, messageId: "direct", data: { name } });
+        const memberName = (node) => {
+          if (!node.computed && node.property.type === "Identifier") return node.property.name;
+          if (node.computed && node.property.type === "Literal") return node.property.value;
+          return null;
+        };
+        return {
+          MemberExpression(node) {
+            const name = memberName(node);
+            if (
+              STORAGE_GLOBALS.has(name) &&
+              node.object.type === "Identifier" &&
+              GLOBAL_OBJECTS.has(node.object.name)
+            ) {
+              report(node, `${node.object.name}.${name}`);
+            }
+          },
+          "Program:exit"(program) {
+            const globalScope = context.sourceCode.getScope(program);
+            // Bare references resolve to no declaration (or to an implicit/configured global).
+            const references = [...globalScope.through];
+            for (const variable of globalScope.variables) {
+              if (STORAGE_GLOBALS.has(variable.name) && variable.defs.length === 0) {
+                references.push(...variable.references);
+              }
+            }
+            for (const reference of references) {
+              if (STORAGE_GLOBALS.has(reference.identifier.name)) {
+                report(reference.identifier, reference.identifier.name);
               }
             }
           },
@@ -2258,6 +2311,25 @@ export default defineConfig([
     ],
     rules: {
       "no-restricted-syntax": "off",
+    },
+  },
+  {
+    // Web storage goes through the persisted-state helpers (see local/no-direct-web-storage).
+    // Tests, stories and story utilities seed and inspect storage directly.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      "src/browser/hooks/usePersistedState.ts",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-direct-web-storage": "error",
     },
   },
   {

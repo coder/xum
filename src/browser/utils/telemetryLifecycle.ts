@@ -4,24 +4,25 @@
  * Handles app startup events
  */
 
-import { trackEvent } from "./client";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
-
-// Storage key for first launch tracking
-const FIRST_LAUNCH_KEY = "mux_first_launch_complete";
+import {
+  readPersistedRawString,
+  readPersistedState,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
+import { trackEvent } from "@/common/telemetry/client";
+import { FIRST_LAUNCH_KEY, VIM_ENABLED_KEY } from "@/common/constants/storage";
 
 /**
  * Check if this is the first app launch
  * Uses localStorage to persist flag across sessions
  */
 function checkFirstLaunch(): boolean {
-  const hasLaunchedBefore = localStorage.getItem(FIRST_LAUNCH_KEY);
-  if (hasLaunchedBefore) {
+  if (readPersistedRawString(FIRST_LAUNCH_KEY)) {
     return false;
   }
 
-  // First launch - set the flag
-  localStorage.setItem(FIRST_LAUNCH_KEY, "true");
+  // First launch - set the flag. JSON true serializes to "true", the raw value older builds wrote.
+  updatePersistedState(FIRST_LAUNCH_KEY, true);
   return true;
 }
 
@@ -29,7 +30,7 @@ function checkFirstLaunch(): boolean {
  * Check if vim mode is enabled
  */
 function checkVimModeEnabled(): boolean {
-  return localStorage.getItem(VIM_ENABLED_KEY) === "true";
+  return readPersistedState<unknown>(VIM_ENABLED_KEY, false) === true;
 }
 
 /**
