@@ -31,9 +31,9 @@ export interface DelegatedCreationInterruptedNoticeProps {
  * confirmation and non-forced removal as the command palette, or keep it as an ordinary
  * workspace. Nothing is removed without the user's confirmation.
  */
-export const DelegatedCreationInterruptedNotice: React.FC<DelegatedCreationInterruptedNoticeProps> = (
-  props
-) => {
+export const DelegatedCreationInterruptedNotice: React.FC<
+  DelegatedCreationInterruptedNoticeProps
+> = (props) => {
   const { api } = useAPI();
   const [pendingAction, setPendingAction] = useState<BannerAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
