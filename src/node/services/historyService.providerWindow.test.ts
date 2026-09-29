@@ -545,8 +545,10 @@ describe("HistoryService bounded active-epoch reads", () => {
     test("rows with an equal sequence survive a page boundary when the cursor names its row", async () => {
       const ws = "page-equal-sequence";
       // Duplicate sequences (an old multi-backend race or a repaired file) must stay browsable:
-      // the cursor row's id tells rows at or before the cursor apart from rows after it.
+      // the cursor row's id tells rows at or before the cursor apart from rows after it. The
+      // duplicate at sequence 0 guards the empty-page shortcut for a cursor at sequence 0.
       await writeLayout(ws, null, [
+        row("d0", "assistant", 0),
         ...assistants(0, 3),
         row("d4a", "assistant", 4),
         row("d4b", "assistant", 4),
