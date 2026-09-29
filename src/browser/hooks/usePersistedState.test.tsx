@@ -164,6 +164,7 @@ describe("persisted state writes under storage quota pressure", () => {
 describe("persisted state key budgets", () => {
   let cleanupDom: (() => void) | null = null;
   let error: ReturnType<typeof spyOn<Console, "error">>;
+  let warn: ReturnType<typeof spyOn<Console, "warn">>;
 
   // Every test uses its own workspace id because refusals are logged once per key per session.
   const TIMELINE_FILTER_BUDGET = getPersistedKeyRegistration(
@@ -171,16 +172,21 @@ describe("persisted state key budgets", () => {
   )!.maxValueChars;
   const valueOfLength = (serializedLength: number) => "x".repeat(serializedLength - 2);
   // Refusal logs shorten long keys, so match on the key's start.
-  const refusalLogsFor = (key: string) =>
-    error.mock.calls.filter((call) => String(call[0]).includes(`"${key.slice(0, 100)}`));
+  const logsFor = (spy: typeof error | typeof warn, key: string) =>
+    spy.mock.calls.filter((call) => String(call[0]).includes(`"${key.slice(0, 100)}`));
+  const refusalLogsFor = (key: string) => logsFor(error, key);
+  // Over-budget values still work for the session, so they only warn.
+  const overBudgetLogsFor = (key: string) => logsFor(warn, key);
 
   beforeEach(() => {
     cleanupDom = installDom();
     error = spyOn(console, "error").mockImplementation(() => undefined);
+    warn = spyOn(console, "warn").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     error.mockRestore();
+    warn.mockRestore();
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
@@ -198,7 +204,8 @@ describe("persisted state key budgets", () => {
     // Readers see the new value for this session; localStorage keeps the last value that fit.
     expect(readPersistedState(key, "")).toBe(overBudget);
     expect(window.localStorage.getItem(key)).toBe(JSON.stringify(atBudget));
-    expect(refusalLogsFor(key)).toHaveLength(1);
+    expect(overBudgetLogsFor(key)).toHaveLength(1);
+    expect(refusalLogsFor(key)).toHaveLength(0);
 
     // A value that fits again is stored and replaces the in-memory one; removal clears both.
     expect(updatePersistedState(key, "tools")).toBe(true);
@@ -218,7 +225,7 @@ describe("persisted state key budgets", () => {
 
     expect(result.current[0]).toBe(overBudget);
     expect(window.localStorage.getItem(key)).toBeNull();
-    expect(refusalLogsFor(key)).toHaveLength(1);
+    expect(overBudgetLogsFor(key)).toHaveLength(1);
   });
 
   test("refuses unregistered keys and keys over the length cap, but always allows removal", () => {

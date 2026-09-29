@@ -168,7 +168,7 @@ function getBudgetViolation(key: string, serialized: string): BudgetViolation | 
     return {
       reason:
         `value is ${serialized.length} chars, over its ${registration.maxValueChars}-char ` +
-        "budget; it is kept in memory for this session and not persisted",
+        "budget; it is kept in memory for this session only",
       overValueBudget: true,
     };
   }
@@ -176,16 +176,25 @@ function getBudgetViolation(key: string, serialized: string): BudgetViolation | 
 }
 
 /**
- * The refusal is logged instead of thrown: an exception would break the component that wrote it.
- * Tests assert refusals through the return value, the stored value and this log.
+ * Budget violations are logged instead of thrown: an exception would break the component that
+ * wrote it. A refusal (unregistered or overlong key) is a bug to fix, so it is an error. An
+ * over-budget value still works for the session and can happen in heavy but normal use (e.g. very
+ * many terminal tabs), so it is only a warning. Tests assert both through the return value, the
+ * stored value and these logs.
  */
-function reportRefusalOnce(key: string, reason: string): void {
+function reportBudgetViolationOnce(key: string, violation: BudgetViolation): void {
   if (keysWithReportedRefusals.has(key)) return;
   keysWithReportedRefusals.add(key);
   // Oversized keys are refused too; don't echo a multi-kilobyte key into the console.
   const shownKey = key.length > 200 ? `${key.slice(0, 200)}...` : key;
+  if (violation.overValueBudget) {
+    console.warn(
+      `Not persisting localStorage key "${shownKey}": ${violation.reason} (further warnings for this key are not logged)`
+    );
+    return;
+  }
   console.error(
-    `Refused localStorage write to "${shownKey}": ${reason} (further refusals for this key are not logged)`
+    `Refused localStorage write to "${shownKey}": ${violation.reason} (further refusals for this key are not logged)`
   );
 }
 
@@ -210,7 +219,7 @@ function writePersistedValue(key: string, newValue: unknown): boolean {
 function writeSerializedValue(key: string, serialized: string): boolean {
   const violation = getBudgetViolation(key, serialized);
   if (violation !== null) {
-    reportRefusalOnce(key, violation.reason);
+    reportBudgetViolationOnce(key, violation);
     if (!violation.overValueBudget) return false;
     getOverBudgetSessionValues().set(key, serialized);
     return true;
