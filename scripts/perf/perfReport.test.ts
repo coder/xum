@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildReport,
   formatLogLine,
@@ -437,7 +440,7 @@ describe("chat-switch scenarios", () => {
           "cold-open-small": legMedians(3),
         },
         "in-process": {
-          "zz-new-leg": legMedians(4),
+          "ZZ New|Leg`::": legMedians(4),
           "cold-open-xl": legMedians(5),
           "cold-open-large": legMedians(9),
           "cold-open-small": legMedians(null),
@@ -680,5 +683,82 @@ describe("sink safety", () => {
       for (const cell of rows.flat()) expect(cell.length).toBeLessThanOrEqual(200);
     }
     expect(markdown).not.toContain("x".repeat(200));
+  });
+
+  // The CLI owns the job-log sink, so these run it the way the workflow does. The environment is
+  // explicit: in CI the test process itself has GITHUB_STEP_SUMMARY set.
+  function runCli(current: string, env: Record<string, string>) {
+    const proc = Bun.spawnSync(
+      [
+        process.execPath,
+        join(import.meta.dir, "perfReport.ts"),
+        "--current",
+        current,
+        "--perf-result",
+        "failure",
+      ],
+      { env: { PATH: process.env.PATH ?? "", GITHUB_ACTIONS: "true", ...env } }
+    );
+    return { exitCode: proc.exitCode, log: `${proc.stdout.toString()}${proc.stderr.toString()}` };
+  }
+
+  test("in GitHub Actions the CLI writes artifact text only to the step summary", () => {
+    const dir = mkdtempSync(join(tmpdir(), "perf-report-cli-"));
+    try {
+      const file = "perf.hostile.spec.ts";
+      mkdirSync(join(dir, "perf", "electron", "hostile-1"), { recursive: true });
+      writeFileSync(
+        join(dir, "perf", "electron", "hostile-1", "perf-summary.json"),
+        JSON.stringify(summary({ runLabel: HOSTILE }, { title: HOSTILE, file }))
+      );
+      writeFileSync(
+        join(dir, "perf", "playwright-results.json"),
+        JSON.stringify({
+          suites: [
+            {
+              file,
+              specs: [
+                {
+                  title: HOSTILE,
+                  tests: [
+                    { status: "unexpected", results: [{ retry: 0, error: { message: HOSTILE } }] },
+                  ],
+                },
+              ],
+            },
+          ],
+          errors: [{ message: HOSTILE }],
+        })
+      );
+      const summaryPath = join(dir, "summary.md");
+      const withSummary = runCli(dir, { GITHUB_STEP_SUMMARY: summaryPath });
+      const withoutSummary = runCli(dir, {});
+      for (const run of [withSummary, withoutSummary]) {
+        expect(run.exitCode).toBe(0);
+        // Rendered Markdown keeps `::` inside code spans, so any Markdown in the log fails here.
+        expect(run.log).not.toContain("::");
+        expect(run.log).not.toContain("secret");
+        expect(run.log.trimEnd()).not.toMatch(CONTROL);
+      }
+      // The report itself still reached the summary.
+      expect(readFileSync(summaryPath, "utf8")).toContain(file);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a crash prints one sanitized line and exits 1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "perf-report-cli-"));
+    try {
+      // A file where the artifact directory should be: reading it throws with the path inside.
+      const current = join(dir, CRAFTED.join(" "));
+      writeFileSync(current, "");
+      const run = runCli(current, {});
+      expect(run.exitCode).toBe(1);
+      expect(run.log).not.toContain("::");
+      expect(run.log.trimEnd()).not.toMatch(CONTROL);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
