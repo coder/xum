@@ -948,7 +948,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
-  const workspaceRemoveWarning = usePopoverError();
+  // Stays until dismissed: the cancelled row is gone, so the user could not reread it (#5143).
+  const workspaceRemoveWarning = usePopoverError(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;

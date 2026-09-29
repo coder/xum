@@ -3,6 +3,7 @@ import "../../../../tests/ui/dom";
 import { type ComponentProps, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -581,6 +582,38 @@ describe("ArchivedWorkspaces", () => {
     expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, { force: true });
     expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
     expect(modalProps).toBeUndefined();
+    // The row is gone, so the warning must survive an unrelated click until dismissed.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.click(document.body);
+    expect(view.getByRole("alert").textContent).toContain(leftover);
+    fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
+    expect(view.queryByRole("alert")).toBeNull();
+  });
+
+  test("a Force Delete retry shows what it left behind", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Container teardown failed",
+    });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")));
+    await waitFor(() => expect(modalProps).toBeDefined());
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+
+    await act(async () => {
+      await modalProps?.onForceDelete(workspace.id, undefined);
+    });
+
+    expect(view.getByRole("alert").textContent).toContain(leftover);
   });
 
   test("shows delete worktree for archived worktree workspaces and calls the API", async () => {

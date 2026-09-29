@@ -344,10 +344,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
-  // Shift-click forces the removal without the Force Delete dialog, so what it left behind (e.g.
-  // a devcontainer that may still hold the plan) is shown here (#5143). Bulk delete shows it in
-  // its progress dialog instead: that modal would hide this popover from assistive technology.
-  const removeWarning = usePopoverError();
+  // What a forced removal left behind (e.g. a devcontainer that may still hold the plan, #5143),
+  // after Shift-click or the Force Delete dialog. It stays until dismissed: the row is gone, so
+  // the user could not reread it. Bulk delete shows it in its progress dialog instead: that modal
+  // would hide this popover from assistive technology.
+  const removeWarning = usePopoverError(null);
 
   // Bulk selection state
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
@@ -813,7 +814,16 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
               force: true,
               acknowledgedDescendantIds,
             });
-            if (result.success) onWorkspacesChanged?.();
+            if (result.success) {
+              // The dialog showed the non-forced error; the forced retry can leave more behind.
+              if (result.warnings?.length) {
+                removeWarning.showError(
+                  workspaceId,
+                  formatWorkspaceRemoveWarnings(result.warnings)
+                );
+              }
+              onWorkspacesChanged?.();
+            }
             return result;
           }}
         />
