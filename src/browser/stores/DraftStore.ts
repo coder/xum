@@ -666,6 +666,8 @@ export class DraftStore {
     await listPut;
     if (this.entries.has(key)) return;
     this.pendingDeletes.set(key, scope);
+    // A list event while waiting above may have shown the row again; hide it now.
+    if (scope.kind === "creation") this.recomputeList();
     await this.sendDelete(key, 0);
   }
 
@@ -1111,6 +1113,20 @@ export class DraftStore {
             }
           }
           continue;
+        }
+        if (scope.kind === "creation" && reply.result !== "orphaned") {
+          // Its row may have fallen out of the over-budget legacy list (#5225), and the list import
+          // above ran before this body existed on the backend. A legacy list import relists every
+          // owned body without a row; if it fails, the keys stay and the next start retries.
+          try {
+            await client.drafts.importLegacyList({ entries: [] });
+          } catch (error) {
+            console.warn(
+              "Could not list an imported legacy draft; will retry on next start:",
+              error
+            );
+            continue;
+          }
         }
         removeKeys();
       } catch (error) {

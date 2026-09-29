@@ -487,6 +487,50 @@ describe("DraftStore", () => {
     expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
   });
 
+  test("keeps a deleted draft hidden when its list put lands while the delete waits", async () => {
+    using tempDir = new TestTempDir("draft-store-list-delete-hidden");
+    const { projectPath, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    // The backend delete keeps failing: only the pending delete hides the row.
+    control.failDeletes = 100;
+    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await deleted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+  });
+
+  test("lists a legacy creation draft whose row the legacy list had already lost", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-unlisted-body");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    // The body exists only in localStorage, and the (over-budget) legacy list lost its row.
+    seedLegacyKey(getInputKey(getDraftScopeId(projectPath, "draft-x")), "typed in an old build");
+    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {
+      [projectPath]: [{ draftId: "other", subProjectPath: null, createdAt: 1 }],
+    });
+    const store = createStore(client);
+    await store.whenReady();
+    await waitFor(() =>
+      (store.getCreationDraftsByProject()[projectPath] ?? []).some(
+        ({ draftId }) => draftId === "draft-x"
+      )
+    );
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      "other",
+      "draft-x",
+    ]);
+    expect(listPersistedKeys("input")).toEqual([]);
+  });
+
   test("imports legacy drafts of workspace ids that start with underscores", async () => {
     using tempDir = new TestTempDir("draft-store-legacy-underscore");
     const { config, projectPath, service, client } = await createHarness(tempDir);
