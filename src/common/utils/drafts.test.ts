@@ -66,4 +66,11 @@ describe("draftJsonBytes", () => {
       Buffer.byteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }))
     );
   });
+
+  test("counts large text exactly across chunk boundaries, surrogate pairs included", () => {
+    const draft = { text: `${"é".repeat(70_000)}${"😀".repeat(70_000)}x`, attachments: [] };
+    expect(draftJsonBytes(draft)).toBe(
+      Buffer.byteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }))
+    );
+  });
 });

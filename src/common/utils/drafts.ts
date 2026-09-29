@@ -37,20 +37,24 @@ export function isDraftEmpty(draft: Draft): boolean {
   return draft.text.length === 0 && draft.attachments.length === 0;
 }
 
-// Code units that take more than one UTF-8 byte: 2-byte ones, a surrogate pair (4 bytes for two
-// units), and the rest of the BMP (3 bytes; JSON.stringify escapes lone surrogates).
-const MULTI_BYTE_UTF16 = /[\u0080-\u07ff]|[\ud800-\udbff][\udc00-\udfff]|[\u0800-\uffff]/g;
+const UTF8_CHUNK_UNITS = 64 * 1024;
+const utf8Encoder = new TextEncoder();
+// Up to 3 bytes per UTF-16 code unit, so one chunk always fits.
+const utf8Scratch = new Uint8Array(UTF8_CHUNK_UNITS * 3);
 
 /**
- * UTF-8 byte length of a string without allocating an encoded copy of a multi-MB draft. The
- * native regex scan skips ASCII (base64 payloads are all ASCII), so a near-limit draft does not
- * cost a per-character JavaScript loop on the renderer thread.
+ * UTF-8 byte length of a string, counted natively in fixed-size chunks: no encoded copy of a
+ * multi-MB draft, and no per-character JavaScript work for ASCII or dense non-ASCII text alike.
  */
 function utf8ByteLength(value: string): number {
-  let bytes = value.length;
-  for (const match of value.matchAll(MULTI_BYTE_UTF16)) {
-    const unit = match[0];
-    bytes += unit.length === 2 ? 2 : unit.charCodeAt(0) < 0x800 ? 1 : 2;
+  let bytes = 0;
+  for (let start = 0; start < value.length; ) {
+    let end = Math.min(start + UTF8_CHUNK_UNITS, value.length);
+    // Never split a surrogate pair: each half alone would count as 3 bytes instead of 4 total.
+    const last = value.charCodeAt(end - 1);
+    if (end < value.length && last >= 0xd800 && last <= 0xdbff) end--;
+    bytes += utf8Encoder.encodeInto(value.slice(start, end), utf8Scratch).written;
+    start = end;
   }
   return bytes;
 }
