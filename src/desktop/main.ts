@@ -184,7 +184,7 @@ import { normalizeAndValidateExternalUrl } from "./utils/normalizeAndValidateExt
 import { hasSameOrigin } from "./utils/hasSameOrigin";
 import assert from "../common/utils/assert";
 import { setOpenSSHHostKeyPolicyMode } from "@/node/runtime/sshConnectionPool";
-import { loadTokenizerModules } from "../node/utils/main/tokenizer";
+import { warmConfiguredTokenizers } from "../node/utils/main/tokenizerWarmModels";
 import { isBashAvailable } from "../node/utils/main/bashPath";
 import windowStateKeeper from "electron-window-state";
 import { getTitleBarOptions } from "./titleBarOptions";
@@ -1025,7 +1025,7 @@ async function loadServices(): Promise<void> {
   );
   services.setTerminalWindowManager(terminalWindowManager);
 
-  loadTokenizerModules().catch((error) => {
+  warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);
   });
 

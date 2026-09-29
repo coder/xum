@@ -126,6 +126,11 @@ function encodingOf(modelName: ModelName): EncodingName {
   return model.encoding;
 }
 
+/** The encoding counting uses for a model id (same overrides and provider fallbacks). */
+export function encodingForModel(modelString: string): EncodingName {
+  return encodingOf(resolveModelName(modelString));
+}
+
 function resolveEncoding(modelName: ModelName): Promise<string> {
   let promise = encodingPromises.get(modelName);
   if (!promise) {

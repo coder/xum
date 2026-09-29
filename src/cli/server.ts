@@ -11,7 +11,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
 import { ServerLockfile } from "@/node/services/serverLockfile";
 import { log } from "@/node/services/log";
-import { loadTokenizerModules } from "@/node/utils/main/tokenizer";
+import { warmConfiguredTokenizers } from "@/node/utils/main/tokenizerWarmModels";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVICE_TEARDOWN_BUDGET_MS } from "@/constants/terminationTimeouts";
@@ -146,9 +146,10 @@ async function main(): Promise<void> {
   // down) gates the listener; the housekeeping that scales with the number of workspaces runs
   // in the background once the server is accepting connections.
   await serviceContainer.initializeCore();
-  // Warm the default tokenizer encodings in background workers (each loads lazily, #4816), so the
-  // first count after startup does not pay the encoding load. Never blocks or fails startup.
-  loadTokenizerModules().catch((error: unknown) => {
+  // Warm the tokenizer encodings the user's configured models need in background workers (each
+  // loads lazily, #4816; warm set from config, #4992), so the first count after startup does not
+  // pay the encoding load. Never blocks or fails startup.
+  warmConfiguredTokenizers(() => config.loadConfigOrDefault()).catch((error: unknown) => {
     log.warn("Failed to preload tokenizer modules:", error);
   });
   serviceContainer.windowService.setMainWindow(mockWindow);
