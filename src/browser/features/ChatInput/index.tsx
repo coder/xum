@@ -18,7 +18,7 @@ import {
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { ConnectionStatusToast } from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { ChatInputToast } from "@/browser/features/ChatInput/ChatInputToast";
-import type { SendMessageError } from "@/common/types/errors";
+import { SendMessageErrorSchema } from "@/common/orpc/schemas/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -464,14 +464,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // late failures (e.g., slow devcontainer startup) still surface a toast.
   const pendingErrorKey =
     variant === "workspace" && workspaceId ? getPendingWorkspaceSendErrorKey(workspaceId) : null;
-  const [pendingError, setPendingError] = usePersistedState<SendMessageError | null>(
+  // Typed as unknown: localStorage can hold anything (another build, a hand edit), and an
+  // invalid error used to crash the workspace view in createErrorToast (#5007).
+  const [pendingError, setPendingError] = usePersistedState<unknown>(
     pendingErrorKey ?? "__unused__",
     null,
     { listener: true }
   );
   useEffect(() => {
-    if (!pendingErrorKey || !pendingError) return;
-    setToast(createErrorToast(pendingError));
+    if (!pendingErrorKey || pendingError == null) return;
+    const parsed = SendMessageErrorSchema.safeParse(pendingError);
+    if (parsed.success) {
+      setToast(createErrorToast(parsed.data));
+    } else {
+      // Self-heal: drop the malformed value (cleared below) instead of throwing.
+      console.warn("Dropping malformed pending send error:", parsed.error);
+    }
     setPendingError(null);
   }, [pendingErrorKey, pendingError, setPendingError]);
 
