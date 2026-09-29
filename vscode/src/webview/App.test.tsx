@@ -2258,6 +2258,13 @@ describe("vscode webview retry barrier (#5092)", () => {
       metadata: { historySequence: 2, timestamp: 2, error: "provider exploded", errorType },
     },
   ];
+  // Scheduled at call time: a countdown that already ran out shows "Retrying..." instead.
+  const scheduledRetry = () => ({
+    type: "auto-retry-scheduled",
+    attempt: 2,
+    delayMs: 60_000,
+    scheduledAt: Date.now(),
+  });
   const chatEvent = (bridge: TestBridge, event: unknown, workspaceId = WORKSPACE.id) =>
     bridge.emit({ type: "chatEvent", workspaceId, event });
   // A live stream the user stops after its first token.
@@ -2321,6 +2328,29 @@ describe("vscode webview retry barrier (#5092)", () => {
       value: { success: false, error: { type: "runtime_not_ready", message: "resume refused" } },
     });
     expect(view.container.textContent).toContain("Retry failed:");
+  });
+
+  test("while the backend has a retry scheduled, the barrier shows its countdown and offers no Retry or Stop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The replayed status snapshot arrives before caught-up, after the failed turn.
+    await selectWorkspace(bridge, [...failedTurn("network"), scheduledRetry()]);
+
+    expect(view.container.textContent).toContain("Retrying in");
+    expect(view.container.textContent).toContain("(attempt 2)");
+    // A manual Retry would race the armed backoff; the webview never stops auto-retry either.
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(view.queryByRole("button", { name: /^Stop/ })).toBeNull();
+
+    // The status belongs to this workspace: another failed workspace offers Retry again.
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
+      await chatEvent(bridge, event, other.id);
+    }
+    expect(view.container.textContent).not.toContain("Retrying");
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   test("a context_exceeded error shows no retry barrier", async () => {

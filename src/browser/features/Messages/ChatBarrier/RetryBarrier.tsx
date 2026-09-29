@@ -47,6 +47,11 @@ interface RetryBarrierContentProps extends RetryBarrierProps {
    */
   onRetry?: () => Promise<void>;
   retryError?: string | null;
+  /**
+   * Whether the scheduled-retry state offers Stop (default true). The VS Code webview shows the
+   * backend's countdown read-only: it never stops or toggles auto-retry.
+   */
+  showStopAutoRetry?: boolean;
 }
 
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
@@ -344,16 +349,18 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
       );
     }
 
-    actionButton = (
-      <button
-        className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
-        onClick={() => {
-          void handleStopAutoRetry();
-        }}
-      >
-        Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
-      </button>
-    );
+    // Never Retry while a retry is active: a manual attempt would race the armed backoff.
+    actionButton =
+      props.showStopAutoRetry === false ? null : (
+        <button
+          className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={() => {
+            void handleStopAutoRetry();
+          }}
+        >
+          Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
+        </button>
+      );
   }
 
   const retryError = manualRetryError ?? props.retryError ?? null;
