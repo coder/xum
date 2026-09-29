@@ -447,99 +447,8 @@ describe("chat-switch scenarios", () => {
     const markdown = render(report);
     expect(tableRows(markdown, "Tests")).toHaveLength(1);
     expect(tableRows(markdown, "Scenario metrics")).toEqual([]);
-    expect(tableRows(markdown, "Chat switch")).toHaveLength(1);
-  });
-
-  test("rows are one per leg × transport in known order, unknown and hostile keys sanitized after", () => {
-    const report = chatSwitchReport({
-      medians: {},
-      // Insertion order is scrambled on purpose; the table order must not depend on it.
-      mediansByTransport: {
-        "Evil|`<b>`::warning::x": {
-          "switch-back-small": legMedians(1),
-          "cold-open-small": legMedians(6),
-        },
-        "server-window": {
-          "switch-back-xl": legMedians(2),
-          "cold-open-small": legMedians(3),
-        },
-        "in-process": {
-          "ZZ New|Leg`::": legMedians(4),
-          "cold-open-xl": legMedians(5),
-          "cold-open-large": legMedians(9),
-          "cold-open-small": legMedians(null),
-        },
-      },
-    });
-    expect(report.problems).toEqual([]);
-    const rows = tableRows(render(report), "Chat switch");
-    expect(rows.map((row) => [row[1], row[2]])).toEqual([
-      ["`cold-open-small`", "`in-process`"],
-      ["`cold-open-small`", "`server-window`"],
-      ["`cold-open-small`", "`evil-b-warning-x`"],
-      ["`cold-open-large`", "`in-process`"],
-      ["`cold-open-xl`", "`in-process`"],
-      ["`switch-back-small`", "`evil-b-warning-x`"],
-      ["`switch-back-xl`", "`server-window`"],
-      ["`zz-new-leg`", "`in-process`"],
-    ]);
-    // A null median is lost coverage: the cell says unavailable and a warning names it; the other
-    // medians of that row still show.
-    expect(rows[0]?.slice(3, 5)).toEqual(["3", "unavailable"]);
-    expect(rows[1]?.[4]).toBe("3.0");
-    expect(
-      report.warnings.some((w) => w.includes("`cold-open-small` (`in-process`) has no value"))
-    ).toBe(true);
-  });
-
-  test("a measured transport missing a core leg warns; missing xl legs do not", () => {
-    const full = (legs: string[]) => Object.fromEntries(legs.map((leg) => [leg, legMedians(1)]));
-    const core = ["cold-open-small", "cold-open-large", "switch-back-small", "switch-back-large"];
-    const complete = chatSwitchReport({
-      mediansByTransport: { "in-process": full(core), "server-window": full(core) },
-    });
-    expect(complete.warnings).toEqual([]);
-    const partial = chatSwitchReport({
-      mediansByTransport: {
-        "in-process": full(core),
-        "server-window": full(["cold-open-small", "cold-open-large"]),
-      },
-    });
-    expect(partial.problems).toEqual([]);
-    expect(partial.warnings).toHaveLength(1);
-    expect(partial.warnings[0]).toContain("`switch-back-small`, `switch-back-large`");
-    const noInProcess = chatSwitchReport({ mediansByTransport: { "server-window": full(core) } });
-    expect(noInProcess.warnings.some((w) => w.includes("no in-process medians"))).toBe(true);
-  });
-
-  test("older files without mediansByTransport report their medians as in-process", () => {
-    const rows = tableRows(
-      render(
-        chatSwitchReport({
-          medians: { "switch-back-large": legMedians(7), "cold-open-large": legMedians(8) },
-        })
-      ),
-      "Chat switch"
-    );
-    expect(rows.map((row) => [row[1], row[2]])).toEqual([
-      ["`cold-open-large`", "`in-process`"],
-      ["`switch-back-large`", "`in-process`"],
-    ]);
-  });
-
-  test.each([
-    ["not an object", "medians"],
-    ["medians not an object", { medians: [1, 2] }],
-    ["mediansByTransport not an object", { medians: {}, mediansByTransport: "x" }],
-    ["transport medians not an object", { medians: {}, mediansByTransport: { "in-process": 5 } }],
-    ["leg medians not an object", { medians: { "cold-open-small": null } }],
-  ])("a malformed chatSwitch (%s) is a problem for the final attempt", (_case, chatSwitch) => {
-    const report = chatSwitchReport(chatSwitch, [readScenario(companionSummary(), undefined)]);
-    expect(keys(report)).toEqual([`chat-switch-invalid:${CHAT_SWITCH_KEY}`]);
-    // The companion is still reported; it never needs Chrome metrics.
-    expect(report.rows[0]?.scenarios.map((scenario) => scenario.label)).toEqual([
-      "chat-switch-mid-stream-server-window",
-    ]);
+    // Per-leg medians are deferred (#4442): no Chat switch section is rendered.
+    expect(markdown).not.toContain("### Chat switch");
   });
 
   test("an earlier attempt's chat-switch summaries are never used", () => {
@@ -565,49 +474,6 @@ describe("chat-switch scenarios", () => {
     expect(keys(report)).toEqual([`summary-missing:${CHAT_SWITCH_KEY}`]);
     expect(report.rows[0]?.scenarios).toEqual([]);
     expect(tableRows(render(report), "Chat switch")).toEqual([]);
-  });
-});
-
-describe("workspace-open milestones", () => {
-  test("milestones show for scenarios that record them and a dash otherwise", () => {
-    const WORKSPACE_TITLE = "perf: open workspace";
-    const WORKSPACE_SPEC = "/w/tests/e2e/scenarios/perf.workspaceOpen.spec.ts";
-    const withMilestones = summary(
-      {
-        runLabel: "workspace-open-small",
-        milestones: { firstMessageMs: 459.5, fullyLoadedMs: 612.2, longestTaskMs: 93 },
-      },
-      { title: WORKSPACE_TITLE, file: WORKSPACE_SPEC }
-    );
-    const nullMilestones = summary(
-      { runLabel: "workspace-open-large", milestones: null },
-      { title: `${WORKSPACE_TITLE} large`, file: WORKSPACE_SPEC }
-    );
-    const report = buildReport(
-      input({
-        results: playwright([
-          { file: "scenarios/perf.chatTyping.spec.ts", title: TITLE },
-          { file: "scenarios/perf.workspaceOpen.spec.ts", title: WORKSPACE_TITLE },
-          { file: "scenarios/perf.workspaceOpen.spec.ts", title: `${WORKSPACE_TITLE} large` },
-        ]),
-        reads: [
-          readScenario(summary(), { sampleCount: 26 }),
-          readScenario(withMilestones, { sampleCount: 24 }),
-          readScenario(nullMilestones, { sampleCount: 30 }),
-        ],
-      })
-    );
-    expect(report.problems).toEqual([]);
-    const milestoneCells = (row: string[] | undefined) =>
-      (["firstMessageMs", "fullyLoadedMs", "longestTaskMs"] as const).map(
-        (id) => row?.[2 + metricColumn(id)]
-      );
-    const rows = tableRows(render(report), "Scenario metrics");
-    expect(rows.map(milestoneCells)).toEqual([
-      ["—", "—", "—"],
-      ["460", "612", "93"],
-      ["—", "—", "—"],
-    ]);
   });
 });
 
@@ -724,7 +590,7 @@ describe("sink safety", () => {
     for (const line of markdown.split("\n").filter((l) => l.startsWith("- "))) {
       expect((line.match(/`/g) ?? []).length % 2).toBe(0);
     }
-    for (const heading of ["Tests", "Scenario metrics", "Chat switch"]) {
+    for (const heading of ["Tests", "Scenario metrics"]) {
       const rows = tableRows(markdown, heading);
       expect(rows.length).toBeGreaterThan(0);
       expect(new Set(rows.map((row) => row.length)).size).toBe(1);
