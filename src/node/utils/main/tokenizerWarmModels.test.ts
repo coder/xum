@@ -67,27 +67,24 @@ describe("deriveWarmModels", () => {
     expect(warmedEncodings(config)).toEqual(["claude", "o200k_base"]);
   });
 
-  test("a coder gateway id to an Anthropic model resolves to claude, not a provider fallback", () => {
-    // Counting resolves this id through its metadata model; the raw id would hit the
-    // provider fallback and warm o200k_base instead.
-    const config = configWith(
-      [{ aiSettings: { model: "coder:vercel/anthropic/claude-opus-4-6" } }],
-      {
-        defaultModel: CLAUDE,
-      }
-    );
-    expect(warmedEncodings(config)).toEqual(["claude"]);
+  const defaultEncodings = () =>
+    [...new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))].sort();
+
+  test("a Coder gateway id keeps the default warm set", () => {
+    // The instance's upstream type lives in providers.jsonc, which startup does not read, so
+    // even a provider-named instance may be backed by another provider's model.
+    const config = configWith([{ aiSettings: { model: "coder:anthropic/claude-opus-4-6" } }], {
+      defaultModel: CLAUDE,
+    });
+    expect(warmedEncodings(config)).toEqual(defaultEncodings());
   });
 
   test("a model whose encoding is only a guess also keeps the default warm set", () => {
-    // A custom-named Coder instance's upstream type lives in providers.jsonc, which startup
-    // does not read, so its encoding falls through to the catch-all guess (o200k_base). Using it
-    // as the default too means only the guess fallback can add the claude encoding.
-    const custom = "coder:prod-anthropic/claude-opus-4-6";
+    // An unknown provider falls through to the catch-all tokenizer (o200k_base). Using it as the
+    // default too means only the guess fallback can add the claude encoding.
+    const custom = "my-proxy:claude-opus-4-6";
     const config = configWith([{ aiSettings: { model: custom } }], { defaultModel: custom });
-    expect(warmedEncodings(config)).toEqual(
-      [...new Set(DEFAULT_WARM_MODELS.map((model) => encodingForModel(model).encoding))].sort()
-    );
+    expect(warmedEncodings(config)).toEqual(defaultEncodings());
     // A known provider's fallback is not a guess, so it does not widen the set.
     const known = configWith([{ aiSettings: { model: "anthropic:claude-unreleased-9" } }], {
       defaultModel: CLAUDE,

@@ -1,6 +1,5 @@
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_MODEL, DEFAULT_WARM_MODELS } from "@/common/constants/knownModels";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import { encodingForModel, loadTokenizerModules } from "./tokenizer";
 
@@ -86,15 +85,16 @@ export function deriveWarmModels(config: ProjectsConfig): string[] {
   const candidates = [nonEmptyModel(config.defaultModel) ?? DEFAULT_MODEL, ...configured];
 
   const byEncoding = new Map<string, string>();
-  let guessed = false;
+  // Startup does not read providers.jsonc (a disk read), so some encodings are only a guess:
+  // a Coder gateway id's upstream type lives there (instances can be custom-named or named
+  // after another provider), and an unknown provider falls through to the catch-all tokenizer.
+  // Any guess keeps today's default set warm too, so such users see no regression.
+  let uncertain = false;
   const keep = (model: string) => {
-    // No providers config: reading providers.jsonc would cost disk I/O at startup, and
-    // coder:<provider>/<model> gateway ids still resolve by provider name without it.
-    const metadataModel = resolveModelForMetadata(model, null);
-    const resolved = encodingForModel(metadataModel);
-    guessed ||= resolved.guessed;
+    const resolved = encodingForModel(model);
+    uncertain ||= resolved.guessed || model.startsWith("coder:");
     if (!byEncoding.has(resolved.encoding)) {
-      byEncoding.set(resolved.encoding, metadataModel);
+      byEncoding.set(resolved.encoding, model);
     }
   };
   for (const model of candidates) {
@@ -104,9 +104,7 @@ export function deriveWarmModels(config: ProjectsConfig): string[] {
       log.debug(`Skipping tokenizer warm-up for '${model}':`, error);
     }
   }
-  if (guessed) {
-    // Without providers.jsonc an unknown provider's encoding is only a guess (e.g. a
-    // custom-named Coder instance), so keep today's default set warm as well.
+  if (uncertain) {
     for (const model of DEFAULT_WARM_MODELS) {
       keep(model);
     }
