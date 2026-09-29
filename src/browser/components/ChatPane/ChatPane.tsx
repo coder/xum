@@ -80,6 +80,7 @@ import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSw
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
@@ -619,6 +620,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const effectiveAutoCompactionThreshold = getEffectiveThreshold({
     threshold: autoCompactionThreshold,
     rolloverEnabled,
+    modelContextLimit: pendingModel
+      ? getEffectiveContextLimit(pendingModel, use1M, providersConfig)
+      : null,
   });
   const autoCompactionResult = useMemo(
     () =>

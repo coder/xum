@@ -94,6 +94,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
           setThreshold: setAutoCompactThreshold,
           contextWarning,
           rolloverEnabled,
+          modelContextLimit: contextUsageData.maxTokens,
         }}
       />
     </div>

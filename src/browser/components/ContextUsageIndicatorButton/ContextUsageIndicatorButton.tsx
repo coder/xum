@@ -5,6 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import {
   HorizontalThresholdSlider,
   getAutoCompactionLabel,
+  getEffectiveThreshold,
   type AutoCompactionConfig,
 } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { Switch } from "../Switch/Switch";
@@ -243,7 +244,7 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
                 trackClassName="bg-surface-quaternary"
               />
               {isAutoCompactionEnabled && (
-                <CompactThresholdIndicator threshold={autoCompaction.threshold} />
+                <CompactThresholdIndicator threshold={getEffectiveThreshold(autoCompaction)} />
               )}
             </div>
           ) : (

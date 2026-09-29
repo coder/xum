@@ -4,6 +4,7 @@ import {
   AUTO_COMPACTION_THRESHOLD_MAX,
   AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT,
 } from "@/common/constants/ui";
+import { getContextBudgetFinalPoint } from "@/common/utils/compaction/contextBudget";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 
 // ----- Types -----
@@ -11,6 +12,8 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/To
 export interface AutoCompactionConfig {
   threshold: number;
   rolloverEnabled?: boolean;
+  /** Context limit the usage meter uses; unknown keeps the stored slider value. */
+  modelContextLimit?: number | null;
   setThreshold: (threshold: number) => void;
   /**
    * Warning if the compaction model context window is smaller than the
@@ -62,22 +65,28 @@ const applyThreshold = (pct: number, setThreshold: (v: number) => void): void =>
 /**
  * Threshold the display should advertise. In rollover mode the backend clamps the stored
  * value to the effective minimum, so a stored 0% or 5% is evaluated (and shown) as 10%.
- * Summarize mode keeps the stored value.
+ * It also clamps a high slider below the final prompt zone, so on a small window a stored
+ * 90% is evaluated (and shown) lower. Summarize mode keeps the stored value.
  */
 export function getEffectiveThreshold(
-  config: Pick<AutoCompactionConfig, "threshold" | "rolloverEnabled">
+  config: Pick<AutoCompactionConfig, "threshold" | "rolloverEnabled" | "modelContextLimit">
 ): number {
-  return config.rolloverEnabled
-    ? Math.max(AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT, config.threshold)
-    : config.threshold;
+  if (!config.rolloverEnabled) return config.threshold;
+  const threshold = Math.max(AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT, config.threshold);
+  const limit = config.modelContextLimit;
+  if (threshold >= DISABLE_THRESHOLD || limit == null || !Number.isFinite(limit) || limit <= 0) {
+    return threshold;
+  }
+  return Math.min(threshold, (getContextBudgetFinalPoint(limit) / limit) * 100);
 }
 
 /** Share the effective automatic policy label between the meter and its settings. */
 export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
   if (config.rolloverEnabled) {
     // The slider is the agent handoff target; only the usable hard ceiling forces a rollover.
+    // A clamped target is rarely a whole percent; round down so the label never overstates it.
     return config.threshold < DISABLE_THRESHOLD
-      ? `Handoff target: ${getEffectiveThreshold(config)}%`
+      ? `Handoff target: ${Math.floor(getEffectiveThreshold(config) * 10) / 10}%`
       : "Automatic rollover disabled";
   }
   return config.threshold < DISABLE_THRESHOLD

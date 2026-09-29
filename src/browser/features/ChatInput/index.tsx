@@ -725,7 +725,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
   }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
-  const autoCompactionProps = useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
+  const autoCompactionSettings = useAutoCompactionSettings(
+    workspaceIdForUsage,
+    contextDisplayModel
+  );
+  const autoCompactionProps = {
+    ...autoCompactionSettings,
+    modelContextLimit: contextUsageData.maxTokens,
+  };
 
   // Idle compaction settings (per-project, persisted to backend for idleCompactionService)
   const { hours: idleCompactionHours, setHours: setIdleCompactionHours } = useIdleCompactionHours({
