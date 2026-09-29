@@ -1,6 +1,6 @@
 {
   "recordedAt": "2026-09-29",
-  "source": "Anthropic /v1/messages/count_tokens via the Coder AI gateway, 2026-09-29. Request text is frozen repo docs/source; smallToolsProviderTokens = count with the 30 small tools minus count without tools (#5219).",
+  "source": "Anthropic /v1/messages/count_tokens via the Coder AI gateway, 2026-09-29. Request text is frozen repo docs/source; smallToolsProviderTokens / oneToolProviderTokens = count with all 30 / only the first small tool minus count without tools (#5219).",
   "providerInputTokens": {
     "claude-opus-5-5": 7289,
     "claude-sonnet-4-6": 5739
@@ -600,5 +600,9 @@
   "smallToolsProviderTokens": {
     "claude-opus-5-5": 2086,
     "claude-sonnet-4-6": 1847
+  },
+  "oneToolProviderTokens": {
+    "claude-opus-5-5": 346,
+    "claude-sonnet-4-6": 542
   }
 }

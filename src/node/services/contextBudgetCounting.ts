@@ -18,6 +18,7 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import {
   CLAUDE_TOOL_OVERHEAD_TOKENS,
+  CLAUDE_TOOL_PREAMBLE_TOKENS,
   NEW_CLAUDE_TOKENIZER_RATIO,
   OLDER_CLAUDE_TOKENIZER_MODEL_ID,
 } from "@/constants/tokenizerCorrection";
@@ -32,24 +33,33 @@ interface TokenizerCorrection {
   ratio: number;
   /** Provider framing per advertised tool, beyond the encoded schema JSON. */
   perToolTokens: number;
+  /** Provider framing charged once when any tool is advertised. */
+  toolPreambleTokens: number;
 }
 
-const NO_CORRECTION: TokenizerCorrection = { ratio: 1, perToolTokens: 0 };
+const NO_CORRECTION: TokenizerCorrection = { ratio: 1, perToolTokens: 0, toolPreambleTokens: 0 };
 
 /**
  * Newer Claude models count 1.33-1.55x the local `claude` encoding, so an uncorrected estimate
- * can let an over-window request past the guard (#5219). Resolved from the same model id the
- * tokenizer uses (the metadata model when one is mapped), so a new or unknown Claude id gets the
- * conservative ratio rather than none. Every Claude model pays the per-tool framing.
+ * can let an over-window request past the guard (#5219). Only requests counted with the `claude`
+ * encoding are corrected (an OpenAI-backed "claude-..." id is counted, and billed, by its own
+ * tokenizer). The Claude id comes from the same model id the tokenizer resolves (the metadata
+ * model when one is mapped), so a new or unknown Claude id gets the conservative ratio rather
+ * than none. Every Claude model pays the tool-use framing.
  */
-function getTokenizerCorrection(model: BudgetModel): TokenizerCorrection {
+function getTokenizerCorrection(model: BudgetModel, encoding: string): TokenizerCorrection {
+  if (encoding !== "claude") return NO_CORRECTION;
   const canonical = normalizeToCanonical(model.metadataModel ?? model.model);
   const claudeId = /claude-[a-z0-9.-]*/i
     .exec(canonical.slice(canonical.indexOf(":") + 1))?.[0]
     ?.toLowerCase();
   if (claudeId == null) return NO_CORRECTION;
   const ratio = OLDER_CLAUDE_TOKENIZER_MODEL_ID.test(claudeId) ? 1 : NEW_CLAUDE_TOKENIZER_RATIO;
-  return { ratio, perToolTokens: CLAUDE_TOOL_OVERHEAD_TOKENS };
+  return {
+    ratio,
+    perToolTokens: CLAUDE_TOOL_OVERHEAD_TOKENS,
+    toolPreambleTokens: CLAUDE_TOOL_PREAMBLE_TOKENS,
+  };
 }
 
 /**
@@ -68,8 +78,10 @@ async function countBudgetInput(
     requireRealEncoding: true,
   });
   assert(tokenizer.encoding !== "approx-4", "A hard budget guard requires a real encoding");
-  const correction = getTokenizerCorrection(model);
-  const fixed = input.fixedTokens + framing + correction.perToolTokens * toolCount;
+  const correction = getTokenizerCorrection(model, tokenizer.encoding);
+  const toolFraming =
+    toolCount > 0 ? correction.toolPreambleTokens + correction.perToolTokens * toolCount : 0;
+  const fixed = input.fixedTokens + framing + toolFraming;
   // The ratio scales encoded text only: fixedTokens already charges one token per omitted byte.
   const corrected = (encoded: number) => Math.ceil(encoded * correction.ratio) + fixed;
   let encoded = 0;

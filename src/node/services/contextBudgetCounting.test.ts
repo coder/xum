@@ -633,18 +633,31 @@ describe("Claude tokenizer correction (#5219)", () => {
     expect(await estimate("anthropic:claude-sonnet-4-5-20250929")).toBe(older);
   });
 
+  const smallTools = Object.fromEntries(
+    calibration.smallTools.map((t) => [
+      t.name,
+      tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
+    ])
+  );
+  const bare = { messages: [{ role: "user", content: [{ type: "text", text: "x" }] }] };
   test.each([
-    ["anthropic:claude-opus-5-5", calibration.smallToolsProviderTokens["claude-opus-5-5"]],
-    ["anthropic:claude-sonnet-4-6", calibration.smallToolsProviderTokens["claude-sonnet-4-6"]],
-  ])("%s tool framing covers the provider's per-tool cost", async (target, providerTokens) => {
-    const smallTools = Object.fromEntries(
-      calibration.smallTools.map((t) => [
-        t.name,
-        tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
-      ])
-    );
-    const bare = { messages: [{ role: "user", content: [{ type: "text", text: "x" }] }] };
-    const withTools = await estimate(target, { ...bare, tools: smallTools });
-    expect(withTools - (await estimate(target, bare))).toBeGreaterThanOrEqual(providerTokens);
+    ["claude-opus-5-5", 30, calibration.smallToolsProviderTokens["claude-opus-5-5"]],
+    ["claude-sonnet-4-6", 30, calibration.smallToolsProviderTokens["claude-sonnet-4-6"]],
+    ["claude-opus-5-5", 1, calibration.oneToolProviderTokens["claude-opus-5-5"]],
+    ["claude-sonnet-4-6", 1, calibration.oneToolProviderTokens["claude-sonnet-4-6"]],
+  ] as const)(
+    "%s tool framing for %i tools covers the provider's tool cost",
+    async (id, count, providerTokens) => {
+      const target = `anthropic:${id}`;
+      const tools = Object.fromEntries(Object.entries(smallTools).slice(0, count));
+      const withTools = await estimate(target, { ...bare, tools });
+      expect(withTools - (await estimate(target, bare))).toBeGreaterThanOrEqual(providerTokens);
+    }
+  );
+
+  test("a claude-named model counted with another tokenizer gets no Claude correction", async () => {
+    // An OpenAI-backed "claude-..." id resolves to the OpenAI tokenizer, which the provider bills.
+    const openaiNamed = await estimate("openai:claude-opus-9");
+    expect(openaiNamed).toBe(await estimate("openai:gpt-5.5-pro"));
   });
 });

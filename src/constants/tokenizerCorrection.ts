@@ -22,10 +22,16 @@ export const NEW_CLAUDE_TOKENIZER_RATIO = 1.55;
  * Anthropic's tool-use framing costs this much per advertised tool beyond the schema JSON the
  * estimator encodes, on every Claude model: 114-116 tokens per tool on the replayed requests
  * (about 40 tools each), and a code-heavy 6-tool fixture came out 0.6% under the provider count
- * on claude-sonnet-4-6 without it. Its fixed tool-use preamble (~350-550 tokens, measured with
- * one tool) is only fully covered once a request advertises about 5 tools.
+ * on claude-sonnet-4-6 without it.
  */
 export const CLAUDE_TOOL_OVERHEAD_TOKENS = 120;
+
+/**
+ * Anthropic's fixed tool-use preamble, charged once when any tool is advertised: a single small
+ * tool cost 542 tokens on claude-sonnet-4-6 and 346 on claude-opus-5-5 (count_tokens, same date),
+ * about 400 more than that tool's schema text and per-tool framing.
+ */
+export const CLAUDE_TOOL_PREAMBLE_TOKENS = 400;
 
 /**
  * Claude model ids counted with the older tokenizer: the 3.x family and 4.x up to Opus/Sonnet
