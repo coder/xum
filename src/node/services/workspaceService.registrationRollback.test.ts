@@ -1263,7 +1263,11 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         await expectFailsWithSaveError(() => service.fork(sourceId, "coder-fork"));
 
         expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "coder-fork", true]);
+        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([
+          projectPath,
+          "coder-fork",
+          true,
+        ]);
         expect(persistedWorkspaceIds()).not.toContain(forkId);
         expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
       });
