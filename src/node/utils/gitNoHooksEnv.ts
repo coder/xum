@@ -312,7 +312,7 @@ export function combineGitNoRepoAutomationEnvs(
   return env;
 }
 
-const LOCAL_DISCOVERY_AUTOMATION_ERROR = "Failed to inspect repository automation drivers";
+export const LOCAL_DISCOVERY_AUTOMATION_ERROR = "Failed to inspect repository automation drivers";
 const LOCAL_DISCOVERY_WORKTREE_ERROR = "Failed to inspect repository worktree config";
 const LOCAL_DISCOVERY_INCLUDES_ERROR = "Failed to inspect repository conditional includes";
 const LOCAL_DISCOVERY_HEADER = "xum-git-discovery 1\n";
