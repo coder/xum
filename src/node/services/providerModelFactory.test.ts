@@ -1103,7 +1103,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
             JSON.stringify({
               id: "resp_test",
               created_at: 0,
-              model: "gpt-5.3-codex",
+              model: "gpt-6.1-sol",
               output: [
                 {
                   type: "message",
@@ -1149,7 +1149,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       };
 
       try {
-        const result = await factory.createModel("openai:gpt-5.3-codex");
+        const result = await factory.createModel("openai:gpt-6.1-sol");
         expect(result.success).toBe(true);
         if (!result.success) {
           return;
@@ -1160,7 +1160,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         }
 
         const originalBody = JSON.stringify({
-          model: "gpt-5.3-codex",
+          model: "gpt-6.1-sol",
           input: [
             { role: "user", content: [{ type: "input_text", text: "Ship the fix." }] },
             { type: "item_reference", id: "rs_123" },
@@ -1214,7 +1214,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
               method: "POST",
               headers: cacheHeaders,
               body: JSON.stringify({
-                model: "gpt-5.3-codex",
+                model: "gpt-6.1-sol",
                 input: [{ role: "user", content: `Turn ${turn}` }],
                 prompt_cache_key: promptCacheKey,
                 store: true,
@@ -1583,17 +1583,17 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
 
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
   // Headless tool loops (Dream, harvest, refine, sidebar status) call
-  // streamText with tools and no provider options. Sol/Luna Chat Completions
+  // streamText with tools and no provider options. Luna Chat Completions
   // accepts function calling only with reasoning_effort "none", so the model
   // itself must fill it in for tool-bearing requests that asked for no effort;
   // Responses, tool-free requests and Astra keep the provider default, and an
   // explicit caller effort is preserved (covered by the "requested effort"
-  // cases in "GPT-6 Sol/Luna reasoning effort none").
+  // cases in "GPT-6 Luna reasoning effort none").
   it.each([
-    ["chatCompletions", "gpt-6-sol", true],
+    ["chatCompletions", "gpt-6-luna", true],
     ["chatCompletions", "team-luna", true],
     ["chatCompletions", "gpt-6-astra", false],
-    ["responses", "gpt-6-sol", false],
+    ["responses", "gpt-6-luna", false],
   ] as const)(
     "clamps %s tool requests for %s at the model boundary (%p)",
     async (wireFormat, modelId, clamped) => {
@@ -1760,7 +1760,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
 
       expect(result.success).toBe(true);
       if (!result.success) {
@@ -1882,7 +1882,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -1903,7 +1903,7 @@ describe("ProviderModelFactory Codex authentication", () => {
             expires: Date.now() + 60_000,
             accountId: "test-account-id",
           },
-          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id }],
         },
       });
 
@@ -1950,7 +1950,7 @@ describe("ProviderModelFactory Codex authentication", () => {
       try {
         // Codex OAuth serves only the Responses API, so the factory must hand the
         // SDK the real key instead of the "codex-oauth" placeholder.
-        const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+        const result = await factory.createModel(KNOWN_MODELS.GPT.id);
         expect(result.success).toBe(true);
         expect(capturedApiKey).toBe("sk-test");
       } finally {
@@ -1967,7 +1967,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -2486,9 +2486,9 @@ describe("ProviderModelFactory routing", () => {
 
         // Direct OpenAI should win because Codex OAuth makes it available for routing.
         // Use a model from CODEX_OAUTH_ALLOWED_MODELS so createModel can route through OAuth.
-        const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
+        const result = await factory.resolveAndCreateModel("openai:gpt-6-luna", "off");
         expectSuccessfulRouteResult(result, {
-          effectiveModelString: "openai:gpt-5.2",
+          effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
           routedThroughGateway: false,
         });
@@ -2737,18 +2737,17 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
 });
 
 // @ai-sdk/openai strips reasoningEffort "none" for every gpt-6-* ID; Xum must still
-// serialize it for Sol/Luna (Chat Completions function calling requires it).
-describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
+// serialize it for Luna (Chat Completions function calling requires it).
+describe("ProviderModelFactory GPT-6 Luna reasoning effort none", () => {
   const cases = [
-    ["gpt-6-sol", "none", "none"],
     ["gpt-6-luna", "none", "none"],
-    ["gpt-6-sol-2026-09-22", "none", "none"],
-    ["gpt-6-sol", "high", "high"],
+    ["gpt-6-luna-2026-09-22", "none", "none"],
+    ["gpt-6-luna", "high", "high"],
     // Astra genuinely rejects "none"; keep the SDK's gating for it.
     ["gpt-6-astra", "none", undefined],
   ] as const;
   // The SDK gates effort on the raw wire ID, so on Chat Completions an opaque alias
-  // mapped to Sol already keeps "none" (and so its tool calls) without the rewrite.
+  // mapped to Luna already keeps "none" (and so its tool calls) without the rewrite.
   // On Responses the SDK treats opaque aliases as non-reasoning and drops every
   // effort, a pre-existing alias limitation not specific to "none" or GPT-6.
   const chatOnlyCases = [["team-model", "none", "none"]] as const;
@@ -2762,7 +2761,7 @@ describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
               apiKey: "native-key",
               wireFormat,
               webSocketTransportEnabled: false,
-              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-sol" }],
+              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-luna" }],
             },
           });
           const { calls, fakeFetch } = createCapturingFetch();
@@ -3293,7 +3292,7 @@ describe("ProviderModelFactory Coder", () => {
   // the only capability identity such an alias has; the raw origin id is not.
   it.each([
     ["coder:chat-proxy/team-luna", true],
-    ["coder:chat-proxy/gpt-6-sol", true],
+    ["coder:chat-proxy/gpt-6-luna", true],
     ["coder:chat-proxy/team-astra", false],
   ])(
     "clamps %s tool requests through a Coder openai-compat instance (%p)",
@@ -5290,17 +5289,18 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     };
     // OAuth only (no API key): the chat path would reroute to chatgpt.com.
     await withEvaluationFixture({ openai: { codexOauth } }, async (_c, factory) => {
-      expect(
-        expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
-      ).toEqual({ reason: "unsupported-route", routeKind: "codex-oauth", providerName: "openai" });
+      expect(expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id))).toEqual({
+        reason: "unsupported-route",
+        routeKind: "codex-oauth",
+        providerName: "openai",
+      });
     });
     // Both credentials, OAuth preferred: still rerouted by the chat path, so rejected.
     await withEvaluationFixture(
       { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "oauth" } },
       async (_c, factory) => {
         expect(
-          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
-            .routeKind
+          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id)).routeKind
         ).toBe("codex-oauth");
       }
     );
@@ -5308,7 +5308,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     await withEvaluationFixture(
       { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "apiKey" } },
       async (_c, factory) => {
-        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id));
+        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id));
       }
     );
   });

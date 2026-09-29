@@ -670,57 +670,8 @@ describe("AIService turn engine events", () => {
 });
 
 describe("AIService.createModel (Codex OAuth routing)", () => {
-  it("returns oauth_not_connected for required Codex models when both OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-oauth-missing");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: {},
-    });
-
-    // Temporarily clear OPENAI_API_KEY so resolveProviderCredentials doesn't find it
-    const savedKey = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
-    try {
-      const service = createBasicAIService(xumHome.path).service;
-      const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
-
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toEqual({ type: "oauth_not_connected", provider: "openai" });
-      }
-    } finally {
-      if (savedKey !== undefined) {
-        process.env.OPENAI_API_KEY = savedKey;
-      }
-    }
-  });
-
-  it("returns api_key_not_found for released gpt-5.3-codex when OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-api-model-missing-auth");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: {},
-    });
-
-    const savedKey = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
-    try {
-      const service = createBasicAIService(xumHome.path).service;
-      const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toEqual({ type: "api_key_not_found", provider: "openai" });
-      }
-    } finally {
-      if (savedKey !== undefined) {
-        process.env.OPENAI_API_KEY = savedKey;
-      }
-    }
-  });
-
-  it("returns api_key_not_found for gpt-5.5 when OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-gpt-5-5-missing-auth");
+  it("returns api_key_not_found for OpenAI models when OAuth and API key are missing", async () => {
+    using xumHome = new DisposableTempDir("codex-openai-missing-auth");
 
     await writeProvidersConfig(xumHome.path, {
       openai: {},
@@ -743,20 +694,6 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     }
   });
 
-  it("falls back to API key for required Codex models when OAuth is missing but API key is present", async () => {
-    using xumHome = new DisposableTempDir("codex-oauth-missing-apikey-present");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: { apiKey: "sk-test-key" },
-    });
-
-    const service = createBasicAIService(xumHome.path).service;
-    const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
-
-    // Should succeed — falls back to API key instead of erroring with oauth_not_connected
-    expect(result.success).toBe(true);
-  });
-
   it("does not require an OpenAI API key when Codex OAuth is configured", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-present");
 
@@ -773,7 +710,7 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     });
 
     const service = createBasicAIService(xumHome.path).service;
-    const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
+    const result = await service.createModel(KNOWN_MODELS.GPT.id);
 
     expect(result.success).toBe(true);
   });
@@ -811,11 +748,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
     configureOpenAICodexOAuth(service, providersConfigStore, requests, {
-      responseModel: "gpt-5.3-codex",
+      responseModel: "gpt-6.1-sol",
     });
     const systemPrompt = "Test system prompt";
 
-    await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
+    await createGeneratedModel(service, KNOWN_MODELS.GPT.id, [
       { role: "system", content: systemPrompt },
       { role: "user", content: [{ type: "text", text: "Hello" }] },
     ]);
@@ -2477,9 +2414,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   );
 
   it.each([
-    { auth: "oauth", model: KNOWN_MODELS.GPT_53_CODEX.id },
+    { auth: "oauth", model: KNOWN_MODELS.GPT.id },
     { auth: "oauth", model: "openai:team-codex" },
-    { auth: "apiKey", model: KNOWN_MODELS.GPT_53_CODEX.id },
+    { auth: "apiKey", model: KNOWN_MODELS.GPT.id },
   ] as const)("keeps $auth chat usage priced for $model", async ({ auth, model }) => {
     using xumHome = new DisposableTempDir("ai-service-codex-costs");
     const projectPath = path.join(xumHome.path, "project");
@@ -2490,7 +2427,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const providersConfig = {
       openai: {
         ...(auth === "oauth" ? { codexOauth: TEST_CODEX_OAUTH } : { apiKey: "sk-test" }),
-        models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+        models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id }],
       },
     };
     new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig(providersConfig);
@@ -3382,7 +3319,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const baseConfig = harness.config.loadConfigOrDefault();
       await harness.config.editConfig(() => ({
         ...baseConfig,
-        advisorModelString: KNOWN_MODELS.GPT_53_CODEX.id,
+        advisorModelString: KNOWN_MODELS.GPT.id,
         agentAiDefaults: {
           ...baseConfig.agentAiDefaults,
           exec: {
@@ -3411,7 +3348,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
       const resolveModel =
         harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-      const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const created = await runtime.createModel(KNOWN_MODELS.GPT.id);
       const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
         agentInitiated: true,
@@ -3434,7 +3371,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const event: ToolModelUsageEvent = {
         source: "tool",
         toolName,
-        model: KNOWN_MODELS.GPT_53_CODEX.id,
+        model: KNOWN_MODELS.GPT.id,
         metadataModel: created.metadataModel,
         usage: {
           inputTokens: 120,

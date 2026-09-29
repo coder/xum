@@ -100,47 +100,17 @@ export function buildCodexRefreshBody(input: { refreshToken: string }): URLSearc
  * The values in this set are providerModelIds (no `openai:` prefix).
  */
 export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
-  "gpt-5.1-codex-max",
-  "gpt-5.1-codex-mini",
-  "gpt-5.2",
-  "gpt-5.4-mini",
-  "gpt-5.5",
-  // GPT-5.6 family (July 9, 2026): available via both the public API and Codex.
-  // The bare alias is a servable model id (OpenAI routes it to Sol), so it must
-  // be allowed too or OAuth-only users selecting it fall to the API-key path.
-  "gpt-5.6",
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
   // GPT-6 Astra (September 3, 2026): served in Codex for ChatGPT subscribers and
   // in the public API. Without this entry an OAuth-only user selecting Astra
   // falls to the API-key path and fails with api_key_not_found.
   "gpt-6-astra",
-  // GPT-6 Sol/Luna (September 22, 2026): listed in the Codex model catalog (see the
-  // context-window overrides below), so the promoted `gpt`/`sol`/`luna` aliases keep
-  // working for OAuth-only users.
-  "gpt-6-sol",
+  // GPT-6 Luna (September 22, 2026): listed in the Codex model catalog (see the
+  // context-window overrides below), so the `luna` alias keeps working for
+  // OAuth-only users.
   "gpt-6-luna",
   // GPT-6.1 Sol (September 29, 2026): the Codex catalog's default model, so the
   // promoted `gpt`/`sol` aliases keep working for OAuth-only users.
   "gpt-6.1-sol",
-  "gpt-5.2-codex",
-  "gpt-5.3-codex",
-  "gpt-5.3-codex-spark",
-  "gpt-5.1-codex",
-]);
-
-/**
- * Models that *prefer* Codex OAuth routing.
- *
- * These models are initially gated behind OAuth but eventually become available
- * via regular API keys.  When the user has OAuth connected, we route through it;
- * otherwise we fall back to their API key and let OpenAI decide whether the
- * model is accessible.
- */
-export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
-  // Spark variants still require ChatGPT OAuth routing.
-  "gpt-5.3-codex-spark",
 ]);
 
 /**
@@ -150,25 +120,14 @@ export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
  */
 const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   // The public API exposes a 1.05M window for these models, but the ChatGPT/Codex
-  // model catalog publishes smaller context windows.
-  // Keep auth-route caps separate so API-key requests retain the full public window.
-  "gpt-5.5": 272_000,
-  // GPT-5.6 Sol/Terra/Luna: 272K default context_window (872K configurable max) in the
-  // pinned catalog below. The earlier 372K came from the July 2026 catalog, which
-  // openai/codex#39102 replaced. The bare alias routes to Sol.
-  "gpt-5.6": 272_000,
-  "gpt-5.6-sol": 272_000,
-  "gpt-5.6-terra": 272_000,
-  "gpt-5.6-luna": 272_000,
-  // GPT-6 Astra/Sol/Luna are each published at 272K (default context_window; the
-  // configurable max_context_window is 872K) in the pinned Codex catalog:
-  // https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
-  // Each entry is sourced from its own catalog row; do not copy one model's cap to another.
+  // model catalog publishes 272K (default context_window; the configurable
+  // max_context_window is 872K). Keep auth-route caps separate so API-key requests
+  // retain the full public window. Each entry is sourced from its own catalog row;
+  // do not copy one model's cap to another.
+  // Astra/Luna: https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
   "gpt-6-astra": 272_000,
-  "gpt-6-sol": 272_000,
   "gpt-6-luna": 272_000,
-  // GPT-6.1 Sol's own catalog row also publishes a 272K default context_window
-  // (872K configurable max).
+  // GPT-6.1 Sol: https://github.com/openai/codex/blob/b1e72963c3b71a9265a551e54beff078384efed9/codex-rs/models-manager/models.json
   "gpt-6.1-sol": 272_000,
 };
 
@@ -184,10 +143,6 @@ function normalizeCodexOauthModelId(modelId: string): string {
 
 export function isCodexOauthAllowedModelId(modelId: string): boolean {
   return CODEX_OAUTH_ALLOWED_MODELS.has(normalizeCodexOauthModelId(modelId));
-}
-
-export function isCodexOauthRequiredModelId(modelId: string): boolean {
-  return CODEX_OAUTH_REQUIRED_MODELS.has(normalizeCodexOauthModelId(modelId));
 }
 
 function normalizeOpenAIModelString(modelId: string): string | null {
@@ -238,14 +193,6 @@ export function isCodexOauthAllowedModel(
 ): boolean {
   const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
   return compatibilityModelId !== null && isCodexOauthAllowedModelId(compatibilityModelId);
-}
-
-export function isCodexOauthRequiredModel(
-  modelId: string,
-  providersConfig: ProviderModelsConfig | null
-): boolean {
-  const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
-  return compatibilityModelId !== null && isCodexOauthRequiredModelId(compatibilityModelId);
 }
 
 export function getCodexOauthContextWindowOverride(modelId: string): number | null {

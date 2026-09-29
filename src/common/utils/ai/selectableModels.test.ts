@@ -26,21 +26,7 @@ import {
 // list in this file stays explicit instead of being derived from the pipeline.
 const ids = (...keys: KnownModelKey[]): string[] => keys.map((key) => KNOWN_MODELS[key].id);
 const ANTHROPIC = ids("FABLE", "MYTHOS", "OPUS", "SONNET", "HAIKU");
-const OPENAI = ids(
-  "GPT",
-  "GPT_56_TERRA",
-  "GPT_6_LUNA",
-  "GPT_6_ASTRA",
-  "GPT_PRO",
-  "GPT_54_MINI",
-  "GPT_54_NANO",
-  "GPT_53_CODEX",
-  "GPT_53_CODEX_SPARK",
-  "GPT_MINI",
-  "GPT_CODEX_MAX",
-  "DAYBREAK_BLUE",
-  "DAYBREAK_RED"
-);
+const OPENAI = ids("GPT", "GPT_6_LUNA", "GPT_6_ASTRA", "DAYBREAK_BLUE", "DAYBREAK_RED");
 const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH");
 const XAI = ids("GROK_47");
 const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
@@ -65,7 +51,6 @@ const OPENROUTER_ROUTABLE_BUILT_INS = [
 ];
 
 const SONNET = KNOWN_MODELS.SONNET.id;
-const SPARK = KNOWN_MODELS.GPT_53_CODEX_SPARK.id;
 const without = (models: string[], ...excluded: string[]): string[] =>
   models.filter((model) => !excluded.includes(model));
 
@@ -114,7 +99,7 @@ describe("computeSelectableModels", () => {
         fixture: customProvider(["fixture-a", { id: "fixture-mapped", mappedToModel: SONNET }]),
         "fixture-off": customProvider(["never"], { isEnabled: false }),
         "mux-gateway": provider({ models: ["anthropic/claude-sonnet-5"] }),
-        "github-copilot": provider({ models: ["gpt-5.6-sol"] }),
+        "github-copilot": provider({ models: ["gpt-6.1-sol"] }),
       };
 
       expect(select({ providersConfig })).toEqual([
@@ -186,12 +171,12 @@ describe("computeSelectableModels", () => {
     test("explicit gateway-prefixed custom entries survive unchanged", () => {
       const providersConfig: ProvidersConfigMap = {
         openrouter: provider({ models: ["anthropic/claude-sonnet-5"] }),
-        coder: provider({ models: ["openai/gpt-5.6-sol"] }),
+        coder: provider({ models: ["openai/gpt-6.1-sol"] }),
       };
 
       expect(select({ providersConfig })).toEqual([
         "openrouter:anthropic/claude-sonnet-5",
-        "coder:openai/gpt-5.6-sol",
+        "coder:openai/gpt-6.1-sol",
       ]);
     });
   });
@@ -256,17 +241,7 @@ describe("computeSelectableModels", () => {
     const openai = (auth: { apiKeySet: boolean; codexOauthSet: boolean }): ProvidersConfigMap => ({
       openai: provider({ isConfigured: true, ...auth }),
     });
-    const CODEX_ALLOWED_BUILT_INS = ids(
-      "GPT",
-      "GPT_56_TERRA",
-      "GPT_6_LUNA",
-      "GPT_6_ASTRA",
-      "GPT_54_MINI",
-      "GPT_53_CODEX",
-      "GPT_53_CODEX_SPARK",
-      "GPT_MINI",
-      "GPT_CODEX_MAX"
-    );
+    const CODEX_ALLOWED_BUILT_INS = ids("GPT", "GPT_6_LUNA", "GPT_6_ASTRA");
 
     test("API key + OAuth: every OpenAI built-in", () => {
       expect(select({ providersConfig: openai({ apiKeySet: true, codexOauthSet: true }) })).toEqual(
@@ -274,22 +249,10 @@ describe("computeSelectableModels", () => {
       );
     });
 
-    test("API key only: hides OAuth-required models", () => {
-      expect(
-        select({ providersConfig: openai({ apiKeySet: true, codexOauthSet: false }) })
-      ).toEqual(without(OPENAI, SPARK));
-    });
-
     test("OAuth only: shows only OAuth-routable models", () => {
       expect(
         select({ providersConfig: openai({ apiKeySet: false, codexOauthSet: true }) })
       ).toEqual(CODEX_ALLOWED_BUILT_INS);
-    });
-
-    test("neither: hides OAuth-required models", () => {
-      expect(
-        select({ providersConfig: openai({ apiKeySet: false, codexOauthSet: false }) })
-      ).toEqual(without(OPENAI, SPARK));
     });
 
     test("a gateway-routed OpenAI model is not gated by OpenAI auth state", () => {

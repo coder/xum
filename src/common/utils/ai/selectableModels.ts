@@ -1,4 +1,4 @@
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
@@ -218,10 +218,7 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
   const hasCodexOauth = providersConfig.openai?.codexOauthSet === true;
 
   // OpenAI model gating (direct route only; see resolvesToDirectOpenAI):
-  // - API key + OAuth: allow everything.
-  // - API key only: hide models that require OAuth.
-  // - OAuth only: show only models routable via OAuth.
-  // - Neither: hide models that require OAuth (status quo).
+  // with OAuth but no API key, show only models routable via OAuth.
   // providerFiltered already guarantees an active route, so the resolved
   // route is the real one rather than the direct fallback.
   const next = providerFiltered.filter((modelId) => {
@@ -241,15 +238,11 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
       return true;
     }
 
-    if (hasOpenaiApiKey && hasCodexOauth) {
-      return true;
-    }
-
     if (!hasOpenaiApiKey && hasCodexOauth) {
       return isCodexOauthAllowedModel(modelId, providersConfig);
     }
 
-    return !isCodexOauthRequiredModel(modelId, providersConfig);
+    return true;
   });
 
   return effectivePolicy ? next.filter(allowedByPolicy) : next;

@@ -332,33 +332,32 @@ describe("cacheStrategy", () => {
   describe("openaiExplicitPromptCachingAvailable", () => {
     const config = openaiProvidersConfig();
 
-    it("accepts every GPT-5.6 tier on the direct official OpenAI route", () => {
+    it("accepts every GPT-6 tier on the direct official OpenAI route", () => {
       for (const model of [
-        "openai:gpt-5.6",
-        "openai:gpt-5.6-sol",
-        "openai:gpt-5.6-terra",
-        "openai:gpt-5.6-luna",
-        "openai:gpt-5.6-sol-2026-07-09",
+        "openai:gpt-6-astra",
+        "openai:gpt-6.1-sol",
+        "openai:gpt-6-luna",
+        "openai:gpt-6.1-sol-2026-09-29",
       ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(true);
       }
     });
 
-    it("accepts openai: aliases mapped to GPT-5.6 targets", () => {
+    it("accepts openai: aliases mapped to GPT-6 targets", () => {
       const aliasConfig = openaiProvidersConfig({
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-6.1-sol" }],
       });
       expect(openaiExplicitPromptCachingAvailable("openai:team-sol", "openai", aliasConfig)).toBe(
         true
       );
     });
 
-    it("rejects aliases whose resolved target is not OpenAI GPT-5.6", () => {
+    it("rejects aliases whose resolved target is not an OpenAI GPT-6 tier", () => {
       const aliasConfig = openaiProvidersConfig({
         models: [
           { id: "team-old", mappedToModel: "openai:gpt-5.2" },
           { id: "team-claude", mappedToModel: "anthropic:claude-opus-4-6" },
-          { id: "team-bare", mappedToModel: "gpt-5.6-sol" },
+          { id: "team-bare", mappedToModel: "gpt-6.1-sol" },
         ],
       });
       for (const alias of ["openai:team-old", "openai:team-claude", "openai:team-bare"]) {
@@ -368,24 +367,30 @@ describe("cacheStrategy", () => {
 
     it("rejects raw unprefixed and non-OpenAI-origin model strings", () => {
       for (const model of [
-        "gpt-5.6-sol", // raw unprefixed: never infer a provider
+        "gpt-6.1-sol", // raw unprefixed: never infer a provider
         "anthropic:claude-opus-4-6",
-        "openrouter:openai/gpt-5.6-sol",
-        "github-copilot:gpt-5.6-sol",
+        "openrouter:openai/gpt-6.1-sol",
+        "github-copilot:gpt-6.1-sol",
       ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
       }
     });
 
     it("rejects older OpenAI models and near-miss ids", () => {
-      for (const model of ["openai:gpt-5.2", "openai:gpt-5.5", "openai:gpt-5.61"]) {
+      for (const model of [
+        "openai:gpt-5.2",
+        "openai:gpt-5.5",
+        "openai:gpt-5.6-sol",
+        "openai:gpt-6-sol",
+        "openai:gpt-5.61",
+      ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
       }
     });
 
     it("rejects missing, unknown, and gateway routes", () => {
       for (const route of [undefined, "unknown", "mux-gateway", "openrouter", "github-copilot"]) {
-        expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", route, config)).toBe(
+        expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", route, config)).toBe(
           false
         );
       }
@@ -395,7 +400,7 @@ describe("cacheStrategy", () => {
       // OAuth tokens without an API key: OAuth wins.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ apiKeySet: false, apiKeySource: undefined, codexOauthSet: true })
         )
@@ -403,7 +408,7 @@ describe("cacheStrategy", () => {
       // OAuth tokens + API key with default precedence: OAuth still wins.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true })
         )
@@ -411,7 +416,7 @@ describe("cacheStrategy", () => {
       // Explicit apiKey precedence restores API-key routing.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true, codexOauthDefaultAuth: "apiKey" })
         )
@@ -423,7 +428,7 @@ describe("cacheStrategy", () => {
       // Chat Completions, which Codex OAuth cannot serve, so the API key is used.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true }),
           { openaiWireFormat: "chatCompletions" }
@@ -432,7 +437,7 @@ describe("cacheStrategy", () => {
       // The stored wire format wins over the request-level value.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true, wireFormat: "responses" }),
           { openaiWireFormat: "chatCompletions" }
@@ -441,10 +446,10 @@ describe("cacheStrategy", () => {
     });
 
     it("rejects when the providers config view is unavailable", () => {
-      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", null)).toBe(
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", "openai", null)).toBe(
         false
       );
-      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", {})).toBe(false);
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", "openai", {})).toBe(false);
     });
 
     it("accepts official explicit and env-resolved base URLs", () => {
@@ -456,7 +461,7 @@ describe("cacheStrategy", () => {
       ]) {
         expect(
           openaiExplicitPromptCachingAvailable(
-            "openai:gpt-5.6-sol",
+            "openai:gpt-6.1-sol",
             "openai",
             openaiProvidersConfig(overrides)
           )
@@ -479,7 +484,7 @@ describe("cacheStrategy", () => {
       ]) {
         expect(
           openaiExplicitPromptCachingAvailable(
-            "openai:gpt-5.6-sol",
+            "openai:gpt-6.1-sol",
             "openai",
             openaiProvidersConfig(overrides)
           )
@@ -494,7 +499,7 @@ describe("cacheStrategy", () => {
     it("returns the exact typed system-message shape for eligible requests", () => {
       const result = createOpenAICachedSystemMessage(
         "You are a helpful assistant",
-        "openai:gpt-5.6-luna",
+        "openai:gpt-6-luna",
         "openai",
         config
       );
@@ -511,9 +516,7 @@ describe("cacheStrategy", () => {
     });
 
     it("returns null for empty system content", () => {
-      expect(createOpenAICachedSystemMessage("", "openai:gpt-5.6-luna", "openai", config)).toBe(
-        null
-      );
+      expect(createOpenAICachedSystemMessage("", "openai:gpt-6-luna", "openai", config)).toBe(null);
     });
 
     it("returns null for ineligible models and routes", () => {
@@ -521,10 +524,10 @@ describe("cacheStrategy", () => {
         createOpenAICachedSystemMessage("prompt", "openai:gpt-5.2", "openai", config)
       ).toBeNull();
       expect(
-        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", "mux-gateway", config)
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", "mux-gateway", config)
       ).toBeNull();
       expect(
-        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", undefined, config)
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", undefined, config)
       ).toBeNull();
     });
   });

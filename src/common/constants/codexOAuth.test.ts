@@ -3,102 +3,44 @@ import {
   getCodexOauthContextWindowOverride,
   isCodexOauthAllowedModel,
   isCodexOauthAllowedModelId,
-  isCodexOauthRequiredModel,
-  isCodexOauthRequiredModelId,
 } from "./codexOAuth";
 
 describe("codexOAuth model gating", () => {
-  it("allows GPT-5.4 mini through the Codex OAuth route", () => {
-    expect(isCodexOauthAllowedModelId("gpt-5.4-mini")).toBe(true);
-    expect(isCodexOauthAllowedModelId("openai:gpt-5.4-mini")).toBe(true);
-  });
-
-  it("allows GPT-5.5 through Codex OAuth without requiring it", () => {
-    expect(isCodexOauthAllowedModelId("gpt-5.5")).toBe(true);
-    expect(isCodexOauthAllowedModelId("openai:gpt-5.5")).toBe(true);
-    expect(isCodexOauthRequiredModelId("gpt-5.5")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-5.5")).toBe(false);
-  });
-
-  it("allows the GPT-5.6 family through Codex OAuth without requiring it", () => {
-    // Includes the bare alias: it is a servable model id (OpenAI routes it to Sol).
-    const contextLimits = {
-      "gpt-5.6": 272_000,
-      "gpt-5.6-sol": 272_000,
-      "gpt-5.6-terra": 272_000,
-      "gpt-5.6-luna": 272_000,
-    } as const;
-
-    for (const [model, contextLimit] of Object.entries(contextLimits)) {
-      expect(isCodexOauthAllowedModelId(model)).toBe(true);
-      expect(isCodexOauthAllowedModelId(`openai:${model}`)).toBe(true);
-      expect(isCodexOauthRequiredModelId(model)).toBe(false);
-      expect(isCodexOauthRequiredModelId(`openai:${model}`)).toBe(false);
-      expect(getCodexOauthContextWindowOverride(model)).toBe(contextLimit);
-      expect(getCodexOauthContextWindowOverride(`openai:${model}`)).toBe(contextLimit);
-    }
-  });
-
   it.each([
     // The Codex catalog publishes a 272K default context_window for each GPT-6 row.
     ["gpt-6-astra", 272_000],
     ["gpt-6.1-sol", 272_000],
-    ["gpt-6-sol", 272_000],
     ["gpt-6-luna", 272_000],
   ])("allows %s through Codex OAuth with a %d context cap", (model, contextLimit) => {
     for (const id of [model, `openai:${model}`]) {
       expect(isCodexOauthAllowedModelId(id)).toBe(true);
-      expect(isCodexOauthRequiredModelId(id)).toBe(false);
       expect(getCodexOauthContextWindowOverride(id)).toBe(contextLimit);
     }
-  });
-
-  it("does not allow GPT-5.5 Pro through the Codex OAuth route", () => {
-    expect(isCodexOauthAllowedModelId("gpt-5.5-pro")).toBe(false);
-    expect(isCodexOauthAllowedModelId("openai:gpt-5.5-pro")).toBe(false);
-    expect(isCodexOauthRequiredModelId("gpt-5.5-pro")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-5.5-pro")).toBe(false);
-  });
-
-  it("does not allow GPT-5.4 nano through the Codex OAuth route", () => {
-    expect(isCodexOauthAllowedModelId("gpt-5.4-nano")).toBe(false);
-    expect(isCodexOauthAllowedModelId("openai:gpt-5.4-nano")).toBe(false);
   });
 
   it("inherits OAuth compatibility from a mapped OpenAI model", () => {
     const config = {
       openai: {
         models: [
-          { id: "team-codex", mappedToModel: "openai:gpt-5.3-codex" },
-          { id: "team-bare", mappedToModel: "gpt-5.3-codex" },
-          { id: "team-litellm", mappedToModel: "openai/gpt-5.3-codex" },
-          { id: "team-spark", mappedToModel: "openai:gpt-5.3-codex-spark" },
+          { id: "team-sol", mappedToModel: "openai:gpt-6.1-sol" },
+          { id: "team-bare", mappedToModel: "gpt-6.1-sol" },
+          { id: "team-litellm", mappedToModel: "openai/gpt-6.1-sol" },
         ],
       },
     };
 
-    expect(isCodexOauthAllowedModel("openai:team-codex", config)).toBe(true);
-    expect(isCodexOauthRequiredModel("openai:team-codex", config)).toBe(false);
+    expect(isCodexOauthAllowedModel("openai:team-sol", config)).toBe(true);
     expect(isCodexOauthAllowedModel("openai:team-bare", config)).toBe(true);
     expect(isCodexOauthAllowedModel("openai:team-litellm", config)).toBe(true);
-    expect(isCodexOauthAllowedModel("openai:team-spark", config)).toBe(true);
-    expect(isCodexOauthRequiredModel("openai:team-spark", config)).toBe(true);
   });
 
   it("does not inherit OpenAI OAuth compatibility across providers", () => {
     const config = {
       openrouter: {
-        models: [{ id: "team-codex", mappedToModel: "openai:gpt-5.3-codex" }],
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-6.1-sol" }],
       },
     };
 
-    expect(isCodexOauthAllowedModel("openrouter:team-codex", config)).toBe(false);
-  });
-
-  it("does not mark GPT-5.4 mini or nano as OAuth-required", () => {
-    expect(isCodexOauthRequiredModelId("gpt-5.4-mini")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-5.4-mini")).toBe(false);
-    expect(isCodexOauthRequiredModelId("gpt-5.4-nano")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-5.4-nano")).toBe(false);
+    expect(isCodexOauthAllowedModel("openrouter:team-sol", config)).toBe(false);
   });
 });

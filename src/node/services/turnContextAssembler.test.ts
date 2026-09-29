@@ -469,7 +469,7 @@ describe("assemblePromptPayload", () => {
     },
     {
       name: "uses an explicit system breakpoint for eligible OpenAI requests",
-      modelString: "openai:gpt-5.6-luna",
+      modelString: "openai:gpt-6-luna",
       providerForMessages: "openai",
       routeProvider: "openai",
       providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },

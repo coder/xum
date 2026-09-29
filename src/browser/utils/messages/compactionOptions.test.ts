@@ -60,13 +60,6 @@ describe("applyCompactionOverrides", () => {
     };
     const anthropicResult = applyCompactionOverrides(baseOptions, anthropicData);
     expect(anthropicResult.thinkingLevel).toBe("medium");
-
-    // Test OpenAI model (gpt-5-pro only supports high)
-    const openaiData: CompactionRequestData = {
-      model: "openai:gpt-5-pro",
-    };
-    const openaiResult = applyCompactionOverrides(baseOptions, openaiData);
-    expect(openaiResult.thinkingLevel).toBe("high");
   });
 
   it("applies maxOutputTokens override", () => {

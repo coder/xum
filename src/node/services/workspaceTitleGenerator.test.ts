@@ -196,14 +196,14 @@ describe("generateWorkspaceIdentity candidate settings", () => {
       "Add setting",
       [
         { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
-        { model: "openai:gpt-5.6-luna" },
+        { model: "openai:gpt-6-luna" },
       ],
       aiService
     );
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.modelUsed).toBe("openai:gpt-5.6-luna");
+      expect(result.data.modelUsed).toBe("openai:gpt-6-luna");
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
     // Fallbacks carry no configured thinking: they are CREATED with an explicit

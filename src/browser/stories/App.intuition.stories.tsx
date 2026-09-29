@@ -171,7 +171,7 @@ export const ReasoningSettings: AppStory = {
           agentDefinitions: FALLBACK_AGENTS,
           agentAiDefaults: {
             intuition: {
-              modelString: "openai:gpt-5.6-sol",
+              modelString: "openai:gpt-6.1-sol",
               thinkingLevel: "high",
               advisorEnabled: true,
             },

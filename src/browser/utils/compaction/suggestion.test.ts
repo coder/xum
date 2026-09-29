@@ -10,7 +10,7 @@ const COPILOT_ONLY_PROVIDERS_CONFIG: ProvidersConfigMap = {
     apiKeySet: true,
     isEnabled: true,
     isConfigured: true,
-    models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+    models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
   },
 };
 
@@ -35,11 +35,11 @@ describe("getExplicitCompactionSuggestion", () => {
     expect(
       getExplicitCompactionSuggestion({
         ...COPILOT_ONLY_OPTIONS,
-        modelId: `github-copilot:${KNOWN_MODELS.GPT_54_MINI.providerModelId}`,
+        modelId: `github-copilot:${KNOWN_MODELS.GPT_6_LUNA.providerModelId}`,
       })
     ).toMatchObject({
       kind: "preferred",
-      modelId: `github-copilot:${KNOWN_MODELS.GPT_54_MINI.providerModelId}`,
+      modelId: `github-copilot:${KNOWN_MODELS.GPT_6_LUNA.providerModelId}`,
     });
   });
 

@@ -1901,7 +1901,7 @@ describe("ProviderService custom provider mutations", () => {
 });
 
 describe("ProviderService.setConfig", () => {
-  it("seeds first-time mux-gateway defaults without GPT-5.2 Codex", async () => {
+  it("seeds first-time mux-gateway defaults", async () => {
     await withTempConfigAsync(async (config, service) => {
       const result = await service.setConfig("mux-gateway", ["couponCode"], "gateway-token");
       expect(result.success).toBe(true);
@@ -1910,9 +1910,8 @@ describe("ProviderService.setConfig", () => {
       expect(providersConfig?.["mux-gateway"]?.models).toEqual([
         "anthropic/claude-sonnet-5-5",
         "anthropic/claude-opus-5-5",
-        "openai/gpt-5.5",
+        "openai/gpt-6.1-sol",
       ]);
-      expect(providersConfig?.["mux-gateway"]?.models).not.toContain("openai/gpt-5.2-codex");
     });
   });
 

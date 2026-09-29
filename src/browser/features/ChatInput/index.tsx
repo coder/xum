@@ -168,7 +168,6 @@ import type {
 } from "./types";
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
-import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
@@ -617,15 +616,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const composerSurfaceStyle: React.CSSProperties & { "--composer-focus-border": string } = {
     "--composer-focus-border": agentColor,
   };
-  const {
-    models,
-    hiddenModelsForSelector,
-    ensureModelInSettings,
-    defaultModel,
-    setDefaultModel,
-    codexOauthSet,
-    requiresCodexOauth,
-  } = useModelsFromSettings();
+  const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
+    useModelsFromSettings();
 
   const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
     AGENT_AI_DEFAULTS_KEY,
@@ -3154,12 +3146,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               />
             </div>
           )}
-
-          <CodexOauthWarningBanner
-            requiresCodexOauth={requiresCodexOauth(baseModel)}
-            codexOauthSet={codexOauthSet}
-            onOpenProviders={() => open("providers", { expandProvider: "openai" })}
-          />
 
           <CommandSuggestions
             suggestions={composerSuggestions.suggestions}

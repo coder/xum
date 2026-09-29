@@ -20,7 +20,6 @@ import * as agentDefinitionsService from "@/node/services/agentDefinitions/agent
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -97,7 +96,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     const created = await createAgentTask(taskService, parentId, "run task with inherited model", {
-      modelString: "openai:gpt-5.3-codex",
+      modelString: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
     expect(created.success).toBe(true);
@@ -107,7 +106,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task with inherited model",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "explore",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -121,10 +120,10 @@ describe("TaskService", () => {
       .find((w) => w.id === created.data.taskId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.aiSettings).toEqual({
-      model: "openai:gpt-5.3-codex",
+      model: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
-    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 
@@ -145,7 +144,7 @@ describe("TaskService", () => {
           name: "parent",
           createdAt: new Date().toISOString(),
           runtimeConfig: { type: "local" },
-          aiSettings: { model: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+          aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "xhigh" },
         },
       ],
       testTaskSettings()
@@ -166,7 +165,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task inheriting parent settings",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "explore",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -179,7 +178,7 @@ describe("TaskService", () => {
       .flatMap((p) => p.workspaces)
       .find((w) => w.id === created.data.taskId);
     expect(childEntry).toBeTruthy();
-    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 
@@ -349,7 +348,7 @@ describe("TaskService", () => {
           name: "parent",
           createdAt: new Date().toISOString(),
           runtimeConfig: { type: "local" },
-          // A configured alias mapped to GPT-5.6: without the providers config
+          // A configured alias mapped to GPT-6.1 Sol: without the providers config
           // threaded into the task-path clamp, "max" would be downgraded to
           // "high" against the default four-level ladder.
           aiSettings: { model: "openai:team-sol", thinkingLevel: "max" },
@@ -363,7 +362,7 @@ describe("TaskService", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-6.1-sol" }],
       },
     };
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
@@ -605,7 +604,7 @@ describe("TaskService", () => {
 
     const created = await createAgentTask(taskService, parentId, "run task with custom agent", {
       agentType: "custom",
-      modelString: "openai:gpt-5.3-codex",
+      modelString: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
     expect(created.success).toBe(true);
@@ -615,7 +614,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task with custom agent",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "custom",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -629,10 +628,10 @@ describe("TaskService", () => {
       .find((w) => w.id === created.data.taskId);
     expect(childEntry).toBeTruthy();
     expect(childEntry?.aiSettings).toEqual({
-      model: "openai:gpt-5.3-codex",
+      model: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
-    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 
@@ -740,7 +739,7 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     await writeCustomAgentDefinition(projectPath, [
       "ai:",
-      "  model: openai:gpt-5.2",
+      "  model: openai:gpt-6-luna",
       "  thinkingLevel: medium",
     ]);
 
@@ -749,7 +748,7 @@ describe("TaskService", () => {
 
     const created = await createAgentTask(taskService, parentId, "run task with explicit model", {
       agentType: "custom",
-      modelString: "openai:gpt-5.3-codex",
+      modelString: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
     expect(created.success).toBe(true);
@@ -759,7 +758,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task with explicit model",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "custom",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -953,9 +952,11 @@ describe("TaskService", () => {
   test("parent runtime thinking hint is clamped by the resolved model policy", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
-    const resolvedModel = "openai:gpt-5.5-pro";
+    const resolvedModel = "openai:gpt-6-astra";
     const requestedThinkingLevel: ThinkingLevel = "off";
-    const expectedThinkingLevel = enforceThinkingPolicy(resolvedModel, requestedThinkingLevel);
+    // Astra rejects "off"; task creation clamps to the default "medium" floor for
+    // recognized reasoning models (not just the capability minimum, "low").
+    const expectedThinkingLevel: ThinkingLevel = "medium";
     expect(expectedThinkingLevel).not.toBe(requestedThinkingLevel);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
       parentAiSettings: { model: resolvedModel, thinkingLevel: "high" },
@@ -1190,8 +1191,8 @@ describe("TaskService", () => {
   }, 20_000);
 
   describe("reawakened sub-agents follow current AI settings", () => {
-    const SPAWN_MODEL = "openai:gpt-5.2";
-    const MODEL_B = "openai:gpt-5.3-codex";
+    const SPAWN_MODEL = "openai:gpt-6-luna";
+    const MODEL_B = "openai:gpt-6.1-sol";
     const MODEL_C = "anthropic:claude-haiku-4-5";
 
     type AcceptingSend = ReturnType<typeof createAcceptingSendMessage>;
@@ -2371,10 +2372,10 @@ describe("TaskService", () => {
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
       agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+        exec: { modelString: "openai:gpt-6-luna", thinkingLevel: "medium" },
       },
       subagentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+        exec: { modelString: "openai:gpt-6.1-sol", thinkingLevel: "xhigh" },
       },
     });
 
@@ -2396,7 +2397,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run exec task with subagent defaults",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "exec",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -2404,7 +2405,7 @@ describe("TaskService", () => {
       expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
-    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 
@@ -2454,7 +2455,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
       agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+        exec: { modelString: "openai:gpt-6.1-sol", thinkingLevel: "xhigh" },
       },
     });
 
@@ -2476,7 +2477,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run exec task with agent defaults",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "exec",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -2490,10 +2491,10 @@ describe("TaskService", () => {
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
       agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "xhigh" },
+        exec: { modelString: "openai:gpt-6-luna", thinkingLevel: "xhigh" },
       },
       subagentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.3-codex" },
+        exec: { modelString: "openai:gpt-6.1-sol" },
       },
     });
 
@@ -2515,7 +2516,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run exec task with partial defaults",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         agentId: "exec",
         thinkingLevel: "xhigh",
         experiments: undefined,
@@ -2527,9 +2528,11 @@ describe("TaskService", () => {
   test("subagent thinking defaults are clamped by the resolved model policy", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
-    const resolvedModel = "openai:gpt-5.5-pro";
+    const resolvedModel = "openai:gpt-6-astra";
     const requestedThinkingLevel: ThinkingLevel = "off";
-    const expectedThinkingLevel = enforceThinkingPolicy(resolvedModel, requestedThinkingLevel);
+    // Astra rejects "off"; task creation clamps to the default "medium" floor for
+    // recognized reasoning models (not just the capability minimum, "low").
+    const expectedThinkingLevel: ThinkingLevel = "medium";
     expect(expectedThinkingLevel).not.toBe(requestedThinkingLevel);
 
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
@@ -2713,7 +2716,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
     const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
       subagentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+        exec: { modelString: "openai:gpt-6.1-sol", thinkingLevel: "xhigh" },
       },
     });
 
@@ -2735,17 +2738,17 @@ describe("TaskService", () => {
         ...cfg.agentAiDefaults,
         exec: {
           ...cfg.agentAiDefaults?.exec,
-          subagent: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+          subagent: { modelString: "openai:gpt-6-luna", thinkingLevel: "medium" },
         },
       },
     }));
 
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.aiSettings).toEqual({
-      model: "openai:gpt-5.3-codex",
+      model: "openai:gpt-6.1-sol",
       thinkingLevel: "xhigh",
     });
-    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 });

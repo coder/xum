@@ -101,7 +101,7 @@ describe("useRouting", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
 
@@ -141,7 +141,7 @@ describe("useRouting", () => {
     };
     routePriority = ["mux-gateway", "direct"];
     // The policy allows the canonical OpenAI models but lets the gateway serve
-    // only Sol. The backend rejects the gateway for GPT Pro at send time, so the
+    // only Sol. The backend rejects the gateway for Astra at send time, so the
     // UI must not offer or resolve that route either.
     policyResponse = {
       source: "env",
@@ -164,8 +164,8 @@ describe("useRouting", () => {
     const viaGateway = (modelId: string) =>
       result.current.availableRoutes(modelId).some((route) => route.route === "mux-gateway");
     await waitFor(() => {
-      expect(viaGateway(KNOWN_MODELS.GPT_PRO.id)).toBe(false);
-      expect(result.current.resolveRoute(KNOWN_MODELS.GPT_PRO.id).route).toBe("direct");
+      expect(viaGateway(KNOWN_MODELS.GPT_6_ASTRA.id)).toBe(false);
+      expect(result.current.resolveRoute(KNOWN_MODELS.GPT_6_ASTRA.id).route).toBe("direct");
       expect(viaGateway(KNOWN_MODELS.GPT.id)).toBe(true);
       expect(result.current.resolveRoute(KNOWN_MODELS.GPT.id).route).toBe("mux-gateway");
     });
