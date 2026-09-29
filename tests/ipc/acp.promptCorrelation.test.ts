@@ -22,7 +22,7 @@ interface Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[];
-  heldInputCalls: { action: "send" | "discard"; workspaceId: string; heldInputId: string }[];
+  discardHeldInputCalls: { workspaceId: string; heldInputId: string }[];
   /** `session/update` params written to the ACP client (only without `acpOutputStream`). */
   sessionUpdates: { sessionId: string; update: Record<string, unknown> }[];
   pushChatEvent: (event: WorkspaceChatMessage) => void;
@@ -309,7 +309,7 @@ function createHarness(options?: HarnessOptions): Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[] = [];
-  const heldInputCalls: Harness["heldInputCalls"] = [];
+  const discardHeldInputCalls: Harness["discardHeldInputCalls"] = [];
   const sessionUpdates: Harness["sessionUpdates"] = [];
   const chatStream = createControlledChatStream();
   // Every full-mode replay closes with a caught-up (the backend emits it in `finally`); a prompt
@@ -399,12 +399,8 @@ function createHarness(options?: HarnessOptions): Harness {
         }
         return { success: true as const, data: undefined };
       },
-      sendHeldInput: async (input: { workspaceId: string; heldInputId: string }) => {
-        heldInputCalls.push({ action: "send", ...input });
-        return { success: true as const, data: undefined };
-      },
       discardHeldInput: async (input: { workspaceId: string; heldInputId: string }) => {
-        heldInputCalls.push({ action: "discard", ...input });
+        discardHeldInputCalls.push(input);
         return { success: true as const, data: undefined };
       },
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
@@ -438,7 +434,7 @@ function createHarness(options?: HarnessOptions): Harness {
     sendMessageCalls,
     delegatedToolAnswers,
     interruptCalls,
-    heldInputCalls,
+    discardHeldInputCalls,
     sessionUpdates,
     pushChatEvent: chatStream.push,
     closeConnection: closeInput,
@@ -1759,9 +1755,8 @@ describe("ACP held inputs (#4944)", () => {
     reviewCount: 0,
   }));
 
-  it("surfaces input held by a cancel and lets the ACP user discard or send it", async () => {
+  it("surfaces input held by a cancel and lets the ACP user discard it by number", async () => {
     const harness: Harness = createHarness({
-      agentOptions: { turnCorrelationTimeoutMs: 1_000 },
       // The backend keeps queued input as held input during the Stop (#4769).
       interruptStream: async ({ workspaceId }) => {
         harness.pushChatEvent({
@@ -1788,28 +1783,15 @@ describe("ACP held inputs (#4944)", () => {
       })
     );
 
-    // Two are held, so a bare command must not guess which one to drop.
+    // Showing held inputs never consumes them, and two are held, so a bare command must not
+    // guess which one to drop.
     await prompt("/discard-held");
-    expect(harness.heldInputCalls).toEqual([]);
+    expect(harness.discardHeldInputCalls).toEqual([]);
     await prompt("/discard-held 2");
-    expect(harness.heldInputCalls).toEqual([
-      { action: "discard", workspaceId: sessionId, heldInputId: "held-2" },
+    expect(harness.discardHeldInputCalls).toEqual([
+      { workspaceId: sessionId, heldInputId: "held-2" },
     ]);
-
-    // A held Send is a normal prompt turn: it settles when the re-sent message's stream ends.
-    const sendPromise = prompt("/send-held 1");
-    await waitForCondition(() => harness.heldInputCalls.length === 2);
-    expect(harness.heldInputCalls[1]).toEqual({
-      action: "send",
-      workspaceId: sessionId,
-      heldInputId: "held-1",
-    });
-    // The held send keeps the options it was queued with: input queued by an earlier ACP prompt
-    // still carries that prompt's correlation id, which must not strand this turn.
-    harness.pushChatEvent(streamStart(sessionId, "assistant-held", { acpPromptId: "earlier" }));
-    harness.pushChatEvent(streamEnd(sessionId, "assistant-held"));
-    await expect(sendPromise).resolves.toMatchObject({ stopReason: "end_turn" });
-    // The backend re-sends its held copy; the agent never re-types it as a new prompt.
+    // Only the original prompt was sent: nothing re-sent the held input.
     expect(harness.sendMessageCalls).toHaveLength(1);
 
     harness.closeConnection();

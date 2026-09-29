@@ -50,7 +50,6 @@ describe("ACP slash command support", () => {
       "compact",
       "fork",
       "new",
-      "send-held",
       "discard-held",
       "react-effects",
       "deep-review",
@@ -215,15 +214,16 @@ describe("ACP slash command support", () => {
     expect(noArgs.argumentText).toBe("");
   });
 
-  it("parses held-input commands with an optional positive number", () => {
+  it("parses /discard-held with an optional positive number", () => {
     const parse = (input: string) => parseAcpSlashCommand(input, mapSkillsByName(skills));
-    expect(parse("/send-held")).toEqual({ kind: "held-input", command: "send-held" });
-    expect(parse("/discard-held 2")).toEqual({
-      kind: "held-input",
-      command: "discard-held",
-      number: 2,
-    });
-    for (const input of ["/send-held 0", "/send-held one", "/discard-held 1 2", "/send-held -1"]) {
+    expect(parse("/discard-held")).toEqual({ kind: "discard-held" });
+    expect(parse("/discard-held 2")).toEqual({ kind: "discard-held", number: 2 });
+    for (const input of [
+      "/discard-held 0",
+      "/discard-held one",
+      "/discard-held 1 2",
+      "/discard-held -1",
+    ]) {
       expect(parse(input)?.kind).toBe("invalid");
     }
   });

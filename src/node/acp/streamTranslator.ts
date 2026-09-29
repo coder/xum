@@ -8,11 +8,7 @@ import type {
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
-import {
-  DISCARD_HELD_COMMAND_NAME,
-  SEND_HELD_COMMAND_NAME,
-  type HeldInputCommandName,
-} from "./slashCommands";
+import { DISCARD_HELD_COMMAND_NAME } from "./slashCommands";
 
 interface ActiveToolCall {
   toolCallId: string;
@@ -91,23 +87,20 @@ export class StreamTranslator {
     assert(chatStream != null, "consumeAndForward: chatStream is required");
 
     let isReplayPhase = true;
+    // Each subscription replays the held list, but only while it is non-empty: start from nothing
+    // so inputs removed during a gap are not kept, and a notice that a failed forward may have
+    // dropped is announced again.
+    this.heldInputsBySessionId.delete(sessionId);
 
-    try {
-      for await (const event of chatStream) {
-        const updates = this.translateEvent(sessionId, event, isReplayPhase);
-        for (const update of updates) {
-          await this.connection.sessionUpdate({ sessionId, update });
-        }
-
-        if (event.type === "caught-up") {
-          isReplayPhase = false;
-        }
+    for await (const event of chatStream) {
+      const updates = this.translateEvent(sessionId, event, isReplayPhase);
+      for (const update of updates) {
+        await this.connection.sessionUpdate({ sessionId, update });
       }
-    } catch (error) {
-      // A held-input notice may not have reached the client: forget what was listed, so the held
-      // list replayed on resubscription is announced again rather than treated as already shown.
-      this.heldInputsBySessionId.delete(sessionId);
-      throw error;
+
+      if (event.type === "caught-up") {
+        isReplayPhase = false;
+      }
     }
   }
 
@@ -308,8 +301,8 @@ export class StreamTranslator {
     const count = heldInputs.length;
     const header = `Xum kept ${count} unsent message${count === 1 ? "" : "s"}. Nothing was lost:`;
     const footer =
-      `Send one with /${SEND_HELD_COMMAND_NAME} <number>, or drop it with ` +
-      `/${DISCARD_HELD_COMMAND_NAME} <number>.`;
+      "To send one, use the Xum app or copy its text into a new prompt. " +
+      `To drop one, use /${DISCARD_HELD_COMMAND_NAME} <number>.`;
     return this.toSingleChunkUpdate(
       "agent_message_chunk",
       `\n\n${header}\n\n${formatHeldInputList(listed, heldInputs)}\n\n${footer}\n`
@@ -321,11 +314,7 @@ export class StreamTranslator {
    * that was sent or discarded since then is refused rather than renumbered, so a number never
    * silently points at a different message.
    */
-  resolveHeldInput(
-    sessionId: string,
-    number: number | undefined,
-    command: HeldInputCommandName
-  ): HeldInputLookup {
+  resolveHeldInput(sessionId: string, number: number | undefined): HeldInputLookup {
     assert(
       number == null || (Number.isSafeInteger(number) && number >= 1),
       "resolveHeldInput: number must be a positive integer"
@@ -341,7 +330,7 @@ export class StreamTranslator {
       if (current.length > 1) {
         return {
           kind: "refused",
-          message: `${current.length} unsent messages are held. Pick one by number, for example /${command} 1:\n\n${listing}`,
+          message: `${current.length} unsent messages are held. Pick one by number, for example /${DISCARD_HELD_COMMAND_NAME} 1:\n\n${listing}`,
         };
       }
       number = state.listed.findIndex((heldInput) => heldInput.id === current[0].id) + 1;

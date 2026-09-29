@@ -220,8 +220,7 @@ describe("StreamTranslator held inputs (#4944)", () => {
       heldChanged(held("h1", "one"), held("h2", "two"), held("h3", "three")),
       heldChanged(held("h1", "one"), held("h3", "three")),
     ]);
-    const resolve = (number?: number) =>
-      translator.resolveHeldInput("session", number, "send-held");
+    const resolve = (number?: number) => translator.resolveHeldInput("session", number);
     // Number 3 still means "three" after h2 left: no renumbering without a new notice.
     expect(resolve(3)).toMatchObject({ kind: "found", heldInput: { id: "h3" } });
     expect(resolve(2).kind).toBe("refused");
@@ -232,11 +231,23 @@ describe("StreamTranslator held inputs (#4944)", () => {
       heldChanged(held("h1", "a"), held("h2", "b")),
       heldChanged(held("h2", "b")),
     ]);
-    expect(single.translator.resolveHeldInput("session", undefined, "discard-held")).toMatchObject({
+    expect(single.translator.resolveHeldInput("session", undefined)).toMatchObject({
       number: 2,
       heldInput: { id: "h2" },
     });
     const empty = await translate([heldChanged(held("h1", "a")), heldChanged()]);
-    expect(empty.translator.resolveHeldInput("session", 1, "send-held").kind).toBe("refused");
+    expect(empty.translator.resolveHeldInput("session", 1).kind).toBe("refused");
+
+    // A clean resubscription replays nothing once the list is empty (the backend replays only a
+    // non-empty list), so inputs removed during the gap must not stay resolvable.
+    const gap = await translate([heldChanged(held("h1", "a"))]);
+    const noEvents: WorkspaceChatMessage[] = [];
+    await gap.translator.consumeAndForward(
+      "session",
+      (async function* () {
+        for (const event of noEvents) yield await Promise.resolve(event);
+      })()
+    );
+    expect(gap.translator.resolveHeldInput("session", 1).kind).toBe("refused");
   });
 });

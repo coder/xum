@@ -9,11 +9,9 @@ const CLEAR_COMMAND_NAME = "clear";
 const COMPACT_COMMAND_NAME = "compact";
 const FORK_COMMAND_NAME = "fork";
 const NEW_COMMAND_NAME = "new";
-// Held inputs (#4944) are listed in a numbered notice (StreamTranslator); these act by number.
-export const SEND_HELD_COMMAND_NAME = "send-held";
+// Held inputs (#4944) are listed in a numbered notice (StreamTranslator); this acts by number.
 export const DISCARD_HELD_COMMAND_NAME = "discard-held";
-export type HeldInputCommandName = typeof SEND_HELD_COMMAND_NAME | typeof DISCARD_HELD_COMMAND_NAME;
-const HELD_INPUT_COMMAND_HINT = "[number]";
+const DISCARD_HELD_COMMAND_HINT = "[number]";
 
 const COMPACT_USAGE = `/compact ${SLASH_COMMAND_HINTS.compact}`;
 
@@ -46,14 +44,9 @@ const SERVER_COMMAND_DEFINITIONS: readonly ServerCommandDefinition[] = [
     inputHint: SLASH_COMMAND_HINTS.new,
   },
   {
-    name: SEND_HELD_COMMAND_NAME,
-    description: "Send an unsent message that Xum kept (for example after a cancel).",
-    inputHint: HELD_INPUT_COMMAND_HINT,
-  },
-  {
     name: DISCARD_HELD_COMMAND_NAME,
-    description: "Discard an unsent message that Xum kept, without sending it.",
-    inputHint: HELD_INPUT_COMMAND_HINT,
+    description: "Discard an unsent message that Xum kept (for example after a cancel).",
+    inputHint: DISCARD_HELD_COMMAND_HINT,
   },
 ] as const;
 
@@ -79,7 +72,7 @@ export type ParsedAcpSlashCommand =
   | { kind: "fork"; startMessage?: string }
   | { kind: "new"; startMessage?: string }
   /** `number` is 1-based, as listed in the held-input notice; omitted means "the only one". */
-  | { kind: "held-input"; command: HeldInputCommandName; number?: number }
+  | { kind: "discard-held"; number?: number }
   | {
       kind: "skill";
       descriptor: AgentSkillDescriptor;
@@ -189,8 +182,8 @@ export function parseAcpSlashCommand(
     return parseNewCommand(rawInput);
   }
 
-  if (commandName === SEND_HELD_COMMAND_NAME || commandName === DISCARD_HELD_COMMAND_NAME) {
-    return parseHeldInputCommand(commandName, remainingTokens);
+  if (commandName === DISCARD_HELD_COMMAND_NAME) {
+    return parseDiscardHeldCommand(remainingTokens);
   }
 
   return parseSkillCommand(trimmed, commandName, skillsByName);
@@ -315,16 +308,16 @@ function parseNewCommand(rawInput: string): ParsedAcpSlashCommand {
   };
 }
 
-function parseHeldInputCommand(
-  command: HeldInputCommandName,
-  tokens: string[]
-): ParsedAcpSlashCommand {
-  if (tokens.length === 0) return { kind: "held-input", command };
+function parseDiscardHeldCommand(tokens: string[]): ParsedAcpSlashCommand {
+  if (tokens.length === 0) return { kind: "discard-held" };
   const number = tokens.length === 1 && /^[1-9]\d*$/.test(tokens[0]) ? Number(tokens[0]) : NaN;
   if (!Number.isSafeInteger(number)) {
-    return { kind: "invalid", message: `Usage: /${command} ${HELD_INPUT_COMMAND_HINT}` };
+    return {
+      kind: "invalid",
+      message: `Usage: /${DISCARD_HELD_COMMAND_NAME} ${DISCARD_HELD_COMMAND_HINT}`,
+    };
   }
-  return { kind: "held-input", command, number };
+  return { kind: "discard-held", number };
 }
 
 function parseSkillCommand(
