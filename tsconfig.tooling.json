@@ -9,6 +9,12 @@
       "mux/*": ["./src/*"]
     }
   },
-  "include": ["src/**/*.d.ts", "vscode/src/**/*.ts", "vscode/src/**/*.tsx", "scripts/**/*.test.ts"],
+  "include": [
+    "src/**/*.d.ts",
+    "vscode/src/**/*.ts",
+    "vscode/src/**/*.tsx",
+    "scripts/**/*.test.ts",
+    "scripts/perf/**/*.ts"
+  ],
   "exclude": ["node_modules", "vscode/node_modules", "dist"]
 }
