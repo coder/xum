@@ -211,7 +211,8 @@ describe("projectStatusHistoryRow", () => {
     // The generator must exercise both branches, or the property proves nothing.
     expect(readableRows).toBeGreaterThan(300);
     expect(cutRows).toBeGreaterThan(1500);
-  });
+    // ~2.6 s locally; the default 5 s timeout flaked on a loaded host.
+  }, 30_000);
 
   test("keeps the full parse's readability at every truncation offset", () => {
     const problems: string[] = [];
