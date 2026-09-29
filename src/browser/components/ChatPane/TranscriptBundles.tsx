@@ -64,6 +64,11 @@ export function useTranscriptBundles(params: {
     operational: EMPTY_OVERRIDES,
   }));
   const isCurrentWorkspace = bundleExpansion.workspaceId === workspaceId;
+  if (!isCurrentWorkspace) {
+    // Choices are per visit: drop the stored overrides on switch (render-phase update, React
+    // re-renders before committing), else returning to the earlier workspace would restore them.
+    setBundleExpansion({ workspaceId, work: EMPTY_OVERRIDES, operational: EMPTY_OVERRIDES });
+  }
   const workBundleExpansionOverrides = isCurrentWorkspace ? bundleExpansion.work : EMPTY_OVERRIDES;
   const operationalBundleExpansionOverrides = isCurrentWorkspace
     ? bundleExpansion.operational

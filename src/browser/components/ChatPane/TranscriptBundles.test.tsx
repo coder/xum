@@ -58,12 +58,18 @@ describe("useTranscriptBundles", () => {
     rerender({ workspaceId: "ws-b" });
     expect(rendersWithOverride).toEqual([]);
 
+    // Choices are per visit: returning without touching anything in the other workspace starts
+    // empty too, instead of restoring the earlier visit's choices.
+    rerender({ workspaceId: "ws-a" });
+    expect(rendersWithOverride).toEqual([]);
+    rerender({ workspaceId: "ws-b" });
+
     // Setting a choice in the new workspace stores it for that workspace only.
     act(() => result.current.setOperationalBundleExpanded("shared-bundle", false));
     expect(result.current.operationalBundleExpansionOverrides.get("shared-bundle")).toBe(false);
     expect(result.current.workBundleExpansionOverrides.has("shared-bundle")).toBe(false);
 
-    // Choices are per visit: returning to the first workspace starts empty again.
+    // Returning after a choice in the other workspace starts empty again as well.
     rendersWithOverride.length = 0;
     rerender({ workspaceId: "ws-a" });
     expect(rendersWithOverride).toEqual([]);
