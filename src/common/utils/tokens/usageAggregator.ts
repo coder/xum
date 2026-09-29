@@ -43,7 +43,7 @@ export interface ChatUsageDisplay {
   serviceTier?: ChatUsageServiceTier;
 }
 
-export type ChatUsageServiceTier = "flex" | "fast" | "unknown" | "mixed";
+export type ChatUsageServiceTier = "flex" | "fast" | "ultrafast" | "unknown" | "mixed";
 
 /**
  * Sum multiple ChatUsageDisplay objects into a single cumulative display

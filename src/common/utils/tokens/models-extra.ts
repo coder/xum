@@ -547,6 +547,33 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-04-20",
   },
 
+  // GPT-6.1 Sol - Released September 29, 2026. Same 1.05M window / 922K max input,
+  // 128K output, and 272K long-context tier as GPT-6 Sol; Standard input/output
+  // rates are unchanged but cached input drops to 5% of input ($0.10/M). Like
+  // Astra, reasoning cannot be disabled and Chat Completions has no tool calling,
+  // so supports_function_calling holds for the default Responses wire format only.
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6.1-sol
+  "gpt-6.1-sol": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000002, // $2 per million input tokens (<272K prompt tokens)
+    input_cost_per_token_above_200k_tokens: 0.000004, // $4 per million input tokens (>272K)
+    output_cost_per_token: 0.00001, // $10 per million output tokens (<272K prompt tokens)
+    output_cost_per_token_above_200k_tokens: 0.000015, // $15 per million output tokens (>272K)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (<272K)
+    cache_read_input_token_cost_above_200k_tokens: 0.0000002, // $0.20 per million cached input tokens (>272K)
+    cache_creation_input_token_cost: 0.0000025, // $2.50 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_200k_tokens: 0.000005, // $5 per million tokens (1.25x long-context input)
+    tiered_pricing_threshold_tokens: 272000, // OpenAI's published boundary is 272K (field names say 200K)
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-30",
+  },
+
   // Ref: https://developers.openai.com/api/docs/models/gpt-6-luna
   "gpt-6-luna": {
     max_input_tokens: 922000,

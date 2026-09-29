@@ -12,9 +12,10 @@ import { resolveRawModelEntry } from "./modelStats";
  * Standard ("default", billed at standard rates). Source for everything below:
  * https://developers.openai.com/api/docs/pricing (Standard, Flex and Fast
  * tables) and https://developers.openai.com/api/docs/guides/fast-mode, both
- * fetched 2026-09-26.
+ * fetched 2026-09-26; Ultrafast table and
+ * https://developers.openai.com/api/docs/guides/ultrafast-mode fetched 2026-09-29.
  */
-export type PricedServiceTier = "flex" | "standard" | "fast" | "unknown";
+export type PricedServiceTier = "flex" | "standard" | "fast" | "ultrafast" | "unknown";
 
 /** Maps a provider-reported tier to its price list; `undefined` means none was reported. */
 export function normalizeOpenAIServiceTier(value: unknown): PricedServiceTier | undefined {
@@ -28,6 +29,8 @@ export function normalizeOpenAIServiceTier(value: unknown): PricedServiceTier | 
       return "fast";
     case "flex":
       return "flex";
+    case "ultrafast":
+      return "ultrafast";
     // Scale Tier is prepaid capacity; Standard is its published per-token reference.
     // A response names the tier actually used, so "auto" is no information: Standard.
     case "default":
@@ -80,8 +83,6 @@ const KNOWN_OPENAI_SERVICE_TIERS: ReadonlySet<string> = new Set([
   "priority",
   "fast",
   "scale",
-  // Access-controlled Ultrafast (gpt-5.6-sol) has no published rate, so it prices
-  // as "unknown"; it is still an SDK enum value, not provider free text.
   "ultrafast",
 ]);
 
@@ -94,7 +95,8 @@ const TIER_COST_RANK: Record<PricedServiceTier, number> = {
   flex: 0,
   standard: 1,
   fast: 2,
-  unknown: 3,
+  ultrafast: 3,
+  unknown: 4,
 };
 
 /** Orders reported tiers by what they can cost; an absent tier ranks lowest. */
@@ -114,6 +116,16 @@ const HALF_BOTH_BANDS: TierFactor = { factor: 0.5, longContext: true };
 const HALF_SHORT_ONLY: TierFactor = { factor: 0.5, longContext: false };
 const DOUBLE_BOTH_BANDS: TierFactor = { factor: 2, longContext: true };
 const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: false });
+/**
+ * OpenAI prices Ultrafast at 6x the model's Standard rate in both context bands
+ * (gpt-6-astra: $60/$6/$75/$300 short, $120/$12/$150/$450 long). Only Astra has a
+ * published card, so this factor also prices models whose Ultrafast rate is not
+ * published yet (GPT-5.6 Sol preview) instead of the lower highest-published
+ * fallback, keeping the budget rule's "never under-count" promise.
+ */
+const ULTRAFAST_SIX_BOTH_BANDS: TierFactor = { factor: 6, longContext: true };
+
+type PricedTierWithFactors = "flex" | "fast" | "ultrafast";
 
 /**
  * Factors reproduce every published Flex/Fast cell from the model's Standard
@@ -123,47 +135,53 @@ const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: fa
  * the corresponding Standard rate"). Keys are the bare catalog keys the model's
  * Standard stats resolve from.
  */
-const SERVICE_TIER_FACTORS: Readonly<Record<string, Partial<Record<"flex" | "fast", TierFactor>>>> =
-  {
-    "gpt-6-astra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    // Catalog alias priced as gpt-5.6-sol (models-extra `"gpt-5.6": GPT_56_SOL_STATS`).
-    "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-    "gpt-5.5": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2.5) },
-    "gpt-5.5-pro": { flex: HALF_SHORT_ONLY },
-    "gpt-5.4": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2) },
-    "gpt-5.4-pro": { flex: HALF_BOTH_BANDS },
-    "gpt-5.4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-    "gpt-5.4-nano": { flex: HALF_SHORT_ONLY },
-    "gpt-5.3-codex": { fast: fastShortOnly(2) },
-    "gpt-5.2": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-    "gpt-5.1": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-    "gpt-5": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-    "gpt-5-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.8) },
-    "gpt-5-nano": { flex: HALF_SHORT_ONLY },
-    o3: { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.75) },
-    "o4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(20 / 11) },
-    "gpt-4.1": { fast: fastShortOnly(1.75) },
-    "gpt-4.1-mini": { fast: fastShortOnly(1.75) },
-    "gpt-4.1-nano": { fast: fastShortOnly(2) },
-    "gpt-4o": { fast: fastShortOnly(1.7) },
-    "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
-    "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
-    // Anthropic Fast mode: 2× Standard across the full context window, with prompt
-    // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
-    // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
-    "claude-opus-5-5": { fast: DOUBLE_BOTH_BANDS },
-    "claude-opus-5": { fast: DOUBLE_BOTH_BANDS },
-    "claude-opus-4-8": { fast: DOUBLE_BOTH_BANDS },
-  };
+const SERVICE_TIER_FACTORS: Readonly<
+  Record<string, Partial<Record<PricedTierWithFactors, TierFactor>>>
+> = {
+  "gpt-6-astra": {
+    flex: HALF_BOTH_BANDS,
+    fast: DOUBLE_BOTH_BANDS,
+    ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
+  },
+  "gpt-6.1-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  // Catalog alias priced as gpt-5.6-sol (models-extra `"gpt-5.6": GPT_56_SOL_STATS`).
+  "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.5": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2.5) },
+  "gpt-5.5-pro": { flex: HALF_SHORT_ONLY },
+  "gpt-5.4": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2) },
+  "gpt-5.4-pro": { flex: HALF_BOTH_BANDS },
+  "gpt-5.4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5.4-nano": { flex: HALF_SHORT_ONLY },
+  "gpt-5.3-codex": { fast: fastShortOnly(2) },
+  "gpt-5.2": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5.1": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.8) },
+  "gpt-5-nano": { flex: HALF_SHORT_ONLY },
+  o3: { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.75) },
+  "o4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(20 / 11) },
+  "gpt-4.1": { fast: fastShortOnly(1.75) },
+  "gpt-4.1-mini": { fast: fastShortOnly(1.75) },
+  "gpt-4.1-nano": { fast: fastShortOnly(2) },
+  "gpt-4o": { fast: fastShortOnly(1.7) },
+  "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
+  "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
+  // Anthropic Fast mode: 2× Standard across the full context window, with prompt
+  // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
+  // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
+  "claude-opus-5-5": { fast: DOUBLE_BOTH_BANDS },
+  "claude-opus-5": { fast: DOUBLE_BOTH_BANDS },
+  "claude-opus-4-8": { fast: DOUBLE_BOTH_BANDS },
+};
 
 function lookupTierFactors(
   modelString: string
-): Partial<Record<"flex" | "fast", TierFactor>> | undefined {
+): Partial<Record<PricedTierWithFactors, TierFactor>> | undefined {
   const key = resolveRawModelEntry(modelString)?.key.replace(/^(?:openai|anthropic)\//, "");
   if (key === undefined) {
     return undefined;
@@ -189,7 +207,11 @@ const RATE_FIELDS = [
  * documented as cheaper than Standard) and takes the higher of the scaled
  * short rate and the Standard long rate for Fast.
  */
-function scaleRates(stats: ModelStats, tier: "flex" | "fast", published: TierFactor): ModelStats {
+function scaleRates(
+  stats: ModelStats,
+  tier: PricedTierWithFactors,
+  published: TierFactor
+): ModelStats {
   const scaled: ModelStats = { ...stats };
   for (const [short, long] of RATE_FIELDS) {
     const shortRate = stats[short];
@@ -241,6 +263,10 @@ export function withServiceTierPricing(
   const factors = lookupTierFactors(modelString);
   if (tier === "flex") {
     return factors?.flex !== undefined ? scaleRates(stats, "flex", factors.flex) : stats;
+  }
+  if (tier === "ultrafast") {
+    // 6x Standard is above every published Fast card, so the fallback never under-counts.
+    return scaleRates(stats, "ultrafast", factors?.ultrafast ?? ULTRAFAST_SIX_BOTH_BANDS);
   }
   const fastCard =
     factors?.fast !== undefined ? scaleRates(stats, "fast", factors.fast) : undefined;

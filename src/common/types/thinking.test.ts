@@ -4,7 +4,9 @@ import {
   getOpenAIReasoningEffort,
   getThinkingDisplayLabel,
   getThinkingOptionLabel,
+  isGpt61SolModel,
   isGpt6AstraModel,
+  isGpt6SolOrLunaModel,
   openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   openaiSupportsProMode,
@@ -186,6 +188,26 @@ describe("getOpenAIReasoningEffort", () => {
   test("keeps the standard mapping for lower levels", () => {
     expect(getOpenAIReasoningEffort("high", "openai:gpt-5.6-sol")).toBe("high");
     expect(getOpenAIReasoningEffort("low", "openai:gpt-5.6-sol")).toBe("low");
+  });
+
+  test("gives GPT-6.1 Sol Astra's surface: native max, off clamps to low, Pro allowed", () => {
+    for (const id of [
+      "openai:gpt-6.1-sol",
+      "mux-gateway:openai/gpt-6.1-sol",
+      "openai:gpt-6.1-sol-2026-09-29",
+    ]) {
+      expect(isGpt61SolModel(id)).toBe(true);
+      expect(openaiRejectsDisabledReasoning(id)).toBe(true);
+      expect(openaiSupportsProMode(id)).toBe(true);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("max");
+      expect(getOpenAIReasoningEffort("off", id)).toBe("low");
+    }
+    // The dotted slug is not a GPT-6 Sol snapshot: it must not inherit Sol's
+    // "none" (Chat Completions tool clamp) behavior, and variants stay outside it.
+    expect(isGpt6SolOrLunaModel("openai:gpt-6.1-sol")).toBe(false);
+    expect(isGpt61SolModel("openai:gpt-6.1-sol-mini")).toBe(false);
+    expect(isGpt61SolModel("openai:gpt-6-sol")).toBe(false);
+    expect(openaiRejectsDisabledReasoning("openai:gpt-6-sol")).toBe(false);
   });
 
   test("gives GPT-6 Astra native max but clamps off to low (it rejects none)", () => {

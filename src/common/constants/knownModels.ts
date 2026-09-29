@@ -98,12 +98,14 @@ const MODEL_DEFINITIONS = {
     aliases: ["haiku"],
     tokenizerOverride: "anthropic/claude-3.5-haiku",
   },
-  // September 22 releases: keep the durable gpt/sol and luna aliases on their
-  // latest tiers without moving users to the more expensive Astra tier. Retired
-  // GPT-5.6 Sol/Luna remain usable as custom model strings with their own metadata.
+  // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
+  // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
+  // Keep the durable gpt/sol aliases on the latest Sol tier without moving users to
+  // the more expensive Astra tier. GPT-6 Sol and the retired GPT-5.6 Sol/Luna stay
+  // usable as custom model strings with their own metadata.
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-6-sol",
+    providerModelId: "gpt-6.1-sol",
     aliases: ["gpt", "sol"],
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.

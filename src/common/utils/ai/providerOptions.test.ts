@@ -1178,6 +1178,47 @@ describe("buildProviderOptions - OpenAI", () => {
       expect("serviceTier" in openai!).toBe(true);
       expect(openai!.serviceTier).toBe("flex");
     });
+
+    test.each([
+      ["openai:gpt-6-astra", "ultrafast"],
+      ["openai:gpt-5.6-sol", "ultrafast"],
+      ["openai:gpt-5.6", "ultrafast"],
+      // Announced but not yet served in the API; must not fall back to Fast either.
+      ["openai:gpt-6.1-sol", undefined],
+      ["openai:gpt-6-sol", undefined],
+      ["openai:gpt-5.6-terra", undefined],
+    ] as const)("gates the Ultrafast tier by model: %s -> %s", (model, expected) => {
+      const openai = getOpenAIOptions(
+        buildProviderOptions(model, "medium", undefined, undefined, {
+          openai: { serviceTier: "ultrafast" },
+        })
+      );
+      expect(openai?.serviceTier).toBe(expected);
+    });
+
+    test("resolves Ultrafast support through a mapped alias", () => {
+      const openai = getOpenAIOptions(
+        buildProviderOptions(
+          "openai:team-astra",
+          "medium",
+          undefined,
+          undefined,
+          { openai: { serviceTier: "ultrafast" } },
+          undefined,
+          undefined,
+          {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          },
+          "openai"
+        )
+      );
+      expect(openai?.serviceTier).toBe("ultrafast");
+    });
   });
 
   describe("promptCacheKey derivation", () => {

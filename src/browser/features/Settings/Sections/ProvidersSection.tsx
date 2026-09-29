@@ -101,7 +101,13 @@ type OpenAIServiceTier = ServiceTier;
 type OpenAIServiceTierSelectValue = typeof OPENAI_SERVICE_TIER_UNSET | OpenAIServiceTier;
 
 function isOpenAIServiceTier(value: string): value is OpenAIServiceTier {
-  return value === "auto" || value === "default" || value === "flex" || value === "priority";
+  return (
+    value === "auto" ||
+    value === "default" ||
+    value === "flex" ||
+    value === "priority" ||
+    value === "ultrafast"
+  );
 }
 
 function isXAIServiceTier(value: string): value is XAIServiceTier {
@@ -2920,6 +2926,7 @@ export function ProvidersSection() {
                                     <SelectItem value="default">default</SelectItem>
                                     <SelectItem value="flex">flex</SelectItem>
                                     <SelectItem value="priority">priority</SelectItem>
+                                    <SelectItem value="ultrafast">ultrafast</SelectItem>
                                   </SelectContent>
                                 </Select>
                               </div>

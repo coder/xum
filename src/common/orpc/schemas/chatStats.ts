@@ -34,7 +34,7 @@ export const ChatUsageDisplaySchema = z.object({
   model: z.string().optional(),
   costsIncluded: z.boolean().optional(),
   // Without it, the schema would strip the tier and repricing would drop the premium (#4787).
-  serviceTier: z.enum(["flex", "fast", "unknown", "mixed"]).optional(),
+  serviceTier: z.enum(["flex", "fast", "ultrafast", "unknown", "mixed"]).optional(),
 });
 
 export const ChatStatsSchema = z.object({

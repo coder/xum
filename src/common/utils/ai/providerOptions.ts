@@ -44,7 +44,10 @@ import {
   isOfficialProviderBaseUrl,
   openaiExplicitPromptCachingAvailable,
 } from "@/common/utils/ai/cacheStrategy";
-import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "./openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -346,13 +349,18 @@ export function buildProviderOptions(
     providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
-  const serviceTier = openaiServiceTierAvailable(modelString, {
-    providersConfig,
-    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
-    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-  })
-    ? muxProviderOptions?.openai?.serviceTier
-    : undefined;
+  // Ultrafast is additionally model-gated; unsupported models drop the tier.
+  const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
+  const serviceTier =
+    requestedServiceTier != null &&
+    openaiServiceTierAvailable(modelString, {
+      providersConfig,
+      resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+      openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+    }) &&
+    openaiModelSupportsServiceTier(modelString, requestedServiceTier, providersConfig)
+      ? requestedServiceTier
+      : undefined;
 
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.

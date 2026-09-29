@@ -8,6 +8,8 @@ import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { isGpt6AstraModel, stripModelProviderPrefixes } from "@/common/types/thinking";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -54,6 +56,35 @@ export function resolveProviderOptionsRoute(
   }
 
   return options?.resolvedRouteProvider ?? "direct";
+}
+
+/**
+ * Whether the model accepts the given OpenAI service tier. Every tier but
+ * Ultrafast is route-gated only (see openaiServiceTierAvailable).
+ *
+ * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29, billed
+ * at 6x Standard) is model-gated: OpenAI serves it for GPT-6 Astra (GA) and
+ * GPT-5.6 Sol (preview access; the bare `gpt-5.6` alias routes to Sol). GPT-6.1
+ * Sol Ultrafast was announced for "the coming days" and is not in the API yet;
+ * add it here once the Ultrafast guide lists it. Callers drop the tier for other
+ * models (Standard or the project default) instead of switching to Fast, which
+ * is a different paid tier.
+ * https://developers.openai.com/api/docs/guides/ultrafast-mode
+ */
+export function openaiModelSupportsServiceTier(
+  modelString: string,
+  serviceTier: string,
+  providersConfig?: ProvidersConfigMap | null
+): boolean {
+  if (serviceTier !== "ultrafast") return true;
+  // Resolve mapped aliases and Coder gateway identities to the upstream model.
+  const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
+  return (
+    isGpt6AstraModel(capabilityModel) ||
+    /^gpt-5\.6(?:-sol)?(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(
+      stripModelProviderPrefixes(capabilityModel)
+    )
+  );
 }
 
 /** Fast shares OpenAI's preference across gateways that forward its service tier. */

@@ -40,8 +40,9 @@ describe("codexOAuth model gating", () => {
   });
 
   it.each([
-    // The pinned Codex catalog publishes a 272K default context_window for all three.
+    // The Codex catalog publishes a 272K default context_window for each GPT-6 row.
     ["gpt-6-astra", 272_000],
+    ["gpt-6.1-sol", 272_000],
     ["gpt-6-sol", 272_000],
     ["gpt-6-luna", 272_000],
   ])("allows %s through Codex OAuth with a %d context cap", (model, contextLimit) => {

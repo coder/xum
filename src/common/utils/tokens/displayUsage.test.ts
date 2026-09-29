@@ -278,6 +278,7 @@ describe("createDisplayUsage", () => {
 
   describe("tiered long-context pricing", () => {
     test.each([
+      ["openai:gpt-6.1-sol", 2, 0.1, 10],
       ["openai:gpt-6-sol", 2, 0.2, 10],
       ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
       // GPT-5.6 Sol promotional base rates (OpenAI pricing page, verified 2026-09-26);
@@ -648,9 +649,20 @@ describe("OpenAI service-tier pricing (#4352)", () => {
   });
 
   test("prices an unknown reported tier at least as high as Fast", () => {
-    const unknown = cost("openai:gpt-6-sol", 100_000, "ultrafast");
+    const unknown = cost("openai:gpt-6-sol", 100_000, "hyperfast");
     expect(unknown).toBeGreaterThan(cost("openai:gpt-6-sol", 100_000));
     expect(unknown).toBeGreaterThanOrEqual(cost("openai:gpt-6-sol", 100_000, "fast"));
+  });
+
+  test("prices Ultrafast at 6x Standard in both context bands", () => {
+    // gpt-6-astra has a published Ultrafast card; gpt-5.6-sol (preview) does not
+    // and falls back to the same announced 6x multiplier, above its Fast card.
+    for (const model of ["openai:gpt-6-astra", "openai:gpt-5.6-sol"]) {
+      for (const inputTokens of [100_000, 300_000]) {
+        expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * cost(model, inputTokens), 9);
+      }
+      expect(cost(model, 100_000, "ultrafast")).toBeGreaterThan(cost(model, 100_000, "fast"));
+    }
   });
 
   test("keeps gateway-included costs at zero whatever tier was reported", () => {
@@ -755,9 +767,14 @@ describe("repricing keeps the billed service tier (#4787)", () => {
   });
 
   test("the billed tier survives the session-usage schema", () => {
-    const usage = priced("openai:gpt-6-sol", "priority");
-    const parsed = ChatUsageDisplaySchema.parse(usage);
-    expect(total(recomputeUsageCosts(parsed, "openai:gpt-6-sol"))).toBeCloseTo(total(usage), 12);
+    for (const [model, tier] of [
+      ["openai:gpt-6-sol", "priority"],
+      ["openai:gpt-6-astra", "ultrafast"],
+    ] as const) {
+      const usage = priced(model, tier);
+      const parsed = ChatUsageDisplaySchema.parse(usage);
+      expect(total(recomputeUsageCosts(parsed, model))).toBeCloseTo(total(usage), 12);
+    }
   });
 
   test("reprices an aggregate of one tier at that tier", () => {

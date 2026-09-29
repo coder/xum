@@ -494,8 +494,7 @@ describe("EvaluationService.evaluate service tier (#4352)", () => {
     expect(await run("priority")).toEqual({
       openai: { reasoningTokens: 1, serviceTier: "priority" },
     });
-    // Ultrafast has no published rate, but it must survive so pricing can apply
-    // the unknown-tier (highest published card) rule instead of Standard.
+    // Ultrafast must survive so pricing applies its 6x premium instead of Standard.
     expect(await run("ultrafast")).toEqual({
       openai: { reasoningTokens: 1, serviceTier: "ultrafast" },
     });

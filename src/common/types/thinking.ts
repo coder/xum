@@ -286,6 +286,18 @@ export function isGpt6SolOrLunaModel(modelString: string): boolean {
 }
 
 /**
+ * GPT-6.1 Sol matcher (released September 29, 2026 as `gpt-6.1-sol`). It is a
+ * separate dotted slug, not a GPT-6 Sol snapshot, and its reasoning surface
+ * matches Astra rather than GPT-6 Sol: low through native max, with `none` and
+ * `minimal` rejected, and no Chat Completions tool calling. Anchored like
+ * isGpt6AstraModel so unannounced variants stay outside it.
+ */
+export function isGpt61SolModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-6\.1-sol(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
+/**
  * Whether the given OpenAI model supports the native "max" reasoning effort.
  *
  * The GPT-5.6 GA launch (July 9, 2026) added a top reasoning effort above
@@ -295,14 +307,16 @@ export function isGpt6SolOrLunaModel(modelString: string): boolean {
  *
  * GPT-6 Astra keeps the native max effort (its model page lists
  * low/medium/high/xhigh/max) but, unlike the GPT-5.6 family, rejects `none`; see
- * openaiRejectsDisabledReasoning. Sol/Luna support none through max.
- * Pro mode is independent of that effort ladder.
+ * openaiRejectsDisabledReasoning. Sol/Luna support none through max; GPT-6.1
+ * Sol follows Astra (low through max). Pro mode is independent of that effort
+ * ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
   return (
     isGpt56FamilyModel(modelString) ||
     isGpt6AstraModel(modelString) ||
-    isGpt6SolOrLunaModel(modelString)
+    isGpt6SolOrLunaModel(modelString) ||
+    isGpt61SolModel(modelString)
   );
 }
 
@@ -310,11 +324,12 @@ export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
  * Whether the given OpenAI model rejects `reasoning.effort: "none"`.
  *
  * GPT-6 Astra returns HTTP 400 for `none` and lists no `minimal`; reasoning
- * cannot be turned off. OpenAI's migration guidance for callers of either value
- * is to send `low`, so the thinking policy drops "off" and clamps it to "low".
+ * cannot be turned off. GPT-6.1 Sol's model page likewise rejects both.
+ * OpenAI's migration guidance for callers of either value is to send `low`, so
+ * the thinking policy drops "off" and clamps it to "low".
  */
 export function openaiRejectsDisabledReasoning(modelString: string): boolean {
-  return isGpt6AstraModel(modelString);
+  return isGpt6AstraModel(modelString) || isGpt61SolModel(modelString);
 }
 
 /**
@@ -344,13 +359,15 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * coverage.
  *
  * GPT-6 Astra, Sol, and Luna also support Pro on the same model id; keep it independent of
- * effort so choosing native max does not silently opt users into Pro serving.
+ * effort so choosing native max does not silently opt users into Pro serving. GPT-6.1 Sol
+ * joins as a GPT-6 family member (the GPT-6 guide lists pro mode family-wide).
  */
 export function openaiSupportsProMode(modelString: string): boolean {
   return (
     isGpt56FamilyModel(modelString) ||
     isGpt6AstraModel(modelString) ||
-    isGpt6SolOrLunaModel(modelString)
+    isGpt6SolOrLunaModel(modelString) ||
+    isGpt61SolModel(modelString)
   );
 }
 

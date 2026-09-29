@@ -166,10 +166,27 @@ describe("ProviderService.getConfig", () => {
       baseChecks: true,
     },
     {
+      name: "surfaces the Ultrafast OpenAI serviceTier",
+      openai: { serviceTier: "ultrafast" },
+      property: "serviceTier",
+      expected: "ultrafast",
+      ownsProperty: true,
+      baseChecks: false,
+    },
+    {
       name: "surfaces a valid Fast-mode restore tier",
       openai: { fastModePreviousServiceTier: "flex" },
       property: "fastModePreviousServiceTier",
       expected: "flex",
+      ownsProperty: true,
+      baseChecks: false,
+    },
+    {
+      // Toggling Fast off must restore Ultrafast rather than fall back to auto.
+      name: "surfaces an Ultrafast Fast-mode restore tier",
+      openai: { fastModePreviousServiceTier: "ultrafast" },
+      property: "fastModePreviousServiceTier",
+      expected: "ultrafast",
       ownsProperty: true,
       baseChecks: false,
     },

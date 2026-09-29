@@ -121,6 +121,9 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   // working for OAuth-only users.
   "gpt-6-sol",
   "gpt-6-luna",
+  // GPT-6.1 Sol (September 29, 2026): the Codex catalog's default model, so the
+  // promoted `gpt`/`sol` aliases keep working for OAuth-only users.
+  "gpt-6.1-sol",
   "gpt-5.2-codex",
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
@@ -164,6 +167,9 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-6-astra": 272_000,
   "gpt-6-sol": 272_000,
   "gpt-6-luna": 272_000,
+  // GPT-6.1 Sol's own catalog row also publishes a 272K default context_window
+  // (872K configurable max).
+  "gpt-6.1-sol": 272_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {

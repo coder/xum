@@ -55,7 +55,10 @@ import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
-import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
@@ -1617,11 +1620,17 @@ export class ProviderModelFactory {
         const serviceTier = ServiceTierSchema.safeParse(
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
+        const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
         const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
-          providersConfig: self.providerService.getConfig(providersConfig),
+          providersConfig: serviceTierProvidersConfig,
           openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
         });
-        if (serviceTier.success && serviceTierAvailable) {
+        if (
+          serviceTier.success &&
+          serviceTierAvailable &&
+          // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierProvidersConfig)
+        ) {
           serviceTierDefault = {
             namespace: "openai",
             option: "serviceTier",

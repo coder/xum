@@ -279,6 +279,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
+  test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    for (const id of ["openai:gpt-6.1-sol", "mux-gateway:openai/gpt-6.1-sol"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
+      expect(enforceThinkingPolicy(id, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, "max")).toBe("max");
+    }
+  });
+
   test("gpt-6-astra named variants and other GPT-6 ids fall through to the default policy", () => {
     const defaultPolicy: ThinkingLevel[] = ["off", "low", "medium", "high"];
     expect(getThinkingPolicyForModel("openai:gpt-6-astra-mini")).toEqual(defaultPolicy);

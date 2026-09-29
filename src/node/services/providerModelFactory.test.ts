@@ -1545,6 +1545,40 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+
+  it.each([
+    ["gpt-6-astra", "ultrafast"],
+    // Ultrafast is model-gated: other models drop the tier instead of sending one
+    // OpenAI rejects (and never fall back to the separately billed Fast tier).
+    ["gpt-6.1-sol", undefined],
+    ["gpt-6-sol", undefined],
+  ] as const)(
+    "sends the configured Ultrafast tier for %s only when supported",
+    async (model, tier) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            serviceTier: "ultrafast",
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(`openai:${model}`);
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+          expect(calls.length).toBe(1);
+          expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 });
 
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {

@@ -462,7 +462,8 @@ export class ProviderService {
         (serviceTier === "auto" ||
           serviceTier === "default" ||
           serviceTier === "flex" ||
-          serviceTier === "priority");
+          serviceTier === "priority" ||
+          serviceTier === "ultrafast");
       const validXAIServiceTier =
         provider === "xai" && (serviceTier === "default" || serviceTier === "priority");
       if (validOpenAIServiceTier || validXAIServiceTier) {
@@ -475,6 +476,7 @@ export class ProviderService {
         (fastModePreviousServiceTier === "auto" ||
           fastModePreviousServiceTier === "default" ||
           fastModePreviousServiceTier === "flex" ||
+          fastModePreviousServiceTier === "ultrafast" ||
           fastModePreviousServiceTier === "unset");
       const validXAIFastModePreviousTier =
         provider === "xai" &&

@@ -83,8 +83,8 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
  * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
  *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
- * - openai:gpt-6-astra → ["low", "medium", "high", "xhigh", "max"] (native max; the API
- *   rejects "none", so reasoning cannot be disabled)
+ * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
+ *   (native max; the API rejects "none", so reasoning cannot be disabled)
  * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
  * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
@@ -166,7 +166,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
-  // GPT-6 Astra cannot disable reasoning: the API rejects effort "none" with a 400
+  // GPT-6 Astra and GPT-6.1 Sol cannot disable reasoning: the API rejects effort "none"
   // and lists no "minimal", so "off" is not offered and requests for it clamp up to "low".
   if (openaiRejectsDisabledReasoning(withoutProviderNamespace)) {
     return ["low", "medium", "high", "xhigh", "max"];
