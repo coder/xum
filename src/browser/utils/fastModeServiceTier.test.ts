@@ -299,6 +299,22 @@ describe("fast mode service tier", () => {
     ).toBeNull();
   });
 
+  test("offers Anthropic Fast mode only on the official API host", () => {
+    const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const withBase = (config: Record<string, string>) =>
+      getFastModeProvider("anthropic:claude-opus-5-5", {
+        resolvedRouteProvider: "direct",
+        providersConfig: { anthropic: { ...anthropic, ...config } },
+      });
+    expect(withBase({ baseUrl: "https://api.anthropic.com" })).toBe("anthropic");
+    expect(withBase({ baseUrl: "https://api.anthropic.com/v1/" })).toBe("anthropic");
+    expect(withBase({ baseUrl: "https://llm-proxy.example.com/anthropic" })).toBeNull();
+    // Env-resolved base URLs count too, and win over an official config value.
+    expect(
+      withBase({ baseUrl: "https://api.anthropic.com", baseUrlResolved: "https://proxy.example" })
+    ).toBeNull();
+  });
+
   test("toggles Anthropic speed without touching service tiers", async () => {
     const { providers, setProviderConfig } = createWriter();
     const base = { apiKeySet: true, isEnabled: true, isConfigured: true };

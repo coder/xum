@@ -24,6 +24,14 @@ export function anthropicSupportsFastMode(modelString: string): boolean {
   return /^claude-opus-(?:4-8|5|5-5)(?:-\d{8})?$/.test(stripModelProviderPrefixes(modelString));
 }
 
+function isFirstPartyAnthropicBaseUrl(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl.trim()).hostname.toLowerCase() === "api.anthropic.com";
+  } catch {
+    return false;
+  }
+}
+
 export interface AnthropicFastModeAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
   resolvedRouteProvider?: string | null;
@@ -46,6 +54,14 @@ export function anthropicFastModeAvailable(
   if (providersConfig != null && providersConfig.anthropic == null) return false;
   // Fast mode is a beta; ZDR setups disable Anthropic beta features entirely.
   if (providersConfig?.anthropic?.disableBetaFeatures === true) return false;
+
+  // A built-in provider pointed at a proxy/compatible endpoint (config or env
+  // base URL) is not the first-party API; only the official host gets Fast.
+  const baseUrl =
+    providersConfig?.anthropic?.baseUrlResolved ?? providersConfig?.anthropic?.baseUrl;
+  if (baseUrl != null && baseUrl.trim() !== "" && !isFirstPartyAnthropicBaseUrl(baseUrl)) {
+    return false;
+  }
 
   const prefix = modelString.split(":", 1)[0];
   if (isCustomProviderConfig(providersConfig?.[prefix])) return false;

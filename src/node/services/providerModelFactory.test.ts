@@ -2690,6 +2690,11 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
     ["unsupported model", { speed: "fast" }, "anthropic:claude-opus-4-7"],
     ["ZDR beta opt-out", { speed: "fast", disableBetaFeatures: true }, "anthropic:claude-opus-5-5"],
     ["preference unset", {}, "anthropic:claude-opus-5-5"],
+    [
+      "non-first-party base URL",
+      { speed: "fast", baseUrl: "https://llm-proxy.example.com/anthropic" },
+      "anthropic:claude-opus-5-5",
+    ],
   ] as const)("omits speed for %s", async (_label, anthropicConfig, modelString) => {
     const call = await sendOnce(anthropicConfig, modelString);
     expect(parseSentBody(call)).not.toHaveProperty("speed");

@@ -5194,7 +5194,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       'Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic\'s [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector\'s **Fast mode** row, the command palette (**Toggle Fast Mode**), or its keyboard shortcut. Xum stores the preference as `"speed": "fast"` under `anthropic` in `providers.jsonc`.',
       "",
-      "Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (Xum Gateway, OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.",
+      "Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (Xum Gateway, OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.",
       "",
       "### OpenRouter Provider Routing",
       "",
