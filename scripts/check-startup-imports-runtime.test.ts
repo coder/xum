@@ -166,3 +166,24 @@ test("attributes files to the innermost package and reports each package once", 
     { packageName: "ai", file: "/app/node_modules/ai/dist/index.js" },
   ]);
 });
+
+test("an entry that routes like the CLI shim reaches desktop main as Electron's main", async () => {
+  // Mirrors src/cli/index.ts: it loads desktop main only under Electron with no
+  // subcommand; otherwise it takes its help path before module-scope import()s settle.
+  await writeFiles({
+    "main.js": [
+      'Promise.resolve().then(() => require("ai"));',
+      "const firstArgIndex = process.defaultApp ? 2 : 1;",
+      'if ("electron" in process.versions && process.argv[firstArgIndex] === undefined) {',
+      '  require("./desktop.js");',
+      "}",
+      "",
+    ].join("\n"),
+    "desktop.js": 'require("electron").app.whenReady();\n',
+  });
+  const { trigger, modules } = await loadEagerModules(path.join(rootDir, "main.js"));
+
+  expect(trigger).toBe("app.whenReady()");
+  expect(modules).toContain(path.join(rootDir, "desktop.js"));
+  expect(findBannedModules(modules, BANNED).map((m) => m.packageName)).toEqual(["ai"]);
+});

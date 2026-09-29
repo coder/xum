@@ -5,13 +5,14 @@
  *
  * The static guard cannot see a module-scope `import()` (it starts loading at startup
  * but looks lazy) or computed loaders (`require(variable)`, `createRequire()` results).
- * This loads the built dist/desktop/main.js in plain Node with a stubbed `electron`
+ * This launches the built package.json `main` (the CLI shim, which routes to desktop
+ * main) the way `electron .` does, in plain Node with a stubbed `electron`
  * (scripts/check-startup-imports-runtime.cjs), so Electron's ready event never fires,
- * and fails when a BANNED_PACKAGES package is in require.cache anyway. The module list
- * is taken when startup reaches `app.whenReady()` (or goes idle first), so it includes
- * code that runs after real I/O. It runs once per desktop platform (simulated
- * `process.platform`), because startup branches on the OS. The CLI shim and the preload
- * are covered by the static guard only (#4423 tracks running the CLI shim here too).
+ * and fails when a BANNED_PACKAGES package is in require.cache anyway, or when the load
+ * did not reach desktop main. The module list is taken when startup reaches
+ * `app.whenReady()` (or goes idle first), so it includes code that runs after real I/O.
+ * It runs once per desktop platform (simulated `process.platform`), because startup
+ * branches on the OS. The preload is covered by the static guard only.
  *
  * Limitation: only `app.getPath()` returns a real value (a path in a temp dir); other
  * Electron values are stubs, so startup code that needs e.g. a real string from another
@@ -24,7 +25,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -177,9 +178,15 @@ async function main(): Promise<number> {
   const rootDir = path.resolve(import.meta.dir, "..");
   const desktopMain = STARTUP_ENTRIES.find((e) => e.entry === "src/desktop/main.ts");
   assert(desktopMain != null, "STARTUP_ENTRIES has no src/desktop/main.ts entry");
-  const target = path.join(rootDir, desktopMain.dist);
+  // Electron launches package.json `main` (the CLI shim), not desktop main directly.
+  const { main: packageMain } = JSON.parse(
+    readFileSync(path.join(rootDir, "package.json"), "utf8")
+  ) as { main: string };
+  const entry = STARTUP_ENTRIES.find((e) => e.dist === packageMain);
+  assert(entry != null, `package.json main (${packageMain}) is not in STARTUP_ENTRIES`);
+  const target = path.join(rootDir, entry.dist);
   if (!existsSync(target)) {
-    console.error(`❌ ${desktopMain.dist} does not exist; run make build-main first`);
+    console.error(`❌ ${entry.dist} does not exist; run make build-main first`);
     return 1;
   }
 
@@ -188,24 +195,29 @@ async function main(): Promise<number> {
     const { trigger, modules } = await loadEagerModules(target, platform);
     const packages = new Set(modules.map(packageOfLoadedFile).filter((p) => p != null));
     console.log(
-      `${desktopMain.dist} (${platform}): ${modules.length} modules loaded` +
+      `${entry.dist} (${platform}): ${modules.length} modules loaded` +
         ` (${packages.size} packages) until ${trigger}`
     );
     // Startup that ends anywhere else (e.g. a swallowed error ended it early) would
     // check only part of the pre-splash path, so it fails instead of passing.
     if (trigger !== "app.whenReady()") {
-      console.error(`❌ ${desktopMain.dist} (${platform}) did not reach app.whenReady()`);
+      console.error(`❌ ${entry.dist} (${platform}) did not reach app.whenReady()`);
+      failed = true;
+    }
+    // The shim must have routed to desktop main, so this run covers everything a
+    // desktop-main-only load would (and a whenReady() call before it cannot pass).
+    if (!modules.includes(realpathSync(path.join(rootDir, desktopMain.dist)))) {
+      console.error(`❌ ${entry.dist} (${platform}) did not load ${desktopMain.dist}`);
       failed = true;
     }
     for (const { packageName, file } of findBannedModules(modules, BANNED_PACKAGES)) {
-      console.error(
-        `\n❌ ${desktopMain.dist} (${platform}) loads "${packageName}" at startup, e.g.:`
-      );
+      console.error(`\n❌ ${entry.dist} (${platform}) loads "${packageName}" at startup, e.g.:`);
       console.error(`   ${path.relative(rootDir, file)}`);
       console.error(
         "   Load it with `await import()` inside the function that needs it." +
           " `bun scripts/check-startup-imports.ts` prints the static import chain; if it" +
-          " passes, look for a module-scope import() or a computed require()."
+          " passes, look for a module-scope import() or a computed require() in" +
+          " src/cli/index.ts, src/desktop/main.ts or the modules they load."
       );
       failed = true;
     }
