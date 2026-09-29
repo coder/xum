@@ -11,7 +11,7 @@ import {
   parseExitCode,
   parsePid,
 } from "./backgroundCommands";
-import { MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 
 describe("backgroundCommands", () => {
   describe("shellQuote", () => {
@@ -37,7 +37,7 @@ describe("backgroundCommands", () => {
   });
 
   describe("buildWrapperScript", () => {
-    it("builds script with trap, cd, and user script joined by &&", () => {
+    it("builds script with trap and cd joined by &&, then the user script", () => {
       const result = buildWrapperScript({
         exitCodePath: "/tmp/exit_code",
         cwd: "/home/user/project",
@@ -45,7 +45,7 @@ describe("backgroundCommands", () => {
       });
 
       expect(result).toBe(
-        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' && { echo hello\n}`
+        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' || exit; echo hello`
       );
     });
 
@@ -143,15 +143,15 @@ describe("backgroundCommands", () => {
       it.skipIf(process.platform === "win32")(
         "a missing cwd fails the script instead of running later lines in the fallback cwd",
         async () => {
-          const result = await runWrapper(
-            'echo line1\npwd\necho "var=$XUM_TEST_VAR"',
-            path.join(root, "missing")
-          );
-          expect({
-            failed: result.status !== 0,
-            recordedFailure: result.recorded !== "0",
-            stdout: result.stdout,
-          }).toEqual({ failed: true, recordedFailure: true, stdout: "" });
+          for (const command of MISSING_CWD_COMMANDS) {
+            const result = await runWrapper(command, path.join(root, "missing"));
+            expect({
+              command,
+              failed: result.status !== 0,
+              recordedFailure: result.recorded !== "0",
+              stdout: result.stdout,
+            }).toEqual({ command, failed: true, recordedFailure: true, stdout: "" });
+          }
         }
       );
 

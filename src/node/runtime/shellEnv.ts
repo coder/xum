@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { shellQuote } from "@/common/utils/shell";
 
 const SHELL_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -33,13 +34,17 @@ export function buildShellPathExport(
 }
 
 /**
- * Groups a caller's command so all of it depends on the `cd … && export …` chain before it.
- * `&&` binds only the first line of a multi-line command; without the group, a missing cwd
- * skips line 1 and the later lines run in the shell's starting directory without the exported
- * env (#5192). With it, a failed `cd` or export fails the whole command.
- * - The newline before `}` keeps a trailing comment or a heredoc terminator from absorbing it.
- * - The command starts on the `{` line, so bash line numbers in error messages do not shift.
+ * Joins a runtime's setup steps (`cd`, exports) with the caller's command so that a failed step
+ * runs none of the command (#5192). `&&` binds only the first line of a multi-line command, so
+ * `cd <cwd> && <command>` would still run the later lines in the shell's starting directory
+ * without the exported env. `|| exit` ends the shell before any caller line runs, with the failed
+ * step's exit code.
+ * - Not a `{ <command>\n}` group: caller text can close a group early (a stray `}`) or absorb
+ *   the newline before `}` (a trailing backslash).
+ * - The command stays on the first line and is parsed line by line as before, so line numbers in
+ *   bash error messages and heredoc/syntax-error handling do not change.
  */
-export function groupShellCommand(command: string): string {
-  return `{ ${command}\n}`;
+export function buildGuardedCommand(setup: readonly string[], command: string): string {
+  assert(setup.length > 0, "buildGuardedCommand needs at least one setup step");
+  return `${setup.join(" && ")} || exit; ${command}`;
 }

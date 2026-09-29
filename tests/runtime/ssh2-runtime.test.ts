@@ -21,6 +21,7 @@ import { createSSHTransport } from "@/node/runtime/transports";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
+import { MISSING_CWD_COMMANDS } from "@/node/runtime/testRemoteRuntime";
 
 function shouldRunIntegrationTests(): boolean {
   return process.env.TEST_INTEGRATION === "1" || process.env.TEST_INTEGRATION === "true";
@@ -88,16 +89,18 @@ describeIntegration("SSH2 Transport integration tests", () => {
       const runtime = createSSH2Runtime(sshConfig!);
       await using workspace = await TestWorkspace.create(runtime, "ssh");
 
-      const result = await execBuffered(runtime, 'echo line1\npwd\necho "var=$TEST_VAR"', {
-        cwd: `${workspace.path}/missing`,
-        env: { TEST_VAR: "set" },
-        timeout: 30,
-      });
-
-      expect({ failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
-        failed: true,
-        stdout: "",
-      });
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await execBuffered(runtime, command, {
+          cwd: `${workspace.path}/missing`,
+          env: { XUM_TEST_VAR: "set" },
+          timeout: 30,
+        });
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
     });
 
     test("captures stderr separately", async () => {

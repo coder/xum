@@ -63,7 +63,7 @@ export class TestRemoteRuntime extends RemoteRuntime {
 
 /**
  * Runs the real RemoteRuntime.exec command string (`timeout -s KILL ... bash -c 'cd <cwd> &&
- * export ... && { <command>\n}'`) in a local shell. Its working directory stands in for the SSH login
+ * export ... || exit; <command>'`) in a local shell. Its working directory stands in for the SSH login
  * directory, where lines outside the cd && export chain would run.
  */
 export class ShellRemoteRuntime extends TestRemoteRuntime {
@@ -125,4 +125,14 @@ export const MULTI_LINE_COMMAND_CASES: ReadonlyArray<{
     exitCode: 3,
   },
   { name: "failing last line", command: "echo x\nfalse", stdout: "x\n", exitCode: 1 },
+  { name: "trailing backslash", command: "echo a\necho b \\", stdout: "a\nb \\\n", exitCode: 0 },
+];
+
+/**
+ * Commands that must fail and print nothing when the cwd is missing (#5192). The second has a
+ * stray `}`, which would close a `{ … }` group around the command early.
+ */
+export const MISSING_CWD_COMMANDS: readonly string[] = [
+  'echo line1\npwd\necho "var=$XUM_TEST_VAR"',
+  "echo line1\n}\npwd\n{ true",
 ];

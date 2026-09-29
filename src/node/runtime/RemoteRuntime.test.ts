@@ -8,6 +8,7 @@ import type { ExecOptions, ExecStream } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
+  MISSING_CWD_COMMANDS,
   MULTI_LINE_COMMAND_CASES,
   ShellRemoteRuntime,
   TestRemoteRuntime,
@@ -233,15 +234,18 @@ describe("RemoteRuntime.exec multi-line commands", () => {
     "a missing cwd fails the command instead of running later lines in the login directory",
     async () => {
       const runtime = new ShellRemoteRuntime(path.join(root, "login"));
-      const result = await execBuffered(runtime, 'echo line1\npwd\necho "var=$XUM_TEST_VAR"', {
-        cwd: path.join(root, "missing"),
-        env: { XUM_TEST_VAR: "set" },
-        timeout: 10,
-      });
-      expect({ failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
-        failed: true,
-        stdout: "",
-      });
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await execBuffered(runtime, command, {
+          cwd: path.join(root, "missing"),
+          env: { XUM_TEST_VAR: "set" },
+          timeout: 10,
+        });
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
     }
   );
 

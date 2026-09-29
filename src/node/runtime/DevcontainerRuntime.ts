@@ -16,7 +16,7 @@ import type {
   ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
-import { buildShellPathExport, groupShellCommand } from "./shellEnv";
+import { buildGuardedCommand, buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { isContainerUnavailableExit } from "./containerExecFailure";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
@@ -482,10 +482,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
         buildShellPathExport(key, value, (envValue) => shescape.quote(envValue))
       )
       .join(" && ");
-    // Group the command so a failed cd/export skips all of its lines (#5192).
-    const fullCommand = [`cd ${shescape.quote(cwd)}`, pathEnvPrelude, groupShellCommand(command)]
-      .filter(Boolean)
-      .join(" && ");
+    // A failed cd/export skips every line of the command (#5192).
+    const fullCommand = buildGuardedCommand(
+      [`cd ${shescape.quote(cwd)}`, pathEnvPrelude].filter(Boolean),
+      command
+    );
     args.push("--", "bash", "-c", fullCommand);
 
     const childProcess = spawnDevcontainer(args, {

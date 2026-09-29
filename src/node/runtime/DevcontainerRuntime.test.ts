@@ -6,7 +6,7 @@ import * as path from "path";
 import * as devcontainerCli from "./devcontainerCli";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
-import { MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 interface RuntimeState {
@@ -207,7 +207,7 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
       ]);
       expect(exitCode).toBe(0);
       expect(argv).toContain("exec\n--workspace-folder\n");
-      expect(argv).toContain("cd '.' && { ./.xum/archive\n}");
+      expect(argv).toContain("cd '.' || exit; ./.xum/archive");
       expect(argv).not.toContain(`cd '${binDir}'`);
     }
   );
@@ -283,11 +283,14 @@ describe("DevcontainerRuntime.exec multi-line commands", () => {
   it.skipIf(process.platform === "win32")(
     "a missing cwd fails the command instead of running later lines in the workspace folder",
     async () => {
-      const result = await run('echo line1\npwd\necho "path=$XUM_TEST_PATH"', `${binDir}/missing`);
-      expect({ failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
-        failed: true,
-        stdout: "",
-      });
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await run(command, `${binDir}/missing`);
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
     }
   );
 
