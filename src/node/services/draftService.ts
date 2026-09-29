@@ -54,8 +54,9 @@ import {
  *   (deleteProjectDrafts) and by the startup GC (collectOrphanedCreationDrafts).
  * - The creation draft list (sidebar rows, including empty drafts): `<xumRoot>/drafts/list.json`.
  *   Only `delete`, putListEntry, importLegacyList, project removal and the GC change it; clearing a
- *   draft's text never delists it. Body and list are locked separately, never nested, body first:
- *   a crash in between leaves an empty listed row, never an unlisted body.
+ *   draft's text never delists it. `delete` removes the body, then the entry, under the body lock
+ *   (the only nesting: body lock, then list lock). A crash in between leaves an empty listed row,
+ *   never an unlisted body.
  */
 const DRAFT_FILE_NAME = "draft.json";
 const CREATION_DRAFTS_DIR_NAME = "drafts";
@@ -92,8 +93,6 @@ export class DraftService extends EventEmitter {
   private readonly revisions = new Map<string, number>();
   private readonly initialRevision = Date.now();
   private listRevision = this.initialRevision;
-  /** Cached list.json entries; null until the first read. */
-  private listEntries: DraftListEntry[] | null = null;
   /**
    * Metadata (text + attachment metadata, no payloads) of every draft, so bulk hydration does not
    * re-read multi-MB files. Filled lazily by the first list(); writes keep it current.
@@ -112,14 +111,13 @@ export class DraftService extends EventEmitter {
     this.listFile = path.join(this.creationRoot, LIST_FILE_NAME);
   }
 
-  /** The creation draft list. */
+  /**
+   * The creation draft list, read from disk every time: it is small, and a sibling backend on the
+   * same root may have changed it (no lock: writes are atomic renames).
+   */
   async getList(): Promise<DraftList> {
-    if (this.listEntries === null) {
-      // No lock: writes are atomic renames. A mutation that finished meanwhile cached newer data.
-      const { entries } = await this.readListFile();
-      this.listEntries ??= entries;
-    }
-    return { entries: this.listEntries, revision: this.listRevision };
+    const { entries } = await this.readListFile();
+    return { entries, revision: this.listRevision };
   }
 
   /**
@@ -130,11 +128,11 @@ export class DraftService extends EventEmitter {
   async putListEntry(entry: DraftListEntry): Promise<{ revision: number }> {
     assert(DRAFT_ID_PATTERN.test(entry.draftId), "putListEntry requires a valid draftId");
     const scope: CreationScope = { kind: "creation", ...entry };
-    if (entry.draftId === DEFAULT_CREATION_DRAFT_ID || !(await this.hasOwner(scope))) {
-      return { revision: this.listRevision };
-    }
+    if (entry.draftId === DEFAULT_CREATION_DRAFT_ID) return { revision: this.listRevision };
     return {
-      revision: await this.mutateList((entries) => {
+      revision: await this.mutateList(async (entries) => {
+        // Under the list lock, so a project removal's cleanup cannot run in between.
+        if (!(await this.hasOwner(scope))) return null;
         const index = entries.findIndex((listed) => isSameListEntry(listed, entry));
         if (index === -1) return [...entries, entry];
         if (entries[index].subProjectPath === entry.subProjectPath) return null;
@@ -153,20 +151,24 @@ export class DraftService extends EventEmitter {
    * leaving their bodies unreachable. Returns the list revision.
    */
   async importLegacyList(legacy: DraftListEntry[]): Promise<{ revision: number }> {
-    const configured = this.configuredProjectDirNames();
-    const owned = legacy.filter(
-      (entry) =>
-        entry.draftId !== DEFAULT_CREATION_DRAFT_ID &&
-        (entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
-          configured.has(projectDraftsDirName(entry.projectPath)))
-    );
     return {
-      revision: await this.mutateList(async (entries, exists) => {
+      revision: await this.mutateList((entries, exists) => {
+        // Under the list lock, so a project removal's cleanup cannot run in between.
+        const configured = this.configuredProjectDirNames();
         const next = [...entries];
-        for (const entry of owned) {
-          if (!next.some((listed) => isSameListEntry(listed, entry))) next.push(entry);
+        for (const entry of legacy) {
+          const owned =
+            entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+            configured.has(projectDraftsDirName(entry.projectPath));
+          if (
+            owned &&
+            entry.draftId !== DEFAULT_CREATION_DRAFT_ID &&
+            !next.some((listed) => isSameListEntry(listed, entry))
+          ) {
+            next.push(entry);
+          }
         }
-        if (!exists) next.push(...(await this.findUnlistedCreationDrafts(next)));
+        // The first import always writes, so the orphaned bodies get listed (see mutateList).
         return exists && next.length === entries.length ? null : next;
       }),
     };
@@ -234,16 +236,18 @@ export class DraftService extends EventEmitter {
    */
   async delete(scope: DraftScope): Promise<{ revision: number }> {
     const filePath = this.filePathFor(scope);
-    const result = await this.withWriteLock(scope, async () => ({
-      revision: await this.persist(scope, filePath, createEmptyDraft()),
-    }));
-    if (scope.kind === "creation") {
-      await this.mutateList((entries) => {
-        const next = entries.filter((listed) => !isSameListEntry(listed, scope));
-        return next.length === entries.length ? null : next;
-      });
-    }
-    return result;
+    return this.withWriteLock(scope, async () => {
+      const revision = await this.persist(scope, filePath, createEmptyDraft());
+      // Delisted under the body lock too (body lock, then list lock; nothing takes them in the
+      // other order), so no write can recreate the body between the two steps.
+      if (scope.kind === "creation") {
+        await this.mutateList((entries) => {
+          const next = entries.filter((listed) => !isSameListEntry(listed, scope));
+          return next.length === entries.length ? null : next;
+        });
+      }
+      return { revision };
+    });
   }
 
   /**
@@ -351,7 +355,16 @@ export class DraftService extends EventEmitter {
 
   /** The event a new subscription starts with. */
   async getSnapshotEvent(): Promise<Extract<DraftEvent, { type: "snapshot" }>> {
-    return { type: "snapshot", drafts: await this.list(), list: await this.getList() };
+    let list: DraftList;
+    try {
+      list = await this.getList();
+    } catch (error) {
+      // An unreadable list file (EACCES, EISDIR...) must not block every draft body: the list
+      // shows empty until it is readable again (writes to it keep failing and are retried).
+      log.warn("Failed to read the creation draft list", { error });
+      list = { entries: [], revision: this.listRevision };
+    }
+    return { type: "snapshot", drafts: await this.list(), list };
   }
 
   private getRevision(key: string): number {
@@ -484,9 +497,10 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Missing list.json: empty and not existing. Unparseable: treated as missing too (with a
-   * warning), so the next legacy import can rebuild it from the draft bodies. Malformed entries are
-   * dropped. Other read failures throw, so a write never replaces a list it could not read.
+   * Missing list.json: empty and not existing. Unparseable, a malformed structure or dropped
+   * malformed entries: the valid entries, treated as not existing (with a warning), so the next
+   * write relists the bodies of lost rows (see mutateList). Other read failures throw, so a write
+   * never replaces a list it could not read.
    */
   private async readListFile(): Promise<{ entries: DraftListEntry[]; exists: boolean }> {
     let raw: unknown;
@@ -504,12 +518,16 @@ export class DraftService extends EventEmitter {
       const parsed = DraftListEntrySchema.safeParse(rawEntry);
       if (parsed.success) entries.push(parsed.data);
     }
-    return { entries, exists: true };
+    const intact = Array.isArray(rawEntries) && entries.length === rawEntries.length;
+    if (!intact) log.warn(`Rebuilding malformed creation draft list ${this.listFile}`);
+    return { entries, exists: intact };
   }
 
   /**
-   * Read-modify-write list.json under its own lock (never nested in a draft body lock). `change`
-   * returns the new entries, or null for no change. Returns the (new) list revision.
+   * Read-modify-write list.json under its own lock (taken inside a body lock only by `delete`,
+   * never the other way round). `change` returns the new entries, or null for no change. The first
+   * write of a missing or damaged list also lists every non-empty creation body without an entry.
+   * Returns the (new) list revision.
    */
   private mutateList(
     change: (
@@ -519,17 +537,16 @@ export class DraftService extends EventEmitter {
   ): Promise<number> {
     return withTargetMutationLock(this.config.rootDir, this.listFile, async () => {
       const { entries, exists } = await this.readListFile();
-      const next = await change(entries, exists);
-      if (next === null) {
-        this.listEntries = entries;
-        return this.listRevision;
-      }
+      const changed = await change(entries, exists);
+      if (changed === null) return this.listRevision;
+      const next = exists
+        ? changed
+        : [...changed, ...(await this.findUnlistedCreationDrafts(changed))];
       await fs.mkdir(this.creationRoot, { recursive: true });
       await writeFileAtomic(
         this.listFile,
         JSON.stringify({ version: LIST_FILE_VERSION, entries: next })
       );
-      this.listEntries = next;
       this.listRevision++;
       const event: DraftEvent = { type: "list", entries: next, revision: this.listRevision };
       this.emit(DraftService.CHANGE_EVENT, event);

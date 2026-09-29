@@ -570,3 +570,43 @@ describe("DraftService creation draft list", () => {
     expect(await service.getSnapshotEvent()).toMatchObject({ list: { revision } });
   });
 });
+
+describe("DraftService creation draft list self-healing", () => {
+  it("sees list changes made by another backend on the same root", async () => {
+    using tempDir = new TestTempDir("drafts-list-foreign");
+    const { config, projectPath } = await createHarness(tempDir);
+    const first = new DraftService(config);
+    expect((await first.getList()).entries).toEqual([]);
+    const entry = { projectPath, draftId: "draft-b", subProjectPath: null, createdAt: 1 };
+    await new DraftService(config).putListEntry(entry);
+    expect((await first.getSnapshotEvent()).list.entries).toEqual([entry]);
+  });
+
+  it("relists the bodies of rows a malformed list file lost on its next write", async () => {
+    using tempDir = new TestTempDir("drafts-list-malformed");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.writeFile(listFile, JSON.stringify({ version: 1, entries: [{ draftId: 7 }] }));
+
+    await service.putListEntry({ projectPath, draftId: "new", subProjectPath: null, createdAt: 1 });
+    expect((await service.getList()).entries.map(({ draftId }) => draftId).sort()).toEqual([
+      "lost",
+      "new",
+    ]);
+  });
+
+  it("still hydrates draft bodies when the list file cannot be read", async () => {
+    using tempDir = new TestTempDir("drafts-list-unreadable");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: WORKSPACE_SCOPE, text: "body" });
+    // A directory where the list file belongs: reads fail with EISDIR.
+    await fs.mkdir(path.join(config.rootDir, "drafts", "list.json"), { recursive: true });
+
+    const snapshot = await new DraftService(config).getSnapshotEvent();
+    expect(snapshot.drafts.map(({ text }) => text)).toEqual(["body"]);
+    expect(snapshot.list.entries).toEqual([]);
+  });
+});
