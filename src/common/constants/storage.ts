@@ -972,6 +972,8 @@ export const EXPANDED_TASK_GROUPS_KEY = "expandedTaskGroups";
 export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 512;
 /** auto-expand:{workspaceId}: the per-tool map keeps the most recently toggled tools that fit. */
 export const AUTO_EXPAND_PREFS_MAX_CHARS = 512;
+/** autoRoutingChoiceByAgent:{workspaceId}: one entry per agent ever chosen; the owner keeps the newest. */
+export const AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS = 384;
 /** reviewSearchState:{workspaceId}: longer searches still work but are not restored on reload. */
 export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
 /**
@@ -1109,7 +1111,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getModelKey, "ui", true, 128),
   workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
-  workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, 384),
+  workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only; lastGeneratedFor is capped at WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS.

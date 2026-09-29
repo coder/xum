@@ -9,7 +9,8 @@
  */
 
 /**
- * Drop the oldest entries until the record serializes to at most `maxChars`. Insertion order is
+ * Drop the oldest entries until the record serializes to at most `maxChars` (entries too large to
+ * fit on their own are skipped). Insertion order is
  * the age order, except that JavaScript lists integer-like keys first; those are dropped first,
  * which still bounds the value.
  */
@@ -19,18 +20,20 @@ export function trimRecordToChars<T>(
 ): Record<string, T> {
   const entries = Object.entries(record);
   let total = 2; // "{}"
-  let kept = 0;
+  const kept: Array<[string, T]> = [];
   for (let index = entries.length - 1; index >= 0; index--) {
     const [key, value] = entries[index];
     const valueChars = JSON.stringify(value)?.length ?? 0;
-    const entryChars = JSON.stringify(key).length + 1 + valueChars + (kept > 0 ? 1 : 0);
+    const bareChars = JSON.stringify(key).length + 1 + valueChars;
+    // An entry that cannot fit even alone (e.g. one very long path) is skipped; stopping here would
+    // drop every older entry and persist an empty value.
+    if (2 + bareChars > maxChars) continue;
+    const entryChars = bareChars + (kept.length > 0 ? 1 : 0);
     if (total + entryChars > maxChars) break;
     total += entryChars;
-    kept++;
+    kept.push(entries[index]);
   }
-  return kept === entries.length
-    ? record
-    : Object.fromEntries(entries.slice(entries.length - kept));
+  return kept.length === entries.length ? record : Object.fromEntries(kept.reverse());
 }
 
 /**

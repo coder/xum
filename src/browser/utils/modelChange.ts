@@ -1,4 +1,5 @@
 import {
+  AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
@@ -16,6 +17,7 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -133,7 +135,14 @@ export function recordAutoRoutingChoiceForAgent(
     getAutoRoutingChoiceByAgentKey(workspaceId),
     (prev) => {
       const record: AutoRoutingChoiceByAgent = prev && typeof prev === "object" ? prev : {};
-      return { ...record, [agentId]: { ...record[agentId], ...choice } };
+      // One entry per agent ever chosen: keep the most recently chosen agents inside the key
+      // budget so the newest choices always persist (an over-budget value would not survive reload).
+      return withRecordEntry(
+        record,
+        agentId,
+        { ...record[agentId], ...choice },
+        AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS
+      );
     },
     {}
   );

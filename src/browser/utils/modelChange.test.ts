@@ -5,10 +5,12 @@ import { GlobalWindow } from "happy-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   consumeWorkspaceModelChange,
+  recordAutoRoutingChoiceForAgent,
   setAutoRoutingChoice,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
 import {
+  AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
@@ -139,5 +141,23 @@ describe("modelChange", () => {
 
     // A persisted rewrite to the passthrough alias must still consume the entry.
     expect(consumeWorkspaceModelChange(workspaceId, gatewayAlias)).toBe("user");
+  });
+
+  // Choices accumulate one entry per agent. Past the key budget the value would only live in
+  // memory, so after a reload the newest explicit choices would be lost.
+  test("keeps the newest per-agent routing choices on disk as agents accumulate", () => {
+    const workspaceId = nextWorkspaceId();
+    const agentIds = Array.from({ length: 12 }, (_, index) =>
+      `custom-agent-${index}`.padEnd(64, "x")
+    );
+    for (const agentId of agentIds) {
+      recordAutoRoutingChoiceForAgent(workspaceId, agentId, { model: true, thinkingLevel: false });
+    }
+
+    const stored = localStorage.getItem(getAutoRoutingChoiceByAgentKey(workspaceId))!;
+    expect(stored.length).toBeLessThanOrEqual(AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS);
+    expect(JSON.parse(stored)).toMatchObject({
+      [agentIds[agentIds.length - 1]]: { model: true, thinkingLevel: false },
+    });
   });
 });

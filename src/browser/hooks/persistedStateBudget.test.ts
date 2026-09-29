@@ -119,8 +119,9 @@ function modelledKeys(entry: PersistedKeyRegistration): string[] {
     case "experiment":
       return experimentKeys.filter((key) => key.startsWith(entry.key));
     default:
-      // LRU caches key their entries by workspace id.
-      return workspaceIds.slice(0, entry.instances).map((id) => entry.key + id);
+      // LRU caches key their entries by workspace id; model every entry maxEntries allows, which
+      // can be more than WORKSPACE_COUNT (session costs outlive deleted workspaces).
+      return Array.from({ length: entry.instances }, (_, index) => entry.key + workspaceId(index));
   }
 }
 

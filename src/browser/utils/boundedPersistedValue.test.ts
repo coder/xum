@@ -26,6 +26,12 @@ describe("bounded persisted values", () => {
     }
   });
 
+  test("trimRecordToChars skips an entry too large to fit alone instead of dropping the rest", () => {
+    const withHugeNewest = { ...record, [`/repo/${"deep/".repeat(200)}`]: true };
+    const trimmed = trimRecordToChars(withHugeNewest, 257);
+    expect(Object.keys(trimmed)).toEqual(Object.keys(trimRecordToChars(record, 257)));
+  });
+
   test("withRecordEntry makes the updated key the newest and removes it for undefined", () => {
     const first = Object.keys(record)[0];
     const updated = withRecordEntry(record, first, true, 10_000);
