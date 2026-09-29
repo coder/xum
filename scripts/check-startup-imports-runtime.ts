@@ -114,6 +114,12 @@ export async function loadEagerModules(requestedTarget: string): Promise<string[
   }
 }
 
+/** Owning package of a loaded file, or null for files outside node_modules. */
+function packageOfLoadedFile(file: string): string | null {
+  const normalized = file.split(path.sep).join("/");
+  return normalized.includes("/node_modules/") ? packageNameOfFile(normalized) : null;
+}
+
 /** Banned packages among loaded files, one example file per package, sorted by name. */
 export function findBannedModules(
   modules: readonly string[],
@@ -121,10 +127,10 @@ export function findBannedModules(
 ): BannedModule[] {
   const found = new Map<string, string>();
   for (const file of modules) {
-    const normalized = file.split(path.sep).join("/");
-    if (!normalized.includes("/node_modules/")) continue;
-    const packageName = packageNameOfFile(normalized);
-    if (!isBannedPackage(packageName, banned) || found.has(packageName)) continue;
+    const packageName = packageOfLoadedFile(file);
+    if (packageName == null || !isBannedPackage(packageName, banned) || found.has(packageName)) {
+      continue;
+    }
     found.set(packageName, file);
   }
   return [...found]
@@ -143,12 +149,7 @@ async function main(): Promise<number> {
   }
 
   const modules = await loadEagerModules(target);
-  const packages = new Set(
-    modules
-      .map((file) => file.split(path.sep).join("/"))
-      .filter((file) => file.includes("/node_modules/"))
-      .map(packageNameOfFile)
-  );
+  const packages = new Set(modules.map(packageOfLoadedFile).filter((p) => p != null));
   console.log(`${desktopMain.dist}: ${modules.length} modules loaded (${packages.size} packages)`);
 
   const violations = findBannedModules(modules, BANNED_PACKAGES);
