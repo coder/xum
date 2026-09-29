@@ -61,7 +61,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
-  stripOpenAIReasoningReplay,
+  stripReasoningReplay,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
 import {
@@ -610,6 +610,11 @@ const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+
 // "The encrypted content [for item rs_…] <blob> could not be verified. Reason: …"
 const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
   /encrypted content\b[\s\S]*?\bcould not be verified/;
+// Anthropic rejecting a replayed thinking signature, e.g. Opus 5.5 binding the
+// block to a system prompt or tool list that has since changed (hot memories
+// and the memory index live there). Routes without the drop_block control
+// (Coder gateway, custom providers) otherwise fail every retry identically.
+const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
 
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
 // arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
@@ -619,6 +624,16 @@ function isOpenAIResponsesModel(model: LanguageModel): boolean {
   return (
     model.provider === "openai.responses" ||
     (model.provider === "gateway" && model.modelId.startsWith("openai/"))
+  );
+}
+
+// Same idea for the Anthropic Messages wire, whose converter replays thinking
+// from the `anthropic` providerOptions namespace on every route.
+function isAnthropicMessagesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  return (
+    model.provider === "anthropic.messages" ||
+    (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
   );
 }
 
@@ -829,7 +844,7 @@ interface WorkspaceStreamInfo {
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
-  // Same for a step-boundary retry without OpenAI reasoning replay.
+  // Same for a step-boundary retry without rejected reasoning replay.
   didRetryReasoningReplayAtStep?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
@@ -4935,7 +4950,7 @@ export class StreamManager {
               didRetryPreviousResponseId = true;
               retried = true;
             } else if (
-              await this.retryStreamWithoutOpenAIReasoningReplay(
+              await this.retryStreamWithoutReasoningReplay(
                 workspaceId,
                 streamInfo,
                 error,
@@ -5074,11 +5089,11 @@ export class StreamManager {
     let errorType = this.categorizeError(actualError);
 
     // A matching rejection that reaches failure handling is final: the one-shot
-    // repair (retryStreamWithoutOpenAIReasoningReplay) already ran, or was
+    // repair (retryStreamWithoutReasoningReplay) already ran, or was
     // unsafe/no-op. Its generic `api` class is auto-retryable, and every outer
     // retry would resend the same rejected input, so classify it terminal.
     // Only this exact shape is reclassified; a later 503/401/429 keeps its own.
-    if (this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+    if (this.getReasoningReplayRejection(error, streamInfo.request.model) != null) {
       errorType = "reasoning_rejected";
     }
 
@@ -5458,13 +5473,29 @@ export class StreamManager {
   // These deterministic rejections survive encrypted-only replay: cross-org
   // blobs and same-turn reasoning references from a flapping route. Keep the
   // match narrow so unrelated provider errors retain their normal retry policy.
-  private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
+  // Returns the providerOptions namespace whose replayed reasoning was rejected.
+  private getReasoningReplayRejection(
+    error: unknown,
+    model: LanguageModel
+  ): "openai" | "anthropic" | null {
     // The SDK can exhaust its own retries on a synthetic stream-error 500.
     // Classify only the final cause; earlier failures must not taint a later one.
     if (RetryError.isInstance(error)) {
       error = error.lastError;
     }
     const statusCode = this.extractStatusCode(error);
+    // Gateways can drop the structured code and forward only the message.
+    const texts = [
+      APICallError.isInstance(error) ? error.responseBody : undefined,
+      error instanceof Error ? error.message : undefined,
+    ];
+    const mentions = (pattern: RegExp) =>
+      texts.some((text) => typeof text === "string" && pattern.test(text));
+    if (isAnthropicMessagesModel(model)) {
+      return statusCode === 400 && mentions(ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN)
+        ? "anthropic"
+        : null;
+    }
     // WebSocket/SSE validation errors have no HTTP failure status. The SDK
     // assigns 500 to code-less frames, including missing reasoning references.
     const isStreamError =
@@ -5476,31 +5507,22 @@ export class StreamManager {
         "type" in error.data &&
         (error.data.type === "error" || error.data.type === "response.failed"));
     if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
-      return false;
+      return null;
     }
     if (!isOpenAIResponsesModel(model)) {
-      return false;
+      return null;
     }
-    if (this.extractErrorCode(error) === "invalid_encrypted_content") {
-      return true;
-    }
-    // Gateways can drop the structured code and forward only the message.
-    const texts = [
-      APICallError.isInstance(error) ? error.responseBody : undefined,
-      error instanceof Error ? error.message : undefined,
-    ];
-    return texts.some(
-      (text) =>
-        typeof text === "string" &&
-        (OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN.test(text) ||
-          OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN.test(text))
-    );
+    return this.extractErrorCode(error) === "invalid_encrypted_content" ||
+      mentions(OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
+      mentions(OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
+      ? "openai"
+      : null;
   }
 
   // Mirror previousResponseId recovery without repeating emitted output or
   // completed tools. The repair budget belongs to this attempt, so a manual
   // continuation may try again after the user changes route or credentials.
-  private async retryStreamWithoutOpenAIReasoningReplay(
+  private async retryStreamWithoutReasoningReplay(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     error: unknown,
@@ -5520,7 +5542,8 @@ export class StreamManager {
       return false;
     }
 
-    if (!this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+    const rejectedNamespace = this.getReasoningReplayRejection(error, streamInfo.request.model);
+    if (rejectedNamespace == null) {
       return false;
     }
 
@@ -5531,7 +5554,9 @@ export class StreamManager {
       return false;
     }
     const sourceMessages = stepMessages ?? streamInfo.request.messages;
-    const messages = stripOpenAIReasoningReplay(sourceMessages);
+    // Strip every block of the namespace, not just the one the error names:
+    // removing one changes the prefix later blocks were bound to.
+    const messages = stripReasoningReplay(sourceMessages, rejectedNamespace);
     if (messages === sourceMessages) {
       return false;
     }
@@ -5546,9 +5571,10 @@ export class StreamManager {
       streamInfo.didRetryReasoningReplayAtStep = true;
     }
 
-    workspaceLog.info("Retrying stream without OpenAI reasoning replay", {
+    workspaceLog.info("Retrying stream without rejected reasoning replay", {
       messageId: streamInfo.messageId,
       model: streamInfo.model,
+      rejectedNamespace,
       retryScope: hasParts ? "step" : "stream",
       errorCode,
       statusCode,

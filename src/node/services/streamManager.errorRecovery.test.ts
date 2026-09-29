@@ -8,6 +8,7 @@ import {
   type LanguageModel,
   type ModelMessage,
 } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
@@ -1012,4 +1013,171 @@ describe("StreamManager - stream error classification", () => {
       expect(await errorTypeForStreamFailure(categorizeCase.error)).toBe(categorizeCase.expected);
     });
   }
+});
+
+describe("StreamManager - Anthropic thinking signature recovery", () => {
+  // Verbatim shape from an Opus 5.5 route without the drop_block control, after
+  // a memory write changed the system prompt and tool list between turns.
+  const bindingRejectionBody = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. The `system` prompt and the `tools` list both differ from when this block was created.',
+    },
+  });
+  const successEvents = [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "repaired" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+    { type: "message_stop" },
+  ];
+
+  /** A real Anthropic Messages model whose HTTP responses are scripted; request bodies are captured. */
+  function scriptedAnthropicModel(responses: Array<() => Response>) {
+    const requestBlockTypes: string[][] = [];
+    const model = createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        (_url: unknown, init?: { body?: unknown }) => {
+          const body = JSON.parse(String(init?.body)) as {
+            messages: Array<{ content: Array<{ type: string }> }>;
+          };
+          requestBlockTypes.push(
+            body.messages.flatMap((message) => message.content.map((block) => block.type))
+          );
+          const next = responses.shift();
+          if (!next) throw new Error(`Unexpected Anthropic request ${requestBlockTypes.length}`);
+          return Promise.resolve(next());
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    })("claude-opus-5-5");
+    return { model, requestBlockTypes };
+  }
+  const rejection = () =>
+    new Response(bindingRejectionBody, {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  const success = () =>
+    new Response(successEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  /** Forwards the request StreamManager built to the real SDK, so the wire shape is real. */
+  const realSdkAttempt: Attempt = async function* (options) {
+    const result = aiSdk.streamText({
+      model: options.model,
+      ...(options.messages != null ? { messages: options.messages } : { prompt: "continue" }),
+      maxRetries: 0,
+    });
+    yield* result.fullStream;
+  };
+
+  const staleThinking = {
+    type: "reasoning" as const,
+    text: "earlier thinking",
+    providerOptions: { anthropic: { signature: "sig-bound-to-old-prefix" } },
+  };
+  const toolCall = {
+    type: "tool-call" as const,
+    toolCallId: "toolu_1",
+    toolName: "bash",
+    input: { script: "pwd" },
+  };
+  const messages = (): ModelMessage[] => [
+    { role: "user", content: "earlier" },
+    { role: "assistant", content: [staleThinking, toolCall] },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "toolu_1",
+          toolName: "bash",
+          output: { type: "text", value: "/tmp" },
+        },
+      ],
+    },
+    { role: "user", content: "now" },
+  ];
+  test("strips replayed thinking once and keeps the tool loop", async () => {
+    const harness = createRecoveryHarness();
+    const { model, requestBlockTypes } = scriptedAnthropicModel([rejection, success]);
+
+    const { calls } = await harness.run({
+      workspaceId: "anthropic-binding-repair",
+      model,
+      modelString: "coder:claude-aws-us-east-2/claude-opus-5-5",
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(requestBlockTypes[0]).toContain("thinking");
+    expect(requestBlockTypes[1]).not.toContain("thinking");
+    expect(requestBlockTypes[1]).toContain("tool_use");
+    expect(requestBlockTypes[1]).toContain("tool_result");
+    expect(harness.errors()).toEqual([]);
+    expect(harness.streamEnds()).toHaveLength(1);
+  });
+
+  test("a repeated rejection is terminal instead of retrying forever", async () => {
+    const workspaceId = "anthropic-binding-repeat";
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([rejection, rejection]);
+
+    const { calls, messageId } = await harness.run({
+      workspaceId,
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]).toMatchObject({ messageId, errorType: "reasoning_rejected" });
+    expect((await historyService.readPartial(workspaceId))?.metadata?.errorType).toBe(
+      "reasoning_rejected"
+    );
+  });
+
+  test("leaves an unrelated Anthropic 400 to ordinary error handling", async () => {
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([
+      () =>
+        new Response(
+          JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: "tool_use ids must be unique" },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } }
+        ),
+    ]);
+
+    const { calls } = await harness.run({
+      workspaceId: "anthropic-binding-unrelated",
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
+  });
 });

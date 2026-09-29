@@ -79,7 +79,7 @@ export const StreamErrorTypeSchema = z.enum([
   "max_output_tokens", // Provider truncated the response at max_tokens (finishReason: "length")
   "model_refusal", // Provider declined to answer (refusal/content-filter); retrying the same request will refuse again
   "agent_resolution", // Strict explicit-agent contract failure (agent missing/hidden/disabled/provenance changed); deterministic, retrying reproduces it
-  "reasoning_rejected", // OpenAI Responses rejected replayed reasoning (unresolvable rs_ item / unverifiable encrypted_content) after the in-stream repair; deterministic
+  "reasoning_rejected", // Provider rejected replayed reasoning (OpenAI rs_ item / encrypted_content, Anthropic thinking signature) after the in-stream repair; deterministic
   "unknown", // Catch-all
 ]);
 

@@ -7,7 +7,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
-  stripOpenAIReasoningReplay,
+  stripReasoningReplay,
 } from "./reasoningProviderOptions";
 
 describe("reasoningProviderOptionsFromMetadata", () => {
@@ -264,7 +264,7 @@ describe("attachReasoningReplayMetadata", () => {
   });
 });
 
-describe("stripOpenAIReasoningReplay", () => {
+describe("stripReasoningReplay", () => {
   // Persisted history replay (encrypted content only, bridged by
   // attachReasoningReplayMetadata) and same-turn SDK step messages (itemId +
   // encrypted content copied from providerMetadata) are both OpenAI replay.
@@ -316,7 +316,7 @@ describe("stripOpenAIReasoningReplay", () => {
     ];
     const snapshot = structuredClone(input);
 
-    const stripped = stripOpenAIReasoningReplay(input);
+    const stripped = stripReasoningReplay(input, "openai");
 
     expect(stripped).toEqual([
       { role: "user", content: "earlier" },
@@ -341,7 +341,7 @@ describe("stripOpenAIReasoningReplay", () => {
     const alreadyEmpty: AssistantModelMessage = { role: "assistant", content: [] };
     const input: ModelMessage[] = [stringAssistant, otherProviders, alreadyEmpty];
 
-    const stripped = stripOpenAIReasoningReplay(input);
+    const stripped = stripReasoningReplay(input, "openai");
 
     expect(stripped).toBe(input);
     expect(stripped[1]).toBe(otherProviders);
@@ -352,11 +352,39 @@ describe("stripOpenAIReasoningReplay", () => {
       { role: "user", content: "question" },
       { role: "assistant", content: [historyReasoning] },
       { role: "user", content: "follow-up" },
+      { role: "assistant", content: [historyReasoning, { type: "text", text: "\n\n" }] },
+      { role: "user", content: "last" },
     ];
 
-    expect(stripOpenAIReasoningReplay(input)).toEqual([
+    expect(stripReasoningReplay(input, "openai")).toEqual([
       { role: "user", content: "question" },
       { role: "user", content: "follow-up" },
+      { role: "user", content: "last" },
+    ]);
+  });
+
+  test("the anthropic namespace removes signed and redacted thinking but keeps OpenAI reasoning", () => {
+    const redactedReasoning = {
+      type: "reasoning" as const,
+      text: "",
+      providerOptions: { anthropic: { redactedData: "opaque" } },
+    };
+    const input: ModelMessage[] = [
+      { role: "user", content: "earlier" },
+      {
+        role: "assistant",
+        content: [
+          anthropicReasoning,
+          redactedReasoning,
+          historyReasoning,
+          { type: "text", text: "kept" },
+        ],
+      },
+    ];
+
+    expect(stripReasoningReplay(input, "anthropic")).toEqual([
+      { role: "user", content: "earlier" },
+      { role: "assistant", content: [historyReasoning, { type: "text", text: "kept" }] },
     ]);
   });
 });

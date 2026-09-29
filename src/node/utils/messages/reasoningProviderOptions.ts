@@ -193,12 +193,16 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
 }
 
 /**
- * Remove rejected OpenAI reasoning from a request, not persisted history.
+ * Remove one provider's rejected reasoning from a request, not persisted history.
  * SDK step messages also carry this namespace. Keep visible text, tools, and
- * other-provider reasoning; drop only assistants emptied by this repair.
+ * other-provider reasoning; drop only assistants this repair leaves without
+ * content (Anthropic rejects whitespace-only text blocks).
  * Preserve input identities on no-op so the caller can decline a useless retry.
  */
-export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessage[] {
+export function stripReasoningReplay(
+  messages: ModelMessage[],
+  namespace: "openai" | "anthropic"
+): ModelMessage[] {
   let changed = false;
   const stripped: ModelMessage[] = [];
   for (const message of messages) {
@@ -207,14 +211,14 @@ export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessa
       continue;
     }
     const content = message.content.filter(
-      (part) => !(part.type === "reasoning" && part.providerOptions?.openai != null)
+      (part) => !(part.type === "reasoning" && part.providerOptions?.[namespace] != null)
     );
     if (content.length === message.content.length) {
       stripped.push(message);
       continue;
     }
     changed = true;
-    if (content.length > 0) {
+    if (content.some((part) => part.type !== "text" || part.text.trim().length > 0)) {
       stripped.push({ ...message, content });
     }
   }
