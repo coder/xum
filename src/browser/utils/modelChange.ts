@@ -135,10 +135,12 @@ export function recordAutoRoutingChoiceForAgent(
     getAutoRoutingChoiceByAgentKey(workspaceId),
     (prev) => {
       const record: AutoRoutingChoiceByAgent = prev && typeof prev === "object" ? prev : {};
+      const choices: Record<string, Partial<Record<AutoRoutingDimension, boolean>>> = {};
+      for (const [id, value] of Object.entries(record)) if (value) choices[id] = value;
       // One entry per agent ever chosen: keep the most recently chosen agents inside the key
       // budget so the newest choices always persist (an over-budget value would not survive reload).
       return withRecordEntry(
-        record,
+        choices,
         agentId,
         { ...record[agentId], ...choice },
         AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS
