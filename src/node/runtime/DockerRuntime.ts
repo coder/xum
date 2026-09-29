@@ -1237,7 +1237,8 @@ export class DockerRuntime extends RemoteRuntime {
       // counts every other branch.
       try {
         const snapshotCmd = `cd ${CONTAINER_SRC_DIR} && ${buildSourceRefSnapshotCommand(gitNoHooksPrefix(params.trusted))}`;
-        await runDockerCommand(`exec ${destContainerName} sh -c ${shescape.quote(snapshotCmd)}`, 30000);
+        // Array args: the pipeline must reach the container's shell, not the host's (cmd.exe on Windows).
+        await runContainerSpawnCommand(["exec", destContainerName, "sh", "-c", snapshotCmd], 30000);
       } catch {
         // Ignore - best-effort
       }

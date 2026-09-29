@@ -67,10 +67,11 @@ export const SOURCE_REF_SNAPSHOT_NAMESPACE = "refs/xum/source-snapshot/";
 export function buildSourceRefSnapshotCommand(gitPrefix = ""): string {
   const ns = SOURCE_REF_SNAPSHOT_NAMESPACE;
   // A fork of a copy inherits the parent's snapshot, which describes the parent's source, not the
-  // parent: clear it before recording the copy's own refs.
+  // parent: clear it before recording the copy's own refs. Only update-ref needs the prefix: it runs
+  // the reference-transaction hook, while for-each-ref runs no repository automation.
   return (
-    `${gitPrefix}git for-each-ref '--format=delete %(refname)' ${ns} | ${gitPrefix}git update-ref --stdin && ` +
-    `${gitPrefix}git for-each-ref '--format=update ${ns}%(refname) %(objectname)' refs/heads/ refs/remotes/ refs/stash | ${gitPrefix}git update-ref --stdin`
+    `git for-each-ref '--format=delete %(refname)' ${ns} | ${gitPrefix}git update-ref --stdin && ` +
+    `git for-each-ref '--format=update ${ns}%(refname) %(objectname)' refs/heads/ refs/remotes/ refs/stash | ${gitPrefix}git update-ref --stdin`
   );
 }
 
