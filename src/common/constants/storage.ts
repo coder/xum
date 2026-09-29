@@ -1114,7 +1114,7 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // whose value grows with user input (paths, ids, URLs, free text, per-item maps) bounds it where
 // it is produced (trim, cap the entry count, or persist a reference such as an id instead of an
 // embedded copy), and the budget derives from that bound. Data that has no natural bound belongs on
-// the backend, as drafts and the creation draft list do. The session-only fallback for an
+// the backend, as composer drafts do (DraftService). The session-only fallback for an
 // over-budget value is a safety net for bugs, not a supported path: a value that can legitimately
 // exceed its budget is a bug in its owner. Known instances are tracked in #5237.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
