@@ -7,7 +7,7 @@ import {
   sanitizeInline,
   type PlaywrightResults,
   type ReportInput,
-} from "./perfReport";
+} from "./perfReportCore";
 
 const SPEC = "/home/runner/work/xum/xum/tests/e2e/scenarios/perf.chatTyping.spec.ts";
 const TITLE = "perf: type in composer with large chat history";

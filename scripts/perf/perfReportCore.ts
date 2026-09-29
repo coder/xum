@@ -8,9 +8,10 @@
  * attempt wrote no usable summary, the row shows "unavailable". An earlier attempt's numbers are
  * never used instead, because the final attempt is the one that decided the run.
  *
- * Pure logic only; `scripts/perf/perfReport.ts` does the file I/O. This lives under `src/` because
- * CI lints, typechecks and unit-tests only `src/**`, and it has no imports, so the CLI runs with
- * plain Bun and no `bun install` (no project dependency code runs in the report job).
+ * Pure logic only; the CLI next to it (`perfReport.ts`) does the file I/O. CI runs every test file
+ * under `scripts/` as a tooling test and typechecks it (with this module) via
+ * `tsconfig.tooling.json`. Keep it free of imports (type-only ones aside): the report job runs the
+ * CLI with plain Bun and no `bun install`, so no project dependency code runs there.
  */
 
 export type MetricId =

@@ -3,9 +3,9 @@
  * Nightly perf report for `.github/workflows/perf-profiles.yml` (job `perf-report`).
  *
  * Reads this run's perf artifact and writes per-test outcomes and scenario metrics to
- * $GITHUB_STEP_SUMMARY (stdout when unset). The logic lives in src/common/utils/perfReport.ts,
- * where CI lints and tests it; keep this file to I/O. It makes no GitHub API calls and uses only
- * Bun/Node built-ins, so it needs no token and no `bun install`.
+ * $GITHUB_STEP_SUMMARY (stdout when unset). The logic lives in perfReportCore.ts next to this file,
+ * where perfReport.test.ts tests it; keep this file to I/O. It makes no GitHub API calls and uses
+ * only Bun/Node built-ins, so it needs no token and no `bun install`.
  *
  * Local replay of a past run:
  *   gh run download <id> -R coder/xum -n perf-artifacts-<id> -D /tmp/perf-<id>
@@ -22,7 +22,7 @@ import {
   renderSummary,
   type PlaywrightResults,
   type ScenarioRead,
-} from "../../src/common/utils/perfReport";
+} from "./perfReportCore";
 
 function readJson(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8")) as unknown;
