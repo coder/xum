@@ -109,4 +109,45 @@ describe("Completing an edit of an older message", () => {
       await app.dispose();
     }
   }, 120_000);
+
+  test("restores the draft once when a /compact edit is cancelled before it is accepted", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-compact-cancel-keeps-draft" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const editTextarea = await startEditWithUnsentDraft(app, scope);
+
+      // Hold the compaction request so the edit can be cancelled while it is pending.
+      const workspaceService = app.env.services.workspaceService;
+      const realSend = workspaceService.sendMessage.bind(workspaceService);
+      let releaseSend: () => void = () => undefined;
+      const sendGate = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
+      const sendSpy = jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementation(async (...args: Parameters<typeof realSend>) => {
+          await sendGate;
+          return realSend(...args);
+        });
+
+      getDraftStore().setText(scope, "/compact -t 500");
+      await waitFor(() => expect(editTextarea.value).toBe("/compact -t 500"));
+      fireEvent.keyDown(editTextarea, { key: "Enter" });
+      await waitFor(() => expect(sendSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+
+      // Cancel restores the draft; the late acceptance must not restore it a second time.
+      fireEvent.keyDown(editTextarea, { key: "Escape" });
+      // The composer stays disabled while the command runs: read the draft itself.
+      await waitFor(
+        () => expect(getDraftStore().getText(scope)).toBe("unsent draft"),
+        LOAD_TOLERANT_WAIT
+      );
+      releaseSend();
+      await app.chat.expectStreamComplete(60_000);
+      await expectUnsentDraftKept(app, scope);
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
 });
