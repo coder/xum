@@ -4,7 +4,6 @@ import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
-import { resolveCoderSSHHost } from "@/constants/coder";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
@@ -128,7 +127,11 @@ import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
-import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
+import {
+  getPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanDirectory,
+} from "@/common/utils/planStorage";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
@@ -508,42 +511,6 @@ export const STARTUP_RECOVERY_CONCURRENCY = 8;
  */
 export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
   "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
-
-/**
- * Where a runtime keeps its plan files: the local home for local and worktree runtimes, the home
- * on the SSH endpoint the runtime connects to. Docker and devcontainer plans live inside their own
- * container and are never shared (undefined).
- */
-function planStorageOf(
-  runtimeConfig: RuntimeConfig
-): { kind: "local" } | { kind: "ssh"; host: string; port?: number } | undefined {
-  if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
-  if (!isSSHRuntime(runtimeConfig)) return { kind: "local" };
-  // The endpoint runtimeFactory connects to (#5043): a Coder workspace's host is a placeholder,
-  // and its SSH host is derived from the Coder workspace name.
-  return {
-    kind: "ssh",
-    host: resolveCoderSSHHost(runtimeConfig.host, runtimeConfig.coder?.workspaceName),
-    port: runtimeConfig.port,
-  };
-}
-
-/**
- * Whether two workspaces may keep their plans in the same place, for "does another workspace use
- * this plan path". It errs towards sharing, which keeps a plan: an unset SSH port is whatever the
- * SSH config says, so it may be the other workspace's port.
- */
-export function sharesPlanStorage(a: RuntimeConfig, b: RuntimeConfig): boolean {
-  const storageA = planStorageOf(a);
-  const storageB = planStorageOf(b);
-  if (storageA === undefined || storageB === undefined) return false;
-  if (storageA.kind === "local" || storageB.kind === "local")
-    return storageA.kind === storageB.kind;
-  return (
-    storageA.host === storageB.host &&
-    (storageA.port === undefined || storageB.port === undefined || storageA.port === storageB.port)
-  );
-}
 
 /** Labels are free text; the About dialog shows them verbatim, so they are cut here. */
 const MAX_RESTART_BLOCKER_LABEL_CHARS = 40;
@@ -8195,8 +8162,7 @@ export class WorkspaceService
         (other) =>
           other.id !== workspaceId &&
           other.name === metadata.name &&
-          other.projectName === metadata.projectName &&
-          sharesPlanStorage(runtimeConfig, other.runtimeConfig)
+          sharesPlanDirectory(other, metadata)
       );
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {

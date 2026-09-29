@@ -3,7 +3,7 @@ import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getLegacyPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -14,7 +14,7 @@ import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { WorkspaceRemoveResultSchema } from "@/common/orpc/schemas/workspace";
 import type { ORPCContext } from "@/node/orpc/context";
 import { removeWorkspace } from "./workspaceOperations";
-import { sharesPlanStorage, type WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import {
   createWorkspaceServiceHarness,
   withTempMuxRoot,
