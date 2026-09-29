@@ -602,7 +602,9 @@ describe("delegated target default consent (#4453)", () => {
     const a = await crashBeforeRecord();
     const b = await backend();
     // A stalled mount: building probed metadata never finishes.
-    spyOn(b.config, "getAllWorkspaceMetadata").mockImplementation(() => new Promise(() => undefined));
+    spyOn(b.config, "getAllWorkspaceMetadata").mockImplementation(
+      () => new Promise(() => undefined)
+    );
 
     await b.manager.resolveOrphanedDelegatedTargets();
 

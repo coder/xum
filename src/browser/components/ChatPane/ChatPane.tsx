@@ -1657,6 +1657,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     // composer surface is replaced with a single read-only notice.
                     <>
                       {turnStatus}
+                      {/* A failed cleanup can leave a flagged row whose checkout is gone (#4983). */}
+                      {meta?.delegatedCreationInterrupted === true && (
+                        <DelegatedCreationInterruptedBanner
+                          workspaceId={workspaceId}
+                          workspaceName={workspaceName}
+                        />
+                      )}
                       <TranscriptOnlyNoticePane
                         workspaceId={workspaceId}
                         heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}

@@ -505,9 +505,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           section: section.workspaces,
           run: async () => {
             if (!p.api) return;
-            await p.api.workspace.keepInterruptedDelegatedWorkspace({
+            const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
               workspaceId: selected.workspaceId,
             });
+            if (!result.success) {
+              showCommandFeedbackToast({
+                type: "error",
+                title: "Could not keep the workspace",
+                message: result.error,
+              });
+            }
           },
         });
       }

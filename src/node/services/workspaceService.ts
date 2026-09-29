@@ -8864,8 +8864,10 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
-    // The resolver runs after the UI connected: publish the flag so its banner shows now.
-    if (flagged) await this.emitDelegatedCreationMetadata(workspaceId);
+    // The resolver runs after the UI connected: publish the flag so its banner shows now. Detached
+    // (tracked for shutdown like deferred cleanup): building metadata probes every checkout, and
+    // one stalled mount must not hold up the startup pass that flags (#4983).
+    if (flagged) this.deferWorkspaceCleanup(() => this.emitDelegatedCreationMetadata(workspaceId));
     return flagged;
   }
 
