@@ -155,6 +155,7 @@ export const DelegatedCreationInterruptedBanner: React.FC<{
         name: props.workspaceName,
         runtimeConfig: meta?.runtimeConfig,
         projects: meta?.projects,
+        kind: meta?.kind,
       }}
       confirm={confirm}
       removeWorkspace={(workspaceId) => removeWorkspace(workspaceId)}

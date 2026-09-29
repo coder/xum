@@ -494,6 +494,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 name: branchName,
                 runtimeConfig: selectedMeta?.runtimeConfig,
                 projects: selectedMeta?.projects,
+                kind: selectedMeta?.kind,
               })
             );
             if (ok) await p.onRemoveWorkspace(selected.workspaceId);
@@ -739,6 +740,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 name: branchName,
                 runtimeConfig: meta?.runtimeConfig,
                 projects: meta?.projects,
+                kind: meta?.kind,
               })
             );
             if (ok) {

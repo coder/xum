@@ -27,6 +27,7 @@ describe("getWorkspaceRemovalKind (#5204)", () => {
     ["Coder workspace Xum created", createdCoder, "coder"],
     ["existing Coder workspace", existingCoder, "ssh"],
     ["Coder config without a workspace name", { ...ssh, coder: {} }, "ssh"],
+    ["Coder config with an empty workspace name", { ...ssh, coder: { workspaceName: "" } }, "ssh"],
     ["Docker", { type: "docker", image: "node:22" }, "docker"],
     ["devcontainer", { type: "devcontainer", configPath: ".devcontainer.json" }, "devcontainer"],
   ];
@@ -35,6 +36,20 @@ describe("getWorkspaceRemovalKind (#5204)", () => {
       expect(getWorkspaceRemovalKind({ name: "feature", runtimeConfig })).toBe(kind);
     });
   }
+
+  test("a runtime type from a newer Xum still gets a confirmation instead of throwing", () => {
+    // Config publishes such workspaces with incompatibleRuntime; the type is outside the schema.
+    const futureRuntime = JSON.parse('{"type":"future-runtime"}') as RuntimeConfig;
+    expect(getWorkspaceRemovalKind({ name: "feature", runtimeConfig: futureRuntime })).toBe(
+      "unknown"
+    );
+  });
+
+  test("a scratch chat is classified by its kind, not its local runtime", () => {
+    expect(
+      getWorkspaceRemovalKind({ name: "chat", runtimeConfig: { type: "local" }, kind: "scratch" })
+    ).toBe("scratch");
+  });
 
   test("several projects win over the runtime type", () => {
     expect(
@@ -64,6 +79,7 @@ describe("removeWorkspaceConfirmOptions names the runtime's resource", () => {
       describeRemoval({ type: "docker", image: "node:22" }),
       describeRemoval({ type: "devcontainer", configPath: ".devcontainer.json" }),
       removeWorkspaceConfirmOptions("Remove?", { name: "feature", projects: [1, 2] }).description,
+      removeWorkspaceConfirmOptions("Remove?", { name: "feature", kind: "scratch" }).description,
     ];
     expect(new Set(descriptions).size).toBe(descriptions.length);
   });
