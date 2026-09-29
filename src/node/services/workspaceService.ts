@@ -8864,10 +8864,9 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
-    // The resolver runs after the UI connected: publish the flag so its banner shows now. Detached
-    // (tracked for shutdown like deferred cleanup): building metadata probes every checkout, and
-    // one stalled mount must not hold up the startup pass that flags (#4983).
-    if (flagged) this.deferWorkspaceCleanup(() => this.emitDelegatedCreationMetadata(workspaceId));
+    // Not published here: building metadata probes every checkout, and a stalled mount must not
+    // hold up the startup pass (#4983). The flag reaches the UI with the next metadata load (the
+    // renderer's initial list, usually); #5189 tracks changes made after that load.
     return flagged;
   }
 
@@ -8893,20 +8892,18 @@ export class WorkspaceService
     } catch (error) {
       return Err(`Failed to keep workspace: ${getErrorMessage(error)}`);
     }
-    if (kept) await this.emitDelegatedCreationMetadata(workspaceId);
-    return Ok(undefined);
-  }
-
-  /** Best effort: the change is durable, and the next metadata refresh shows it anyway. */
-  private async emitDelegatedCreationMetadata(workspaceId: string): Promise<void> {
-    try {
-      await this.emitCurrentWorkspaceMetadata(workspaceId);
-    } catch (error) {
-      log.warn("Failed to publish a delegated creation flag change", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
+    if (kept) {
+      try {
+        await this.emitCurrentWorkspaceMetadata(workspaceId);
+      } catch (error) {
+        // The mark is gone either way; the next metadata load shows it.
+        log.warn("Failed to publish a kept delegated workspace", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
     }
+    return Ok(undefined);
   }
 
   async setHeartbeatSettings(
