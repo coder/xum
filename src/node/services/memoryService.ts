@@ -24,7 +24,6 @@ import * as path from "node:path";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
@@ -865,19 +864,6 @@ export function extractMemoryDescription(content: string): string {
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
-
-/** The conventional context-notes file, kept visible even when a scope exceeds its file cap. */
-const CONTEXT_NOTES = parseMemoryPath(CONTEXT_NOTES_MEMORY_PATH);
-assert(
-  CONTEXT_NOTES.scope !== null && CONTEXT_NOTES.relPath !== "",
-  "context notes must be a file inside a memory scope"
-);
-
-/** One pinned-file mutation for {@link MemoryService.writePinnedFile}. */
-export type PinnedFileMutation =
-  | { command: "create"; fileText: string }
-  | { command: "str_replace"; oldStr: string; newStr: string }
-  | { command: "insert"; insertLine: number; insertText: string };
 
 export class MemoryService extends EventEmitter {
   /**
@@ -3278,91 +3264,6 @@ export class MemoryService extends EventEmitter {
    * mutation lock is taken (the state can change between staging and apply,
    * where the real command re-validates authoritatively).
    */
-  /**
-   * Preservation-turn write for one pinned file (the context-budget final flush). The agent
-   * gets a single call, so the mutation must not fail on an existence verdict that went stale
-   * between the prompt and the call (Memory UI or another session creating/deleting the file).
-   * Under the target mutation lock: `create` replaces an existing file (even one that is no longer
-   * readable as a memory file), `str_replace`/`insert` create a missing file from their payload,
-   * the per-scope file cap does not apply, and the actual result is capped at `maxFileBytes`
-   * (which must not exceed the ordinary cap).
-   */
-  async writePinnedFile(
-    ctx: MemoryScopeContext,
-    virtualPath: string,
-    mutation: PinnedFileMutation,
-    maxFileBytes: number,
-    actor: MemoryActor,
-    toolCallId?: string,
-    abortSignal?: AbortSignal
-  ): Promise<MemoryCommandResult> {
-    return this.runCommand(ctx, async () => {
-      const parsed = parseMemoryPath(virtualPath);
-      const scope = this.requireFilePath(parsed, virtualPath);
-      if (mutation.command === "str_replace" && mutation.oldStr.length === 0) {
-        throw new MemoryCommandError("old_str must not be empty");
-      }
-      const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
-        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
-        await store.ensureRoot();
-        const kind = await store.kind(parsed.relPath);
-        if (kind === "dir") {
-          throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
-        }
-        // The notes slot is exempt from MEMORY_MAX_FILES_PER_SCOPE: the pinned turn cannot delete
-        // anything to make room, and a full scope must not waste the single preservation step.
-        let current: string | null = null;
-        // Inverse for the journal; a malformed existing file (over the ordinary cap, NUL bytes)
-        // keeps whatever bounded text prefix could be read.
-        let previous: string | null = null;
-        if (kind !== null) {
-          try {
-            current = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
-            previous = current;
-          } catch (error) {
-            // Only `create` replaces without reading; edits need the real contents.
-            if (mutation.command !== "create") throw error;
-            previous = await store.readFilePrefix(parsed.relPath, MEMORY_MAX_FILE_BYTES);
-          }
-        }
-        const updated =
-          mutation.command === "create"
-            ? mutation.fileText
-            : mutation.command === "str_replace"
-              ? current === null
-                ? mutation.newStr
-                : computeStrReplaceUpdate(current, mutation.oldStr, mutation.newStr, virtualPath)
-              : computeInsertUpdate(
-                  current ?? "",
-                  current === null ? 0 : mutation.insertLine,
-                  mutation.insertText
-                ).updated;
-        assertWithinFileSizeCap(updated, maxFileBytes);
-        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
-        await store.writeFile(parsed.relPath, updated);
-        const physicalPath = store.physicalPath(parsed.relPath);
-        // Row is written before the write is acknowledged (mutation → row → ack).
-        await this.journalRefinement(
-          ctx,
-          { op: mutation.command, path: toVirtualPath(scope, parsed.relPath) },
-          previous === null
-            ? { op: "delete-files", paths: [physicalPath] }
-            : { op: "restore-files", files: [{ path: physicalPath, content: previous }] },
-          actor,
-          toolCallId,
-          [{ path: physicalPath, content: updated }]
-        );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-        this.emitChange(ctx, scope, parsed.relPath, actor);
-        return {
-          success: true as const,
-          output: `${previous === null ? "Created" : "Edited"} ${toVirtualPath(scope, parsed.relPath)}`,
-        };
-      });
-    });
-  }
-
   async validateMutation(
     ctx: MemoryScopeContext,
     command:
@@ -3781,23 +3682,9 @@ export class MemoryService extends EventEmitter {
         if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
           // Files can be edited outside MemoryService; honor the cap at
           // enumeration so a degenerate directory cannot force thousands of
-          // per-file reads on stream startup. The context-notes slot is exempt
-          // from the cap on write (writePinnedFile), so it must survive the cut
-          // too or the flush handoff would vanish from the next window's index.
+          // per-file reads on stream startup.
           log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          // The bounded walk may have stopped before reaching the notes: probe them
-          // directly. lstat (not store.kind, which follows symlinks) so the probe
-          // admits exactly what the walk's dirent filter would: a regular file. A
-          // symlinked notes slot must not smuggle an out-of-root file into the index.
-          const keepNotes =
-            scope === CONTEXT_NOTES.scope &&
-            (await fsPromises
-              .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
-              .then((stat) => stat.isFile())
-              .catch(() => false));
-          files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
-          if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
-            files.push(CONTEXT_NOTES.relPath);
+          files.length = MEMORY_MAX_FILES_PER_SCOPE;
         }
         for (const relPath of files) {
           // Filenames are attacker-controlled: only index paths the memory tool
@@ -3846,7 +3733,6 @@ export class MemoryService extends EventEmitter {
     options: {
       countTokens: (text: string) => Promise<number>;
       tokenBudgetActive?: boolean;
-      onlyContextNotes?: boolean;
     }
   ): Promise<MemoryHotSetItem[]> {
     // The session scope is an agent's rollover checkpoint: it reads it on demand after a
@@ -3867,7 +3753,6 @@ export class MemoryService extends EventEmitter {
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
-      onlyContextNotes: options.onlyContextNotes,
       readFile: async (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);

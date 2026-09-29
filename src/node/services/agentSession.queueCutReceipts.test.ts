@@ -32,7 +32,6 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
-    memoryWritable: true,
     ...overrides,
   };
 }
@@ -195,7 +194,6 @@ describe("AgentSession queue-cut receipts", () => {
       expect(entryId).toBeDefined();
       expect(outcome).toEqual({ decision: fixture.decision, continuationEntryId: entryId });
       expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("pending");
-      // New windows never create a flush pair; the unused key must not invent a successor.
       const unusedKey =
         fixture.dedupeKey === CONTEXT_WARNING_DEDUPE_KEY
           ? CONTEXT_CONTINUE_DEDUPE_KEY
@@ -205,7 +203,6 @@ describe("AgentSession queue-cut receipts", () => {
       h.settleStream(0);
       await h.secondRequest;
       expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("streaming");
-      expect(h.requests[1].muxMetadata?.contextBudgetFlush).not.toBe(true);
       expect(await h.requests[1].onStepSettled!(step(5_000))).toEqual({ decision: "continue" });
     } finally {
       await teardown(h);

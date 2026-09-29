@@ -238,7 +238,6 @@ describe("StreamManager - stopWhen configuration", () => {
         onStepSettled,
         modelString: "anthropic:claude-sonnet-4-5",
         tools: { session_history: sessionHistory },
-        contextBudgetMemoryWritable: true,
       });
       const providerMetadata = { anthropic: { cacheCreationInputTokens: 20 } };
       expect(
@@ -268,7 +267,6 @@ describe("StreamManager - stopWhen configuration", () => {
         usage: { inputTokens: 90, outputTokens: 10, cachedInputTokens: 40, reasoningTokens: 3 },
         providerMetadata,
         sessionHistoryAvailable: true,
-        memoryWritable: true,
       });
       expect(settled.toolResultChars).toBeGreaterThan(40_000);
       expect(settled.newContextRequested).toBe(false);

@@ -27,7 +27,7 @@ Two machine-authored prompts, each at most once per window, ask the agent to wri
 
 Work after the request is ordinary work: it runs with the agent's normal toolset, permissions, costs, goal caps, queued user input, and Stop. Xum queues no extra turn to extract a `new_context` call; if the agent finishes with text only, the next real message re-evaluates usage and may carry the request. Ignoring the request forces nothing before the usable limit.
 
-New windows no longer offer a **final flush**. Rows of that kind already persisted in older histories (**Context window ending: notes flush**) still resume as before: one bounded, memory-only provider step, then the window seals.
+New windows no longer offer a **final flush**. A pending flush turn persisted by an older build now resumes as an ordinary continuation: normal toolset and permissions, no one-step limit. The usable-limit rollover still seals the window later.
 
 The prompts report usage against the usable limit (the point where Xum forces a rollover), not the model's full context window. Advisories are best-effort: they are sent only while the request still has headroom under Xum's counting estimates, and the final request preflight remains authoritative.
 

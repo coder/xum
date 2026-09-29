@@ -213,11 +213,6 @@ export interface ToolConfiguration {
   memoryAccess?: MemoryScopeAccess;
   /** Memory scopes the tool serves (see resolveMemoryScopes); defaults to no session scope. */
   memoryScopes?: readonly MemoryScope[];
-  /**
-   * When set, every mutating memory command is limited to this exact virtual path
-   * (context-budget flush turns may only write the workspace context notes).
-   */
-  memoryWritePath?: string;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /**

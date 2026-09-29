@@ -586,35 +586,6 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
-  test("a final-flush stream-end is deferred even without a queued continuation", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
-    const event: StreamEndEvent = {
-      type: "stream-end",
-      workspaceId: "childworkspace",
-      messageId: "msg_flush",
-      metadata: {
-        model: "anthropic:claude-opus-4-6",
-        agentId: "exec",
-        finishReason: "tool-calls",
-        muxMetadata: {
-          ...workspaceTurnMuxMetadata(parentId),
-          contextBudgetContinuation: true,
-          contextBudgetFlush: true,
-        },
-      },
-      parts: [],
-    };
-    // Nothing is queued (e.g. the user cleared the queue mid-flush): the housekeeping finish still
-    // must not settle the delegated task.
-    expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
-    expect(
-      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
-    ).toMatchObject({
-      status: "running",
-      deferredMessageIds: ["msg_flush"],
-    });
-  });
-
   test("workspace-turn deferred marker does not rewrite terminal handles", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     const interruptResult = await taskService.interruptWorkspaceTurn(parentId, "wst_handle");

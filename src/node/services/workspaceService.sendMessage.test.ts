@@ -2015,61 +2015,6 @@ describe("WorkspaceService streaming generation guard", () => {
       expect.objectContaining({ generation: 1, hasTodos: false })
     );
   });
-
-  test.each([true, false])(
-    "stream-end recency follows the hidden token-budget flush flag (flush=%s)",
-    async (flush) => {
-      const workspaceId = "ws-flush-stream-completion";
-      const stopped = createDeferred<void>();
-      const setStreaming = mock(
-        (
-          _workspaceId: string,
-          streaming: boolean,
-          update: ExtensionMetadataStreamingUpdate = {}
-        ) => {
-          if (!streaming) stopped.resolve();
-          return Promise.resolve({
-            recency: Date.now(),
-            streaming,
-            lastModel: update.model ?? null,
-            lastThinkingLevel: update.thinkingLevel ?? null,
-            hasTodos: update.hasTodos,
-            agentStatus: null,
-          });
-        }
-      );
-
-      readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
-
-      spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-      const updateRecency = spyRecency();
-
-      emitAiEvent("stream-start", {
-        workspaceId,
-        messageId: "flush-answer",
-        model: "anthropic:claude-opus-5",
-      });
-      emitAiEvent("stream-end", {
-        workspaceId,
-        messageId: "flush-answer",
-        parts: [],
-        metadata: {
-          model: "anthropic:claude-opus-5",
-          muxMetadata: flush ? { type: "normal", contextBudgetFlush: true } : { type: "normal" },
-        },
-      });
-      await stopped.promise;
-
-      // A hidden flush is maintenance: streaming still stops, but recency (which drives
-      // unread state and background completion notifications) must not advance.
-      expect(updateRecency).toHaveBeenCalledTimes(flush ? 0 : 1);
-      expect(setStreaming).toHaveBeenCalledWith(
-        workspaceId,
-        false,
-        expect.objectContaining({ generation: 1 })
-      );
-    }
-  );
 });
 
 describe("WorkspaceService post-compaction metadata refresh", () => {

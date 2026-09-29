@@ -287,7 +287,6 @@ export interface SettledStepBudget {
    */
   nextRequestTokens?: number;
   sessionHistoryAvailable: boolean;
-  memoryWritable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
   newContextRequested?: boolean;
 }
@@ -296,8 +295,8 @@ export type ContextBudgetStepDecision = "continue" | "warn" | "rollover" | "bloc
 
 /**
  * Budget verdict for a settled step. `continuationEntryId` is the exact queue entry the session
- * designated to continue the turn when it decided to stop (its enqueued "Continue"/flush, or the
- * paired rollover behind a flush turn); absent when the stop hands over to nothing in particular.
+ * designated to continue the turn when it decided to stop (its enqueued "Continue"); absent when
+ * the stop hands over to nothing in particular.
  */
 export interface SettledStepOutcome {
   decision: ContextBudgetStepDecision;
@@ -322,7 +321,6 @@ interface StreamRequestOptions {
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
@@ -442,7 +440,6 @@ interface StreamRequestConfig {
   /** Optional hook for callers that need the live prepared step transcript. */
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   toolPolicy?: ToolPolicy;
   /**
@@ -480,7 +477,6 @@ interface StreamRequestConfig {
  * verbatim would leak provider-specific options/messages across providers).
  */
 interface PreparedModelFallback {
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
@@ -500,12 +496,6 @@ interface PreparedModelFallback {
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   thinkingLevel?: string;
-  /**
-   * Output cap for the fallback attempt when it must differ from the source request's (the
-   * context-budget flush sizes its cap for each model's own thinking level). Otherwise the
-   * original cap carries over.
-   */
-  maxOutputTokens?: number;
   /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
   /**
@@ -2477,7 +2467,6 @@ export class StreamManager {
       onChunk,
       onStepMessages,
       onStepSettled,
-      contextBudgetMemoryWritable,
       contextBudgetLimit,
       toolSearchState,
       onToolExecutionStart,
@@ -2533,7 +2522,6 @@ export class StreamManager {
       onChunk,
       onStepMessages,
       onStepSettled,
-      contextBudgetMemoryWritable,
       contextBudgetLimit,
       toolPolicy,
       toolSearchState,
@@ -2554,7 +2542,6 @@ export class StreamManager {
       | "onStepSettled"
       | "modelString"
       | "tools"
-      | "contextBudgetMemoryWritable"
       | "budgetMetadataModel"
       | "contextBudgetLimit"
       | "system"
@@ -2663,7 +2650,6 @@ export class StreamManager {
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
-            memoryWritable: request.contextBudgetMemoryWritable === true,
             newContextRequested: step.toolResults.some(
               (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
             ),
@@ -3932,7 +3918,7 @@ export class StreamManager {
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
-      maxOutputTokens: prepared.data.maxOutputTokens ?? fallbackState.original.maxOutputTokens,
+      maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
@@ -3941,7 +3927,6 @@ export class StreamManager {
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
       onStepSettled: streamInfo.request.onStepSettled,
-      contextBudgetMemoryWritable: prepared.data.contextBudgetMemoryWritable,
       contextBudgetLimit: prepared.data.contextBudgetLimit,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.

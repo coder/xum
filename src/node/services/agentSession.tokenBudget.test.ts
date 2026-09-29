@@ -9,7 +9,7 @@ import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -20,11 +20,9 @@ import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
@@ -38,11 +36,7 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
-import {
-  createContextBudgetWarning,
-  createRolloverPrefix,
-  type ContextWindowRollover,
-} from "./contextWindowRollover";
+import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
 import * as rolloverMessages from "./contextWindowRollover";
 import * as contextLimits from "@/common/utils/compaction/contextLimit";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -79,8 +73,6 @@ function budgetOf(h: AgentSessionHarness) {
     contextBudgetGeneration: number;
     contextBudgetWarningClaimed: boolean;
     contextBudgetHandoffClaimed: boolean;
-    contextBudgetFlushClaimed: boolean;
-    contextBudgetHistoryAvailable: boolean;
   };
 }
 
@@ -95,7 +87,6 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
-    memoryWritable: true,
     ...overrides,
   };
 }
@@ -171,43 +162,6 @@ async function seedHistory(h: AgentSessionHarness, inputTokens: number, toolResu
       contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
     }),
     last,
-  ]);
-  expect(result.success).toBe(true);
-}
-
-const LEGACY_FLUSH_TRIGGER = "Flush context notes now.";
-
-/**
- * Rows an older build left behind after offering its final pre-rollover flush: the durable final
- * warning plus the hidden trigger it dispatched (old context precedes them). New windows never
- * write these; recovery must still finish them as one bounded step that seals the window.
- */
-async function seedLegacyFlushTurn(
-  h: AgentSessionHarness,
-  metadata?: Pick<MuxMetadata, "muxMetadata" | "kind" | "goalId">
-) {
-  await seedHistory(h, 110_000);
-  const result = await h.historyService.appendManyToHistory(workspaceId, [
-    createContextBudgetWarning({
-      contextTokens: 110_010,
-      maxTokens: 128_000,
-      // Older builds budgeted the slider's force band, not the usable ceiling.
-      budgetTokens: 96_000,
-      memoryWritable: true,
-      sessionHistoryAvailable: true,
-      final: true,
-    }),
-    createMuxMessage("legacy-flush-trigger", "user", LEGACY_FLUSH_TRIGGER, {
-      synthetic: true,
-      uiVisible: false,
-      retrySendOptions: { model, agentId: "exec", agentInitiated: true },
-      ...metadata,
-      muxMetadata: {
-        ...(metadata?.muxMetadata ?? { type: "normal" }),
-        contextBudgetContinuation: true,
-        contextBudgetFlush: true,
-      },
-    }),
   ]);
   expect(result.success).toBe(true);
 }
@@ -368,7 +322,6 @@ describe("AgentSession token-budget lifecycle", () => {
     await seedHistory(h, 20_000);
     const state = budgetOf(h);
     state.contextBudgetWarningClaimed = true;
-    state.contextBudgetFlushClaimed = true;
     const generation = state.contextBudgetGeneration;
     expect(
       (
@@ -381,7 +334,6 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(true);
     expect(state.contextBudgetGeneration).toBeGreaterThan(generation);
     expect(state.contextBudgetWarningClaimed).toBe(false);
-    expect(state.contextBudgetFlushClaimed).toBe(false);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].onStepSettled).toBeUndefined();
     h.completions[0].settle({
@@ -2011,7 +1963,6 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test.each([
     ["at the hard ceiling", step(127_000), false],
-    ["with read-only memory", step(120_000, { memoryWritable: false }), false],
     ["without session_history", step(120_000, { sessionHistoryAvailable: false }), false],
   ])(
     "settled rollover %s seals without a flush and preserves continuation correlation",
@@ -2303,7 +2254,6 @@ describe("AgentSession token-budget lifecycle", () => {
         (
           await h.requests[0].onStepSettled?.(
             step(90_000, {
-              memoryWritable: previousEnabled,
               sessionHistoryAvailable: previousEnabled,
             })
           )
@@ -2672,341 +2622,6 @@ describe("AgentSession token-budget lifecycle", () => {
       autoModelRouting: record,
       additionalSystemContext: "",
     });
-  });
-
-  // Older builds offered a hidden notes-flush step before sealing a window. New windows never
-  // write those rows; the durable ones already on disk must still finish as one bounded step.
-  test("a resumed legacy flush stays one bounded step, then seals the window", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first, { muxMetadata: correlation });
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const sendOptions = { ...options, maxOutputTokens: 300, thinkingLevel: "high" as const };
-    expect((await h.session.resumeStream(sendOptions)).success).toBe(true);
-    // The sealing intent is restored up front; the flush itself runs memory-only at the lowest
-    // thinking with the bounded cap, whatever the caller configured.
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    expect(h.requests[0].thinkingLevel).toBe("off");
-    expect(h.requests[0].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-    expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
-    // Bounded to one step although the resumed step crosses nothing; its memory-only toolset
-    // reports session_history as unavailable, which must not queue a second flush either.
-    const outcome = await h.requests[0].onStepSettled!(
-      step(50_000, { sessionHistoryAvailable: false })
-    );
-    expect(outcome.decision).toBe("rollover");
-    expect(outcome.continuationEntryId).toBeDefined();
-    // Legacy flush recovery must still identify the paired rollover as its exact successor.
-    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("pending");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    h.settleStream(0);
-    await h.waitForRequest(2);
-    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("streaming");
-    const rows = await allRows(h);
-    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    expect(warningRows(rows)).toHaveLength(1);
-    const [reset] = rolloverRows(rows);
-    // The reset keeps the budget the legacy row promised, not the current ceiling.
-    expect(reset.metadata?.muxMetadata).toMatchObject({
-      reason: "mid-stream",
-      flushOpportunity: true,
-      budgetTokens: 96_000,
-    });
-    expect(rows.at(-1)?.metadata).toMatchObject({
-      synthetic: true,
-      retrySendOptions: { agentInitiated: true },
-      muxMetadata: { ...correlation, contextBudgetContinuation: true },
-    });
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].thinkingLevel).toBe("high");
-    expect(h.requests[1].maxOutputTokens).toBe(300);
-    // Neither the trigger text nor its flag reaches the fresh window, and the legacy claim does
-    // not suppress the fresh window's own advisories.
-    expect(
-      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some(
-        (row) =>
-          text(row) === LEGACY_FLUSH_TRIGGER ||
-          row.metadata?.muxMetadata?.contextBudgetFlush === true
-      )
-    ).toBe(false);
-    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-  });
-
-  test("a persisted legacy flush resumed with token-budget mode disabled stays bounded to one step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const disabled = { ...options, experiments: { tokenBudget: false } };
-    expect((await h.session.resumeStream(disabled)).success).toBe(true);
-    // The hidden trigger keeps its memory-only ceiling and a pinned middleware chain, but nothing
-    // restores the promised reset.
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    // The settled-step callback still ends the turn after its single step.
-    expect((await h.requests[0].onStepSettled?.(step(50_000)))?.decision).toBe("rollover");
-    h.settleStream(0, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(1);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    // Re-enabling the mode later cannot seal the window with the stale legacy intent.
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-  });
-
-  test("a persisted legacy flush resumed with the mode disabled runs tool-less when no chain can be pinned", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect(
-        (await h.session.resumeStream({ ...options, experiments: { tokenBudget: false } })).success
-      ).toBe(true);
-      expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-      expect(h.requests[0].requestAssemblySnapshot).toBeUndefined();
-      expect(applyToolPolicyToNames(["memory"], h.requests[0].toolPolicy)).toEqual([]);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("resuming a persisted legacy flush re-validates rollover admission first", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect(await h.session.resumeStream(options)).toMatchObject({
-        success: false,
-        error: { type: "context_budget_blocked" },
-      });
-      expect(h.requests).toHaveLength(0);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("resuming a legacy flush without a writable memory tool degrades it to a tool-less step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    // The memory tool was disabled before the restart resume.
-    expect(
-      (
-        await h.session.resumeStream({
-          ...options,
-          toolPolicy: [{ regex_match: "memory", action: "disable" }],
-        })
-      ).success
-    ).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([]);
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(rolloverRows(await allRows(h))).toHaveLength(1);
-  });
-
-  test("middleware registered during a resumed legacy flush cannot block the promised reset", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-      h.settleStream(0);
-      await h.waitForRequest(2);
-      expect(rolloverRows(await allRows(h))).toHaveLength(1);
-      // The reset is pinned to the snapshot admitted with the resume, not the changed registry.
-      expect(h.requests[1].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    } finally {
-      unregister();
-    }
-  });
-
-  test.each(["settled-step", "text-only"] as const)(
-    "disabling rollover while a resumed legacy flush runs drops the reset but keeps the Continue (%s)",
-    async (ending) => {
-      const first = await setup();
-      await seedLegacyFlushTurn(first, { muxMetadata: correlation });
-      await first.session.dispose();
-      const h = await setup({ previous: first });
-      expect((await h.session.resumeStream(options)).success).toBe(true);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      await seedThreshold(h, 1);
-      if (ending === "settled-step")
-        expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-      // The paired continuation survives as an ordinary same-turn continuation: the delegated
-      // turn's outcome is the resumed work, never the notes-only flush finish.
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      h.settleStream(0, { finishReason: "stop" });
-      await h.waitForRequest(2);
-      let rows = await allRows(h);
-      expect(rolloverRows(rows)).toHaveLength(0);
-      expect(text(rows.at(-1)!)).toBe("Continue");
-      expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
-      expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-      h.settleStream(1, { finishReason: "stop" });
-      await h.session.waitForIdle();
-      await seedThreshold(h, 0.7);
-      expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-      rows = await allRows(h);
-      expect(rolloverRows(rows)).toHaveLength(0);
-      // The window's handoff advisory may still ride this send; no second legacy flush does.
-      expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    }
-  );
-
-  test("a crash after only the legacy flush placeholder keeps the notes-writing step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    // The builder appends an empty assistant placeholder before any output exists.
-    const placeholder = createMuxMessage("flush-placeholder", "assistant", "", {
-      model,
-      partial: true,
-    });
-    expect((await first.historyService.appendToHistory(workspaceId, placeholder)).success).toBe(
-      true
-    );
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([
-      "memory",
-      "bash",
-    ]);
-  });
-
-  test("an emergency rollover during a resumed legacy flush sanitizes the flush trigger", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    const streamError = {
-      workspaceId,
-      messageId: "assistant-1",
-      error: "context limit",
-      errorType: "context_exceeded" as const,
-      contextBudgetExceeded: {
-        type: "context_budget_exceeded" as const,
-        model,
-        estimate: 127_000,
-        hardCeiling: 119_808,
-      },
-    };
-    h.aiEmitter.emit("error", streamError);
-    h.completions[0].settle({ status: "failed", streamError });
-    expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-1")).toBe(
-      "retry-started"
-    );
-    await h.waitForRequest(2);
-    const rows = await allRows(h);
-    const [reset] = rolloverRows(rows);
-    expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
-    const fresh = sliceMessagesForProviderFromLatestContextBoundary(rows);
-    const trigger = fresh.findLast((row) => row.role === "user")!;
-    expect(text(trigger)).toBe("Continue");
-    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    // The sanitized retry carries neither the internal trigger text nor its flag, so the request
-    // builder applies the ordinary toolset again.
-    const leaked = (row: MuxMessage) =>
-      text(row) === LEGACY_FLUSH_TRIGGER || row.metadata?.muxMetadata?.contextBudgetFlush === true;
-    expect(fresh.some(leaked)).toBe(false);
-    expect(h.requests[1].messages.some(leaked)).toBe(false);
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-  });
-
-  test("a legacy flush whose step already completed before a crash gets no second memory call", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    // The flush step's memory call settled into the partial before the crash. StreamManager
-    // first persists an assistant placeholder to reserve its history sequence.
-    const partial = createMuxMessage("flush-partial", "assistant", "", {
-      model,
-      partial: true,
-      stepStartPartIndices: [0],
-    });
-    expect((await first.historyService.appendToHistory(workspaceId, partial)).success).toBe(true);
-    partial.parts = [
-      {
-        type: "dynamic-tool",
-        toolName: "memory",
-        toolCallId: "flush-write",
-        state: "output-available",
-        input: { command: "create", path: "/memories/workspace/context-notes.md", file_text: "x" },
-        output: { success: true },
-      },
-    ];
-    expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // No tools at all: the resumed turn can only end, then the queued rollover seals the window.
-    expect(applyToolPolicyToNames(["memory", "session_history"], h.requests[0].toolPolicy)).toEqual(
-      []
-    );
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(rolloverRows(await allRows(h))).toHaveLength(1);
-  });
-
-  test("a resumed legacy flush stream is exempt from goal accounting; its continuation is not", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first, goals: true });
-    assert(h.goalAccounting, "Expected an injected goal service");
-    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
-    expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
-    await emitUsageDelta(h);
-    expect(previewStreamAccounting).not.toHaveBeenCalled();
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(recordStreamAccounting).not.toHaveBeenCalled();
-    // The paired continuation is an ordinary stream again.
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    await emitUsageDelta(h);
-    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
   });
 
   const exceeded: SendMessageError = {

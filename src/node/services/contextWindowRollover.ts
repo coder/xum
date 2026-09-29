@@ -1,4 +1,3 @@
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
@@ -120,7 +119,6 @@ interface ContextBudgetWarningOptions {
   budgetTokens: number;
   memoryWritable: boolean;
   sessionHistoryAvailable: boolean;
-  final?: boolean;
   handoff?: boolean;
   handoffTokens?: number;
   newContextAvailable?: boolean | "unknown";
@@ -133,14 +131,9 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     budgetTokens,
     memoryWritable,
     sessionHistoryAvailable,
-    final,
     handoff,
     handoffTokens,
   } = options;
-  assert(
-    !(final && handoff),
-    "A budget advisory cannot be both a handoff and a legacy final flush"
-  );
   assert(
     handoffTokens == null ||
       (Number.isFinite(handoffTokens) && handoffTokens > 0 && handoffTokens <= maxTokens),
@@ -151,23 +144,7 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     budgetTokens > 0 && budgetTokens <= maxTokens,
     "context budget warnings require a positive budget within the model limit"
   );
-  const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before ${final ? "this window rolls over" : "Xum forces a rollover at the usable limit"}).`;
-  if (final) {
-    // The final flush is only offered while memory is writable and history recovery is
-    // available, so no degraded wording is needed here.
-    assert(memoryWritable && sessionHistoryAvailable, "final flush requires memory and recovery");
-    return [
-      usage,
-      "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
-      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool. When memory hot-set loading is enabled, only a bounded excerpt is preloaded; read the remainder in the next window if needed. In the next window, session_history can retrieve earlier messages.`,
-      "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume.",
-      // The pinned memory tool resolves create-or-update atomically (see
-      // MemoryService.writePinnedFile), so no on-disk existence verdict is needed here and a
-      // stale one cannot waste the only step this turn gets.
-      "If the full file is visible and sufficient space is known, use a brief insert at insert_line 0 or str_replace with a unique match. If the preload is truncated or headroom is unknown, use create for a compact checkpoint of the essential known state within this step's output budget. It replaces the entire existing file, including unshown content.",
-      "Do not continue the task or reply to the user in this step.",
-    ].join(" ");
-  }
+  const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before Xum forces a rollover at the usable limit).`;
   // Permissions do not guarantee advertising; deferred tools or middleware may still hide them.
   // Wording follows the Codex token-budget reminder: save the checkpoint, then request a window.
   const checkpoint = memoryWritable
@@ -199,7 +176,7 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
 }
 
 export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {
-  const { contextTokens, maxTokens, budgetTokens, final, handoff, handoffTokens } = options;
+  const { contextTokens, maxTokens, budgetTokens, handoff, handoffTokens } = options;
   return createMuxMessage(createUserMessageId(), "user", buildBudgetWarningText(options), {
     timestamp: Date.now(),
     synthetic: true,
@@ -209,7 +186,6 @@ export function createContextBudgetWarning(options: ContextBudgetWarningOptions)
       contextTokens,
       maxTokens,
       budgetTokens,
-      ...(final ? { final: true as const } : {}),
       ...(handoff ? { handoff: true as const } : {}),
       ...(handoffTokens != null ? { handoffTokens } : {}),
     },

@@ -574,8 +574,6 @@ interface MuxMessageMetadataBase {
   mcpPromptRefs?: MCPPromptReference[];
   /** Internal budget control turn; retains delegation metadata without a human prompt bubble. */
   contextBudgetContinuation?: true;
-  /** Budget continuation that asks for one final notes flush before the window is sealed. */
-  contextBudgetFlush?: true;
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }

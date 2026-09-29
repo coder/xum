@@ -4296,11 +4296,7 @@ export class WorkspaceService
 
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
-        void this.trackWorkspaceCleanup(() =>
-          this.handleStreamCompletion(data.workspaceId, {
-            hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
-          })
-        );
+        void this.trackWorkspaceCleanup(() => this.handleStreamCompletion(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
       }
     });
@@ -4851,10 +4847,7 @@ export class WorkspaceService
     return this.updateStreamingStatus(workspaceId, false, { generation });
   }
 
-  private async handleStreamCompletion(
-    workspaceId: string,
-    completion: { hiddenFlush?: boolean } = {}
-  ): Promise<void> {
+  private async handleStreamCompletion(workspaceId: string): Promise<void> {
     const generation = this.streamingGenerations.get(workspaceId) ?? 0;
     const isIdleCompaction = this.idleCompactingWorkspaces.has(workspaceId);
 
@@ -4865,10 +4858,8 @@ export class WorkspaceService
     // Idle compaction is maintenance work, so preserve the pre-existing recency.
     // That keeps the workspace from jumping to the top of the sidebar and also
     // prevents the background activity path from treating compaction as a fresh response.
-    // A token-budget flush is the same kind of maintenance: the transcript hides its output,
-    // so it must not mark the workspace unread or notify from the activity snapshot.
 
-    if (!isIdleCompaction && completion.hiddenFlush !== true) {
+    if (!isIdleCompaction) {
       // Always use Date.now() for stream-completion recency.
       // extractTimestamp() returns the message-creation timestamp from stream
       // metadata, which is effectively the same as the sendMessage recency and

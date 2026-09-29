@@ -204,11 +204,11 @@ test("preparation receipts are owner-bound and only context resets invalidate th
   const budget = tokenBudgetOf(controller);
   const claimed = () => ({
     warning: Reflect.get(budget, "contextBudgetWarningClaimed") as boolean,
-    flush: Reflect.get(budget, "contextBudgetFlushClaimed") as boolean,
+    handoff: Reflect.get(budget, "contextBudgetHandoffClaimed") as boolean,
   });
   const arm = () => {
     Reflect.set(budget, "contextBudgetWarningClaimed", true);
-    Reflect.set(budget, "contextBudgetFlushClaimed", true);
+    Reflect.set(budget, "contextBudgetHandoffClaimed", true);
   };
 
   // A receipt proves the issuing strategy has not been reset; another session's controller
@@ -251,7 +251,7 @@ test("preparation receipts are owner-bound and only context resets invalidate th
     expect({ reason, ...claimed() }).toEqual({
       reason,
       warning: !clearing.has(reason),
-      flush: !clearing.has(reason),
+      handoff: !clearing.has(reason),
     });
     // Resets never cross session boundaries.
     expect(sibling.validatePreparation(sibling.capturePreparation())).toBe(true);
@@ -264,7 +264,7 @@ test("preparation receipts are owner-bound and only context resets invalidate th
     const before = controller.capturePreparation();
     controller.onUserInterrupt({ abandonPartial });
     expect(controller.validatePreparation(before)).toBe(false);
-    expect(claimed()).toEqual({ warning: false, flush: false });
+    expect(claimed()).toEqual({ warning: false, handoff: false });
   }
   expect(sibling.validatePreparation(receipt)).toBe(false);
 });

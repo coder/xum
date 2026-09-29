@@ -618,14 +618,6 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
   }
 }
 
-function isContextBudgetFlushMetadata(muxMetadata: unknown): boolean {
-  return (
-    typeof muxMetadata === "object" &&
-    muxMetadata !== null &&
-    (muxMetadata as { contextBudgetFlush?: unknown }).contextBudgetFlush === true
-  );
-}
-
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
@@ -5247,14 +5239,6 @@ export class WorkspaceTurnManager {
     if (this.isDeferredWorkspaceTurnMessage(record, event.messageId)) {
       return true;
     }
-    // A context-budget final flush is housekeeping inside the delegated turn, never its outcome:
-    // defer regardless of whether its paired continuation is still queued (a cleared queue must
-    // not turn the notes-only finish into the task's completion; the next stream settles it).
-    if (isContextBudgetFlushMetadata(event.metadata.muxMetadata)) {
-      await this.markWorkspaceTurnStreamEndDeferred(event);
-      return true;
-    }
-
     // Check runtime state before history. A finishing successor commits history before it disappears.
     // Parent guidance and report wake-ups continue the exact delegated turn. This includes
     // turn-end guidance: don't publish an early report before the queued guidance runs.

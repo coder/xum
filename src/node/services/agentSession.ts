@@ -25,7 +25,6 @@ import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
-import { resolveContextBudgetFlushThinking } from "@/common/utils/compaction/contextBudget";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
@@ -366,8 +365,7 @@ interface AutoRetryResumeRequest {
   requestAssemblySnapshot?: RequestAssemblySnapshot;
   /**
    * The request already is an admitted context reset, so a budget failure on retry must not
-   * reset again. Distinct from the snapshot: an admitted final flush pins its chain too, yet
-   * its emergency reset stays available.
+   * reset again.
    */
   contextBudgetRetried?: boolean;
   agentInitiated?: boolean;
@@ -739,7 +737,6 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options?: {
       includeHotMemories?: boolean;
       tokenBudgetActive?: boolean;
-      onlyContextNotes?: boolean;
     }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
@@ -1339,8 +1336,6 @@ export class AgentSession {
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
-    /** The active stream is a context-budget final-flush turn (bounded to one provider step). */
-    contextBudgetFlushTurn?: boolean;
   };
 
   private activeCompactionRequest?: {
@@ -4647,11 +4642,7 @@ export class AgentSession {
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.contextController.isTokenBudgetActive(optionsForStream);
-    optionsForStream = this.contextController.normalizeSend(
-      userMessage,
-      optionsForStream,
-      tokenBudgetActive
-    );
+    if (!tokenBudgetActive) this.contextController.dropPendingRollover();
     // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
       if (isManualUserMessage) {
@@ -4946,19 +4937,10 @@ export class AgentSession {
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
         };
       }
-      const publication = this.contextController.preparePublication({
-        userMessage,
-        prefixRows: contextBudgetPrefix,
-        options: optionsForStream,
-        assemblySnapshot: requestAssemblySnapshot,
-      });
-      contextBudgetPrefix = publication.prefixRows;
-      optionsForStream = publication.options;
-      requestAssemblySnapshot = publication.assemblySnapshot;
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
       if (contextRollover) {
         assert(requestAssemblySnapshot != null, "Rollover must pin request assembly");
-        const receipt = publication.receipt;
+        const receipt = this.contextController.capturePreparation();
         const candidate = await this.prepareRolloverRequest(
           batch,
           optionsForStream.model,
@@ -5821,7 +5803,7 @@ export class AgentSession {
       | {
           snapshot: RequestAssemblySnapshot;
           request: PreparedStreamMessage;
-          /** Send options for the retry (a flush trigger's marker is stripped). */
+          /** Send options for the retry. */
           options: SendMessageOptions | undefined;
         }
       | undefined,
@@ -7688,23 +7670,7 @@ export class AgentSession {
         return await refuseRejectedResume(lastUserMessage);
       }
 
-      const restoration = this.contextController.restoreStream({
-        history: historyResult.data,
-        userMessage: lastUserMessage,
-        options,
-        model: modelString,
-        autoModelRouting: options?.autoModelRoutingRecord,
-        admissionCapture,
-        goalKind,
-        goalId,
-        isAborted: isStreamStartAborted,
-      });
-      // Claim hydration is synchronous. Only actual flush preparation may yield here.
-      const restoredContext = restoration instanceof Promise ? await restoration : restoration;
-      if (!restoredContext.success) return await fail(restoredContext.error);
-      if (restoredContext.data == null) return Ok(undefined);
-      const resumedFlushSnapshot = restoredContext.data.assemblySnapshot;
-      const resumedFlushCannotWrite = restoredContext.data.cannotWrite;
+      this.contextController.restoreStream({ history: historyResult.data, options });
 
       // A crash between snapshot and user-row appends can leave orphaned prompt
       // expansions on disk; exclude them from every provider request.
@@ -7825,38 +7791,11 @@ export class AgentSession {
         lastUserMessage?.metadata?.muxMetadata,
         requestMessages
       );
-      // A final-flush trigger (fresh dispatch or resumed after restart) keeps its flag so the
-      // request builder applies the memory-only ceiling regardless of the caller's current send
-      // options; the flag is request-local and never becomes the workspace-turn correlation.
-      const contextBudgetFlushTurn =
-        lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true;
-      // The flush is one mechanical memory call: lowest thinking the model allows (the user's
-      // configured floor is for real work) and a bounded cap sized for that level, so an
-      // inherited medium/high level cannot make the only preservation step fail or overrun.
-      const flushThinking = contextBudgetFlushTurn
-        ? resolveContextBudgetFlushThinking(modelString, providersConfig)
-        : undefined;
-      // The flush turn is bounded to one provider step. If a crash left that step's completed
-      // memory call on disk (committed above), the resumed request gets no tools at all so the
-      // turn can only end, after which the queued rollover seals the window.
-      const flushAlreadyStepped =
-        contextBudgetFlushTurn &&
-        lastUserMessage != null &&
-        historyResult.data.slice(historyResult.data.indexOf(lastUserMessage) + 1).some(
-          (row) =>
-            row.role === "assistant" &&
-            // An empty placeholder is appended before streaming; only a settled tool call
-            // proves the single flush step actually happened.
-            row.parts.some(
-              (part) => part.type === "dynamic-tool" && part.state === "output-available"
-            )
-        );
       // Mid-stream compaction runs after the original send options have already been resolved against
       // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
       // post-compaction continuation remains the same delegated workspace turn.
       if (this.activeStreamContext != null) {
         this.activeStreamContext.workspaceTurnMetadata = streamMuxMetadata;
-        this.activeStreamContext.contextBudgetFlushTurn = contextBudgetFlushTurn;
       }
       const acpPromptId =
         normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata);
@@ -7919,28 +7858,20 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         modelString,
         abortSignal,
-        thinkingLevel: flushThinking?.level ?? effectiveThinkingLevel,
+        thinkingLevel: effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
-        toolPolicy:
-          flushAlreadyStepped || resumedFlushCannotWrite
-            ? [...(options?.toolPolicy ?? []), { regex_match: ".*", action: "disable" }]
-            : options?.toolPolicy,
+        toolPolicy: options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
-        // The flush step gets its own bounded cap: a terse caller cap could cut the notes payload
-        // short and waste the single step, while an unbounded one would let transcript-influenced
-        // text run to a model-sized reply. The paired continuation keeps the caller's cap.
-        maxOutputTokens: flushThinking?.maxOutputTokens ?? options?.maxOutputTokens,
+        maxOutputTokens: options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
         autoModelRouting: options?.autoModelRoutingRecord,
-        muxMetadata: contextBudgetFlushTurn
-          ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
-          : streamMuxMetadata,
+        muxMetadata: streamMuxMetadata,
         recordFileState,
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments,
@@ -7963,19 +7894,16 @@ export class AgentSession {
         contextBudgetRolloverAvailable:
           this.contextController.isTokenBudgetActive(options) &&
           this.contextController.autoCompactionThreshold(modelString) < 1,
-        requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
-        // A flush turn stays bounded to one step even when token-budget mode was disabled
-        // after its trigger was persisted (the callback then only stops it).
+        requestAssemblySnapshot,
         onStepSettled: this.contextController.stepSettlement({
           kind: "starting",
-          stream: { options, contextBudgetFlushTurn },
+          stream: { options },
         }),
         openaiTruncationModeOverride,
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
-        // A mid-turn thinking raise must not push the flush's budget past its bounded cap.
-        activeTurnThinkingOverride: contextBudgetFlushTurn ? undefined : activeTurnThinkingOverride,
+        activeTurnThinkingOverride,
         onPreStartError: ({ workspaceId: _workspaceId, ...payload }) =>
           preStartErrors.push(payload),
         onStreamStarting: (messageId) => {
@@ -8523,11 +8451,6 @@ export class AgentSession {
     if (!this.workspaceGoalService) {
       return;
     }
-    // Housekeeping flush turns are excluded from goal accounting (see
-    // recordGoalAccountingFromUsage); their usage must not leak into the live preview either.
-    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
-      return;
-    }
     const displayUsage = createDisplayUsage(
       input.usage,
       input.model,
@@ -8593,13 +8516,6 @@ export class AgentSession {
     if (!this.workspaceGoalService) {
       return;
     }
-    // The context-budget final flush is housekeeping, like compaction: it must not consume a
-    // goal turn or charge the goal's cost cap. Its row keeps the goal attribution on purpose,
-    // because a restart re-derives the paired continuation's goalKind/goalId from that row.
-    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
-      return;
-    }
-
     const displayUsage = createDisplayUsage(
       input.usage,
       input.model,
@@ -9014,10 +8930,6 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
-    // A final-flush turn is housekeeping, not the goal's work: its text-only finish must never
-    // count as an implicit complete_goal.
-    const activeStreamWasContextBudgetFlush =
-      this.activeStreamContext?.contextBudgetFlushTurn === true;
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -9190,10 +9102,7 @@ export class AgentSession {
           // user's first manual turn answered with text is never
           // mistaken for completion. `requestContinuationAfterStreamEnd`
           // below safely no-ops once the goal flips to `complete`.
-          if (
-            activeStreamGoalKind === GOAL_CONTINUATION_KIND &&
-            !activeStreamWasContextBudgetFlush
-          ) {
+          if (activeStreamGoalKind === GOAL_CONTINUATION_KIND) {
             await this.maybeAutoCompleteGoalFromSilentContinuation(streamEndPayload);
             if (
               !this.coordinator.isCurrentTurn(turn) ||
@@ -11395,26 +11304,12 @@ export class AgentSession {
     options?: {
       includeHotMemories?: boolean;
       tokenBudgetActive?: boolean;
-      onlyContextNotes?: boolean;
     },
     cache = this.memoryContextByModelString
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
     const tokenBudgetActive = options?.tokenBudgetActive === true;
-    if (options?.onlyContextNotes === true) {
-      // SECURITY: a final-flush turn must not see other memories (index or preloaded
-      // contents); this narrowed context is never cached for ordinary turns.
-      const narrowed =
-        typeof this.aiService.buildMemorySessionContext === "function"
-          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-              includeHotMemories,
-              tokenBudgetActive,
-              onlyContextNotes: true,
-            })
-          : null;
-      return narrowed ?? undefined;
-    }
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
