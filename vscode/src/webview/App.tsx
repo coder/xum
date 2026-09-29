@@ -460,7 +460,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
-    // The background processes strip and the bash tool cards' live process status (#5092).
+    // The background processes strip and the bash tool cards' live process status (#5092). Workspace
+    // IDs can repeat across servers, so the previous server's cached rows are dropped first.
+    backgroundBashStore.clearCachedState();
     backgroundBashStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();

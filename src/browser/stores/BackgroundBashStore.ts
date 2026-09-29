@@ -92,6 +92,30 @@ export class BackgroundBashStore {
   private retryAttempts = new Map<string, number>();
   private retryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /**
+   * Drops every workspace's cached process state. For a host that switches between servers (the
+   * VS Code webview): workspace IDs can repeat across servers, so one server's rows must never be
+   * shown, or terminated, against another. Call it before installing the new server's client.
+   */
+  clearCachedState(): void {
+    const workspaceIds = new Set([
+      ...this.processesCache.keys(),
+      ...this.foregroundIdsCache.keys(),
+      ...this.terminatingIdsCache.keys(),
+      ...this.stateKnownWorkspaces,
+    ]);
+    this.processesCache.clear();
+    this.foregroundIdsCache.clear();
+    this.terminatingIdsCache.clear();
+    this.stateKnownWorkspaces.clear();
+    for (const workspaceId of workspaceIds) {
+      this.processesStore.bump(workspaceId);
+      this.foregroundIdsStore.bump(workspaceId);
+      this.terminatingIdsStore.bump(workspaceId);
+      this.stateKnownStore.bump(workspaceId);
+    }
+  }
+
   setClient(client: APIClient | null): void {
     this.client = client;
 

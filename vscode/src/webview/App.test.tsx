@@ -2617,6 +2617,71 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
   });
 
+  test("a terminate failure that arrives after a workspace switch is not shown over the new chat", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late", workspaceName: "bash-late" };
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late-2", workspaceName: "bash-late-2" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-late",
+      [runningProcess]
+    );
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+    expect(bridge.orpcCalls("workspace.backgroundBashes.terminate")).toHaveLength(1);
+
+    // Switch before the host answers, then the terminate fails.
+    await bridge.emit({ type: "workspaces", workspaces: [workspace, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: other.id, event: { type: "caught-up" } });
+    await settle();
+    await bridge.answer("workspace.backgroundBashes.terminate", {
+      success: false,
+      error: "terminate refused",
+    });
+    await settle();
+
+    // PopoverError renders in a portal, so check the whole document.
+    expect(document.body.textContent).not.toContain("terminate refused");
+  });
+
+  test("switching servers drops the previous server's processes", async () => {
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-server",
+      workspaceName: "bash-server",
+    };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-server-1",
+      [runningProcess]
+    );
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+
+    // Another server with a workspace of the same ID: its state is unknown until it reports.
+    await bridge.emit({
+      type: "connectionStatus",
+      status: { mode: "api", baseUrl: "http://other" },
+    });
+    await settle();
+
+    expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
+    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe").length).toBeGreaterThan(1);
+  });
+
   test("does not show another workspace's processes after a switch", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);

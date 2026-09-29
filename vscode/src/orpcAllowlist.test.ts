@@ -273,6 +273,36 @@ describe("background processes strip (#5092)", () => {
     }
   });
 
+  test("empties monitor match lines before the process state reaches the webview", () => {
+    const monitor = {
+      filter: "ERROR",
+      totalMatches: 2,
+      lastLines: ["ERROR token=abc"],
+      stopped: false,
+    };
+    const state = {
+      processes: [
+        { id: "p1", script: "tail -f log", status: "running", monitor },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
+    };
+    expect(redactWebviewOrpcResult(path("subscribe"), state)).toEqual({
+      processes: [
+        {
+          id: "p1",
+          script: "tail -f log",
+          status: "running",
+          monitor: { ...monitor, lastLines: [] },
+        },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
+    });
+    // The host's copy is not mutated.
+    expect(monitor.lastLines).toEqual(["ERROR token=abc"]);
+  });
+
   test("rejects unknown workspaces and malformed input", () => {
     for (const [procedure, input] of [
       ["subscribe", { workspaceId: "ws-2" }],

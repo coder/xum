@@ -128,6 +128,9 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   if (procedure === "providers.getConfig") {
     return redactProvidersConfig(value);
   }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return redactBackgroundBashState(value);
+  }
   if (procedure !== "policy.get") {
     return value;
   }
@@ -348,4 +351,33 @@ function sanitizeBackgroundBashAction(
   }
   assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
   return { ok: true, input: { workspaceId, processId: record.processId } };
+}
+
+/**
+ * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
+ * stdout/stderr lines (monitor.lastLines). The strip never shows them, and the webview cannot read
+ * process output otherwise (getOutput is not bridged), so they are emptied before the state crosses
+ * the bridge. Everything else in each state passes through; the input is not mutated.
+ */
+function redactBackgroundBashState(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const state = value as { processes?: unknown };
+  if (!Array.isArray(state.processes)) {
+    return value;
+  }
+  return {
+    ...state,
+    processes: state.processes.map((process: unknown) => {
+      if (typeof process !== "object" || process === null) {
+        return process;
+      }
+      const record = process as { monitor?: unknown };
+      if (typeof record.monitor !== "object" || record.monitor === null) {
+        return process;
+      }
+      return { ...record, monitor: { ...(record.monitor as object), lastLines: [] } };
+    }),
+  };
 }
