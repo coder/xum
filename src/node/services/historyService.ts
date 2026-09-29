@@ -17,6 +17,11 @@ import {
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
   readProviderHistorySuffix,
+  readProviderHistoryWindow,
+  readProviderHistorySinceFloor,
+  readProviderHistoryBefore,
+  type HistoryPageOptions,
+  type HistoryWindowCaps,
   readCompactionPendingHistoryBoundary,
   readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -99,6 +104,15 @@ import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReas
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  HISTORY_PAGE_MAX_BYTES,
+  HISTORY_PAGE_MAX_ROWS,
+  HISTORY_THROUGH_MAX_BYTES,
+  ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+  ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+  ONCHAT_REPLAY_WINDOW_TURN_EXTENSION_MAX_BYTES,
+  ONCHAT_REPLAY_WINDOW_TURN_EXTENSION_MAX_ROWS,
+} from "@/constants/orpcSubscriptions";
 import {
   historyWriteLockPath,
   isWorkspaceRemovalTombstoned,
@@ -2613,6 +2627,121 @@ export class HistoryService {
           )
         )
     );
+  }
+
+  /**
+   * The newest rows of getHistoryFromLatestBoundary(workspaceId), bounded for windowed onChat
+   * replay (#4961) and cut at a turn start when one is near; `reachedEpochStart` is true only when
+   * the result is the whole active epoch. See readProviderHistoryWindow.
+   */
+  async getHistoryWindowFromLatestBoundary(
+    workspaceId: string,
+    caps: HistoryWindowCaps = {
+      maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+      maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+      extensionMaxRows: ONCHAT_REPLAY_WINDOW_TURN_EXTENSION_MAX_ROWS,
+      extensionMaxBytes: ONCHAT_REPLAY_WINDOW_TURN_EXTENSION_MAX_BYTES,
+    },
+    observer?: HistoryReadObserver
+  ): Promise<Result<{ messages: MuxMessage[]; reachedEpochStart: boolean }>> {
+    assert(isPositiveInteger(caps.maxRows), "window maxRows must be a positive integer");
+    assert(isPositiveInteger(caps.maxBytes), "window maxBytes must be a positive integer");
+    try {
+      return await this.withRecoveredHistoryLock(
+        workspaceId,
+        async () => {
+          // Replay rotates like getHistoryFromLatestBoundary so reads stay O(active epoch).
+          await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+          return Ok(
+            await readProviderHistoryWindow(this.getHistoryPaths(workspaceId), caps, {
+              onBytesRead: observer?.onBytesRead,
+            })
+          );
+        },
+        observer?.onLockAcquired
+      );
+    } catch (error) {
+      return Err(`Failed to read history window from boundary: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Rows of getHistoryFromLatestBoundary(workspaceId) from the newest row whose historySequence is
+   * <= `floorSequence` through the end (the whole active epoch when none), for windowed reconnects
+   * (#4961). See readProviderHistorySinceFloor for malformed-sequence handling.
+   */
+  async getHistorySinceSequence(
+    workspaceId: string,
+    floorSequence: number,
+    observer?: HistoryReadObserver
+  ): Promise<Result<MuxMessage[]>> {
+    assert(isNonNegativeInteger(floorSequence), "floorSequence must be a non-negative integer");
+    try {
+      return await this.withRecoveredHistoryLock(
+        workspaceId,
+        async () => {
+          await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+          return Ok(
+            await readProviderHistorySinceFloor(this.getHistoryPaths(workspaceId), floorSequence, {
+              onBytesRead: observer?.onBytesRead,
+            })
+          );
+        },
+        observer?.onLockAcquired
+      );
+    } catch (error) {
+      return Err(`Failed to read history since sequence: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * One page of the active epoch older than `beforeHistorySequence` (#4961): the newest rows below
+   * it, or with `throughHistorySequence` every row down to that one in one call. Unlike
+   * getHistoryBoundaryWindow, it never leaves the active epoch. See readProviderHistoryBefore.
+   */
+  async getHistoryPageBefore(
+    workspaceId: string,
+    options: {
+      beforeHistorySequence: number;
+      throughHistorySequence?: number;
+      maxRows?: number;
+      maxBytes?: number;
+    }
+  ): Promise<Result<{ messages: MuxMessage[]; reachedEpochStart: boolean }>> {
+    const through = options.throughHistorySequence;
+    const page: HistoryPageOptions = {
+      beforeSequence: options.beforeHistorySequence,
+      throughSequence: through,
+      maxRows: options.maxRows ?? HISTORY_PAGE_MAX_ROWS,
+      maxBytes:
+        options.maxBytes ??
+        (through === undefined ? HISTORY_PAGE_MAX_BYTES : HISTORY_THROUGH_MAX_BYTES),
+    };
+    assert(
+      isNonNegativeInteger(page.beforeSequence),
+      "beforeHistorySequence must be a non-negative integer"
+    );
+    assert(
+      through === undefined || (isNonNegativeInteger(through) && through < page.beforeSequence),
+      "throughHistorySequence must be a non-negative integer below beforeHistorySequence"
+    );
+    assert(isPositiveInteger(page.maxRows), "page maxRows must be a positive integer");
+    assert(isPositiveInteger(page.maxBytes), "page maxBytes must be a positive integer");
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history page",
+      async () => {
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        return Ok(await readProviderHistoryBefore(this.getHistoryPaths(workspaceId), page));
+      }
+    );
+  }
+
+  private getHistoryPaths(workspaceId: string): Record<"chat" | "archive", string> {
+    return {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
   }
 
   /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
