@@ -839,7 +839,11 @@ interface ActiveEpochRow {
 async function scanActiveEpochNewestFirst(
   files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>,
   visit: (row: ScannedHistoryRow) => boolean,
-  onBytesRead?: (bytes: number) => void
+  onBytesRead?: (bytes: number) => void,
+  // Rows for which this returns false are kept without their parsed message, so a read that
+  // filters out most visited rows does not hold all of them in memory. Only pass it for rows the
+  // caller never projects (a null message projects nothing for a row within the line limit).
+  keepMessage?: (row: ScannedHistoryRow) => boolean
 ): Promise<{ rows: ActiveEpochRow[]; reachedEpochStart: boolean }> {
   const rows: ActiveEpochRow[] = [];
   let stopRequested = false;
@@ -848,8 +852,13 @@ async function scanActiveEpochNewestFirst(
     if (!file) continue;
     const visited: ScannedHistoryRow[] = [];
     const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
-      visited.push(row);
       stopRequested ||= visit(row);
+      const keep = keepMessage === undefined || row.message === null || keepMessage(row);
+      assert(
+        keep || row.size <= SESSION_HISTORY_MAX_LINE_BYTES,
+        "only in-limit rows lose messages"
+      );
+      visited.push(keep ? row : { start: row.start, size: row.size, message: null });
       return stopRequested;
     });
     const from = location.kind === "start" ? location.offset : 0;
@@ -900,9 +909,20 @@ function mayProjectRow(row: ScannedHistoryRow): boolean {
   return row.message !== null || row.size > SESSION_HISTORY_MAX_LINE_BYTES;
 }
 
+/**
+ * A row's message as a window cut sees it: during the scan an oversized row's type is unknown
+ * (the locator does not parse it); the final cut re-reads it.
+ */
+type WindowCutMessage = MuxMessage | null | "unknown";
+
+function scanCutMessage(row: ScannedHistoryRow): WindowCutMessage {
+  return row.message ?? (row.size > SESSION_HISTORY_MAX_LINE_BYTES ? "unknown" : null);
+}
+
 /** Same safe turn start as selectKeepRecentTailStartIndex: a real user prompt with a sequence. */
-function isTurnStartRow(message: MuxMessage | null): boolean {
+function isTurnStartRow(message: WindowCutMessage): boolean {
   return (
+    message !== "unknown" &&
     message?.role === "user" &&
     message.metadata?.synthetic !== true &&
     isNonNegativeInteger(message.metadata?.historySequence)
@@ -930,6 +950,9 @@ export interface HistoryWindowCaps {
  * returns true once the cut is decided, which always happens on a row outside the window (the
  * row past a snapshot cluster or past the extension bound), so `keep` never counts it.
  * Rows count only when the full read may project them; bytes count every row read.
+ * An "unknown" (oversized, unparsed) row never starts a turn and never ends a snapshot cluster,
+ * so the scan over-visits; the final cut, which knows every type, then decides at or before the
+ * scan's cut, within the rows the scan visited.
  */
 function createHistoryWindowCutter(caps: HistoryWindowCaps) {
   let phase: "fill" | "extend" | "cluster" | "done" = "fill";
@@ -942,7 +965,7 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
     get keep() {
       return keep;
     },
-    push(row: ScannedHistoryRow): boolean {
+    push(row: ScannedHistoryRow, message: WindowCutMessage): boolean {
       if (phase === "done") return true;
       const projected = mayProjectRow(row);
       if (phase === "fill") {
@@ -950,7 +973,7 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         if (projected) rows++;
         bytes += row.size;
         if (rows > 0 && (rows >= caps.maxRows || bytes >= caps.maxBytes)) {
-          phase = isTurnStartRow(row.message) ? "cluster" : "extend";
+          phase = isTurnStartRow(message) ? "cluster" : "extend";
         }
         return false;
       }
@@ -962,7 +985,12 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         phase = "done";
         return true;
       }
-      if (phase === "cluster" && projected && !isTurnSnapshotRow(row.message)) {
+      if (
+        phase === "cluster" &&
+        projected &&
+        message !== "unknown" &&
+        !isTurnSnapshotRow(message)
+      ) {
         // The snapshot cluster ended: this row belongs to an older turn.
         phase = "done";
         return true;
@@ -970,7 +998,7 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
       keep++;
       if (projected) extensionRows++;
       extensionBytes += row.size;
-      if (phase === "extend" && isTurnStartRow(row.message)) phase = "cluster";
+      if (phase === "extend" && isTurnStartRow(message)) phase = "cluster";
       return false;
     },
   };
@@ -981,7 +1009,7 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
  * Collects rows until `maxRows` projected rows or `maxBytes` raw bytes (at least one row), then
  * extends to the nearest turn start (a real user row with a historySequence, plus its snapshot
  * cluster) within `extensionMaxRows`/`extensionMaxBytes`; past that bound it cuts mid-turn.
- * Oversized rows are never turn starts or snapshot rows (their type is parsed only at the end).
+ * Oversized rows are re-read for the final cut, so an oversized prompt can start the window.
  * `reachedEpochStart` is true only when the result is the whole active epoch, which then equals
  * readProviderHistory(paths).
  */
@@ -998,16 +1026,27 @@ export function readProviderHistoryWindow(
     const scanCutter = createHistoryWindowCutter(caps);
     const scan = await scanActiveEpochNewestFirst(
       files,
-      (row) => scanCutter.push(row),
+      (row) => scanCutter.push(row, scanCutMessage(row)),
       options?.onBytesRead
     );
     // Decide the cut again over the rows actually in the epoch: a privacy floor can drop visited
     // unreadable rows, and rows visited after the stop request must be trimmed.
+    // Oversized rows are re-read here so their types count.
     const cutter = createHistoryWindowCutter(caps);
-    for (const { row } of scan.rows) if (cutter.push(row)) break;
-    const kept = scan.rows.slice(0, cutter.keep);
+    const kept: Array<MuxMessage | null> = [];
+    for (const entry of scan.rows) {
+      const message = await readActiveEpochRowMessage(entry);
+      if (cutter.push(entry.row, message)) break;
+      kept.push(message);
+    }
+    assert(kept.length === cutter.keep, "window cut keeps exactly the rows it accepted");
+    const messages: MuxMessage[] = [];
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const message = kept[i];
+      if (message) messages.push(message);
+    }
     return {
-      messages: await projectActiveEpochRows(kept),
+      messages,
       reachedEpochStart: scan.reachedEpochStart && kept.length === scan.rows.length,
     };
   });
@@ -1037,8 +1076,14 @@ export function readProviderHistorySinceFloor(
       options?.onBytesRead
     );
     // The matching row is readable, so the locator stops right after it (or it is the start):
-    // every visited row belongs to the result.
-    return projectActiveEpochRows(scan.rows);
+    // every visited row belongs to the result. The visitor cannot see an oversized row's
+    // sequence, so the scan ran past an oversized floor row; now that it is parsed, start there.
+    const messages = await projectActiveEpochRows(scan.rows);
+    const floorIndex = messages.findLastIndex((message) => {
+      const sequence = message.metadata?.historySequence;
+      return isNonNegativeInteger(sequence) && sequence <= floorSequence;
+    });
+    return floorIndex > 0 ? messages.slice(floorIndex) : messages;
   });
 }
 
@@ -1059,17 +1104,19 @@ export interface HistoryPageOptions {
  * "skip" for a row it filters out, and "full" for the first row it would include past its caps.
  * A row that would exceed `maxBytes` is left out unless the page is still empty.
  */
+/** Whether a page may include this row at all (its sequence is an integer below `before`). */
+function isPageCandidate(message: MuxMessage | null, options: HistoryPageOptions): boolean {
+  const sequence = message?.metadata?.historySequence;
+  return isNonNegativeInteger(sequence) && sequence < options.beforeSequence;
+}
+
 function createHistoryPageSelector(options: HistoryPageOptions) {
   let rows = 0;
   let bytes = 0;
   let throughReached = false;
   return (message: MuxMessage | "unknown", size: number): "take" | "skip" | "full" => {
     const sequence = message === "unknown" ? undefined : message.metadata?.historySequence;
-    if (
-      message !== "unknown" &&
-      !(isNonNegativeInteger(sequence) && sequence < options.beforeSequence)
-    )
-      return "skip";
+    if (message !== "unknown" && !isPageCandidate(message, options)) return "skip";
     const rowCapped = options.throughSequence === undefined && rows >= options.maxRows;
     if (throughReached || rowCapped || (rows > 0 && bytes + size > options.maxBytes)) return "full";
     rows++;
@@ -1086,6 +1133,9 @@ function createHistoryPageSelector(options: HistoryPageOptions) {
  * getHistoryBoundaryWindow), up to `maxRows`/`maxBytes`; with `throughSequence`, every such row
  * down to the first with sequence <= it, up to `maxBytes`. Chronological. In-epoch paging (#4961)
  * passes the oldest sequence it holds; `reachedEpochStart` is true when no older such row exists.
+ * Cost: every page scans from EOF, so its time grows with its distance from EOF (rows newer than
+ * `beforeSequence` are parsed but not kept). Paging a whole large epoch this way is quadratic;
+ * PR3 of #4961 must decide on a cheaper cursor (for example a byte offset) before paging deep.
  */
 export function readProviderHistoryBefore(
   paths: Record<HistoryArtifact, string>,
@@ -1103,21 +1153,31 @@ export function readProviderHistoryBefore(
         options.throughSequence < options.beforeSequence),
     "page through must be a non-negative integer below before"
   );
+  // No row has an integer sequence below 0: skip the scan.
+  if (options.beforeSequence === 0)
+    return Promise.resolve({ messages: [], reachedEpochStart: true });
   return withVerifiedHistorySnapshot(paths, async (files) => {
     // The visitor cannot parse oversized rows, so it counts them as page rows once the page has
     // begun (a conservative early stop only shortens the page). It starts counting at the first
     // readable page row, so a scan that stops always holds at least one page row.
     const select = createHistoryPageSelector(options);
     let begun = false;
-    const scan = await scanActiveEpochNewestFirst(files, (row) => {
-      if (row.message === null && row.size <= SESSION_HISTORY_MAX_LINE_BYTES) return false;
-      if (!begun) {
-        if (row.message === null || select(row.message, row.size) !== "take") return false;
-        begun = true;
-        return false;
-      }
-      return select(row.message ?? "unknown", row.size) === "full";
-    });
+    const scan = await scanActiveEpochNewestFirst(
+      files,
+      (row) => {
+        if (row.message === null && row.size <= SESSION_HISTORY_MAX_LINE_BYTES) return false;
+        if (!begun) {
+          if (row.message === null || select(row.message, row.size) !== "take") return false;
+          begun = true;
+          return false;
+        }
+        return select(row.message ?? "unknown", row.size) === "full";
+      },
+      undefined,
+      // Rows the page filters out (e.g. every row newer than `beforeSequence`) are never
+      // projected; drop their messages so a deep page does not hold the epoch in memory.
+      (row) => row.size > SESSION_HISTORY_MAX_LINE_BYTES || isPageCandidate(row.message, options)
+    );
     // Choose the page exactly now that oversized rows can be parsed.
     const choose = createHistoryPageSelector(options);
     const page: MuxMessage[] = [];

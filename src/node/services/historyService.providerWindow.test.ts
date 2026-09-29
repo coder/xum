@@ -248,6 +248,24 @@ describe("HistoryService bounded active-epoch reads", () => {
       expect(atStart.messages[0].id).toBe("s3");
     });
 
+    test("an oversized prompt starts a turn with its snapshot cluster", async () => {
+      const ws = "window-oversized-prompt";
+      const bigPrompt = json(
+        createMuxMessage("big-user", "user", "y".repeat(OVERSIZED), { historySequence: 5 })
+      );
+      await writeLayout(ws, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 3),
+        fileSnapshot("s4", 4),
+        bigPrompt,
+        ...assistants(6, 8),
+      ]);
+      const result = await window(ws, { maxRows: 2, maxBytes: BIG, ...UNBOUNDED_EXTENSION });
+      expect(ids(result.messages)).toEqual(["s4", "big-user", "a1006", "a1007", "a1008"]);
+      expect(result.reachedEpochStart).toBe(false);
+      expectSuffix(await full(ws), result.messages);
+    });
+
     test("cuts mid-turn when the extension bound is hit first", async () => {
       const ws = "window-long-turn";
       const rows = [row("u0", "user", 0), ...assistants(1, 20)];
@@ -331,6 +349,20 @@ describe("HistoryService bounded active-epoch reads", () => {
       const rows = await since(ws, 5);
       expect(rows.map((m) => m.metadata?.historySequence)).toEqual([5, 6, 7, 8, 9]);
       expectSuffix(await full(ws), rows);
+
+      // The scan cannot parse an oversized floor row, but the result still starts at it.
+      const oversized = "since-oversized";
+      const big = json(
+        createMuxMessage("big", "assistant", "y".repeat(OVERSIZED), { historySequence: 5 })
+      );
+      await writeLayout(
+        oversized,
+        null,
+        epoch().map((r, i) => (i === 5 ? big : r))
+      );
+      const fromBig = await since(oversized, 5);
+      expect(ids(fromBig)).toEqual(["big", "a1006", "a1007", "a1008", "a1009"]);
+      expectSuffix(await full(oversized), fromBig);
     });
 
     test("a deleted or unreadable floor row starts at an older row", async () => {
