@@ -64,6 +64,7 @@ interface UserMessageProps {
   className?: string;
   onEdit?: (message: EditingMessageState) => void;
   isCompacting?: boolean;
+  editSendPending?: boolean;
   clipboardWriteText?: (data: string) => Promise<void>;
   /** Navigation info for backward/forward between user messages */
   navigation?: UserMessageNavigation;
@@ -79,6 +80,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   className,
   onEdit,
   isCompacting,
+  editSendPending,
   clipboardWriteText = copyToClipboard,
   navigation,
 }) => {
@@ -217,13 +219,15 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Edit",
             onClick: handleEdit,
-            disabled: isCompacting,
+            disabled: isCompacting === true || editSendPending === true,
             icon: <Pencil />,
             tooltip: isCompacting
               ? isMobileTouch
                 ? "Cannot edit while compacting"
                 : `Cannot edit while compacting (${formatKeybind(vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL)} to cancel)`
-              : undefined,
+              : editSendPending
+                ? "Cannot edit while an edit is sending"
+                : undefined,
           },
         ]
       : []),

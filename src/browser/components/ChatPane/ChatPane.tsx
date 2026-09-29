@@ -406,11 +406,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         : previous
     );
   };
+  // The workspace whose edit send is unresolved. No edit starts meanwhile (#5226): overlapping
+  // edits would each restore and clear the composer by reply timing.
+  const [editSendPendingWorkspaceId, setEditSendPendingWorkspaceId] = useState<string | null>(null);
+  const editSendPending = editSendPendingWorkspaceId === workspaceId;
+  const handleEditSendPendingChange = (pending: boolean) =>
+    setEditSendPendingWorkspaceId((current) =>
+      pending ? workspaceId : current === workspaceId ? null : current
+    );
   /**
    * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
    * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
    */
   const beginEditingMessage = (message: EditingMessageState): boolean => {
+    if (editSendPending) return false;
     const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
     if (!precondition) {
       publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
@@ -1430,6 +1439,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         }
         workspaceId={workspaceId}
         isCompacting={isCompacting}
+        editSendPending={editSendPending}
         onReviewNote={handleReviewNote}
         isLatestProposePlan={
           message.type === "tool" &&
@@ -1706,6 +1716,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onCancelEdit={handleCancelEdit}
                       onEditingMessageChange={updateEditingMessage}
                       onEditLastUserMessage={handleEditLastUserMessageClick}
+                      onEditSendPendingChange={handleEditSendPendingChange}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
                       heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
@@ -1804,6 +1815,7 @@ interface ChatInputPaneProps {
   onCancelEdit: () => void;
   onEditingMessageChange: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage: () => void;
+  onEditSendPendingChange: (pending: boolean) => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
   heldInputs: readonly HeldInputData[];
@@ -2013,6 +2025,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onCancelEdit={props.onCancelEdit}
         onEditingMessageChange={props.onEditingMessageChange}
         onEditLastUserMessage={props.onEditLastUserMessage}
+        onEditSendPendingChange={props.onEditSendPendingChange}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}
         onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}

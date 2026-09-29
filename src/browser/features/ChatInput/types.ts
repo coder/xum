@@ -59,6 +59,8 @@ export interface ChatInputWorkspaceVariant {
    */
   onEditingMessageChange?: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage?: () => void;
+  /** An edit send started (true) or settled (false); no new edit may start meanwhile. */
+  onEditSendPendingChange?: (pending: boolean) => void;
   canInterrupt?: boolean;
   disabled?: boolean;
   /** Queued follow-up currently waiting during an active workspace stream. */

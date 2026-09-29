@@ -31,6 +31,8 @@ interface MessageRendererProps {
   onEditQueuedMessage?: () => void;
   workspaceId?: string;
   isCompacting?: boolean;
+  /** An edit send is unresolved: user messages cannot start another edit. */
+  editSendPending?: boolean;
   /** Handler for adding review notes from inline diffs */
   onReviewNote?: (data: ReviewNoteData) => void;
   /** Whether this message is the latest propose_plan tool call (for external edit detection) */
@@ -91,6 +93,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     onEditUserMessage,
     workspaceId,
     isCompacting,
+    editSendPending,
     onReviewNote,
     isLatestProposePlan,
     bashOutputGroup,
@@ -147,6 +150,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               className={className}
               onEdit={onEditUserMessage}
               isCompacting={isCompacting}
+              editSendPending={editSendPending}
               navigation={userMessageNavigation}
             />
           );

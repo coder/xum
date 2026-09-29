@@ -8,7 +8,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDraftStore } from "@/browser/stores/DraftStore";
@@ -23,7 +23,10 @@ const LOAD_TOLERANT_WAIT = { timeout: 30_000 };
 
 async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope) {
   await app.chat.send("first message");
-  await app.chat.expectTranscriptContains("Mock response", LOAD_TOLERANT_WAIT.timeout);
+  await app.chat.expectTranscriptContains(
+    "Mock response: first message",
+    LOAD_TOLERANT_WAIT.timeout
+  );
   await app.chat.expectStreamComplete();
 
   await app.chat.typeWithoutSending("unsent draft");
@@ -38,9 +41,9 @@ async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope) {
   ]);
 
   const editButton = await waitFor(() => {
-    const button = app.view.container.querySelector('button[aria-label="Edit"]');
+    const button = rowEditButton(app, "first message");
     if (!button) throw new Error("Edit button not found");
-    return button as HTMLElement;
+    return button;
   }, LOAD_TOLERANT_WAIT);
   fireEvent.click(editButton);
   return await waitFor(() => {
@@ -214,8 +217,6 @@ const editTextarea = (app: AppHarness) =>
   app.view.container.querySelector<HTMLTextAreaElement>(
     'textarea[aria-label="Edit your last message"]'
   );
-const sendButton = (app: AppHarness) =>
-  app.view.container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
 /** Text of the mounted workspace composer (its review panel lives inside it). */
 const composerText = (app: AppHarness) =>
   [...app.view.container.querySelectorAll('[data-component="ChatInputSection"]')]
@@ -274,15 +275,36 @@ const editQueuedMessage = (app: AppHarness) =>
     "Queued message Edit button"
   );
 
+/** The Edit action of the transcript row that shows `rowText`. */
+const rowEditButton = (app: AppHarness, rowText: string) =>
+  [
+    ...app.view.container.querySelectorAll<HTMLButtonElement>(
+      '[data-message-block] button[aria-label="Edit"]'
+    ),
+  ].find((element) => element.closest("[data-message-block]")?.textContent?.includes(rowText));
+
 async function editRow(app: AppHarness, rowText: string) {
-  await clickWhenShown(
-    () =>
-      [
-        ...app.view.container.querySelectorAll('[data-message-block] button[aria-label="Edit"]'),
-      ].find((element) => element.closest("[data-message-block]")?.textContent?.includes(rowText)),
-    `Edit button of "${rowText}"`
-  );
+  await clickWhenShown(() => rowEditButton(app, rowText), `Edit button of "${rowText}"`);
   await waitFor(() => expect(editTextarea(app)?.value).toBe(rowText), LOAD_TOLERANT_WAIT);
+}
+
+/**
+ * Try to edit a row while an edit send is pending: its Edit action is disabled and a click
+ * does not open edit mode.
+ */
+async function expectEditRefused(app: AppHarness, rowText: string) {
+  const button = await waitFor(() => {
+    const element = rowEditButton(app, rowText);
+    if (!element) throw new Error(`Edit button of "${rowText}" not found`);
+    return element;
+  }, LOAD_TOLERANT_WAIT);
+  const editValueBefore = editTextarea(app)?.value;
+  await act(async () => {
+    fireEvent.click(button);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+  expect(editTextarea(app)?.value).toBe(editValueBefore);
+  expect(button.disabled).toBe(true);
 }
 
 /**
@@ -333,14 +355,17 @@ async function holdNextSendBeforeClear(app: AppHarness) {
   return { release, spy };
 }
 
-/** Press Enter in the workspace composer that holds `value`. */
-function pressEnterInComposer(app: AppHarness, value: string) {
-  const composer = [
+/** The workspace composer textarea that holds `value`. */
+const composerHolding = (app: AppHarness, value: string) =>
+  [
     ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
       'textarea[aria-label="Message Claude"]'
     ),
-  ].find((textarea) => textarea.value === value);
-  fireEvent.keyDown(composer!, { key: "Enter" });
+  ].find((textarea) => textarea.value === value && !textarea.disabled)!;
+
+/** Press Enter in the workspace composer that holds `value`. */
+function pressEnterInComposer(app: AppHarness, value: string) {
+  fireEvent.keyDown(composerHolding(app, value), { key: "Enter" });
 }
 
 const sentMessages = (spy: ReturnType<typeof holdSendReplies>["spy"], message: string) =>
@@ -351,28 +376,103 @@ describe("Edit sends racing newer composer input (#5226)", () => {
     await preloadTestModules();
   });
 
-  test("a second edit started while the first is pending keeps the first edit's draft", async () => {
-    const app = await createAppHarness({ branchPrefix: "edit-second-edit-keeps-draft" });
+  test("no new edit starts while an edit send is pending; the unsent draft comes back in order", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-refused-while-pending" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       await startEditWithUnsentDraft(app, scope);
+      // Hold the edit's reply, and its stream at start: the composer is usable meanwhile.
       const replies = holdSendReplies(app);
-      await sendEdit(app, scope, "edited message", "first message");
-      await app.chat.expectStreamComplete();
+      await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
 
-      // The first edit's reply is still pending: edit its replacement row.
-      await editRow(app, "edited message");
-      expect(sendButton(app)?.disabled).toBe(true);
+      // A second edit (the row's Edit action) and a third (ArrowUp in the empty composer).
+      await expectEditRefused(app, "edited message");
+      await act(async () => {
+        fireEvent.keyDown(composerHolding(app, ""), { key: "ArrowUp" });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(editTextarea(app)).toBeNull();
+      await app.chat.typeWithoutSending("typed meanwhile");
 
       replies.release();
-      // The first send settled; the second edit is still open and untouched.
-      await waitFor(() => expect(sendButton(app)?.disabled).toBe(false), LOAD_TOLERANT_WAIT);
-      expect(editTextarea(app)?.value).toBe("edited message");
-
-      // Cancelling the second edit brings back the draft from before the first one.
-      fireEvent.keyDown(editTextarea(app)!, { key: "Escape" });
-      await expectUnsentDraftKept(app, scope);
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectStreamComplete();
+      await app.chat.expectInputValue(
+        "unsent draft\n\ntyped meanwhile",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      expect(
+        getDraftStore()
+          .getView(scope)
+          .attachments.map(({ id }) => id)
+      ).toEqual(["file-unsent"]);
+      // Edits work again once the send settled.
+      await waitFor(() => expect(rowEditButton(app, "edited message")?.disabled).toBe(false));
       replies.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("no new edit starts while an editing /compact is pending, and no attachment is lost", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-compact-refuses-edit" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("earlier message");
+      await app.chat.expectTranscriptContains("Mock response: earlier message");
+      await app.chat.expectStreamComplete();
+      const editTextarea0 = await startEditWithUnsentDraft(app, scope);
+      // Hold the compaction request so the command stays pending.
+      const workspaceService = app.env.services.workspaceService;
+      const realSend = workspaceService.sendMessage.bind(workspaceService);
+      let releaseSend: () => void = () => undefined;
+      const sendGate = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
+      const sendSpy = jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementation(async (...args: Parameters<typeof realSend>) => {
+          await sendGate;
+          return realSend(...args);
+        });
+      getDraftStore().setText(scope, "/compact -t 500");
+      await waitFor(() => expect(editTextarea0.value).toBe("/compact -t 500"));
+      fireEvent.keyDown(editTextarea0, { key: "Enter" });
+      await waitFor(() => expect(sendSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+
+      await expectEditRefused(app, "earlier message");
+
+      releaseSend();
+      await app.chat.expectStreamComplete(60_000);
+      await expectUnsentDraftKept(app, scope);
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("cancelling an edit while its send waits does not let a reopened edit be closed or cleared", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-cancel-reopen" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const save = await holdNextSendBeforeClear(app);
+      getDraftStore().setText(scope, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+
+      // The send waits for the settings save; the user cancels the edit and reopens the row.
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      await waitFor(
+        () => expect(getDraftStore().getText(scope)).toBe("unsent draft"),
+        LOAD_TOLERANT_WAIT
+      );
+      await expectEditRefused(app, "first message");
+
+      save.release();
+      await app.chat.expectStreamComplete();
+      await expectUnsentDraftKept(app, scope);
+      save.spy.mockRestore();
     } finally {
       await app.dispose();
     }
