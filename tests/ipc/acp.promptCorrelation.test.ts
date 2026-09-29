@@ -22,6 +22,9 @@ interface Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[];
+  heldInputCalls: { action: "send" | "discard"; workspaceId: string; heldInputId: string }[];
+  /** `session/update` params written to the ACP client (only without `acpOutputStream`). */
+  sessionUpdates: { sessionId: string; update: Record<string, unknown> }[];
   pushChatEvent: (event: WorkspaceChatMessage) => void;
   closeConnection: () => void;
   connectionClosed: Promise<void>;
@@ -306,6 +309,8 @@ function createHarness(options?: HarnessOptions): Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[] = [];
+  const heldInputCalls: Harness["heldInputCalls"] = [];
+  const sessionUpdates: Harness["sessionUpdates"] = [];
   const chatStream = createControlledChatStream();
   // Every full-mode replay closes with a caught-up (the backend emits it in `finally`); a prompt
   // waits for that first one before dispatching so a failed replay is refused, not raced.
@@ -394,6 +399,14 @@ function createHarness(options?: HarnessOptions): Harness {
         }
         return { success: true as const, data: undefined };
       },
+      sendHeldInput: async (input: { workspaceId: string; heldInputId: string }) => {
+        heldInputCalls.push({ action: "send", ...input });
+        return { success: true as const, data: undefined };
+      },
+      discardHeldInput: async (input: { workspaceId: string; heldInputId: string }) => {
+        heldInputCalls.push({ action: "discard", ...input });
+        return { success: true as const, data: undefined };
+      },
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
     },
@@ -406,7 +419,7 @@ function createHarness(options?: HarnessOptions): Harness {
   };
 
   const { stream, closeInput } = createControllableAcpStream({
-    output: options?.acpOutputStream,
+    output: options?.acpOutputStream ?? createSessionUpdateCollector(sessionUpdates),
   });
 
   let agentInstance: MuxAgent | null = null;
@@ -425,10 +438,33 @@ function createHarness(options?: HarnessOptions): Harness {
     sendMessageCalls,
     delegatedToolAnswers,
     interruptCalls,
+    heldInputCalls,
+    sessionUpdates,
     pushChatEvent: chatStream.push,
     closeConnection: closeInput,
     connectionClosed: connection.closed,
   };
+}
+
+/** Decode the agent's ndjson output and keep each `session/update` notification's params. */
+function createSessionUpdateCollector(
+  sessionUpdates: Harness["sessionUpdates"]
+): WritableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  let buffered = "";
+  return new WritableStream<Uint8Array>({
+    write(chunk) {
+      buffered += decoder.decode(chunk, { stream: true });
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      for (const line of lines) {
+        const message = JSON.parse(line) as { method?: string; params?: unknown };
+        if (message.method === "session/update") {
+          sessionUpdates.push(message.params as Harness["sessionUpdates"][number]);
+        }
+      }
+    },
+  });
 }
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -1712,4 +1748,68 @@ describe("ACP prompt stream correlation", () => {
     harness.closeConnection();
     await harness.connectionClosed;
   }, 15_000);
+});
+
+describe("ACP held inputs (#4944)", () => {
+  const heldInputs = ["queued follow-up", "second queued"].map((displayText, index) => ({
+    id: `held-${index + 1}`,
+    reason: "interrupted" as const,
+    displayText,
+    attachmentCount: 0,
+    reviewCount: 0,
+  }));
+
+  it("surfaces input held by a cancel and lets the ACP user discard or send it", async () => {
+    const harness: Harness = createHarness({
+      // The backend keeps queued input as held input during the Stop (#4769).
+      interruptStream: async ({ workspaceId }) => {
+        harness.pushChatEvent({
+          type: "restore-to-input",
+          workspaceId,
+          text: "queued follow-up\nsecond queued",
+          heldInputIds: heldInputs.map(({ id }) => id),
+        });
+        harness.pushChatEvent({ type: "held-inputs-changed", workspaceId, heldInputs });
+        return { success: true, data: undefined };
+      },
+    });
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+    const sessionId = newSessionResponse.sessionId;
+    const prompt = (text: string) =>
+      harness.agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
+
+    await harness.agent.cancel({ sessionId });
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "cancelled" });
+    await waitForCondition(() =>
+      harness.sessionUpdates.some(({ update }) => {
+        const text = update.sessionUpdate === "agent_message_chunk" ? JSON.stringify(update) : "";
+        return text.includes("queued follow-up") && text.includes("second queued");
+      })
+    );
+
+    // Two are held, so a bare command must not guess which one to drop.
+    await prompt("/discard-held");
+    expect(harness.heldInputCalls).toEqual([]);
+    await prompt("/discard-held 2");
+    expect(harness.heldInputCalls).toEqual([
+      { action: "discard", workspaceId: sessionId, heldInputId: "held-2" },
+    ]);
+
+    // A held Send is a normal prompt turn: it settles when the re-sent message's stream ends.
+    const sendPromise = prompt("/send-held 1");
+    await waitForCondition(() => harness.heldInputCalls.length === 2);
+    expect(harness.heldInputCalls[1]).toEqual({
+      action: "send",
+      workspaceId: sessionId,
+      heldInputId: "held-1",
+    });
+    harness.pushChatEvent(streamStart(sessionId, "assistant-held"));
+    harness.pushChatEvent(streamEnd(sessionId, "assistant-held"));
+    await expect(sendPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    // The backend re-sends its held copy; the agent never re-types it as a new prompt.
+    expect(harness.sendMessageCalls).toHaveLength(1);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
 });

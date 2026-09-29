@@ -9,6 +9,11 @@ const CLEAR_COMMAND_NAME = "clear";
 const COMPACT_COMMAND_NAME = "compact";
 const FORK_COMMAND_NAME = "fork";
 const NEW_COMMAND_NAME = "new";
+// Held inputs (#4944) are listed in a numbered notice (StreamTranslator); these act by number.
+export const SEND_HELD_COMMAND_NAME = "send-held";
+export const DISCARD_HELD_COMMAND_NAME = "discard-held";
+export type HeldInputCommandName = typeof SEND_HELD_COMMAND_NAME | typeof DISCARD_HELD_COMMAND_NAME;
+const HELD_INPUT_COMMAND_HINT = "[number]";
 
 const COMPACT_USAGE = `/compact ${SLASH_COMMAND_HINTS.compact}`;
 
@@ -40,6 +45,16 @@ const SERVER_COMMAND_DEFINITIONS: readonly ServerCommandDefinition[] = [
       "Create a new workspace in the current project from its trunk branch. Optionally include a start message.",
     inputHint: SLASH_COMMAND_HINTS.new,
   },
+  {
+    name: SEND_HELD_COMMAND_NAME,
+    description: "Send an unsent message that Xum kept (for example after a cancel).",
+    inputHint: HELD_INPUT_COMMAND_HINT,
+  },
+  {
+    name: DISCARD_HELD_COMMAND_NAME,
+    description: "Discard an unsent message that Xum kept, without sending it.",
+    inputHint: HELD_INPUT_COMMAND_HINT,
+  },
 ] as const;
 
 const RESERVED_COMMAND_NAMES = new Set<string>(
@@ -63,6 +78,8 @@ export type ParsedAcpSlashCommand =
     }
   | { kind: "fork"; startMessage?: string }
   | { kind: "new"; startMessage?: string }
+  /** `number` is 1-based, as listed in the held-input notice; omitted means "the only one". */
+  | { kind: "held-input"; command: HeldInputCommandName; number?: number }
   | {
       kind: "skill";
       descriptor: AgentSkillDescriptor;
@@ -170,6 +187,10 @@ export function parseAcpSlashCommand(
 
   if (commandName === NEW_COMMAND_NAME) {
     return parseNewCommand(rawInput);
+  }
+
+  if (commandName === SEND_HELD_COMMAND_NAME || commandName === DISCARD_HELD_COMMAND_NAME) {
+    return parseHeldInputCommand(commandName, remainingTokens);
   }
 
   return parseSkillCommand(trimmed, commandName, skillsByName);
@@ -292,6 +313,18 @@ function parseNewCommand(rawInput: string): ParsedAcpSlashCommand {
     kind: "new",
     startMessage: startMessage.length > 0 ? startMessage : undefined,
   };
+}
+
+function parseHeldInputCommand(
+  command: HeldInputCommandName,
+  tokens: string[]
+): ParsedAcpSlashCommand {
+  if (tokens.length === 0) return { kind: "held-input", command };
+  const number = tokens.length === 1 && /^[1-9]\d*$/.test(tokens[0]) ? Number(tokens[0]) : NaN;
+  if (!Number.isSafeInteger(number)) {
+    return { kind: "invalid", message: `Usage: /${command} ${HELD_INPUT_COMMAND_HINT}` };
+  }
+  return { kind: "held-input", command, number };
 }
 
 function parseSkillCommand(
