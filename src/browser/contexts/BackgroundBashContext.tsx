@@ -16,11 +16,7 @@ const BackgroundBashErrorContext = createContext<ReturnType<typeof usePopoverErr
 
 interface BackgroundBashProviderProps {
   workspaceId: string;
-  /**
-   * Identifies the server connection. A hosting surface that keeps the provider mounted across
-   * server switches (the VS Code webview) passes it so a failure issued on one connection is
-   * dropped after a switch, as for a workspace switch. Desktop omits it.
-   */
+  /** Identifies the server connection; the VS Code webview passes it, desktop omits it. */
   connectionKey?: string | null;
   children: ReactNode;
 }

@@ -143,11 +143,9 @@ function WebviewChatProviders(props: {
                 (#5092). Without a selection nothing reads it: both render only for a selected
                 workspace. */}
             {/* Never key this by the server connection: it wraps the whole layout, and a remount
-                replaces the transcript scrollport that useAutoScroll observes, so a fresh open
-                stayed at the top instead of pinned to the bottom (#5231). The connection scope is
-                enforced instead by connectionKey (a late action failure from the previous server
-                is dropped, even for a workspace ID both servers share), by the error popover's
-                scope, and by the strip's key. */}
+                replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
+                open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
+                and the strip's key scope late failures and rows to the connection instead. */}
             <BackgroundBashProvider
               workspaceId={props.selectedWorkspaceId ?? ""}
               connectionKey={props.apiConnectionKey}
@@ -1240,8 +1238,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                     ) : null}
                     {/* Background bashes sit between held inputs and the turn status, as in the
                         desktop dock. Keyed so the expanded list and an open output dialog never
-                        carry over to another workspace or server. Without a server connection the store has
-                        no client, so its last-known processes are not offered. */}
+                        carry over to another workspace or server. Without a server connection the
+                        store has no client, so its last-known processes are not offered. */}
                     {selectedWorkspaceId && canChat ? (
                       // The shared banner brings its own dock gutter (desktop's composer has the
                       // same one); cancel this dock's padding so it lines up with the composer.
