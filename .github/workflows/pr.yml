@@ -425,6 +425,7 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
+      - run: make check-startup-imports-runtime
       - name: Pack npm package
         id: pack
         run: echo "tarball=$(./scripts/pack-npm-package.sh)" >> "$GITHUB_OUTPUT"

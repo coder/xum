@@ -3,7 +3,8 @@
 // check-startup-imports` runs this file before the real check (scripts/ tests
 // are not part of the `bun test src` lane).
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -11,6 +12,7 @@ import {
   type EntryOutput,
   isBannedPackage,
   packageNameOf,
+  STARTUP_ENTRIES,
 } from "./check-startup-imports";
 
 let rootDir: string;
@@ -181,4 +183,68 @@ test("package matching handles subpaths and scopes", () => {
   expect(isBannedPackage("@ai-sdk/openai", ["@ai-sdk/*"])).toBe(true);
   expect(isBannedPackage("ai-tokenizer", ["ai"])).toBe(false);
   expect(isBannedPackage("@ai-sdk-extra/x", ["@ai-sdk/*"])).toBe(false);
+});
+
+// The tests below read the real repo: they fail when a new runtime entry point is added
+// without registering it in STARTUP_ENTRIES, or when a registered `dist` drifts from the
+// build. Worker threads and CLI subcommands are not detected (see STARTUP_ENTRIES).
+const repoRoot = path.resolve(import.meta.dir, "..");
+
+async function readRepoFile(relativePath: string): Promise<string> {
+  return readFile(path.join(repoRoot, relativePath), "utf8");
+}
+
+/** Build output of every `preload:` script passed to a BrowserWindow in src/. */
+async function collectPreloadScripts(): Promise<string[]> {
+  const scripts: string[] = [];
+  for await (const file of new Bun.Glob("src/**/*.{ts,tsx}").scan({ cwd: repoRoot })) {
+    if (/\.(test|stories)\.tsx?$/.test(file)) continue;
+    const source = await readRepoFile(file);
+    for (const match of source.matchAll(/\bpreload\s*:/g)) {
+      const rest = source.slice(match.index + match[0].length);
+      const literal = /^\s*path\.join\(\s*__dirname\s*,\s*(["'])([^"']+)\1\s*,?\s*\)/.exec(rest);
+      if (literal == null) {
+        throw new Error(
+          `${file}: unrecognized \`preload:\` value. Register its build output in` +
+            " STARTUP_ENTRIES by hand and extend this test to resolve the new form."
+        );
+      }
+      // tsc maps src/<dir>/x.ts to dist/<dir>/x.js, so __dirname is dist/<dir>.
+      const buildDir = path.posix.join("dist", path.posix.dirname(file).replace(/^src\/?/, ""));
+      scripts.push(path.posix.join(buildDir, literal[2]));
+    }
+  }
+  return scripts;
+}
+
+test("every runtime entry point is registered in STARTUP_ENTRIES", async () => {
+  const packageJson = JSON.parse(await readRepoFile("package.json")) as {
+    main?: string;
+    bin?: string | Record<string, string>;
+  };
+  const bins =
+    typeof packageJson.bin === "string" ? [packageJson.bin] : Object.values(packageJson.bin ?? {});
+  const preloads = await collectPreloadScripts();
+  // Guards against the scan silently matching nothing.
+  expect(preloads.length).toBeGreaterThan(0);
+
+  const entryPoints = [...new Set([packageJson.main, ...bins, ...preloads])]
+    .filter((p): p is string => p != null)
+    .map((p) => path.posix.normalize(p));
+  const registered = new Set(STARTUP_ENTRIES.map((e) => e.dist));
+  expect(entryPoints.filter((p) => !registered.has(p))).toEqual([]);
+});
+
+test("STARTUP_ENTRIES dist paths match the build", async () => {
+  const makefile = await readRepoFile("Makefile");
+  for (const { entry, output, dist } of STARTUP_ENTRIES) {
+    expect(existsSync(path.join(repoRoot, entry))).toBe(true);
+    if (output === "commonjs") {
+      // tsconfig.main.json: rootDir src, outDir dist.
+      expect(dist).toBe(entry.replace(/^src\//, "dist/").replace(/\.tsx?$/, ".js"));
+    } else {
+      const rule = makefile.split("\n").some((line) => line.startsWith(`${dist}: ${entry}`));
+      expect({ dist, rule }).toEqual({ dist, rule: true });
+    }
+  }
 });
