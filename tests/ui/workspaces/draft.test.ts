@@ -21,6 +21,11 @@ import {
 import { addProjectViaUI, cleanupView, getWorkspaceDraftIds, setupTestDom } from "../helpers";
 import { renderApp } from "../renderReviewPanel";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  defaultCreationDraftScope,
+  getDraftStore,
+  type DraftStoreScope,
+} from "@/browser/stores/DraftStore";
 
 import { WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
 
@@ -35,6 +40,17 @@ async function waitForDraftCount(projectPath: string, count: number): Promise<st
         throw new Error(`Expected ${count} drafts, got ${ids.length}`);
       }
       return ids;
+    },
+    { timeout: 5_000 }
+  );
+}
+
+async function findProjectRow(container: HTMLElement, projectPath: string): Promise<HTMLElement> {
+  return await waitFor(
+    () => {
+      const el = container.querySelector(`[data-project-path="${projectPath}"][aria-controls]`);
+      if (!el) throw new Error("Project row not found");
+      return el as HTMLElement;
     },
     { timeout: 5_000 }
   );
@@ -153,6 +169,67 @@ describeIntegration("Draft workspace behavior", () => {
       expect(draftId).toBeTruthy();
       expect(view.container.querySelector("[data-draft-id]")).toBeNull();
     } finally {
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
+
+  test("clicking the project row brings the default creation draft along when listed drafts exist", async () => {
+    const env = getSharedEnv();
+    const projectPath = getSharedRepoPath();
+
+    const cleanupDom = setupTestDom();
+    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
+
+    const view = renderApp({ apiClient: env.orpc });
+    const createdScopes: DraftStoreScope[] = [];
+
+    try {
+      await view.waitForReady();
+      const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      const projectRow = await findProjectRow(view.container, normalizedProjectPath);
+
+      // A listed draft with text, so the project row cannot reuse it and has no
+      // "first listed draft" to move the default draft into.
+      fireEvent.click(projectRow);
+      const [listedDraftId] = await waitForDraftCount(normalizedProjectPath, 1);
+      const listedScope: DraftStoreScope = {
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId: listedDraftId,
+      };
+      // Text typed on the bare project page (no draft id) lives in the default creation draft.
+      const defaultScope = defaultCreationDraftScope(normalizedProjectPath);
+      createdScopes.push(listedScope, defaultScope);
+      getDraftStore().setText(listedScope, "listed draft text");
+
+      getDraftStore().setText(defaultScope, "default draft text");
+      await getDraftStore().flush(defaultScope);
+
+      fireEvent.click(projectRow);
+
+      // The project row must not hide the default draft behind a fresh empty composer.
+      await waitFor(
+        () => {
+          const textarea = view.container.querySelector("textarea");
+          expect(textarea?.value).toBe("default draft text");
+        },
+        { timeout: 5_000 }
+      );
+      const draftIds = await waitForDraftCount(normalizedProjectPath, 2);
+      createdScopes.push({ kind: "creation", projectPath: normalizedProjectPath, draftId: draftIds[1] });
+      expect(
+        getDraftStore().getView({
+          kind: "creation",
+          projectPath: normalizedProjectPath,
+          draftId: draftIds[1],
+        }).text
+      ).toBe("default draft text");
+      await waitFor(() => expect(getDraftStore().getView(defaultScope).text).toBe(""), {
+        timeout: 5_000,
+      });
+    } finally {
+      // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       await cleanupView(view, cleanupDom);
     }
   }, 60_000);

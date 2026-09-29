@@ -2004,6 +2004,22 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         projectPath,
         subProjectPath
       );
+      const draftId = existingEmptyDraftId ?? createDraftId();
+
+      // Text typed on the bare project page (no draft id) lives in the default creation draft,
+      // which only that URL shows. Move it into the draft this opens, so the project row never
+      // hides it behind an empty composer (#5071). Done outside the state updater so the
+      // move runs exactly once.
+      const defaultScope = defaultCreationDraftScope(projectPath);
+      const pending = getDraftStore().getView(defaultScope);
+      if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
+        // Never rejects; the default draft is deleted only once the new one is saved.
+        getDraftStore()
+          .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
+          .catch(() => undefined);
+        migrateWorkspaceStorage(getPendingScopeId(projectPath), getDraftScopeId(projectPath, draftId));
+      }
+
       if (existingEmptyDraftId) {
         navigateToProject(projectPath, existingEmptyDraftId, {
           replace: options?.replace,
@@ -2011,7 +2027,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return;
       }
 
-      const draftId = createDraftId();
       const createdAt = Date.now();
       const draft: WorkspaceDraft = {
         draftId,
@@ -2021,27 +2036,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
       setWorkspaceDraftsByProjectState((prev) => {
         const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-
-        // One-time migration: if the user has an old per-project pending draft, move it
-        // into the first draft scope so it stays accessible.
-        // The default creation composer's draft (no draft id) moves into the first listed one.
-        if (existing.length === 0) {
-          const pendingScopeId = getPendingScopeId(projectPath);
-          const defaultScope = defaultCreationDraftScope(projectPath);
-          const pending = getDraftStore().getView(defaultScope);
-          if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
-            // Never rejects; the default draft is deleted only once the new one is saved.
-            getDraftStore()
-              .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
-              .catch(() => undefined);
-            migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
-          }
-        }
-
         return {
           ...current,
-          [projectPath]: [...existing, draft],
+          [projectPath]: [...(current[projectPath] ?? []), draft],
         };
       });
 
