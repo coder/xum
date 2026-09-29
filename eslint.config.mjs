@@ -1193,6 +1193,22 @@ const localPlugin = {
           if (node.computed && node.property.type === "Literal") return node.property.value;
           return null;
         };
+        // `const { localStorage } = window` reads the property without a MemberExpression, and the
+        // new binding has a declaration, so the reference check below would not see it.
+        const checkDestructuring = (pattern, source) => {
+          if (pattern.type !== "ObjectPattern" || source?.type !== "Identifier") return;
+          if (!GLOBAL_OBJECTS.has(source.name)) return;
+          for (const property of pattern.properties) {
+            if (property.type !== "Property") continue;
+            const name =
+              !property.computed && property.key.type === "Identifier"
+                ? property.key.name
+                : property.key.type === "Literal"
+                  ? property.key.value
+                  : null;
+            if (STORAGE_GLOBALS.has(name)) report(property, `${source.name}.${name}`);
+          }
+        };
         return {
           MemberExpression(node) {
             const name = memberName(node);
@@ -1203,6 +1219,12 @@ const localPlugin = {
             ) {
               report(node, `${node.object.name}.${name}`);
             }
+          },
+          VariableDeclarator(node) {
+            checkDestructuring(node.id, node.init);
+          },
+          AssignmentExpression(node) {
+            checkDestructuring(node.left, node.right);
           },
           "Program:exit"(program) {
             const globalScope = context.sourceCode.getScope(program);
