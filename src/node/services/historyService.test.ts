@@ -3720,6 +3720,17 @@ describe("HistoryService", () => {
       const result = await service.hasHistory(workspaceId);
       expect(result).toBe(true);
     });
+
+    // The startup orphan sweep (#4983) removes a workspace only when this answers false.
+    it("should count history it cannot inspect", async () => {
+      const workspaceId = "ws-uninspectable";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      // A symlink loop: stat fails with ELOOP, not ENOENT.
+      await fs.symlink("chat.jsonl", path.join(workspaceDir, "chat.jsonl"));
+
+      expect(await service.hasHistory(workspaceId)).toBe(true);
+    });
   });
 
   describe("iterateFullHistory", () => {

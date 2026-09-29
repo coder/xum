@@ -48,7 +48,11 @@ import {
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
-import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
+import {
+  createRuntimeContextForWorkspace,
+  createRuntimeForWorkspace,
+} from "@/node/runtime/runtimeHelpers";
+import { findWorkInCheckoutWithoutBase } from "@/node/services/subagentRemovalWorkCheck";
 import {
   formatRuntimeUnreachableError,
   isRuntimeTransportError,
@@ -778,54 +782,176 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
-   * turn (crash between create() and the handle record, or between the terminal write and the
-   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
-   * has a live holder, here or in another backend, is still being created and is left alone.
-   * Never throws: startup must not fail.
+   * Startup resolver for delegated targets whose creator died. Never throws: startup must not
+   * fail.
+   * - #4453: a creator that died before settling its creating turn (crash between create() and
+   *   the handle record, or between the terminal write and the grant) leaves the pending mark.
+   *   Clear such marks; never grant.
+   * - #4983: a crash between create() and the handle record also leaves the target itself, which
+   *   nothing owns (a mode "existing" retry is invalid_scope). Remove it when it never ran work
+   *   (see removeCrashOrphanedTarget).
+   * A handle whose live-owner lock has a live holder, here or in another backend, is still being
+   * created and is left alone.
    */
-  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
-    for (const project of this.config.loadConfigOrDefault().projects.values()) {
-      for (const workspace of project.workspaces) {
-        const tags = workspace.tags ?? {};
-        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
-        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
-        const workspaceId = workspace.id;
-        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
-        if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
-        try {
-          await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
-            // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
-            if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
-              return;
-            }
-            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
-            // its creator locked it before create(), and the lock outlives the creator until the
-            // record settles. Without a lock only a record that created this target counts.
-            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
-            const locked = await fsPromises.access(lockPath).then(
-              () => true,
-              () => false
-            );
-            if (!locked) {
-              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
-              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
-            }
-            if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
-            try {
+  async resolveOrphanedDelegatedTargets(): Promise<void> {
+    let workspaces;
+    try {
+      workspaces = [...this.config.loadConfigOrDefault().projects.values()].flatMap(
+        (project) => project.workspaces
+      );
+    } catch (error: unknown) {
+      log.warn("Failed to read config for the delegated target resolver", {
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    for (const workspace of workspaces) {
+      const tags = workspace.tags ?? {};
+      const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+      const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+      const workspaceId = workspace.id;
+      const pending = workspace.unrelatedWorkspaceConsentPending === true;
+      if (workspaceId == null || !isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
+      try {
+        await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+          // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
+          if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
+            return;
+          }
+          // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
+          // its creator locked it before create(), and the lock outlives the creator until the
+          // record settles. Without a lock only a record that created this target counts, and
+          // the target is never removed.
+          const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+          const locked = await fsPromises.access(lockPath).then(
+            () => true,
+            () => false
+          );
+          if (!locked) {
+            if (!pending) return;
+            const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+            if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+          }
+          if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
+          try {
+            if (pending) {
               await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
-            } finally {
-              await this.releaseTurnOwnerLock(handleId);
             }
-          });
-        } catch (error: unknown) {
-          log.warn("Failed to clear an orphaned delegated consent default", {
-            workspaceId,
-            error: getErrorMessage(error),
-          });
-        }
+            if (locked) await this.removeCrashOrphanedTarget(workspaceId, ownerId, handleId);
+          } finally {
+            await this.releaseTurnOwnerLock(handleId);
+          }
+        });
+      } catch (error: unknown) {
+        log.warn("Failed to resolve an orphaned delegated target", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
       }
     }
+  }
+
+  /**
+   * #4983: remove a delegated target whose creator died between create() and the handle record.
+   * The caller holds the handle's live-owner lock, reclaimed from that dead creator, so no other
+   * backend can be creating or settling it. This is an automatic forced removal, so it fails
+   * closed: it removes only a single-project worktree target that demonstrably never ran work,
+   * and leaves anything else as an ordinary workspace (logged) for the user to remove by hand.
+   */
+  private async removeCrashOrphanedTarget(
+    workspaceId: string,
+    ownerId: string,
+    handleId: string
+  ): Promise<void> {
+    // Any record file, even one that reads as null (corrupt, or a newer build's schema), means the
+    // handle persisted and the creator settled or recovery owns it.
+    if (await this.taskHandleStore.hasWorkspaceTurnFile(ownerId, handleId)) return;
+    const leave = (reason: string) =>
+      log.info("Leaving a delegated target whose creation was interrupted", {
+        workspaceId,
+        handleId,
+        reason,
+      });
+    // Records live in the owner's session dir and are deleted only with it, so a removed owner
+    // explains a missing record without a crash.
+    const ownerSessionDir = path.join(this.config.sessionsDir, ownerId);
+    const ownerSessionDirExists = await fsPromises.stat(ownerSessionDir).then(
+      (stat) => stat.isDirectory(),
+      () => false
+    );
+    if (
+      !ownerSessionDirExists ||
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerId) == null
+    ) {
+      leave("its owner workspace is gone");
+      return;
+    }
+    // Lock order: this handle's settlement lock, then the target's tree lock. No other path can
+    // take this handle's settlement lock meanwhile: it has no record and no live registration.
+    await this.taskHost.withTaskTreeLifecycleLock(workspaceId, async () => {
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      const row = entry?.workspace;
+      if (entry == null || row?.tags?.[WORKSPACE_TURN_TASK_TAGS.handle] !== handleId) return;
+      if (isWorkspaceArchived(row.archivedAt, row.unarchivedAt)) {
+        leave("it is archived");
+        return;
+      }
+      const workspaceName = coerceNonEmptyString(row.name);
+      const workspacePath = coerceNonEmptyString(row.path);
+      // Other runtimes (project-dir local, SSH, Docker, devcontainer, Coder) are left for now:
+      // each removes something different, and only a worktree checkout is judged below.
+      if (
+        !isWorktreeRuntime(row.runtimeConfig) ||
+        (row.projects?.length ?? 0) > 1 ||
+        workspaceName == null ||
+        workspacePath == null
+      ) {
+        leave("only single-project worktree targets are removed");
+        return;
+      }
+      if (await this.historyService.hasHistory(workspaceId)) {
+        leave("it has chat history");
+        return;
+      }
+      const work = await findWorkInCheckoutWithoutBase({
+        runtime: createRuntimeForWorkspace({
+          runtimeConfig: row.runtimeConfig,
+          projectPath: entry.projectPath,
+          name: workspaceName,
+          namedWorkspacePath: workspacePath,
+        }),
+        projectRepo: {
+          projectPath: entry.projectPath,
+          projectName: path.basename(entry.projectPath),
+          repoCwd: workspacePath,
+        },
+      });
+      if (!work.success || work.data.kind !== "none") {
+        leave(
+          work.success ? "its checkout has work" : `its checkout cannot be judged: ${work.error}`
+        );
+        return;
+      }
+      // Keep the branch: the creation's createdBranch was never persisted, so it may be one the
+      // creation only reused. The check above found no commit that the branch alone holds.
+      const removal = await this.workspaceService.removeWhileTaskTreeLocked(
+        workspaceId,
+        true,
+        undefined,
+        { keepBranch: true }
+      );
+      if (!removal.success) {
+        log.warn("Failed to remove a delegated target whose creation was interrupted", {
+          workspaceId,
+          error: removal.error,
+        });
+        return;
+      }
+      log.info("Removed a delegated target whose creation was interrupted", {
+        workspaceId,
+        handleId,
+      });
+    });
   }
 
   /**

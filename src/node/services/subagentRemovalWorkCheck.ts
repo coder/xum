@@ -1,6 +1,7 @@
 /**
  * Finds work that removing a sub-agent checkout would destroy and nothing preserves (#4723). Only
  * model-driven task_remove consults it; user-confirmed and automatic removals keep force-removing.
+ * The startup orphan sweep of delegated targets (#4983) uses findWorkInCheckoutWithoutBase.
  */
 import assert from "node:assert/strict";
 
@@ -44,6 +45,8 @@ export type UnpreservedSubagentWork =
     };
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
+// A branch name reaches a shell command and a --exclude glob: accept only plain names.
+const PLAIN_BRANCH_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 // Repository automation (hooks, core.fsmonitor, filters) stays off: a checkout-controlled git
 // config must not run code in the backend just because the model asked to remove a sub-agent.
@@ -236,6 +239,53 @@ export async function findUnpreservedSubagentWork(params: {
       uncapturedCommitCount,
       ...(otherRefCommitCount > 0 ? { otherRefCommitCount } : {}),
     });
+  } catch (error) {
+    return Err(getErrorMessage(error));
+  }
+}
+
+/**
+ * Work in a checkout that has no recorded base commit (#4983: a delegated target whose creator
+ * died before its handle record persisted). "none" only for a git work tree with a clean status
+ * whose every commit reachable from HEAD is also on another branch, a remote-tracking ref or a
+ * tag, i.e. nothing beyond the branch it was created from. That stands in for "no commits beyond
+ * the creation base", which is not persisted. A missing checkout, a detached HEAD, an unusual
+ * branch name or any failed probe is an Err: the caller must leave the workspace alone.
+ */
+export async function findWorkInCheckoutWithoutBase(params: {
+  runtime: Runtime;
+  projectRepo: SubagentRemovalProjectRepo;
+}): Promise<Result<UnpreservedSubagentWork, string>> {
+  try {
+    const repo = await openGitRepo(params.runtime, params.projectRepo);
+    if (repo == null) return Err(`${params.projectRepo.projectName} has no git checkout`);
+    const status = await git(
+      params.runtime,
+      repo,
+      "--no-optional-locks status --porcelain -z --untracked-files=normal --ignore-submodules=none"
+    );
+    const paths = parseGitStatusPorcelainZ(status).map((entry) => entry.path);
+    if (paths.length > 0) {
+      return Ok({ kind: "lossy", paths: [...new Set(paths)].sort(), uncapturedCommitCount: 0 });
+    }
+    // Detached HEAD exits nonzero, which throws (fail closed).
+    const ref = (await git(params.runtime, repo, "symbolic-ref -q HEAD")).trim();
+    const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : "";
+    if (!PLAIN_BRANCH_NAME_PATTERN.test(branch)) {
+      return Err(`the branch of ${repo.projectName} cannot be checked`);
+    }
+    // --exclude matches --branches names without their refs/heads/ prefix.
+    const value = Number(
+      await git(
+        params.runtime,
+        repo,
+        `rev-list --count HEAD --not '--exclude=${branch}' --branches --remotes --tags`
+      )
+    );
+    assert(Number.isInteger(value) && value >= 0, "git rev-list --count prints a count");
+    return Ok(
+      value === 0 ? { kind: "none" } : { kind: "lossy", paths: [], uncapturedCommitCount: value }
+    );
   } catch (error) {
     return Err(getErrorMessage(error));
   }

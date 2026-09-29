@@ -2838,6 +2838,8 @@ export class HistoryService {
   /**
    * Check if a workspace has any chat history without parsing the files.
    * Much cheaper than iterateFullHistory() when only an emptiness check is needed.
+   * Fails closed: a file that exists but cannot be inspected counts as history, because the
+   * startup orphan sweep (#4983) removes a workspace only when this answers false.
    */
   async hasHistory(workspaceId: string): Promise<boolean> {
     return this.withRecoveredHistoryLock(workspaceId, async () => {
@@ -2850,8 +2852,9 @@ export class HistoryService {
           if (stat.size > 0) {
             return true;
           }
-        } catch {
+        } catch (error) {
           // Missing file — keep checking.
+          if (!isErrnoWithCode(error, "ENOENT")) return true;
         }
       }
       return false;

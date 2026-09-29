@@ -7,6 +7,9 @@ import type { Config } from "@/node/config";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { createMuxMessage } from "@/common/types/message";
+import { HistoryService } from "@/node/services/historyService";
+import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import {
   workspaceTurnOwnerLockPath,
   type WorkspaceTurnManager,
@@ -324,7 +327,7 @@ describe("delegated target default consent (#4453)", () => {
     expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
 
     // The next startup's resolver clears it (the lock was released with the settlement).
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
@@ -339,9 +342,127 @@ describe("delegated target default consent (#4453)", () => {
       return cfg;
     });
 
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config).pending).toBe(true);
   });
+
+  /**
+   * #4983: the creator died (SIGKILL, power loss) after create() made a worktree target and before
+   * its handle record persisted. `finish` lets the paused in-test creator return; a really dead
+   * one never resumes.
+   */
+  async function crashBeforeRecord(options: { creator: "alive" | "dead" }) {
+    const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
+    initGitRepo(a.projectPath);
+    await a.config.editConfig((cfg) => {
+      const parent = findWorkspaceEntry(cfg, a.parentId)?.workspace;
+      if (parent)
+        parent.runtimeConfig = { type: "worktree", srcBaseDir: path.join(rootDir, "src") };
+      return cfg;
+    });
+    const creating = a.manager
+      .createWorkspaceTurn({
+        ownerWorkspaceId: a.parentId,
+        prompt: "Summarize",
+        title: "Workspace turn",
+        workspace: { mode: "new", branchName: "fresh", trunkBranch: "main" },
+      })
+      .catch(() => undefined);
+    await created.promise;
+    // The owner is mid-turn: its task tool call started this creation.
+    const ownerTurn = createMuxMessage("msg_owner", "user", "delegate");
+    expect(
+      (await new HistoryService(a.config).appendToHistory(a.parentId, ownerTurn)).success
+    ).toBe(true);
+    if (options.creator === "dead") await markCreatorDead();
+    const checkout = findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace.path;
+    expect(checkout).toBeDefined();
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: a.projectPath, encoding: "utf8" }).trim();
+    const finish = async () => {
+      paused.resolve();
+      await creating;
+    };
+    return { ...a, checkout: checkout!, git, finish };
+  }
+
+  test("the startup resolver removes a target orphaned by a crash before its handle record (#4983)", async () => {
+    const a = await crashBeforeRecord({ creator: "dead" });
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).toBeNull();
+    expect(await fsPromises.stat(a.checkout).catch(() => null)).toBeNull();
+    // Forced removal keeps the branch: the creation's own createdBranch was never persisted.
+    expect(a.git("branch", "--list", "fresh")).not.toBe("");
+    const lock = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+    expect(await fsPromises.stat(lock).catch(() => null)).toBeNull();
+    await a.finish();
+  });
+
+  const handlePath = (parentId: string) =>
+    path.join(rootDir, "sessions", parentId, "task-handles", "wst_handle.json");
+  const leftAlone: Record<
+    string,
+    { creator?: "alive"; before?: (a: Awaited<ReturnType<typeof crashBeforeRecord>>) => unknown }
+  > = {
+    "its creator is alive": { creator: "alive" },
+    "it has chat history": {
+      before: async ({ config }) =>
+        expect(
+          (
+            await new HistoryService(config).appendToHistory(
+              TARGET,
+              createMuxMessage("msg_user", "user", "work")
+            )
+          ).success
+        ).toBe(true),
+    },
+    "its checkout has an untracked file": {
+      before: ({ checkout }) => fsPromises.writeFile(path.join(checkout, "notes.md"), "work"),
+    },
+    "its branch has a commit": {
+      before: ({ checkout }) =>
+        execFileSync("git", ["commit", "--allow-empty", "-m", "work"], { cwd: checkout }),
+    },
+    "its handle record exists": {
+      before: ({ config, parentId }) =>
+        new TaskHandleStore(config).upsertWorkspaceTurn({
+          kind: "workspace_turn",
+          handleId: "wst_handle",
+          ownerWorkspaceId: parentId,
+          workspaceId: TARGET,
+          turnId: "turn",
+          status: "running",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          createdWorkspace: true,
+          disposableWorkspace: false,
+        }),
+    },
+    // A newer build's record or a corrupt one reads as null, yet proves the handle persisted.
+    "its handle record is unreadable": {
+      before: async ({ parentId }) => {
+        await fsPromises.mkdir(path.dirname(handlePath(parentId)), { recursive: true });
+        await fsPromises.writeFile(handlePath(parentId), "{");
+      },
+    },
+  };
+  for (const [reason, { creator = "dead", before }] of Object.entries(leftAlone)) {
+    test(`the startup resolver keeps a delegated target when ${reason} (#4983)`, async () => {
+      const a = await crashBeforeRecord({ creator });
+      await before?.(a);
+
+      await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+      expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).not.toBeNull();
+      expect(await fsPromises.stat(a.checkout).then(() => true)).toBe(true);
+      // A dead creator's pending mark is still cleared.
+      expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
+      await a.finish();
+    });
+  }
 
   for (const creator of ["alive", "dead"] as const) {
     test(`the startup resolver clears a mark only when its creator is dead (${creator})`, async () => {
@@ -351,8 +472,8 @@ describe("delegated target default consent (#4453)", () => {
       await created.promise; // The row exists with its mark; the handle record does not yet.
       if (creator === "dead") await markCreatorDead();
 
-      await a.manager.clearOrphanedDelegatedConsentDefaults();
-      await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+      await a.manager.resolveOrphanedDelegatedTargets();
+      await (await backend()).manager.resolveOrphanedDelegatedTargets();
       expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
 
       paused.resolve();
