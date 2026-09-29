@@ -96,7 +96,7 @@
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "ai": "7.0.107",
-    "ai-tokenizer": "^1.0.6",
+    "ai-tokenizer": "^1.0.7",
     "ajv": "^8.20.0",
     "chalk": "^5.6.2",
     "comlink": "^4.4.2",
@@ -340,7 +340,6 @@
   ],
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
-    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch",
-    "ai-tokenizer@1.0.6": "patches/ai-tokenizer@1.0.6.patch"
+    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch"
   }
 }

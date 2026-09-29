@@ -1,5 +1,7 @@
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
+import { removeWorkspaceConfirmOptions } from "./removeWorkspaceConfirm";
+import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ProjectConfig } from "@/node/config";
@@ -75,6 +77,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),
+    onRemoveSubagent: () => Promise.resolve(),
     onUpdateTitle: () => Promise.resolve({ success: true }),
     onAddProject: () => undefined,
     onRemoveProject: () => undefined,
@@ -541,6 +544,75 @@ test("selected scratch workspace omits the generic create-workspace action", () 
 
   expect(actions.find((action) => action.id === "ws:new")).toBeUndefined();
   expect(actions.find((action) => action.id === "ws:new-scratch")).toBeDefined();
+});
+
+test("sub-agents get the confirmed sub-agent removal instead of the plain remove (#5106)", async () => {
+  const onRemoveSubagent = mock((_workspaceId: string, _title: string) => Promise.resolve());
+  const onRemoveWorkspace = mock(() => Promise.resolve({ success: true }));
+  const child: FrontendWorkspaceMetadata = {
+    id: "child",
+    name: "agent_exec_child",
+    title: "Child task",
+    parentWorkspaceId: "w1",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/agent_exec_child",
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["child", child]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: child.namedWorkspacePath,
+      workspaceId: "child",
+    },
+    onRemoveSubagent,
+    onRemoveWorkspace,
+  });
+
+  expect(actions.find((action) => action.id === CommandIds.workspaceRemove())).toBeUndefined();
+  await actions.find((action) => action.id === CommandIds.workspaceRemoveSubagent())?.run();
+  expect(onRemoveSubagent).toHaveBeenCalledWith("child", "Child task");
+
+  // Picking the sub-agent in the generic "Remove Workspace…" prompt takes the same path.
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "child" });
+  expect(onRemoveSubagent).toHaveBeenCalledTimes(2);
+  expect(onRemoveWorkspace).not.toHaveBeenCalled();
+});
+
+test("palette removal confirms with the workspace's runtime (#5204)", async () => {
+  const confirmDialog = mock((_options: ConfirmDialogOptions) => Promise.resolve(false));
+  const remote: FrontendWorkspaceMetadata = {
+    id: "remote",
+    name: "feature",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/feature",
+    runtimeConfig: { type: "ssh", host: "build-box", srcBaseDir: "~/xum" },
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["remote", remote]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: remote.namedWorkspacePath,
+      workspaceId: "remote",
+    },
+    confirmDialog,
+  });
+
+  await actions.find((action) => action.id === CommandIds.workspaceRemove())?.run();
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "remote" });
+
+  const expected = removeWorkspaceConfirmOptions("", remote).description;
+  expect(expected).not.toBe(removeWorkspaceConfirmOptions("", { name: "feature" }).description);
+  expect(confirmDialog.mock.calls.map(([options]) => options.description)).toEqual([
+    expected,
+    expected,
+  ]);
 });
 
 test("buildCoreSources includes archive merged workspaces in project action", () => {

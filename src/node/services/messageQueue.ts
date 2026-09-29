@@ -717,6 +717,9 @@ export class MessageQueue {
       internal?.skipOnSendCompaction === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
+      // An ACP prompt's turn binds the one dispatch that carries its correlation (#5170):
+      // batching would drop that correlation or lend it to other messages.
+      options?.acpPromptId != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches

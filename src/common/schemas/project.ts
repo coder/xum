@@ -80,6 +80,13 @@ export const PendingRemovalSchema = z.object({
   at: z.string(),
 });
 
+/** A delegated target's creation mark (#4983); see WorkspaceConfigSchema.delegatedCreation. */
+export const DelegatedCreationMarkSchema = z.object({
+  handleId: z.string().min(1),
+  ownerWorkspaceId: z.string().min(1),
+  interruptedAt: z.string().min(1).optional(),
+});
+
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -131,6 +138,10 @@ export const WorkspaceConfigSchema = z.object({
   unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
+  }),
+  delegatedCreation: DelegatedCreationMarkSchema.optional().meta({
+    description:
+      "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",
   }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,

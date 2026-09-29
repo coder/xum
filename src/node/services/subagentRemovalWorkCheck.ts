@@ -42,6 +42,8 @@ export type UnpreservedSubagentWork =
       uncapturedCommitCount: number;
       /** Commits only other local branches or the stash hold (checkouts that own their repository). */
       otherRefCommitCount?: number;
+      /** Why commits could not be counted; set only when uncommitted paths were found. */
+      commitCheckError?: string;
     };
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -205,10 +207,39 @@ export async function findUnpreservedSubagentWork(params: {
         paths.push(prefixPaths ? `${repo.projectName}/${entry.path}` : entry.path);
       }
     }
-    if (paths.length > 0) {
-      return Ok({ kind: "lossy", paths: [...new Set(paths)].sort(), uncapturedCommitCount: 0 });
-    }
+  } catch (error) {
+    return Err(getErrorMessage(error));
+  }
+  const dirtyPaths = [...new Set(paths)].sort();
+  const commits = await countUnpreservedCommits(params, gitRepos);
+  if (!commits.success) {
+    // The files are known even when commits cannot be counted: report both, so a user
+    // confirmation never lists less than removal deletes (#5106).
+    if (dirtyPaths.length === 0) return commits;
+    return Ok({
+      kind: "lossy",
+      paths: dirtyPaths,
+      uncapturedCommitCount: 0,
+      commitCheckError: commits.error,
+    });
+  }
+  const { uncapturedCommitCount, otherRefCommitCount } = commits.data;
+  if (dirtyPaths.length === 0 && uncapturedCommitCount === 0 && otherRefCommitCount === 0) {
+    return Ok({ kind: "none" });
+  }
+  return Ok({
+    kind: "lossy",
+    paths: dirtyPaths,
+    uncapturedCommitCount,
+    ...(otherRefCommitCount > 0 ? { otherRefCommitCount } : {}),
+  });
+}
 
+async function countUnpreservedCommits(
+  params: Parameters<typeof findUnpreservedSubagentWork>[0],
+  gitRepos: GitRepo[]
+): Promise<Result<{ uncapturedCommitCount: number; otherRefCommitCount: number }, string>> {
+  try {
     // Committed work survives only in a patch artifact: removal force-deletes the task branch.
     // A ready/skipped artifact covers it only when it captured the current head and the range has
     // no merge commits (format-patch drops merge resolutions). Refuse to guess without a base.
@@ -252,13 +283,7 @@ export async function findUnpreservedSubagentWork(params: {
         otherRefCommitCount += await countOtherRefCommits(params.runtime, repo, base, head);
       }
     }
-    if (uncapturedCommitCount === 0 && otherRefCommitCount === 0) return Ok({ kind: "none" });
-    return Ok({
-      kind: "lossy",
-      paths: [],
-      uncapturedCommitCount,
-      ...(otherRefCommitCount > 0 ? { otherRefCommitCount } : {}),
-    });
+    return Ok({ uncapturedCommitCount, otherRefCommitCount });
   } catch (error) {
     return Err(getErrorMessage(error));
   }

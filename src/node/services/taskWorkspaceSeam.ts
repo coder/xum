@@ -20,6 +20,7 @@ import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
 import type {
@@ -729,7 +730,7 @@ export interface WorkspaceLifecycleHost {
     force?: boolean,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>>;
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
 }
@@ -747,11 +748,15 @@ export interface WorkspaceProvisioningHost {
     options?: {
       awaitMaterialization?: boolean;
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
   /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
   grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;
+  /** A delegated target's creation mark (#4983): drop it (never throws) or flag it (CAS). */
+  clearDelegatedCreationMark(workspaceId: string, handleId: string): Promise<void>;
+  markDelegatedCreationInterrupted(workspaceId: string, handleId: string): Promise<boolean>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
     workspacePath: string,
@@ -803,7 +808,7 @@ export interface AgentTaskIntegration {
     workspaceId: string,
     acknowledgedIds: string[],
     gatedIds?: ReadonlySet<string>
-  ): Promise<Result<void>>;
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   /** A running continuation has a matching accepted live registration, not only a persisted execution status. */

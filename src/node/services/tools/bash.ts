@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
+import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -31,6 +32,7 @@ import {
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForLocalRepo,
   gitNoRepoAutomationEnvForRuntimeRepo,
+  LOCAL_DISCOVERY_AUTOMATION_ERROR,
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
@@ -870,6 +872,20 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
 }
 
 /**
+ * Local discovery treats `git -C <path>` exit 128 as "not a repository" and returns only the
+ * static env, so a missing directory would silently skip the repo's driver config. Fail
+ * instead; remote discovery already fails on a missing cwd.
+ */
+async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
+  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  if (!stats?.isDirectory()) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: new Error(`Repository directory does not exist: ${repoPath}`),
+    });
+  }
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -919,8 +935,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // selected by highest-precedence .git/info/attributes on every runtime.
       let hooksEnv: Record<string, string> = {};
       if (!gitHooksAllowed(config.trusted)) {
+        // getProjects() returns one entry even for a single-project workspace, whose cwd is
+        // the checkout itself (or a directory inside it). Only a multi-project cwd (the
+        // _workspaces/<name> container with one <projectName> symlink per checkout) is joined
+        // with project names. The threshold matches isMultiProject().
         const repoPaths =
-          config.projects != null && config.projects.length > 0
+          config.projects != null && config.projects.length > 1
             ? [
                 ...new Set(
                   config.projects.map((project) => path.join(config.cwd, project.projectName))
@@ -929,10 +949,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {
-          repoEnvs.push(
-            config.runtime instanceof LocalBaseRuntime
-              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
-              : config.runtime != null
+          if (config.runtime instanceof LocalBaseRuntime) {
+            await assertLocalRepoDirectoryExists(repoPath);
+            repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
+          } else {
+            repoEnvs.push(
+              config.runtime != null
                 ? await gitNoRepoAutomationEnvForRuntimeRepo(
                     config.runtime,
                     repoPath,
@@ -940,7 +962,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
                     true
                   )
                 : gitNoRepoAutomationEnv()
-          );
+            );
+          }
         }
         hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
       }

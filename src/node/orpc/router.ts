@@ -1745,6 +1745,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.setPinned(input.workspaceId, input.pinned)
         ),
+      keepInterruptedDelegatedWorkspace: t
+        .input(schemas.workspace.keepInterruptedDelegatedWorkspace.input)
+        .output(schemas.workspace.keepInterruptedDelegatedWorkspace.output)
+        .handler(async ({ context, input }) =>
+          context.workspaceService.keepInterruptedDelegatedWorkspace(input.workspaceId)
+        ),
       reorderPinned: t
         .input(schemas.workspace.reorderPinned.input)
         .output(schemas.workspace.reorderPinned.output)
@@ -1880,7 +1886,11 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)
         .handler(({ context, input }) =>
-          context.workspaceService.sendHeldInput(input.workspaceId, input.heldInputId)
+          context.workspaceService.sendHeldInput(
+            input.workspaceId,
+            input.heldInputId,
+            input.acpCorrelation
+          )
         ),
       discardHeldInput: t
         .input(schemas.workspace.discardHeldInput.input)
@@ -2242,6 +2252,16 @@ export const router = (authToken?: string) => {
         .input(schemas.tasks.create.input)
         .output(schemas.tasks.create.output)
         .handler(({ context, input }) => context.taskService.createFromRpc(input)),
+      previewRemoval: t
+        .input(schemas.tasks.previewRemoval.input)
+        .output(schemas.tasks.previewRemoval.output)
+        .handler(({ context, input }) => context.taskService.previewSubagentRemoval(input.taskId)),
+      remove: t
+        .input(schemas.tasks.remove.input)
+        .output(schemas.tasks.remove.output)
+        .handler(({ context, input }) =>
+          context.taskService.removeSubagentForUser(input.taskId, input.acknowledgedWork)
+        ),
     },
     window: {
       setTitle: t

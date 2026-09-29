@@ -74,6 +74,7 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -116,6 +117,7 @@ import {
   AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
+  WorkspaceRemoveWarningSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
@@ -1509,6 +1511,11 @@ export const workspace = {
     input: z.object({ workspaceId: z.string(), pinned: z.boolean() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /** Keep a delegated workspace whose setup was interrupted (#4983): clears its flag. */
+  keepInterruptedDelegatedWorkspace: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   reorderPinned: {
     /**
      * Full desired pinned order for one project bucket. The server derives the
@@ -1812,7 +1819,12 @@ export const workspace = {
    * unless the send is accepted; the error explains why it was not.
    */
   sendHeldInput: {
-    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      heldInputId: z.string(),
+      /** ACP /send-held only: re-send as this prompt instead of the one it was queued as. */
+      acpCorrelation: AcpPromptCorrelationSchema.optional(),
+    }),
     output: ResultSchema(z.void(), SendMessageErrorSchema),
   },
   /** Drop a held input without sending it. */
@@ -2370,6 +2382,29 @@ export const tasks = {
         status: z.enum(["queued", "starting", "running"]),
         desktopOwnerWorkspaceId: z.string().optional(),
       }),
+      z.string()
+    ),
+  },
+  /** #5106: what removing a sub-agent would lose (summary null = nothing), for the user's confirmation. */
+  previewRemoval: {
+    input: z.object({ taskId: z.string() }),
+    output: ResultSchema(
+      z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+      z.string()
+    ),
+  },
+  /**
+   * #5106: user-confirmed sub-agent removal; never exposed as a model tool. `acknowledgedWork` is
+   * the preview the user confirmed: removal refuses if the work changed since.
+   */
+  remove: {
+    input: z.object({
+      taskId: z.string(),
+      acknowledgedWork: z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+    }),
+    // Warnings name what the forced removal left behind (#5143), as workspace.remove does.
+    output: ResultSchema(
+      z.object({ warnings: z.array(WorkspaceRemoveWarningSchema).optional() }),
       z.string()
     ),
   },

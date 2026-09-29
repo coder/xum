@@ -1,4 +1,4 @@
-import { describe, it, expect, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, it, expect, spyOn } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
@@ -1631,16 +1631,15 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
-        if (command.includes("rev-parse --git-dir"))
-          return Promise.resolve(createExecStream(".git\n"));
-        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream(""));
-        if (options.cwd === "/remote/workspace/project-a") {
-          return Promise.resolve(createExecStream("", 1));
-        }
-        if (options.cwd === "/remote/workspace/project-b") {
+        if (command.includes("xum-git-discovery 1")) {
+          if (options.cwd === "/remote/workspace/project-a") {
+            return Promise.resolve(createExecStream("xum-git-discovery 1\n\0drivers 1\n"));
+          }
           return Promise.resolve(
             createExecStream(
-              "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0"
+              "xum-git-discovery 1\n" +
+                "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0" +
+                "\0drivers 0\n"
             )
           );
         }
@@ -1668,22 +1667,26 @@ describe("remote bash git hardening", () => {
     )) as BashToolResult;
 
     expect(result.success).toBe(true);
-    expect(calls).toHaveLength(7);
+    expect(calls).toHaveLength(3);
     expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
-    expect(calls[3]?.options.cwd).toBe("/remote/workspace/project-b");
-    expect(calls[6]?.options.env?.ANTHROPIC_API_KEY).toBe("");
-    expect(Object.values(calls[6]?.options.env ?? {})).toContain("filter.evil.smudge");
-    expect(Object.values(calls[6]?.options.env ?? {})).toContain("alias.evil");
+    expect(calls[0]?.options.env?.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
+    expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("alias.evil");
   });
 
   it("fails closed when remote driver discovery fails", async () => {
     let callCount = 0;
     const runtime = {
       exec(): Promise<ExecStream> {
-        const exitCodes = [0, 0, 1, 0, 2];
-        const exitCode = exitCodes[callCount] ?? 2;
         callCount += 1;
-        return Promise.resolve(createExecStream("", exitCode));
+        // project-a discovery succeeds; project-b discovery exits 2.
+        return Promise.resolve(
+          callCount === 1
+            ? createExecStream("xum-git-discovery 1\n\0drivers 1\n")
+            : createExecStream("", 2)
+        );
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
@@ -1711,7 +1714,7 @@ describe("remote bash git hardening", () => {
     }
     expect(rejection).toBeInstanceOf(Error);
     expect((rejection as Error).message).toContain("Failed to inspect repository");
-    expect(callCount).toBe(5);
+    expect(callCount).toBe(2);
   });
 
   it("blanks run-session roots inherited by local Bash", async () => {
@@ -1742,6 +1745,153 @@ describe("remote bash git hardening", () => {
       if (previousMuxRoot == null) delete process.env.MUX_RUN_SESSION_ROOT;
       else process.env.MUX_RUN_SESSION_ROOT = previousMuxRoot;
     }
+  });
+});
+
+describe("untrusted bash repo discovery paths", () => {
+  // The host's global git config can define filters (git-lfs); isolate so results depend only
+  // on the repos built here.
+  const previousGitEnv: Record<string, string | undefined> = {};
+  let root: TestTempDir;
+
+  beforeEach(() => {
+    root = new TestTempDir("test-bash-repo-paths");
+    for (const key of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
+      previousGitEnv[key] = process.env[key];
+    }
+    const globalConfig = path.join(root.path, "gitconfig-global");
+    fs.writeFileSync(globalConfig, "");
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(previousGitEnv)) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+    root[Symbol.dispose]();
+  });
+
+  const PLANTED_SMUDGE = "echo planted-smudge";
+
+  function createRepo(name: string, options: { plantedFilter: boolean }): string {
+    const repo = path.join(root.path, name);
+    fs.mkdirSync(repo);
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    if (options.plantedFilter) {
+      execFileSync("git", ["config", "filter.probe.smudge", PLANTED_SMUDGE], { cwd: repo });
+      fs.writeFileSync(path.join(repo, ".gitattributes"), "* filter=probe\n");
+      execFileSync("git", ["add", ".gitattributes"], { cwd: repo });
+    }
+    return repo;
+  }
+
+  function createUntrustedLocalTool(cwd: string, projects: ProjectRef[]) {
+    const config = createTestToolConfig(cwd, { runtime: new LocalRuntime(cwd) });
+    const runtimeTempDir = path.join(root.path, "runtime-tmp");
+    fs.mkdirSync(runtimeTempDir, { recursive: true });
+    config.runtimeTempDir = runtimeTempDir;
+    config.trusted = false;
+    config.projects = projects;
+    return createBashTool(config);
+  }
+
+  // Same layout as the multi-project container: one symlink per project; only b plants a filter.
+  function createMultiProjectTool() {
+    const repoA = createRepo("repo-a", { plantedFilter: false });
+    const repoB = createRepo("repo-b", { plantedFilter: true });
+    const container = path.join(root.path, "_workspaces", "ws");
+    fs.mkdirSync(container, { recursive: true });
+    fs.symlinkSync(repoA, path.join(container, "a"));
+    fs.symlinkSync(repoB, path.join(container, "b"));
+    const tool = createUntrustedLocalTool(container, [
+      { projectName: "a", projectPath: "/projects/a" },
+      { projectName: "b", projectPath: "/projects/b" },
+    ]);
+    return { tool, repoB };
+  }
+
+  async function runScript(
+    tool: ReturnType<typeof createBashTool>,
+    script: string
+  ): Promise<BashToolResult> {
+    return (await tool.execute!(
+      { script, timeout_secs: 10, run_in_background: false, display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
+  }
+
+  it("untrusted single-project local workspace applies the repo's driver config", async () => {
+    const repo = createRepo("checkout", { plantedFilter: true });
+    // Production passes getProjects(metadata), which has one entry whose projectName differs
+    // from the checkout directory name.
+    const tool = createUntrustedLocalTool(repo, [
+      { projectName: "proj", projectPath: "/some/proj" },
+    ]);
+
+    const result = await runScript(tool, 'git config --get filter.probe.smudge; echo "rc=$?"');
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output).not.toContain("planted-smudge");
+      expect(result.output.trim()).toBe("rc=0");
+    }
+  });
+
+  it("untrusted single-project remote workspace inspects the workspace directory", async () => {
+    const calls: Array<{ command: string; options: ExecOptions }> = [];
+    const runtime = {
+      exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        calls.push({ command, options });
+        return Promise.resolve(
+          command.includes("xum-git-discovery 1")
+            ? createExecStream("xum-git-discovery 1\n\0drivers 1\n")
+            : createExecStream("done\n")
+        );
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [{ projectName: "proj", projectPath: "/remote/proj" }];
+    const tool = createBashTool(config);
+
+    const result = await runScript(tool, "echo hello");
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.command).toContain("xum-git-discovery 1");
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace");
+  });
+
+  it("untrusted multi-project local workspace inspects each project checkout", async () => {
+    const { tool } = createMultiProjectTool();
+
+    const result = await runScript(tool, 'git -C b config --get filter.probe.smudge; echo "rc=$?"');
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output).not.toContain("planted-smudge");
+      expect(result.output.trim()).toBe("rc=0");
+    }
+  });
+
+  it("untrusted local workspace fails when a project directory is missing", async () => {
+    const { tool, repoB } = createMultiProjectTool();
+    fs.rmSync(repoB, { recursive: true, force: true });
+    const marker = path.join(root.path, "command-ran");
+
+    let rejection: unknown;
+    try {
+      await runScript(tool, `touch ${JSON.stringify(marker)}`);
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toBe("Failed to inspect repository automation drivers");
+    expect(fs.existsSync(marker)).toBe(false);
   });
 });
 

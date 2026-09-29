@@ -592,6 +592,106 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // #5171: an ACP prompt that waits in the queue settles only on events carrying its correlation
+  // id. A dequeue refusal starts no stream, so the held list must name the refused prompt.
+  test("a queued send refused at dequeue is held with its ACP prompt correlation id", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-refused-acp-held",
+      captureEvents: true,
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        { model: TEST_MODEL, agentId: "exec", acpPromptId: "acp-prompt-1" },
+        {
+          acceptanceOrigin: "manual",
+          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+
+      expect(stream).not.toHaveBeenCalled();
+      expect(h.events.findLast((event) => event.type === "held-inputs-changed")).toMatchObject({
+        heldInputs: [{ displayText: "acp prompt", acpPromptId: "acp-prompt-1" }],
+      });
+    } finally {
+      stream.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
+  // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
+  test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "held-acp-correlation" });
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          acpPromptId: "old-prompt",
+          delegatedToolNames: ["file_read"],
+          muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"], keep: 1 },
+        },
+        {
+          acceptanceOrigin: "manual",
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+      const [held] = h.session.getHeldInputs();
+      const claimOptions = (correlation?: {
+        acpPromptId: string;
+        delegatedToolNames?: string[];
+      }) => {
+        const claim = h.session.claimHeldInputSend(held.id, correlation);
+        h.session.releaseHeldInputSend(held.id);
+        return claim.kind === "claimed" ? claim.send.options : undefined;
+      };
+
+      expect(claimOptions({ acpPromptId: "new-prompt" })).toMatchObject({
+        acpPromptId: "new-prompt",
+        delegatedToolNames: undefined,
+        muxMetadata: { acpPromptId: "new-prompt", keep: 1 },
+      });
+      expect(claimOptions({ acpPromptId: "new-prompt" })?.muxMetadata).not.toHaveProperty(
+        "acpDelegatedTools"
+      );
+      expect(
+        claimOptions({ acpPromptId: "new-prompt", delegatedToolNames: ["bash"] })
+      ).toMatchObject({
+        delegatedToolNames: ["bash"],
+        muxMetadata: { acpPromptId: "new-prompt", acpDelegatedTools: ["bash"] },
+      });
+      // Without a correlation (desktop Send) the send is exactly what was queued.
+      expect(claimOptions()).toMatchObject({ acpPromptId: "old-prompt" });
+      // The held copy itself is never rewritten: a failed re-send keeps the original.
+      expect(h.session.getHeldInputs()[0].send.options).toMatchObject({
+        acpPromptId: "old-prompt",
+        muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"] },
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
     let calls = 0;

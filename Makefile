@@ -95,7 +95,7 @@ include fmt.mk
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
-.PHONY: check-startup-imports check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
+.PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -538,7 +538,8 @@ test-e2e: ## Run end-to-end tests
 
 test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build
-	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts $(PLAYWRIGHT_ARGS)
+	@# One worker: parallel Electron apps contend on CPU, so a scenario measures its neighbours' startup (#5209).
+	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
 
 ## Distribution
 dist: build ## Build distributable packages
@@ -722,6 +723,13 @@ clean: ## Clean build artifacts
 check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Check that heavy packages stay off the eager startup import path
 	@bun test ./scripts/check-startup-imports.test.ts
 	@bun scripts/check-startup-imports.ts
+
+# Post-build complement to check-startup-imports (#4423): loads dist/desktop/main.js in
+# plain Node with a stubbed `electron` and fails if a banned package is in require.cache.
+# Catches what the static walk cannot (module-scope import(), computed require()).
+# Needs a build, so it runs in CI's Smoke / Server job rather than static-check.
+check-startup-imports-runtime: build-main ## Check the built desktop main process loads no banned package
+	@bun scripts/check-startup-imports-runtime.ts
 
 # ~3 s: compiles only the hot-path files listed in the script, so it runs in static-check.
 check-react-compiler: node_modules/.installed ## Fail when a hot renderer component stops compiling under React Compiler

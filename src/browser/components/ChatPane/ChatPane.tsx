@@ -70,6 +70,7 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { HeldInput } from "@/browser/features/Messages/HeldInput";
+import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
@@ -1656,6 +1657,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     // composer surface is replaced with a single read-only notice.
                     <>
                       {turnStatus}
+                      {/* A failed cleanup can leave a flagged row whose checkout is gone (#4983). */}
+                      {meta?.delegatedCreationInterrupted === true && (
+                        <DelegatedCreationInterruptedBanner
+                          key={workspaceId}
+                          workspaceId={workspaceId}
+                          workspaceName={workspaceName}
+                        />
+                      )}
                       <TranscriptOnlyNoticePane
                         workspaceId={workspaceId}
                         heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
@@ -1674,6 +1683,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       transcriptReplayFailed={transcriptReplayFailed}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
+                      delegatedCreationInterrupted={meta?.delegatedCreationInterrupted === true}
                       preStreamAgentTaskStatus={
                         meta?.taskStatus === "starting" ? "starting" : "queued"
                       }
@@ -1768,6 +1778,8 @@ interface ChatInputPaneProps {
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
   isPreStreamAgentTask: boolean;
+  /** The delegated task that created this workspace died before its setup finished (#4983). */
+  delegatedCreationInterrupted: boolean;
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -1936,6 +1948,20 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     addDecorationEntry({
       key: "reviews-banner",
       node: <ReviewsBanner workspaceId={props.workspaceId} />,
+    });
+  }
+  if (props.delegatedCreationInterrupted) {
+    addDecorationEntry({
+      key: "delegated-creation-interrupted",
+      node: (
+        <DelegatedCreationInterruptedBanner
+          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+          // pending Remove/Keep or its error must not carry over to another's banner.
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspaceName={props.workspaceName}
+        />
+      ),
     });
   }
   if (props.isPreStreamAgentTask) {

@@ -6,6 +6,8 @@ import * as path from "path";
 import * as devcontainerCli from "./devcontainerCli";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 
 interface RuntimeState {
   remoteHomeDir?: string;
@@ -205,7 +207,7 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
       ]);
       expect(exitCode).toBe(0);
       expect(argv).toContain("exec\n--workspace-folder\n");
-      expect(argv).toContain("cd '.' && ./.xum/archive");
+      expect(argv).toContain("cd '.' || exit; ./.xum/archive");
       expect(argv).not.toContain(`cd '${binDir}'`);
     }
   );
@@ -245,6 +247,74 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
       expect(unknown).toContain(`XUM_TEST_INSIDE=${hostWorkspace}/nested/file`);
     }
   );
+});
+
+describe("DevcontainerRuntime.exec multi-line commands", () => {
+  // A fake `devcontainer` CLI that runs the command after `--` from its own cwd. exec spawns it
+  // with the host workspace as cwd, which stands in for the container's workspace folder, where
+  // `devcontainer exec` starts commands.
+  let binDir: string;
+  let originalPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "fake-devcontainer-")));
+    await fs.writeFile(
+      path.join(binDir, "devcontainer"),
+      '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',
+      { mode: 0o755 }
+    );
+    await fs.mkdir(path.join(binDir, "workspace"));
+    originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = originalPath;
+    await fs.rm(binDir, { recursive: true, force: true });
+  });
+
+  const run = (command: string, cwd: string) =>
+    execBuffered(createRuntime({ currentWorkspacePath: binDir }), command, {
+      cwd,
+      pathEnv: { XUM_TEST_PATH: "relative" },
+      timeout: 10,
+    });
+
+  it.skipIf(process.platform === "win32")(
+    "a missing cwd fails the command instead of running later lines in the workspace folder",
+    async () => {
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await run(command, `${binDir}/missing`);
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "later lines run in the cwd with the exported path env",
+    async () => {
+      const cwd = `${binDir}/workspace`;
+      const result = await run('true\npwd\necho "path=$XUM_TEST_PATH"', cwd);
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: 0,
+        stdout: `${cwd}\npath=${cwd}/relative\n`,
+      });
+    }
+  );
+
+  for (const c of MULTI_LINE_COMMAND_CASES) {
+    it.skipIf(process.platform === "win32")(`keeps output and exit code: ${c.name}`, async () => {
+      const result = await run(c.command, `${binDir}/workspace`);
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: c.exitCode,
+        stdout: c.stdout,
+      });
+    });
+  }
 });
 
 describe("DevcontainerRuntime.mapHostPathToContainer", () => {

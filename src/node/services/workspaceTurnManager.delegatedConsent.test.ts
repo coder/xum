@@ -7,6 +7,9 @@ import type { Config } from "@/node/config";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
+import { createMuxMessage } from "@/common/types/message";
+import { HistoryService } from "@/node/services/historyService";
 import {
   workspaceTurnOwnerLockPath,
   type WorkspaceTurnManager,
@@ -64,6 +67,12 @@ describe("delegated target default consent (#4453)", () => {
         (...args: Parameters<WorkspaceHost["removeWhileTaskTreeLocked"]>) =>
           real.removeWhileTaskTreeLocked(...args)
       ),
+      clearDelegatedCreationMark: mock((id: string, handleId: string) =>
+        real.clearDelegatedCreationMark(id, handleId)
+      ),
+      markDelegatedCreationInterrupted: mock((id: string, handleId: string) =>
+        real.markDelegatedCreationInterrupted(id, handleId)
+      ),
     });
     const { taskService: manager } = createWorkspaceTurnManagerHarness(config, {
       aiService,
@@ -108,6 +117,40 @@ describe("delegated target default consent (#4453)", () => {
     const lock = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
     await fsPromises.writeFile(lockPath, JSON.stringify({ ...lock, token: "dead-owner" }));
   }
+
+  /** #4983: the creator-written mark on a row (TARGET unless another id is given). */
+  const mark = (config: Config, workspaceId = TARGET) =>
+    findWorkspaceEntry(config.loadConfigOrDefault(), workspaceId)?.workspace.delegatedCreation;
+
+  /** The owner's task tool call started the creation, so the owner has a transcript. */
+  async function ownerMidTurn(config: Config, parentId: string) {
+    const turn = createMuxMessage("msg_owner", "user", "delegate");
+    expect((await new HistoryService(config).appendToHistory(parentId, turn)).success).toBe(true);
+  }
+
+  /**
+   * #4983: the creator died (SIGKILL, power loss) after create() registered the target and before
+   * its handle record persisted. The in-test creator stays paused until `finish`.
+   */
+  async function crashBeforeRecord(options: { disposable?: boolean } = {}) {
+    const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
+    const creating = createTurn(a.manager, a.parentId, {
+      mode: "new",
+      disposable: options.disposable,
+    }).catch(() => undefined);
+    await created.promise;
+    await ownerMidTurn(a.config, a.parentId);
+    await markCreatorDead();
+    const finish = async () => {
+      paused.resolve();
+      await creating;
+    };
+    return { ...a, finish };
+  }
+
+  const handleRecordPath = (parentId: string) =>
+    path.join(rootDir, "sessions", parentId, "task-handles", "wst_handle.json");
 
   const endTurn = (
     manager: WorkspaceTurnManager,
@@ -324,7 +367,7 @@ describe("delegated target default consent (#4453)", () => {
     expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
 
     // The next startup's resolver clears it (the lock was released with the settlement).
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
@@ -339,7 +382,7 @@ describe("delegated target default consent (#4453)", () => {
       return cfg;
     });
 
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config).pending).toBe(true);
   });
 
@@ -349,16 +392,270 @@ describe("delegated target default consent (#4453)", () => {
       const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
       const creating = createTurn(a.manager, a.parentId, { mode: "new" });
       await created.promise; // The row exists with its mark; the handle record does not yet.
+      const binding = { handleId: "wst_handle", ownerWorkspaceId: a.parentId };
+      expect(mark(a.config)).toEqual(binding);
+      await ownerMidTurn(a.config, a.parentId);
       if (creator === "dead") await markCreatorDead();
 
-      await a.manager.clearOrphanedDelegatedConsentDefaults();
-      await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+      await a.manager.resolveOrphanedDelegatedTargets();
+      await (await backend()).manager.resolveOrphanedDelegatedTargets();
       expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
+      // #4983: only a dead creator's target is flagged, and flagging removes nothing.
+      const flaggedAt = mark(a.config)?.interruptedAt;
+      expect(flaggedAt === undefined).toBe(creator === "alive");
+      const lock = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+      expect((await fsPromises.stat(lock).catch(() => null)) === null).toBe(creator === "dead");
+      // A later startup leaves a flagged row as it is.
+      await (await backend()).manager.resolveOrphanedDelegatedTargets();
+      expect(mark(a.config)?.interruptedAt).toBe(flaggedAt);
 
       paused.resolve();
       expect((await creating).success).toBe(true);
+      // A persisted record ends the unconfirmed mark; a confirmed flag stays for the user.
+      expect(mark(a.config)).toEqual(
+        creator === "alive" ? undefined : { ...binding, interruptedAt: flaggedAt }
+      );
       await endTurn(a.manager, a.parentId);
       expect(targetRow(a.config).consent === undefined).toBe(creator === "dead");
     });
   }
+
+  test("a disposable target is marked too and flagged when its creator dies (#4983)", async () => {
+    const a = await crashBeforeRecord({ disposable: true });
+    expect(mark(a.config)?.interruptedAt).toBeUndefined();
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    await a.finish();
+  });
+
+  test("copied reserved tags never make a workspace an orphan (#4983)", async () => {
+    // A real orphan leaves a lock with a dead holder; a public create copies its tags.
+    const a = await crashBeforeRecord();
+    const tags = { "mux.taskHandleId": "wst_handle", "mux.taskOwnerWorkspaceId": a.parentId };
+    const input = workspaceApi.create.input.parse({
+      projectPath: a.projectPath,
+      branchName: "forged",
+      tags,
+      delegatedCreation: { handleId: "wst_handle", ownerWorkspaceId: a.parentId },
+    });
+    expect(input).not.toHaveProperty("delegatedCreation");
+    const forged = await a.real.create(
+      input.projectPath,
+      input.branchName,
+      "main",
+      undefined,
+      {
+        type: "local",
+      },
+      undefined,
+      false,
+      input.tags
+    );
+    expect(forged.success).toBe(true);
+    const forgedId = forged.success ? forged.data.metadata.id : "";
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), forgedId)?.workspace).toBeDefined();
+    expect(mark(a.config, forgedId)).toBeUndefined();
+    await a.finish();
+  });
+
+  test("a handle record file, even an unreadable one, means the target is not an orphan (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    // Corrupt, or written by a newer build: getWorkspaceTurn() reads it as null.
+    await fsPromises.mkdir(path.dirname(handleRecordPath(a.parentId)), { recursive: true });
+    await fsPromises.writeFile(handleRecordPath(a.parentId), "{ not json");
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    // Not flagged, and the mark stays: the unreadable record cannot bind the target itself.
+    expect(mark(a.config)).toEqual({ handleId: "wst_handle", ownerWorkspaceId: a.parentId });
+    await fsPromises.rm(handleRecordPath(a.parentId));
+    await a.finish();
+  });
+
+  test("a mark left beside a persisted record is cleared, not flagged (#4983)", async () => {
+    const { config, manager, parentId } = await setUp();
+    await start(manager, parentId, { mode: "new" });
+    expect(mark(config)).toBeUndefined();
+    // The creator died between its record write and the mark's clear.
+    await config.editConfig((cfg) => {
+      const row = findWorkspaceEntry(cfg, TARGET)?.workspace;
+      if (row) row.delegatedCreation = { handleId: "wst_handle", ownerWorkspaceId: parentId };
+      return cfg;
+    });
+    await markCreatorDead();
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(config)).toBeUndefined();
+  });
+
+  test("an orphan whose owner is gone is left unflagged (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    // Records are deleted with the owner's session dir, so a missing record proves nothing.
+    await fsPromises.rm(path.join(rootDir, "sessions", a.parentId), {
+      recursive: true,
+      force: true,
+    });
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeUndefined();
+    await a.finish();
+  });
+
+  test("an orphan being removed is left unflagged (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    await a.config.editConfig((cfg) => {
+      const row = findWorkspaceEntry(cfg, TARGET)?.workspace;
+      if (row) {
+        const identity = { birth: null, bootId: null, pidNs: null, machineId: null };
+        row.pendingRemoval = {
+          removalId: "removal",
+          instanceId: "other",
+          // Another live process (init), so no self-heal takes the marker over.
+          pid: 1,
+          identity: { ...identity, platform: process.platform, hostname: null },
+          at: new Date().toISOString(),
+        };
+      }
+      return cfg;
+    });
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(
+      findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace.pendingRemoval
+    ).toBeDefined();
+    expect(mark(a.config)?.interruptedAt).toBeUndefined();
+    await a.finish();
+  });
+
+  test("the resolver never touches the target's runtime (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    // An SSH host that cannot resolve: any probe would fail or hang instead of flagging.
+    await a.config.editConfig((cfg) => {
+      const row = findWorkspaceEntry(cfg, TARGET)?.workspace;
+      if (row) row.runtimeConfig = { type: "ssh", host: "orphan.invalid", srcBaseDir: "/src" };
+      return cfg;
+    });
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    await a.finish();
+  });
+
+  test("a flagged orphan whose consent clear failed gets it cleared next time (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    // The consent clear's write fails (it only logs); the flag write after it succeeds.
+    spyOn(b.config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(targetRow(a.config).pending).toBe(true);
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    expect(targetRow(a.config).pending).toBeUndefined();
+    await a.finish();
+  });
+
+  test("the flag reaches workspace metadata, and Keep drops only a flagged mark (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const flagOf = async () =>
+      (await a.config.getAllWorkspaceMetadata()).find((meta) => meta.id === TARGET)
+        ?.delegatedCreationInterrupted;
+    // Keep cannot erase the binding of a creation nobody flagged.
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)?.handleId).toBe("wst_handle");
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    expect(await flagOf()).toBe(true);
+
+    const published: unknown[] = [];
+    a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId !== TARGET) return;
+      published.push(
+        (event.metadata as { delegatedCreationInterrupted?: true } | null)
+          ?.delegatedCreationInterrupted
+      );
+    });
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)).toBeUndefined();
+    expect(await flagOf()).toBeUndefined();
+    // Keep publishes the cleared flag, so the banner goes away without a reload.
+    expect(published).toHaveLength(1);
+    expect(published[0]).toBeUndefined();
+    await a.finish();
+  });
+
+  test("the startup pass never builds probed metadata (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    // Building metadata probes every checkout, which a stalled mount blocks indefinitely.
+    const build = spyOn(b.config, "getAllWorkspaceMetadata");
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(build).not.toHaveBeenCalled();
+    await a.finish();
+  });
+
+  test("Keep also drops a pending consent default the resolver failed to clear (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    spyOn(b.config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    await b.manager.resolveOrphanedDelegatedTargets();
+    expect(targetRow(a.config).pending).toBe(true);
+
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+
+    expect(mark(a.config)).toBeUndefined();
+    expect(targetRow(a.config).pending).toBeUndefined();
+    await a.finish();
+  });
+
+  test("Keep republishes an already kept workspace, so a retry clears a stale banner (#5199)", async () => {
+    const a = await crashBeforeRecord();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    // Another backend kept it: this backend's renderer never saw the cleared flag.
+    expect((await (await backend()).real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(
+      true
+    );
+    const published: unknown[] = [];
+    a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId !== TARGET) return;
+      published.push(
+        (event.metadata as { delegatedCreationInterrupted?: true } | null)
+          ?.delegatedCreationInterrupted
+      );
+    });
+
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+
+    expect(published).toHaveLength(1);
+    expect(published[0]).toBeUndefined();
+    await a.finish();
+  });
+
+  test("a failed flag write never fails startup and is retried next time (#4983)", async () => {
+    const a = await crashBeforeRecord({ disposable: true }); // No consent write comes first.
+    const b = await backend();
+    spyOn(b.config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+    expect(mark(a.config)?.interruptedAt).toBeUndefined();
+
+    // The lock was released, so the next startup takes it again and flags.
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    await a.finish();
+  });
 });

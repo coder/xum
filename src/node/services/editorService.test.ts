@@ -9,12 +9,8 @@ const emptyConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
 };
 
 const externalEditorOpenRecorder = {
-  recordExternalEditorOpenForLaunch: () =>
-    Promise.resolve({
-      success: true as const,
-      data: { rollbackAfterFailedLaunch: () => Promise.resolve() },
-    }),
-} satisfies Pick<WorkspaceService, "recordExternalEditorOpenForLaunch">;
+  launchExternalEditor: (_workspaceId, launch) => launch(),
+} satisfies Pick<WorkspaceService, "launchExternalEditor">;
 
 function createEditorService(config: Pick<Config, "getAllWorkspaceMetadata">): EditorService {
   return new EditorService(config, externalEditorOpenRecorder);

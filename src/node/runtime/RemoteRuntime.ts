@@ -39,7 +39,7 @@ import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { DisposableProcess } from "@/node/utils/disposableExec";
 import { shescape } from "./streamUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { buildShellExport, buildShellPathExport } from "./shellEnv";
+import { buildGuardedCommand, buildShellExport, buildShellPathExport } from "./shellEnv";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   buildRegularFileReadCommand,
@@ -138,11 +138,8 @@ export abstract class RemoteRuntime implements Runtime {
       parts.push(buildShellPathExport(key, value, (envValue) => shescape.quote(envValue)));
     }
 
-    // Add the actual command
-    parts.push(command);
-
-    // Join all parts with && to ensure each step succeeds before continuing
-    let fullCommand = parts.join(" && ");
+    // Join the setup steps with && and skip every line of the command if one fails (#5192)
+    let fullCommand = buildGuardedCommand(parts, command);
 
     // Wrap in bash for consistent shell behavior
     fullCommand = `bash -c ${shescape.quote(fullCommand)}`;

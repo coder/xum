@@ -75,7 +75,9 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
-import { PendingRemovalSchema } from "@/common/schemas/project";
+import { sharesPlanDirectory } from "@/common/utils/planStorage";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import { DelegatedCreationMarkSchema, PendingRemovalSchema } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
@@ -710,6 +712,15 @@ function healMalformedTaskAttemptId(
   persisted.taskAttemptUnproven = true;
 }
 
+/** #4983: the metadata flag for a delegated target the startup resolver flagged. */
+function delegatedCreationInterruptedField(workspace: Workspace): {
+  delegatedCreationInterrupted?: true;
+} {
+  return workspace.delegatedCreation?.interruptedAt != null
+    ? { delegatedCreationInterrupted: true }
+    : {};
+}
+
 function normalizePersistedWorkspace(
   workspace: ProjectConfig["workspaces"][number]
 ): ProjectConfig["workspaces"][number] {
@@ -747,13 +758,19 @@ function normalizePersistedWorkspace(
   const hasMalformedConsentPending =
     Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
     persisted.unrelatedWorkspaceConsentPending !== true;
+  // A malformed delegated-creation mark reads as absent: the startup resolver then leaves the row
+  // alone, as it does every row without the creator's mark (#4983).
+  const hasMalformedDelegatedCreation =
+    Object.hasOwn(persisted, "delegatedCreation") &&
+    !DelegatedCreationMarkSchema.safeParse(persisted.delegatedCreation).success;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
-    !hasMalformedConsentPending
+    !hasMalformedConsentPending &&
+    !hasMalformedDelegatedCreation
   ) {
     return workspace;
   }
@@ -763,6 +780,7 @@ function normalizePersistedWorkspace(
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
+  if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -1011,13 +1029,56 @@ class ProjectRegistrationLockContended extends Error {
 }
 
 /**
- * Another workspace in the project already has this name. The text avoids "Workspace already
- * exists", which create() treats as a retry-with-suffix signal.
+ * Another workspace in the project already has this name, or a workspace in `sharedWithProjectPath`
+ * does and keeps its plans in the same plan directory (a same-basename project on the same plan
+ * storage, #5139). The text avoids "Workspace already exists", which create() treats as a
+ * retry-with-suffix signal.
  */
 export class WorkspaceNameTakenError extends Error {
-  constructor(workspaceName: string) {
-    super(`Workspace with name "${workspaceName}" already exists in this project`);
+  constructor(workspaceName: string, sharedWithProjectPath?: string) {
+    super(
+      sharedWithProjectPath === undefined
+        ? `Workspace with name "${workspaceName}" already exists in this project`
+        : `Workspace with name "${workspaceName}" already exists in ${sharedWithProjectPath}, which keeps its plans in the same directory as this project`
+    );
     this.name = "WorkspaceNameTakenError";
+  }
+}
+
+/**
+ * The `projectName` a config row's metadata carries (and its plan directory, plans/<projectName>/):
+ * scratch chats use a fixed name, multi-project rows join their projects' names, and every other
+ * row uses the basename of the project it is stored under.
+ */
+function projectNameOfEntry(
+  configProjectPath: string,
+  workspace: Pick<Workspace, "kind" | "projects">
+): string {
+  if (workspace.kind === "scratch") return SCRATCH_PROJECT_NAME;
+  const workspaceProjects = workspace.projects?.length ? workspace.projects : undefined;
+  return workspaceProjects
+    ? workspaceProjects.map((projectRef) => projectRef.projectName).join("+")
+    : PlatformPaths.getProjectName(configProjectPath);
+}
+
+/**
+ * Registered rows that keep their plans in `target`'s plan directory: plans/<projectName>/ on shared
+ * plan storage, which same-basename projects share (#5139). A name such a row uses is taken for
+ * `target`: its plan file is the same file. Rows default their runtime like the metadata the
+ * removal's plan guard reads.
+ */
+export function* workspacesSharingPlanDirectory(
+  projects: ProjectsConfig["projects"],
+  target: { projectName: string; runtimeConfig: RuntimeConfig }
+): Generator<{ projectPath: string; workspace: Workspace }> {
+  for (const [projectPath, project] of projects) {
+    for (const workspace of project.workspaces) {
+      const row = {
+        projectName: projectNameOfEntry(projectPath, workspace),
+        runtimeConfig: workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
+      };
+      if (sharesPlanDirectory(row, target)) yield { projectPath, workspace };
+    }
   }
 }
 
@@ -3608,8 +3669,6 @@ export class Config {
         continue;
       }
 
-      const projectName = this.getProjectName(projectPath);
-
       for (const storedWorkspace of projectConfig.workspaces) {
         const archived = isWorkspaceArchived(
           storedWorkspace.archivedAt,
@@ -3655,12 +3714,7 @@ export class Config {
           workspace.kind === "scratch"
             ? workspace.path
             : (primaryWorkspaceProject?.projectPath ?? projectPath);
-        const resolvedProjectName =
-          workspace.kind === "scratch"
-            ? SCRATCH_PROJECT_NAME
-            : workspaceProjects
-              ? workspaceProjects.map((projectRef) => projectRef.projectName).join("+")
-              : projectName;
+        const resolvedProjectName = projectNameOfEntry(projectPath, workspace);
 
         try {
           // NEW FORMAT: If workspace has metadata in config, use it directly
@@ -3706,6 +3760,7 @@ export class Config {
               taskStatus: workspace.taskStatus,
               taskPendingGuidance: workspace.taskPendingGuidance,
               taskLaunchError: workspace.taskLaunchError,
+              ...delegatedCreationInterruptedField(workspace),
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
               taskThinkingLevel: workspace.taskThinkingLevel,
@@ -3889,6 +3944,8 @@ export class Config {
             metadata.taskStatus ??= workspace.taskStatus;
             metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
             metadata.taskLaunchError ??= workspace.taskLaunchError;
+            metadata.delegatedCreationInterrupted ??=
+              delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
             metadata.reportedAt ??= workspace.reportedAt;
             metadata.taskModelString ??= workspace.taskModelString;
             metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
@@ -4010,6 +4067,7 @@ export class Config {
               taskStatus: workspace.taskStatus,
               taskPendingGuidance: workspace.taskPendingGuidance,
               taskLaunchError: workspace.taskLaunchError,
+              ...delegatedCreationInterruptedField(workspace),
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
               taskThinkingLevel: workspace.taskThinkingLevel,
@@ -4092,6 +4150,7 @@ export class Config {
             taskStatus: workspace.taskStatus,
             taskPendingGuidance: workspace.taskPendingGuidance,
             taskLaunchError: workspace.taskLaunchError,
+            ...delegatedCreationInterruptedField(workspace),
             reportedAt: workspace.reportedAt,
             taskModelString: workspace.taskModelString,
             taskThinkingLevel: workspace.taskThinkingLevel,
@@ -4194,9 +4253,11 @@ export class Config {
       unrelatedWorkspaceConsentPending?: true;
       /**
        * Reject with WorkspaceNameTakenError, writing nothing, when another row in the project has
-       * this name. Checked on the fresh config inside the serialized write, so of two concurrent
-       * registrations of one name exactly one lands (#5026). Legacy rows without a `name` are the
-       * caller's to check up front; rows registered concurrently always carry one.
+       * this name, or a row in another project does and keeps its plans in the same plan
+       * directory (`metadata.projectName` on shared plan storage, #5139). Checked on the fresh
+       * config inside the serialized write, so of two concurrent registrations of one name
+       * exactly one lands (#5026). Legacy rows without a `name` are the caller's to check up
+       * front; rows registered concurrently always carry one.
        */
       refuseTakenName?: true;
       /**
@@ -4229,11 +4290,25 @@ export class Config {
         config.projects.set(projectPath, project);
       }
 
-      if (
-        options.refuseTakenName === true &&
-        project.workspaces.some((w) => w.id !== metadata.id && w.name === metadata.name)
-      ) {
-        throw new WorkspaceNameTakenError(metadata.name);
+      if (options.refuseTakenName === true) {
+        // The caller's plan copy went to plans/<metadata.projectName>/<name>.md: compare that
+        // directory, not one derived here, so this check covers the file actually written.
+        assert(
+          typeof metadata.projectName === "string" && metadata.projectName.length > 0,
+          "refuseTakenName needs the projectName of the caller's plan directory"
+        );
+        if (project.workspaces.some((w) => w.id !== metadata.id && w.name === metadata.name)) {
+          throw new WorkspaceNameTakenError(metadata.name);
+        }
+        const planTarget = {
+          projectName: metadata.projectName,
+          runtimeConfig: metadata.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
+        };
+        for (const other of workspacesSharingPlanDirectory(config.projects, planTarget)) {
+          if (other.workspace.id !== metadata.id && other.workspace.name === metadata.name) {
+            throw new WorkspaceNameTakenError(metadata.name, other.projectPath);
+          }
+        }
       }
 
       // Check if workspace already exists (by ID)
@@ -4306,6 +4381,7 @@ export class Config {
           taskTerminalFailure: existing.taskTerminalFailure,
           pendingRemoval: existing.pendingRemoval,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          delegatedCreation: existing.delegatedCreation,
         };
       } else {
         // Add new workspace

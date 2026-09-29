@@ -744,6 +744,11 @@ export const HeldInputsChangedEventSchema = z.object({
       displayText: z.string(),
       attachmentCount: z.number().int().nonnegative(),
       reviewCount: z.number().int().nonnegative(),
+      /**
+       * The ACP prompt that queued this input, when one did. Such an input never starts a stream,
+       * so the ACP agent settles that prompt's turn from this list (#5171).
+       */
+      acpPromptId: z.string().optional(),
     })
   ),
 });
@@ -1087,3 +1092,12 @@ export const SendMessageOptionsSchema = z.object({
    */
   authoredText: z.string().optional(),
 });
+
+/**
+ * The ACP prompt a held input is re-sent as (#5170): replaces the correlation it was queued with,
+ * so the resent turn reports to the prompt that asked for it.
+ */
+export const AcpPromptCorrelationSchema = SendMessageOptionsSchema.pick({
+  acpPromptId: true,
+  delegatedToolNames: true,
+}).required({ acpPromptId: true });

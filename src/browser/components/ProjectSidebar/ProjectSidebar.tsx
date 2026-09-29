@@ -125,6 +125,7 @@ import {
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
@@ -947,6 +948,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
+  // Stays until dismissed: the cancelled row is gone, so the user could not reread it (#5143).
+  const workspaceRemoveWarning = usePopoverError(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;
@@ -1268,6 +1271,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             workspaceId,
             result.error ?? "Failed to cancel workspace creation"
           );
+        } else if (result.warnings?.length) {
+          // This forced removal skips the Force Delete dialog, so show what it left behind
+          // (#5143), e.g. a devcontainer that may still hold the plan.
+          workspaceRemoveWarning.showError(
+            workspaceId,
+            formatWorkspaceRemoveWarnings(result.warnings)
+          );
         }
       } finally {
         setRemovingWorkspaceIds((prev) => {
@@ -1277,7 +1287,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError]
+    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (
@@ -3737,6 +3747,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             error={workspaceRemoveError.error}
             prefix="Failed to cancel workspace creation"
             onDismiss={workspaceRemoveError.clearError}
+          />
+          <PopoverError
+            error={workspaceRemoveWarning.error}
+            prefix="Workspace creation cancelled, but something was left behind"
+            onDismiss={workspaceRemoveWarning.clearError}
           />
           <PopoverError
             error={projectRemoveError.error}

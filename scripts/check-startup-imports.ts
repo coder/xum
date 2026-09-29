@@ -28,6 +28,8 @@
  *   Keep dynamic imports inside the functions that need them.
  * - Computed loaders, such as a `createRequire()` result or `require(variable)`, are
  *   invisible to the import graph.
+ * `make check-startup-imports-runtime` (scripts/check-startup-imports-runtime.ts) covers
+ * both for the desktop main process after a build.
  *
  * Run: bun scripts/check-startup-imports.ts
  */
@@ -46,26 +48,38 @@ export interface StartupEntry {
    * "commonjs" (tsc output, `require` branch) or "bundle" (bundled, `import` branch).
    */
   output: EntryOutput;
+  /** Build output the runtime actually loads, relative to the project root. */
+  dist: string;
 }
 
 export type EntryOutput = "commonjs" | "bundle";
 
+// The registration test in check-startup-imports.test.ts fails when package.json
+// `main`/`bin` or a BrowserWindow `preload:` script points at a build output that is not
+// some entry's `dist`. It cannot cheaply detect worker threads (e.g.
+// src/node/utils/main/workerPool.ts, the analytics worker) or CLI subcommand modules:
+// whether those start before the splash screen is runtime control flow, and worker
+// threads have their own module registry, so neither this static guard nor the runtime
+// check sees them. Register new ones here by hand.
 export const STARTUP_ENTRIES: readonly StartupEntry[] = [
   {
     entry: "src/cli/index.ts",
     reason: "CLI shim; runs before every subcommand and the desktop app",
     output: "commonjs",
+    dist: "dist/cli/index.js",
   },
   {
     entry: "src/desktop/main.ts",
     reason: "Electron main process before the splash screen (loadServices() loads the rest)",
     output: "commonjs",
+    dist: "dist/desktop/main.js",
   },
   {
     entry: "src/desktop/preload.ts",
     reason: "renderer preload script",
     // Makefile builds dist/preload.js with `bun build`, not tsc.
     output: "bundle",
+    dist: "dist/preload.js",
   },
 ];
 
@@ -118,7 +132,7 @@ const RUNTIME_PROVIDED_PACKAGES = new Set(["electron"]);
 const CJS_RESOLVE = Symbol("cjs-resolve");
 
 /** Owning package of a resolved node_modules path ("node_modules/@a/b/x.js" -> "@a/b"). */
-function packageNameOfFile(file: string): string {
+export function packageNameOfFile(file: string): string {
   return packageNameOf(file.split("node_modules/").pop()!);
 }
 

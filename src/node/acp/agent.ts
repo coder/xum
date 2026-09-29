@@ -73,6 +73,7 @@ import {
   type ParsedAcpSlashCommand,
 } from "./slashCommands";
 import { StreamTranslator } from "./streamTranslator";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { ToolRouter } from "./toolRouter";
 
 const DEFAULT_AGENT_ID = "exec";
@@ -143,6 +144,11 @@ interface TurnCompletion {
    * Used to avoid binding fallback stream-start events emitted before prompt dispatch.
    */
   dispatchedAtMs?: number;
+  /**
+   * Bind only a stream-start that carries this turn's correlation id. A /send-held turn passes
+   * its id through the resend (#5170), so an uncorrelated start is another entry's stream.
+   */
+  requiresExactCorrelation?: boolean;
   /** Inactivity timer so idle prompt turns cannot hang forever. */
   timeoutHandle: ReturnType<typeof setTimeout>;
   /** Set after stream-start; only this message id may resolve/reject the turn. */
@@ -716,24 +722,7 @@ export class MuxAgent implements Agent {
     );
     assert(args.message.trim().length > 0, "sendWorkspaceMessageAndAwaitTurn: message required");
 
-    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
-
-    const promptCorrelationId = randomUUID();
-    const turnPromise = this.beginTurn(args.sessionId, promptCorrelationId);
-
-    // Attach a sink immediately so early stream failures cannot produce
-    // unhandled rejections before this method awaits turnPromise.
-    void turnPromise.catch(() => undefined);
-
-    try {
-      // Re-establish chat subscription if a prior one dropped (e.g., transient
-      // websocket interruption). Register the turn first so subscription
-      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
-      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
-      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
-
-      this.markTurnDispatched(args.sessionId, promptCorrelationId);
-
+    return this.dispatchAndAwaitTurn(args, async (promptCorrelationId) => {
       const delegatedToolNames = this.getDelegatedToolNames(args.sessionId);
       const optionsWithPromptCorrelation = this.attachPromptCorrelationToSendOptions(
         args.options,
@@ -756,6 +745,39 @@ export class MuxAgent implements Agent {
           `prompt: workspace.sendMessage failed: ${stringifyUnknown(sendResult.error)}`
         );
       }
+    });
+  }
+
+  /**
+   * Run one prompt turn: `dispatch` starts (or queues) the workspace message, and the returned
+   * response settles when that message's stream ends, aborts or fails.
+   */
+  private async dispatchAndAwaitTurn(
+    args: { sessionId: string; workspaceId: string; requiresExactCorrelation?: boolean },
+    dispatch: (promptCorrelationId: string) => Promise<void>
+  ): Promise<PromptResponse> {
+    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
+
+    const promptCorrelationId = randomUUID();
+    const turnPromise = this.beginTurn(
+      args.sessionId,
+      promptCorrelationId,
+      args.requiresExactCorrelation
+    );
+
+    // Attach a sink immediately so early stream failures cannot produce
+    // unhandled rejections before this method awaits turnPromise.
+    void turnPromise.catch(() => undefined);
+
+    try {
+      // Re-establish chat subscription if a prior one dropped (e.g., transient
+      // websocket interruption). Register the turn first so subscription
+      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
+      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
+      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
+
+      this.markTurnDispatched(args.sessionId, promptCorrelationId);
+      await dispatch(promptCorrelationId);
 
       const turn = await turnPromise;
       const usage = turn.usage ?? this.latestUsageBySessionId.get(args.sessionId);
@@ -888,6 +910,69 @@ export class MuxAgent implements Agent {
     switch (parsedCommand.kind) {
       case "invalid":
         return this.respondToCommand(sessionId, parsedCommand.message);
+
+      case "send-held": {
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
+        // the one it was queued with, so the turn binds only its own stream. A resend that is
+        // queued and then refused at dequeue is held again under this id and settles the turn
+        // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
+        // which says whether the input is still held (it may have been sent or discarded
+        // elsewhere since the notice).
+        let refusal: string | undefined;
+        const response = await this.dispatchAndAwaitTurn(
+          { sessionId, workspaceId, requiresExactCorrelation: true },
+          async (promptCorrelationId) => {
+            const delegatedToolNames = this.getDelegatedToolNames(sessionId);
+            const sendResult = await this.server.client.workspace.sendHeldInput({
+              workspaceId,
+              heldInputId: lookup.heldInput.id,
+              acpCorrelation: {
+                acpPromptId: promptCorrelationId,
+                delegatedToolNames: delegatedToolNames.length > 0 ? delegatedToolNames : undefined,
+              },
+            });
+            if (!sendResult.success) {
+              refusal = formatSendMessageError(sendResult.error).message;
+              throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
+            }
+          }
+        ).catch((error: unknown) => {
+          if (refusal == null) throw error;
+          return null;
+        });
+        if (response != null) {
+          return response;
+        }
+        assert(refusal != null, "send-held: a failed resend records its refusal");
+        return this.respondToCommand(
+          sessionId,
+          `Could not send unsent message ${lookup.number}: ${refusal}`
+        );
+      }
+
+      case "discard-held": {
+        // The ACP counterpart of the desktop banner's Discard (#4944). ACP cannot put text back
+        // into the client's prompt, so the held-input notice shows each message's full text;
+        // sending it is tracked in #5170.
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        const discardResult = await this.server.client.workspace.discardHeldInput({
+          workspaceId,
+          heldInputId: lookup.heldInput.id,
+        });
+        return this.respondToCommand(
+          sessionId,
+          discardResult.success
+            ? `Discarded unsent message ${lookup.number}.`
+            : `Could not discard unsent message ${lookup.number}: ${discardResult.error}`
+        );
+      }
 
       case "clear": {
         const clearResult = await this.server.client.workspace.truncateHistory({
@@ -1834,6 +1919,11 @@ export class MuxAgent implements Agent {
 
     this.refreshTurnInactivityTimeoutFromEvent(sessionId, event);
 
+    if (event.type === "held-inputs-changed") {
+      this.settleTurnHeldBeforeStart(sessionId, event.heldInputs);
+      return;
+    }
+
     if (event.type === "usage-delta") {
       if (!this.isActiveTurnMessage(sessionId, event.messageId)) {
         return;
@@ -1854,6 +1944,7 @@ export class MuxAgent implements Agent {
       const hasMatchingCorrelation = event.acpPromptId === completion.promptCorrelationId;
       const canFallbackToUncorrelatedStart =
         completion.messageId == null &&
+        completion.requiresExactCorrelation !== true &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
         event.acpPromptId == null &&
@@ -1938,6 +2029,32 @@ export class MuxAgent implements Agent {
       }
       this.rejectTurn(sessionId, new Error(`prompt stream failed: ${event.error}`));
     }
+  }
+
+  /**
+   * A queued prompt that the backend refused at dequeue (or a Stop returned from the queue) is
+   * kept as held input and never starts a stream, so no terminal event would settle its turn
+   * (#5171). The held list names that prompt by its correlation id: settle the turn from it.
+   */
+  private settleTurnHeldBeforeStart(
+    sessionId: string,
+    heldInputs: Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }>["heldInputs"]
+  ): void {
+    const completion = this.turnCompletions.get(sessionId);
+    // A turn bound to its stream-start was dispatched: its input was sent, so it is not held.
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const held = heldInputs.find(
+      (heldInput) => heldInput.acpPromptId === completion.promptCorrelationId
+    );
+    if (held == null) {
+      return;
+    }
+    this.resolveTurn(sessionId, {
+      stopReason: held.reason === "interrupted" ? "cancelled" : "refusal",
+      usage: this.latestUsageBySessionId.get(sessionId),
+    });
   }
 
   private async maybeDelegateToolCallToEditor(
@@ -2054,7 +2171,11 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private beginTurn(sessionId: string, promptCorrelationId: string): Promise<TurnResult> {
+  private beginTurn(
+    sessionId: string,
+    promptCorrelationId: string,
+    requiresExactCorrelation?: boolean
+  ): Promise<TurnResult> {
     assert(
       !this.turnCompletions.has(sessionId),
       `prompt: session '${sessionId}' already has a running turn`
@@ -2081,6 +2202,7 @@ export class MuxAgent implements Agent {
         promptCorrelationId,
         startedAtMs,
         timeoutHandle,
+        requiresExactCorrelation,
       });
     });
   }

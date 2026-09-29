@@ -1,6 +1,8 @@
-import { describe, it, expect } from "bun:test";
-import { execSync } from "child_process";
+import { afterEach, beforeEach, describe, it, expect } from "bun:test";
+import { execSync, spawnSync } from "child_process";
 import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import {
   shellQuote,
   buildWrapperScript,
@@ -9,6 +11,7 @@ import {
   parseExitCode,
   parsePid,
 } from "./backgroundCommands";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 
 describe("backgroundCommands", () => {
   describe("shellQuote", () => {
@@ -34,7 +37,7 @@ describe("backgroundCommands", () => {
   });
 
   describe("buildWrapperScript", () => {
-    it("builds script with trap, cd, and user script joined by &&", () => {
+    it("builds script with trap and cd joined by &&, then the user script", () => {
       const result = buildWrapperScript({
         exitCodePath: "/tmp/exit_code",
         cwd: "/home/user/project",
@@ -42,7 +45,7 @@ describe("backgroundCommands", () => {
       });
 
       expect(result).toBe(
-        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' && echo hello`
+        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' || exit; echo hello`
       );
     });
 
@@ -108,6 +111,63 @@ describe("backgroundCommands", () => {
       });
 
       expect(result).toContain("export MSG='it'\"'\"'s a test'");
+    });
+
+    describe("multi-line scripts", () => {
+      let root: string;
+
+      beforeEach(async () => {
+        root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "bg-wrapper-lines-")));
+        await fs.mkdir(path.join(root, "workspace"));
+      });
+
+      afterEach(async () => {
+        await fs.rm(root, { recursive: true, force: true });
+      });
+
+      // Runs the wrapper the way buildSpawnCommand does, from `root`, which stands in for the
+      // spawn command's fallback cwd.
+      const runWrapper = async (script: string, cwd: string) => {
+        const exitCodePath = path.join(root, "exit_code");
+        const wrapper = buildWrapperScript({
+          exitCodePath,
+          cwd,
+          env: { XUM_TEST_VAR: "set" },
+          script,
+        });
+        const child = spawnSync("bash", ["-c", wrapper], { cwd: root, encoding: "utf-8" });
+        const recorded = await fs.readFile(exitCodePath, "utf-8");
+        return { status: child.status, stdout: child.stdout, recorded: recorded.trim() };
+      };
+
+      it.skipIf(process.platform === "win32")(
+        "a missing cwd fails the script instead of running later lines in the fallback cwd",
+        async () => {
+          for (const command of MISSING_CWD_COMMANDS) {
+            const result = await runWrapper(command, path.join(root, "missing"));
+            expect({
+              command,
+              failed: result.status !== 0,
+              recordedFailure: result.recorded !== "0",
+              stdout: result.stdout,
+            }).toEqual({ command, failed: true, recordedFailure: true, stdout: "" });
+          }
+        }
+      );
+
+      for (const c of MULTI_LINE_COMMAND_CASES) {
+        it.skipIf(process.platform === "win32")(
+          `keeps output and exit code: ${c.name}`,
+          async () => {
+            const result = await runWrapper(c.command, path.join(root, "workspace"));
+            expect(result).toEqual({
+              status: c.exitCode,
+              stdout: c.stdout,
+              recorded: String(c.exitCode),
+            });
+          }
+        );
+      }
     });
   });
 

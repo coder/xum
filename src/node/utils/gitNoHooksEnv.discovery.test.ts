@@ -9,6 +9,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
+import { ShellRemoteRuntime, TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import * as disposableExec from "@/node/utils/disposableExec";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -18,6 +21,7 @@ import {
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForConfigKeys,
   gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
   parseLocalRepoAutomationDiscovery,
 } from "./gitNoHooksEnv";
 
@@ -253,6 +257,73 @@ const exists = (file: string) =>
 
 const appendConfig = (repo: string, text: string | Buffer) =>
   fs.appendFile(path.join(repo, ".git", "config"), text);
+
+// The remote shell transport needs GNU-style `timeout` and bash.
+const RUNTIME_TRANSPORTS: Array<{ name: string; create: (loginDir: string) => Runtime }> = [
+  { name: "LocalRuntime", create: (loginDir) => new LocalRuntime(loginDir) },
+  ...(process.platform === "win32" || process.platform === "darwin"
+    ? []
+    : [{ name: "remote shell", create: (loginDir: string) => new ShellRemoteRuntime(loginDir) }]),
+];
+
+async function discoverRuntimeCountingExecs(
+  runtime: Runtime,
+  repo: string,
+  allowNonRepository?: boolean,
+  signal?: AbortSignal
+) {
+  const spy = spyOn(runtime, "exec");
+  try {
+    const outcome = await toOutcome(() =>
+      gitNoRepoAutomationEnvForRuntimeRepo(runtime, repo, signal, allowNonRepository)
+    );
+    return { outcome, execs: spy.mock.calls.length };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/**
+ * How the runtime outcome relates to the local one: "same" (byte-identical env, or the same
+ * message and refusal cause), "both throw" (process-level failures, where the wording comes
+ * from the transport), or "runtime throws" (a missing path with allowNonRepository: the
+ * runtimes cannot cd into it).
+ */
+type RuntimeRelation = "same" | "both throw" | "runtime throws";
+
+async function expectRuntimeMatchesLocal(
+  repo: string,
+  relation: RuntimeRelation,
+  allowNonRepository?: boolean,
+  signal?: AbortSignal
+) {
+  const local = await discover(repo, allowNonRepository, signal);
+  for (const transport of RUNTIME_TRANSPORTS) {
+    const { outcome, execs } = await discoverRuntimeCountingExecs(
+      transport.create(root.path),
+      repo,
+      allowNonRepository,
+      signal
+    );
+    expect({ transport: transport.name, execs }).toEqual({ transport: transport.name, execs: 1 });
+    if (relation === "same") {
+      if ("env" in local && "env" in outcome) {
+        expect(JSON.stringify(outcome.env)).toBe(JSON.stringify(local.env));
+      }
+      expect({ transport: transport.name, outcome }).toEqual({
+        transport: transport.name,
+        outcome: local,
+      });
+      continue;
+    }
+    if (relation === "both throw") expect("error" in local).toBe(true);
+    else expect("env" in local).toBe(true);
+    expect({ transport: transport.name, threw: "error" in outcome }).toEqual({
+      transport: transport.name,
+      threw: true,
+    });
+  }
+}
 
 const ISOLATED_ENV_KEYS = [
   "GIT_CONFIG_GLOBAL",
@@ -505,6 +576,110 @@ describe("gitNoRepoAutomationEnvForLocalRepo discovery", () => {
   );
 });
 
+const RUNTIME_RELATIONS: Record<string, RuntimeRelation> = {
+  "missing path (allowNonRepository=true)": "runtime throws",
+  "missing path (allowNonRepository=false)": "both throw",
+  "driver output over 256 KiB": "both throw",
+  "pre-aborted signal": "both throw",
+};
+
+describe("gitNoRepoAutomationEnvForRuntimeRepo discovery", () => {
+  for (const c of CASES) {
+    test(
+      `runtime discovery matches local discovery in one exec: ${c.name}`,
+      async () => {
+        const repo = await c.repo(root.path);
+        await expectRuntimeMatchesLocal(
+          repo,
+          RUNTIME_RELATIONS[c.name] ?? "same",
+          c.allowNonRepository,
+          c.signal
+        );
+      },
+      TEST_TIMEOUT_MS
+    );
+  }
+
+  test.skipIf(process.platform === "win32" || process.platform === "darwin")(
+    "runtime discovery fails closed on a missing cwd even when the login directory is a repository",
+    async () => {
+      const loginRepo = await makeRepo(root.path, "login", async (repo) => {
+        await fs.writeFile(path.join(repo, ".git", "info", "attributes"), "* filter=evil\n");
+        git(repo, "config", "filter.evil.smudge", "cat");
+      });
+      const runtime = new ShellRemoteRuntime(loginRepo);
+      const discoverAt = (cwd: string, allowNonRepository: boolean) =>
+        toOutcome(() =>
+          gitNoRepoAutomationEnvForRuntimeRepo(runtime, cwd, undefined, allowNonRepository)
+        );
+      // Control: the login repository's driver would be discovered if the script ran there.
+      expect(await discoverAt(loginRepo, false)).toEqual(driversEnv("filter.evil.smudge\ncat"));
+      for (const allow of [false, true]) {
+        const outcome = await discoverAt(path.join(root.path, "missing"), allow);
+        expect({ allow, threw: "error" in outcome }).toEqual({ allow, threw: true });
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
+});
+
+/** Returns fixed exec output, which execBuffered still reads under its output cap. */
+class FixedOutputRuntime extends TestRemoteRuntime {
+  private readonly output: { stdout: string; stderr: string; exitCode: number };
+
+  constructor(output: { stdout: string; stderr: string; exitCode: number }) {
+    super();
+    this.output = output;
+  }
+
+  override exec(_command: string, _options: ExecOptions): Promise<ExecStream> {
+    const stream = (text: string) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(text));
+          controller.close();
+        },
+      });
+    return Promise.resolve({
+      stdout: stream(this.output.stdout),
+      stderr: stream(this.output.stderr),
+      stdin: new WritableStream<Uint8Array>(),
+      exitCode: Promise.resolve(this.output.exitCode),
+      duration: Promise.resolve(0),
+    });
+  }
+}
+
+describe("gitNoRepoAutomationEnvForRuntimeRepo exec result", () => {
+  const COMPLETE_RECORD = "xum-git-discovery 1\n\0drivers 1\n";
+  const discoverWith = (output: { stdout: string; stderr: string; exitCode: number }) =>
+    toOutcome(() => gitNoRepoAutomationEnvForRuntimeRepo(new FixedOutputRuntime(output), "/repo"));
+
+  test("a complete record with exit 0 is accepted", async () => {
+    expect(await discoverWith({ stdout: COMPLETE_RECORD, stderr: "", exitCode: 0 })).toEqual(
+      baseEnv()
+    );
+  });
+
+  // Abort, timeout, SIGKILL, SSH transport failure and plain shell failure exit codes.
+  test("runtime discovery fails closed when the exec exits non-zero after a complete record", async () => {
+    for (const exitCode of [-998, -997, 124, 137, 255, 1]) {
+      const outcome = await discoverWith({ stdout: COMPLETE_RECORD, stderr: "", exitCode });
+      expect({ exitCode, outcome }).toEqual({ exitCode, outcome: { error: AUTOMATION } });
+    }
+  });
+
+  // A capped stream is cut without notice; stderr is not part of the record, so only the size
+  // check catches it.
+  test("runtime discovery fails closed when stderr reaches the output cap", async () => {
+    const stderr = "x".repeat(2 * MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES);
+    expect(await discoverWith({ stdout: COMPLETE_RECORD, stderr, exitCode: 0 })).toEqual({
+      error: AUTOMATION,
+      cause: "Repository automation discovery output exceeded the safety limit",
+    });
+  });
+});
+
 describe.skipIf(process.platform === "win32")("automation stays off (POSIX)", () => {
   test(
     "hooks, fsmonitor and info/attributes filters do not run",
@@ -698,6 +873,53 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
       TEST_TIMEOUT_MS
     );
   }
+
+  for (const fault of FAULTS) {
+    test(
+      `runtime discovery matches local discovery in one exec: ${fault.name}`,
+      async () => {
+        const repo = await makeRepo(root.path, "faulted", (r) => {
+          if (fault.worktreeConfig) git(r, "config", "extensions.worktreeConfig", "true");
+        });
+        process.env.XUM_TEST_GIT_FAULT_MATCH = fault.match;
+        process.env.XUM_TEST_GIT_FAULT_EXIT = fault.exit;
+        process.env.XUM_TEST_GIT_FAULT_STDOUT = fault.stdout ?? "";
+        process.env.XUM_TEST_GIT_FAULT_STDERR_BYTES = String(fault.stderrBytes ?? "");
+        // Output past the cap fails closed on both sides; only the wording differs.
+        const relation = fault.stderrBytes != null ? "both throw" : "same";
+        await expectRuntimeMatchesLocal(repo, relation, fault.allowNonRepository);
+        // Each discovery (local, then every transport) hit the injected failure once; otherwise
+        // a transport that missed the shim could match a success outcome for the wrong reason.
+        const hits = (await fs.readFile(log, "utf8"))
+          .split("\n")
+          .filter((line) => line.includes(fault.match));
+        expect(hits).toHaveLength(1 + RUNTIME_TRANSPORTS.length);
+      },
+      TEST_TIMEOUT_MS
+    );
+  }
+
+  test(
+    "runtime discovery fails closed when git is not installed",
+    async () => {
+      const repo = await makeRepo(root.path, "no-git");
+      // The shell's exit status for a command it cannot find.
+      process.env.XUM_TEST_GIT_FAULT_MATCH = "rev-parse --git-dir";
+      process.env.XUM_TEST_GIT_FAULT_EXIT = "127";
+      for (const transport of RUNTIME_TRANSPORTS) {
+        const { outcome } = await discoverRuntimeCountingExecs(
+          transport.create(root.path),
+          repo,
+          true
+        );
+        expect({ transport: transport.name, outcome }).toEqual({
+          transport: transport.name,
+          outcome: { error: AUTOMATION },
+        });
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
 
   // One abort covers the whole spawn, so an abort mid-discovery reads as the automation failure
   // instead of the step it interrupted (the legacy discovery reported the worktree config step).

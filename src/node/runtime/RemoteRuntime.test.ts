@@ -1,9 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
-import { TestRemoteRuntime } from "./testRemoteRuntime";
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import {
+  MISSING_CWD_COMMANDS,
+  MULTI_LINE_COMMAND_CASES,
+  ShellRemoteRuntime,
+  TestRemoteRuntime,
+} from "./testRemoteRuntime";
 
 class RecordingRemoteRuntime extends TestRemoteRuntime {
   spawnCount = 0;
@@ -203,4 +212,68 @@ describe("RemoteRuntime.writeFile", () => {
 
     expect(runtime.spawnCount).toBe(0);
   });
+});
+
+// ShellRemoteRuntime needs GNU-style `timeout` and bash.
+const noShellTransport = process.platform === "win32" || process.platform === "darwin";
+
+describe("RemoteRuntime.exec multi-line commands", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "remote-exec-lines-")));
+    await fs.mkdir(path.join(root, "login"));
+    await fs.mkdir(path.join(root, "workspace"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it.skipIf(noShellTransport)(
+    "a missing cwd fails the command instead of running later lines in the login directory",
+    async () => {
+      const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await execBuffered(runtime, command, {
+          cwd: path.join(root, "missing"),
+          env: { XUM_TEST_VAR: "set" },
+          timeout: 10,
+        });
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
+    }
+  );
+
+  it.skipIf(noShellTransport)("later lines run in the cwd with the exported env", async () => {
+    const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+    const cwd = path.join(root, "workspace");
+    const result = await execBuffered(runtime, 'true\npwd\necho "var=$XUM_TEST_VAR"', {
+      cwd,
+      env: { XUM_TEST_VAR: "set" },
+      timeout: 10,
+    });
+    expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+      exitCode: 0,
+      stdout: `${cwd}\nvar=set\n`,
+    });
+  });
+
+  for (const c of MULTI_LINE_COMMAND_CASES) {
+    it.skipIf(noShellTransport)(`keeps output and exit code: ${c.name}`, async () => {
+      const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+      const result = await execBuffered(runtime, c.command, {
+        cwd: path.join(root, "workspace"),
+        timeout: 10,
+      });
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: c.exitCode,
+        stdout: c.stdout,
+      });
+    });
+  }
 });

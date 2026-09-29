@@ -49,6 +49,7 @@ export type HeldInput = Extract<
   WorkspaceChatMessage,
   { type: "held-inputs-changed" }
 >["heldInputs"][number];
+export type AcpPromptCorrelation = z.infer<typeof schemas.AcpPromptCorrelationSchema>;
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
 export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;

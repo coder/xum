@@ -303,7 +303,7 @@ describe("WorkspaceService project lifecycle scripts", () => {
       expect((await harness.service.archive(workspaceId)).success).toBe(true);
       const argv = await fs.readFile(markerPath, "utf8");
       expect(argv).toContain(`exec\n--workspace-folder\n${workspacePath}\n`);
-      expect(argv).toContain("cd '.' && if");
+      expect(argv).toContain("cd '.' || exit; if");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;

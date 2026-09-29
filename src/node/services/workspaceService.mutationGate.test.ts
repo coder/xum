@@ -18,6 +18,7 @@ import {
   saveWorkspaces,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
+import { EditorService } from "@/node/services/editorService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { TerminalService } from "@/node/services/terminalService";
 import * as bashToolModule from "@/node/services/tools/bash";
@@ -614,6 +615,72 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(renameWorkspace).not.toHaveBeenCalled();
     expect(deleteWorkspace).not.toHaveBeenCalled();
     expect(rowOf(a.config, rootId)).toBeDefined();
+  });
+
+  // #4909: a custom-command editor launches in this backend after its recording, so the open
+  // must stay counted until the launcher returns, or the rename/removal moves the checkout first.
+  test("this backend's rename and removal refuse while its own custom-editor launch is in flight", async () => {
+    const reached = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    // The launcher's first await; only the command check and the synchronous spawn follow it.
+    const editorService = new EditorService(
+      {
+        getAllWorkspaceMetadata: async () => {
+          reached.resolve();
+          await held.promise;
+          return a.config.getAllWorkspaceMetadata();
+        },
+      },
+      a.workspaceService
+    );
+    const opening = editorService.openInEditor({
+      workspaceId: rootId,
+      targetPath: path.join(srcBaseDir, "repo", "root"),
+      // Not installed: the launch fails at its command check, so no process is spawned.
+      editorConfig: { editor: "custom", customCommand: "/nonexistent/xum-4909-editor" },
+    });
+    await reached.promise;
+
+    expect(errorOf(await a.workspaceService.rename(rootId, "renamed"))).toContain(
+      "an external editor is being opened"
+    );
+    expect(errorOf(await a.workspaceService.remove(rootId, true))).toContain(
+      "an external editor is being opened"
+    );
+    expect(renameWorkspace).not.toHaveBeenCalled();
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+
+    held.resolve();
+    expect(errorOf(await opening)).toContain("Editor command not found");
+    // The failed launch ended the in-flight count: the own rename tolerates the editor again.
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("a custom-editor open that starts during this backend's own rename is refused and never launches", async () => {
+    const renameReached = Promise.withResolvers<void>();
+    const renameHeld = Promise.withResolvers<void>();
+    renameWorkspace.mockImplementationOnce(async () => {
+      renameReached.resolve();
+      await renameHeld.promise;
+      return { success: false as const, error: "stub move" };
+    });
+    const getAllWorkspaceMetadata = mock(() => a.config.getAllWorkspaceMetadata());
+    const editorService = new EditorService({ getAllWorkspaceMetadata }, a.workspaceService);
+
+    const renaming = a.workspaceService.rename(rootId, "renamed");
+    await renameReached.promise;
+    // Refused, not queued behind the rename: the launch never starts.
+    const opened = await editorService.openInEditor({
+      workspaceId: rootId,
+      targetPath: path.join(srcBaseDir, "repo", "root"),
+      editorConfig: { editor: "custom", customCommand: "/nonexistent/xum-4909-editor" },
+    });
+    expect(errorOf(opened)).toContain("being renamed, removed or archived");
+    expect(getAllWorkspaceMetadata).not.toHaveBeenCalled();
+
+    renameHeld.resolve();
+    expect(errorOf(await renaming)).toContain("stub move");
   });
 
   test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {

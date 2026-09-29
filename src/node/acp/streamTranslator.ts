@@ -8,6 +8,7 @@ import type {
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
+import { DISCARD_HELD_COMMAND_NAME, SEND_HELD_COMMAND_NAME } from "./slashCommands";
 
 interface ActiveToolCall {
   toolCallId: string;
@@ -25,6 +26,22 @@ type PlanSessionUpdate = Extract<SessionUpdate, { sessionUpdate: "plan" }>;
 type PlanEntry = PlanSessionUpdate["entries"][number];
 type PlanEntryStatus = PlanEntry["status"];
 type PlanEntryPriority = PlanEntry["priority"];
+
+type HeldInput = Extract<
+  WorkspaceChatMessage,
+  { type: "held-inputs-changed" }
+>["heldInputs"][number];
+
+export type HeldInputLookup =
+  | { kind: "found"; number: number; heldInput: HeldInput }
+  | { kind: "refused"; message: string };
+
+/** Only `reported` may say a report happened (mirrors the desktop banner's wording rule). */
+const HELD_INPUT_REASON_LABELS: Record<HeldInput["reason"], string> = {
+  reported: "the task reported before it ran",
+  indeterminate: "the task's outcome was not confirmed before it ran",
+  interrupted: "interrupted before it ran",
+};
 
 type UserMessageForwarding =
   | { kind: "parts" }
@@ -45,6 +62,11 @@ export class StreamTranslator {
   private readonly activeToolCallsByMessageKey = new Map<string, string[]>();
   private readonly toolCallsByKey = new Map<string, ActiveToolCall>();
   private readonly currentPlanEntriesBySessionId = new Map<string, PlanEntry[]>();
+  /** Per session: the backend's current held list, and the list as last numbered for the user. */
+  private readonly heldInputsBySessionId = new Map<
+    string,
+    { current: HeldInput[]; listed: HeldInput[] }
+  >();
 
   constructor(private readonly connection: AgentSideConnection) {
     assert(connection != null, "StreamTranslator: connection is required");
@@ -65,6 +87,10 @@ export class StreamTranslator {
     assert(chatStream != null, "consumeAndForward: chatStream is required");
 
     let isReplayPhase = true;
+    // Each subscription replays the held list, but only while it is non-empty: start from nothing
+    // so inputs removed during a gap are not kept, and a notice that a failed forward may have
+    // dropped is announced again.
+    this.heldInputsBySessionId.delete(sessionId);
 
     for await (const event of chatStream) {
       const updates = this.translateEvent(sessionId, event, isReplayPhase);
@@ -208,6 +234,12 @@ export class StreamTranslator {
         return abortUpdates;
       }
 
+      case "restore-to-input":
+        return this.translateRestoreToInput(event);
+
+      case "held-inputs-changed":
+        return this.translateHeldInputsChanged(sessionId, event.heldInputs);
+
       // Informational/no-op events for ACP stream output.
       case "heartbeat":
       case "caught-up":
@@ -219,8 +251,6 @@ export class StreamTranslator {
       case "usage-delta":
       case "session-usage-delta":
       case "queued-message-changed":
-      case "restore-to-input":
-      case "held-inputs-changed":
       case "runtime-status":
       case "init-start":
       case "init-output":
@@ -231,6 +261,91 @@ export class StreamTranslator {
       default:
         return [];
     }
+  }
+
+  /**
+   * ACP cannot put text back into the client's prompt. A restore backed by held inputs is shown
+   * by the held-inputs notice that follows it; one without is shown here, so the ACP user still
+   * has the only copy of that input.
+   */
+  private translateRestoreToInput(
+    event: Extract<WorkspaceChatMessage, { type: "restore-to-input" }>
+  ): SessionUpdate[] {
+    if ((event.heldInputIds?.length ?? 0) > 0) return [];
+    const summary = formatHeldInputText(
+      event.text,
+      event.fileParts?.length ?? 0,
+      event.reviews?.length ?? 0,
+      ""
+    );
+    if (summary.length === 0) return [];
+    return this.toSingleChunkUpdate(
+      "agent_message_chunk",
+      `\n\nYour queued message was not sent:\n\n${summary}\n`
+    );
+  }
+
+  /**
+   * The backend sends its full held list on every change and subscription. Announce it only when
+   * an input the user was not shown appears: removals and replays stay silent, so a notice never
+   * interleaves with a re-sent turn and numbers keep meaning what the last notice showed.
+   */
+  private translateHeldInputsChanged(sessionId: string, heldInputs: HeldInput[]): SessionUpdate[] {
+    const state = this.heldInputsBySessionId.get(sessionId) ?? { current: [], listed: [] };
+    const listedIds = new Set(state.listed.map((heldInput) => heldInput.id));
+    const hasUnlisted = heldInputs.some((heldInput) => !listedIds.has(heldInput.id));
+    const listed = hasUnlisted ? heldInputs : state.listed;
+    this.heldInputsBySessionId.set(sessionId, { current: heldInputs, listed });
+    if (!hasUnlisted) return [];
+
+    const count = heldInputs.length;
+    const header = `Xum kept ${count} unsent message${count === 1 ? "" : "s"}. Nothing was lost:`;
+    const footer =
+      `Send one with /${SEND_HELD_COMMAND_NAME} <number>, or drop it with ` +
+      `/${DISCARD_HELD_COMMAND_NAME} <number>.`;
+    return this.toSingleChunkUpdate(
+      "agent_message_chunk",
+      `\n\n${header}\n\n${formatHeldInputList(listed, heldInputs)}\n\n${footer}\n`
+    );
+  }
+
+  /**
+   * Resolve a held-input command's number against the list the user was last shown. An input
+   * that was sent or discarded since then is refused rather than renumbered, so a number never
+   * silently points at a different message.
+   */
+  resolveHeldInput(sessionId: string, number: number | undefined): HeldInputLookup {
+    assert(
+      number == null || (Number.isSafeInteger(number) && number >= 1),
+      "resolveHeldInput: number must be a positive integer"
+    );
+    const state = this.heldInputsBySessionId.get(sessionId);
+    const current = state?.current ?? [];
+    if (state == null || current.length === 0) {
+      return { kind: "refused", message: "No unsent messages are held in this workspace." };
+    }
+    const listing = formatHeldInputList(state.listed, current);
+
+    if (number == null) {
+      if (current.length > 1) {
+        return {
+          kind: "refused",
+          message: `${current.length} unsent messages are held. Name one by its number:\n\n${listing}`,
+        };
+      }
+      number = state.listed.findIndex((heldInput) => heldInput.id === current[0].id) + 1;
+      // Every current input was listed: a notice lists the whole list whenever one is new.
+      assert(number >= 1, "resolveHeldInput: a held input was never listed");
+    }
+
+    const heldInput = state.listed.at(number - 1);
+    if (heldInput == null || !current.some((candidate) => candidate.id === heldInput.id)) {
+      return {
+        kind: "refused",
+        message: `Unsent message ${number} is not held (it may have been sent or discarded). Held messages:\n\n${listing}`,
+      };
+    }
+    return { kind: "found", number, heldInput };
   }
 
   private translateReplayMessage(
@@ -668,6 +783,7 @@ export class StreamTranslator {
     }
 
     this.currentPlanEntriesBySessionId.delete(sessionId);
+    this.heldInputsBySessionId.delete(sessionId);
   }
 
   private hasNonEmptyMessageId(messageId: string): boolean {
@@ -687,6 +803,43 @@ export class StreamTranslator {
 
     return `${sessionId}${SESSION_SCOPED_TOOL_KEY_DELIMITER}${toolCallId}`;
   }
+}
+
+/** Number each still-held input by its position in the list the user was shown. */
+function formatHeldInputList(listed: HeldInput[], current: HeldInput[]): string {
+  const currentIds = new Set(current.map((heldInput) => heldInput.id));
+  return listed
+    .flatMap((heldInput, index) => {
+      if (!currentIds.has(heldInput.id)) return [];
+      const prefix = `${index + 1}. `;
+      const text = formatHeldInputText(
+        heldInput.displayText,
+        heldInput.attachmentCount,
+        heldInput.reviewCount,
+        " ".repeat(prefix.length)
+      );
+      return [`${prefix}${text} (${HELD_INPUT_REASON_LABELS[heldInput.reason]})`];
+    })
+    .join("\n");
+}
+
+/** The input's full text (continuation lines indented) plus what it carries besides text. */
+function formatHeldInputText(
+  text: string,
+  attachmentCount: number,
+  reviewCount: number,
+  indent: string
+): string {
+  const extras = [
+    [attachmentCount, "attachment"],
+    [reviewCount, "review"],
+  ] as const;
+  const extraText = extras
+    .filter(([count]) => count > 0)
+    .map(([count, noun]) => `${count} ${noun}${count === 1 ? "" : "s"}`)
+    .join(", ");
+  const body = text.trim().length > 0 ? text.split("\n").join(`\n${indent}`) : "";
+  return [body, extraText.length > 0 ? `[+ ${extraText}]` : ""].filter(Boolean).join(" ");
 }
 
 function extractRawCommand(metadata: MessageMetadataWithFrontendFields | undefined): string | null {

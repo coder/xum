@@ -312,89 +312,7 @@ export function combineGitNoRepoAutomationEnvs(
   return env;
 }
 
-export async function gitNoRepoAutomationEnvForRuntimeRepo(
-  runtime: Runtime,
-  repoPath: string,
-  signal?: AbortSignal,
-  allowNonRepository = false
-): Promise<Record<string, string>> {
-  const baseEnv = gitNoRepoAutomationEnv();
-  const prefix = `${gitEnvPrefix(baseEnv)}LC_ALL=C `;
-  const repoResult = await execBuffered(runtime, `${prefix}git rev-parse --git-dir`, {
-    cwd: repoPath,
-    timeout: 10,
-    abortSignal: signal,
-    maxOutputBytes: 1024,
-  });
-  if (repoResult.exitCode === 128 && allowNonRepository) return baseEnv;
-  if (repoResult.exitCode !== 0) {
-    throw new Error(repoResult.stderr.trim() || "Failed to inspect repository");
-  }
-
-  const includeResult = await execBuffered(
-    runtime,
-    `${prefix}git config --local --includes --null --name-only --get-regexp ${shellQuote(
-      GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
-    )} || [ "$?" -eq 1 ]; ` +
-      `worktree_config=$(${prefix}git config --local --bool extensions.worktreeConfig); ` +
-      `worktree_status=$?; ` +
-      `if [ "$worktree_status" -eq 0 ] && [ "$worktree_config" = true ]; then ` +
-      `${prefix}git config --worktree --includes --null --name-only --get-regexp ${shellQuote(
-        GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
-      )} || [ "$?" -eq 1 ]; ` +
-      `elif [ "$worktree_status" -ne 1 ]; then exit "$worktree_status"; fi`,
-    {
-      cwd: repoPath,
-      timeout: 10,
-      abortSignal: signal,
-      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
-    }
-  );
-  if (includeResult.stdout.length > 0) {
-    if (includeResult.stdout.toLowerCase().includes("includeif.")) {
-      throw new Error("Refusing git operation with conditional config includes");
-    }
-    throw new Error("Refusing git operation with unsupported executable config");
-  }
-  if (includeResult.exitCode !== 0 && includeResult.exitCode !== 1) {
-    throw new Error(
-      includeResult.stderr.trim() ||
-        includeResult.stdout.trim() ||
-        "Failed to inspect repository conditional includes"
-    );
-  }
-
-  const result = await execBuffered(
-    runtime,
-    `${prefix}git config --null --includes --get-regexp ${shellQuote(
-      GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
-    )}`,
-    {
-      cwd: repoPath,
-      timeout: 10,
-      abortSignal: signal,
-      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
-    }
-  );
-  if (result.exitCode === 1 && result.stdout.length === 0) {
-    return baseEnv;
-  }
-  if (result.exitCode !== 0) {
-    throw new Error(
-      result.stderr.trim() ||
-        result.stdout.trim() ||
-        "Failed to inspect repository automation drivers"
-    );
-  }
-  if (
-    new TextEncoder().encode(result.stdout).byteLength > MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES
-  ) {
-    throw new Error("Repository automation driver config output exceeded the safety limit");
-  }
-  return appendDisabledRepoAutomationDrivers(baseEnv, result.stdout.split("\0"));
-}
-
-const LOCAL_DISCOVERY_AUTOMATION_ERROR = "Failed to inspect repository automation drivers";
+export const LOCAL_DISCOVERY_AUTOMATION_ERROR = "Failed to inspect repository automation drivers";
 const LOCAL_DISCOVERY_WORKTREE_ERROR = "Failed to inspect repository worktree config";
 const LOCAL_DISCOVERY_INCLUDES_ERROR = "Failed to inspect repository conditional includes";
 const LOCAL_DISCOVERY_HEADER = "xum-git-discovery 1\n";
@@ -442,10 +360,33 @@ rc=$?
 printf '\000drivers %s\n' "$rc"
 `;
 
+/**
+ * The discovery script with its variables assigned, shared by the local and runtime variants.
+ * Only these values are interpolated: the patterns are shell-quoted here, and callers pass
+ * either a shell-quoted path or `.`.
+ */
+function repoAutomationDiscoveryScript(repoExpression: string): string {
+  return [
+    `repo=${repoExpression}`,
+    `unrepresentable_pattern=${shellQuote(GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN)}`,
+    `includeif_pattern=${shellQuote(GIT_CONDITIONAL_INCLUDE_KEY_PATTERN)}`,
+    `automation_pattern=${shellQuote(GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN)}`,
+    LOCAL_DISCOVERY_SCRIPT_BODY,
+  ].join("\n");
+}
+
 function localDiscoveryShell(): string {
   // Non-interactive POSIX sh reads no startup files. Windows has no /bin/sh outside Git Bash;
   // getBashPath throws when Git Bash is missing, which the caller turns into a closed failure.
   return process.platform === "win32" ? getBashPath() : "/bin/sh";
+}
+
+/** Shaped like the execFileAsync error a direct git spawn would raise. */
+function gitFailureError(status: number, stderr: string): Error {
+  return Object.assign(new Error(stderr.trim() || `Command failed with exit code ${status}`), {
+    code: status,
+    stderr,
+  });
 }
 
 function malformedLocalDiscoveryOutput(): Error {
@@ -485,11 +426,7 @@ export function parseLocalRepoAutomationDiscovery(
   }
 
   const status = Number(statusText);
-  // Shaped like the execFileAsync error a direct git spawn would raise.
-  const gitFailure = Object.assign(
-    new Error(output.stderr.trim() || `Command failed with exit code ${status}`),
-    { code: status, stderr: output.stderr }
-  );
+  const gitFailure = gitFailureError(status, output.stderr);
   switch (step) {
     case "rev-parse":
       if (status === 128 && allowNonRepository) return baseEnv;
@@ -542,14 +479,7 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
   signal?: AbortSignal,
   allowNonRepository = false
 ): Promise<Record<string, string>> {
-  // Only these three values are interpolated, each shell-quoted.
-  const script = [
-    `repo=${shellQuote(repoPath)}`,
-    `unrepresentable_pattern=${shellQuote(GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN)}`,
-    `includeif_pattern=${shellQuote(GIT_CONDITIONAL_INCLUDE_KEY_PATTERN)}`,
-    `automation_pattern=${shellQuote(GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN)}`,
-    LOCAL_DISCOVERY_SCRIPT_BODY,
-  ].join("\n");
+  const script = repoAutomationDiscoveryScript(shellQuote(repoPath));
   let output: { stdout: string; stderr: string };
   try {
     using proc = execFileAsync(localDiscoveryShell(), ["-c", script], {
@@ -564,6 +494,60 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
     output = await proc.result;
   } catch (error) {
     throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, { cause: error });
+  }
+  return parseLocalRepoAutomationDiscovery(output, allowNonRepository);
+}
+
+// The slack covers header, record and stderr; the parser caps the payload itself.
+const RUNTIME_DISCOVERY_MAX_OUTPUT_BYTES = MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 4096;
+
+/**
+ * Runtime counterpart of gitNoRepoAutomationEnvForLocalRepo for any Runtime (SSH, Docker,
+ * devcontainer, local). It runs the same discovery script in one runtime exec and maps the
+ * output with the same parser, so both variants return identical envs; each exec costs SSH
+ * round trips or a `docker exec`/`devcontainer exec`, so the queries share one.
+ *
+ * - The runtime applies the cwd (SSH expands `~`) and the env, so the script uses `repo=.`.
+ * - RemoteRuntime and DevcontainerRuntime run `cd <cwd> && export ... && <command>`, and only
+ *   the first line of a multi-line command is part of that chain. The brace group keeps the
+ *   whole script inside the runtime's cd && export chain, so a failed cd runs nothing.
+ * - The script exits 0 only after writing its record; any other exit fails closed.
+ * - execBuffered truncates each stream at maxOutputBytes without reporting it, so a stream
+ *   near the cap fails closed.
+ * - Exec rejections (transport errors, a missing local cwd, a pre-aborted signal) propagate
+ *   unchanged so callers keep their transport classification.
+ */
+export async function gitNoRepoAutomationEnvForRuntimeRepo(
+  runtime: Runtime,
+  repoPath: string,
+  signal?: AbortSignal,
+  allowNonRepository = false
+): Promise<Record<string, string>> {
+  const output = await execBuffered(runtime, `{\n${repoAutomationDiscoveryScript(".")}\n}`, {
+    cwd: repoPath,
+    // The same channel the bash tool uses for its git env.
+    env: gitNoRepoAutomationEnv(),
+    // Seconds. Each of the three execs this replaced had 10 s, so a slow remote repo (huge repo,
+    // cold cache, slow disk) had up to 30 s; one exec keeps that total so such repos do not
+    // start failing closed.
+    timeout: 30,
+    abortSignal: signal,
+    maxOutputBytes: RUNTIME_DISCOVERY_MAX_OUTPUT_BYTES,
+  });
+  if (output.exitCode !== 0) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: gitFailureError(output.exitCode, output.stderr),
+    });
+  }
+  // execBuffered drops a code point split at the cap (at most 3 bytes), and invalid UTF-8 only
+  // lengthens the decoded text, so a stream that was cut measures at least cap - 3 bytes here.
+  // Failing closed on that also rejects a few complete outputs just under the cap.
+  const nearCap = (text: string) =>
+    Buffer.byteLength(text) >= RUNTIME_DISCOVERY_MAX_OUTPUT_BYTES - 3;
+  if (nearCap(output.stdout) || nearCap(output.stderr)) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: new Error("Repository automation discovery output exceeded the safety limit"),
+    });
   }
   return parseLocalRepoAutomationDiscovery(output, allowNonRepository);
 }

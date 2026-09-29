@@ -198,6 +198,21 @@ describe("findUnpreservedSubagentWork", () => {
     });
   });
 
+  test("reports uncaptured commits alongside dirty paths, and paths even when commits cannot be counted (#5106)", async () => {
+    execSync("git commit -q --allow-empty -m work", { cwd: repo });
+    await fsPromises.writeFile(path.join(repo, "notes.txt"), "unsaved\n");
+    expect(await check()).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: ["notes.txt"], uncapturedCommitCount: 1 },
+    });
+    const unknownBase = await check({ base: null });
+    expect(unknownBase.success ? unknownBase.data : null).toMatchObject({
+      kind: "lossy",
+      paths: ["notes.txt"],
+      commitCheckError: "the task base commit of repo is unknown",
+    });
+  });
+
   test("commits are preserved only by a ready artifact that captured the current head", async () => {
     execSync("git commit --allow-empty -m work", { cwd: repo, stdio: "ignore" });
     const head = git(repo, "rev-parse HEAD");

@@ -171,6 +171,7 @@ interface MockAgentListItemProps {
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onArchiveWorkspace?: (workspaceId: string, button: HTMLElement) => Promise<void>;
+  onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
 type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
@@ -179,6 +180,7 @@ let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
   | ((workspaceId: string, button: HTMLElement) => Promise<void>)
   | null = null;
+let latestCancelCreationHandler: ((workspaceId: string) => Promise<void>) | null = null;
 
 let ProjectSidebar!: typeof ProjectSidebarComponent;
 let preflightArchiveWorkspaceMock = mock(
@@ -328,6 +330,7 @@ function installProjectSidebarTestDoubles() {
   );
   confirmDialogMock = mock(() => Promise.resolve(true));
   latestArchiveWorkspaceHandler = null;
+  latestCancelCreationHandler = null;
   void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
     __esModule: true,
     default: () => <svg data-testid="xum-logo-dark" />,
@@ -365,6 +368,7 @@ function installProjectSidebarTestDoubles() {
       const displayTitle = metadata.title ?? metadata.name;
 
       latestArchiveWorkspaceHandler = props.onArchiveWorkspace ?? null;
+      latestCancelCreationHandler = props.onCancelCreation ?? null;
 
       return (
         <div
@@ -2850,6 +2854,54 @@ describe("ProjectSidebar archive errors", () => {
     expect(args?.[0]).toBe(workspace.id);
     expect(args?.[1]).toBe("snapshot failed");
     expect(args?.length).toBe(2);
+  });
+});
+
+// #5143: cancel-creation forces the removal without the Force Delete dialog, so what the removal
+// left behind (a devcontainer that may still hold the plan) must reach the user another way.
+describe("ProjectSidebar cancel-creation warnings", () => {
+  const showPopoverMock = mock(
+    (_workspaceId: string, _message: string, _anchor?: { top: number; left: number }) => undefined
+  );
+
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    showPopoverMock.mockClear();
+    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
+      () =>
+        ({
+          error: null,
+          showError: showPopoverMock,
+          clearError: mock(() => undefined),
+        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
+    );
+  });
+  afterEach(cleanupProjectSidebarDom);
+
+  test("shows what a cancelled creation's forced removal left behind", async () => {
+    const description = "The devcontainer container labeled x was left behind";
+    const removeWorkspaceMock = mock((_workspaceId: string, _options?: { force?: boolean }) =>
+      Promise.resolve({
+        success: true,
+        warnings: [{ kind: "leftover" as const, description }],
+      })
+    );
+    mockWorkspaceActions({ removeWorkspace: removeWorkspaceMock });
+    const workspace = {
+      ...createWorkspace("cancel-target"),
+      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
+    };
+    renderProjectSidebarForWorkspace(workspace);
+
+    expect(latestCancelCreationHandler).toBeTruthy();
+    await act(async () => {
+      await latestCancelCreationHandler?.(workspace.id);
+    });
+
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id, { force: true });
+    expect(showPopoverMock).toHaveBeenCalledTimes(1);
+    expect(showPopoverMock.mock.calls[0]?.[0]).toBe(workspace.id);
+    expect(showPopoverMock.mock.calls[0]?.[1]).toContain(description);
   });
 });
 

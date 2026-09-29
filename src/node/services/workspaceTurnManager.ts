@@ -770,20 +770,32 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
-   * turn (crash between create() and the handle record, or between the terminal write and the
-   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
-   * has a live holder, here or in another backend, is still being created and is left alone.
-   * Never throws: startup must not fail.
+   * Startup resolver for delegated targets whose creator died. Never throws: startup must not
+   * fail. A handle whose live-owner lock has a live holder, here or in another backend, is still
+   * being created and is left alone.
+   * - #4453: a creator that died before settling its creating turn (crash between create() and
+   *   the handle record, or between the terminal write and the grant) leaves the pending mark.
+   *   Clear such marks; never grant.
+   * - #4983: a crash between create() and the handle record also leaves the target itself, which
+   *   its owner can no longer reach (a mode "existing" retry is invalid_scope). Flag it for the
+   *   user (flagInterruptedDelegatedCreation). Nothing is removed automatically: a wrong
+   *   automatic removal costs more than a visible, clean workspace the user can remove.
    */
-  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+  async resolveOrphanedDelegatedTargets(): Promise<void> {
     for (const project of this.config.loadConfigOrDefault().projects.values()) {
       for (const workspace of project.workspaces) {
         const tags = workspace.tags ?? {};
-        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
-        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+        // The creator's own mark, which the public create API cannot write, outranks the tags.
+        // A flagged mark still binds the row (a later pass may owe it a consent clear); only an
+        // unconfirmed one is flagged.
+        const bindingMark = workspace.delegatedCreation;
+        const creationMark = bindingMark?.interruptedAt == null ? bindingMark : undefined;
+        const handleId = bindingMark?.handleId ?? tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        const ownerId =
+          bindingMark?.ownerWorkspaceId ?? tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
         const workspaceId = workspace.id;
-        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
+        const pending = workspace.unrelatedWorkspaceConsentPending === true;
+        if ((!pending && creationMark == null) || workspaceId == null) continue;
         if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
         try {
           await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
@@ -791,32 +803,85 @@ export class WorkspaceTurnManager {
             if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
               return;
             }
-            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
-            // its creator locked it before create(), and the lock outlives the creator until the
-            // record settles. Without a lock only a record that created this target counts.
-            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
-            const locked = await fsPromises.access(lockPath).then(
-              () => true,
-              () => false
-            );
-            if (!locked) {
-              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
-              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+            // Tags are caller-supplied (workspace.create accepts any), so without the creator's
+            // mark the handle must be real: its creator locked it before create(), and the lock
+            // outlives the creator until the record settles. Without a lock only a record that
+            // created this target counts.
+            if (bindingMark == null) {
+              const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+              const locked = await fsPromises.access(lockPath).then(
+                () => true,
+                () => false
+              );
+              if (!locked) {
+                const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+                if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+              }
             }
             if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
             try {
-              await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+              if (pending) {
+                await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+              }
+              if (creationMark != null) {
+                await this.flagInterruptedDelegatedCreation(workspaceId, ownerId, handleId);
+              }
             } finally {
               await this.releaseTurnOwnerLock(handleId);
             }
           });
         } catch (error: unknown) {
-          log.warn("Failed to clear an orphaned delegated consent default", {
+          log.warn("Failed to resolve an orphaned delegated target", {
             workspaceId,
             error: getErrorMessage(error),
           });
         }
       }
+    }
+  }
+
+  /**
+   * #4983: flag a delegated target whose creator died before its handle record persisted. The
+   * caller holds the handle's live-owner lock, so no live backend is creating or settling it.
+   * Reads only config and file metadata, never the target's runtime: an unreachable SSH host or a
+   * stopped Coder workspace must not slow startup or be started by it.
+   */
+  private async flagInterruptedDelegatedCreation(
+    workspaceId: string,
+    ownerId: string,
+    handleId: string
+  ): Promise<void> {
+    // Any record file, even one that reads as null (corrupt, or a newer build's schema), means the
+    // handle persisted: the target is not an orphan. Drop the leftover mark (the creator died
+    // before clearing it) only when the record itself binds this target; an unreadable record
+    // cannot, so the mark stays as the remaining evidence of the binding.
+    if (await this.taskHandleStore.hasWorkspaceTurnFile(ownerId, handleId)) {
+      const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+      if (record?.createdWorkspace === true && record.workspaceId === workspaceId) {
+        await this.workspaceService.clearDelegatedCreationMark(workspaceId, handleId);
+      }
+      return;
+    }
+    // Records live in the owner's session dir and are deleted only with it, so a removed owner
+    // explains a missing record without a crash.
+    const ownerSessionDirExists = await fsPromises
+      .stat(path.join(this.config.sessionsDir, ownerId))
+      .then(
+        (stat) => stat.isDirectory(),
+        () => false
+      );
+    if (
+      !ownerSessionDirExists ||
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerId) == null
+    ) {
+      log.info("Leaving an unflagged delegated target: its owner workspace is gone", {
+        workspaceId,
+        handleId,
+      });
+      return;
+    }
+    if (await this.workspaceService.markDelegatedCreationInterrupted(workspaceId, handleId)) {
+      log.info("Flagged a delegated target whose setup did not finish", { workspaceId, handleId });
     }
   }
 
@@ -1553,6 +1618,8 @@ export class WorkspaceTurnManager {
           awaitMaterialization: true,
           defaultUnrelatedConsent:
             args.workspace?.disposable === true ? "none" : "caller-finalizes",
+          // Binds the row to this handle and owner until the record below persists (#4983).
+          delegatedCreation: { handleId, ownerWorkspaceId },
         }
       );
       if (!createResult.success) {
@@ -1777,6 +1844,10 @@ export class WorkspaceTurnManager {
         });
       }
     ).catch((error: unknown) => ({ error: getErrorMessage(error) }));
+    // The record now binds the target (#4983); its creation mark is only hygiene from here on.
+    if (persistedHandle && createdWorkspace) {
+      await this.workspaceService.clearDelegatedCreationMark(targetWorkspaceId, handleId);
+    }
     if (typeof persisted === "object") {
       if (persistedHandle) {
         await this.settleWorkspaceTurn({

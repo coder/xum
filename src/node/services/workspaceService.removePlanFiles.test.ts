@@ -3,7 +3,7 @@ import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getLegacyPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -11,7 +11,10 @@ import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
-import { sharesPlanStorage, type WorkspaceService } from "./workspaceService";
+import { WorkspaceRemoveResultSchema } from "@/common/orpc/schemas/workspace";
+import type { ORPCContext } from "@/node/orpc/context";
+import { removeWorkspace } from "./workspaceOperations";
+import type { WorkspaceService } from "./workspaceService";
 import {
   createWorkspaceServiceHarness,
   withTempMuxRoot,
@@ -356,6 +359,39 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
         /devcontainer container labeled devcontainer\.local_folder=\S+\/dcleft\b/
       );
       expect(await service.getInfo("ffffffff21")).not.toBeNull();
+    });
+  });
+
+  // #5143: forced paths (bulk delete, cancel-creation, shift-click) never see that non-forced
+  // error, so the forced removal itself reports the surviving container through the IPC result.
+  test("a forced removal whose devcontainer teardown fails returns the container as a warning", async () => {
+    await withTempMuxRoot(async () => {
+      await addWorkspaceIn(projectPath, {
+        id: "ffffffff22",
+        name: "dcforced",
+        path: path.join(harness.rootDir, "dcforced"),
+        runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+      });
+      spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+        kind: "error",
+        message: "Failed to remove container: daemon down",
+      });
+      spyRemotePlanDeletion();
+      const context = { workspaceService: service } as unknown as ORPCContext;
+
+      // Parse through the IPC output schema: oRPC strips keys the schema does not declare.
+      const result = WorkspaceRemoveResultSchema.parse(
+        await removeWorkspace(context, { workspaceId: "ffffffff22", options: { force: true } })
+      );
+
+      expect(result.success ? "" : result.error).toBe("");
+      expect(await service.getInfo("ffffffff22")).toBeNull();
+      expect(result.warnings).toContainEqual({
+        kind: "leftover",
+        description: expect.stringMatching(
+          /devcontainer container labeled devcontainer\.local_folder=\S+\/dcforced\b.*plan file/
+        ) as string,
+      });
     });
   });
 });

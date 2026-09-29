@@ -480,6 +480,11 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     workspaceId: string,
     options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
   ) => Promise<WorkspaceRemoveResult>;
+  /** User-confirmed removal of a sub-agent, even one holding unpreserved work (#5106). */
+  removeSubagent: (
+    workspaceId: string,
+    acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+  ) => Promise<WorkspaceRemoveResult>;
   updateWorkspaceTitle: (
     workspaceId: string,
     newTitle: string
@@ -1499,10 +1504,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api, refreshProjects, setWorkspaceMetadata]
   );
 
-  const removeWorkspace = useCallback(
+  // Shared by workspace removal and user-confirmed sub-agent removal (#5106): both end with the
+  // same local cleanup and navigation.
+  const runWorkspaceRemoval = useCallback(
     async (
       workspaceId: string,
-      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+      remove: (client: APIClient) => Promise<WorkspaceRemoveResult>
     ): Promise<WorkspaceRemoveResult> => {
       if (!api) return { success: false, error: "API not connected" };
 
@@ -1516,7 +1523,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         : selectedWorkspace?.projectPath;
 
       try {
-        const result = await api.workspace.remove({ workspaceId, options });
+        const result = await remove(api);
         if (result.success) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
@@ -1544,7 +1551,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             navigateToProject(projectPath);
           }
           // If not selected, don't navigate at all - stay where we are
-          return { success: true };
+          // Keep the warnings: forced callers show what the removal left behind (#5143).
+          return { success: true, ...(result.warnings ? { warnings: result.warnings } : {}) };
         } else {
           console.error("Failed to remove workspace:", result.error);
           return result;
@@ -1564,6 +1572,31 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       api,
       setWorkspaceMetadata,
     ]
+  );
+
+  const removeWorkspace = useCallback(
+    (
+      workspaceId: string,
+      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+    ): Promise<WorkspaceRemoveResult> =>
+      runWorkspaceRemoval(workspaceId, (client) =>
+        client.workspace.remove({ workspaceId, options })
+      ),
+    [runWorkspaceRemoval]
+  );
+
+  const removeSubagent = useCallback(
+    (
+      workspaceId: string,
+      acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+    ): Promise<WorkspaceRemoveResult> =>
+      runWorkspaceRemoval(workspaceId, async (client) => {
+        const result = await client.tasks.remove({ taskId: workspaceId, acknowledgedWork });
+        return result.success
+          ? { success: true, ...(result.data.warnings ? { warnings: result.data.warnings } : {}) }
+          : { success: false, error: result.error };
+      }),
+    [runWorkspaceRemoval]
   );
 
   /**
@@ -2157,6 +2190,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     () => ({
       createWorkspace,
       removeWorkspace,
+      removeSubagent,
       updateWorkspaceTitle,
       setWorkspacePinned,
       reorderPinnedWorkspaces,
@@ -2184,6 +2218,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [
       createWorkspace,
       removeWorkspace,
+      removeSubagent,
       updateWorkspaceTitle,
       setWorkspacePinned,
       reorderPinnedWorkspaces,

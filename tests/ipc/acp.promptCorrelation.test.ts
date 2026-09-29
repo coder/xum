@@ -22,6 +22,10 @@ interface Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[];
+  discardHeldInputCalls: { workspaceId: string; heldInputId: string }[];
+  sendHeldInputCalls: Record<string, unknown>[];
+  /** `session/update` params written to the ACP client (only without `acpOutputStream`). */
+  sessionUpdates: { sessionId: string; update: Record<string, unknown> }[];
   pushChatEvent: (event: WorkspaceChatMessage) => void;
   closeConnection: () => void;
   connectionClosed: Promise<void>;
@@ -284,6 +288,9 @@ interface HarnessOptions {
     workspaceId: string;
     options?: Record<string, unknown>;
   }) => Promise<{ success: boolean; data?: unknown; error?: unknown }>;
+  sendHeldInput?: (
+    input: Record<string, unknown>
+  ) => Promise<{ success: boolean; data?: unknown; error?: unknown }>;
   /** Custom output WritableStream for simulating stdout backpressure. */
   acpOutputStream?: WritableStream<Uint8Array>;
   agentOptions?: ConstructorParameters<typeof MuxAgent>[2];
@@ -306,6 +313,9 @@ function createHarness(options?: HarnessOptions): Harness {
     workspaceId: string;
     options?: Record<string, unknown>;
   }[] = [];
+  const discardHeldInputCalls: Harness["discardHeldInputCalls"] = [];
+  const sendHeldInputCalls: Harness["sendHeldInputCalls"] = [];
+  const sessionUpdates: Harness["sessionUpdates"] = [];
   const chatStream = createControlledChatStream();
   // Every full-mode replay closes with a caught-up (the backend emits it in `finally`); a prompt
   // waits for that first one before dispatching so a failed replay is refused, not raced.
@@ -394,6 +404,14 @@ function createHarness(options?: HarnessOptions): Harness {
         }
         return { success: true as const, data: undefined };
       },
+      sendHeldInput: async (input: Record<string, unknown>) => {
+        sendHeldInputCalls.push(input);
+        return (await options?.sendHeldInput?.(input)) ?? { success: true, data: undefined };
+      },
+      discardHeldInput: async (input: { workspaceId: string; heldInputId: string }) => {
+        discardHeldInputCalls.push(input);
+        return { success: true as const, data: undefined };
+      },
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
     },
@@ -406,7 +424,7 @@ function createHarness(options?: HarnessOptions): Harness {
   };
 
   const { stream, closeInput } = createControllableAcpStream({
-    output: options?.acpOutputStream,
+    output: options?.acpOutputStream ?? createSessionUpdateCollector(sessionUpdates),
   });
 
   let agentInstance: MuxAgent | null = null;
@@ -425,10 +443,34 @@ function createHarness(options?: HarnessOptions): Harness {
     sendMessageCalls,
     delegatedToolAnswers,
     interruptCalls,
+    discardHeldInputCalls,
+    sendHeldInputCalls,
+    sessionUpdates,
     pushChatEvent: chatStream.push,
     closeConnection: closeInput,
     connectionClosed: connection.closed,
   };
+}
+
+/** Decode the agent's ndjson output and keep each `session/update` notification's params. */
+function createSessionUpdateCollector(
+  sessionUpdates: Harness["sessionUpdates"]
+): WritableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  let buffered = "";
+  return new WritableStream<Uint8Array>({
+    write(chunk) {
+      buffered += decoder.decode(chunk, { stream: true });
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      for (const line of lines) {
+        const message = JSON.parse(line) as { method?: string; params?: unknown };
+        if (message.method === "session/update") {
+          sessionUpdates.push(message.params as Harness["sessionUpdates"][number]);
+        }
+      }
+    },
+  });
 }
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -1712,4 +1754,247 @@ describe("ACP prompt stream correlation", () => {
     harness.closeConnection();
     await harness.connectionClosed;
   }, 15_000);
+});
+
+describe("ACP held inputs (#4944)", () => {
+  const heldInputs = ["queued follow-up", "second queued"].map((displayText, index) => ({
+    id: `held-${index + 1}`,
+    reason: "interrupted" as const,
+    displayText,
+    attachmentCount: 0,
+    reviewCount: 0,
+  }));
+
+  it("surfaces input held by a cancel and lets the ACP user discard it by number", async () => {
+    const harness: Harness = createHarness({
+      // The backend keeps queued input as held input during the Stop (#4769).
+      interruptStream: async ({ workspaceId }) => {
+        harness.pushChatEvent({
+          type: "restore-to-input",
+          workspaceId,
+          text: "queued follow-up\nsecond queued",
+          heldInputIds: heldInputs.map(({ id }) => id),
+        });
+        harness.pushChatEvent({ type: "held-inputs-changed", workspaceId, heldInputs });
+        return { success: true, data: undefined };
+      },
+    });
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+    const sessionId = newSessionResponse.sessionId;
+    const prompt = (text: string) =>
+      harness.agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
+
+    await harness.agent.cancel({ sessionId });
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "cancelled" });
+    await waitForCondition(() =>
+      harness.sessionUpdates.some(({ update }) => {
+        const text = update.sessionUpdate === "agent_message_chunk" ? JSON.stringify(update) : "";
+        return text.includes("queued follow-up") && text.includes("second queued");
+      })
+    );
+
+    // Showing held inputs never consumes them, and two are held, so a bare command must not
+    // guess which one to drop.
+    await prompt("/discard-held");
+    expect(harness.discardHeldInputCalls).toEqual([]);
+    await prompt("/discard-held 2");
+    expect(harness.discardHeldInputCalls).toEqual([
+      { workspaceId: sessionId, heldInputId: "held-2" },
+    ]);
+    // Only the original prompt was sent: nothing re-sent the held input.
+    expect(harness.sendMessageCalls).toHaveLength(1);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+});
+
+describe("ACP prompt refused while queued (#5171)", () => {
+  function heldChanged(
+    workspaceId: string,
+    reason: "reported" | "indeterminate" | "interrupted",
+    acpPromptId: string
+  ): WorkspaceChatMessage {
+    return {
+      type: "held-inputs-changed",
+      workspaceId,
+      heldInputs: [
+        {
+          id: "held-1",
+          reason,
+          displayText: "hello",
+          attachmentCount: 0,
+          reviewCount: 0,
+          acpPromptId,
+        },
+      ],
+    };
+  }
+
+  it.each([
+    ["reported", "refusal"],
+    ["indeterminate", "refusal"],
+    ["interrupted", "cancelled"],
+  ] as const)(
+    "settles a queued prompt at once when the backend holds it (%s -> %s)",
+    async (reason, stopReason) => {
+      const harness = createHarness();
+      const { newSessionResponse, promptPromise, promptCorrelationId } =
+        await createDefaultPromptTurn(harness);
+      const sessionId = newSessionResponse.sessionId;
+      const isSettled = trackSettled(promptPromise);
+
+      // Another prompt's held input is not this turn's.
+      harness.pushChatEvent(heldChanged(sessionId, reason, "another-prompt"));
+      await sleep(50);
+      expect(isSettled()).toBe(false);
+
+      // The dequeue gate refused this prompt's queued send and kept it as held input: no stream
+      // will ever start for it, so the turn settles now instead of at the correlation timeout.
+      harness.pushChatEvent(heldChanged(sessionId, reason, promptCorrelationId));
+      await waitForCondition(isSettled);
+      await expect(promptPromise).resolves.toMatchObject({ stopReason });
+
+      harness.closeConnection();
+      await harness.connectionClosed;
+    }
+  );
+});
+
+describe("ACP /send-held (#5170)", () => {
+  function heldInput(id: string, displayText: string, acpPromptId?: string) {
+    return {
+      id,
+      reason: "reported" as const,
+      displayText,
+      attachmentCount: 0,
+      reviewCount: 0,
+      ...(acpPromptId != null ? { acpPromptId } : {}),
+    };
+  }
+
+  /** A cancelled prompt leaves two held inputs listed in the notice as 1 and 2. */
+  async function withTwoHeld(options?: HarnessOptions) {
+    const harness: Harness = createHarness({
+      ...options,
+      interruptStream: async ({ workspaceId }) => {
+        harness.pushChatEvent({
+          type: "held-inputs-changed",
+          workspaceId,
+          heldInputs: [heldInput("held-1", "first"), heldInput("held-2", "second")],
+        });
+        return { success: true, data: undefined };
+      },
+    });
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+    const sessionId = newSessionResponse.sessionId;
+    await harness.agent.cancel({ sessionId });
+    await promptPromise;
+    await waitForCondition(() =>
+      harness.sessionUpdates.some(({ update }) => JSON.stringify(update).includes("2. second"))
+    );
+    const prompt = (text: string) =>
+      harness.agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
+    const sentCorrelation = () => {
+      const correlation = harness.sendHeldInputCalls.at(-1)?.acpCorrelation as
+        | { acpPromptId?: unknown }
+        | undefined;
+      if (typeof correlation?.acpPromptId !== "string") {
+        throw new Error("expected a correlated resend");
+      }
+      return correlation.acpPromptId;
+    };
+    return { harness, sessionId, prompt, sentCorrelation };
+  }
+
+  it("re-sends as this prompt and ignores another entry's stream", async () => {
+    const { harness, sessionId, prompt, sentCorrelation } = await withTwoHeld();
+    const sendPromise = prompt("/send-held 2");
+    const isSettled = trackSettled(sendPromise);
+    await waitForCondition(() => harness.sendHeldInputCalls.length === 1);
+    expect(harness.sendHeldInputCalls[0]).toMatchObject({
+      workspaceId: sessionId,
+      heldInputId: "held-2",
+    });
+    const correlation = sentCorrelation();
+
+    // An earlier queue entry (or the held send's old prompt) streams first: not this turn.
+    harness.pushChatEvent(streamStart(sessionId, "other-entry"));
+    harness.pushChatEvent(streamEnd(sessionId, "other-entry"));
+    harness.pushChatEvent(streamStart(sessionId, "old-prompt", { acpPromptId: "earlier" }));
+    harness.pushChatEvent(streamEnd(sessionId, "old-prompt", { acpPromptId: "earlier" }));
+    await sleep(50);
+    expect(isSettled()).toBe(false);
+
+    harness.pushChatEvent(streamStart(sessionId, "resent", { acpPromptId: correlation }));
+    harness.pushChatEvent(streamEnd(sessionId, "resent", { acpPromptId: correlation }));
+    await expect(sendPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(harness.sendMessageCalls).toHaveLength(1);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("settles when the queued resend is refused and held again at dequeue", async () => {
+    const { harness, sessionId, prompt, sentCorrelation } = await withTwoHeld();
+    const sendPromise = prompt("/send-held 1");
+    await waitForCondition(() => harness.sendHeldInputCalls.length === 1);
+    // Accepted into the queue (the backend dropped held-1), then refused at dequeue and held
+    // again under a new id, named by this prompt's correlation.
+    harness.pushChatEvent({
+      type: "held-inputs-changed",
+      workspaceId: sessionId,
+      heldInputs: [heldInput("held-2", "second"), heldInput("held-3", "first", sentCorrelation())],
+    });
+    await expect(sendPromise).resolves.toMatchObject({ stopReason: "refusal" });
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("refuses a number the last notice showed once that input is gone", async () => {
+    const { harness, sessionId, prompt } = await withTwoHeld();
+    // held-1 was sent from the desktop: no new notice, so numbers keep their meaning.
+    harness.pushChatEvent({
+      type: "held-inputs-changed",
+      workspaceId: sessionId,
+      heldInputs: [heldInput("held-2", "second")],
+    });
+    await sleep(50);
+    await expect(prompt("/send-held 1")).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(harness.sendHeldInputCalls).toEqual([]);
+
+    const sendPromise = prompt("/send-held 2");
+    await waitForCondition(() => harness.sendHeldInputCalls.length === 1);
+    expect(harness.sendHeldInputCalls[0]).toMatchObject({ heldInputId: "held-2" });
+    await harness.agent.cancel({ sessionId });
+    await sendPromise;
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("reports a refused resend and leaves no turn behind", async () => {
+    const { harness, sessionId, prompt } = await withTwoHeld({
+      sendHeldInput: async () => ({
+        success: false,
+        error: { type: "unknown", raw: "This unsent message is no longer held." },
+      }),
+    });
+    await expect(prompt("/send-held 1")).resolves.toMatchObject({ stopReason: "end_turn" });
+    const replies = harness.sessionUpdates
+      .map(({ update }) => JSON.stringify(update))
+      .filter((text) => text.includes("This unsent message is no longer held."));
+    expect(replies).toHaveLength(1);
+    // The backend knows whether the input is still held; the reply must not contradict it.
+    expect(replies[0]).not.toContain("still held");
+    // The failed resend left no pending turn: a later command still runs.
+    await expect(prompt("/discard-held 2")).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(harness.discardHeldInputCalls).toEqual([
+      { workspaceId: sessionId, heldInputId: "held-2" },
+    ]);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
 });

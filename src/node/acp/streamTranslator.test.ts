@@ -131,3 +131,123 @@ describe("StreamTranslator plan-review record replay", () => {
     expect(updates).toEqual([]);
   });
 });
+
+describe("StreamTranslator held inputs (#4944)", () => {
+  type HeldInput = Extract<
+    WorkspaceChatMessage,
+    { type: "held-inputs-changed" }
+  >["heldInputs"][number];
+
+  function held(id: string, displayText: string, extra: Partial<HeldInput> = {}): HeldInput {
+    return { id, reason: "interrupted", displayText, attachmentCount: 0, reviewCount: 0, ...extra };
+  }
+
+  function heldChanged(...heldInputs: HeldInput[]): WorkspaceChatMessage {
+    return { type: "held-inputs-changed", workspaceId: "ws", heldInputs };
+  }
+
+  async function translate(events: WorkspaceChatMessage[]) {
+    const sessionUpdate = mock(() => Promise.resolve(undefined));
+    const translator = new StreamTranslator({ sessionUpdate } as unknown as AgentSideConnection);
+    async function* stream(): AsyncIterable<WorkspaceChatMessage> {
+      for (const event of events) yield await Promise.resolve(event);
+    }
+    await translator.consumeAndForward("session", stream());
+    const notices = sessionUpdate.mock.calls.map((call) => {
+      const { update } = (call as unknown[])[0] as {
+        update: { sessionUpdate: string; content: { text: string } };
+      };
+      expect(update.sessionUpdate).toBe("agent_message_chunk");
+      return update.content.text;
+    });
+    return { translator, notices };
+  }
+
+  test("announces new held inputs once, numbered, with their full text", async () => {
+    const one = held("h1", "first message");
+    const two = held("h2", "line one\nline two");
+    const three = held("h3", "", { attachmentCount: 2, reviewCount: 1 });
+    const { notices } = await translate([
+      heldChanged(),
+      heldChanged(one, two),
+      // The backend re-sends the full list on every change and subscription: a replay, a
+      // removal and an empty list announce nothing.
+      heldChanged(one, two),
+      heldChanged(two),
+      heldChanged(two, three),
+      heldChanged(),
+    ]);
+
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain("1. first message");
+    expect(notices[0]).toContain("2. line one\n   line two");
+    // A later new input re-lists everything still held; attachment-only input stays visible.
+    expect(notices[1]).not.toContain("first message");
+    expect(notices[1]).toContain("1. line one");
+    expect(notices[1]).toMatch(/2\. .*2 attachments.*1 review/);
+  });
+
+  test("a notice the client never received is announced again on the replay", async () => {
+    const sessionUpdate = mock(() => Promise.resolve(undefined));
+    sessionUpdate.mockImplementationOnce(() => Promise.reject(new Error("stdout closed")));
+    const translator = new StreamTranslator({ sessionUpdate } as unknown as AgentSideConnection);
+    async function* stream(): AsyncIterable<WorkspaceChatMessage> {
+      yield await Promise.resolve(heldChanged(held("h1", "keep me")));
+    }
+    const failure: unknown = await translator
+      .consumeAndForward("session", stream())
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    // The resubscription replays the same held list.
+    await translator.consumeAndForward("session", stream());
+    expect(sessionUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  test("restore-to-input defers to held inputs, and shows its text when nothing holds it", async () => {
+    const { notices } = await translate([
+      { type: "restore-to-input", workspaceId: "ws", text: "kept text", heldInputIds: ["h1"] },
+      heldChanged(held("h1", "kept text")),
+      { type: "restore-to-input", workspaceId: "ws", text: "only copy" },
+      { type: "restore-to-input", workspaceId: "ws", text: "" },
+    ]);
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain("1. kept text");
+    expect(notices[1]).toContain("only copy");
+  });
+
+  test("numbers resolve against the last notice; gone, unknown or ambiguous are refused", async () => {
+    const { translator } = await translate([
+      heldChanged(held("h1", "one"), held("h2", "two"), held("h3", "three")),
+      heldChanged(held("h1", "one"), held("h3", "three")),
+    ]);
+    const resolve = (number?: number) => translator.resolveHeldInput("session", number);
+    // Number 3 still means "three" after h2 left: no renumbering without a new notice.
+    expect(resolve(3)).toMatchObject({ kind: "found", heldInput: { id: "h3" } });
+    expect(resolve(2).kind).toBe("refused");
+    expect(resolve(4).kind).toBe("refused");
+    expect(resolve().kind).toBe("refused");
+
+    const single = await translate([
+      heldChanged(held("h1", "a"), held("h2", "b")),
+      heldChanged(held("h2", "b")),
+    ]);
+    expect(single.translator.resolveHeldInput("session", undefined)).toMatchObject({
+      number: 2,
+      heldInput: { id: "h2" },
+    });
+    const empty = await translate([heldChanged(held("h1", "a")), heldChanged()]);
+    expect(empty.translator.resolveHeldInput("session", 1).kind).toBe("refused");
+
+    // A clean resubscription replays nothing once the list is empty (the backend replays only a
+    // non-empty list), so inputs removed during the gap must not stay resolvable.
+    const gap = await translate([heldChanged(held("h1", "a"))]);
+    const noEvents: WorkspaceChatMessage[] = [];
+    await gap.translator.consumeAndForward(
+      "session",
+      (async function* () {
+        for (const event of noEvents) yield await Promise.resolve(event);
+      })()
+    );
+    expect(gap.translator.resolveHeldInput("session", 1).kind).toBe("refused");
+  });
+});

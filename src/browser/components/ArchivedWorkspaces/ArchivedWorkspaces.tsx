@@ -12,6 +12,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { ChevronDown, ChevronRight, FolderX, Loader2, Search, Trash2 } from "lucide-react";
 import { ArchiveIcon, ArchiveRestoreIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -56,6 +57,8 @@ interface BulkOperationState {
   completed: number;
   current: string | null;
   errors: string[];
+  /** What forced removals left behind (#5143); kept in the dialog so Done does not clear it. */
+  warnings?: string[];
 }
 
 function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
@@ -285,6 +288,18 @@ const BulkProgressModal: React.FC<{
           </div>
         )}
 
+        {/* Leftovers of successful forced removals */}
+        {operation.warnings != null && operation.warnings.length > 0 && (
+          <div
+            role="status"
+            className="bg-warning-overlay text-warning-text max-h-32 overflow-y-auto rounded p-2 text-xs break-words whitespace-pre-wrap"
+          >
+            {operation.warnings.map((warning, i) => (
+              <div key={i}>{warning}</div>
+            ))}
+          </div>
+        )}
+
         {isComplete && (
           <DialogFooter className="justify-center">
             <Button variant="secondary" onClick={onClose} className="w-full">
@@ -329,6 +344,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
+  // What a forced removal left behind (e.g. a devcontainer that may still hold the plan, #5143),
+  // after Shift-click or the Force Delete dialog. It stays until dismissed: the row is gone, so
+  // the user could not reread it. Bulk delete shows it in its progress dialog instead: that modal
+  // would hide this popover from assistive technology.
+  const removeWarning = usePopoverError(null);
 
   // Bulk selection state
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
@@ -536,6 +556,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
       try {
         const result = await removeWorkspace(id, { force: true });
+        if (result.success && result.warnings?.length) {
+          const line = `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`;
+          setBulkOperation((prev) =>
+            prev ? { ...prev, warnings: [...(prev.warnings ?? []), line] } : prev
+          );
+        }
         if (!result.success) {
           setBulkOperation((prev) =>
             prev
@@ -735,6 +761,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             : {}),
         });
         if (forced.success) {
+          if (forced.warnings?.length) {
+            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
+          }
           onWorkspacesChanged?.();
           return;
         }
@@ -785,7 +814,16 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
               force: true,
               acknowledgedDescendantIds,
             });
-            if (result.success) onWorkspacesChanged?.();
+            if (result.success) {
+              // The dialog showed the non-forced error; the forced retry can leave more behind.
+              if (result.warnings?.length) {
+                removeWarning.showError(
+                  workspaceId,
+                  formatWorkspaceRemoveWarnings(result.warnings)
+                );
+              }
+              onWorkspacesChanged?.();
+            }
             return result;
           }}
         />
@@ -799,6 +837,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         error={deleteWorktreeError.error}
         prefix="Failed to delete managed worktree"
         onDismiss={deleteWorktreeError.clearError}
+      />
+      <PopoverError
+        error={removeWarning.error}
+        prefix="Workspace deleted, but something was left behind"
+        onDismiss={removeWarning.clearError}
       />
       {bulkOperation && (
         <BulkProgressModal operation={bulkOperation} onClose={() => setBulkOperation(null)} />

@@ -16,7 +16,9 @@ import {
   scanHistoryFilesBounded,
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
-  readProviderHistorySuffix,
+  openHistorySnapshot,
+  readStatusHistorySuffix,
+  type OpenHistorySnapshot,
   readProviderHistoryWindow,
   readProviderHistorySinceFloor,
   readProviderHistoryBefore,
@@ -126,6 +128,12 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+const STATUS_SUFFIX_ERROR_PREFIX = "Failed to read history suffix from boundary";
+// Windows: libuv's rename (MoveFileExW + MOVEFILE_REPLACE_EXISTING) fails with EPERM while any
+// handle has the destination open, and writeFileAtomic does not retry. An unlocked status scan
+// every tick would make in-process rewrites fail there, so Windows keeps the whole scan locked.
+const STATUS_SCAN_RELEASES_HISTORY_LOCK = process.platform !== "win32";
 
 export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
@@ -2599,11 +2607,33 @@ export class HistoryService {
   }
 
   /**
-   * A suffix of getHistoryFromLatestBoundary(workspaceId) holding at least `minMatching` rows
-   * that satisfy `matches` (or the whole read when it has fewer), so trailing-window readers
-   * (sidebar status) do not parse the whole active epoch under the lock (#4720).
+   * Sidebar status read (#4720, #4790): a suffix of getHistoryFromLatestBoundary(workspaceId)
+   * holding at least `minMatching` rows that satisfy `matches` (or the whole read when it has
+   * fewer), so the status tick never parses the whole active epoch.
+   *
+   * Rows over SESSION_HISTORY_MAX_LINE_BYTES are status-grade, never provider-grade: tool
+   * payloads come back null and file URLs "" (readStatusHistorySuffix).
+   *
+   * Lock scope: on POSIX only truncate recovery, open and fstat run under the history lock; the
+   * scan and the final stamp check run on the pinned descriptors after it is released, so
+   * partial writes and chat opens no longer wait behind a giant-row scan. Why that is safe:
+   * - Every in-process mutation holds the same mutex for its whole read+replace (see
+   *   withCrossProcessWriteLock, always nested inside it), so the captured chat/archive pair
+   *   never sits between two steps of a transaction.
+   * - No production writer shrinks or rewrites history bytes in place: appends use O_APPEND
+   *   (appendHistoryUnderWriteLock, rotation's archive "a+"), torn tails are delimited by
+   *   APPENDING a newline (historyAppendProvenance, rotation), every rewrite goes through
+   *   writeFileAtomic / rename, and truncate recovery only removes or renames the archive, its
+   *   tombstone and the marker. The pinned inodes therefore keep the snapshot bytes, and every
+   *   read stays within the captured sizes.
+   * - A foreign in-place shrink makes a positional read come back short, which fails closed;
+   *   any append, rotation or replacement fails the stamp check.
+   * - A failed unlocked scan falls back once to the fully locked read (today's cost, paid only
+   *   on a conflict), so an in-process writer never makes status skip a tick. If that read
+   *   fails too, Err: the status tick keeps the current status and retries at its normal
+   *   interval, the path cross-process races already take today.
    */
-  async getHistorySuffixFromLatestBoundary(
+  async getStatusHistorySuffix(
     workspaceId: string,
     minMatching: number,
     matches: (message: MuxMessage) => boolean
@@ -2612,21 +2642,37 @@ export class HistoryService {
     // correctness nor for boundedness, and a background tick must stay read-only instead of
     // paying a one-time full-file scan under the cross-process write lock. Boundary writes,
     // replay and provider requests still rotate.
-    return this.withRecoveredHistoryResultLock(
-      workspaceId,
-      "Failed to read history suffix from boundary",
-      async () =>
-        Ok(
-          await readProviderHistorySuffix(
-            {
-              chat: this.getChatHistoryPath(workspaceId),
-              archive: this.getChatArchivePath(workspaceId),
-            },
-            minMatching,
-            matches
-          )
-        )
-    );
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    const read = async (snapshot: OpenHistorySnapshot) => {
+      try {
+        return Ok(await readStatusHistorySuffix(snapshot, minMatching, matches));
+      } finally {
+        await snapshot.close();
+      }
+    };
+    const lockedRead = () =>
+      this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
+        read(await openHistorySnapshot(paths))
+      );
+    if (!STATUS_SCAN_RELEASES_HISTORY_LOCK) return lockedRead();
+    // Only truncate recovery + open + fstat need the lock (see the doc comment).
+    let snapshot: OpenHistorySnapshot;
+    try {
+      snapshot = await this.withRecoveredHistoryLock(workspaceId, () => openHistorySnapshot(paths));
+    } catch (error) {
+      return Err(`${STATUS_SUFFIX_ERROR_PREFIX}: ${getErrorMessage(error)}`);
+    }
+    try {
+      return await read(snapshot);
+    } catch {
+      // A writer changed history mid-scan. Skipping made status miss 7/50 ticks under
+      // continuous appends (#4790 UAT), so fall back once to the whole-read lock: base's cost,
+      // paid only on a conflict, and in-process writers cannot change the files under it.
+      return lockedRead();
+    }
   }
 
   /**

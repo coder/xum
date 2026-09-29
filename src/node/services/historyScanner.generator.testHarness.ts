@@ -4,6 +4,7 @@ import {
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
 } from "@/common/constants/contextBudget";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -416,3 +417,72 @@ export function deepEqualAnyDepth(a: unknown, b: unknown): boolean {
   }
   return true;
 }
+
+/**
+ * Independent oracle of the status projection (#4790) on a parsed row: the value the status read
+ * must return for a row over SESSION_HISTORY_MAX_LINE_BYTES that the full read returns as `row`.
+ */
+export function referenceStatusElision(row: unknown): unknown {
+  if (!isPlainObject(row) || !Array.isArray(row.parts)) return row;
+  const elide = (value: unknown) =>
+    typeof value === "string" || (typeof value === "object" && value !== null) ? null : value;
+  const elidePayloads = (owner: Record<string, unknown>) => {
+    const copy = { ...owner };
+    for (const key of ["input", "output"]) if (key in copy) copy[key] = elide(copy[key]);
+    return copy;
+  };
+  const parts: unknown[] = row.parts.map((part: unknown) => {
+    if (!isPlainObject(part)) return part;
+    const copy = elidePayloads(part);
+    if (typeof copy.url === "string") copy.url = "";
+    if (Array.isArray(copy.nestedCalls))
+      copy.nestedCalls = copy.nestedCalls.map((call: unknown) =>
+        isPlainObject(call) ? elidePayloads(call) : call
+      );
+    return copy;
+  });
+  return { ...row, parts };
+}
+
+/**
+ * A readable row whose bytes are mostly `payload` in a tool input/output, a nested call payload
+ * or a file URL: the giant-row shapes the status projection cuts (#4790).
+ */
+export function payloadRow(id: string, shape: number, payload: string): MuxMessage {
+  const message = createMuxMessage(id, shape === 2 ? "user" : "assistant", `payload row ${id}`);
+  const tool = { type: "dynamic-tool" as const, toolCallId: `${id}-call`, toolName: "bash" };
+  if (shape === 0)
+    message.parts.push({
+      ...tool,
+      state: "output-available",
+      input: { script: "ls" },
+      output: payload,
+    });
+  else if (shape === 1)
+    message.parts.push({ ...tool, state: "input-available", input: { script: payload } });
+  else if (shape === 2)
+    message.parts.push({
+      type: "file",
+      mediaType: "image/png",
+      url: `data:image/png;base64,${payload}`,
+    });
+  else
+    message.parts.push({
+      ...tool,
+      toolName: "code_execution",
+      state: "output-available",
+      input: { code: "run()" },
+      output: { ok: true },
+      nestedCalls: [
+        {
+          toolCallId: `${id}-n`,
+          toolName: "file_read",
+          state: "output-available",
+          input: 7,
+          output: [payload],
+        },
+      ],
+    });
+  return message;
+}
+export const PAYLOAD_ROW_SHAPES = 4;

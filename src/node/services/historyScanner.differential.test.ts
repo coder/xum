@@ -50,7 +50,7 @@ async function observe(
     const result = await locate(handle, size, skip, includeReadableResetFloor, (row) => {
       rows.push(row);
       if (row.message !== null) readable++;
-      // The suffix reader's rule (readProviderHistorySuffix): once requested, the stop stays
+      // The status suffix reader's rule (readStatusHistorySuffix): once requested, the stop stays
       // requested; the locator honors it only after a safe readable row.
       return stopAfterReadable !== null && readable >= stopAfterReadable;
     });
