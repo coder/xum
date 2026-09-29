@@ -510,6 +510,42 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
+  // #4967: background cleanup() refuses migrations only while it runs, and it returns before the
+  // checkout is deleted. A command that reaches beginMigration in between would register and keep
+  // running in the deleted checkout, so removal keeps migrations refused until it settles.
+  test("refuses background migrations until the removal settles", async () => {
+    for (const deletion of ["succeeds", "fails"] as const) {
+      let admittedAtDeletion: boolean | undefined;
+      let manager: WorkspaceServiceHarness["backgroundProcessManager"] | undefined;
+      const deleteWorkspace = mock(() => {
+        using migration = manager?.beginMigration(workspaceId);
+        admittedAtDeletion = migration?.admitted;
+        return Promise.resolve(
+          deletion === "succeeds"
+            ? { success: true as const, deletedPath: sharedPath }
+            : { success: false as const, error: "delete failed" }
+        );
+      });
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        deleteWorkspace,
+      } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+      try {
+        await using harness = await createChildHarness(undefined);
+        manager = harness.backgroundProcessManager;
+
+        const result = await harness.service.remove(workspaceId, false);
+
+        expect(result.success).toBe(deletion === "succeeds");
+        expect(admittedAtDeletion).toBe(false);
+        // A failed removal keeps the workspace, which must be able to background commands again.
+        using after = harness.backgroundProcessManager.beginMigration(workspaceId);
+        expect(after.admitted).toBe(true);
+      } finally {
+        createRuntimeSpy.mockRestore();
+      }
+    }
+  });
+
   // #4760: MCP prompt discovery starts stdio servers in the checkout, so a removal refuses
   // new discoveries while it runs.
   test("refuses MCP prompt discovery while a removal runs", async () => {

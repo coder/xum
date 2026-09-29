@@ -7219,6 +7219,10 @@ export class WorkspaceService
       // disposal at scope exit (after deregistration or its rollback) is safe
       // since a late renewal of a retained terminal marker is meaningless.
       using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
+      // #4967: background cleanup() below refuses new fg→bg migrations only while it runs, and
+      // the checkout is deleted after it returns. Keep them refused until this removal settles:
+      // a failed removal keeps the workspace, which can then background commands again.
+      using _migrationSeal = this.backgroundProcessManager.sealMigrations(workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is

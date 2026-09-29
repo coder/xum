@@ -1427,8 +1427,9 @@ ${scriptWithEnv}`;
             exitCode = completed[0];
           } else {
             // Held until the command is registered below or terminated after a failed
-            // migration: a removal's cleanup() in between waits for it (#4805).
-            using _migration =
+            // migration: a removal's cleanup() in between waits for it (#4805). Refused
+            // (not admitted) once cleanup has started for the workspace (#4967).
+            using migration =
               config.backgroundProcessManager && config.workspaceId
                 ? config.backgroundProcessManager.beginMigration(config.workspaceId)
                 : undefined;
@@ -1458,8 +1459,15 @@ ${scriptWithEnv}`;
 
             // Migrate to background tracking if manager is available
             let migrationError =
-              claim?.success === false ? claim.error : "background process manager unavailable";
-            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+              migration?.admitted === false
+                ? "the workspace's background processes are being cleaned up"
+                : claim?.success === false
+                  ? claim.error
+                  : "background process manager unavailable";
+            if (migration?.admitted === false) {
+              // Nothing was written under the claimed name.
+              claimLock?.releaseName();
+            } else if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams

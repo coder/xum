@@ -9,6 +9,7 @@ import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
+import { execFileSync } from "child_process";
 import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
 import type { createRuntime as CreateRuntimeFn } from "@/node/runtime/runtimeFactory";
 
@@ -2239,6 +2240,99 @@ describe("bash tool - background execution", () => {
 
     tempDir[Symbol.dispose]();
   }, 15000);
+
+  // #4967: cleanup() waited only for migrations that had begun when it started. A command still
+  // before beginMigration (claiming its record name, or in the exit grace) then migrated and
+  // registered after cleanup's snapshot and kept running. Cleanup refuses migrations while it runs.
+  it.skipIf(process.platform === "win32")(
+    "a command that reaches migration while cleanup runs is terminated",
+    async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-cleanup-seal");
+      const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.backgroundProcessManager = manager;
+      const workspaceId = config.workspaceId!;
+      let pid = 0;
+      const finishTerminate = Promise.withResolvers<void>();
+      const resumeCommand = Promise.withResolvers<void>();
+      try {
+        // Keeps cleanup() running after its snapshot: terminating this process waits on a gate.
+        const busy = await manager.spawn(new LocalRuntime(tempDir.path), workspaceId, "sleep 30", {
+          cwd: tempDir.path,
+          displayName: "busy",
+        });
+        expect(busy.success).toBe(true);
+        const terminating = Promise.withResolvers<void>();
+        const terminate = manager.terminate.bind(manager);
+        spyOn(manager, "terminate").mockImplementation(async (...args) => {
+          terminating.resolve();
+          await finishTerminate.promise;
+          return terminate(...args);
+        });
+        // Parks the command once it has claimed its record name, before beginMigration.
+        const claimed = Promise.withResolvers<void>();
+        const claim = manager.claimMigrationProcessId.bind(manager);
+        spyOn(manager, "claimMigrationProcessId").mockImplementation(async (...args) => {
+          const result = await claim(...args);
+          claimed.resolve();
+          await resumeCommand.promise;
+          return result;
+        });
+
+        // The command reports its pid through a FIFO, so the test knows it runs without polling.
+        const pidFifo = path.join(tempDir.path, "pid.fifo");
+        execFileSync("mkfifo", [pidFifo]);
+        const resultPromise = createBashTool(config).execute!(
+          {
+            script: `echo $$ > "${pidFifo}"; sleep 30`,
+            timeout_secs: 60,
+            run_in_background: false,
+            display_name: "migrate-seal",
+          },
+          mockToolCallOptions
+        ) as Promise<BashToolResult>;
+        pid = Number.parseInt((await fs.promises.readFile(pidFifo, "utf8")).trim(), 10);
+        expect(pid).toBeGreaterThan(1);
+        expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        await claimed.promise;
+
+        const cleanup = manager.cleanup(workspaceId);
+        await terminating.promise; // cleanup has taken its snapshot and is still running
+        resumeCommand.resolve();
+        const result = await resultPromise;
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("terminated because it could not be tracked");
+        }
+        finishTerminate.resolve();
+        await cleanup;
+
+        expect(await manager.list(workspaceId)).toEqual([]);
+        let alive = true;
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      } finally {
+        // On failure, stop whatever survived (the pre-fix code leaves the command registered).
+        finishTerminate.resolve();
+        resumeCommand.resolve();
+        await manager.cleanup(workspaceId);
+        if (pid > 1) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+        tempDir[Symbol.dispose]();
+      }
+    },
+    15000
+  );
 
   // #4878: two backends (desktop + `xum server` on one XUM_ROOT) have separate managers but
   // share the migrated-record root, so migration names must be claimed across processes.
