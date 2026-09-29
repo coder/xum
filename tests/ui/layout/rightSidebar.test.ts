@@ -30,9 +30,9 @@ import { renderApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_LAYOUT_MAX_CHARS,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
+  getPersistedKeyRegistration,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
@@ -767,17 +767,16 @@ describeIntegration("RightSidebar (UI)", () => {
   test("a new terminal gets its tab even when the layout no longer fits its budget", async () => {
     // Pad the tabset id so the layout sits just under its budget: with a terminal tab (~45 chars)
     // it no longer fits. That layout write used to be refused, so the terminal never got a tab.
+    const layoutKey = getRightSidebarLayoutKey(workspaceId);
+    const layoutBudget = getPersistedKeyRegistration(layoutKey)!.maxValueChars;
     const base = getDefaultRightSidebarLayoutState("costs");
-    const padding = "p".repeat(
-      Math.floor((RIGHT_SIDEBAR_LAYOUT_MAX_CHARS - 20 - JSON.stringify(base).length) / 2)
-    );
+    const padding = "p".repeat(Math.floor((layoutBudget - 20 - JSON.stringify(base).length) / 2));
     const tabsetId = `${base.focusedTabsetId}${padding}`;
     const paddedLayout: RightSidebarLayoutState = {
       ...base,
       focusedTabsetId: tabsetId,
       root: { ...base.root, id: tabsetId } as RightSidebarLayoutState["root"],
     };
-    const layoutKey = getRightSidebarLayoutKey(workspaceId);
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       expect(updatePersistedState(layoutKey, paddedLayout)).toBe(true);
     });

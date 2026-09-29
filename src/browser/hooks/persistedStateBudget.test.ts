@@ -144,18 +144,22 @@ describe("localStorage budget", () => {
   });
 
   test("the worst case of every registered key stays under the ceilings", () => {
-    const refused: string[] = [];
+    const storage = window.localStorage;
+    const notStored: string[] = [];
     for (const entry of PERSISTED_KEY_REGISTRY) {
       if (entry.maxValueChars === 0) continue; // Legacy keys: never written.
       // A JSON string of exactly maxValueChars chars (quotes included).
       const value = "x".repeat(entry.maxValueChars - 2);
       for (const key of modelledKeys(entry)) {
-        if (!updatePersistedState(key, value)) refused.push(key);
+        updatePersistedState(key, value);
+        // Check the disk, not the return value: an over-budget value (e.g. a key resolving to a
+        // smaller-budget registration) is kept in memory and still returns true, so it would be
+        // missing from the totals below.
+        if (storage.getItem(key) !== JSON.stringify(value)) notStored.push(key);
       }
     }
-    expect(refused).toEqual([]);
+    expect(notStored).toEqual([]);
 
-    const storage = window.localStorage;
     let total = 0;
     let nonEvictable = 0;
     for (let index = 0; index < storage.length; index++) {

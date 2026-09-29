@@ -10,7 +10,7 @@ const record = Object.fromEntries(
 );
 
 describe("bounded persisted values", () => {
-  // A trimmed value one char over its key budget would be refused, freezing that UI state.
+  // A trimmed value one char over its key budget would not persist at all.
   test("trimRecordToChars keeps the newest entries that fit and nothing more", () => {
     for (const maxChars of [2, 30, 31, 32, 100, 257, 500, 10_000]) {
       const trimmed = trimRecordToChars(record, maxChars);

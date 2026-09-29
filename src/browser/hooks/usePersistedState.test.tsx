@@ -12,6 +12,7 @@ import {
   MAX_PERSISTED_KEY_CHARS,
   UI_THEME_KEY,
   getLastRuntimeConfigKey,
+  getPersistedKeyRegistration,
   getTimelineFilterKey,
 } from "@/common/constants/storage";
 import {
@@ -164,9 +165,10 @@ describe("persisted state key budgets", () => {
   let cleanupDom: (() => void) | null = null;
   let error: ReturnType<typeof spyOn<Console, "error">>;
 
-  // getTimelineFilterKey has a 64-char budget; every test uses its own workspace id because
-  // refusals are logged once per key per session.
-  const TIMELINE_FILTER_BUDGET = 64;
+  // Every test uses its own workspace id because refusals are logged once per key per session.
+  const TIMELINE_FILTER_BUDGET = getPersistedKeyRegistration(
+    getTimelineFilterKey("budget")
+  )!.maxValueChars;
   const valueOfLength = (serializedLength: number) => "x".repeat(serializedLength - 2);
   // Refusal logs shorten long keys, so match on the key's start.
   const refusalLogsFor = (key: string) =>

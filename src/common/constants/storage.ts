@@ -979,7 +979,7 @@ export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
  * about 35 terminals. The layout cannot be trimmed; a larger layout lives in memory for the
  * session (see usePersistedState), and on reload terminal tabs are restored from the backend.
  */
-export const RIGHT_SIDEBAR_LAYOUT_MAX_CHARS = 1792;
+const RIGHT_SIDEBAR_LAYOUT_MAX_CHARS = 1792;
 /** right-sidebar:terminal-titles:{workspaceId}: RightSidebar keeps the newest titles that fit. */
 export const TERMINAL_TITLES_MAX_CHARS = 768;
 /** Each left sidebar expansion map; entries accumulate per project/workspace/group forever. */
