@@ -590,7 +590,8 @@ describe("delegated target default consent (#4453)", () => {
     expect(mark(a.config)).toBeUndefined();
     expect(await flagOf()).toBeUndefined();
     // Keep publishes the cleared flag, so the banner goes away without a reload.
-    expect(published).toEqual([undefined]);
+    expect(published).toHaveLength(1);
+    expect(published[0]).toBeUndefined();
     await a.finish();
   });
 
