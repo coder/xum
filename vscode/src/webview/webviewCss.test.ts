@@ -139,8 +139,8 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "titlebar-safe-right-gutter-3",
   "titlebar-safe-right-minus-sidebar",
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
-  // (pointer: coarse) media blocks (sidebar overlay, sticky header, touch rows). The webview has
-  // no app shell and does not bundle these components.
+  // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
+  // and does not bundle these components.
   "mobile-bottom-inset-host",
   "mobile-header-spacer",
   "mobile-hide-right-sidebar",
@@ -151,7 +151,6 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "mobile-sidebar",
   "mobile-sidebar-collapsed",
   "mobile-sticky-header",
-  "mobile-touch-row",
   // Project sidebar only: the webview shows one workspace and no project sidebar.
   "react-colorful",
   "section-color-picker",

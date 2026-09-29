@@ -55,6 +55,16 @@ const ALLOWED_PROCEDURES = {
   policy: new Set(["get", "onChanged"]),
 } as const;
 
+// The only nested procedures the webview may call: the background processes strip lists
+// (subscribe) and terminates a workspace's background bashes, and its output dialog peeks their
+// output (#5092). sendToBackground stays blocked (bashForegroundControls is unsupported).
+// sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+const ALLOWED_NESTED_PROCEDURES = new Set([
+  "workspace.backgroundBashes.subscribe",
+  "workspace.backgroundBashes.terminate",
+  "workspace.backgroundBashes.getOutput",
+]);
+
 export function isAllowedOrpcPath(path: string[]): boolean {
   assert(Array.isArray(path), "isAllowedOrpcPath requires path array");
 
@@ -62,8 +72,11 @@ export function isAllowedOrpcPath(path: string[]): boolean {
     return false;
   }
 
-  // We only support direct procedure access from the VS Code webview.
-  // Nested routers expand the surface area and aren't needed for the sidebar.
+  // We only support direct procedure access from the VS Code webview, plus the few nested
+  // procedures listed above. Other nested routers expand the surface area and aren't needed.
+  if (path.length === 3) {
+    return ALLOWED_NESTED_PROCEDURES.has(path.join("."));
+  }
   if (path.length !== 2) {
     return false;
   }
@@ -236,6 +249,10 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  *
  * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
  * {workspaceId, options} is forwarded.
+ *
+ * workspace.backgroundBashes.* (#5092): only for a workspace the extension sent. subscribe forwards
+ * {workspaceId}, terminate {workspaceId, processId}, and getOutput also its read window
+ * (fromOffset, tailBytes). The backend refuses a processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -250,6 +267,9 @@ export function sanitizeWebviewOrpcInput(
   }
   if (procedure === "workspace.resumeStream") {
     return sanitizeResumeStream(input, knownWorkspaceIds);
+  }
+  if (ALLOWED_NESTED_PROCEDURES.has(procedure)) {
+    return sanitizeBackgroundBashAction(procedure, input, knownWorkspaceIds);
   }
 
   if (procedure !== "agents.list") {
@@ -305,4 +325,39 @@ function sanitizeResumeStream(
     return { ok: false, error: "workspace.resumeStream is limited to known workspaces" };
   }
   return { ok: true, input: { workspaceId, options: record.options } };
+}
+
+function sanitizeBackgroundBashAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return { ok: true, input: { workspaceId } };
+  }
+  if (typeof record.processId !== "string") {
+    return { ok: false, error: `${procedure} requires a processId` };
+  }
+  if (procedure === "workspace.backgroundBashes.terminate") {
+    return { ok: true, input: { workspaceId, processId: record.processId } };
+  }
+  assert(procedure === "workspace.backgroundBashes.getOutput", `unexpected procedure ${procedure}`);
+  // The backend validates the read window's values.
+  return {
+    ok: true,
+    input: {
+      workspaceId,
+      processId: record.processId,
+      ...(record.fromOffset !== undefined ? { fromOffset: record.fromOffset } : {}),
+      ...(record.tailBytes !== undefined ? { tailBytes: record.tailBytes } : {}),
+    },
+  };
 }

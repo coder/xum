@@ -1535,8 +1535,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.postMessage({
           type: "orpcStreamData",
           streamId,
-          // Same redaction as value responses (#4820): the allowed streams emit only void change
-          // signals today, but a future structured stream on a redacted path must not bypass it.
+          // Same redaction as value responses (#4820): a structured stream on a redacted path
+          // must not bypass it.
           value: redactWebviewOrpcResult(path, value),
         });
       }

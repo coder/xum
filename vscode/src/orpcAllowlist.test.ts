@@ -25,8 +25,12 @@ describe("isAllowedOrpcPath", () => {
       .toBe(false);
   });
 
-  test("rejects nested routers", () => {
-    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe"]))
+  test("rejects nested routers other than the background processes strip's", () => {
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"]))
+      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "goal", "get"]))
+      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"]))
       .toBe(false);
   });
 
@@ -241,6 +245,51 @@ describe("retry barrier (#5092)", () => {
       ["resumeStream", null],
     ] as const) {
       expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
+    }
+  });
+});
+
+describe("background processes strip (#5092)", () => {
+  const known = new Set(["ws-1"]);
+  const path = (procedure: string) => ["workspace", "backgroundBashes", procedure];
+
+  test("lists, terminates and reads a known workspace's processes with only the fields each needs", () => {
+    for (const [procedure, input, forwarded] of [
+      ["subscribe", { workspaceId: "ws-1", processId: "p1" }, { workspaceId: "ws-1" }],
+      [
+        "terminate",
+        { workspaceId: "ws-1", processId: "p1", extra: true },
+        { workspaceId: "ws-1", processId: "p1" },
+      ],
+      [
+        "getOutput",
+        { workspaceId: "ws-1", processId: "p1", tailBytes: 64, extra: true },
+        { workspaceId: "ws-1", processId: "p1", tailBytes: 64 },
+      ],
+      [
+        "getOutput",
+        { workspaceId: "ws-1", processId: "p1", fromOffset: 10 },
+        { workspaceId: "ws-1", processId: "p1", fromOffset: 10 },
+      ],
+    ] as const) {
+      expect(isAllowedOrpcPath(path(procedure))).toBe(true);
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known)).toEqual({
+        ok: true,
+        input: forwarded,
+      });
+    }
+  });
+
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const [procedure, input] of [
+      ["subscribe", { workspaceId: "ws-2" }],
+      ["subscribe", null],
+      ["terminate", { workspaceId: "ws-2", processId: "p1" }],
+      ["terminate", { workspaceId: "ws-1" }],
+      ["getOutput", { workspaceId: "ws-2", processId: "p1" }],
+      ["getOutput", { workspaceId: "ws-1", processId: 7 }],
+    ] as const) {
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known).ok).toBe(false);
     }
   });
 });

@@ -2353,6 +2353,34 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
+  test("repeated identical stream errors render as one card with a count, as on desktop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const failedAttempt = (id: string, sequence: number) => ({
+      type: "message",
+      id,
+      role: "assistant",
+      parts: [],
+      metadata: {
+        historySequence: sequence,
+        timestamp: sequence,
+        error: "provider exploded",
+        errorType: "network",
+      },
+    });
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      failedAttempt("a1", 2),
+      failedAttempt("a2", 3),
+      failedAttempt("a3", 4),
+    ]);
+
+    expect(view.container.textContent?.match(/provider exploded/g)).toHaveLength(1);
+    expect(view.container.textContent).toContain("×3");
+    // The merged card is still the retry candidate.
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
   test("a context_exceeded error shows no retry barrier", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
@@ -2456,4 +2484,114 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 
+});
+
+describe("vscode webview background processes strip (#5092)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // The background bash store is an app-wide singleton that keeps each workspace's last-known
+  // processes, so these tests use workspaces no other test selects.
+  const workspaceA: UiWorkspace = { ...WORKSPACE, id: "ws-bash-a", workspaceName: "bash-a" };
+  const workspaceB: UiWorkspace = { ...WORKSPACE, id: "ws-bash-b", workspaceName: "bash-b" };
+  const runningProcess = {
+    id: "bash-1",
+    pid: 4242,
+    script: "sleep 600",
+    startTime: Date.now(),
+    status: "running",
+  };
+  // The oRPC client reaches the bridge after a few promise hops.
+  const settle = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  // Plays the host opening the subscription's stream and emitting one state.
+  const emitProcesses = async (
+    bridge: TestBridge,
+    call: { requestId: string },
+    streamId: string,
+    processes: unknown[]
+  ) => {
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId,
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId,
+      value: { processes, foregroundToolCallIds: [] },
+    });
+    await settle();
+  };
+  const click = async (element: Element) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+
+  test("shows the selected workspace's running processes in the dock and terminates them", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toEqual([{ workspaceId: workspaceA.id }]);
+    await emitProcesses(bridge, subscriptions[0], "stream-a", [runningProcess]);
+
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    // Each row ends with its Terminate button.
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+
+    expect(
+      bridge.orpcCalls("workspace.backgroundBashes.terminate").map((call) => call.input)
+    ).toEqual([{ workspaceId: workspaceA.id, processId: "bash-1" }]);
+    // Re-renders (history caught up, expanding, terminating) keep the one backend stream.
+    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
+  });
+
+  test("does not show another workspace's processes after a switch", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-a",
+      [runningProcess]
+    );
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+
+    await bridge.emit({ type: "workspaces", workspaces: [workspaceA, workspaceB] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspaceB.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: workspaceB.id,
+      event: { type: "caught-up" },
+    });
+    await settle();
+
+    expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toContainEqual({ workspaceId: workspaceB.id });
+  });
 });
