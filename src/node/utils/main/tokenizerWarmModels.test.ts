@@ -10,13 +10,9 @@ const CLAUDE = "anthropic:claude-opus-4-6";
 const OPENAI = "openai:gpt-5.5-pro";
 
 // Loosely typed on purpose: the persisted config can hold junk the types do not admit.
-function configWith(
-  workspaces: unknown[],
-  extra: Record<string, unknown> = {},
-  projectExtra: Record<string, unknown> = {}
-): ProjectsConfig {
+function configWith(workspaces: unknown[], extra: Record<string, unknown> = {}): ProjectsConfig {
   return {
-    projects: new Map([["/repo", { workspaces, ...projectExtra }]]),
+    projects: new Map([["/repo", { workspaces }]]),
     ...extra,
   } as unknown as ProjectsConfig;
 }

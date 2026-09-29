@@ -12,11 +12,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function nonEmptyModel(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 function collectConfiguredModels(config: ProjectsConfig): string[] {
   const found: string[] = [];
   const add = (value: unknown) => {
-    if (typeof value === "string" && value.trim().length > 0) {
-      found.push(value.trim());
+    const model = nonEmptyModel(value);
+    if (model !== undefined) {
+      found.push(model);
     }
   };
   // The config can hold junk, so every access is guarded instead of trusting the types.
@@ -71,12 +76,7 @@ export function deriveWarmModels(config: ProjectsConfig): string[] {
     return Array.from(DEFAULT_WARM_MODELS);
   }
   // New workspaces start on the default model, so its encoding is always warmed.
-  const candidates = [
-    typeof config.defaultModel === "string" && config.defaultModel.trim().length > 0
-      ? config.defaultModel.trim()
-      : DEFAULT_MODEL,
-    ...configured,
-  ];
+  const candidates = [nonEmptyModel(config.defaultModel) ?? DEFAULT_MODEL, ...configured];
 
   const byEncoding = new Map<string, string>();
   for (const model of candidates) {
