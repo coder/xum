@@ -840,10 +840,11 @@ async function scanActiveEpochNewestFirst(
   files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>,
   visit: (row: ScannedHistoryRow) => boolean,
   onBytesRead?: (bytes: number) => void,
-  // Rows for which this returns false are kept without their parsed message, so a read that
-  // filters out most visited rows does not hold all of them in memory. Only pass it for rows the
-  // caller never projects (a null message projects nothing for a row within the line limit).
-  keepMessage?: (row: ScannedHistoryRow) => boolean
+  // Rows for which this returns false are not retained at all, so a read that filters out most
+  // visited rows (a deep page skips every row newer than its cursor) holds only what it may
+  // return. Only pass it for rows the caller never projects; oversized rows must be kept because
+  // only the final pass can parse them.
+  keepRow?: (row: ScannedHistoryRow) => boolean
 ): Promise<{ rows: ActiveEpochRow[]; reachedEpochStart: boolean }> {
   const rows: ActiveEpochRow[] = [];
   let stopRequested = false;
@@ -851,20 +852,22 @@ async function scanActiveEpochNewestFirst(
     const file = files.get(artifact);
     if (!file) continue;
     const visited: ScannedHistoryRow[] = [];
+    // Rows arrive newest first, so the last visited row starts lowest (for onBytesRead).
+    let lastVisitedStart: number | null = null;
     const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
       stopRequested ||= visit(row);
-      const keep = keepMessage === undefined || row.message === null || keepMessage(row);
-      assert(
-        keep || row.size <= SESSION_HISTORY_MAX_LINE_BYTES,
-        "only in-limit rows lose messages"
-      );
-      visited.push(keep ? row : { start: row.start, size: row.size, message: null });
+      lastVisitedStart = row.start;
+      const keep = keepRow === undefined || keepRow(row);
+      assert(keep || row.size <= SESSION_HISTORY_MAX_LINE_BYTES, "oversized rows must be kept");
+      if (keep) visited.push(row);
       return stopRequested;
     });
     const from = location.kind === "start" ? location.offset : 0;
-    const inEpoch = visited.filter((row) => row.start >= from);
-    for (const row of inEpoch) rows.push({ file, row });
-    onBytesRead?.(inEpoch.length > 0 ? file.size - inEpoch[inEpoch.length - 1].start : 0);
+    for (const row of visited) if (row.start >= from) rows.push({ file, row });
+    // Same as scanProviderHistory: the raw bytes from the oldest in-epoch row to EOF. Every row
+    // from `from` on was visited, so that row starts at max(from, the last visited start).
+    const oldestStart: number | null = lastVisitedStart;
+    onBytesRead?.(oldestStart === null ? 0 : file.size - Math.max(from, oldestStart));
     if (location.kind === "start") return { rows, reachedEpochStart: true };
     if (location.kind === "stopped") return { rows, reachedEpochStart: false };
     if (stopRequested) {
@@ -961,6 +964,10 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
   // Whether the rows pushed so far end inside a turn start's snapshot cluster, so a cap that
   // lands on one of its snapshot rows keeps only the rest of that cluster.
   let inCluster = false;
+  // `keep` and projected rows just before the latest turn start, to roll the prompt back when its
+  // snapshot cluster does not fit the extension bound.
+  let keepBeforeTurnStart = 0;
+  let projectedBeforeTurnStart = 0;
   const endsCluster = (message: WindowCutMessage) =>
     message !== null && message !== "unknown" && !isTurnSnapshotRow(message);
   return {
@@ -973,11 +980,14 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
       // row count (the final cut passes the parsed message; the scan passes "unknown").
       const projected = message !== null;
       if (phase === "fill") {
+        if (isTurnStartRow(message)) {
+          keepBeforeTurnStart = keep;
+          projectedBeforeTurnStart = rows;
+          inCluster = true;
+        } else if (endsCluster(message)) inCluster = false;
         keep++;
         if (projected) rows++;
         bytes += row.size;
-        if (isTurnStartRow(message)) inCluster = true;
-        else if (endsCluster(message)) inCluster = false;
         if (rows > 0 && (rows >= caps.maxRows || bytes >= caps.maxBytes)) {
           phase = inCluster ? "cluster" : "extend";
         }
@@ -987,7 +997,11 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         (projected && extensionRows + 1 > caps.extensionMaxRows) ||
         extensionBytes + row.size > caps.extensionMaxBytes
       ) {
-        // Extension bound: cut at the last row within it, even mid-turn.
+        // Extension bound: cut at the last row within it, even mid-turn. A prompt whose snapshot
+        // cluster does not fit is rolled back with its partial cluster (as keepRecentTail does), so
+        // the window never starts on a prompt that lost its snapshots, unless the prompt is the
+        // only projected row left.
+        if (phase === "cluster" && projectedBeforeTurnStart > 0) keep = keepBeforeTurnStart;
         phase = "done";
         return true;
       }
@@ -996,10 +1010,15 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
         phase = "done";
         return true;
       }
+      const turnStart = phase === "extend" && isTurnStartRow(message);
+      if (turnStart) {
+        keepBeforeTurnStart = keep;
+        projectedBeforeTurnStart = rows + extensionRows;
+      }
       keep++;
       if (projected) extensionRows++;
       extensionBytes += row.size;
-      if (phase === "extend" && isTurnStartRow(message)) phase = "cluster";
+      if (turnStart) phase = "cluster";
       return false;
     },
   };
@@ -1040,7 +1059,9 @@ export function readProviderHistoryWindow(
       if (cutter.push(entry.row, message)) break;
       kept.push(message);
     }
-    assert(kept.length === cutter.keep, "window cut keeps exactly the rows it accepted");
+    // A rolled-back prompt makes the cut keep fewer rows than it accepted.
+    assert(cutter.keep <= kept.length, "window cut keeps at most the rows it accepted");
+    kept.length = cutter.keep;
     const messages = kept.filter((message) => message !== null).reverse();
     return {
       messages,
@@ -1201,8 +1222,8 @@ export function readProviderHistoryBefore(
       },
       undefined,
       // Rows the page filters out (e.g. every row newer than `beforeSequence`) are never
-      // projected; drop their messages so a deep page does not hold the epoch in memory. Keep
-      // rows at the cursor's sequence: the final pass must see the cursor row itself.
+      // projected; drop them so a deep page does not hold one object per epoch row. Keep rows
+      // at the cursor's sequence: the final pass must see the cursor row itself.
       (row) =>
         row.size > SESSION_HISTORY_MAX_LINE_BYTES ||
         isScanCandidate(row.message) ||

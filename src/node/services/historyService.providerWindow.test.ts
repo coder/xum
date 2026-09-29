@@ -297,6 +297,49 @@ describe("HistoryService bounded active-epoch reads", () => {
       expectSuffix(await full(ws), result.messages);
     });
 
+    test("a prompt whose snapshot cluster exceeds the extension bound is rolled back", async () => {
+      const ws = "window-cluster-over-bound";
+      await writeLayout(ws, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 3),
+        fileSnapshot("s4", 4),
+        fileSnapshot("s5", 5),
+        fileSnapshot("s6", 6),
+        row("u7", "user", 7),
+        ...assistants(8, 12),
+      ]);
+      // Fill ends mid-turn at a1010; the extension reaches u7 but only one of its three snapshot
+      // rows fits, so the cut goes back to just after the prompt instead of starting on a prompt
+      // without its snapshots.
+      const result = await window(ws, {
+        maxRows: 3,
+        maxBytes: BIG,
+        extensionMaxRows: 4,
+        extensionMaxBytes: BIG,
+      });
+      expect(ids(result.messages)).toEqual(["a1008", "a1009", "a1010", "a1011", "a1012"]);
+      expect(result.reachedEpochStart).toBe(false);
+      expectSuffix(await full(ws), result.messages);
+
+      // A prompt that is the only projected row stays, even without its whole cluster.
+      const onlyPromptWs = "window-only-prompt";
+      await writeLayout(onlyPromptWs, null, [
+        row("u0", "user", 0),
+        fileSnapshot("s1", 1),
+        fileSnapshot("s2", 2),
+        fileSnapshot("s3", 3),
+        row("u4", "user", 4),
+      ]);
+      const onlyPrompt = await window(onlyPromptWs, {
+        maxRows: 1,
+        maxBytes: BIG,
+        extensionMaxRows: 2,
+        extensionMaxBytes: BIG,
+      });
+      expect(ids(onlyPrompt.messages)).toEqual(["s2", "s3", "u4"]);
+      expectSuffix(await full(onlyPromptWs), onlyPrompt.messages);
+    });
+
     test("oversized prompt and snapshot rows keep the turn's snapshot cluster", async () => {
       const ws = "window-oversized-prompt";
       const bigPrompt = json(
