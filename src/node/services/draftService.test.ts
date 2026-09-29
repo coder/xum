@@ -485,7 +485,7 @@ describe("DraftService creation draft list", () => {
     expect((await service.getList()).entries).toEqual([]);
   });
 
-  it("imports legacy entries without clobbering and adopts unlisted bodies only on the first import", async () => {
+  it("imports legacy entries without clobbering and relists unlisted bodies on every import", async () => {
     using tempDir = new TestTempDir("drafts-list-import");
     const { config, projectPath } = await createHarness(tempDir);
     const service = new DraftService(config);
@@ -512,7 +512,8 @@ describe("DraftService creation draft list", () => {
       entry(projectPath, "listed", { subProjectPath: "/sub", createdAt: 2 })
     );
 
-    // A second origin's import only adds entries the list lacks, and adopts nothing.
+    // A second origin's import adds the entries the list lacks, plus bodies without a row (its
+    // legacy bodies may have been imported after the first origin created the list).
     await service.delete({ kind: "creation", projectPath, draftId: "lost" });
     await service.update({ scope: { kind: "creation", projectPath, draftId: "late" }, text: "d" });
     await new DraftService(config).importLegacyList([
@@ -528,6 +529,7 @@ describe("DraftService creation draft list", () => {
       ["listed", "/sub"],
       ["empty", null],
       ["second", null],
+      ["late", null],
     ]);
   });
 
@@ -654,39 +656,30 @@ describe("DraftService creation draft list repair", () => {
 });
 
 describe("DraftService creation draft list compatibility", () => {
-  it("keeps the data of a newer list file version when it writes the list", async () => {
+  it("refuses to rewrite a list file written by a newer version", async () => {
     using tempDir = new TestTempDir("drafts-list-newer-version");
     const { config, projectPath } = await createHarness(tempDir);
     const listFile = path.join(config.rootDir, "drafts", "list.json");
     await fs.mkdir(path.dirname(listFile), { recursive: true });
-    const future = {
-      projectPath,
-      draftId: "future",
-      subProjectPath: null,
-      createdAt: 1,
-      pinned: true,
-    };
-    await fs.writeFile(
-      listFile,
-      JSON.stringify({ version: 2, order: ["future"], entries: [future] })
-    );
+    const future = { projectPath, draftId: "future", subProjectPath: null, createdAt: 1 };
+    const content = JSON.stringify({ version: 2, order: ["future"], entries: [future] });
+    await fs.writeFile(listFile, content);
+    const service = new DraftService(config);
 
-    await new DraftService(config).putListEntry({
-      projectPath,
-      draftId: "added",
-      subProjectPath: null,
-      createdAt: 2,
-    });
-    const written = JSON.parse(await fs.readFile(listFile, "utf-8")) as {
-      version: number;
-      order: string[];
-      entries: Array<{ draftId: string; pinned?: boolean }>;
-    };
-    expect(written.version).toBe(2);
-    expect(written.order).toEqual(["future"]);
-    expect(written.entries.map(({ draftId, pinned }) => [draftId, pinned])).toEqual([
-      ["future", true],
-      ["added", undefined],
-    ]);
+    let error: unknown;
+    try {
+      await service.putListEntry({
+        projectPath,
+        draftId: "added",
+        subProjectPath: null,
+        createdAt: 2,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(await fs.readFile(listFile, "utf-8")).toBe(content);
+    // Still readable.
+    expect((await service.getList()).entries).toEqual([future]);
   });
 });
