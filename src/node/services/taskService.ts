@@ -14072,12 +14072,27 @@ export class TaskService implements AgentTaskIntegration {
     taskId: string
   ): Promise<Result<{ summary: string | null; paths: string[] }, string>> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-    const parentWorkspaceId = entry?.workspace.parentWorkspaceId;
-    if (entry == null || parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    if (entry == null) return Err("This sub-agent no longer exists.");
+    const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+    if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    // Refuse up front what removal would refuse, rather than asking the user to confirm a removal
+    // that cannot happen (and listing files a running sub-agent is still changing).
+    if (
+      this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return Err("Stop the sub-agent before removing it.");
+    }
+    if (this.listDescendantAgentTasks(taskId).length > 0) {
+      return Err("Cannot remove a sub-agent while descendant sub-agents remain.");
+    }
     const patchArtifact = await readSubagentGitPatchArtifact(
       path.join(this.config.sessionsDir, parentWorkspaceId),
       taskId
     );
+    if (patchArtifact?.status === "pending") {
+      return Err("Cannot remove the sub-agent while its git patch artifact is still pending.");
+    }
     const lost = await this.describeUnpreservedSubagentWork(
       taskId,
       entry,
@@ -14094,8 +14109,9 @@ export class TaskService implements AgentTaskIntegration {
    */
   async removeSubagentForUser(taskId: string): Promise<Result<void, string>> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-    const parentWorkspaceId = entry?.workspace.parentWorkspaceId;
-    if (entry == null || parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    if (entry == null) return Err("This sub-agent no longer exists.");
+    const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+    if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
     const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId);
     if (!result.success) return Err(result.error);
     switch (result.data.status) {

@@ -428,7 +428,11 @@ describe("TaskService", () => {
       child.taskStatus = "running";
       return cfg;
     });
-    // Confirming removal does not grant consent to stop a running sub-agent.
+    // Confirming removal does not grant consent to stop a running sub-agent, and the preview
+    // refuses up front instead of asking the user to confirm a removal that cannot happen.
+    expect(await taskService.previewSubagentRemoval(childTaskId)).toMatchObject({
+      success: false,
+    });
     expect(await taskService.removeSubagentForUser(childTaskId)).toMatchObject({
       success: false,
     });
