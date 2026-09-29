@@ -916,7 +916,12 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
         // Output past the cap fails closed on both sides; only the wording differs.
         const relation = fault.stderrBytes != null ? "both throw" : "same";
         await expectRuntimeMatchesLocal(repo, relation, fault.allowNonRepository);
-        expect(await fs.readFile(log, "utf8")).toContain(fault.match);
+        // Each discovery (local, then every transport) hit the injected failure once; otherwise
+        // a transport that missed the shim could match a success outcome for the wrong reason.
+        const hits = (await fs.readFile(log, "utf8"))
+          .split("\n")
+          .filter((line) => line.includes(fault.match));
+        expect(hits).toHaveLength(1 + RUNTIME_TRANSPORTS.length);
       },
       TEST_TIMEOUT_MS
     );
