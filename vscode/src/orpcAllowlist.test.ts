@@ -224,6 +224,8 @@ describe("retry barrier (#5092)", () => {
   test("resumes a known workspace's stream with only its ID and send options", () => {
     const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
     expect(isAllowedOrpcPath(["workspace", "resumeStream"])).toBe(true);
+    // Retry resumes only; the webview never toggles the auto-retry preference.
+    expect(isAllowedOrpcPath(["workspace", "setAutoRetryEnabled"])).toBe(false);
     expect(
       sanitizeWebviewOrpcInput(
         ["workspace", "resumeStream"],
@@ -233,26 +235,10 @@ describe("retry barrier (#5092)", () => {
     ).toEqual({ ok: true, input: { workspaceId: "ws-1", options } });
   });
 
-  test("toggles auto-retry for a known workspace without ever persisting the preference", () => {
-    expect(isAllowedOrpcPath(["workspace", "setAutoRetryEnabled"])).toBe(true);
-    for (const enabled of [true, false]) {
-      expect(
-        sanitizeWebviewOrpcInput(
-          ["workspace", "setAutoRetryEnabled"],
-          { workspaceId: "ws-1", enabled, persist: true, extra: true },
-          known
-        )
-      ).toEqual({ ok: true, input: { workspaceId: "ws-1", enabled, persist: false } });
-    }
-  });
-
   test("rejects unknown workspaces and malformed input", () => {
     for (const [procedure, input] of [
       ["resumeStream", { workspaceId: "ws-2", options: {} }],
       ["resumeStream", null],
-      ["setAutoRetryEnabled", { workspaceId: "ws-2", enabled: true }],
-      ["setAutoRetryEnabled", { workspaceId: "ws-1", enabled: "yes" }],
-      ["setAutoRetryEnabled", null],
     ] as const) {
       expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
     }

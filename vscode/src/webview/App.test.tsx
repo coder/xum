@@ -2258,13 +2258,6 @@ describe("vscode webview retry barrier (#5092)", () => {
       metadata: { historySequence: 2, timestamp: 2, error: "provider exploded", errorType },
     },
   ];
-  // Scheduled at call time: a countdown that already ran out shows "Retrying..." instead.
-  const scheduledRetry = () => ({
-    type: "auto-retry-scheduled",
-    attempt: 2,
-    delayMs: 60_000,
-    scheduledAt: Date.now(),
-  });
   const chatEvent = (bridge: TestBridge, event: unknown, workspaceId = WORKSPACE.id) =>
     bridge.emit({ type: "chatEvent", workspaceId, event });
   // A live stream the user stops after its first token.
@@ -2306,7 +2299,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     });
   };
 
-  test("Retry after a stream error re-enables auto-retry for this attempt, then resumes the stream", async () => {
+  test("Retry after a stream error resumes the stream without toggling auto-retry", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"));
@@ -2314,79 +2307,20 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.container.textContent).toContain("Stream interrupted");
     await click(view.getByRole("button", { name: "Retry" }));
 
-    const toggles = bridge.orpcCalls("workspace.setAutoRetryEnabled");
-    expect(toggles).toHaveLength(1);
-    expect(toggles[0].input).toEqual({ workspaceId: WORKSPACE.id, enabled: true, persist: false });
-    await bridge.answer("workspace.setAutoRetryEnabled", {
-      success: true,
-      data: { previousEnabled: true, enabled: true },
-    });
-
     const resumes = bridge.orpcCalls("workspace.resumeStream");
     expect(resumes).toHaveLength(1);
     expect(resumes[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
-  });
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
 
-  test("a replayed retry snapshot shows its countdown; Stop turns auto-retry off, and a new stream clears it", async () => {
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge, [...failedTurn("network"), scheduledRetry()]);
-
-    expect(view.container.textContent).toContain("Retrying in");
-    expect(view.container.textContent).toContain("(attempt 2)");
-    await click(view.getByRole("button", { name: /^Stop/ }));
-    // A refused Stop is reported in the webview (it has no desktop chat-error toast consumer).
-    await bridge.answer("workspace.interruptStream", { success: false, error: "stop refused" });
-    expect(view.container.textContent).toContain("Failed to interrupt stream. (stop refused)");
-    // As on desktop, Esc stops too while the retry barrier shows, with no stream running.
-    await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
-      await Promise.resolve();
+    // A refused resume is reported on the barrier.
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: resumes[0].requestId,
+      ok: true,
+      kind: "value",
+      value: { success: false, error: { type: "runtime_not_ready", message: "resume refused" } },
     });
-    const stops = bridge.orpcCalls("workspace.interruptStream");
-    expect(stops).toHaveLength(2);
-    for (const stop of stops) {
-      expect(stop.input).toEqual({
-        workspaceId: WORKSPACE.id,
-        options: { disableAutoRetry: true, retireBashMonitorAttention: true },
-      });
-    }
-
-    // The retried attempt starts and fails again: the old countdown must not come back.
-    await chatEvent(bridge, {
-      type: "stream-start",
-      workspaceId: WORKSPACE.id,
-      messageId: "a2",
-      model: "anthropic:claude-sonnet-4-5",
-      historySequence: 3,
-      startTime: 3,
-    });
-    await chatEvent(bridge, {
-      type: "stream-error",
-      messageId: "a2",
-      error: "provider exploded again",
-      errorType: "network",
-    });
-    expect(view.container.textContent).toContain("Stream interrupted");
-    expect(view.container.textContent).not.toContain("Retrying");
-  });
-
-  test("a retry status does not carry over to another workspace", async () => {
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge, failedTurn("network"));
-    await chatEvent(bridge, scheduledRetry());
-    expect(view.container.textContent).toContain("Retrying in");
-
-    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
-    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
-    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
-    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
-      await chatEvent(bridge, event, other.id);
-    }
-
-    expect(view.container.textContent).toContain("Stream interrupted");
-    expect(view.container.textContent).not.toContain("Retrying");
+    expect(view.container.textContent).toContain("Retry failed:");
   });
 
   test("a context_exceeded error shows no retry barrier", async () => {
@@ -2397,41 +2331,6 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.container.textContent).toContain("provider exploded");
     expect(view.container.textContent).not.toContain("Stream interrupted");
     expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
-    // No barrier, so Esc has nothing to stop: it must not persist an auto-retry opt-out.
-    await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
-      await Promise.resolve();
-    });
-    expect(bridge.orpcCalls("workspace.interruptStream")).toHaveLength(0);
-  });
-
-  test("a Retry still in flight when the workspace switches restores the auto-retry preference", async () => {
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge, failedTurn("network"));
-    await click(view.getByRole("button", { name: "Retry" }));
-
-    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
-    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
-    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
-    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
-      await chatEvent(bridge, event, other.id);
-    }
-
-    // Auto-retry was off, so Retry enables it only for this attempt; the switch came first.
-    await bridge.answer("workspace.setAutoRetryEnabled", {
-      success: true,
-      data: { previousEnabled: false, enabled: true },
-    });
-    const resumes = bridge.orpcCalls("workspace.resumeStream");
-    expect(resumes).toHaveLength(1);
-    expect(resumes[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
-    await bridge.answer("workspace.resumeStream", { success: true, data: { started: true } });
-
-    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled").map((call) => call.input)).toEqual([
-      { workspaceId: WORKSPACE.id, enabled: true, persist: false },
-      { workspaceId: WORKSPACE.id, enabled: false, persist: false },
-    ]);
   });
 
   test("a replayed terminal context_exceeded error survives history loading and shows no Retry", async () => {
@@ -2510,10 +2409,6 @@ describe("vscode webview retry barrier (#5092)", () => {
     });
 
     await click(view.getByRole("button", { name: "Retry" }));
-    await bridge.answer("workspace.setAutoRetryEnabled", {
-      success: true,
-      data: { previousEnabled: true, enabled: true },
-    });
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 

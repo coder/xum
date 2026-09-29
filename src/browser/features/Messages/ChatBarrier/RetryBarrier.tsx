@@ -41,15 +41,12 @@ interface RetryBarrierContentProps extends RetryBarrierProps {
   isStreamStarting: boolean;
   canInterrupt: boolean;
   /**
-   * Overrides the stored agent for the retried send. The VS Code webview (which has no
-   * WorkspaceStore and passes its own aggregator state) sets a sub-agent's locked agent (#4738).
+   * Replaces the default Retry (temporarily enable auto-retry, then resume). The VS Code webview
+   * does not toggle auto-retry: it retries through its resume path (useResumeStream), which owns
+   * the error it reports as `retryError`.
    */
-  agentId?: string;
-  /**
-   * Replaces the default Stop (desktop stopStream, whose failures surface in the desktop chat
-   * input). The VS Code webview passes its own interrupt path, which reports failures itself.
-   */
-  onStopAutoRetry?: () => void;
+  onRetry?: () => Promise<void>;
+  retryError?: string | null;
 }
 
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
@@ -74,25 +71,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const manualRetryRollbackArmedRef = useRef(false);
   const manualRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
   const apiRef = useRef(api);
-  // Whether this barrier still observes the workspace a Retry started on. After an unmount or a
-  // workspace change, nothing sees the resumed attempt's terminal events (the rollback trigger).
-  const isMountedRef = useRef(false);
-  const liveWorkspaceIdRef = useRef(props.workspaceId);
 
   useEffect(() => {
     apiRef.current = api;
   }, [api]);
-
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    liveWorkspaceIdRef.current = props.workspaceId;
-  }, [props.workspaceId]);
 
   const rollbackManualRetryAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -220,11 +202,20 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     setIsManualRetrying(true);
     setManualRetryError(null);
 
+    const onRetry = props.onRetry;
+    if (onRetry) {
+      await runWithCatchFinally(
+        onRetry,
+        (error) => setManualRetryError(getErrorMessage(error)),
+        () => setIsManualRetrying(false)
+      );
+      return;
+    }
+
     // runWithCatchFinally keeps try/catch/finally out of the component so React Compiler compiles it.
     await runWithCatchFinally(
       async () => {
         let options = getSendOptionsFromStorage(props.workspaceId);
-        if (props.agentId) options = { ...options, agentId: props.agentId };
         const lastUserMessage = [...props.messages]
           .reverse()
           .find(
@@ -278,18 +269,6 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           resumeResult.data.started === false
         ) {
           await rollbackManualRetryAutoRetryIfNeeded();
-          return;
-        }
-
-        // The barrier unmounted or moved to another workspace while this Retry was in flight (the
-        // VS Code webview unmounts it on a workspace switch). Its unmount/switch cleanup ran before
-        // the temporary enablement was recorded, and no terminal event will reach it now, so
-        // restore the preference here instead of leaving auto-retry on in the background.
-        if (
-          manualRetryRollbackPendingRef.current &&
-          (!isMountedRef.current || liveWorkspaceIdRef.current !== props.workspaceId)
-        ) {
-          await rollbackManualRetryAutoRetryIfNeeded({ suppressErrors: true });
         }
       },
       async (error) => {
@@ -303,10 +282,6 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const handleStopAutoRetry = async () => {
     setCountdown(0);
     setManualRetryError(null);
-    if (props.onStopAutoRetry) {
-      props.onStopAutoRetry();
-      return;
-    }
     if (!api) return;
     await stopStream(api, props.workspaceId, { disableAutoRetry: true });
   };
@@ -381,9 +356,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     );
   }
 
-  const details = manualRetryError ? (
+  const retryError = manualRetryError ?? props.retryError ?? null;
+  const details = retryError ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">
-      <span className="text-warning font-semibold">Retry failed:</span> {manualRetryError}
+      <span className="text-warning font-semibold">Retry failed:</span> {retryError}
     </div>
   ) : autoRetryStatus?.type === "auto-retry-abandoned" ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">

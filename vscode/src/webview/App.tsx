@@ -71,10 +71,6 @@ import {
   type RetryBarrierDerivation,
 } from "xum/browser/components/ChatPane/retryBarrierDerivation";
 import { useResumeStream } from "xum/browser/hooks/useResumeStream";
-import {
-  isAutoRetryStatusEvent,
-  type AutoRetryStatus,
-} from "xum/browser/utils/messages/autoRetryStatus";
 
 import type {
   ExtensionToWebviewMessage,
@@ -248,13 +244,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
   // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
   const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
-  // The latest auto-retry banner event, as WorkspaceStore tracks it on desktop: set by
-  // auto-retry-*, cleared by stream-start/stream-end and by every reset (new selection, chatReset,
-  // new replay). Stored with its workspace so it never reaches another workspace's first render.
-  const [autoRetryState, setAutoRetryState] = useState<{
-    workspaceId: string;
-    status: AutoRetryStatus;
-  } | null>(null);
   const workspacesRef = useRef<UiWorkspace[]>([]);
 
   // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
@@ -396,9 +385,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     const unsubscribeSeed = appConfigStore.subscribe(() => {
       seedWebviewPreferences(appConfigStore.getSnapshot());
     });
-    // Unlike WorkspaceStore, the webview does not clear a provider-config-fixable "Auto-retry
-    // stopped" banner on a provider config change: its store cannot tell the first config load
-    // from a real change, so the banner would vanish at startup. The next stream clears it.
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     return () => {
@@ -459,7 +445,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
           setActiveBashMonitorCount(0);
-          setAutoRetryState(null);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -487,7 +472,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
-          setAutoRetryState(null);
           // The monitor count is kept: a resubscribe to the same workspace posts a fresh count, but
           // if the host cannot read it, the last one is better than hiding an armed monitor.
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
@@ -526,20 +510,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
               chatReplayStateRef.current = replayState;
               liveBashOutput.reset(msg.workspaceId);
               setHeldInputs([]);
-              setAutoRetryState(null);
               transcriptBarrier.reset(msg.workspaceId);
               setTranscriptCaughtUp(false);
             }
-
-            // Auto-retry banner transitions, applied in stream order (replayed events from the
-            // flush loop, live ones below), so a buffered stream-start never clears a later status.
-            const applyAutoRetryTransition = (chatEvent: WorkspaceChatMessage) => {
-              if (isAutoRetryStatusEvent(chatEvent)) {
-                setAutoRetryState({ workspaceId: msg.workspaceId, status: chatEvent });
-              } else if (chatEvent.type === "stream-start" || chatEvent.type === "stream-end") {
-                setAutoRetryState(null);
-              }
-            };
 
             const flushReplayBuffer = () => {
               const hasActiveStream = replayState.pendingStreamEvents.some(
@@ -552,7 +525,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
               }
 
               for (const bufferedEvent of replayState.pendingStreamEvents) {
-                applyAutoRetryTransition(bufferedEvent);
                 applyWorkspaceChatEventToAggregator(aggregator, bufferedEvent);
               }
               replayState.pendingStreamEvents.length = 0;
@@ -617,14 +589,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                 return;
               }
 
-              if (shouldBufferUntilCaughtUp(event) || isAutoRetryStatusEvent(event)) {
+              if (shouldBufferUntilCaughtUp(event)) {
                 replayState.pendingStreamEvents.push(event);
                 forceCatchUp();
                 return;
               }
             }
 
-            applyAutoRetryTransition(event);
             const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
 
             if (hint === "ignored") {
@@ -720,10 +691,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   };
   const interruptStreamRef = useRef(interruptStream);
   interruptStreamRef.current = interruptStream;
-  // The retry barrier's Stop (auto-retry scheduled): no partial stream exists to abandon.
-  const stopAutoRetry = () => interruptStream({ abandonPartial: false });
-  // The window key listeners read the latest retry derivation and resume through these refs,
-  // which are updated where both are computed below.
+  // The Shift+R listener reads the latest retry derivation and resumes through these refs, which
+  // are updated where both are computed below.
   const retryBarrierRef = useRef<RetryBarrierDerivation | null>(null);
   const resumeInterruptedStreamRef = useRef<() => void>(() => undefined);
 
@@ -764,17 +733,10 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       }
 
       // A starting turn (before stream-start) shows Stop and its Esc chip too, so Esc must reach it.
-      // It also stops while the retry barrier is visible (turning auto-retry off). Gated on the
-      // visible barrier, not the raw interruption: a context_exceeded error shows no barrier, and a
-      // Stop there would only persist an auto-retry opt-out the user never asked for.
       const isStarting =
         aggregator.getPendingStreamStartTime() !== null ||
         aggregator.getStreamLifecycle()?.phase === "preparing";
-      if (
-        !aggregator.getActiveStreamMessageId() &&
-        !isStarting &&
-        !retryBarrierRef.current?.showRetryBarrierUI
-      ) {
+      if (!aggregator.getActiveStreamMessageId() && !isStarting) {
         return;
       }
 
@@ -861,8 +823,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // Retry barrier and interrupted dividers, with desktop ChatPane's shared derivation fed from this
   // webview's aggregator. Its rows are never deferred, so both message inputs are the same rows.
   const aggregator = aggregatorRef.current;
-  const autoRetryStatus =
-    autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
   const retryBarrier =
     selectedWorkspaceId && aggregator && streamState
       ? getRetryBarrierDerivation({
@@ -871,7 +831,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           pendingStreamStartTime: aggregator.getPendingStreamStartTime(),
           runtimeStatus: aggregator.getRuntimeStatus(),
           lastAbortReason: aggregator.getLastAbortReason(),
-          autoRetryStatus,
+          // The webview does not track auto-retry status (it neither toggles auto-retry nor shows
+          // the countdown), so the barrier shows the interruption and Retry only.
+          autoRetryStatus: null,
           isHydratingTranscript: !transcriptCaughtUp,
           isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
           // Without a server connection (file mode) every bridged action is refused, so the
@@ -886,7 +848,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     selectedWorkspace?.ai?.parentWorkspaceId != null
       ? resolvePersistedAgentId(selectedWorkspace.ai, "") || undefined
       : undefined;
-  // Shared by the divider's resume button and Shift+R, as in ChatPane.
+  // Shared by the divider's resume button, Shift+R and the retry barrier's Retry: the webview
+  // retries through the same resume path instead of toggling auto-retry.
   const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
     selectedWorkspaceId ?? "",
     retryBarrier?.lastRetryCandidateMessage?.id,
@@ -1069,13 +1032,11 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                                 workspaceId={selectedWorkspaceId}
                                 visible={retryBarrier.showRetryBarrierUI}
                                 messages={displayedMessages}
-                                autoRetryStatus={autoRetryStatus}
+                                autoRetryStatus={null}
                                 isStreamStarting={streamState.isStreamStarting}
                                 canInterrupt={streamState.canInterrupt}
-                                agentId={lockedAgentId}
-                                // The webview has no chat-error toast consumer, so Stop goes
-                                // through its interrupt path, which reports failures as notices.
-                                onStopAutoRetry={stopAutoRetry}
+                                onRetry={resumeInterruptedStreamAsync}
+                                retryError={resumeInterruptedError}
                               />
                             ) : null}
                           </LiveBashOutputSourceContext.Provider>

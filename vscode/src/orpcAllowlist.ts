@@ -35,10 +35,9 @@ const ALLOWED_PROCEDURES = {
     // sanitizeWebviewOrpcInput.
     "sendHeldInput",
     "discardHeldInput",
-    // The retry barrier and interrupted divider (#5092); limited to shown workspaces, and
-    // setAutoRetryEnabled to a temporary (non-persisted) toggle, by sanitizeWebviewOrpcInput.
+    // The retry barrier's Retry and the interrupted divider's resume (#5092); limited to shown
+    // workspaces by sanitizeWebviewOrpcInput.
     "resumeStream",
-    "setAutoRetryEnabled",
   ]),
   // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
@@ -235,10 +234,8 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  * workspace.sendHeldInput / discardHeldInput (#4771): only for a workspace the extension sent, and
  * only {workspaceId, heldInputId} is forwarded.
  *
- * workspace.resumeStream / setAutoRetryEnabled (#5092): only for a workspace the extension sent.
- * resumeStream forwards {workspaceId, options}. setAutoRetryEnabled forwards
- * {workspaceId, enabled, persist: false}: the retry barrier only toggles auto-retry for one resumed
- * attempt, so the webview can never write the persisted auto-retry preference.
+ * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
+ * {workspaceId, options} is forwarded.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -251,8 +248,8 @@ export function sanitizeWebviewOrpcInput(
   if (procedure === "workspace.sendHeldInput" || procedure === "workspace.discardHeldInput") {
     return sanitizeHeldInputAction(procedure, input, knownWorkspaceIds);
   }
-  if (procedure === "workspace.resumeStream" || procedure === "workspace.setAutoRetryEnabled") {
-    return sanitizeRetryAction(procedure, input, knownWorkspaceIds);
+  if (procedure === "workspace.resumeStream") {
+    return sanitizeResumeStream(input, knownWorkspaceIds);
   }
 
   if (procedure !== "agents.list") {
@@ -295,24 +292,17 @@ function sanitizeHeldInputAction(
   return { ok: true, input: { workspaceId, heldInputId: record.heldInputId } };
 }
 
-function sanitizeRetryAction(
-  procedure: string,
+function sanitizeResumeStream(
   input: unknown,
   knownWorkspaceIds: ReadonlySet<string>
 ): SanitizedOrpcInput {
   if (typeof input !== "object" || input === null) {
-    return { ok: false, error: `${procedure} requires an input object` };
+    return { ok: false, error: "workspace.resumeStream requires an input object" };
   }
   const record = input as Record<string, unknown>;
   const workspaceId = record.workspaceId;
   if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
-    return { ok: false, error: `${procedure} is limited to known workspaces` };
+    return { ok: false, error: "workspace.resumeStream is limited to known workspaces" };
   }
-  if (procedure === "workspace.resumeStream") {
-    return { ok: true, input: { workspaceId, options: record.options } };
-  }
-  if (typeof record.enabled !== "boolean") {
-    return { ok: false, error: `${procedure} requires a boolean enabled` };
-  }
-  return { ok: true, input: { workspaceId, enabled: record.enabled, persist: false } };
+  return { ok: true, input: { workspaceId, options: record.options } };
 }
