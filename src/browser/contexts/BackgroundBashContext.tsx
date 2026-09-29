@@ -16,42 +16,51 @@ const BackgroundBashErrorContext = createContext<ReturnType<typeof usePopoverErr
 
 interface BackgroundBashProviderProps {
   workspaceId: string;
+  /**
+   * Identifies the server connection. A hosting surface that keeps the provider mounted across
+   * server switches (the VS Code webview) passes it so a failure issued on one connection is
+   * dropped after a switch, as for a workspace switch. Desktop omits it.
+   */
+  connectionKey?: string | null;
   children: ReactNode;
 }
 
 export const BackgroundBashProvider: React.FC<BackgroundBashProviderProps> = (props) => {
   const store = useBackgroundBashStoreRaw();
   const error = usePopoverError();
-  // An action's failure belongs to the workspace it was issued in. A provider that stays mounted
-  // across workspace switches (the VS Code webview's) drops failures that arrive after a switch,
-  // so they never show over another workspace's chat.
-  const liveWorkspaceIdRef = useRef(props.workspaceId);
+  // An action's failure belongs to the workspace and server connection it was issued in. A
+  // provider that stays mounted across workspace or server switches (the VS Code webview's) drops
+  // failures that arrive after a switch, so they never show over another workspace's chat.
+  const connectionKey = props.connectionKey ?? null;
+  const liveScopeRef = useRef({ workspaceId: props.workspaceId, connectionKey });
   useEffect(() => {
-    liveWorkspaceIdRef.current = props.workspaceId;
-  }, [props.workspaceId]);
+    liveScopeRef.current = { workspaceId: props.workspaceId, connectionKey };
+  }, [props.workspaceId, connectionKey]);
 
-  const actions = useMemo<BackgroundBashActions>(
-    () => ({
+  const actions = useMemo<BackgroundBashActions>(() => {
+    const isLive = (workspaceId: string) =>
+      liveScopeRef.current.workspaceId === workspaceId &&
+      liveScopeRef.current.connectionKey === connectionKey;
+    return {
       terminate: (processId: string) => {
         const workspaceId = props.workspaceId;
         store.terminate(workspaceId, processId).catch((err: Error) => {
-          if (liveWorkspaceIdRef.current !== workspaceId) return;
+          if (!isLive(workspaceId)) return;
           error.showError(processId, err.message);
         });
       },
       sendToBackground: (toolCallId: string) => {
         const workspaceId = props.workspaceId;
         store.sendToBackground(workspaceId, toolCallId).catch((err: Error) => {
-          if (liveWorkspaceIdRef.current !== workspaceId) return;
+          if (!isLive(workspaceId)) return;
           error.showError(`send-to-background-${toolCallId}`, err.message);
         });
       },
       autoBackgroundOnSend: () => {
         store.autoBackgroundOnSend(props.workspaceId);
       },
-    }),
-    [error, props.workspaceId, store]
-  );
+    };
+  }, [connectionKey, error, props.workspaceId, store]);
 
   return (
     <BackgroundBashActionsContext.Provider value={actions}>

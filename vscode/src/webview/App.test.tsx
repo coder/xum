@@ -266,6 +266,84 @@ describe("vscode webview transcript auto-scroll", () => {
   });
 });
 
+describe("vscode webview initial bottom pin", () => {
+  let cleanupDom: (() => void) | null = null;
+  // Observed elements -> observer callbacks, so a test can deliver a resize for one element the
+  // way a browser does: only observers watching that element hear about it.
+  const resizeCallbacks = new Map<Element, Set<ResizeObserverCallback>>();
+  let originalResizeObserver: typeof ResizeObserver | undefined;
+
+  class RecordingResizeObserver {
+    private readonly observed = new Set<Element>();
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      this.observed.add(target);
+      const callbacks = resizeCallbacks.get(target) ?? new Set();
+      callbacks.add(this.callback);
+      resizeCallbacks.set(target, callbacks);
+    }
+    unobserve(target: Element): void {
+      this.observed.delete(target);
+      resizeCallbacks.get(target)?.delete(this.callback);
+    }
+    disconnect(): void {
+      for (const target of this.observed) {
+        resizeCallbacks.get(target)?.delete(this.callback);
+      }
+      this.observed.clear();
+    }
+  }
+
+  function resize(target: Element): void {
+    for (const callback of resizeCallbacks.get(target) ?? []) {
+      callback([], {} as ResizeObserver);
+    }
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    originalResizeObserver = window.ResizeObserver;
+    window.ResizeObserver = RecordingResizeObserver as unknown as typeof ResizeObserver;
+  });
+
+  afterEach(() => {
+    cleanup();
+    resizeCallbacks.clear();
+    if (originalResizeObserver) window.ResizeObserver = originalResizeObserver;
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("stays pinned to the bottom as the transcript loads after the first connectionStatus", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The host's first connectionStatus arrives after the webview mounted (#5231).
+    await selectWorkspace(bridge, [
+      {
+        type: "message",
+        id: "m-1",
+        role: "user",
+        parts: [{ type: "text", text: "a long transcript" }],
+        metadata: { historySequence: 1, timestamp: 1 },
+      },
+    ]);
+
+    const scrollport = view.getByTestId("transcript-bottom-sentinel").parentElement;
+    if (!scrollport) throw new Error("sentinel must live inside the transcript scrollport");
+    // The loaded rows grow the transcript: the browser reports a resize of the scrollport's
+    // content, and the locked transcript must follow it to the bottom.
+    setScrollGeometry(scrollport, { scrollTop: 0 });
+    const content = scrollport.firstElementChild;
+    if (!content) throw new Error("transcript content must precede the sentinel");
+    await act(async () => {
+      resize(content);
+      await Promise.resolve();
+    });
+
+    expect(scrollport.scrollTop).toBe(800);
+  });
+});
+
 describe("vscode webview workspace selection", () => {
   let cleanupDom: (() => void) | null = null;
 
@@ -2654,7 +2732,12 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(document.body.textContent).not.toContain("terminate refused");
   });
 
-  test("switching servers shows neither the previous server's rows nor its late errors, from the first render", async () => {
+  // The terminate failure either lands on server A before the switch (already shown) or arrives
+  // late, after it; neither may show over server B.
+  test.each([
+    ["an already-shown", true],
+    ["a late", false],
+  ])("switching servers shows neither the previous server's rows nor %s error over the new connection", async (_label, answerBeforeSwitch) => {
     // Both servers expose a workspace with this ID.
     const workspace: UiWorkspace = {
       ...WORKSPACE,
@@ -2688,23 +2771,38 @@ describe("vscode webview background processes strip (#5092)", () => {
     const script = view.container.querySelector('[title="sleep 600"]');
     if (!script) throw new Error("the expanded strip does not list the process");
     const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
-    // Terminate on server A; its answer arrives only after the switch.
+    // Terminate on server A.
     await click(rowButtons[rowButtons.length - 1]);
     await settle();
+    const answerTerminate = () =>
+      bridge.answer("workspace.backgroundBashes.terminate", {
+        success: false,
+        error: "terminate refused",
+      });
+    if (answerBeforeSwitch) {
+      await answerTerminate();
+      await settle();
+      expect(view.getByText(/terminate refused/)).toBeTruthy();
+    }
 
     commits.length = 0;
     await bridge.emit({
       type: "connectionStatus",
       status: { mode: "api", baseUrl: "http://other" },
     });
-    await bridge.answer("workspace.backgroundBashes.terminate", {
-      success: false,
-      error: "terminate refused",
-    });
+    if (!answerBeforeSwitch) {
+      await answerTerminate();
+    }
     await settle();
 
     expect(commits.length).toBeGreaterThan(0);
-    expect(commits.filter((commit) => commit.rows || commit.error)).toEqual([]);
+    expect(commits.filter((commit) => commit.rows)).toEqual([]);
+    // An already-shown error can remain in the commits of the synchronous store resets that
+    // precede the render showing the new connection; once gone it never comes back. A late error
+    // arrives after the first (error-free) commit, so it must never show.
+    const firstErrorFree = commits.findIndex((commit) => !commit.error);
+    expect(firstErrorFree).toBeGreaterThanOrEqual(0);
+    expect(commits.slice(firstErrorFree).filter((commit) => commit.error)).toEqual([]);
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe").length).toBeGreaterThan(1);
   });
 

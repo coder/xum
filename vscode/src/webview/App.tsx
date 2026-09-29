@@ -142,15 +142,21 @@ function WebviewChatProviders(props: {
             {/* Covers the transcript's bash cards and the dock's background processes strip
                 (#5092). Without a selection nothing reads it: both render only for a selected
                 workspace. */}
-            {/* Keyed by the server connection: a server switch remounts the provider (and the
-                strip) before paint, so a late action failure from the previous server can never
-                show over the new one, even for a workspace ID both servers share. */}
+            {/* Never key this by the server connection: it wraps the whole layout, and a remount
+                replaces the transcript scrollport that useAutoScroll observes, so a fresh open
+                stayed at the top instead of pinned to the bottom (#5231). The connection scope is
+                enforced instead by connectionKey (a late action failure from the previous server
+                is dropped, even for a workspace ID both servers share), by the error popover's
+                scope, and by the strip's key. */}
             <BackgroundBashProvider
-              key={props.apiConnectionKey ?? "no-connection"}
               workspaceId={props.selectedWorkspaceId ?? ""}
+              connectionKey={props.apiConnectionKey}
             >
               {props.children}
-              <BackgroundBashErrorPopover workspaceId={props.selectedWorkspaceId} />
+              <BackgroundBashErrorPopover
+                workspaceId={props.selectedWorkspaceId}
+                connectionKey={props.apiConnectionKey}
+              />
             </BackgroundBashProvider>
           </TooltipProvider>
         </BashCollapsedSummaryModeProvider>
@@ -183,21 +189,30 @@ const EMPTY_DISPLAYED_ROWS: { messages: DisplayedMessage[]; rendered: DisplayedM
 };
 
 // Terminate failures of the background processes strip, shown like desktop WorkspaceShell does.
-// Cleared on a workspace switch, as desktop ChatPane does, so it never shows under another chat.
-function BackgroundBashErrorPopover(props: { workspaceId: string | null }): JSX.Element {
+// Cleared on a workspace or server switch, as desktop ChatPane does on a workspace switch, so it
+// never shows under another chat.
+function BackgroundBashErrorPopover(props: {
+  workspaceId: string | null;
+  connectionKey: string | null;
+}): JSX.Element {
   const { error, clearError } = useBackgroundBashError();
-  // The error belongs to the workspace it was raised in. Hide it during the render that switches
-  // workspaces (a post-render clear alone would paint it over the new chat for a frame), then
-  // clear it and follow the new workspace.
-  const [errorWorkspaceId, setErrorWorkspaceId] = useState(props.workspaceId);
-  const switched = errorWorkspaceId !== props.workspaceId;
+  // The error belongs to the server connection and workspace it was raised in. Hide it during the
+  // render that switches either (a post-render clear alone would paint it over the new chat for a
+  // frame), then clear it and follow the new scope.
+  const [errorScope, setErrorScope] = useState({
+    workspaceId: props.workspaceId,
+    connectionKey: props.connectionKey,
+  });
+  const switched =
+    errorScope.workspaceId !== props.workspaceId ||
+    errorScope.connectionKey !== props.connectionKey;
   useEffect(() => {
     if (!switched) {
       return;
     }
     clearError();
-    setErrorWorkspaceId(props.workspaceId);
-  }, [clearError, props.workspaceId, switched]);
+    setErrorScope({ workspaceId: props.workspaceId, connectionKey: props.connectionKey });
+  }, [clearError, props.connectionKey, props.workspaceId, switched]);
   return (
     <PopoverError
       error={switched ? null : error}
@@ -1225,7 +1240,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                     ) : null}
                     {/* Background bashes sit between held inputs and the turn status, as in the
                         desktop dock. Keyed so the expanded list and an open output dialog never
-                        carry over to another workspace. Without a server connection the store has
+                        carry over to another workspace or server. Without a server connection the store has
                         no client, so its last-known processes are not offered. */}
                     {selectedWorkspaceId && canChat ? (
                       // The shared banner brings its own dock gutter (desktop's composer has the
@@ -1233,7 +1248,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                       <div className="-mx-[15px]">
                         <BackgroundProcessesBanner
                           // Sibling of the composer, which is keyed by the bare workspace ID.
-                          key={`background-processes-${selectedWorkspaceId}`}
+                          // Includes the connection: both servers may share a workspace ID.
+                          key={`background-processes-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
                           workspaceId={selectedWorkspaceId}
                         />
                       </div>
