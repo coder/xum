@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
 import { isAbortError } from "@/browser/utils/isAbortError";
@@ -497,29 +497,44 @@ export function useBackgroundBashStoreRaw(): BackgroundBashStore {
   return getStoreInstance();
 }
 
+// The subscribe callbacks below start and stop the workspace's backend subscription. An unstable
+// callback makes React re-subscribe on every render, which drops the last subscriber and restarts
+// the backend stream; the VS Code webview is not React-Compiler compiled, so it re-rendered the
+// background processes strip into a new stream on every chat flush (#5092). These useCallbacks
+// are for correctness, not performance.
 export function useBackgroundProcesses(workspaceId: string | undefined): BackgroundProcessInfo[] {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) => (workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined),
-    () => (workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES)
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined,
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES
   );
 }
 
 export function useForegroundBashToolCallIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeForegroundIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET
   );
 }
 
 export function useBackgroundBashTerminatingIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeTerminatingIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET
   );
 }
 
