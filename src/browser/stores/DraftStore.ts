@@ -243,6 +243,8 @@ interface PendingListPut {
   attempt: number;
   /** List revision of the backend's reply; the put is done once the list reached it. */
   confirmedRevision: number | null;
+  /** The request in flight: one at a time per draft, so an older value never lands last. */
+  sending: Promise<void> | null;
 }
 
 function listEntryKey(entry: { projectPath: string; draftId: string }): string {
@@ -399,26 +401,45 @@ export class DraftStore {
   putCreationDraft(projectPath: string, draft: WorkspaceDraft): void {
     const entry: DraftListEntry = { projectPath, ...draft };
     const key = listEntryKey(entry);
-    const pending: PendingListPut = { entry, attempt: 0, confirmedRevision: null };
-    this.pendingListPuts.set(key, pending);
+    let pending = this.pendingListPuts.get(key);
+    if (pending) {
+      // A request in flight sends this value once it settles (see sendListPut).
+      pending.entry = entry;
+      pending.confirmedRevision = null;
+    } else {
+      pending = { entry, attempt: 0, confirmedRevision: null, sending: null };
+      this.pendingListPuts.set(key, pending);
+    }
     this.recomputeList();
-    this.sendListPut(key, pending).catch(() => undefined);
+    this.startListPut(key, pending);
   }
 
+  private startListPut(key: string, pending: PendingListPut): void {
+    if (pending.sending) return;
+    const sending = this.sendListPut(key, pending).finally(() => {
+      if (pending.sending === sending) pending.sending = null;
+    });
+    pending.sending = sending;
+  }
+
+  /** Never rejects. */
   private async sendListPut(key: string, pending: PendingListPut): Promise<void> {
     const client = this.client;
     // Puts wait for hydration: the legacy list import runs first, and the first import (before a
     // list.json exists) also lists orphaned draft bodies. The snapshot handler resends.
     if (!client || !this.hydrated || this.pendingListPuts.get(key) !== pending) return;
+    const sent = pending.entry;
     try {
-      const { revision } = await client.drafts.putListEntry(pending.entry);
+      const { revision } = await client.drafts.putListEntry(sent);
       if (this.pendingListPuts.get(key) !== pending) return;
+      // Changed while in flight: send the latest value (still one request at a time).
+      if (pending.entry !== sent) return await this.sendListPut(key, pending);
       pending.confirmedRevision = revision;
       this.settleList();
     } catch (error) {
       console.warn("Failed to list a creation draft; retrying:", error);
       setTimeout(() => {
-        if (this.client === client) this.sendListPut(key, pending).catch(() => undefined);
+        if (this.client === client) this.startListPut(key, pending);
       }, retryDelayMs(pending.attempt++));
     }
   }
@@ -632,9 +653,12 @@ export class DraftStore {
     const key = draftStoreScopeKey(scope);
     const entry = this.dropEntry(key);
     if (scope.kind === "pending") return;
+    const listPut = this.pendingListPuts.get(key)?.sending;
     if (scope.kind === "creation") this.dropListEntry(key);
-    // Let a write in flight land first, so it cannot recreate the file after the delete.
+    // Let a write in flight land first, so it cannot recreate the file after the delete; the same
+    // for a list put, which would relist the draft.
     await entry?.inFlight;
+    await listPut;
     if (this.entries.has(key)) return;
     this.pendingDeletes.set(key, scope);
     await this.sendDelete(key, 0);
@@ -932,9 +956,7 @@ export class DraftStore {
               this.sendDelete(key, 0).catch(() => undefined);
             }
             for (const [key, pending] of this.pendingListPuts) {
-              if (pending.confirmedRevision === null) {
-                this.sendListPut(key, pending).catch(() => undefined);
-              }
+              if (pending.confirmedRevision === null) this.startListPut(key, pending);
             }
           } else if (event.type === "list") {
             // Pushes that trail a newer snapshot are stale.
@@ -1058,6 +1080,7 @@ export class DraftStore {
                   entry,
                   attempt: 0,
                   confirmedRevision: listed.revision,
+                  sending: null,
                 });
                 this.settleList();
               }
@@ -1109,9 +1132,10 @@ export class DraftStore {
    * the older build (their bodies stay on the backend) until the next upgrade.
    */
   private async importLegacyDraftList(client: APIClient): Promise<void> {
-    const raw = readLegacyJson(WORKSPACE_DRAFTS_BY_PROJECT_KEY);
-    if (raw === undefined) return;
-    const entries = parseLegacyDraftList(raw);
+    if (readPersistedString(WORKSPACE_DRAFTS_BY_PROJECT_KEY) === undefined) return;
+    // An unparseable value imports as empty (and is then removed): the import still runs, so a
+    // missing backend list is created and relists the draft bodies.
+    const entries = parseLegacyDraftList(readLegacyJson(WORKSPACE_DRAFTS_BY_PROJECT_KEY));
     this.legacyListFallback = entries;
     this.recomputeList();
     try {

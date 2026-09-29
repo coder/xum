@@ -292,6 +292,9 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
       try {
+        const draftIds = (getDraftStore().getCreationDraftsByProject()[path] ?? []).map(
+          (draft) => draft.draftId
+        );
         const result = await api.projects.remove({
           projectPath: path,
           force: options?.force,
@@ -304,9 +307,10 @@ export function ProjectProvider(props: { children: ReactNode }) {
           });
 
           // The backend deleted the project's creation drafts and delisted them. Clean up their
-          // localStorage settings, then drop them from memory.
-          for (const draft of getDraftStore().getCreationDraftsByProject()[path] ?? []) {
-            deleteWorkspaceStorage(getDraftScopeId(path, draft.draftId));
+          // localStorage settings (ids captured before the removal: its list event may already
+          // have emptied the list), then drop them from memory.
+          for (const draftId of draftIds) {
+            deleteWorkspaceStorage(getDraftScopeId(path, draftId));
           }
           getDraftStore().forgetProject(path);
 

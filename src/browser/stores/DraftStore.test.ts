@@ -55,6 +55,8 @@ function createClient(service: DraftService) {
     failGets: 0,
     failListPuts: 0,
     failListImports: 0,
+    /** Consumed one per putListEntry call, in call order. */
+    listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
@@ -94,6 +96,7 @@ function createClient(service: DraftService) {
       return service.importLegacy(input);
     },
     putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
+      await control.listPutGates.shift();
       if (control.failListPuts > 0) {
         control.failListPuts--;
         throw new Error("list put failed");
@@ -405,6 +408,61 @@ describe("DraftStore", () => {
     const restarted = createStore(createClient(new DraftService(config)).client);
     await restarted.whenReady();
     expect(listedIds(restarted)).toEqual(expected);
+  });
+
+  test("sends list puts of one draft in order, so an older sub-project never lands last", async () => {
+    using tempDir = new TestTempDir("draft-store-list-order");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseFirst: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/a", createdAt: 1 });
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/b", createdAt: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseFirst();
+    await waitFor(async () => (await service.getList()).entries[0]?.subProjectPath === "/b");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await service.getList()).entries.map((entry) => entry.subProjectPath)).toEqual(["/b"]);
+    await waitFor(
+      () => store.getCreationDraftsByProject()[projectPath]?.[0]?.subProjectPath === "/b"
+    );
+  });
+
+  test("a delete waits for the draft's list put, so it is not relisted", async () => {
+    using tempDir = new TestTempDir("draft-store-list-delete-order");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await deleted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await service.getList()).entries).toEqual([]);
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+  });
+
+  test("replaces a malformed legacy draft list, so its import still completes", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-list-malformed");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    window.localStorage.setItem(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "{not json");
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "t" });
+    const store = createStore(client);
+    await store.whenReady();
+    await waitFor(() => store.getCreationDraftsByProject()[projectPath]?.[0]?.draftId === "lost");
+    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
   });
 
   test("imports legacy drafts of workspace ids that start with underscores", async () => {
