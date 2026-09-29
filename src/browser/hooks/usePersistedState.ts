@@ -230,7 +230,11 @@ function writeSerializedValue(key: string, serialized: string): WriteOutcome {
     getOverBudgetSessionValues().set(key, serialized);
     return "session";
   }
+  return storeSerializedValue(key, serialized);
+}
 
+/** setItem with the quota handling (evict caches, retry once); no budget checks. */
+function storeSerializedValue(key: string, serialized: string): WriteOutcome {
   const storage = window.localStorage;
   try {
     storage.setItem(key, serialized);
@@ -414,6 +418,31 @@ export function writePersistedRawString(key: string, value: string): boolean {
 }
 
 /**
+ * Copy an existing value of a legacy migration-only key (registered with maxValueChars 0) verbatim,
+ * e.g. to a workspace fork. Features never write these keys, so they have no budget; a fork still
+ * needs the source's not-yet-imported legacy data so its own one-time import finds it. The data
+ * already exists, so a copy cannot grow it beyond one more copy until that import removes it.
+ * Returns true only when the value reached localStorage.
+ */
+export function copyLegacyPersistedRawString(key: string, value: string): boolean {
+  try {
+    if (!isLocalStorageReadable()) return false;
+    const registration = getPersistedKeyRegistration(key);
+    if (registration?.maxValueChars !== 0 || key.length > MAX_PERSISTED_KEY_CHARS) {
+      reportBudgetViolationOnce(key, {
+        reason: "only registered legacy keys (maxValueChars 0) can be copied without a budget",
+        overValueBudget: false,
+      });
+      return false;
+    }
+    return storeSerializedValue(key, value) === "stored";
+  } catch (error) {
+    reportWriteFailureOnce(key, error);
+    return false;
+  }
+}
+
+/**
  * Remove many keys in one pass (startup cleanups, workspace deletion, orphan GC), then notify
  * write listeners and hook subscribers once per key so mounted consumers do not write a stale
  * value back. Unlike updatePersistedState it dispatches no per-key window CustomEvent: the only
@@ -445,16 +474,39 @@ export function isPersistedStateStorageEvent(event: StorageEvent): boolean {
   return typeof window !== "undefined" && event.storageArea === window.localStorage;
 }
 
+const persistedStateStorageViews = new WeakMap<Storage, Storage>();
+
 /**
- * The persisted-state Storage, or null outside a browser. Only for reads and identity checks by
- * code that takes an injectable Storage (tests pass their own); writes must go through
- * updatePersistedState/syncPersistedStateFromBackend/removePersistedStateKeys.
+ * A read view of the persisted state, or null outside a browser. Only for reads and identity
+ * checks by code that takes an injectable Storage (tests pass their own); writes must go through
+ * updatePersistedState/syncPersistedStateFromBackend/removePersistedStateKeys. getItem returns what
+ * the helpers' readers return, including a session-only over-budget value, so e.g. the preference
+ * sync never reads an older on-disk value than the one the user just set. The view is stable per
+ * Storage, so identity checks against it work.
  */
 export function getPersistedStateStorage(): Storage | null {
-  if (typeof window === "undefined" || !window.localStorage) {
+  if (!isLocalStorageReadable()) {
     return null;
   }
-  return window.localStorage;
+  const storage = window.localStorage;
+  let view = persistedStateStorageViews.get(storage);
+  if (!view) {
+    const refuseWrite = (): never => {
+      throw new Error("Write persisted state through the persisted-state helpers");
+    };
+    view = {
+      get length() {
+        return storage.length;
+      },
+      key: (index) => storage.key(index),
+      getItem: (key) => getStoredRaw(key),
+      setItem: refuseWrite,
+      removeItem: refuseWrite,
+      clear: refuseWrite,
+    };
+    persistedStateStorageViews.set(storage, view);
+  }
+  return view;
 }
 
 /**

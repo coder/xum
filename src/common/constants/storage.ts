@@ -1143,13 +1143,14 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Note: auto-compaction threshold is per-model, not per-workspace.
 
   // Legacy review data, now in the backend review-state.json (imported once when the review
-  // panel opens, then removed). Never written again. Not copied on fork: the backend fork copies
-  // review-state.json; only never-imported legacy marks of the source stay with the source.
-  workspaceKey(getReviewStateKey, "workspace-scoped", false, 0),
-  workspaceKey(getHunkFirstSeenKey, "workspace-scoped", false, 0),
-  workspaceKey(getReviewExpandStateKey, "workspace-scoped", false, 0),
-  workspaceKey(getReviewReadMoreKey, "workspace-scoped", false, 0),
-  workspaceKey(getReviewsKey, "workspace-scoped", false, 0),
+  // panel opens, then removed). Never written again, so no budget (0). Still copied on fork: a
+  // source that has not been imported yet has no review-state.json for the backend fork to copy,
+  // so the fork's own import needs these (copyLegacyPersistedRawString).
+  workspaceKey(getReviewStateKey, "workspace-scoped", true, 0),
+  workspaceKey(getHunkFirstSeenKey, "workspace-scoped", true, 0),
+  workspaceKey(getReviewExpandStateKey, "workspace-scoped", true, 0),
+  workspaceKey(getReviewReadMoreKey, "workspace-scoped", true, 0),
+  workspaceKey(getReviewsKey, "workspace-scoped", true, 0),
 
   // Deleted with the workspace but not copied on fork.
   // SendMessageError; transient (shown as a toast after navigation, then removed).

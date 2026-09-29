@@ -16,7 +16,6 @@ import {
   getTimelineFilterKey,
 } from "@/common/constants/storage";
 import {
-  readPersistedState,
   removePersistedStateKeys,
   readPersistedRawString,
   readPersistedState,

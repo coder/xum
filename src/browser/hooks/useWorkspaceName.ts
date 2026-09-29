@@ -98,13 +98,26 @@ const WorkspaceNamePersistedStateSchema = z.object({
 
 export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
 
+/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
+function hashMessage(message: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < message.length; index++) {
+    hash ^= message.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 /**
- * lastGeneratedFor only detects whether the message changed, so it keeps just a prefix: the full
- * creation message can be many KB, and the persisted state must fit its localStorage budget.
- * Messages that differ only after the prefix reuse the generated name.
+ * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
+ * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
+ * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
+ * edit past the prefix still counts as a change and regenerates the name.
  */
 function toStoredMessage(message: string): string {
-  return message.slice(0, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS);
+  if (message.length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
+  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
+  return message.slice(0, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix;
 }
 
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {

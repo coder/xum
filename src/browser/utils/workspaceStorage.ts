@@ -5,6 +5,7 @@
  * and routed through the persisted-state helpers so every write takes the shared write path.
  */
 import {
+  copyLegacyPersistedRawString,
   listPersistedStateKeys,
   readPersistedRawString,
   removePersistedStateKeys,
@@ -24,13 +25,14 @@ import {
  */
 export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): boolean {
   let copiedAll = true;
-  for (const { getKey, copyOnFork } of WORKSPACE_KEY_REGISTRATIONS) {
+  for (const { getKey, copyOnFork, maxValueChars } of WORKSPACE_KEY_REGISTRATIONS) {
     if (!copyOnFork) continue;
     const value = readPersistedRawString(getKey(sourceWorkspaceId));
+    if (value === null) continue;
     // Copy the serialized value verbatim so the destination is byte-identical to the source.
-    if (value !== null && !writePersistedRawString(getKey(destWorkspaceId), value)) {
-      copiedAll = false;
-    }
+    // Legacy migration-only keys (budget 0) are carried along for the destination's own import.
+    const write = maxValueChars === 0 ? copyLegacyPersistedRawString : writePersistedRawString;
+    if (!write(getKey(destWorkspaceId), value)) copiedAll = false;
   }
   return copiedAll;
 }
