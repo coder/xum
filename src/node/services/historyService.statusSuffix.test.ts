@@ -111,6 +111,7 @@ describe("HistoryService.getStatusHistorySuffix", () => {
     adversarial: boolean
   ): Promise<string[]> {
     const problems: string[] = [];
+    let payloadRowsCompared = 0;
     for (let seed = 1; seed <= seeds; seed++) {
       const random = mulberry32(seed);
       const rows = generateRows(random, { oversized: seed % 20 === 0, adversarial });
@@ -136,6 +137,10 @@ describe("HistoryService.getStatusHistorySuffix", () => {
       const before = await stamps(workspaceId);
       const tails = new Map<number, MuxMessage[]>();
       for (const window of windows) tails.set(window, await suffix(workspaceId, window));
+      if (seed % 20 === 0)
+        payloadRowsCompared += tails
+          .get(Math.max(...windows))!
+          .filter((m) => /^p\d$/.test(m.id) && oversized.has(m.id)).length;
       if ((await stamps(workspaceId)) !== before)
         problems.push(`seed ${seed}: suffix read modified history files`);
       // The full read runs second: it may rotate a legacy layout.
@@ -148,6 +153,9 @@ describe("HistoryService.getStatusHistorySuffix", () => {
         problems.push(...check(`seed ${seed} N=${window} rotated`, rotated, tail, window));
       }
     }
+    // Most payload rows land before a floor; the elision is compared only if one survives
+    // (seed 220 today), so a generator change must not silently drop that coverage.
+    if (payloadRowsCompared === 0) problems.push("no giant payload row reached a compared window");
     return problems;
   }
 

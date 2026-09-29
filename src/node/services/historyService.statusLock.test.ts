@@ -234,8 +234,9 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       tracked.restore();
       if (result.success !== c.expectOk) problems.push(`${c.name}: success=${result.success}`);
       if (c.failStat && !checkedAfterOpen) problems.push(`${c.name}: stamp check not reached`);
-      // A failed scan or stamp check retries once under the lock with two new descriptors.
-      const expectedHandles = c.options.failOpen ? 1 : c.expectOk ? 2 : 4;
+      // On POSIX a failed unlocked scan or stamp check retries once under the lock with two new
+      // descriptors; Windows reads only once, under the lock (this file runs in the Windows smoke).
+      const expectedHandles = c.options.failOpen ? 1 : c.expectOk || !posix ? 2 : 4;
       if (tracked.handles.length !== expectedHandles)
         problems.push(`${c.name}: opened ${tracked.handles.length}`);
       for (const handle of tracked.handles)
