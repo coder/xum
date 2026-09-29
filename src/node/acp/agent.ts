@@ -144,6 +144,12 @@ interface TurnCompletion {
    * Used to avoid binding fallback stream-start events emitted before prompt dispatch.
    */
   dispatchedAtMs?: number;
+  /**
+   * A held send (/send-held) keeps the options it was queued with, which may carry an earlier ACP
+   * prompt's correlation id, so its turn binds the first stream-start after dispatch whatever id
+   * that start carries.
+   */
+  bindsAnyStartAfterDispatch?: boolean;
   /** Inactivity timer so idle prompt turns cannot hang forever. */
   timeoutHandle: ReturnType<typeof setTimeout>;
   /** Set after stream-start; only this message id may resolve/reject the turn. */
@@ -748,13 +754,17 @@ export class MuxAgent implements Agent {
    * response settles when that message's stream ends, aborts or fails.
    */
   private async dispatchAndAwaitTurn(
-    args: { sessionId: string; workspaceId: string },
+    args: { sessionId: string; workspaceId: string; bindsAnyStartAfterDispatch?: boolean },
     dispatch: (promptCorrelationId: string) => Promise<void>
   ): Promise<PromptResponse> {
     this.markNewSessionWorkspacePromptActivity(args.workspaceId);
 
     const promptCorrelationId = randomUUID();
-    const turnPromise = this.beginTurn(args.sessionId, promptCorrelationId);
+    const turnPromise = this.beginTurn(
+      args.sessionId,
+      promptCorrelationId,
+      args.bindsAnyStartAfterDispatch
+    );
 
     // Attach a sink immediately so early stream failures cannot produce
     // unhandled rejections before this method awaits turnPromise.
@@ -1199,11 +1209,10 @@ export class MuxAgent implements Agent {
       );
     }
 
-    // The held send keeps the options it was queued with, not this prompt's correlation id: the
-    // turn binds to the next uncorrelated stream-start after dispatch (see handleStreamEvent).
-    // Input queued by an earlier ACP prompt keeps that prompt's id, so its turn cannot bind and
-    // fails at the correlation timeout, while the re-sent stream still reaches the client.
-    return this.dispatchAndAwaitTurn({ sessionId, workspaceId }, async () => {
+    // The held send keeps the options it was queued with, not this prompt's correlation id, so
+    // the turn binds the first stream-start after dispatch (see TurnCompletion).
+    const turnArgs = { sessionId, workspaceId, bindsAnyStartAfterDispatch: true };
+    return this.dispatchAndAwaitTurn(turnArgs, async () => {
       const sendResult = await this.server.client.workspace.sendHeldInput(request);
       if (!sendResult.success) {
         throw new Error(
@@ -1916,7 +1925,7 @@ export class MuxAgent implements Agent {
         completion.messageId == null &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
-        event.acpPromptId == null &&
+        (event.acpPromptId == null || completion.bindsAnyStartAfterDispatch === true) &&
         Number.isFinite(event.startTime) &&
         event.startTime >= completion.dispatchedAtMs;
 
@@ -2114,7 +2123,11 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private beginTurn(sessionId: string, promptCorrelationId: string): Promise<TurnResult> {
+  private beginTurn(
+    sessionId: string,
+    promptCorrelationId: string,
+    bindsAnyStartAfterDispatch?: boolean
+  ): Promise<TurnResult> {
     assert(
       !this.turnCompletions.has(sessionId),
       `prompt: session '${sessionId}' already has a running turn`
@@ -2141,6 +2154,7 @@ export class MuxAgent implements Agent {
         promptCorrelationId,
         startedAtMs,
         timeoutHandle,
+        bindsAnyStartAfterDispatch,
       });
     });
   }

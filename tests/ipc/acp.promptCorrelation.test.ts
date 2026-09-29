@@ -1761,6 +1761,7 @@ describe("ACP held inputs (#4944)", () => {
 
   it("surfaces input held by a cancel and lets the ACP user discard or send it", async () => {
     const harness: Harness = createHarness({
+      agentOptions: { turnCorrelationTimeoutMs: 1_000 },
       // The backend keeps queued input as held input during the Stop (#4769).
       interruptStream: async ({ workspaceId }) => {
         harness.pushChatEvent({
@@ -1803,7 +1804,9 @@ describe("ACP held inputs (#4944)", () => {
       workspaceId: sessionId,
       heldInputId: "held-1",
     });
-    harness.pushChatEvent(streamStart(sessionId, "assistant-held"));
+    // The held send keeps the options it was queued with: input queued by an earlier ACP prompt
+    // still carries that prompt's correlation id, which must not strand this turn.
+    harness.pushChatEvent(streamStart(sessionId, "assistant-held", { acpPromptId: "earlier" }));
     harness.pushChatEvent(streamEnd(sessionId, "assistant-held"));
     await expect(sendPromise).resolves.toMatchObject({ stopReason: "end_turn" });
     // The backend re-sends its held copy; the agent never re-types it as a new prompt.

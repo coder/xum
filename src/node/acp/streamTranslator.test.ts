@@ -187,6 +187,22 @@ describe("StreamTranslator held inputs (#4944)", () => {
     expect(notices[1]).toMatch(/2\. .*2 attachments.*1 review/);
   });
 
+  test("a notice the client never received is announced again on the replay", async () => {
+    const sessionUpdate = mock(() => Promise.resolve(undefined));
+    sessionUpdate.mockImplementationOnce(() => Promise.reject(new Error("stdout closed")));
+    const translator = new StreamTranslator({ sessionUpdate } as unknown as AgentSideConnection);
+    async function* stream(): AsyncIterable<WorkspaceChatMessage> {
+      yield await Promise.resolve(heldChanged(held("h1", "keep me")));
+    }
+    const failure: unknown = await translator
+      .consumeAndForward("session", stream())
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    // The resubscription replays the same held list.
+    await translator.consumeAndForward("session", stream());
+    expect(sessionUpdate).toHaveBeenCalledTimes(2);
+  });
+
   test("restore-to-input defers to held inputs, and shows its text when nothing holds it", async () => {
     const { notices } = await translate([
       { type: "restore-to-input", workspaceId: "ws", text: "kept text", heldInputIds: ["h1"] },

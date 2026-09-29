@@ -92,15 +92,22 @@ export class StreamTranslator {
 
     let isReplayPhase = true;
 
-    for await (const event of chatStream) {
-      const updates = this.translateEvent(sessionId, event, isReplayPhase);
-      for (const update of updates) {
-        await this.connection.sessionUpdate({ sessionId, update });
-      }
+    try {
+      for await (const event of chatStream) {
+        const updates = this.translateEvent(sessionId, event, isReplayPhase);
+        for (const update of updates) {
+          await this.connection.sessionUpdate({ sessionId, update });
+        }
 
-      if (event.type === "caught-up") {
-        isReplayPhase = false;
+        if (event.type === "caught-up") {
+          isReplayPhase = false;
+        }
       }
+    } catch (error) {
+      // A held-input notice may not have reached the client: forget what was listed, so the held
+      // list replayed on resubscription is announced again rather than treated as already shown.
+      this.heldInputsBySessionId.delete(sessionId);
+      throw error;
     }
   }
 
