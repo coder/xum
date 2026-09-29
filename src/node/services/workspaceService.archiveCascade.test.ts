@@ -242,6 +242,23 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     expect(await exists(path.join(checkouts.get(grandchildId)!, "notes.txt"))).toBe(true);
   });
 
+  test("a model-facing snapshot archive refuses with the parent's own untracked paths before archiving its sub-agents", async () => {
+    await setArchiveBehavior("snapshot");
+    a.workspaceService.setWorktreeArchiveSnapshotService(
+      new WorktreeArchiveSnapshotService(a.config)
+    );
+    await fsPromises.writeFile(path.join(checkouts.get(rootId)!, "notes.txt"), "unsaved\n");
+
+    const result = await modelArchiveRoot();
+
+    assert(result.success, "the lifecycle archive returns a result");
+    expect(result.data.status).toBe("error");
+    expect(result.data.paths).toEqual(["notes.txt"]);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+    }
+  });
+
   test("a delete-mode archive of an idle tree archives every row and deletes every checkout", async () => {
     await setArchiveBehavior("delete");
 

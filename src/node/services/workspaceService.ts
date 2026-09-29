@@ -405,6 +405,7 @@ import {
   normalizeArchiveUntrackedPaths,
   resolveTaskAgentIdForResume,
   type AgentTaskIntegration,
+  type ArchiveCascadePreflight,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
   type RemovalAttemptBinding,
@@ -10942,21 +10943,23 @@ export class WorkspaceService
 
   /**
    * #4930: the model-facing archive cascades over sub-agents too, but no tool acknowledgement
-   * can approve losing a sub-agent's work (#3950). Run before anything is interrupted or
-   * archived, this lists the untracked files each sub-agent's snapshot archive would lose, and
-   * refuses a sub-agent the delete policy would delete, as the lifecycle tool does for its
-   * target. The sink rechecks each sub-agent under the gate, so a file created after this scan
-   * still refuses (with the generic cascade message).
+   * can approve losing work (#3950). Run before anything is interrupted or archived, this lists
+   * the untracked files each sub-agent's snapshot archive would lose, and refuses a sub-agent the
+   * delete policy would delete, as the lifecycle tool does for its target. When the tree has
+   * sub-agents, it also lists the target's own lossy paths: the cascade archives the sub-agents
+   * first, so the target's refusal at the sink would come after they were archived. The sink
+   * rechecks each workspace, so a file created after this scan still refuses.
    */
-  async preflightArchiveDescendants(
+  async preflightArchiveCascade(
     workspaceId: string,
     worktreeArchiveBehavior: WorktreeArchiveBehavior
-  ): Promise<Result<Array<{ workspaceId: string; title: string; paths: string[] }>>> {
+  ): Promise<Result<ArchiveCascadePreflight>> {
     const descendants = this.listUnarchivedDescendants(workspaceId);
+    if (descendants.length === 0) return Ok({ targetPaths: [], subagents: [] });
     if (descendants.some((descendant) => descendant.active)) {
       return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
     }
-    const lossy: Array<{ workspaceId: string; title: string; paths: string[] }> = [];
+    const subagents: ArchiveCascadePreflight["subagents"] = [];
     for (const descendant of descendants) {
       const label = `sub-agent ${descendant.title} (${descendant.workspaceId})`;
       if (worktreeArchiveBehavior === "delete") {
@@ -10974,14 +10977,21 @@ export class WorkspaceService
       });
       if (!preflight.success) return Err(`Cannot archive ${label}: ${preflight.error}`);
       if (preflight.data.kind === "confirm-lossy-untracked-files") {
-        lossy.push({
+        subagents.push({
           workspaceId: descendant.workspaceId,
           title: descendant.title,
           paths: preflight.data.paths,
         });
       }
     }
-    return Ok(lossy);
+    const target = await this.preflightArchive(workspaceId, {
+      worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+    });
+    if (!target.success) return Err(target.error);
+    return Ok({
+      targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
+      subagents,
+    });
   }
 
   /**

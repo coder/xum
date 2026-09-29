@@ -3863,22 +3863,23 @@ export class WorkspaceTurnManager {
 
           // #4930: the archive cascades over the target's unarchived sub-agents. Refuse before
           // anything is interrupted or archived when a sub-agent is active, the delete policy
-          // would delete its checkout, or its snapshot archive would lose untracked files: no
-          // tool acknowledgement can approve that loss (#3950), so list the paths instead.
-          const descendantPreflight = await this.workspaceService.preflightArchiveDescendants(
+          // would delete its checkout, or its (or the target's) snapshot archive would lose
+          // untracked files: no tool acknowledgement can approve that loss (#3950), so list the
+          // paths instead.
+          const cascadePreflight = await this.workspaceService.preflightArchiveCascade(
             resolved.workspaceId,
             worktreeArchiveBehavior
           );
-          if (!descendantPreflight.success) {
+          if (!cascadePreflight.success) {
             return Ok({
               status: "error",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error: descendantPreflight.error,
+              error: cascadePreflight.error,
             });
           }
-          if (descendantPreflight.data.length > 0) {
-            const subagents = descendantPreflight.data;
+          const { subagents, targetPaths } = cascadePreflight.data;
+          if (subagents.length > 0) {
             return Ok({
               status: "error",
               action: "archive",
@@ -3894,6 +3895,9 @@ export class WorkspaceTurnManager {
                 "This tool cannot approve that loss, and you must not delete the files to get around it. " +
                 "Ask the user to archive those sub-agents manually first; the archive dialog lists the files and asks for confirmation.",
             });
+          }
+          if (targetPaths.length > 0) {
+            return Ok(this.lossySnapshotArchiveRefusal(resolved, targetPaths));
           }
 
           // Held (when interrupting) from before the first turn interruption through the
