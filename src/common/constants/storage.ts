@@ -966,10 +966,21 @@ export const EXPANDED_COMPLETED_SUB_AGENTS_KEY = "expandedCompletedSubAgents";
 export const EXPANDED_TASK_GROUPS_KEY = "expandedTaskGroups";
 
 // Budgets that owners also use to keep growing values inside them (see trimRecordToChars).
+// Per-workspace values that owners trim degrade gracefully (older entries are forgotten), so
+// they get tighter budgets than values that cannot be trimmed, like the right sidebar layout.
 /** fileTreeExpandState:{workspaceId}: only directory overrides of the default expansion. */
-export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 1024;
+export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 512;
 /** auto-expand:{workspaceId}: the per-tool map keeps the most recently toggled tools that fit. */
-export const AUTO_EXPAND_PREFS_MAX_CHARS = 768;
+export const AUTO_EXPAND_PREFS_MAX_CHARS = 512;
+/** reviewSearchState:{workspaceId}: longer searches still work but are not restored on reload. */
+export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
+/**
+ * right-sidebar:layout:{workspaceId}: dock layout tree, ~200 chars plus ~45 per terminal tab, so
+ * about 35 terminals. The layout cannot be trimmed; RightSidebar refuses a terminal that won't fit.
+ */
+export const RIGHT_SIDEBAR_LAYOUT_MAX_CHARS = 1792;
+/** right-sidebar:terminal-titles:{workspaceId}: RightSidebar keeps the newest titles that fit. */
+export const TERMINAL_TITLES_MAX_CHARS = 768;
 /** Each left sidebar expansion map; entries accumulate per project/workspace/group forever. */
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
@@ -1110,7 +1121,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
     true,
     FILE_TREE_EXPAND_STATE_MAX_CHARS
   ),
-  workspaceKey(getReviewSearchStateKey, "workspace-scoped", true, 256),
+  workspaceKey(getReviewSearchStateKey, "workspace-scoped", true, REVIEW_SEARCH_STATE_MAX_CHARS),
   workspaceKey(getReviewImmersiveKey, "workspace-scoped", true, 16),
   workspaceKey(getAutoCompactionEnabledKey, "ui", true, 16),
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
@@ -1140,10 +1151,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getDisableWorkspaceAgentsKey, "ui", false, 16),
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
-  // Dock layout tree; a 6-terminal split layout serializes to ~600 chars.
-  workspaceKey(getRightSidebarLayoutKey, "ui", false, 1024),
+  workspaceKey(getRightSidebarLayoutKey, "ui", false, RIGHT_SIDEBAR_LAYOUT_MAX_CHARS),
   // Record<terminalSessionId, title>, pruned when sessions close.
-  workspaceKey(getTerminalTitlesKey, "ui", false, 768),
+  workspaceKey(getTerminalTitlesKey, "ui", false, TERMINAL_TITLES_MAX_CHARS),
   workspaceKey(getReviewFileFilterKey, "ui", false, 512),
   workspaceKey(getTimelineFilterKey, "ui", false, 64),
   workspaceKey(getDesktopPopoutKey, "ui", false, 128),

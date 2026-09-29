@@ -167,8 +167,9 @@ describe("persisted state key budgets", () => {
   // refusals are logged once per key per session.
   const TIMELINE_FILTER_BUDGET = 64;
   const valueOfLength = (serializedLength: number) => "x".repeat(serializedLength - 2);
+  // Refusal logs shorten long keys, so match on the key's start.
   const refusalLogsFor = (key: string) =>
-    error.mock.calls.filter((call) => String(call[0]).includes(`"${key}"`));
+    error.mock.calls.filter((call) => String(call[0]).includes(`"${key.slice(0, 100)}`));
 
   beforeEach(() => {
     cleanupDom = installDom();
@@ -216,6 +217,8 @@ describe("persisted state key budgets", () => {
     expect(window.localStorage.getItem(overlongKey)).toBeNull();
     expect(refusalLogsFor(unregistered)).toHaveLength(1);
     expect(refusalLogsFor(overlongKey)).toHaveLength(1);
+    // The log line stays bounded instead of echoing the whole oversized key.
+    expect(String(refusalLogsFor(overlongKey)[0][0]).length).toBeLessThan(overlongKey.length);
 
     // Legacy keys are no longer registered; startup cleanups must still remove them.
     window.localStorage.setItem("input:legacy-draft", JSON.stringify("old text"));

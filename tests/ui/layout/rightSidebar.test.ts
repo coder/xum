@@ -30,6 +30,7 @@ import { renderApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
+  RIGHT_SIDEBAR_LAYOUT_MAX_CHARS,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getRightSidebarLayoutKey,
@@ -38,7 +39,10 @@ import {
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 // RightSidebarLayoutState used for initial setup via persisted-state helpers - acceptable for test fixtures
-import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import {
+  getDefaultRightSidebarLayoutState,
+  type RightSidebarLayoutState,
+} from "@/browser/utils/rightSidebarLayout";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -755,6 +759,52 @@ describeIntegration("RightSidebar (UI)", () => {
       const reviewPanel = sidebar.querySelector('[role="tabpanel"][id*="review"]');
       expect(costsPanel).toBeTruthy();
       expect(reviewPanel).toBeTruthy();
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("closes a new terminal whose tab would not fit the persisted layout", async () => {
+    // Pad the tabset id so the layout sits just under its budget: a terminal tab (~45 chars)
+    // no longer fits, and a refused layout write would drop the tab but keep the shell running.
+    const base = getDefaultRightSidebarLayoutState("costs");
+    const padding = "p".repeat(
+      Math.floor((RIGHT_SIDEBAR_LAYOUT_MAX_CHARS - 20 - JSON.stringify(base).length) / 2)
+    );
+    const tabsetId = `${base.focusedTabsetId}${padding}`;
+    const paddedLayout: RightSidebarLayoutState = {
+      ...base,
+      focusedTabsetId: tabsetId,
+      root: { ...base.root, id: tabsetId } as RightSidebarLayoutState["root"],
+    };
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      expect(updatePersistedState(getRightSidebarLayoutKey(workspaceId), paddedLayout)).toBe(true);
+    });
+
+    try {
+      fireEvent.click(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="New terminal"]',
+          "New terminal button not found"
+        )
+      );
+
+      await waitFor(
+        () => {
+          const alert = document.body.querySelector('[role="alert"]');
+          expect(alert?.textContent).toContain("Too many terminals");
+        },
+        { timeout: 10_000 }
+      );
+      expect(sidebar.querySelector('[role="tab"][aria-controls*="terminal:"]')).toBeNull();
+      // The shell created for the refused tab is closed instead of orphaned.
+      await waitFor(
+        async () => {
+          expect(await env.orpc.terminal.listSessions({ workspaceId })).toEqual([]);
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await cleanup();
     }

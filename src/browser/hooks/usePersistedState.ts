@@ -140,8 +140,10 @@ function getBudgetViolation(key: string, serialized: string): string | null {
 function reportRefusalOnce(key: string, reason: string): void {
   if (keysWithReportedRefusals.has(key)) return;
   keysWithReportedRefusals.add(key);
+  // Oversized keys are refused too; don't echo a multi-kilobyte key into the console.
+  const shownKey = key.length > 200 ? `${key.slice(0, 200)}...` : key;
   console.error(
-    `Refused localStorage write to "${key}": ${reason} (further refusals for this key are not logged)`
+    `Refused localStorage write to "${shownKey}": ${reason} (further refusals for this key are not logged)`
   );
 }
 

@@ -3,9 +3,12 @@ import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   getReviewImmersiveKey,
+  RIGHT_SIDEBAR_LAYOUT_MAX_CHARS,
+  TERMINAL_TITLES_MAX_CHARS,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
+import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -244,6 +247,26 @@ const DragAwarePanelResizeHandle: React.FC<{
 
   return <PanelResizeHandle className={className} />;
 };
+
+/** Whether the layout fits its key budget, so persisting it is not refused. */
+function rightSidebarLayoutFits(layout: RightSidebarLayoutState): boolean {
+  return JSON.stringify(layout).length <= RIGHT_SIDEBAR_LAYOUT_MAX_CHARS;
+}
+
+/** Longest title kept per terminal in the persisted map (deep working directories get long). */
+const PERSISTED_TERMINAL_TITLE_MAX_CHARS = 96;
+
+/**
+ * Persist a bounded copy of the terminal titles: they come from the shell, so cap each title and
+ * keep the newest ones that fit the key budget (a refused write would stop persisting any title).
+ * The in-memory titles stay complete.
+ */
+function persistTerminalTitles(key: string, titles: Map<TabType, string>): void {
+  const capped = Object.fromEntries(
+    Array.from(titles, ([tab, title]) => [tab, title.slice(0, PERSISTED_TERMINAL_TITLE_MAX_CHARS)])
+  );
+  updatePersistedState(key, trimRecordToChars(capped, TERMINAL_TITLES_MAX_CHARS));
+}
 
 function hasMountedReviewPanel(node: RightSidebarLayoutNode): boolean {
   if (node.type === "tabset") {
@@ -1388,7 +1411,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.delete(tab);
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
@@ -1501,8 +1524,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.set(tab, title);
-        // Persist to localStorage
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
@@ -1529,6 +1551,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       void createTerminalSession(api, workspaceId, options)
         .then((session) => {
           const newTab = makeTerminalTabType(session.sessionId);
+          // The layout cannot be trimmed, and a refused layout write would drop the new tab
+          // while its shell keeps running. Close the session instead when the tab won't fit.
+          if (!rightSidebarLayoutFits(addTabToFocusedTabset(getBaseLayout(), newTab))) {
+            api.terminal.close({ sessionId: session.sessionId }).catch((err: unknown) => {
+              console.warn("[RightSidebar] Failed to close terminal session:", err);
+            });
+            terminalCreateError.showError(
+              "terminal-create",
+              "Too many terminals in this workspace. Close one to open another."
+            );
+            return;
+          }
           setLayout((prev) => addTabToFocusedTabset(prev, newTab));
           // Schedule focus for this terminal (will be consumed when the tab mounts)
           setAutoFocusTerminalSession(session.sessionId);
@@ -1538,7 +1572,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           terminalCreateError.showError("terminal-create", getErrorMessage(err));
         });
     },
-    [api, workspaceId, setLayout, setCollapsed, terminalCreateError]
+    [api, workspaceId, getBaseLayout, setLayout, setCollapsed, terminalCreateError]
   );
 
   // Expose handleAddTerminal to parent via ref (for Cmd/Ctrl+T keybind)
@@ -1600,7 +1634,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.delete(tab);
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
