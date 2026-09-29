@@ -1678,6 +1678,7 @@ describe("WorkspaceStore", () => {
       // message: its `cause` (the schema issues) is never serialized (#5082).
       const workspaceId = "workspace-event-validation-failed";
       const serverRouter = {
+        // eslint-disable-next-line @typescript-eslint/require-await -- an event iterator source
         onChat: os.output(eventIterator(WorkspaceChatMessageSchema)).handler(async function* () {
           // A stream-delta without its required token count.
           yield {
