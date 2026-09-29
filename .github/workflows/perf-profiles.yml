@@ -35,6 +35,8 @@ jobs:
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
       - name: Run perf profiling scenarios
+        # Serial run (#5209) measured 6m05s including the build; about 2x that.
+        timeout-minutes: 12
         run: xvfb-run -a make test-e2e-perf
         env:
           ELECTRON_DISABLE_SANDBOX: 1
