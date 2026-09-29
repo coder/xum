@@ -7,6 +7,10 @@ import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { computeTimingPercentages } from "@/browser/utils/timingPercentages";
 import { calculateAverageTPS } from "@/browser/utils/messages/StreamingTPSCalculator";
 import { formatDuration } from "@/common/utils/formatDuration";
+import {
+  STATS_TAB_VIEW_MODE_KEY,
+  STATS_TAB_SHOW_MODE_BREAKDOWN_KEY,
+} from "@/common/constants/storage";
 
 // Colors for timing components (matching TOKEN_COMPONENT_COLORS style)
 const TIMING_COLORS = {
@@ -62,9 +66,9 @@ function computeAverageTtft(totalTtftMs: number, ttftCount: number): number | nu
 function useStatsData(workspaceId: string) {
   const snapshot = useWorkspaceStatsSnapshot(workspaceId);
   const telemetry = useTelemetry();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>("statsTab:viewMode", "session");
+  const [viewMode, setViewMode] = usePersistedState<ViewMode>(STATS_TAB_VIEW_MODE_KEY, "session");
   const [showModeBreakdown, setShowModeBreakdown] = usePersistedState<boolean>(
-    "statsTab:showModeBreakdown",
+    STATS_TAB_SHOW_MODE_BREAKDOWN_KEY,
     false
   );
 

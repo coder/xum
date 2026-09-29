@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewStateKey, getReviewsKey } from "@/common/constants/storage";
 import type {
   ReviewStateDelta,
@@ -13,6 +13,12 @@ import type { Review } from "@/common/types/review";
 import { applyReviewStateDelta, withReviewStateSection } from "@/common/utils/reviewState";
 import { installDom } from "../../../tests/ui/dom";
 import { ReviewStateStore } from "./ReviewStateStore";
+
+// Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
+// an older build left them on disk.
+function seedLegacyKey(key: string, value: unknown): void {
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
 
 const WS = "ws-review-store";
 
@@ -506,7 +512,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
   test("sends a legacy section the backend already has (another origin's data), then removes the key", async () => {
     const { backend, client } = createBackend({ reviews: {} });
     const legacyReviews = { other: makeReview("other", "attached") };
-    updatePersistedState(getReviewsKey(WS), {
+    seedLegacyKey(getReviewsKey(WS), {
       workspaceId: WS,
       reviews: legacyReviews,
       lastUpdated: 1,
@@ -523,7 +529,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
   test("imports a legacy section the backend never wrote, then removes the key", async () => {
     const { backend, client } = createBackend();
     const readState = { h1: { hunkId: "h1", isRead: true, timestamp: 5 } };
-    updatePersistedState(getReviewStateKey(WS), { workspaceId: WS, readState, lastUpdated: 1 });
+    seedLegacyKey(getReviewStateKey(WS), { workspaceId: WS, readState, lastUpdated: 1 });
 
     const store = connect(client);
     await store.whenReady(WS);
@@ -552,7 +558,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
       readState: { h1: { hunkId: "h1", isRead: true, timestamp: 5 } },
       lastUpdated: 1,
     };
-    updatePersistedState(getReviewStateKey(WS), legacy);
+    seedLegacyKey(getReviewStateKey(WS), legacy);
 
     const store = connect(client);
     await store.whenReady(WS);

@@ -3,7 +3,7 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js"
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { REMOTE_CONNECTION_URL_KEY } from "@/browser/features/Settings/Sections/RemoteConnectionSection";
+import { REMOTE_CONNECTION_URL_KEY } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getRemoteConnectionServerUrl,

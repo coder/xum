@@ -28,6 +28,12 @@ import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerD
 import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { DraftStore, draftStoreScopeKey } from "./DraftStore";
 
+// Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
+// an older build left them on disk.
+function seedLegacyKey(key: string, value: unknown): void {
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
+
 const WS = "draft-store-ws";
 const WS_SCOPE: DraftScope = { kind: "workspace", workspaceId: WS };
 
@@ -165,10 +171,10 @@ describe("DraftStore", () => {
     // Another origin already stored this workspace's draft on the backend.
     await service.update({ scope: WS_SCOPE, text: "backend copy" });
     const creationScopeId = getDraftScopeId(projectPath, "draft-a");
-    updatePersistedState(getInputKey(WS), "stale local copy");
-    updatePersistedState(getInputKey(creationScopeId), "legacy creation text");
-    updatePersistedState(getInputAttachmentsKey(creationScopeId), [image]);
-    updatePersistedState(getInputKey(getPendingScopeId(projectPath)), "pending text");
+    seedLegacyKey(getInputKey(WS), "stale local copy");
+    seedLegacyKey(getInputKey(creationScopeId), "legacy creation text");
+    seedLegacyKey(getInputAttachmentsKey(creationScopeId), [image]);
+    seedLegacyKey(getInputKey(getPendingScopeId(projectPath)), "pending text");
     // Scope-bound settings of the pending composer follow its draft, like createWorkspaceDraft.
     updatePersistedState(getModelKey(getPendingScopeId(projectPath)), "pending-model");
 
@@ -368,7 +374,7 @@ describe("DraftStore", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
     });
-    updatePersistedState(getInputKey(workspaceId), "underscored");
+    seedLegacyKey(getInputKey(workspaceId), "underscored");
 
     const store = createStore(client);
     await store.whenReady();
@@ -507,7 +513,7 @@ describe("DraftStore", () => {
   test("shows and saves a legacy draft whose import failed when the backend has none", async () => {
     using tempDir = new TestTempDir("draft-store-import-failed");
     const { service, client, control } = await createHarness(tempDir);
-    updatePersistedState(getInputKey(WS), "pre-upgrade");
+    seedLegacyKey(getInputKey(WS), "pre-upgrade");
 
     control.failImports = 100;
     const first = createStore(client);

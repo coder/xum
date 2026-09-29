@@ -22,6 +22,10 @@ import {
   getDraftScopeId,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
+  EXPANDED_SECTIONS_KEY,
+  EXPANDED_COMPLETED_SUB_AGENTS_KEY,
+  EXPANDED_TASK_GROUPS_KEY,
 } from "@/common/constants/storage";
 import { getDisplayTitleFromPersistedState } from "@/browser/hooks/useWorkspaceName";
 import { DndProvider } from "react-dnd";
@@ -32,7 +36,8 @@ import {
   reorderProjects,
   normalizeOrder,
 } from "@/common/utils/projectOrdering";
-import { PROJECT_ORDER_KEY } from "@/common/constants/storage";
+import { PROJECT_ORDER_KEY, SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   matchesKeybind,
   formatKeybind,
@@ -865,7 +870,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
   const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
     Record<string, boolean>
-  >("expandedOldWorkspaces", {});
+  >(EXPANDED_OLD_WORKSPACES_KEY, {});
 
   // Whether workspaces are grouped under collapsible "Older than X days" tiers.
   // Toggled from Settings → General; listener keeps the sidebar live-updated.
@@ -884,20 +889,24 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   // Track which sections are expanded
   const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    "expandedSections",
+    EXPANDED_SECTIONS_KEY,
     {}
   );
 
   // Track parent workspaces whose reported child tasks are expanded.
   const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
     Record<string, boolean>
-  >("expandedCompletedSubAgents", {});
+  >(EXPANDED_COMPLETED_SUB_AGENTS_KEY, {});
   const toggleCompletedChildrenExpansion = useCallback(
     (workspaceId: string) => {
-      setExpandedCompletedSubAgents((prev) => ({
-        ...prev,
-        [workspaceId]: !(prev[workspaceId] ?? false),
-      }));
+      setExpandedCompletedSubAgents((prev) =>
+        withRecordEntry(
+          prev,
+          workspaceId,
+          !(prev[workspaceId] ?? false),
+          SIDEBAR_EXPANSION_MAP_MAX_CHARS
+        )
+      );
     },
     [setExpandedCompletedSubAgents]
   );
@@ -915,7 +924,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Task-group expansion survives reloads (D7). Keys are namespaced per group
   // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
   const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
-    "expandedTaskGroups",
+    EXPANDED_TASK_GROUPS_KEY,
     {}
   );
   // D6: a workflow group that is (or was, this session) active defaults to
@@ -933,10 +942,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     new Map()
   );
   const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
-    setExpandedTaskGroups((prev) => ({
-      ...prev,
-      [storageKey]: !isCurrentlyExpanded,
-    }));
+    setExpandedTaskGroups((prev) =>
+      withRecordEntry(prev, storageKey, !isCurrentlyExpanded, SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
@@ -1047,10 +1055,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setExpandedSections((prev) =>
+      withRecordEntry(prev, key, !prev[key], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const handleForkWorkspace = useCallback(
@@ -2351,10 +2358,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         <React.Fragment key={tierKey}>
           <button
             onClick={() => {
-              setExpandedOldWorkspaces((prev) => ({
-                ...prev,
-                [tierKey]: !prev[tierKey],
-              }));
+              setExpandedOldWorkspaces((prev) =>
+                withRecordEntry(prev, tierKey, !prev[tierKey], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+              );
             }}
             aria-label={
               isTierExpanded

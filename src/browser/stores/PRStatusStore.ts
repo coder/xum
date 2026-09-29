@@ -27,6 +27,7 @@ import { createLRUCache } from "@/browser/utils/lruCache";
 import {
   PR_STATUS_CACHE_ENTRY_PREFIX,
   PR_STATUS_CACHE_INDEX_KEY,
+  PR_STATUS_CACHE_MAX_ENTRIES,
 } from "@/common/constants/storage";
 import {
   canRunPassiveRuntimeCommand,
@@ -92,7 +93,7 @@ interface PersistedPRStatus {
 const prStatusLRU = createLRUCache<PersistedPRStatus>({
   entryPrefix: PR_STATUS_CACHE_ENTRY_PREFIX,
   indexKey: PR_STATUS_CACHE_INDEX_KEY,
-  maxEntries: 50,
+  maxEntries: PR_STATUS_CACHE_MAX_ENTRIES,
   // No TTL - we refresh on mount anyway, just want instant display
 });
 

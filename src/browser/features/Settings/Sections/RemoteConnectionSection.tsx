@@ -10,8 +10,7 @@ import {
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 import { getErrorMessage } from "@/common/utils/errors";
-
-export const REMOTE_CONNECTION_URL_KEY = "remoteConnectionUrl";
+import { REMOTE_CONNECTION_URL_KEY } from "@/common/constants/storage";
 
 const STATUS_LABELS: Record<RemoteConnectionState["status"], string> = {
   disconnected: "Disconnected",

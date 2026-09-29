@@ -73,9 +73,13 @@ describe("Malformed persisted workspace state", () => {
     const app = await createAppHarness({
       branchPrefix: "bad-review-keys",
       beforeRender: (workspaceId) => {
-        updatePersistedState(getReviewsKey(workspaceId), {});
+        // Legacy keys are refused by the key registry now; seed them as an older build left them.
+        window.localStorage.setItem(getReviewsKey(workspaceId), JSON.stringify({}));
         // A known field holding a malformed entry must be dropped too, not imported.
-        updatePersistedState(getReviewStateKey(workspaceId), { readState: { hunk: "yes" } });
+        window.localStorage.setItem(
+          getReviewStateKey(workspaceId),
+          JSON.stringify({ readState: { hunk: "yes" } })
+        );
       },
     });
 

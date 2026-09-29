@@ -1,4 +1,7 @@
-import { listPersistedStateKeys, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  listPersistedStateKeys,
+  removePersistedStateKeys,
+} from "@/browser/hooks/usePersistedState";
 
 // Legacy per-workspace cache prefixes, kept only so startup can delete them. These caches
 // duplicated backend-owned data (plan text, post-compaction state) and now live in memory;
@@ -10,7 +13,5 @@ const DROPPED_CACHE_KEY_PREFIXES = ["planContent:", "postCompactionState:"] as c
  * (cheap and idempotent) so keys re-written by an older build after a downgrade are cleaned too.
  */
 export function removeDroppedCacheKeys(): void {
-  for (const key of listPersistedStateKeys(DROPPED_CACHE_KEY_PREFIXES)) {
-    updatePersistedState(key, null);
-  }
+  removePersistedStateKeys(listPersistedStateKeys(DROPPED_CACHE_KEY_PREFIXES));
 }

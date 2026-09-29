@@ -6,9 +6,11 @@ import React from "react";
 import { extractNewPath, type FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FileChangeType } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   getFileTreeExpandStateKey,
   REVIEW_FILE_TREE_VIEW_MODE_KEY,
+  FILE_TREE_EXPAND_STATE_MAX_CHARS,
 } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
@@ -141,10 +143,16 @@ const TreeNodeContent: React.FC<{
   const isOpen = hasManualState ? expandStateMap[node.path] : depth < 2; // Default: auto-expand first 2 levels
 
   const setIsOpen = (open: boolean) => {
-    setExpandStateMap((prev) => ({
-      ...prev,
-      [node.path]: open,
-    }));
+    // Store only overrides of the default expansion, newest last and trimmed to the key budget,
+    // so the map stays bounded as directories are toggled over time.
+    setExpandStateMap((prev) =>
+      withRecordEntry(
+        prev,
+        node.path,
+        open === depth < 2 ? undefined : open,
+        FILE_TREE_EXPAND_STATE_MAX_CHARS
+      )
+    );
   };
 
   const handleClick = (e: React.MouseEvent) => {

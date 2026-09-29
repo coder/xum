@@ -16,6 +16,7 @@ import { CostsTab } from "./CostsTab";
 import { ContextTab } from "./ContextTab";
 import { ContextUsageSection } from "./ContextUsageSection";
 import { TimingPanel, ModelBreakdownPanel } from "./StatsTab";
+import { STATS_CONTAINER_SUB_TAB_KEY } from "@/common/constants/storage";
 
 type StatsSubTab = "cost" | "context" | "timing" | "models";
 
@@ -36,7 +37,7 @@ interface StatsContainerProps {
 }
 
 export function StatsContainer(props: StatsContainerProps) {
-  const [subTab, setSubTab] = usePersistedState<StatsSubTab>("statsContainer:subTab", "cost");
+  const [subTab, setSubTab] = usePersistedState<StatsSubTab>(STATS_CONTAINER_SUB_TAB_KEY, "cost");
 
   const effectiveTab = OPTIONS.some((o) => o.value === subTab) ? subTab : "cost";
 

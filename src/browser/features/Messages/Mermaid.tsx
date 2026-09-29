@@ -6,6 +6,7 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
+import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 
 const MIN_HEIGHT = 300;
 const DEFAULT_ZOOM = 1;
@@ -303,7 +304,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   }, [chart]);
 
   const [storedDiagramZoom, setStoredDiagramZoom] = usePersistedState(
-    "mermaid-diagram-zoom",
+    MERMAID_DIAGRAM_ZOOM_KEY,
     DEFAULT_ZOOM,
     { listener: true }
   );

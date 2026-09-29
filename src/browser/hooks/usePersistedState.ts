@@ -1,7 +1,11 @@
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import { getStorageChangeEvent } from "@/common/constants/events";
-import { getPersistedKeyKind } from "@/common/constants/storage";
+import {
+  MAX_PERSISTED_KEY_CHARS,
+  getPersistedKeyKind,
+  getPersistedKeyRegistration,
+} from "@/common/constants/storage";
 
 type SetValue<T> = T | ((prev: T) => T);
 
@@ -92,7 +96,7 @@ function reportWriteFailureOnce(key: string, error: unknown): void {
 
 /**
  * Free space by removing registry `cache` keys (refetchable data such as LRU cache entries and
- * cached plan content). Drafts, review data and preferences are never evicted: losing them is the
+ * cached backend lists). Drafts, review data and preferences are never evicted: losing them is the
  * failure this eviction exists to prevent. Returns how many keys were removed.
  */
 function evictCacheKeys(storage: Storage): number {
@@ -107,10 +111,46 @@ function evictCacheKeys(storage: Storage): number {
   return cacheKeys.length;
 }
 
+const keysWithReportedRefusals = new Set<string>();
+
 /**
- * The single low-level localStorage write for persisted state. null/undefined remove the key.
- * On QuotaExceededError it evicts cache keys and retries once. Returns false when the value could
- * not be stored; callers skip change notifications then, because nothing changed on disk.
+ * Why a write of `serialized` to `key` breaks the key registry's budgets, or null when it fits.
+ * Budgets keep localStorage bounded: without them one growing value or unregistered key family
+ * can fill the shared origin quota (see PERSISTED_KEY_REGISTRY).
+ */
+function getBudgetViolation(key: string, serialized: string): string | null {
+  if (key.length > MAX_PERSISTED_KEY_CHARS) {
+    return `key is ${key.length} chars, over the ${MAX_PERSISTED_KEY_CHARS}-char key cap`;
+  }
+  const registration = getPersistedKeyRegistration(key);
+  if (!registration) {
+    return "key is not registered in PERSISTED_KEY_REGISTRY (src/common/constants/storage.ts)";
+  }
+  if (serialized.length > registration.maxValueChars) {
+    return `value is ${serialized.length} chars, over its ${registration.maxValueChars}-char budget`;
+  }
+  return null;
+}
+
+/**
+ * The refusal is logged instead of thrown: a refused write only leaves the previous value (UI
+ * state stays unchanged), while an exception would break the component that wrote it. Tests
+ * assert refusals through the return value and this log.
+ */
+function reportRefusalOnce(key: string, reason: string): void {
+  if (keysWithReportedRefusals.has(key)) return;
+  keysWithReportedRefusals.add(key);
+  console.error(
+    `Refused localStorage write to "${key}": ${reason} (further refusals for this key are not logged)`
+  );
+}
+
+/**
+ * The single low-level localStorage write for persisted state. null/undefined remove the key;
+ * removal is always allowed so legacy cleanups work for keys that are no longer registered.
+ * Writes to unregistered keys or over the key's budget are refused. On QuotaExceededError it
+ * evicts cache keys and retries once. Returns false when the value could not be stored; callers
+ * skip change notifications then, because nothing changed on disk.
  */
 function writePersistedValue(key: string, newValue: unknown): boolean {
   if (newValue === undefined || newValue === null) {
@@ -122,6 +162,12 @@ function writePersistedValue(key: string, newValue: unknown): boolean {
 
 /** Store an already-serialized value (see writePersistedValue for the quota handling). */
 function writeSerializedValue(key: string, serialized: string): boolean {
+  const violation = getBudgetViolation(key, serialized);
+  if (violation !== null) {
+    reportRefusalOnce(key, violation);
+    return false;
+  }
+
   const storage = window.localStorage;
   try {
     storage.setItem(key, serialized);

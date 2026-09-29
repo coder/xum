@@ -4,6 +4,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
+import { OUTPUT_TAB_LEVEL_KEY } from "@/common/constants/storage";
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -63,7 +64,7 @@ export function OutputTab(_props: OutputTabProps) {
     epoch: 0,
     entries: [],
   });
-  const [levelFilter, setLevelFilter] = usePersistedState<LogLevel>("output-tab-level", "info");
+  const [levelFilter, setLevelFilter] = usePersistedState<LogLevel>(OUTPUT_TAB_LEVEL_KEY, "info");
   const [autoScroll, setAutoScroll] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);

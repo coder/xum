@@ -37,6 +37,7 @@ import {
   SIDEBAR_AGE_GROUPING_KEY,
   UI_THEME_KEY,
   getWorkspaceLastReadKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
 } from "@/common/constants/storage";
 
 const meta: Meta<typeof LeftSidebar> = {
@@ -651,7 +652,7 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
         expandProjects([projectPath]);
         // Keep this regression deterministic even when Storybook reuses localStorage
         // across stories/runs and a prior interaction expanded an old-age tier.
-        localStorage.setItem("expandedOldWorkspaces", JSON.stringify({}));
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
@@ -863,7 +864,7 @@ export const FlatListWhenAgeGroupingDisabled: AppStory = {
         expandProjects([projectPath]);
         updatePersistedState(SIDEBAR_AGE_GROUPING_KEY, false);
         // Grouping is off, so no tier should need expansion for rows to show.
-        localStorage.setItem("expandedOldWorkspaces", JSON.stringify({}));
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
@@ -1447,7 +1448,7 @@ export const MixedAgentStatesAndAges: AppStory = {
         );
 
         // Expand age tiers so older-than-1-day and older-than-7-days rows are visible.
-        updatePersistedState("expandedOldWorkspaces", {
+        updatePersistedState(EXPANDED_OLD_WORKSPACES_KEY, {
           [`${projectPath}:0`]: true,
           [`${projectPath}:1`]: true,
         });

@@ -2,7 +2,10 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -94,6 +97,15 @@ const WorkspaceNamePersistedStateSchema = z.object({
 });
 
 export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
+
+/**
+ * lastGeneratedFor only detects whether the message changed, so it keeps just a prefix: the full
+ * creation message can be many KB, and the persisted state must fit its localStorage budget.
+ * Messages that differ only after the prefix reuse the generated name.
+ */
+function toStoredMessage(message: string): string {
+  return message.slice(0, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS);
+}
 
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
@@ -246,7 +258,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           setStored((prev) => ({
             ...prev,
             generatedIdentity: identity,
-            lastGeneratedFor: forMessage,
+            lastGeneratedFor: toStoredMessage(forMessage),
           }));
 
           safeResolve(identity);
@@ -257,7 +269,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -270,7 +282,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -291,7 +303,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === message) {
+    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -401,7 +413,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     }
 
     // If we have an identity that was generated for the current message, use it
-    if (generatedIdentity && lastGeneratedFor === message) {
+    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) {
       return generatedIdentity;
     }
 

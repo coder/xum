@@ -79,6 +79,7 @@ import {
   getReviewSearchStateKey,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   REVIEW_SORT_ORDER_KEY,
+  REVIEW_SHOW_READ_KEY,
 } from "@/common/constants/storage";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { parseNumstat, buildFileTree, extractNewPath } from "@/common/utils/git/numstatParser";
@@ -867,7 +868,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   );
 
   // Persist showReadHunks flag globally
-  const [showReadHunks, setShowReadHunks] = usePersistedState("review-show-read", true);
+  const [showReadHunks, setShowReadHunks] = usePersistedState(REVIEW_SHOW_READ_KEY, true);
 
   // Persist sort order globally
   const [sortOrder, setSortOrder] = usePersistedState<ReviewSortOrder>(

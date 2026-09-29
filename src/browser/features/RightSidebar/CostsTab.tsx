@@ -14,6 +14,7 @@ import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { COSTS_TAB_VIEW_MODE_KEY } from "@/common/constants/storage";
 
 type ViewMode = "last-request" | "session";
 
@@ -29,7 +30,7 @@ interface CostsTabProps {
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>("costsTab:viewMode", "session");
+  const [viewMode, setViewMode] = usePersistedState<ViewMode>(COSTS_TAB_VIEW_MODE_KEY, "session");
 
   // Session usage for cost calculation
   // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)

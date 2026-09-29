@@ -32,6 +32,11 @@ import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
 import { buildTimeFilterPredicate } from "./sqlTimeFilter";
+import {
+  ANALYTICS_TIME_RANGE_KEY,
+  ANALYTICS_TIMING_METRIC_KEY,
+  ANALYTICS_TIME_ZONE_MODE_KEY,
+} from "@/common/constants/storage";
 
 interface AnalyticsDashboardProps {
   leftSidebarCollapsed: boolean;
@@ -46,9 +51,6 @@ const VALID_TIME_RANGES = new Set<string>(["7d", "30d", "90d", "all"]);
 const VALID_TIMING_METRICS = new Set<string>(["ttft", "duration", "tps"]);
 
 const VALID_TIME_ZONE_MODES = new Set<string>(["local", "utc"]);
-const ANALYTICS_TIME_RANGE_STORAGE_KEY = "analytics:timeRange";
-const ANALYTICS_TIMING_METRIC_STORAGE_KEY = "analytics:timingMetric";
-const ANALYTICS_TIME_ZONE_MODE_STORAGE_KEY = "analytics:timeZoneMode";
 
 /** Coerce a persisted value to a known TimeRange, falling back to "30d" if stale/corrupted. */
 function normalizeTimeRange(value: unknown): TimeRange {
@@ -133,15 +135,15 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [rawTimeRange, setTimeRange] = usePersistedState<TimeRange>(
-    ANALYTICS_TIME_RANGE_STORAGE_KEY,
+    ANALYTICS_TIME_RANGE_KEY,
     "30d"
   );
   const [rawTimingMetric, setTimingMetric] = usePersistedState<TimingMetric>(
-    ANALYTICS_TIMING_METRIC_STORAGE_KEY,
+    ANALYTICS_TIMING_METRIC_KEY,
     "duration"
   );
   const [rawTimeZoneMode, setTimeZoneMode] = usePersistedState<TimeZoneMode>(
-    ANALYTICS_TIME_ZONE_MODE_STORAGE_KEY,
+    ANALYTICS_TIME_ZONE_MODE_KEY,
     "local"
   );
 
