@@ -515,4 +515,70 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
     expect(await fs.stat(runtime.getWorkspacePath(projectPath, "ws2"))).toBeTruthy();
     expect(git("branch", "--list", "ws2")).not.toBe("");
   });
+
+  // #5124: a stopped container (after a daemon restart or a manual `docker stop`) still holds the
+  // workspace's files, including its plan, and a later workspace at this path would reuse it.
+  it("removes a stopped container as well as a running one", async () => {
+    const binDir = path.join(root, "bin");
+    const dockerLog = path.join(root, "docker.log");
+    await fs.mkdir(binDir);
+    // Fake docker: `ps` lists "stopped1" only with -a, "running2" always; `rm` succeeds.
+    await fs.writeFile(
+      path.join(binDir, "docker"),
+      [
+        "#!/bin/sh",
+        `echo "$*" >> '${dockerLog}'`,
+        'if [ "$1" = ps ]; then',
+        '  case " $* " in *" -a "*|*" -aq "*) echo stopped1 ;; esac',
+        "  echo running2",
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+    try {
+      const projectPath = path.join(root, "repo");
+      await fs.mkdir(projectPath);
+      const git = (...args: string[]) =>
+        execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+      git("init", "-b", "main");
+      git(
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=T",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "i"
+      );
+      const runtime = new DevcontainerRuntime({
+        srcBaseDir: path.join(root, "src"),
+        configPath: ".devcontainer/devcontainer.json",
+      });
+      const workspacePath = runtime.getWorkspacePath(projectPath, "ws");
+      git("worktree", "add", "-b", "ws", workspacePath);
+
+      const result = await runtime.deleteWorkspace(projectPath, "ws", false, undefined, true);
+
+      expect(result.success).toBe(true);
+      const removed = (await fs.readFile(dockerLog, "utf8"))
+        .split("\n")
+        .filter((line) => line.startsWith("rm "));
+      expect(removed).toEqual(["rm -f stopped1 running2"]);
+
+      // "Stop runtime" (the same helper without the delete option) still matches running
+      // containers only: it is not a deletion, and a stopped container is already stopped.
+      await fs.rm(dockerLog);
+      expect(await devcontainerCli.stopDevcontainer(workspacePath)).toEqual({ kind: "stopped" });
+      expect(
+        (await fs.readFile(dockerLog, "utf8")).split("\n").filter((l) => l.startsWith("rm "))
+      ).toEqual(["rm -f running2"]);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
 });

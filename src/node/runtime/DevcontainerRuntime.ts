@@ -841,8 +841,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   > {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
-    // Stop and remove the container, which is labeled with the host path.
-    const containerStop = await devcontainerDown(workspacePath, this.configPath).catch(
+    // Stop and remove the container, which is labeled with the host path. A stopped one is
+    // removed too (#5124): it still holds the workspace's files, and a later workspace at this
+    // path would reuse it.
+    const containerStop = await devcontainerDown(workspacePath, this.configPath, {
+      includeStopped: true,
+    }).catch(
       (error: unknown): DevcontainerStopResult => ({
         kind: "error",
         message: getErrorMessage(error),
