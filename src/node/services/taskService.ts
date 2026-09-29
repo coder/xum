@@ -13978,6 +13978,29 @@ export class TaskService implements AgentTaskIntegration {
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
     patchArtifact: SubagentGitPatchArtifact | null
   ): Promise<{ error: string; paths?: string[] } | null> {
+    const lost = await this.describeUnpreservedSubagentWork(taskId, entry, patchArtifact);
+    if (lost == null) return null;
+    const guidance =
+      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
+      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
+      "or remove the sub-agent themselves from the command palette (Remove Current Sub-agent or Remove Workspace), whose confirmation lists this work.";
+    return {
+      error: `${lost.summary} ${guidance}`,
+      ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
+    };
+  }
+
+  /**
+   * What removing this sub-agent would permanently delete, or null when nothing. Shared by the
+   * model's refusal and the user's confirmation (#5106), so both report the same work.
+   */
+  private async describeUnpreservedSubagentWork(
+    taskId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    patchArtifact: SubagentGitPatchArtifact | null,
+    /** Where the reader finds the paths: the model gets a `paths` field, the dialog a list. */
+    pathsLocation = "listed in paths"
+  ): Promise<{ summary: string; paths: string[] } | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
     if (subagentRemovalPreservesCheckout(ws)) return null;
@@ -14015,22 +14038,17 @@ export class TaskService implements AgentTaskIntegration {
             }),
             removalDeletesBundleClone: isDockerRuntime(runtimeConfig),
           });
-    // No per-sub-agent removal with a dirty-checkout confirmation exists in the UI today; the
-    // parent deletion dialog is the user-confirmed path that removes sub-agents.
-    const guidance =
-      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
-      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
-      "or delete the parent workspace, whose confirmation dialog lists the sub-agents it removes.";
     if (!check.success) {
       return {
-        error: `Cannot verify that removing this sub-agent keeps its work (${check.error}), so it was not removed. ${guidance}`,
+        summary: `Cannot verify that removing this sub-agent keeps its work (${check.error}).`,
+        paths: [],
       };
     }
     const work = check.data;
     if (work.kind === "none") return null;
     const otherRefCommitCount = work.otherRefCommitCount ?? 0;
     const lost = [
-      ...(work.paths.length > 0 ? ["the uncommitted or untracked files listed in paths"] : []),
+      ...(work.paths.length > 0 ? [`the uncommitted or untracked files ${pathsLocation}`] : []),
       ...(work.uncapturedCommitCount > 0
         ? [`${work.uncapturedCommitCount} commit(s) not captured by a ready patch artifact`]
         : []),
@@ -14044,9 +14062,55 @@ export class TaskService implements AgentTaskIntegration {
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
     return {
-      error: `Removing this sub-agent would permanently delete ${lost.join(" and ")}. ${guidance}`,
-      ...(work.paths.length > 0 ? { paths: work.paths } : {}),
+      summary: `Removing this sub-agent would permanently delete ${lost.join(" and ")}.`,
+      paths: work.paths,
     };
+  }
+
+  /** #5106: what a user-confirmed removal would lose, for the confirmation dialog. */
+  async previewSubagentRemoval(
+    taskId: string
+  ): Promise<Result<{ summary: string | null; paths: string[] }, string>> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const parentWorkspaceId = entry?.workspace.parentWorkspaceId;
+    if (entry == null || parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    const patchArtifact = await readSubagentGitPatchArtifact(
+      path.join(this.config.sessionsDir, parentWorkspaceId),
+      taskId
+    );
+    const lost = await this.describeUnpreservedSubagentWork(
+      taskId,
+      entry,
+      patchArtifact,
+      "listed below"
+    );
+    return Ok({ summary: lost?.summary ?? null, paths: lost?.paths ?? [] });
+  }
+
+  /**
+   * #5106: removal the user confirmed after seeing the preview. It takes the same path as the
+   * parent deletion cascade (no lossy-work refusal), so it still refuses active sub-agents,
+   * sub-agents with descendants and pending patch artifacts.
+   */
+  async removeSubagentForUser(taskId: string): Promise<Result<void, string>> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const parentWorkspaceId = entry?.workspace.parentWorkspaceId;
+    if (entry == null || parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId);
+    if (!result.success) return Err(result.error);
+    switch (result.data.status) {
+      case "removed":
+      case "already_removed":
+        return Ok(undefined);
+      case "active":
+        return Err("Stop the sub-agent before removing it.");
+      case "invalid_scope":
+        return Err("This is not a sub-agent.");
+      default:
+        return Err(
+          ("error" in result.data ? result.data.error : undefined) ?? "Sub-agent removal failed."
+        );
+    }
   }
 
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {

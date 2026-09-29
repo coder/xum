@@ -149,6 +149,8 @@ export interface BuildSourcesParams {
     workspaceId: string;
   }) => void;
   onRemoveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /** #5106: confirmation listing unpreserved work, then user-confirmed sub-agent removal. */
+  onRemoveSubagent: (workspaceId: string, title: string) => Promise<void>;
   onUpdateTitle: (
     workspaceId: string,
     newName: string
@@ -464,26 +466,39 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
         },
       });
-      list.push({
-        id: CommandIds.workspaceRemove(),
-        title: "Remove Current Workspace…",
-        subtitle: workspaceDisplayName,
-        section: section.workspaces,
-        run: async () => {
-          const branchName =
-            selectedMeta?.name ??
-            selected.namedWorkspacePath.split("/").pop() ??
-            selected.namedWorkspacePath;
-          const ok = await p.confirmDialog({
-            title: "Remove current workspace?",
-            description: `This will delete the worktree and local branch "${branchName}".`,
-            warning: "This cannot be undone.",
-            confirmLabel: "Remove",
-            confirmVariant: "destructive",
-          });
-          if (ok) await p.onRemoveWorkspace(selected.workspaceId);
-        },
-      });
+      // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
+      // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
+      if (selectedMeta?.parentWorkspaceId != null) {
+        list.push({
+          id: CommandIds.workspaceRemoveSubagent(),
+          title: "Remove Current Sub-agent…",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: () =>
+            p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
+        });
+      } else {
+        list.push({
+          id: CommandIds.workspaceRemove(),
+          title: "Remove Current Workspace…",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: async () => {
+            const branchName =
+              selectedMeta?.name ??
+              selected.namedWorkspacePath.split("/").pop() ??
+              selected.namedWorkspacePath;
+            const ok = await p.confirmDialog({
+              title: "Remove current workspace?",
+              description: `This will delete the worktree and local branch "${branchName}".`,
+              warning: "This cannot be undone.",
+              confirmLabel: "Remove",
+              confirmVariant: "destructive",
+            });
+            if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          },
+        });
+      }
       list.push({
         id: CommandIds.workspaceEditTitle(),
         title: "Edit Current Workspace Title…",
@@ -689,6 +704,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             const meta = Array.from(p.workspaceMetadata.values()).find(
               (m) => m.id === vals.workspaceId
             );
+            if (meta?.parentWorkspaceId != null) {
+              // Sub-agents get the confirmation that lists their unpreserved work (#5106).
+              await p.onRemoveSubagent(meta.id, meta.title ?? meta.name);
+              return;
+            }
             const workspaceName = meta ? `${meta.projectName}/${meta.name}` : vals.workspaceId;
             const branchName = meta?.name ?? workspaceName.split("/").pop() ?? workspaceName;
             const ok = await p.confirmDialog({

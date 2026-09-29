@@ -2242,6 +2242,14 @@ export const router = (authToken?: string) => {
         .input(schemas.tasks.create.input)
         .output(schemas.tasks.create.output)
         .handler(({ context, input }) => context.taskService.createFromRpc(input)),
+      previewRemoval: t
+        .input(schemas.tasks.previewRemoval.input)
+        .output(schemas.tasks.previewRemoval.output)
+        .handler(({ context, input }) => context.taskService.previewSubagentRemoval(input.taskId)),
+      remove: t
+        .input(schemas.tasks.remove.input)
+        .output(schemas.tasks.remove.output)
+        .handler(({ context, input }) => context.taskService.removeSubagentForUser(input.taskId)),
     },
     window: {
       setTitle: t

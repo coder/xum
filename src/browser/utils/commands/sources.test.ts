@@ -75,6 +75,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),
+    onRemoveSubagent: () => Promise.resolve(),
     onUpdateTitle: () => Promise.resolve({ success: true }),
     onAddProject: () => undefined,
     onRemoveProject: () => undefined,
@@ -541,6 +542,42 @@ test("selected scratch workspace omits the generic create-workspace action", () 
 
   expect(actions.find((action) => action.id === "ws:new")).toBeUndefined();
   expect(actions.find((action) => action.id === "ws:new-scratch")).toBeDefined();
+});
+
+test("sub-agents get the confirmed sub-agent removal instead of the plain remove (#5106)", async () => {
+  const onRemoveSubagent = mock((_workspaceId: string, _title: string) => Promise.resolve());
+  const onRemoveWorkspace = mock(() => Promise.resolve({ success: true }));
+  const child: FrontendWorkspaceMetadata = {
+    id: "child",
+    name: "agent_exec_child",
+    title: "Child task",
+    parentWorkspaceId: "w1",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/agent_exec_child",
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["child", child]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: child.namedWorkspacePath,
+      workspaceId: "child",
+    },
+    onRemoveSubagent,
+    onRemoveWorkspace,
+  });
+
+  expect(actions.find((action) => action.id === CommandIds.workspaceRemove())).toBeUndefined();
+  await actions.find((action) => action.id === CommandIds.workspaceRemoveSubagent())?.run();
+  expect(onRemoveSubagent).toHaveBeenCalledWith("child", "Child task");
+
+  // Picking the sub-agent in the generic "Remove Workspace…" prompt takes the same path.
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "child" });
+  expect(onRemoveSubagent).toHaveBeenCalledTimes(2);
+  expect(onRemoveWorkspace).not.toHaveBeenCalled();
 });
 
 test("buildCoreSources includes archive merged workspaces in project action", () => {

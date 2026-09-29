@@ -2373,6 +2373,19 @@ export const tasks = {
       z.string()
     ),
   },
+  /** #5106: what removing a sub-agent would lose (summary null = nothing), for the user's confirmation. */
+  previewRemoval: {
+    input: z.object({ taskId: z.string() }),
+    output: ResultSchema(
+      z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+      z.string()
+    ),
+  },
+  /** #5106: user-confirmed sub-agent removal; never exposed as a model tool. */
+  remove: {
+    input: z.object({ taskId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
 };
 
 // Agent definitions (unifies UI modes + subagents)

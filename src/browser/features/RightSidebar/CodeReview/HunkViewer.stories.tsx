@@ -87,6 +87,7 @@ function createStubWorkspaceContextValue(): WorkspaceContextValue {
         workspaceId: "created-workspace",
       }),
     removeWorkspace: () => Promise.resolve({ success: true }),
+    removeSubagent: () => Promise.resolve({ success: true }),
     updateWorkspaceTitle: () => Promise.resolve({ success: true }),
     setWorkspacePinned: () => Promise.resolve({ success: true }),
     reorderPinnedWorkspaces: () => Promise.resolve({ success: true }),

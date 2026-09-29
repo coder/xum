@@ -99,6 +99,7 @@ import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
+import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
 import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
@@ -167,6 +168,7 @@ function AppInner() {
     loading,
     setWorkspaceMetadata,
     removeWorkspace,
+    removeSubagent,
     updateWorkspaceTitle,
     reorderPinnedWorkspaces,
     selectedWorkspace,
@@ -916,6 +918,19 @@ function AppInner() {
     },
     [removeWorkspace, paletteRemoveError]
   );
+  const removeSubagentFromPalette = useCallback(
+    async (workspaceId: string, title: string) => {
+      const error = await confirmAndRemoveSubagent({
+        api,
+        confirm: confirmDialog,
+        removeSubagent,
+        workspaceId,
+        title,
+      });
+      if (error != null) paletteRemoveError.showError(workspaceId, error);
+    },
+    [api, confirmDialog, removeSubagent, paletteRemoveError]
+  );
 
   const updateTitleFromPalette = useCallback(
     async (workspaceId: string, newTitle: string) => updateWorkspaceTitle(workspaceId, newTitle),
@@ -1006,6 +1021,7 @@ function AppInner() {
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
     onRemoveWorkspace: removeWorkspaceFromPalette,
+    onRemoveSubagent: removeSubagentFromPalette,
     onUpdateTitle: updateTitleFromPalette,
     onAddProject: addProjectFromPalette,
     onRemoveProject: removeProjectFromPalette,

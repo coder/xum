@@ -383,6 +383,58 @@ describe("TaskService", () => {
     expect(remove).toHaveBeenCalledTimes(1);
   });
 
+  test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {
+    const parentWorkspaceId = "parent-remove-user";
+    const childTaskId = "child-remove-user";
+    const { childPath, remove, taskService, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    expect(await taskService.previewSubagentRemoval(childTaskId)).toEqual(
+      Ok({ summary: null, paths: [] })
+    );
+
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
+    // The confirmation lists the same work the model's refusal reports.
+    const preview = await taskService.previewSubagentRemoval(childTaskId);
+    assert(preview.success && preview.data.summary != null, "dirty checkout must be reported");
+    expect(preview.data.paths).toEqual(["notes.txt"]);
+    expect(remove).not.toHaveBeenCalled();
+
+    // Only the user-confirmed path force-removes it.
+    expect(await taskService.removeSubagentForUser(childTaskId)).toEqual(Ok(undefined));
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("user-confirmed sub-agent removal refuses active sub-agents and non-sub-agents (#5106)", async () => {
+    const parentWorkspaceId = "parent-remove-user-active";
+    const childTaskId = "child-remove-user-active";
+    const { config, projectPath, remove, taskService } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    expect(await taskService.removeSubagentForUser(parentWorkspaceId)).toMatchObject({
+      success: false,
+    });
+    expect(await taskService.previewSubagentRemoval(parentWorkspaceId)).toMatchObject({
+      success: false,
+    });
+    await config.editConfig((cfg) => {
+      const child = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((workspace) => workspace.id === childTaskId);
+      assert(child != null, "child workspace must exist");
+      child.taskStatus = "running";
+      return cfg;
+    });
+    // Confirming removal does not grant consent to stop a running sub-agent.
+    expect(await taskService.removeSubagentForUser(childTaskId)).toMatchObject({
+      success: false,
+    });
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   test("model-driven task removal still removes clean and shared-checkout children", async () => {
     const parentWorkspaceId = "parent-remove-clean";
     const childTaskId = "child-remove-clean";

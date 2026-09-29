@@ -316,3 +316,49 @@ export const RemoveCurrentWorkspaceRefused: AppStory = {
     await expect(alert).toHaveTextContent(REMOVE_REFUSAL);
   },
 };
+
+/**
+ * #5106: "Remove Current Sub-agent…" on a sub-agent that holds unpreserved work (the kind a
+ * model's task_remove refuses). The confirmation lists what removal would permanently delete.
+ */
+export const RemoveCurrentSubagentConfirmation: AppStory = {
+  // Behavior contract only: the snapshot budget is full.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const subagent = createWorkspace({
+          id: "ws-myapp-subagent",
+          name: "agent_exec_auth",
+          projectName: "my-app",
+          title: "Refactor auth helpers",
+          parentWorkspaceId: "ws-myapp-fix-login",
+        });
+        const client = setupStory([subagent, ...createRichWorkspaces()]);
+        return Object.assign(client, {
+          tasks: {
+            ...client.tasks,
+            previewRemoval: () =>
+              Promise.resolve({
+                success: true as const,
+                data: {
+                  summary:
+                    "Removing this sub-agent would permanently delete the uncommitted or untracked files listed below and 2 commit(s) not captured by a ready patch artifact.",
+                  paths: ["src/auth/session.ts", "src/auth/tokenStore.test.ts", "notes/todo.md"],
+                },
+              }),
+          },
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await openPalette(canvasElement, "Refactor auth helpers");
+    await userEvent.keyboard(">Remove Current Sub-agent");
+    const body = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await body.findByText("Remove Current Sub-agent…"));
+    const files = await body.findByRole("region", { name: "Uncommitted or untracked files" });
+    await expect(files).toHaveTextContent("src/auth/session.ts");
+    await expect(body.findByRole("button", { name: /Remove sub-agent/ })).resolves.toBeTruthy();
+  },
+};
