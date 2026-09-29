@@ -35,6 +35,39 @@ function breakReviewStateSubscription(env: TestEnvironment) {
   return control;
 }
 
+/**
+ * Make the backend refuse every sendMessage (a send that stops after the review read). The
+ * reply is delayed like a real round trip, so the UI renders the state before the refusal.
+ */
+function refuseSends(env: TestEnvironment, raw: string) {
+  jest.spyOn(env.services.workspaceService, "sendMessage").mockImplementation(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return { success: false, error: { type: "unknown", raw } };
+  });
+}
+
+/**
+ * Every distinct error alert text shown from now on. A toast that appears and is then replaced
+ * still counts, so a wrong toast cannot hide behind the real error.
+ */
+function recordAlerts(container: HTMLElement) {
+  const seen = new Set<string>();
+  const record = () => {
+    for (const alert of container.querySelectorAll('[role="alert"]')) {
+      if (alert.textContent) seen.add(alert.textContent);
+    }
+  };
+  const observer = new MutationObserver(record);
+  observer.observe(container, { childList: true, subtree: true, characterData: true });
+  return {
+    seen,
+    stop: () => {
+      record();
+      observer.disconnect();
+    },
+  };
+}
+
 async function reviewStatus(env: TestEnvironment, workspaceId: string) {
   const snapshot = await env.services.reviewStateService.getSnapshot(workspaceId);
   return snapshot.sections.reviews?.r1?.status;
@@ -96,6 +129,101 @@ describe("Send after a failed review-state subscription", () => {
       // The command ran (it clears the input) after the bounded review read settled.
       await app.chat.expectInputValue("", 10_000);
       expect(app.view.container.querySelector('[role="alert"]')).toBeNull();
+      expect(await reviewStatus(app.env, app.workspaceId)).toBe("attached");
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  // #5149: the missing-notes toast belongs to an accepted send only. A send that stops shows
+  // just its own error, which the missing-notes toast must neither precede nor replace.
+  test("a refused send shows only its own error", async () => {
+    const sendError = "send refused 5149";
+    const app = await createAppHarness({
+      branchPrefix: "review-sub-refused",
+      beforeRenderEnvironment: (env) => {
+        breakReviewStateSubscription(env);
+        refuseSends(env, sendError);
+      },
+    });
+
+    try {
+      await app.env.services.reviewStateService.applyDelta(app.workspaceId, {
+        reviews: { set: { r1: attachedReview() } },
+      });
+      const alerts = recordAlerts(app.view.container);
+
+      await app.chat.send("refused send");
+      await waitFor(
+        () => {
+          expect(app.view.container.querySelector('[role="alert"]')?.textContent).toContain(
+            sendError
+          );
+        },
+        { timeout: 10_000 }
+      );
+      alerts.stop();
+      expect([...alerts.seen].filter((text) => !text.includes(sendError))).toEqual([]);
+      expect(await reviewStatus(app.env, app.workspaceId)).toBe("attached");
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("a /compact that fails to start shows only its own error", async () => {
+    const compactError = "compaction refused 5149";
+    const app = await createAppHarness({
+      branchPrefix: "review-sub-compact",
+      beforeRenderEnvironment: (env) => {
+        breakReviewStateSubscription(env);
+        refuseSends(env, compactError);
+      },
+    });
+
+    try {
+      await app.env.services.reviewStateService.applyDelta(app.workspaceId, {
+        reviews: { set: { r1: attachedReview() } },
+      });
+      const alerts = recordAlerts(app.view.container);
+
+      await app.chat.send("/compact");
+      // The failed command restores its text into the composer once it has settled.
+      await app.chat.expectInputValue("/compact", 10_000);
+      await waitFor(() => {
+        expect(app.view.container.querySelector('[role="alert"]')).not.toBeNull();
+      });
+      alerts.stop();
+      // Only the compaction error, never replaced by the missing-notes toast.
+      expect([...alerts.seen].filter((text) => !text.includes(compactError))).toEqual([]);
+      expect(app.view.container.querySelector('[role="alert"]')?.textContent).toContain(
+        compactError
+      );
+      expect(await reviewStatus(app.env, app.workspaceId)).toBe("attached");
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("a started /compact still says the notes were left out", async () => {
+    const app = await createAppHarness({
+      branchPrefix: "review-sub-compact-ok",
+      beforeRenderEnvironment: (env) => {
+        breakReviewStateSubscription(env);
+      },
+    });
+
+    try {
+      await app.env.services.reviewStateService.applyDelta(app.workspaceId, {
+        reviews: { set: { r1: attachedReview() } },
+      });
+
+      await app.chat.send("/compact");
+      await waitFor(
+        () => {
+          expect(app.view.container.querySelector('[role="alert"]')).not.toBeNull();
+        },
+        { timeout: 10_000 }
+      );
       expect(await reviewStatus(app.env, app.workspaceId)).toBe("attached");
     } finally {
       await app.dispose();

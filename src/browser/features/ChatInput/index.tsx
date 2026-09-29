@@ -1798,7 +1798,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   };
 
-  /** Only for paths that send the notes, so a command like /vim never shows this. */
+  /**
+   * Called only once a message that would carry the notes was accepted (a normal send, or
+   * /compact's check-reviews action), so a failed send or a command like /vim never shows it.
+   */
   const warnIfReviewsUnavailable = (reviews: ReviewsForSend) => {
     if (!reviews.unavailable) return;
     pushToast({
@@ -1931,6 +1934,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             if (variant === "workspace" && action.reviewIds.length > 0) {
               props.onCheckReviews?.(action.reviewIds);
             }
+            // Emitted once the command's message was accepted (/compact).
+            if (options?.reviews) warnIfReviewsUnavailable(options.reviews);
             break;
           case "message-sent":
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
@@ -2352,11 +2357,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               reviews: reviewsForSend,
             });
       if (commandHandled) {
-        // /compact is the only command whose message carries the review notes.
-        if (parsed?.type === "compact") warnIfReviewsUnavailable(reviewsForSend);
         return;
       }
-      warnIfReviewsUnavailable(reviewsForSend);
 
       // A normal workspace send supersedes any pending asynchronous slash
       // command completion. If that older command fails after this send clears
@@ -2690,6 +2692,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           if (sentReviewIds.length > 0) {
             props.onCheckReviews?.(sentReviewIds);
           }
+          warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
           if (editMessageForSend && props.onCancelEdit) {
