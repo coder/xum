@@ -7,6 +7,7 @@ import { getLegacyPlanFilePath } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
@@ -332,4 +333,29 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
       });
     }
   );
+
+  // #5143: a forced removal whose container teardown fails deletes the workspace but leaves the
+  // container, and the plan inside it cannot be deleted once the worktree is gone. The failed
+  // non-forced removal, which the user sees before choosing to force it, names that container.
+  test("a failed devcontainer teardown names the container a forced removal would leave", async () => {
+    await withTempMuxRoot(async () => {
+      await addWorkspaceIn(projectPath, {
+        id: "ffffffff21",
+        name: "dcleft",
+        path: path.join(harness.rootDir, "dcleft"),
+        runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+      });
+      spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+        kind: "error",
+        message: "Failed to remove container: daemon down",
+      });
+
+      const result = await service.remove("ffffffff21");
+
+      expect(result.success ? "" : result.error).toMatch(
+        /devcontainer container labeled devcontainer\.local_folder=\S+\/dcleft\b/
+      );
+      expect(await service.getInfo("ffffffff21")).not.toBeNull();
+    });
+  });
 });

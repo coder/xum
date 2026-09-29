@@ -7727,6 +7727,14 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
+            // A container left behind still holds this workspace's plan (#5143): the plan step
+            // below cannot reach it once the worktree is gone. Name it for the user's logs.
+            if (deleteResult.leftoverPaths?.length) {
+              log.warn("Forced removal left these behind; a container may still hold the plan", {
+                workspaceId,
+                leftovers: deleteResult.leftoverPaths,
+              });
+            }
           }
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()

@@ -882,10 +882,13 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     // retry would then fall back to deleting the branch named after the workspace, which may not
     // be this workspace's. A forced delete (rollbacks, forced removal) is not retried on the same
     // entry, so it still removes the worktree.
+    // The message names the container and what forcing would leave (#5143): the user sees it
+    // before choosing a forced removal, which deletes the worktree and so can no longer reach the
+    // container to delete the plan inside it.
     if (containerStop.kind === "error" && !force) {
       return {
         success: false,
-        error: `Failed to remove the devcontainer: ${containerStop.message}`,
+        error: `Failed to remove the ${containerLeftover}: ${containerStop.message}. A forced removal deletes the workspace but leaves this container, which may still hold its plan file; remove the container afterwards.`,
         leftoverPaths: [containerLeftover],
       };
     }
