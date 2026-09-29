@@ -4,7 +4,7 @@ import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
-import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -41,6 +41,14 @@ import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as path from "path";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { Config } from "@/node/config";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { DraftService } from "@/node/services/draftService";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { TestTempDir } from "@/node/services/tools/testHelpers";
+import type { DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 
 let currentClientMock: TestApiOverrides<APIClient> = {};
 
@@ -2041,12 +2049,11 @@ describe("WorkspaceContext", () => {
   });
 
   test.each([
-    { name: "project", linkedPath: "/alpha" },
-    // A sub-project's page uses its owning project's default draft and creates in the sub-project.
-    { name: "sub-project", linkedPath: "/alpha/sub" },
+    { name: "project", linkedPath: "/alpha", subProjectPath: null },
+    { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },
   ])(
-    "a new_chat deep link keeps its prompt reachable when the draft list cannot be written ($name)",
-    async ({ linkedPath }) => {
+    "a new_chat deep link lists its draft even when localStorage is full ($name)",
+    async ({ linkedPath, subProjectPath }) => {
       const projectPath = "/alpha";
       createMockAPI({
         projects: {
@@ -2060,26 +2067,87 @@ describe("WorkspaceContext", () => {
         // An explicit route, so only the deep link navigates.
         locationPath: "/settings",
       });
-      // A full origin: the draft list entry never fits.
+      // A full origin: the draft list no longer depends on localStorage (#5225).
       Object.defineProperty(window, "localStorage", {
         configurable: true,
         value: new QuotaLimitedStorage(0),
       });
-      const defaultScope = defaultCreationDraftScope(projectPath);
       try {
         const ctx = await setup();
 
-        // No unlisted draft holds the prompt: the project's default draft does, on the linked
-        // (sub-)project's bare page.
-        await waitFor(() => expect(getDraftStore().getText(defaultScope)).toBe("from the link"));
-        expect(ctx().workspaceDraftsByProject[projectPath]).toBeUndefined();
-        expect(ctx().pendingNewWorkspaceDraftId).toBeNull();
-        expect(ctx().pendingNewWorkspaceProject).toBe(linkedPath);
+        await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(1));
+        const [draft] = ctx().workspaceDraftsByProject[projectPath];
+        expect(draft.subProjectPath).toBe(subProjectPath);
+        expect(ctx().pendingNewWorkspaceDraftId).toBe(draft.draftId);
+        expect(
+          getDraftStore().getText({ kind: "creation", projectPath, draftId: draft.draftId })
+        ).toBe("from the link");
       } finally {
         getDraftStore().forgetProject(projectPath);
       }
     }
   );
+
+  test("keeps every creation draft listed across a restart when the list outgrows 32 KiB (#5225)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-list");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    // A long sub-project path makes each list entry large (#5225).
+    const subProjectPath = path.join(projectPath, "packages", "x".repeat(300));
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const projectList = () =>
+      Promise.resolve([
+        [projectPath, { workspaces: [] }],
+        [subProjectPath, { workspaces: [], parentProjectPath: projectPath }],
+      ] as Awaited<ReturnType<APIClient["projects"]["list"]>>);
+    const connect = () => {
+      currentClientMock.drafts = createDraftServiceClient(new DraftService(config));
+      getDraftStore().setClient(createTestApiClient(currentClientMock));
+    };
+    const count = 120;
+    createMockAPI({ projects: { list: projectList }, locationPath: "/settings" });
+    connect();
+    try {
+      const ctx = await setup();
+      await waitFor(() => expect(getDraftStore().isReady()).toBe(true));
+      const draftIds = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        act(() => ctx().createWorkspaceDraft(projectPath, subProjectPath));
+        const draftId = ctx().pendingNewWorkspaceDraftId;
+        expect(draftId === null || draftIds.has(draftId)).toBe(false);
+        draftIds.add(draftId!);
+        // Non-empty, so the next create does not reuse it.
+        const scope: DraftScope = { kind: "creation", projectPath, draftId: draftId! };
+        getDraftStore().setText(scope, `draft ${i}`);
+        await getDraftStore().flush(scope);
+      }
+      await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(count));
+
+      // Restart: a new window with what reached disk, a new backend process, a remount.
+      const persisted: Record<string, string> = {};
+      for (let index = 0; index < window.localStorage.length; index++) {
+        const key = window.localStorage.key(index)!;
+        persisted[key] = window.localStorage.getItem(key)!;
+      }
+      cleanup();
+      createMockAPI({ projects: { list: projectList }, localStorage: persisted });
+      connect();
+      const restarted = await setup();
+      await waitFor(
+        () =>
+          expect(
+            new Set(restarted().workspaceDraftsByProject[projectPath]?.map((d) => d.draftId))
+          ).toEqual(draftIds),
+        { timeout: 5_000 }
+      );
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  }, 30_000);
 
   describe("reorderPinnedWorkspaces", () => {
     // Three pinned chats in one project; pinnedAt ascending = a, b, c.
@@ -2222,6 +2290,46 @@ describe("WorkspaceContext", () => {
     });
   });
 });
+
+/** A drafts API backed by a real DraftService (real files), passing every call through. */
+function createDraftServiceClient(service: DraftService): TestApiOverrides<APIClient["drafts"]> {
+  return {
+    list: () => service.list(),
+    get: ({ scope }) => service.get(scope),
+    update: (input) => service.update(input),
+    delete: ({ scope }) => service.delete(scope),
+    importLegacy: (input) => service.importLegacy(input),
+    putListEntry: (input) => service.putListEntry(input),
+    importLegacyList: ({ entries }) => service.importLegacyList(entries),
+    subscribe: async (_input, opts) => {
+      const queue: DraftEvent[] = [];
+      let wake: (() => void) | null = null;
+      const listener = (event: DraftEvent) => {
+        queue.push(event);
+        wake?.();
+      };
+      service.on(DraftService.CHANGE_EVENT, listener);
+      queue.unshift(await service.getSnapshotEvent());
+      return (async function* () {
+        try {
+          while (!opts?.signal?.aborted) {
+            const next = queue.shift();
+            if (next) {
+              yield next;
+              continue;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        } finally {
+          service.off(DraftService.CHANGE_EVENT, listener);
+        }
+      })();
+    },
+  };
+}
 
 async function setup() {
   const contexts = await setupWithProjectContext();

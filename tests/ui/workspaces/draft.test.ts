@@ -18,16 +18,19 @@ import {
   getSharedRepoPath,
 } from "../../ipc/sendMessageTestHelpers";
 
-import { addProjectViaUI, cleanupView, getWorkspaceDraftIds, setupTestDom } from "../helpers";
+import {
+  addProjectViaUI,
+  cleanupView,
+  clearWorkspaceDrafts,
+  getWorkspaceDraftIds,
+  setupTestDom,
+} from "../helpers";
 import { renderApp } from "../renderReviewPanel";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   defaultCreationDraftScope,
   getDraftStore,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
-
-import { WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -70,14 +73,14 @@ describeIntegration("Draft workspace behavior", () => {
     const projectPath = getSharedRepoPath();
 
     const cleanupDom = setupTestDom();
-    // Clear any existing drafts from previous tests
-    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
 
     const view = renderApp({ apiClient: env.orpc });
 
     try {
       await view.waitForReady();
       const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      // The draft list lives on the backend: clear drafts left by earlier tests.
+      await clearWorkspaceDrafts(normalizedProjectPath);
       const projectName = path.basename(normalizedProjectPath);
 
       // Click project row to open creation view (creates first draft)
@@ -136,13 +139,14 @@ describeIntegration("Draft workspace behavior", () => {
     const projectPath = getSharedRepoPath();
 
     const cleanupDom = setupTestDom();
-    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
 
     const view = renderApp({ apiClient: env.orpc });
 
     try {
       await view.waitForReady();
       const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      // The draft list lives on the backend: clear drafts left by earlier tests.
+      await clearWorkspaceDrafts(normalizedProjectPath);
 
       const projectRow = await waitFor(
         () => {
@@ -178,7 +182,6 @@ describeIntegration("Draft workspace behavior", () => {
     const projectPath = getSharedRepoPath();
 
     const cleanupDom = setupTestDom();
-    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
 
     const view = renderApp({ apiClient: env.orpc });
     const createdScopes: DraftStoreScope[] = [];
@@ -186,6 +189,8 @@ describeIntegration("Draft workspace behavior", () => {
     try {
       await view.waitForReady();
       const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      // The draft list lives on the backend: clear drafts left by earlier tests.
+      await clearWorkspaceDrafts(normalizedProjectPath);
       const projectRow = await findProjectRow(view.container, normalizedProjectPath);
 
       // A listed draft with text, so the project row cannot reuse it.
@@ -228,13 +233,14 @@ describeIntegration("Draft workspace behavior", () => {
     const projectPath = getSharedRepoPath();
 
     const cleanupDom = setupTestDom();
-    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
 
     const view = renderApp({ apiClient: env.orpc });
 
     try {
       await view.waitForReady();
       const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      // The draft list lives on the backend: clear drafts left by earlier tests.
+      await clearWorkspaceDrafts(normalizedProjectPath);
       const projectName = path.basename(normalizedProjectPath);
 
       const projectRow = await waitFor(

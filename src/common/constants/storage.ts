@@ -100,7 +100,8 @@ export const PROJECT_ORDER_KEY = "mux:projectOrder";
 export const EXPANDED_PROJECTS_KEY = "expandedProjects";
 
 /**
- * LocalStorage key for UI-only workspace creation drafts.
+ * Legacy localStorage key of the creation draft list (now the backend drafts/list.json, #5225);
+ * only read by DraftStore's one-way import and then removed.
  *
  * Value: Record<string, Array<{ draftId: string; subProjectPath: string | null; createdAt: number }>>
  * Keyed by projectPath.
@@ -1183,8 +1184,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // string[] of project paths.
   globalKey(PROJECT_ORDER_KEY, "synced", 32 * 1024),
   globalKey(EXPANDED_PROJECTS_KEY, "ui", 32 * 1024),
-  // Record<projectPath, Array<{ draftId, subProjectPath, createdAt }>>.
-  globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 32 * 1024),
+  // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
+  // then removed, #5225). Never written again, so no budget (0).
+  globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
   globalKey(RUNTIME_ENABLEMENT_KEY, "synced", 1024),
   globalKey(DEFAULT_RUNTIME_KEY, "synced", 256),
   globalKey(DEFAULT_MODEL_KEY, "synced", 256),

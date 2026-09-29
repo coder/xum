@@ -37,7 +37,6 @@ import {
   LAUNCH_BEHAVIOR_KEY,
   RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
 import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
@@ -52,7 +51,6 @@ import {
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
   updatePersistedState,
-  usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -80,7 +78,14 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
-import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import {
+  defaultCreationDraftScope,
+  getDraftStore,
+  useCreationDraftsByProject,
+  useDraftStoreReady,
+  type CreationDraftsByProject,
+  type WorkspaceDraft,
+} from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
 
 /**
@@ -328,66 +333,13 @@ function ensureCreatedAt(metadata: FrontendWorkspaceMetadata): void {
   }
 }
 
-export interface WorkspaceDraft {
-  draftId: string;
-  subProjectPath: string | null;
-  createdAt: number;
-}
+export type { WorkspaceDraft };
 
-type WorkspaceDraftsByProject = Record<string, WorkspaceDraft[]>;
+type WorkspaceDraftsByProject = CreationDraftsByProject;
 
 type WorkspaceMetadataLoadResult = "api-unavailable" | "failed" | "loaded";
 
 type WorkspaceDraftPromotionsByProject = Record<string, Record<string, FrontendWorkspaceMetadata>>;
-
-function isWorkspaceDraft(value: unknown): value is WorkspaceDraft {
-  if (!value || typeof value !== "object") return false;
-
-  const record = value as { draftId?: unknown; subProjectPath?: unknown; createdAt?: unknown };
-  return (
-    typeof record.draftId === "string" &&
-    record.draftId.trim().length > 0 &&
-    typeof record.createdAt === "number" &&
-    Number.isFinite(record.createdAt) &&
-    (record.subProjectPath === null ||
-      record.subProjectPath === undefined ||
-      typeof record.subProjectPath === "string")
-  );
-}
-
-function normalizeWorkspaceDraftsByProject(value: unknown): WorkspaceDraftsByProject {
-  if (!value || typeof value !== "object") {
-    return {};
-  }
-
-  const result: WorkspaceDraftsByProject = {};
-
-  for (const [projectPath, drafts] of Object.entries(value as Record<string, unknown>)) {
-    if (!Array.isArray(drafts)) continue;
-
-    const nextDrafts: WorkspaceDraft[] = [];
-    for (const draft of drafts) {
-      if (!isWorkspaceDraft(draft)) continue;
-
-      const normalizedSubProjectPath =
-        typeof draft.subProjectPath === "string" && draft.subProjectPath.trim().length > 0
-          ? draft.subProjectPath
-          : null;
-
-      nextDrafts.push({
-        draftId: draft.draftId,
-        subProjectPath: normalizedSubProjectPath,
-        createdAt: draft.createdAt,
-      });
-    }
-
-    if (nextDrafts.length > 0) {
-      result[projectPath] = nextDrafts;
-    }
-  }
-
-  return result;
-}
 
 /**
  * Check if a draft workspace is empty (no input text, no attachments, and no workspace name set).
@@ -820,17 +772,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   const [workspaceDraftPromotionsByProject, setWorkspaceDraftPromotionsByProject] =
     useState<WorkspaceDraftPromotionsByProject>({});
-  const [workspaceDraftsByProjectState, setWorkspaceDraftsByProjectState] =
-    usePersistedState<WorkspaceDraftsByProject>(
-      WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-      {},
-      { listener: true }
-    );
-
-  const workspaceDraftsByProject = useMemo(
-    () => normalizeWorkspaceDraftsByProject(workspaceDraftsByProjectState),
-    [workspaceDraftsByProjectState]
-  );
+  // The creation draft list lives on the backend (drafts/list.json, #5225).
+  const workspaceDraftsByProject = useCreationDraftsByProject();
+  const draftsReady = useDraftStoreReady();
 
   const pendingDeepLinksRef = useRef<DeepLinkPayload[]>([]);
 
@@ -879,37 +823,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           ? payload.prompt
           : null;
 
-      // The direct write reports a failed list write (e.g. a full origin), which the hook's setter
-      // would not.
-      const listed = updatePersistedState<WorkspaceDraftsByProject>(
-        WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-        (prev) => {
-          const current = normalizeWorkspaceDraftsByProject(prev);
-          const existing = current[owningProjectPath] ?? [];
-          return {
-            ...current,
-            [owningProjectPath]: [
-              ...existing,
-              { draftId, subProjectPath: normalizedSubProjectPath, createdAt },
-            ],
-          };
-        },
-        {}
-      );
-      if (!listed) {
-        // Without its list entry a new draft is unreachable once the user leaves it, and its
-        // backend file is never removed. Keep the prompt in the project's default creation draft
-        // instead, after any text already there, and open the linked (sub-)project's bare page:
-        // it shows that draft (a sub-project's page uses its owning project's default draft) and
-        // creates the workspace in the linked sub-project.
-        if (prompt) {
-          getDraftStore().setText(defaultCreationDraftScope(owningProjectPath), (current) =>
-            [current, prompt].filter((part) => part.trim().length > 0).join("\n\n")
-          );
-        }
-        navigateToProject(resolvedProjectPath, undefined);
-        return;
-      }
+      getDraftStore().putCreationDraft(owningProjectPath, {
+        draftId,
+        subProjectPath: normalizedSubProjectPath,
+        createdAt,
+      });
 
       if (prompt) {
         getDraftStore().setText(
@@ -1974,51 +1892,26 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           ? subProjectPath
           : null;
 
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-        if (existing.length === 0) {
-          return prev;
-        }
-
-        let didUpdate = false;
-        const nextDrafts = existing.map((draft) => {
-          if (draft.draftId !== draftId) {
-            return draft;
-          }
-          if (draft.subProjectPath === normalizedSubProjectPath) {
-            return draft;
-          }
-          didUpdate = true;
-          return {
-            ...draft,
-            subProjectPath: normalizedSubProjectPath,
-          };
+      const existing = (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).find(
+        (draft) => draft.draftId === draftId
+      );
+      if (existing && existing.subProjectPath !== normalizedSubProjectPath) {
+        getDraftStore().putCreationDraft(projectPath, {
+          ...existing,
+          subProjectPath: normalizedSubProjectPath,
         });
-
-        if (!didUpdate) {
-          return prev;
-        }
-
-        return {
-          ...current,
-          [projectPath]: nextDrafts,
-        };
-      });
+      }
 
       navigateToProject(projectPath, draftId);
     },
-    [navigateToProject, setWorkspaceDraftsByProjectState]
+    [navigateToProject]
   );
 
   const createWorkspaceDraft = useCallback(
     (projectPath: string, subProjectPath?: string, options?: { replace?: boolean }) => {
-      // Read directly from localStorage to get the freshest value, avoiding stale closure issues.
+      // Read the store directly to get the freshest value, avoiding stale closure issues.
       // The React state (workspaceDraftsByProject) may be out of date if this is called rapidly.
-      const freshDrafts = normalizeWorkspaceDraftsByProject(
-        readPersistedState<WorkspaceDraftsByProject>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {})
-      );
-      const existingDrafts = freshDrafts[projectPath] ?? [];
+      const existingDrafts = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
 
       // Text typed on the bare project page (no draft id) lives in the project's default creation
       // draft, which only that page shows. While it holds anything, the project row opens it
@@ -2050,39 +1943,34 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         createdAt,
       };
 
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-
-        // One-time migration: if the user has an old per-project pending draft, move it
-        // into the first draft scope so it stays accessible.
-        // The default creation composer's draft (no draft id) moves into the first listed one.
-        if (existing.length === 0) {
-          const pendingScopeId = getPendingScopeId(projectPath);
-          const defaultScope = defaultCreationDraftScope(projectPath);
-          const pending = getDraftStore().getView(defaultScope);
-          if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
-            // Never rejects; the default draft is deleted only once the new one is saved.
-            getDraftStore()
-              .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
-              .catch(() => undefined);
-            migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
-          }
+      // One-time migration: if the user has an old per-project pending draft, move it
+      // into the first draft scope so it stays accessible.
+      // The default creation composer's draft (no draft id) moves into the first listed one.
+      if (existingDrafts.length === 0) {
+        const pendingScopeId = getPendingScopeId(projectPath);
+        const defaultScope = defaultCreationDraftScope(projectPath);
+        const pending = getDraftStore().getView(defaultScope);
+        if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
+          // Never rejects; the default draft is deleted only once the new one is saved.
+          getDraftStore()
+            .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
+            .catch(() => undefined);
+          migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
         }
-
-        return {
-          ...current,
-          [projectPath]: [...existing, draft],
-        };
-      });
+      }
+      getDraftStore().putCreationDraft(projectPath, draft);
 
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },
-    [navigateToProject, setWorkspaceDraftsByProjectState]
+    [navigateToProject]
   );
 
   useEffect(() => {
-    if (loading || projectsLoading || hasHandledStartupRootRouteRef.current) return;
+    // Waits for the drafts: the "new-chat" launch behavior reuses an empty listed draft, and the
+    // list is hydrated from the backend.
+    if (loading || projectsLoading || !draftsReady || hasHandledStartupRootRouteRef.current) {
+      return;
+    }
 
     if (
       shouldBlockStartupAutoNavigation({
@@ -2134,6 +2022,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     api,
     loading,
     projectsLoading,
+    draftsReady,
     hasBlockingStartupRouteState,
     resolveFallbackWorkspaceScope,
     createWorkspaceDraft,
@@ -2188,26 +2077,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       });
 
       deleteWorkspaceStorage(getDraftScopeId(projectPath, draftId));
-      // Deletes the backend draft file too; failures are logged by the store.
+      // Delists the draft and deletes its backend file; failures are retried by the store.
       getDraftStore()
         .deleteDraft({ kind: "creation", projectPath, draftId })
         .catch(() => undefined);
-
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-        const nextDrafts = existing.filter((draft) => draft.draftId !== draftId);
-
-        const next: WorkspaceDraftsByProject = { ...current };
-        if (nextDrafts.length === 0) {
-          delete next[projectPath];
-        } else {
-          next[projectPath] = nextDrafts;
-        }
-        return next;
-      });
     },
-    [setWorkspaceDraftPromotionsByProject, setWorkspaceDraftsByProjectState]
+    [setWorkspaceDraftPromotionsByProject]
   );
 
   // Split into two context values so metadata-Map churn doesn't re-render

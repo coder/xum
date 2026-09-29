@@ -15,8 +15,7 @@ import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { WORKSPACE_DRAFTS_BY_PROJECT_KEY, getDraftScopeId } from "@/common/constants/storage";
+import { getDraftScopeId } from "@/common/constants/storage";
 import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -304,36 +303,12 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // The backend deleted the project's creation draft files; drop them from memory.
-          getDraftStore().forgetProject(path);
-
-          // Clean up any UI-only workspace drafts for this project.
-          const draftsValue = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
-          if (draftsValue && typeof draftsValue === "object") {
-            const record = draftsValue as Record<string, unknown>;
-            const drafts = record[path];
-            if (drafts !== undefined) {
-              if (Array.isArray(drafts)) {
-                for (const draft of drafts) {
-                  if (!draft || typeof draft !== "object") continue;
-                  const draftId = (draft as { draftId?: unknown }).draftId;
-                  if (typeof draftId === "string" && draftId.trim().length > 0) {
-                    deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-                  }
-                }
-              }
-
-              updatePersistedState<Record<string, unknown>>(
-                WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-                (prev) => {
-                  const next = prev && typeof prev === "object" ? { ...prev } : {};
-                  delete next[path];
-                  return next;
-                },
-                {}
-              );
-            }
+          // The backend deleted the project's creation drafts and delisted them. Clean up their
+          // localStorage settings, then drop them from memory.
+          for (const draft of getDraftStore().getCreationDraftsByProject()[path] ?? []) {
+            deleteWorkspaceStorage(getDraftScopeId(path, draft.draftId));
           }
+          getDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };
