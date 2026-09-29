@@ -34,6 +34,7 @@ import {
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
@@ -1652,6 +1653,30 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
         }
       });
     }
+
+    // #5043: a devcontainer's plan is inside its container, so the deletion runs in there. The
+    // host file at the same path is not this workspace's (#4775) and is never touched; a container
+    // that cannot be reached refuses the clear like an unreachable SSH host.
+    test("a devcontainer whose container cannot be reached refuses the full clear and leaves the host path", async () => {
+      const t = await setup("plan-devcontainer-unreachable", "canonical", true, {
+        type: "devcontainer",
+        configPath: ".devcontainer/devcontainer.json",
+      });
+      try {
+        const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockRejectedValue(
+          new RuntimeError("container is not running", "exec")
+        );
+        const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
+        exec.mockRestore();
+        expect(cleared.success ? "" : cleared.error).toStartWith(
+          PLAN_FILE_DELETE_UNREACHABLE_MESSAGE
+        );
+        expect(await t.historyIds()).toEqual(["user-1"]);
+        expect(existsSync(t.planPath)).toBe(true);
+      } finally {
+        await t.teardown();
+      }
+    });
   });
 
   test("a destructive replacement without deletePlanFile keeps the plan file in place", async () => {

@@ -4,6 +4,7 @@ import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
+import { resolveCoderSSHHost } from "@/constants/coder";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
@@ -506,13 +507,39 @@ export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
   "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
 
 /**
- * Where a runtime keeps its plan files, for "do these two workspaces share a plan path": the local
- * home for local and worktree runtimes, the host's home for SSH. Docker and devcontainer plans live
- * inside their own container and are never shared (undefined).
+ * Where a runtime keeps its plan files: the local home for local and worktree runtimes, the home
+ * on the SSH endpoint the runtime connects to. Docker and devcontainer plans live inside their own
+ * container and are never shared (undefined).
  */
-function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
+function planStorageOf(
+  runtimeConfig: RuntimeConfig
+): { kind: "local" } | { kind: "ssh"; host: string; port?: number } | undefined {
   if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
-  return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
+  if (!isSSHRuntime(runtimeConfig)) return { kind: "local" };
+  // The endpoint runtimeFactory connects to (#5043): a Coder workspace's host is a placeholder,
+  // and its SSH host is derived from the Coder workspace name.
+  return {
+    kind: "ssh",
+    host: resolveCoderSSHHost(runtimeConfig.host, runtimeConfig.coder?.workspaceName),
+    port: runtimeConfig.port,
+  };
+}
+
+/**
+ * Whether two workspaces may keep their plans in the same place, for "does another workspace use
+ * this plan path". It errs towards sharing, which keeps a plan: an unset SSH port is whatever the
+ * SSH config says, so it may be the other workspace's port.
+ */
+export function sharesPlanStorage(a: RuntimeConfig, b: RuntimeConfig): boolean {
+  const storageA = planStorageOf(a);
+  const storageB = planStorageOf(b);
+  if (storageA === undefined || storageB === undefined) return false;
+  if (storageA.kind === "local" || storageB.kind === "local")
+    return storageA.kind === storageB.kind;
+  return (
+    storageA.host === storageB.host &&
+    (storageA.port === undefined || storageB.port === undefined || storageA.port === storageB.port)
+  );
 }
 
 /** Labels are free text; the About dialog shows them verbatim, so they are cut here. */
@@ -7110,6 +7137,9 @@ export class WorkspaceService
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
+    // Set when the runtime deletion ran and succeeded; for a devcontainer that confirms its
+    // container, which holds the plan, is gone (#5043).
+    let containerRemovalConfirmed = false;
     // Set once this attempt published the durable removal tombstone (sealed
     // sub-agent handover, or the session-dir teardown). If the removal then
     // ends with the workspace STILL REGISTERED — a refused checkout deletion,
@@ -7686,6 +7716,8 @@ export class WorkspaceService
             runtimeOptions
           );
 
+          // A devcontainer's delete succeeds only once its container is gone (#5126, #5124).
+          containerRemovalConfirmed = deleteResult.success;
           if (!deleteResult.success) {
             // If force is true, we continue to remove from config even if fs removal failed
             if (!force) {
@@ -7940,7 +7972,11 @@ export class WorkspaceService
       // without its plan, like its already deleted session. Without captured metadata there is no
       // path to derive.
       if (removedMetadata)
-        await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
+        await this.deletePlanFilesOfRemovedWorkspace(
+          workspaceId,
+          removedMetadata,
+          containerRemovalConfirmed
+        );
 
       // Remove from config
       try {
@@ -8090,16 +8126,20 @@ export class WorkspaceService
    */
   private async deletePlanFilesOfRemovedWorkspace(
     workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    containerRemovalConfirmed: boolean
   ): Promise<void> {
     const runtimeConfig = metadata.runtimeConfig;
     // Skipped where the plan is not at a path this process can safely delete: Docker keeps it in
-    // the container the removal deleted; a devcontainer keeps it inside the container, and the
-    // same host path is not this workspace's (#4775); a Coder workspace that Xum created is
-    // deleted with the workspace, and an exec would reach for a host that is gone.
+    // the container the removal deleted; a Coder workspace that Xum created is deleted with the
+    // workspace, and an exec would reach for a host that is gone. A devcontainer keeps it inside
+    // its container: skipped only once the removal confirmed that container gone (#5043).
+    // Otherwise (a forced removal that could not remove it, or a task that shares its parent's
+    // container) the container survives with the plan, and a later workspace at this path would
+    // reconnect to it, so the plan is deleted in there, never at the same host path (#4775).
     if (
       isDockerRuntime(runtimeConfig) ||
-      isDevcontainerRuntime(runtimeConfig) ||
+      (isDevcontainerRuntime(runtimeConfig) && containerRemovalConfirmed) ||
       (isSSHRuntime(runtimeConfig) &&
         runtimeConfig.coder != null &&
         runtimeConfig.coder.existingWorkspace !== true)
@@ -8109,13 +8149,12 @@ export class WorkspaceService
     try {
       // Plans key on the project basename: a same-named workspace in another project with that
       // basename, on the same plan storage, shares this path, and the plan may be its live one.
-      const storage = planStorageOf(runtimeConfig);
       const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
         (other) =>
           other.id !== workspaceId &&
           other.name === metadata.name &&
           other.projectName === metadata.projectName &&
-          planStorageOf(other.runtimeConfig) === storage
+          sharesPlanStorage(runtimeConfig, other.runtimeConfig)
       );
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {
@@ -16210,8 +16249,8 @@ export class WorkspaceService
   }
 
   /**
-   * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH and
-   * Docker, on the local filesystem otherwise. Missing files are fine; any other failure is
+   * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH, Docker
+   * and devcontainers, on the local filesystem otherwise. Missing files are fine; any other failure is
    * returned.
    */
   private async deletePlanFiles(
@@ -16220,7 +16259,13 @@ export class WorkspaceService
     planPath: string,
     legacyPlanPath: string
   ): Promise<Result<void, PlanFileDeletionError>> {
-    if (isDockerRuntime(runtimeConfig) || isSSHRuntime(runtimeConfig)) {
+    // A devcontainer's plan is inside its container: the same path on the host is not this
+    // workspace's (#4775, #5043).
+    if (
+      isDockerRuntime(runtimeConfig) ||
+      isDevcontainerRuntime(runtimeConfig) ||
+      isSSHRuntime(runtimeConfig)
+    ) {
       // Plan paths are absolute or home-relative, never relative to the cwd below.
       for (const remotePath of [planPath, legacyPlanPath]) {
         assert(

@@ -4,9 +4,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { getLegacyPlanFilePath } from "@/common/utils/planStorage";
+import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { WorkspaceService } from "./workspaceService";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import * as runtimeHelpers from "@/node/utils/runtime/helpers";
+import { sharesPlanStorage, type WorkspaceService } from "./workspaceService";
 import {
   createWorkspaceServiceHarness,
   withTempMuxRoot,
@@ -186,4 +190,146 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
       expect(await exists(localPlan)).toBe(false);
     });
   });
+
+  /** Spy on the remote plan deletion (exec'd rm) and return the plan paths it was asked to delete. */
+  const spyRemotePlanDeletion = () => {
+    const exec = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      duration: 0,
+    });
+    return () =>
+      exec.mock.calls.flatMap(([, , options]) =>
+        options.pathEnv?.XUM_PLAN != null ? [options.pathEnv.XUM_PLAN] : []
+      );
+  };
+
+  const addWorkspaceIn = (
+    inProject: string,
+    entry: { id: string; name: string; path: string; runtimeConfig: RuntimeConfig } & Record<
+      string,
+      unknown
+    >
+  ) =>
+    harness.config.editConfig((cfg) => {
+      const project = cfg.projects.get(inProject) ?? { workspaces: [], trusted: true };
+      project.workspaces.push(entry);
+      cfg.projects.set(inProject, project);
+      return cfg;
+    });
+
+  // #5043 item 1: the shared-plan-storage check keys by the endpoint the runtime connects to.
+  // Another port on the same host is another sshd (often another machine or container), so its
+  // plan path is not this one; an unset port may be the same one, so the plan is kept.
+  test.each([
+    { label: "another port", twinPort: 2200, deleted: true },
+    { label: "an unset port", twinPort: undefined, deleted: false },
+  ])(
+    "an SSH removal next to a same-named workspace on the same host with $label",
+    async ({ twinPort, deleted }) => {
+      await withTempMuxRoot(async () => {
+        const ssh = (port: number | undefined): RuntimeConfig => ({
+          type: "ssh",
+          host: "box",
+          srcBaseDir: "~/xum",
+          ...(port !== undefined ? { port } : {}),
+        });
+        await addWorkspaceIn(projectPath, {
+          id: "ffffffff10",
+          name: "hosted",
+          path: "~/xum/project/hosted",
+          runtimeConfig: ssh(2222),
+        });
+        await addWorkspaceIn(path.join(harness.rootDir, "remote", "project"), {
+          id: "ffffffff11",
+          name: "hosted",
+          path: "~/xum/project/hosted",
+          runtimeConfig: ssh(twinPort),
+        });
+        spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+          success: true,
+          deletedPath: "~/xum/project/hosted",
+        });
+        const deletedPlans = spyRemotePlanDeletion();
+
+        const result = await service.remove("ffffffff10");
+
+        expect(result.success ? "" : result.error).toBe("");
+        expect(deletedPlans()).toEqual(deleted ? ["~/.mux/plans/project/hosted.md"] : []);
+      });
+    }
+  );
+
+  test("Coder workspaces share plan storage only when they are the same Coder workspace", () => {
+    const coder = (workspaceName: string): RuntimeConfig => ({
+      type: "ssh",
+      host: "coder://",
+      srcBaseDir: "~/xum",
+      coder: { workspaceName, existingWorkspace: true },
+    });
+    expect(sharesPlanStorage(coder("alpha"), coder("beta"))).toBe(false);
+    expect(sharesPlanStorage(coder("alpha"), coder("alpha"))).toBe(true);
+  });
+
+  // #5043 item 2: a devcontainer's plan is inside its container. A removal that confirmed the
+  // container gone has nothing left to delete; otherwise the container survives with the plan,
+  // and a later workspace at this path would reconnect to it, so the plan is deleted in there.
+  // Never on the host: the same host path is not this workspace's (#4775).
+  const devcontainerCases: Array<{
+    label: string;
+    force: boolean;
+    deleteResult: Awaited<ReturnType<DevcontainerRuntime["deleteWorkspace"]>>;
+    entry: Record<string, unknown>;
+    inContainer: boolean;
+  }> = [
+    {
+      label: "whose container the removal confirmed gone",
+      force: false,
+      deleteResult: { success: true, deletedPath: "/dc" },
+      entry: {},
+      inContainer: false,
+    },
+    {
+      label: "whose forced removal left its container",
+      force: true,
+      deleteResult: {
+        success: false,
+        error: "Failed to remove the devcontainer: daemon down",
+        leftoverPaths: ["devcontainer container labeled devcontainer.local_folder=/dc"],
+      },
+      entry: {},
+      inContainer: true,
+    },
+    {
+      label: "that shares its parent's container",
+      force: false,
+      deleteResult: { success: true, deletedPath: "/dc" },
+      entry: { taskIsolation: "none" },
+      inContainer: true,
+    },
+  ];
+  test.each(devcontainerCases)(
+    "a devcontainer $label",
+    async ({ force, deleteResult, entry, inContainer }) => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspaceIn(projectPath, {
+          id: "ffffffff20",
+          name: "dc",
+          path: path.join(harness.rootDir, "dc"),
+          runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+          ...entry,
+        });
+        const hostPlan = await writePlanFile(root, "project", "dc");
+        spyOn(DevcontainerRuntime.prototype, "deleteWorkspace").mockResolvedValue(deleteResult);
+        const deletedPlans = spyRemotePlanDeletion();
+
+        const result = await service.remove("ffffffff20", force);
+
+        expect(result.success ? "" : result.error).toBe("");
+        expect(deletedPlans()).toEqual(inContainer ? ["~/.xum/plans/project/dc.md"] : []);
+        expect(await exists(hostPlan)).toBe(true);
+      });
+    }
+  );
 });
