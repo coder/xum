@@ -1631,16 +1631,15 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
-        if (command.includes("rev-parse --git-dir"))
-          return Promise.resolve(createExecStream(".git\n"));
-        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream(""));
-        if (options.cwd === "/remote/workspace/project-a") {
-          return Promise.resolve(createExecStream("", 1));
-        }
-        if (options.cwd === "/remote/workspace/project-b") {
+        if (command.includes("xum-git-discovery 1")) {
+          if (options.cwd === "/remote/workspace/project-a") {
+            return Promise.resolve(createExecStream("xum-git-discovery 1\n\0drivers 1\n"));
+          }
           return Promise.resolve(
             createExecStream(
-              "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0"
+              "xum-git-discovery 1\n" +
+                "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0" +
+                "\0drivers 0\n"
             )
           );
         }
@@ -1668,22 +1667,26 @@ describe("remote bash git hardening", () => {
     )) as BashToolResult;
 
     expect(result.success).toBe(true);
-    expect(calls).toHaveLength(7);
+    expect(calls).toHaveLength(3);
     expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
-    expect(calls[3]?.options.cwd).toBe("/remote/workspace/project-b");
-    expect(calls[6]?.options.env?.ANTHROPIC_API_KEY).toBe("");
-    expect(Object.values(calls[6]?.options.env ?? {})).toContain("filter.evil.smudge");
-    expect(Object.values(calls[6]?.options.env ?? {})).toContain("alias.evil");
+    expect(calls[0]?.options.env?.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
+    expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("alias.evil");
   });
 
   it("fails closed when remote driver discovery fails", async () => {
     let callCount = 0;
     const runtime = {
       exec(): Promise<ExecStream> {
-        const exitCodes = [0, 0, 1, 0, 2];
-        const exitCode = exitCodes[callCount] ?? 2;
         callCount += 1;
-        return Promise.resolve(createExecStream("", exitCode));
+        // project-a discovery succeeds; project-b discovery exits 2.
+        return Promise.resolve(
+          callCount === 1
+            ? createExecStream("xum-git-discovery 1\n\0drivers 1\n")
+            : createExecStream("", 2)
+        );
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
@@ -1711,7 +1714,7 @@ describe("remote bash git hardening", () => {
     }
     expect(rejection).toBeInstanceOf(Error);
     expect((rejection as Error).message).toContain("Failed to inspect repository");
-    expect(callCount).toBe(5);
+    expect(callCount).toBe(2);
   });
 
   it("blanks run-session roots inherited by local Bash", async () => {

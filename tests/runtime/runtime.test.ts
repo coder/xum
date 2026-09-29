@@ -14,6 +14,9 @@
 
 // Jest globals are available automatically - no need to import
 import * as os from "os";
+import { execFileSync } from "child_process";
+import * as fs from "fs/promises";
+import * as path from "path";
 // shouldRunIntegrationTests checks TEST_INTEGRATION env var
 function shouldRunIntegrationTests(): boolean {
   return process.env.TEST_INTEGRATION === "1" || process.env.TEST_INTEGRATION === "true";
@@ -31,6 +34,10 @@ import {
   type RuntimeType,
 } from "./test-fixtures/test-helpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
+import {
+  gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { CoderService } from "@/node/services/coderService";
 import { RuntimeError } from "@/node/runtime/Runtime";
@@ -863,6 +870,76 @@ describeIntegration("Runtime integration tests", () => {
           expect(result.exitCode).not.toBe(0);
           expect(result.stderr.toLowerCase()).toContain("permission denied");
         });
+      });
+
+      // Sequential on purpose: the local side isolates process.env git config, and Jest runs a
+      // block's concurrent tests as one unit, so none run while this block does.
+      describe("Repository automation discovery", () => {
+        test("runtime discovery returns the local discovery env and fails closed on a missing cwd", async () => {
+          const seed = [
+            "git init -q plain",
+            "git init -q drivers",
+            "mkdir -p drivers/.git/info",
+            "printf '* filter=evil diff=evil merge=evil\\n' > drivers/.git/info/attributes",
+            "git -C drivers config filter.evil.smudge cat",
+            "git -C drivers config diff.evil.textconv cat",
+            "git -C drivers config merge.evil.driver 'cat %A'",
+            "git -C drivers config alias.evil '!echo hi'",
+            "git init -q wtcfg",
+            "git -C wtcfg config extensions.worktreeConfig true",
+            "git -C wtcfg config --worktree filter.wt.smudge cat",
+          ].join(" && ");
+          const runtime = createRuntime();
+          await using workspace = await TestWorkspace.create(runtime, type);
+          const localRoot = await fs.mkdtemp(path.join(os.tmpdir(), "git-discovery-parity-"));
+          const saved = {
+            global: process.env.GIT_CONFIG_GLOBAL,
+            nosystem: process.env.GIT_CONFIG_NOSYSTEM,
+          };
+          try {
+            // Host git config (for example git-lfs filters) would otherwise differ from the
+            // remote's.
+            const globalConfig = path.join(localRoot, "global.gitconfig");
+            await fs.writeFile(globalConfig, "");
+            process.env.GIT_CONFIG_GLOBAL = globalConfig;
+            process.env.GIT_CONFIG_NOSYSTEM = "1";
+            execFileSync("sh", ["-c", seed], { cwd: localRoot, stdio: "pipe" });
+            const seeded = await execWorkspace(runtime, workspace, seed);
+            expect(seeded.exitCode).toBe(0);
+
+            for (const name of ["plain", "drivers", "wtcfg"]) {
+              const local = await gitNoRepoAutomationEnvForLocalRepo(path.join(localRoot, name));
+              const remote = await gitNoRepoAutomationEnvForRuntimeRepo(
+                runtime,
+                `${workspace.path}/${name}`
+              );
+              expect({ name, env: JSON.stringify(remote) }).toEqual({
+                name,
+                env: JSON.stringify(local),
+              });
+              if (name === "drivers") {
+                expect(Object.values(remote)).toContain("filter.evil.smudge");
+              }
+            }
+
+            const missing = await gitNoRepoAutomationEnvForRuntimeRepo(
+              runtime,
+              `${workspace.path}/missing`,
+              undefined,
+              true
+            ).then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(missing).toBeInstanceOf(Error);
+          } finally {
+            if (saved.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+            else process.env.GIT_CONFIG_GLOBAL = saved.global;
+            if (saved.nosystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+            else process.env.GIT_CONFIG_NOSYSTEM = saved.nosystem;
+            await fs.rm(localRoot, { recursive: true, force: true });
+          }
+        }, 60000);
       });
     }
   );
