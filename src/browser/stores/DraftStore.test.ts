@@ -47,6 +47,7 @@ function createClient(service: DraftService) {
     failUpdates: 0,
     failImports: 0,
     failDeletes: 0,
+    failGets: 0,
     updateGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
@@ -56,6 +57,10 @@ function createClient(service: DraftService) {
     list: () => service.list(),
     get: async ({ scope }: { scope: DraftScope }) => {
       await control.getGate;
+      if (control.failGets > 0) {
+        control.failGets--;
+        throw new Error("get failed");
+      }
       return service.get(scope);
     },
     update: async (input: Parameters<DraftService["update"]>[0]) => {
@@ -516,6 +521,86 @@ describe("DraftStore", () => {
     // Another client removes the big attachment: the refused edit fits now and must be saved.
     await service.update({ scope: WS_SCOPE, attachments: [] });
     await waitFor(async () => (await service.get(WS_SCOPE)).text === "x".repeat(400));
+  });
+
+  test("retries a failed payload load while an attachment update waits for it", async () => {
+    using tempDir = new TestTempDir("draft-store-payload-retry-queued");
+    const { service, client, control } = await createHarness(tempDir);
+    await service.update({ scope: WS_SCOPE, attachments: [image] });
+    const store = createStore(client);
+    await store.whenReady();
+
+    control.failGets = 1;
+    const second: DraftAttachment = { ...image, id: "img-2" };
+    store.setAttachments(WS_SCOPE, (previous) => [...previous, second]);
+    // No later backend event or remount: only a retry can apply and save the update.
+    await waitFor(async () => (await service.get(WS_SCOPE)).attachments.length === 2, 5_000);
+    expect(store.getAttachments(WS_SCOPE).map(({ id }) => id)).toEqual(["img-1", "img-2"]);
+  });
+
+  test("retries a failed payload load of a shown draft, so its attachments become sendable", async () => {
+    using tempDir = new TestTempDir("draft-store-payload-retry-shown");
+    const { service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.subscribe(WS_SCOPE, () => undefined);
+
+    control.failGets = 1;
+    await service.update({ scope: WS_SCOPE, attachments: [image] });
+    await waitFor(() => store.getView(WS_SCOPE).payloadsLoaded, 5_000);
+    expect(store.getAttachments(WS_SCOPE)).toEqual([image]);
+  });
+
+  test("an attachment added before the first snapshot keeps the server's attachments", async () => {
+    using tempDir = new TestTempDir("draft-store-attach-before-snapshot");
+    const { service, client, control } = await createHarness(tempDir);
+    await service.update({ scope: WS_SCOPE, attachments: [image] });
+    let releaseSubscribe: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSubscribe = resolve;
+    });
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    fakeTimers.useFakeTimers();
+    let store: DraftStore;
+    try {
+      store = createStore(client);
+      fakeTimers.advanceTimersByTime(DRAFT_STORE_READY_TIMEOUT_MS);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+    expect(store.isReady()).toBe(true);
+
+    const second: DraftAttachment = { ...image, id: "img-2" };
+    store.setAttachments(WS_SCOPE, (previous) => [...previous, second]);
+    releaseSubscribe();
+    await waitFor(async () => (await service.get(WS_SCOPE)).attachments.length === 2);
+    expect((await service.get(WS_SCOPE)).attachments.map(({ id }) => id)).toEqual([
+      "img-1",
+      "img-2",
+    ]);
+  });
+
+  test("flush confirms an attachment update that waited for the payloads", async () => {
+    using tempDir = new TestTempDir("draft-store-flush-queued");
+    const { service, client, control } = await createHarness(tempDir);
+    await service.update({ scope: WS_SCOPE, attachments: [image] });
+    const store = createStore(client);
+    await store.whenReady();
+
+    let releaseGet: () => void = () => undefined;
+    control.getGate = new Promise<void>((resolve) => {
+      releaseGet = resolve;
+    });
+    const second: DraftAttachment = { ...image, id: "img-2" };
+    store.setAttachments(WS_SCOPE, (previous) => [...previous, second]);
+    const flushed = store.flush(WS_SCOPE);
+    releaseGet();
+    await flushed;
+    // Resolved means saved, as the #4448 restore ack relies on.
+    expect((await service.get(WS_SCOPE)).attachments.map(({ id }) => id)).toEqual([
+      "img-1",
+      "img-2",
+    ]);
   });
 
   test("reports a save failure to the next composer when none was listening", async () => {

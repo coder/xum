@@ -3,6 +3,8 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -2037,6 +2039,47 @@ describe("WorkspaceContext", () => {
       expect(state.pendingNewWorkspaceProject).toBeNull();
     });
   });
+
+  test.each([
+    { name: "project", linkedPath: "/alpha" },
+    // A sub-project's page uses its owning project's default draft and creates in the sub-project.
+    { name: "sub-project", linkedPath: "/alpha/sub" },
+  ])(
+    "a new_chat deep link keeps its prompt reachable when the draft list cannot be written ($name)",
+    async ({ linkedPath }) => {
+      const projectPath = "/alpha";
+      createMockAPI({
+        projects: {
+          list: () =>
+            Promise.resolve([
+              [projectPath, { workspaces: [] }],
+              ["/alpha/sub", { workspaces: [], parentProjectPath: projectPath }],
+            ]),
+        },
+        pendingDeepLinks: [{ type: "new_chat", projectPath: linkedPath, prompt: "from the link" }],
+        // An explicit route, so only the deep link navigates.
+        locationPath: "/settings",
+      });
+      // A full origin: the draft list entry never fits.
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: new QuotaLimitedStorage(0),
+      });
+      const defaultScope = defaultCreationDraftScope(projectPath);
+      try {
+        const ctx = await setup();
+
+        // No unlisted draft holds the prompt: the project's default draft does, on the linked
+        // (sub-)project's bare page.
+        await waitFor(() => expect(getDraftStore().getText(defaultScope)).toBe("from the link"));
+        expect(ctx().workspaceDraftsByProject[projectPath]).toBeUndefined();
+        expect(ctx().pendingNewWorkspaceDraftId).toBeNull();
+        expect(ctx().pendingNewWorkspaceProject).toBe(linkedPath);
+      } finally {
+        getDraftStore().forgetProject(projectPath);
+      }
+    }
+  );
 
   describe("reorderPinnedWorkspaces", () => {
     // Three pinned chats in one project; pinnedAt ascending = a, b, c.

@@ -116,6 +116,9 @@ interface Entry {
   /** Bumped whenever the server's attachment list changes, invalidating a payload load. */
   payloadGeneration: number;
   payloadLoad: Promise<void> | null;
+  /** Retry of a failed payload load, while someone still needs the payloads. */
+  payloadRetryTimer: ReturnType<typeof setTimeout> | null;
+  payloadAttempt: number;
   /** Functional updates issued before the payloads arrived; applied onto them. */
   queuedAttachmentUpdates: AttachmentUpdate[];
   /** Newest server revision applied; reset by each subscription snapshot. */
@@ -367,6 +370,20 @@ export class DraftStore {
       this.applyAttachments(entry, value);
       return;
     }
+    if (
+      entry.payloadsLoaded &&
+      this.client !== null &&
+      !this.hydrated &&
+      entry.scope.kind !== "pending" &&
+      entry.revision === Number.NEGATIVE_INFINITY &&
+      !isAttachmentsDirty(entry)
+    ) {
+      // Before the first snapshot (composers render after the readiness timeout) the server's
+      // attachments are unknown: an update applied onto the empty local list would replace them.
+      // Load them first, like a hydrated draft's payloads.
+      entry.payloadsLoaded = false;
+      this.recompute(entry);
+    }
     if (!entry.payloadsLoaded) {
       entry.queuedAttachmentUpdates.push(value);
       this.ensurePayloads(scope).catch((error: unknown) => {
@@ -403,6 +420,7 @@ export class DraftStore {
           return;
         }
         entry.payloadsLoaded = true;
+        entry.payloadAttempt = 0;
         entry.attachments = draft.attachments;
         entry.attachmentCount = draft.attachments.length;
         const queued = entry.queuedAttachmentUpdates;
@@ -415,12 +433,32 @@ export class DraftStore {
         } else {
           this.recompute(entry);
         }
+      } catch (error) {
+        this.schedulePayloadRetry(entry, key);
+        throw error;
       } finally {
         if (entry.payloadLoad === current.load) entry.payloadLoad = null;
       }
     })();
     entry.payloadLoad = current.load;
     return current.load;
+  }
+
+  /**
+   * After a failed payload load, retry with backoff while the payloads are needed: queued
+   * attachment updates stay invisible and unsaved until they load, and a shown draft's
+   * attachments (and its Send) stay unavailable until a later event, which may never come.
+   */
+  private schedulePayloadRetry(entry: Entry, key: string): void {
+    const needed =
+      entry.queuedAttachmentUpdates.length > 0 || (this.listeners.get(key)?.size ?? 0) > 0;
+    if (entry.payloadRetryTimer || !needed) return;
+    entry.payloadRetryTimer = setTimeout(() => {
+      entry.payloadRetryTimer = null;
+      if (this.entries.get(key) !== entry) return;
+      // A further failure schedules the next attempt.
+      this.ensurePayloads(entry.scope).catch(() => undefined);
+    }, retryDelayMs(entry.payloadAttempt++));
   }
 
   /**
@@ -438,6 +476,9 @@ export class DraftStore {
     }
     await this.readyPromise;
     if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    // An attachment update waiting for the payloads is not saved yet: apply it (by loading them)
+    // first, so this never confirms a draft without it. A failed load rejects.
+    if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
     await this.drain(entry);
   }
 
@@ -533,6 +574,8 @@ export class DraftStore {
     if (!entry) return undefined;
     if (entry.flushTimer) clearTimeout(entry.flushTimer);
     entry.flushTimer = null;
+    if (entry.payloadRetryTimer) clearTimeout(entry.payloadRetryTimer);
+    entry.payloadRetryTimer = null;
     this.entries.delete(key);
     this.notify(key);
     return entry;
@@ -550,6 +593,8 @@ export class DraftStore {
       payloadsLoaded: true,
       payloadGeneration: 0,
       payloadLoad: null,
+      payloadRetryTimer: null,
+      payloadAttempt: 0,
       queuedAttachmentUpdates: [],
       revision: Number.NEGATIVE_INFINITY,
       textVersion: 0,

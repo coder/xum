@@ -874,27 +874,42 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const draftId = createDraftId();
       const createdAt = Date.now();
 
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[owningProjectPath] ?? [];
-
-        return {
-          ...current,
-          [owningProjectPath]: [
-            ...existing,
-            {
-              draftId,
-              subProjectPath: normalizedSubProjectPath,
-              createdAt,
-            },
-          ],
-        };
-      });
-
       const prompt =
         typeof payload.prompt === "string" && payload.prompt.trim().length > 0
           ? payload.prompt
           : null;
+
+      // The direct write reports a failed list write (e.g. a full origin), which the hook's setter
+      // would not.
+      const listed = updatePersistedState<WorkspaceDraftsByProject>(
+        WORKSPACE_DRAFTS_BY_PROJECT_KEY,
+        (prev) => {
+          const current = normalizeWorkspaceDraftsByProject(prev);
+          const existing = current[owningProjectPath] ?? [];
+          return {
+            ...current,
+            [owningProjectPath]: [
+              ...existing,
+              { draftId, subProjectPath: normalizedSubProjectPath, createdAt },
+            ],
+          };
+        },
+        {}
+      );
+      if (!listed) {
+        // Without its list entry a new draft is unreachable once the user leaves it, and its
+        // backend file is never removed. Keep the prompt in the project's default creation draft
+        // instead, after any text already there, and open the linked (sub-)project's bare page:
+        // it shows that draft (a sub-project's page uses its owning project's default draft) and
+        // creates the workspace in the linked sub-project.
+        if (prompt) {
+          getDraftStore().setText(defaultCreationDraftScope(owningProjectPath), (current) =>
+            [current, prompt].filter((part) => part.trim().length > 0).join("\n\n")
+          );
+        }
+        navigateToProject(resolvedProjectPath, undefined);
+        return;
+      }
 
       if (prompt) {
         getDraftStore().setText(
@@ -912,7 +927,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       resolveNewChatProjectPath,
       getProjectConfig,
       hasAnyProject,
-      setWorkspaceDraftsByProjectState,
     ]
   );
 
