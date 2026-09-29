@@ -76,6 +76,11 @@ export interface DevcontainerRuntimeOptions {
  * - File I/O → host fs (worktree is bind-mounted into container)
  * - ensureReady → devcontainer up (starts/rebuilds container as needed)
  */
+/** Names a workspace's devcontainer by the host-path label Docker matches it with. */
+function containerLabel(workspacePath: string): string {
+  return `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
+}
+
 export class DevcontainerRuntime extends LocalBaseRuntime {
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
@@ -805,9 +810,25 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
     | { success: false; error: string }
   > {
-    // Stop container before rename (container labels reference old path)
+    // Remove the container before the rename: its labels reference the old path. A stopped one
+    // is removed too, and a failed removal refuses the rename before the worktree moves (#5137):
+    // the container would otherwise survive with this workspace's files, including its plan, and
+    // a later workspace at the old path would reuse it.
     const oldPath = this.getWorkspacePath(projectPath, oldName);
-    await devcontainerDown(oldPath, this.configPath);
+    const containerStop = await devcontainerDown(oldPath, this.configPath, {
+      includeStopped: true,
+    }).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
+    if (containerStop.kind === "error") {
+      return {
+        success: false,
+        error: `Failed to remove the ${containerLabel(oldPath)}: ${containerStop.message}`,
+      };
+    }
 
     // Rename worktree on host
     const result = await this.worktreeManager.renameWorkspace(
@@ -853,7 +874,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       })
     );
 
-    const containerLeftover = `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
+    const containerLeftover = containerLabel(workspacePath);
     // A container that is still there is not a clean delete: removal and rollbacks report it, and
     // name it so the user can remove it (#5120); a later workspace at this path would reuse it.
     // A non-forced delete then stops before the host worktree, so the caller keeps the workspace

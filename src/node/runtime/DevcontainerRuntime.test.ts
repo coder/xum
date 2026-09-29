@@ -413,6 +413,38 @@ describe("DevcontainerRuntime.getContainerEnv", () => {
   });
 });
 
+/**
+ * Put a fake `docker` first on PATH. Its `ps` lists "stopped1" only with -a and "running2" always;
+ * `rm` succeeds. Every call is appended to the returned log.
+ */
+async function installFakeDocker(root: string) {
+  const binDir = path.join(root, "bin");
+  const dockerLog = path.join(root, "docker.log");
+  await fs.mkdir(binDir);
+  await fs.writeFile(
+    path.join(binDir, "docker"),
+    [
+      "#!/bin/sh",
+      `echo "$*" >> '${dockerLog}'`,
+      'if [ "$1" = ps ]; then',
+      '  case " $* " in *" -a "*|*" -aq "*) echo stopped1 ;; esac',
+      "  echo running2",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+  return {
+    dockerLog,
+    restorePath: () => {
+      process.env.PATH = originalPath;
+    },
+  };
+}
+
 describe("DevcontainerRuntime.deleteWorkspace", () => {
   let root: string;
   beforeEach(async () => {
@@ -519,26 +551,7 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
   // #5124: a stopped container (after a daemon restart or a manual `docker stop`) still holds the
   // workspace's files, including its plan, and a later workspace at this path would reuse it.
   it("removes a stopped container as well as a running one", async () => {
-    const binDir = path.join(root, "bin");
-    const dockerLog = path.join(root, "docker.log");
-    await fs.mkdir(binDir);
-    // Fake docker: `ps` lists "stopped1" only with -a, "running2" always; `rm` succeeds.
-    await fs.writeFile(
-      path.join(binDir, "docker"),
-      [
-        "#!/bin/sh",
-        `echo "$*" >> '${dockerLog}'`,
-        'if [ "$1" = ps ]; then',
-        '  case " $* " in *" -a "*|*" -aq "*) echo stopped1 ;; esac',
-        "  echo running2",
-        "fi",
-        "exit 0",
-        "",
-      ].join("\n"),
-      { mode: 0o755 }
-    );
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+    const { dockerLog, restorePath } = await installFakeDocker(root);
     try {
       const projectPath = path.join(root, "repo");
       await fs.mkdir(projectPath);
@@ -578,7 +591,83 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
         (await fs.readFile(dockerLog, "utf8")).split("\n").filter((l) => l.startsWith("rm "))
       ).toEqual(["rm -f running2"]);
     } finally {
-      process.env.PATH = originalPath;
+      restorePath();
     }
+  });
+});
+
+describe("DevcontainerRuntime.renameWorkspace", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "mux-devcontainer-rename-"));
+  });
+  afterEach(async () => {
+    mock.restore();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const setupWorktree = async () => {
+    const projectPath = path.join(root, "repo");
+    await fs.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "i"
+    );
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: path.join(root, "src"),
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const oldPath = runtime.getWorkspacePath(projectPath, "old");
+    git("worktree", "add", "-b", "old", oldPath);
+    return { projectPath, runtime, oldPath, git };
+  };
+
+  // #5137: the container is labeled with the old path. A stopped one would survive the rename
+  // with the renamed workspace's files, and a later workspace at the old path would reuse it.
+  it("removes a stopped container labeled with the old path", async () => {
+    const { dockerLog, restorePath } = await installFakeDocker(root);
+    try {
+      const { projectPath, runtime } = await setupWorktree();
+
+      const result = await runtime.renameWorkspace(projectPath, "old", "new", undefined, true);
+
+      expect(result.success).toBe(true);
+      expect(
+        (await fs.readFile(dockerLog, "utf8")).split("\n").filter((l) => l.startsWith("rm "))
+      ).toEqual(["rm -f stopped1 running2"]);
+    } finally {
+      restorePath();
+    }
+  });
+
+  it("refuses the rename before moving the worktree when the container cannot be removed", async () => {
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+      kind: "error",
+      message: "Failed to remove container: daemon down",
+    });
+    const { projectPath, runtime, oldPath, git } = await setupWorktree();
+
+    const result = await runtime.renameWorkspace(projectPath, "old", "new", undefined, true, {
+      renameBranch: true,
+    });
+
+    expect(result.success).toBe(false);
+    const error = result.success ? "" : result.error;
+    expect(error).toContain("daemon down");
+    expect(error).toContain(`devcontainer container labeled devcontainer.local_folder=${oldPath}`);
+    expect(await fs.stat(oldPath)).toBeTruthy();
+    expect(
+      await fs.stat(runtime.getWorkspacePath(projectPath, "new")).catch(() => null)
+    ).toBeNull();
+    expect(git("branch", "--list", "old")).not.toBe("");
   });
 });
