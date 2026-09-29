@@ -129,6 +129,23 @@ async function run(tool: Tool, input: Record<string, unknown>): Promise<MemoryTo
 }
 
 describe("memory tool", () => {
+  it("does not commit a mutation after the stream is stopped", async () => {
+    using fixture = await createFixture();
+    const controller = new AbortController();
+    controller.abort();
+    const parsed = TOOL_DEFINITIONS.memory.schema.parse({
+      command: "create",
+      path: "/memories/global/late.md",
+      file_text: "late",
+    });
+    const result = (await fixture.tool.execute!(parsed, {
+      ...mockToolCallOptions,
+      abortSignal: controller.signal,
+    })) as MemoryToolResult;
+    expect(result.success).toBe(false);
+    expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "late.md"))).toBe(false);
+  });
+
   describe("command dispatch", () => {
     it("creates, views, edits, renames and deletes through the tool surface", async () => {
       using fixture = await createFixture();
