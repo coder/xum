@@ -629,58 +629,16 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   };
 }
 
-interface ValidationIssue {
-  path?: Array<string | number>;
-  message?: string;
-}
-
-type IteratorValidationFailedError = Error & {
-  code: "EVENT_ITERATOR_VALIDATION_FAILED";
-  cause?: {
-    issues?: ValidationIssue[];
-    data?: unknown;
-  };
-};
-
-function isIteratorValidationFailed(error: unknown): error is IteratorValidationFailedError {
+/**
+ * The error oRPC (and the server's own onChat validation, #4868) raises when a yielded chat
+ * event fails the output schema. The client receives only its code and message: oRPC does not
+ * serialize the error's `cause`, so the schema issues stay on the server (#5082).
+ */
+function isIteratorValidationFailed(error: unknown): error is Error {
   return (
     error instanceof Error &&
-    (error as { code?: unknown }).code === "EVENT_ITERATOR_VALIDATION_FAILED"
+    (error as { code?: unknown }).code === "ASYNC_ITERATOR_OBJECT_VALIDATION_FAILED"
   );
-}
-
-/**
- * Extract a human-readable summary from an iterator validation error.
- * ORPC wraps Zod issues in error.cause with { issues: [...], data: ... }
- */
-function formatValidationError(error: IteratorValidationFailedError): string {
-  const cause = error.cause;
-  if (!cause) {
-    return "Unknown validation error (no cause)";
-  }
-
-  const issues = cause.issues ?? [];
-  if (issues.length === 0) {
-    return `Unknown validation error (no issues). Data: ${JSON.stringify(cause.data)}`;
-  }
-
-  // Format issues like: "type: Invalid discriminator value" or "metadata.usage.inputTokens: Expected number"
-  const issuesSummary = issues
-    .slice(0, 3) // Limit to first 3 issues
-    .map((issue) => {
-      const path = issue.path?.join(".") ?? "(root)";
-      const message = issue.message ?? "Unknown issue";
-      return `${path}: ${message}`;
-    })
-    .join("; ");
-
-  const moreCount = issues.length > 3 ? ` (+${issues.length - 3} more)` : "";
-
-  // Include the event type if available
-  const data = cause.data as { type?: string } | undefined;
-  const eventType = data?.type ? ` [event: ${data.type}]` : "";
-
-  return `${issuesSummary}${moreCount}${eventType}`;
 }
 
 /**
@@ -4466,10 +4424,7 @@ export class WorkspaceStore {
         } else if (isIteratorValidationFailed(error)) {
           if (!this.isWorkspaceRegistered(workspaceId)) return true;
           console.error(
-            "[WorkspaceStore] Event validation failed for " +
-              workspaceId +
-              ": " +
-              formatValidationError(error)
+            "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
           );
         } else if (!abortError)
           console.error(

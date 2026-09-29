@@ -8,6 +8,11 @@ import type { ORPCContext } from "@/node/orpc/context";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
+import { createORPCClient } from "@orpc/client";
+import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
+import { eventIterator, os, type RouterClient } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/message-port";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import {
   describe,
   expect,
@@ -1664,6 +1669,54 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
       unsubscribe();
       mockChatScript([], { keepOpen: true });
+    });
+
+    it("logs a server event-validation failure as the client receives it, then retries", async () => {
+      // oRPC validates each yielded event against the chat schema and fails the stream; the
+      // server's own validation throws the identical error (#4868). It crosses a real oRPC
+      // message-port transport, like the desktop app's, which sends only the error's code and
+      // message: its `cause` (the schema issues) is never serialized (#5082).
+      const workspaceId = "workspace-event-validation-failed";
+      const serverRouter = {
+        onChat: os.output(eventIterator(WorkspaceChatMessageSchema)).handler(async function* () {
+          // A stream-delta without its required token count.
+          yield {
+            type: "stream-delta",
+            workspaceId,
+            messageId: "live",
+            delta: "text",
+            timestamp: 1,
+          } as unknown as WorkspaceChatMessage;
+        }),
+      };
+      const { port1, port2 } = new MessageChannel();
+      new RPCHandler(serverRouter).upgrade(port2);
+      port2.start();
+      const transport: RouterClient<typeof serverRouter> = createORPCClient(
+        new MessagePortLink({ port: port1 })
+      );
+      port1.start();
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        // Only the first attempt reaches the server; the retry just stays open.
+        if (subscriptions++ > 0) return await waitForAbortSignal(options?.signal);
+        yield* await transport.onChat(undefined, { signal: options?.signal });
+      });
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+        expect(consoleError.mock.calls).toEqual([
+          [
+            `[WorkspaceStore] Event validation failed for ${workspaceId}: AsyncIteratorObject validation failed`,
+          ],
+        ]);
+      } finally {
+        consoleError.mockRestore();
+        port1.close();
+        port2.close();
+        mockChatScript([], { keepOpen: true });
+      }
     });
 
     it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
