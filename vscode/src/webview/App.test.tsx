@@ -2,6 +2,7 @@ import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
@@ -2653,14 +2654,28 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(document.body.textContent).not.toContain("terminate refused");
   });
 
-  test("switching servers drops the previous server's processes", async () => {
+  test("switching servers shows neither the previous server's rows nor its late errors, from the first render", async () => {
+    // Both servers expose a workspace with this ID.
     const workspace: UiWorkspace = {
       ...WORKSPACE,
       id: "ws-bash-server",
       workspaceName: "bash-server",
     };
     const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
+    // Snapshot the document after every commit, before passive effects run.
+    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const onRender = () => {
+      const text = document.body.textContent ?? "";
+      commits.push({
+        rows: text.includes("background bash"),
+        error: text.includes("terminate refused"),
+      });
+    };
+    const view = render(
+      <Profiler id="app" onRender={onRender}>
+        <App bridge={bridge} />
+      </Profiler>
+    );
     await selectWorkspace(bridge, [], workspace);
     await settle();
     await emitProcesses(
@@ -2669,16 +2684,27 @@ describe("vscode webview background processes strip (#5092)", () => {
       "stream-server-1",
       [runningProcess]
     );
-    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    // Terminate on server A; its answer arrives only after the switch.
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
 
-    // Another server with a workspace of the same ID: its state is unknown until it reports.
+    commits.length = 0;
     await bridge.emit({
       type: "connectionStatus",
       status: { mode: "api", baseUrl: "http://other" },
     });
+    await bridge.answer("workspace.backgroundBashes.terminate", {
+      success: false,
+      error: "terminate refused",
+    });
     await settle();
 
-    expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.filter((commit) => commit.rows || commit.error)).toEqual([]);
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe").length).toBeGreaterThan(1);
   });
 

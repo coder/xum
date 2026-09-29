@@ -105,10 +105,17 @@ import type { VscodeBridge } from "./vscodeBridge";
 // (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
 // backend still enforces policy on send). A single AgentProvider covers both the transcript
 // (ProposePlanToolCall) and the composer.
+/** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
+function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
+  return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
+}
+
 function WebviewChatProviders(props: {
   workspaceId: string | undefined;
   workspaceAi: UiWorkspaceAiState | undefined;
   selectedWorkspaceId: string | null;
+  /** The server connection; background bash state and errors never outlive it. */
+  apiConnectionKey: string | null;
   children: ReactNode;
 }) {
   return (
@@ -135,7 +142,13 @@ function WebviewChatProviders(props: {
             {/* Covers the transcript's bash cards and the dock's background processes strip
                 (#5092). Without a selection nothing reads it: both render only for a selected
                 workspace. */}
-            <BackgroundBashProvider workspaceId={props.selectedWorkspaceId ?? ""}>
+            {/* Keyed by the server connection: a server switch remounts the provider (and the
+                strip) before paint, so a late action failure from the previous server can never
+                show over the new one, even for a workspace ID both servers share. */}
+            <BackgroundBashProvider
+              key={props.apiConnectionKey ?? "no-connection"}
+              workspaceId={props.selectedWorkspaceId ?? ""}
+            >
               {props.children}
               <BackgroundBashErrorPopover workspaceId={props.selectedWorkspaceId} />
             </BackgroundBashProvider>
@@ -274,6 +287,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
+  const connectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -434,9 +448,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   pushNoticeRef.current = pushNotice;
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
-  // Identifies the server connection: switching servers keeps mode "api" but changes the URL.
-  const apiConnectionKey =
-    connectionStatus?.mode === "api" ? (connectionStatus.baseUrl ?? "api") : null;
+  const apiConnectionKey = getApiConnectionKey(connectionStatus);
 
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
@@ -460,9 +472,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
-    // The background processes strip and the bash tool cards' live process status (#5092). Workspace
-    // IDs can repeat across servers, so the previous server's cached rows are dropped first.
-    backgroundBashStore.clearCachedState();
+    // The background processes strip and the bash tool cards' live process status (#5092). A
+    // server switch already dropped the previous server's cached rows (connectionStatus handler).
     backgroundBashStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
@@ -486,10 +497,20 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       const msg = raw as ExtensionToWebviewMessage;
 
       switch (msg.type) {
-        case "connectionStatus":
+        case "connectionStatus": {
           transcriptBarrier.setConnected(msg.status.mode === "api");
+          const nextConnectionKey = getApiConnectionKey(msg.status);
+          if (nextConnectionKey !== connectionKeyRef.current) {
+            connectionKeyRef.current = nextConnectionKey;
+            // Workspace IDs can repeat across servers. Drop the previous server's background bash
+            // subscriptions and cached rows now, before the render that shows the new connection,
+            // so it never paints them; the connection effect installs the new server's client.
+            backgroundBashStore.setClient(null);
+            backgroundBashStore.clearCachedState();
+          }
           setConnectionStatus(msg.status);
           return;
+        }
         case "workspaces":
           // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
           // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
@@ -998,6 +1019,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                 workspaceId={agentScopeWorkspaceId}
                 workspaceAi={selectedWorkspace?.ai}
                 selectedWorkspaceId={selectedWorkspaceId}
+                apiConnectionKey={apiConnectionKey}
               >
                 <div className="flex h-screen flex-col">
                   <div className="border-b border-border bg-background-secondary p-3">
