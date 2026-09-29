@@ -9,7 +9,7 @@
  *
  * Local replay of a past run:
  *   gh run download <id> -R coder/xum -n perf-artifacts-<id> -D /tmp/perf-<id>
- *   bun scripts/perf/perfReport.ts --current /tmp/perf-<id> --perf-result success --chat-switch-xl 1
+ *   bun scripts/perf/perfReport.ts --current /tmp/perf-<id> --perf-result success
  */
 import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -76,14 +76,12 @@ function main(): void {
     options: {
       current: { type: "string" },
       "perf-result": { type: "string" },
-      // The workflow's XUM_E2E_CHAT_SWITCH_XL; "1" (the harness's own test) requires the xl legs.
-      "chat-switch-xl": { type: "string" },
       help: { type: "boolean" },
     },
   });
   if (values.help || !values.current || !values["perf-result"]) {
     console.log(
-      "Usage: bun scripts/perf/perfReport.ts --current <artifact dir> --perf-result <success|failure|cancelled|skipped> [--chat-switch-xl <XUM_E2E_CHAT_SWITCH_XL>]\n" +
+      "Usage: bun scripts/perf/perfReport.ts --current <artifact dir> --perf-result <success|failure|cancelled|skipped>\n" +
         "Env (optional): GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID for the run link; GITHUB_STEP_SUMMARY."
     );
     process.exit(values.help ? 0 : 2);
@@ -99,7 +97,6 @@ function main(): void {
     artifactFound: dir.artifactFound,
     results: dir.results,
     reads: dir.reads,
-    expectChatSwitchXl: values["chat-switch-xl"] === "1",
   });
   const markdown = renderSummary({ runUrl, perfResult: values["perf-result"], report });
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
