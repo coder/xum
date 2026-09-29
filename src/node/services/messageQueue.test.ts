@@ -294,6 +294,26 @@ describe("MessageQueue", () => {
       expect(queue.dequeueNext().message).toBe("User follow-up");
     });
 
+    // #5170: an ACP prompt's turn binds only the dispatch that carries its correlation, so a
+    // correlated send must neither join an open entry nor absorb later messages.
+    it("dispatches an ACP-correlated send on its own, with its own correlation", () => {
+      queue.add("/compact", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      queue.add("resent held input", { model: "gpt-4", agentId: "exec", acpPromptId: "acp-1" });
+      queue.add("desktop follow-up", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.dequeueNext().message).toBe("/compact");
+      const acpEntry = queue.dequeueNext();
+      expect(acpEntry.message).toBe("resent held input");
+      expect(acpEntry.options?.acpPromptId).toBe("acp-1");
+      const followUp = queue.dequeueNext();
+      expect(followUp.message).toBe("desktop follow-up");
+      expect(followUp.options?.acpPromptId).toBeUndefined();
+    });
+
     it("keeps agent peer messages sealed so later messages never coalesce with them", () => {
       const peerMetadata: MuxMessageMetadata = {
         type: "agent-peer-message",
