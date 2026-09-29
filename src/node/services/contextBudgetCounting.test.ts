@@ -624,6 +624,8 @@ describe("Claude tokenizer correction (#5219)", () => {
   test("a new or unknown Claude id gets the new-tokenizer correction; older ids do not", async () => {
     const newTokenizer = await estimate("anthropic:claude-opus-5-5");
     expect(await estimate("anthropic:claude-zeta-9")).toBe(newTokenizer);
+    // Haiku's older-tokenizer range ends at 4.5, below Opus/Sonnet's 4.6.
+    expect(await estimate("anthropic:claude-haiku-4-6")).toBe(newTokenizer);
     // A mapped custom model is corrected by its metadata model, like its tokenizer.
     expect(
       await estimate("openrouter:acme/house-model", payload, "anthropic:claude-opus-5-5")
@@ -654,6 +656,20 @@ describe("Claude tokenizer correction (#5219)", () => {
       expect(withTools - (await estimate(target, bare))).toBeGreaterThanOrEqual(providerTokens);
     }
   );
+
+  test("tool framing is kept when the character heuristic dominates the text estimate", async () => {
+    // Plain repeated prose encodes densely, so chars/3.5 wins the text estimate; the provider's
+    // tool framing is not part of either text measure and must still be added.
+    const prose = {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello world ".repeat(3000) }] }],
+    };
+    const oneTool = Object.fromEntries(Object.entries(smallTools).slice(0, 1));
+    const target = "anthropic:claude-sonnet-4-6";
+    const withTool = await estimate(target, { ...prose, tools: oneTool });
+    expect(withTool - (await estimate(target, prose))).toBeGreaterThanOrEqual(
+      calibration.oneToolProviderTokens["claude-sonnet-4-6"]
+    );
+  });
 
   test("a claude-named model counted with another tokenizer gets no Claude correction", async () => {
     // An OpenAI-backed "claude-..." id resolves to the OpenAI tokenizer, which the provider bills.

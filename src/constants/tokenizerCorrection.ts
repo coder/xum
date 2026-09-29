@@ -34,9 +34,9 @@ export const CLAUDE_TOOL_OVERHEAD_TOKENS = 120;
 export const CLAUDE_TOOL_PREAMBLE_TOKENS = 400;
 
 /**
- * Claude model ids counted with the older tokenizer: the 3.x family and 4.x up to Opus/Sonnet
- * 4.6 and Haiku 4.5, with optional date/"latest"/Bedrock version suffixes and dotted versions.
- * Any other Claude id, newer or unknown, gets the conservative new-tokenizer ratio.
+ * Claude model ids counted with the older tokenizer: the 3.x family, Opus/Sonnet 4.x up to 4.6
+ * and Haiku 4.x up to 4.5, with optional date/"latest"/Bedrock version suffixes and dotted
+ * versions. Any other Claude id, newer or unknown, gets the conservative new-tokenizer ratio.
  */
 export const OLDER_CLAUDE_TOKENIZER_MODEL_ID =
-  /^claude-(?:3(?:[.-][57])?-(?:haiku|sonnet|opus)|(?:haiku|sonnet|opus)-4(?:[.-][0-6])?)(?:-(?:\d{8}|latest))?(?:-v\d+)?$/;
+  /^claude-(?:3(?:[.-][57])?-(?:haiku|sonnet|opus)|(?:sonnet|opus)-4(?:[.-][0-6])?|haiku-4(?:[.-][0-5])?)(?:-(?:\d{8}|latest))?(?:-v\d+)?$/;

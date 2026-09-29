@@ -81,9 +81,9 @@ async function countBudgetInput(
   const correction = getTokenizerCorrection(model, tokenizer.encoding);
   const toolFraming =
     toolCount > 0 ? correction.toolPreambleTokens + correction.perToolTokens * toolCount : 0;
-  const fixed = input.fixedTokens + framing + toolFraming;
   // The ratio scales encoded text only: fixedTokens already charges one token per omitted byte.
-  const corrected = (encoded: number) => Math.ceil(encoded * correction.ratio) + fixed;
+  const corrected = (encoded: number) =>
+    Math.ceil(encoded * correction.ratio) + input.fixedTokens + framing;
   let encoded = 0;
   let chunks = 0;
   for (let start = 0; start < input.text.length; ) {
@@ -95,12 +95,13 @@ async function countBudgetInput(
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
     // This early exit returns a lower bound, not an exact request size.
-    if (ceiling != null && corrected(encoded) > ceiling) return ceiling + 1;
+    if (ceiling != null && corrected(encoded) + toolFraming > ceiling) return ceiling + 1;
     start = end;
   }
   // Retain existing conservative ASCII estimates while correcting token-dense text.
   // Encoding failures propagate; never fall back silently to chars-per-token.
-  return Math.max(input.heuristicTokens, corrected(encoded));
+  // Tool framing is provider overhead neither text measure contains, so it is added after both.
+  return Math.max(input.heuristicTokens, corrected(encoded)) + toolFraming;
 }
 
 export function estimateFreshRequestTokensForModel(
