@@ -7,8 +7,11 @@ import {
   prepareAssembledRequestTokenCount,
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
+import type { JSONSchema7 } from "@ai-sdk/provider";
+import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
+  estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -582,5 +585,66 @@ describe("real-encoding budget guards", () => {
         { model, modelContextLimit: 10000 }
       ).catch((error: unknown) => error)
     ).toBe(failure);
+  });
+});
+
+describe("Claude tokenizer correction (#5219)", () => {
+  // A tool-heavy request whose provider input tokens were recorded with Anthropic count_tokens.
+  const tools = Object.fromEntries(
+    calibration.request.tools.map((t) => [
+      t.name,
+      tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
+    ])
+  );
+  const payload = {
+    system: calibration.request.system,
+    messages: calibration.request.messages,
+    tools,
+  };
+  const estimate = async (
+    target: string,
+    request: AssembledRequestBudgetInput = payload,
+    metadataModel?: string
+  ) =>
+    (
+      await estimateAssembledRequestTokensForModel(request, {
+        model: target,
+        metadataModel,
+        modelContextLimit: 10_000_000,
+      })
+    )?.estimate ?? Number.NaN;
+
+  test.each([
+    ["anthropic:claude-opus-5-5", calibration.providerInputTokens["claude-opus-5-5"]],
+    ["anthropic:claude-sonnet-4-6", calibration.providerInputTokens["claude-sonnet-4-6"]],
+  ])("%s estimate stays at or above the provider count", async (target, providerTokens) => {
+    expect(await estimate(target)).toBeGreaterThanOrEqual(providerTokens);
+  });
+
+  test("a new or unknown Claude id gets the new-tokenizer correction; older ids do not", async () => {
+    const newTokenizer = await estimate("anthropic:claude-opus-5-5");
+    expect(await estimate("anthropic:claude-zeta-9")).toBe(newTokenizer);
+    // A mapped custom model is corrected by its metadata model, like its tokenizer.
+    expect(
+      await estimate("openrouter:acme/house-model", payload, "anthropic:claude-opus-5-5")
+    ).toBe(newTokenizer);
+    const older = await estimate("anthropic:claude-sonnet-4-6");
+    expect(older).toBeLessThan(newTokenizer);
+    expect(await estimate("anthropic:claude-sonnet-4-5-20250929")).toBe(older);
+  });
+
+  test.each([
+    ["anthropic:claude-opus-5-5", calibration.smallToolsProviderTokens["claude-opus-5-5"]],
+    ["anthropic:claude-sonnet-4-6", calibration.smallToolsProviderTokens["claude-sonnet-4-6"]],
+  ])("%s tool framing covers the provider's per-tool cost", async (target, providerTokens) => {
+    const smallTools = Object.fromEntries(
+      calibration.smallTools.map((t) => [
+        t.name,
+        tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
+      ])
+    );
+    const bare = { messages: [{ role: "user", content: [{ type: "text", text: "x" }] }] };
+    const withTools = await estimate(target, { ...bare, tools: smallTools });
+    expect(withTools - (await estimate(target, bare))).toBeGreaterThanOrEqual(providerTokens);
   });
 });

@@ -15,10 +15,41 @@ import {
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import {
+  CLAUDE_TOOL_OVERHEAD_TOKENS,
+  NEW_CLAUDE_TOKENIZER_RATIO,
+  OLDER_CLAUDE_TOKENIZER_MODEL_ID,
+} from "@/constants/tokenizerCorrection";
 
 interface BudgetModel {
   model: string;
   metadataModel?: string;
+}
+
+interface TokenizerCorrection {
+  /** Multiplier on the locally encoded token count. */
+  ratio: number;
+  /** Provider framing per advertised tool, beyond the encoded schema JSON. */
+  perToolTokens: number;
+}
+
+const NO_CORRECTION: TokenizerCorrection = { ratio: 1, perToolTokens: 0 };
+
+/**
+ * Newer Claude models count 1.33-1.55x the local `claude` encoding, so an uncorrected estimate
+ * can let an over-window request past the guard (#5219). Resolved from the same model id the
+ * tokenizer uses (the metadata model when one is mapped), so a new or unknown Claude id gets the
+ * conservative ratio rather than none. Every Claude model pays the per-tool framing.
+ */
+function getTokenizerCorrection(model: BudgetModel): TokenizerCorrection {
+  const canonical = normalizeToCanonical(model.metadataModel ?? model.model);
+  const claudeId = /claude-[a-z0-9.-]*/i
+    .exec(canonical.slice(canonical.indexOf(":") + 1))?.[0]
+    ?.toLowerCase();
+  if (claudeId == null) return NO_CORRECTION;
+  const ratio = OLDER_CLAUDE_TOKENIZER_MODEL_ID.test(claudeId) ? 1 : NEW_CLAUDE_TOKENIZER_RATIO;
+  return { ratio, perToolTokens: CLAUDE_TOOL_OVERHEAD_TOKENS };
 }
 
 /**
@@ -30,12 +61,17 @@ async function countBudgetInput(
   input: BudgetTokenCountInput,
   model: BudgetModel,
   framing: number,
-  ceiling?: number
+  ceiling?: number,
+  toolCount = 0
 ): Promise<number> {
   const tokenizer = await getTokenizerForModel(model.model, model.metadataModel, {
     requireRealEncoding: true,
   });
   assert(tokenizer.encoding !== "approx-4", "A hard budget guard requires a real encoding");
+  const correction = getTokenizerCorrection(model);
+  const fixed = input.fixedTokens + framing + correction.perToolTokens * toolCount;
+  // The ratio scales encoded text only: fixedTokens already charges one token per omitted byte.
+  const corrected = (encoded: number) => Math.ceil(encoded * correction.ratio) + fixed;
   let encoded = 0;
   let chunks = 0;
   for (let start = 0; start < input.text.length; ) {
@@ -47,12 +83,12 @@ async function countBudgetInput(
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
     // This early exit returns a lower bound, not an exact request size.
-    if (ceiling != null && encoded + input.fixedTokens + framing > ceiling) return ceiling + 1;
+    if (ceiling != null && corrected(encoded) > ceiling) return ceiling + 1;
     start = end;
   }
   // Retain existing conservative ASCII estimates while correcting token-dense text.
   // Encoding failures propagate; never fall back silently to chars-per-token.
-  return Math.max(input.heuristicTokens, encoded + input.fixedTokens + framing);
+  return Math.max(input.heuristicTokens, corrected(encoded));
 }
 
 export function estimateFreshRequestTokensForModel(
@@ -100,13 +136,14 @@ export async function estimateAssembledRequestTokensForModel(
             payload.tools && name in payload.tools ? [[name, payload.tools[name]]] : []
           )
         );
-  const framing =
-    REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + Object.keys(tools ?? {}).length);
+  const toolCount = Object.keys(tools ?? {}).length;
+  const framing = REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + toolCount);
   const estimate = await countBudgetInput(
     prepareAssembledRequestTokenCount({ ...payload, tools }),
     options,
     framing,
-    hardCeiling
+    hardCeiling,
+    toolCount
   );
   return { estimate, hardCeiling };
 }
