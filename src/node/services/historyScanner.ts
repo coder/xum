@@ -830,7 +830,7 @@ interface ActiveEpochRow {
 /**
  * Visit the active epoch newest first and return its visited rows (newest first) plus whether the
  * scan reached the epoch start. Reads chat.jsonl, then the archive only while chat.jsonl has no
- * start and no stop was requested, exactly like scanProviderHistory. The stop request is kept
+ * start and no stop was honored, like scanProviderHistory. The stop request is kept
  * monotonic here: once `visit` returns true it stays requested until the locator can honor it
  * (right after a readable row), so rows visited after the request must be trimmed by the caller.
  * Every returned row is part of readProviderHistory(paths), and the returned rows are always a
@@ -870,12 +870,10 @@ async function scanActiveEpochNewestFirst(
     onBytesRead?.(oldestStart === null ? 0 : file.size - Math.max(from, oldestStart));
     if (location.kind === "start") return { rows, reachedEpochStart: true };
     if (location.kind === "stopped") return { rows, reachedEpochStart: false };
-    if (stopRequested) {
-      // Exhausted while the stop waited for a readable row: the archive may still hold older
-      // rows of this epoch, which the caller did not ask for.
-      const archive = artifact === "chat" ? files.get("archive") : undefined;
-      return { rows, reachedEpochStart: archive === undefined || archive.size === 0 };
-    }
+    // Exhausted, possibly with a stop still waiting for a readable row (e.g. requested on a
+    // malformed row): continue into the archive, where the sticky request is honored after its
+    // first readable row. Callers trim rows visited after their cut, and a cut decided on rows
+    // that parsed to nothing still needs that older readable row.
   }
   return { rows, reachedEpochStart: true };
 }

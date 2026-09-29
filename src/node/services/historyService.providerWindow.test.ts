@@ -208,6 +208,26 @@ describe("HistoryService bounded active-epoch reads", () => {
 
       const chatOnly = await window(ws, { maxRows: 2, maxBytes: BIG, ...UNBOUNDED_EXTENSION });
       expect(ids(chatOnly.messages)).toEqual(ids(fullRead.slice(-4)));
+
+      // chat.jsonl holds only malformed oversized rows: the scan counts the newest one toward the
+      // cap and requests its stop on the older one, which cannot honor it (unreadable). The scan
+      // must continue into the archive instead of returning nothing.
+      const malformedChatWs = "window-archive-malformed-chat";
+      const malformed = `{"broken": "${"y".repeat(OVERSIZED)}`;
+      await writeLayout(
+        malformedChatWs,
+        [row("u0", "user", 0), boundary("b1", 1, 1), row("u2", "user", 2), ...assistants(3, 5)],
+        [malformed, malformed]
+      );
+      const acrossSplit = await window(malformedChatWs, {
+        maxRows: 1,
+        maxBytes: BIG,
+        extensionMaxRows: 0,
+        extensionMaxBytes: 0,
+      });
+      expect(ids(acrossSplit.messages)).toEqual(["a1005"]);
+      expect(acrossSplit.reachedEpochStart).toBe(false);
+      expectSuffix(await full(malformedChatWs), acrossSplit.messages);
     });
 
     test("keeps oversized rows and skips malformed rows inside the window", async () => {
