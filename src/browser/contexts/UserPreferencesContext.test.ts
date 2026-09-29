@@ -176,6 +176,29 @@ describe("UserPreferencesProvider bridge helpers", () => {
     expect(JSON.parse(storage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe("last-workspace");
   });
 
+  // Production passes no storage: writes must be routed to the helpers because the default storage
+  // is the (write-refusing) persisted-state view, recognized by identity.
+  test("hydrates into the real localStorage through the default persisted-state view", async () => {
+    const cleanupDom = installDom();
+    try {
+      await hydrateUserPreferencesLocalCache({
+        configClient: {
+          getConfig: () =>
+            Promise.resolve({
+              userPreferences: { navigation: { launchBehavior: "last-workspace" } },
+            }),
+          saveConfig: () => Promise.resolve(),
+        },
+      });
+
+      expect(JSON.parse(window.localStorage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe(
+        "last-workspace"
+      );
+    } finally {
+      cleanupDom();
+    }
+  });
+
   test("does not backfill stale local cache after backend preferences are initialized", async () => {
     const storage = new MemoryStorage();
     storage.setJSON(UI_THEME_KEY, "dark");
