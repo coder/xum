@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { DelegatedCreationInterruptedNotice } from "./DelegatedCreationInterruptedBanner";
 
@@ -11,6 +11,9 @@ const meta = {
   ...lightweightMeta,
   title: "App/Chat/Components/DelegatedCreationInterruptedBanner",
   component: DelegatedCreationInterruptedNotice,
+  // Kept out of Pixel snapshots (the repo's snapshot budget is full); the Phone play below still
+  // checks the narrow layout, and the PR carries desktop and 390 px screenshots of the real app.
+  parameters: { ...lightweightMeta.parameters, pixel: PIXEL_DISABLED },
   args: {
     workspaceId: "orphan",
     workspaceName: "fix-login-redirect",
@@ -37,7 +40,6 @@ export const Default: Story = {};
 /** The actions wrap instead of overflowing on a phone. */
 export const Phone: Story = {
   globals: { viewport: { value: "phone390", isRotated: false } },
-  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   render: (args) => (
     <APIProvider client={client}>
       {/* The test-runner applies no viewport: force the phone width here. */}
