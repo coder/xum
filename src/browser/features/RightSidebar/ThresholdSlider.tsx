@@ -125,12 +125,19 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
 
     const apply = (pct: number) => applyThreshold(pct, config.setThreshold);
 
-    apply(calcPercent(e.clientX));
+    // The handle sits at the effective (possibly clamped) threshold, not the stored one, so a
+    // press alone must not persist: a stored 90% shown at 85.6% would otherwise save 85%.
+    // Persist only once the drag leaves the snap step it started in.
+    const startPercent = calcPercent(e.clientX);
+    let moved = false;
 
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== pointerId) return;
       ev.preventDefault();
-      apply(calcPercent(ev.clientX));
+      const pct = calcPercent(ev.clientX);
+      if (!moved && pct === startPercent) return;
+      moved = true;
+      apply(pct);
     };
 
     const onUp = (ev: PointerEvent) => {
