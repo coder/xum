@@ -92,8 +92,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      # No `bun install`: the report script uses only Bun/Node built-ins and a dependency-free src
-      # module, so no project dependency code runs in this job.
+      # No `bun install`: the report script uses only Bun/Node built-ins and the dependency-free
+      # core module next to it, so no project dependency code runs in this job.
       - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
         with:
           bun-version: 1.3.5

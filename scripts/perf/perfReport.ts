@@ -17,9 +17,11 @@ import { parseArgs } from "node:util";
 import { Glob } from "bun";
 import {
   buildReport,
+  formatLogLine,
   parsePlaywrightResults,
   readScenario,
   renderSummary,
+  sanitizeForLog,
   type PlaywrightResults,
   type ScenarioRead,
 } from "./perfReportCore";
@@ -99,16 +101,20 @@ function main(): void {
   const markdown = renderSummary({ runUrl, perfResult: values["perf-result"], report });
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
   if (summaryPath) appendFileSync(summaryPath, markdown);
-  else console.log(markdown);
-  // One log line so the job log shows the verdict without opening the summary. The step still
-  // exits 0: the perf job's own result already marks a failed run red.
-  console.error(
-    report.problems.length > 0
-      ? `perf report: problems (${report.problems.map((problem) => problem.key).join(", ")})`
-      : "perf report: healthy"
-  );
+  // In GitHub Actions stdout is the job log, which parses workflow commands, so the Markdown (it
+  // holds artifact text) goes only to the step summary. Local runs print it.
+  else if (process.env.GITHUB_ACTIONS !== "true") console.log(markdown);
+  // One counts-only log line so the job log shows the verdict without opening the summary. The
+  // step still exits 0: the perf job's own result already marks a failed run red.
+  console.error(formatLogLine(report));
 }
 
 if (import.meta.main) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    // The message may quote artifact text (a path, a parse error), so it is sanitized for the log.
+    console.error(`perf report: crashed: ${sanitizeForLog(errorMessage(error))}`);
+    process.exit(1);
+  }
 }

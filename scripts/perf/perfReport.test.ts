@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildReport,
+  formatLogLine,
+  METRICS,
   parsePlaywrightResults,
   readScenario,
   renderSummary,
-  sanitizeInline,
+  sanitizeForLog,
+  type MetricId,
   type PlaywrightResults,
+  type Report,
   type ReportInput,
+  type ScenarioRead,
 } from "./perfReportCore";
 
 const SPEC = "/home/runner/work/xum/xum/tests/e2e/scenarios/perf.chatTyping.spec.ts";
@@ -37,29 +42,45 @@ function summary(
   };
 }
 
-/** Playwright JSON results for one test with the given per-attempt statuses. */
-function results(status: string, attempts: number, error?: string): PlaywrightResults {
+interface SpecFixture {
+  file: string;
+  title: string;
+  status?: string;
+  attempts?: number;
+  error?: string;
+}
+
+/** Playwright JSON results; each spec has one test with `attempts` results (retry 0..n-1). */
+function playwright(specs: SpecFixture[]): PlaywrightResults {
   return parsePlaywrightResults({
-    suites: [
-      {
-        file: "scenarios/perf.chatTyping.spec.ts",
+    suites: specs.map((spec) => {
+      const attempts = spec.attempts ?? 1;
+      return {
+        file: spec.file,
         specs: [
           {
-            title: TITLE,
+            title: spec.title,
             tests: [
               {
-                status,
+                status: spec.status ?? "expected",
                 results: Array.from({ length: attempts }, (_, retry) => ({
                   retry,
-                  error: error && retry === attempts - 1 ? { message: error } : undefined,
+                  error: spec.error && retry === attempts - 1 ? { message: spec.error } : undefined,
                 })),
               },
             ],
           },
         ],
-      },
-    ],
+      };
+    }),
   });
+}
+
+/** Playwright JSON results for the chat-typing test with the given outcome. */
+function results(status: string, attempts: number, error?: string): PlaywrightResults {
+  return playwright([
+    { file: "scenarios/perf.chatTyping.spec.ts", title: TITLE, status, attempts, error },
+  ]);
 }
 
 function input(overrides: Partial<ReportInput> = {}): ReportInput {
@@ -76,16 +97,48 @@ function keys(report: ReturnType<typeof buildReport>): string[] {
   return report.problems.map((problem) => problem.key);
 }
 
+function metricValues(read: ScenarioRead): Partial<Record<MetricId, number>> {
+  if (!read.ok || !read.metrics.ok) throw new Error("expected usable metrics");
+  return read.metrics.values;
+}
+
+function metricColumn(id: MetricId): number {
+  return METRICS.findIndex((spec) => spec.id === id);
+}
+
+function render(report: Report): string {
+  return renderSummary({ runUrl: "https://example.test/run", perfResult: "success", report });
+}
+
+/** Body rows (cells, trimmed) of the table under `### <heading>`; [] when the section is absent. */
+function tableRows(markdown: string, heading: string): string[][] {
+  const lines = markdown.split("\n");
+  const start = lines.indexOf(`### ${heading}`);
+  if (start === -1) return [];
+  const rows: string[][] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.startsWith("### ")) break;
+    if (line.startsWith("|"))
+      rows.push(
+        line
+          .split("|")
+          .slice(1, -1)
+          .map((cell) => cell.trim())
+      );
+  }
+  return rows.slice(2); // header and separator
+}
+
 describe("readScenario", () => {
   test("extracts metrics and removes DevTools overhead from task time", () => {
     const read = readScenario(summary(), { sampleCount: 26 });
     expect(read).toMatchObject({ ok: true, testKey: KEY, retry: 0 });
-    if (!read.ok) return;
-    expect(read.values.scriptMs).toBeCloseTo(400);
-    expect(read.values.taskMs).toBeCloseTo(500);
-    expect(read.values.heapMb).toBeCloseTo(77);
-    expect(read.values.reactRenders).toBe(26);
-    expect("hunkStepMedianMs" in read.values).toBe(false);
+    const values = metricValues(read);
+    expect(values.scriptMs).toBeCloseTo(400);
+    expect(values.taskMs).toBeCloseTo(500);
+    expect(values.heapMb).toBeCloseTo(77);
+    expect(values.reactRenders).toBe(26);
+    expect("hunkStepMedianMs" in values).toBe(false);
   });
 
   test("reads the hunk step median only when the scenario records it", () => {
@@ -93,7 +146,7 @@ describe("readScenario", () => {
       summary({ historyProfile: { iterationSummary: { medianMs: 5.3 } } }),
       undefined
     );
-    expect(read.ok && read.values.hunkStepMedianMs).toBe(5.3);
+    expect(metricValues(read).hunkStepMedianMs).toBe(5.3);
   });
 
   test("unusable summaries keep their test identity for attribution", () => {
@@ -103,9 +156,10 @@ describe("readScenario", () => {
       metrics: Record<string, number>;
     };
     const { DevToolsCommandDuration: _omitted, ...metrics } = chrome.metrics;
+    // Readable and attributable; whether its metrics are required depends on its siblings.
     const read = readScenario(summary({ chromeProfile: { ...chrome, metrics } }), undefined);
-    expect(read).toMatchObject({ ok: false, testKey: KEY, retry: 0 });
-    expect(!read.ok && read.reason).toContain("taskMs");
+    expect(read).toMatchObject({ ok: true, testKey: KEY, retry: 0, metrics: { ok: false } });
+    expect(read.ok && !read.metrics.ok && read.metrics.reason).toContain("taskMs");
 
     expect(readScenario(summary({ schemaVersion: 2 }), undefined)).toMatchObject({
       ok: false,
@@ -177,7 +231,9 @@ describe("buildReport attribution", () => {
     expect(report.problems).toEqual([]);
     expect(report.warnings).toEqual([]);
     expect(report.rows).toHaveLength(1);
-    expect(report.rows[0]).toMatchObject({ label: "chat-typing-large-history" });
+    expect(report.rows[0]?.scenarios.map((scenario) => scenario.label)).toEqual([
+      "chat-typing-large-history",
+    ]);
   });
 
   test("a flaky test uses its final attempt, never the earlier one", () => {
@@ -187,7 +243,7 @@ describe("buildReport attribution", () => {
     );
     const final = readScenario(summary({}, { retry: 1 }), undefined);
     const report = buildReport(input({ results: results("flaky", 2), reads: [final, first] }));
-    expect(report.rows[0]?.values?.wallMs).toBe(900);
+    expect(report.rows[0]?.scenarios[0]?.values?.wallMs).toBe(900);
     expect(report.problems).toEqual([]);
   });
 
@@ -196,13 +252,13 @@ describe("buildReport attribution", () => {
     const failed = buildReport(
       input({ results: results("unexpected", 2, "boom"), reads: [first] })
     );
-    expect(failed.rows[0]?.values).toBeUndefined();
+    expect(failed.rows[0]?.scenarios).toEqual([]);
     expect(failed.rows[0]?.unavailable).toBe("final attempt wrote no summary");
     expect(keys(failed)).toEqual([`test-failed:${KEY}`]);
 
     // A passed test whose final attempt wrote nothing is a harness problem of its own.
     const passed = buildReport(input({ results: results("flaky", 2), reads: [first] }));
-    expect(passed.rows[0]?.values).toBeUndefined();
+    expect(passed.rows[0]?.scenarios).toEqual([]);
     expect(keys(passed)).toEqual([`summary-missing:${KEY}`]);
   });
 
@@ -219,7 +275,7 @@ describe("buildReport attribution", () => {
   test("a failed test still shows the numbers its final attempt wrote", () => {
     // Threshold asserts run after the summary is written, so the final attempt's data is real.
     const report = buildReport(input({ results: results("unexpected", 1, "expected < 2500") }));
-    expect(report.rows[0]?.values?.wallMs).toBe(900);
+    expect(report.rows[0]?.scenarios[0]?.values?.wallMs).toBe(900);
     expect(keys(report)).toEqual([`test-failed:${KEY}`]);
   });
 
@@ -293,49 +349,336 @@ describe("renderSummary", () => {
       perfResult: "failure",
       report,
     });
-    const row = markdown.split("\n").find((line) => line.startsWith(`| \`${KEY}`)) ?? "";
-    expect(row.match(/\| unavailable /g)).toHaveLength(8);
+    const [row] = tableRows(markdown, "Scenario metrics");
+    expect(row?.slice(2)).toEqual(METRICS.map(() => "unavailable"));
 
     const ok = renderSummary({
       runUrl: "https://example.test/run",
       perfResult: "success",
       report: buildReport(input()),
     });
-    const okRow = ok.split("\n").find((line) => line.startsWith(`| \`${KEY}`)) ?? "";
+    const [okRow] = tableRows(ok, "Scenario metrics");
     expect(okRow).not.toContain("unavailable");
-    expect(okRow.trim().endsWith("| — |")).toBe(true); // no hunk step metric for this scenario
+    expect(okRow?.[2 + metricColumn("hunkStepMedianMs")]).toBe("—"); // not recorded by this scenario
+  });
+});
+
+const CHAT_SWITCH_SPEC = "/home/runner/work/xum/xum/tests/e2e/scenarios/perf.chatSwitch.spec.ts";
+const CHAT_SWITCH_TITLE = "perf: switch back to chats left mid-stream";
+const CHAT_SWITCH_KEY = `perf.chatSwitch.spec.ts › ${CHAT_SWITCH_TITLE}`;
+
+function legMedians(firstRowFromClickMs: number | null): Record<string, number | null> {
+  return {
+    count: 3,
+    "dom.firstRowFromClickMs": firstRowFromClickMs,
+    "renderer.firstRowMs": 91.5,
+    "renderer.caughtUpMs": 47.4,
+    "dom.longestTaskMs": 0,
+    "server.totalMs": 19.4,
+    "server.sentRowCount": 24,
+  };
+}
+
+/** The chat-switch primary summary: a `chatSwitch` object plus full Chrome metrics. */
+function chatSwitchSummary(chatSwitch: unknown, retry = 0): Record<string, unknown> {
+  return summary(
+    { runLabel: "chat-switch-mid-stream", chatSwitch },
+    { title: CHAT_SWITCH_TITLE, file: CHAT_SWITCH_SPEC, retry }
+  );
+}
+
+/** The server-window companion: same test and attempt, profile only, no Chrome `metrics` key. */
+function companionSummary(retry = 0): Record<string, unknown> {
+  return summary(
+    { runLabel: "chat-switch-mid-stream-server-window", chromeProfile: { wallTimeMs: 68580 } },
+    { title: CHAT_SWITCH_TITLE, file: CHAT_SWITCH_SPEC, retry }
+  );
+}
+
+function chatSwitchReport(chatSwitch: unknown, extra: ScenarioRead[] = []): Report {
+  return buildReport(
+    input({
+      results: playwright([
+        { file: "scenarios/perf.chatSwitch.spec.ts", title: CHAT_SWITCH_TITLE },
+      ]),
+      reads: [readScenario(chatSwitchSummary(chatSwitch), undefined), ...extra],
+    })
+  );
+}
+
+describe("chat-switch scenarios", () => {
+  test("a primary and a metrics-less companion are one test with two scenarios, outside the metrics table", () => {
+    const report = chatSwitchReport({ medians: { "cold-open-small": legMedians(105.4) } }, [
+      readScenario(companionSummary(), undefined),
+    ]);
+    expect(report.problems).toEqual([]);
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]?.scenarios.map((scenario) => scenario.label)).toEqual([
+      "chat-switch-mid-stream",
+      "chat-switch-mid-stream-server-window",
+    ]);
+    const markdown = render(report);
+    expect(tableRows(markdown, "Tests")).toHaveLength(1);
+    expect(tableRows(markdown, "Scenario metrics")).toEqual([]);
+    expect(tableRows(markdown, "Chat switch")).toHaveLength(1);
   });
 
-  test("crafted labels and errors cannot inject HTML or break the table", () => {
-    const hostile = "</details><img src=x onerror=alert(1)>|`@org/team`\nnext";
-    const read = readScenario(summary({ runLabel: hostile }, { title: hostile }), undefined);
-    const hostileResults = parsePlaywrightResults({
-      suites: [
-        {
-          file: "perf.chatTyping.spec.ts",
-          specs: [
+  test("rows are one per leg × transport in known order, unknown and hostile keys sanitized after", () => {
+    const report = chatSwitchReport({
+      medians: {},
+      // Insertion order is scrambled on purpose; the table order must not depend on it.
+      mediansByTransport: {
+        "Evil|`<b>`::warning::x": {
+          "switch-back-small": legMedians(1),
+          "cold-open-small": legMedians(6),
+        },
+        "server-window": {
+          "switch-back-xl": legMedians(2),
+          "cold-open-small": legMedians(3),
+        },
+        "in-process": {
+          "zz-new-leg": legMedians(4),
+          "cold-open-xl": legMedians(5),
+          "cold-open-large": legMedians(9),
+          "cold-open-small": legMedians(null),
+        },
+      },
+    });
+    expect(report.problems).toEqual([]);
+    const rows = tableRows(render(report), "Chat switch");
+    expect(rows.map((row) => [row[1], row[2]])).toEqual([
+      ["`cold-open-small`", "`in-process`"],
+      ["`cold-open-small`", "`server-window`"],
+      ["`cold-open-small`", "`evil-b-warning-x`"],
+      ["`cold-open-large`", "`in-process`"],
+      ["`cold-open-xl`", "`in-process`"],
+      ["`switch-back-small`", "`evil-b-warning-x`"],
+      ["`switch-back-xl`", "`server-window`"],
+      ["`zz-new-leg`", "`in-process`"],
+    ]);
+    // A null median renders as a dash; the other medians of that row still show.
+    expect(rows[0]?.slice(3, 5)).toEqual(["3", "—"]);
+    expect(rows[1]?.[4]).toBe("3.0");
+  });
+
+  test("older files without mediansByTransport report their medians as in-process", () => {
+    const rows = tableRows(
+      render(
+        chatSwitchReport({
+          medians: { "switch-back-large": legMedians(7), "cold-open-large": legMedians(8) },
+        })
+      ),
+      "Chat switch"
+    );
+    expect(rows.map((row) => [row[1], row[2]])).toEqual([
+      ["`cold-open-large`", "`in-process`"],
+      ["`switch-back-large`", "`in-process`"],
+    ]);
+  });
+
+  test.each([
+    ["not an object", "medians"],
+    ["medians not an object", { medians: [1, 2] }],
+    ["mediansByTransport not an object", { medians: {}, mediansByTransport: "x" }],
+    ["transport medians not an object", { medians: {}, mediansByTransport: { "in-process": 5 } }],
+    ["leg medians not an object", { medians: { "cold-open-small": null } }],
+  ])("a malformed chatSwitch (%s) is a problem for the final attempt", (_case, chatSwitch) => {
+    const report = chatSwitchReport(chatSwitch, [readScenario(companionSummary(), undefined)]);
+    expect(keys(report)).toEqual([`chat-switch-invalid:${CHAT_SWITCH_KEY}`]);
+    // The companion is still reported; it never needs Chrome metrics.
+    expect(report.rows[0]?.scenarios.map((scenario) => scenario.label)).toEqual([
+      "chat-switch-mid-stream-server-window",
+    ]);
+  });
+
+  test("an earlier attempt's chat-switch summaries are never used", () => {
+    const report = buildReport(
+      input({
+        results: playwright([
+          {
+            file: "perf.chatSwitch.spec.ts",
+            title: CHAT_SWITCH_TITLE,
+            status: "flaky",
+            attempts: 2,
+          },
+        ]),
+        reads: [
+          readScenario(
+            chatSwitchSummary({ medians: { "cold-open-small": legMedians(1) } }),
+            undefined
+          ),
+          readScenario(companionSummary(), undefined),
+        ],
+      })
+    );
+    expect(keys(report)).toEqual([`summary-missing:${CHAT_SWITCH_KEY}`]);
+    expect(report.rows[0]?.scenarios).toEqual([]);
+    expect(tableRows(render(report), "Chat switch")).toEqual([]);
+  });
+});
+
+describe("workspace-open milestones", () => {
+  test("milestones show for scenarios that record them and a dash otherwise", () => {
+    const WORKSPACE_TITLE = "perf: open workspace";
+    const WORKSPACE_SPEC = "/w/tests/e2e/scenarios/perf.workspaceOpen.spec.ts";
+    const withMilestones = summary(
+      {
+        runLabel: "workspace-open-small",
+        milestones: { firstMessageMs: 459.5, fullyLoadedMs: 612.2, longestTaskMs: 93 },
+      },
+      { title: WORKSPACE_TITLE, file: WORKSPACE_SPEC }
+    );
+    const nullMilestones = summary(
+      { runLabel: "workspace-open-large", milestones: null },
+      { title: `${WORKSPACE_TITLE} large`, file: WORKSPACE_SPEC }
+    );
+    const report = buildReport(
+      input({
+        results: playwright([
+          { file: "scenarios/perf.chatTyping.spec.ts", title: TITLE },
+          { file: "scenarios/perf.workspaceOpen.spec.ts", title: WORKSPACE_TITLE },
+          { file: "scenarios/perf.workspaceOpen.spec.ts", title: `${WORKSPACE_TITLE} large` },
+        ]),
+        reads: [
+          readScenario(summary(), undefined),
+          readScenario(withMilestones, undefined),
+          readScenario(nullMilestones, undefined),
+        ],
+      })
+    );
+    expect(report.problems).toEqual([]);
+    const milestoneCells = (row: string[] | undefined) =>
+      (["firstMessageMs", "fullyLoadedMs", "longestTaskMs"] as const).map(
+        (id) => row?.[2 + metricColumn(id)]
+      );
+    const rows = tableRows(render(report), "Scenario metrics");
+    expect(rows.map(milestoneCells)).toEqual([
+      ["—", "—", "—"],
+      ["460", "612", "93"],
+      ["—", "—", "—"],
+    ]);
+  });
+});
+
+describe("sink safety", () => {
+  // Workflow commands, their %-encoded newline form, terminal escapes and line breaks.
+  const CRAFTED = [
+    "::warning::x",
+    "::add-mask::secret",
+    "::stop-commands::tok",
+    "%0A::error::y",
+    ":::group:::z",
+    "\u001b[31mred\u001b[0m",
+    "\u001b]0;title\u0007",
+    "\u001bcreset",
+    "\u009b2Jclear",
+    "cr\rlf\ntab\tnel\u0085ls\u2028ps\u2029end",
+  ];
+  const HOSTILE = `${CRAFTED.join(" ")} </details><img src=x onerror=alert(1)>|\`@org/team\``;
+  const LONG_TITLE = `${HOSTILE} ${"x".repeat(5000)}`;
+  const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+  function hostileReport(): Report {
+    const file = "perf.hostile.spec.ts";
+    return buildReport(
+      input({
+        perfResult: "failure",
+        results: parsePlaywrightResults({
+          suites: [
             {
-              title: hostile,
-              tests: [
-                { status: "unexpected", results: [{ retry: 0, error: { message: hostile } }] },
+              file,
+              specs: [
+                {
+                  title: LONG_TITLE,
+                  tests: [
+                    { status: "unexpected", results: [{ retry: 0, error: { message: HOSTILE } }] },
+                  ],
+                },
+                { title: HOSTILE, tests: [{ status: "expected", results: [{ retry: 0 }] }] },
+                {
+                  title: `${HOSTILE} flaky`,
+                  tests: [{ status: "flaky", results: [{ retry: 0 }, { retry: 1 }] }],
+                },
               ],
             },
           ],
-        },
-      ],
-    });
-    const report = buildReport(input({ results: hostileResults, reads: [read] }));
-    const markdown = renderSummary({
-      runUrl: "https://example.test/run",
-      perfResult: "failure",
-      report,
-    });
+          errors: [{ message: HOSTILE }],
+        }),
+        reads: [
+          readScenario(summary({ runLabel: HOSTILE }, { title: LONG_TITLE, file }), undefined),
+          readScenario(
+            summary(
+              {
+                runLabel: HOSTILE,
+                chatSwitch: {
+                  medians: {},
+                  mediansByTransport: { [HOSTILE]: { [HOSTILE]: legMedians(1) } },
+                },
+              },
+              { title: HOSTILE, file }
+            ),
+            undefined
+          ),
+          readScenario(
+            summary(
+              { runLabel: HOSTILE, schemaVersion: 2 },
+              { title: `${HOSTILE} flaky`, file, retry: 1 }
+            ),
+            undefined
+          ),
+          readScenario(
+            summary({ runLabel: HOSTILE }, { title: `stray ${HOSTILE}`, file }),
+            undefined
+          ),
+        ],
+      })
+    );
+  }
+
+  test("the job log line carries counts only, never artifact text", () => {
+    const report = hostileReport();
+    expect(report.problems.length).toBeGreaterThan(0);
+    expect(report.warnings.length).toBeGreaterThan(0);
+    const line = formatLogLine(report);
+    expect(line).not.toContain("::");
+    expect(line).not.toMatch(CONTROL);
+    for (const token of [
+      "warning::",
+      "add-mask",
+      "secret",
+      "stop-commands",
+      "tok",
+      "%0A",
+      "error",
+      "red",
+      "title",
+      "img",
+      "x".repeat(20),
+    ]) {
+      expect(line).not.toContain(token);
+    }
+  });
+
+  test.each([...CRAFTED, HOSTILE, LONG_TITLE])("sanitizeForLog neutralizes %#", (text) => {
+    const cleaned = sanitizeForLog(text);
+    expect(cleaned).not.toMatch(CONTROL);
+    expect(cleaned).not.toContain("::");
+    expect(cleaned.length).toBeLessThanOrEqual(200);
+  });
+
+  test("the summary has no escapes, HTML or broken tables, and long titles are truncated in their cell", () => {
+    const markdown = render(hostileReport());
+    expect(markdown).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]/);
     expect(markdown).not.toMatch(/[<>]/);
-    const rows = markdown.split("\n").filter((line) => line.startsWith("| "));
-    expect(new Set(rows.map((row) => row.split("|").length)).size).toBe(1);
     for (const line of markdown.split("\n").filter((l) => l.startsWith("- "))) {
       expect((line.match(/`/g) ?? []).length % 2).toBe(0);
     }
-    expect(sanitizeInline("x".repeat(500)).length).toBe(160);
+    for (const heading of ["Tests", "Scenario metrics", "Chat switch"]) {
+      const rows = tableRows(markdown, heading);
+      expect(rows.length).toBeGreaterThan(0);
+      expect(new Set(rows.map((row) => row.length)).size).toBe(1);
+      for (const cell of rows.flat()) expect(cell.length).toBeLessThanOrEqual(200);
+    }
+    expect(markdown).not.toContain("x".repeat(200));
   });
 });

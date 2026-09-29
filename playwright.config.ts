@@ -2,7 +2,7 @@ import { defineConfig, type ReporterDescription } from "@playwright/test";
 import { resolveXumEnvironmentValue } from "./src/common/compat/xumEnv";
 
 const isCI = process.env.CI === "true";
-// Perf runs also write per-test outcomes for the nightly trend report (scripts/perf/perfTrend.ts).
+// Perf runs also write per-test outcomes for the nightly perf report (scripts/perf/perfReport.ts).
 // artifacts/perf/ is already uploaded by perf-profiles.yml and is not cleaned by Playwright.
 const perfResultsReporter: ReporterDescription[] =
   resolveXumEnvironmentValue("E2E_RUN_PERF", process.env) === "1"

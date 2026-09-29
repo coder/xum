@@ -6,7 +6,13 @@
  *
  * Attribution rule: a scenario's numbers come from its test's final attempt only. When the final
  * attempt wrote no usable summary, the row shows "unavailable". An earlier attempt's numbers are
- * never used instead, because the final attempt is the one that decided the run.
+ * never used instead, because the final attempt is the one that decided the run. One test may
+ * write several summaries in its final attempt (the chat-switch test writes a server-window
+ * companion); each becomes its own scenario.
+ *
+ * Artifact text is untrusted: it only goes into the Markdown summary, sanitized inside code spans.
+ * The job log gets a counts-only line (`formatLogLine`) or a sanitized crash message
+ * (`sanitizeForLog`), so a crafted test title cannot inject workflow commands.
  *
  * Pure logic only; the CLI next to it (`perfReport.ts`) does the file I/O. CI runs every test file
  * under `scripts/` as a tooling test and typechecks it (with this module) via
@@ -22,13 +28,16 @@ export type MetricId =
   | "styleRecalcs"
   | "reactRenders"
   | "heapMb"
-  | "hunkStepMedianMs";
+  | "hunkStepMedianMs"
+  | "firstMessageMs"
+  | "fullyLoadedMs"
+  | "longestTaskMs";
 
 export interface MetricSpec {
   id: MetricId;
   label: string;
   decimals: number;
-  /** Every summary must provide it; otherwise the summary is unusable. */
+  /** Every non-chat-switch summary must provide it; otherwise the summary is unusable. */
   required: boolean;
 }
 
@@ -44,14 +53,52 @@ export const METRICS: readonly MetricSpec[] = [
   { id: "heapMb", label: "Heap MB", decimals: 0, required: true },
   // Only the immersive-review hunk iteration scenario records it.
   { id: "hunkStepMedianMs", label: "Hunk step ms", decimals: 1, required: false },
+  // Page milestones (`milestones` in perf-summary.json); only workspace-open scenarios record them.
+  { id: "firstMessageMs", label: "First message ms", decimals: 0, required: false },
+  { id: "fullyLoadedMs", label: "Fully loaded ms", decimals: 0, required: false },
+  { id: "longestTaskMs", label: "Longest task ms", decimals: 0, required: false },
 ];
+
+/** Leg medians shown for chat-switch scenarios (keys of `chatSwitch.mediansByTransport[t][leg]`). */
+export const CHAT_SWITCH_METRICS = [
+  { key: "dom.firstRowFromClickMs", label: "Click to first row ms", decimals: 1 },
+  { key: "renderer.firstRowMs", label: "Renderer first row ms", decimals: 1 },
+  { key: "renderer.caughtUpMs", label: "Caught up ms", decimals: 1 },
+  { key: "dom.longestTaskMs", label: "Longest task ms", decimals: 0 },
+  { key: "server.totalMs", label: "Server replay ms", decimals: 1 },
+  { key: "server.sentRowCount", label: "Rows sent", decimals: 0 },
+] as const;
+
+export type ChatSwitchMetricKey = (typeof CHAT_SWITCH_METRICS)[number]["key"];
+
+// Known orders (tests/e2e/utils/chatSwitchSummary.ts); unknown keys sort after these by name.
+const CHAT_SWITCH_LEGS: readonly string[] = [
+  "cold-open-small",
+  "cold-open-large",
+  "cold-open-xl",
+  "switch-back-small",
+  "switch-back-large",
+  "switch-back-xl",
+];
+const CHAT_SWITCH_TRANSPORTS: readonly string[] = ["in-process", "server-window"];
 
 // ---------------------------------------------------------------------------
 // Sanitizing: every string taken from an artifact is untrusted.
 // ---------------------------------------------------------------------------
 
-const ANSI_ESCAPE = new RegExp(String.raw`\u001b\[[0-9;?]*[ -/]*[@-~]`, "g");
-const CONTROL_CHARS = new RegExp(String.raw`[\u0000-\u001f\u007f]`, "g");
+// OSC sequences (ESC ] ... BEL or ESC \), then CSI (ESC [ or C1 CSI) and two-character ESC
+// sequences. Anything left over is removed as a control character below.
+const ANSI_ESCAPE = new RegExp(
+  String.raw`\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[\u001b\u009b]\[?[0-9;?]*[ -/]*[@-~]`,
+  "g"
+);
+// C0, DEL, C1 (incl. U+0085 NEL) and the Unicode line/paragraph separators.
+const CONTROL_CHARS = new RegExp(String.raw`[\u0000-\u001f\u007f-\u009f\u2028\u2029]`, "g");
+
+function truncate(text: string, maxLength: number): string {
+  if (text.length === 0) return "(empty)";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
 
 /**
  * Make untrusted text safe for a Markdown inline code span inside a table: no ANSI or control
@@ -65,11 +112,26 @@ export function sanitizeInline(text: string, maxLength = 160): string {
     .replace(/[`<>|]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (cleaned.length === 0) return "(empty)";
-  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 1)}…` : cleaned;
+  return truncate(cleaned, maxLength);
 }
 
-/** Scenario labels become table cells, so restrict them to a safe alphabet. */
+/**
+ * Make untrusted text safe for one job-log line. The runner parses stdout/stderr lines for
+ * workflow commands (`::warning::`, `::add-mask::`, `::stop-commands::`), so every `::` gets a
+ * space between its colons, after control characters and escape sequences are gone (removing them
+ * could otherwise join two colons). Single line, at most `maxLength` characters.
+ */
+export function sanitizeForLog(text: string, maxLength = 200): string {
+  const cleaned = text
+    .replace(ANSI_ESCAPE, "")
+    .replace(CONTROL_CHARS, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/:(?=:)/g, ": ");
+  return truncate(cleaned, maxLength);
+}
+
+/** Scenario labels, legs and transports become table cells, so restrict them to a safe alphabet. */
 export function sanitizeLabel(label: string): string {
   const cleaned = label
     .toLowerCase()
@@ -114,16 +176,142 @@ export interface ScenarioIdentity {
   retry?: number;
 }
 
-export type ScenarioRead =
-  | ({ ok: true; values: Partial<Record<MetricId, number>> } & ScenarioIdentity & {
-        testKey: string;
-        retry: number;
-      })
-  | ({ ok: false; reason: string } & ScenarioIdentity);
+export type MetricsRead =
+  | { ok: true; values: Partial<Record<MetricId, number>> }
+  | { ok: false; reason: string };
+
+export interface ChatSwitchLegRow {
+  /** Sanitized transport key. */
+  transport: string;
+  /** Sanitized leg key. */
+  leg: string;
+  count?: number;
+  medians: Partial<Record<ChatSwitchMetricKey, number>>;
+}
+
+export type ChatSwitchRead = { ok: true; rows: ChatSwitchLegRow[] } | { ok: false; reason: string };
 
 /**
- * Validate one scenario's artifacts and extract its metrics. Bad data never throws: it comes back
- * as `{ ok: false }` (with whatever identity could be read) so it can be reported.
+ * `ok: true` means the summary is readable and attributable to a test attempt. Whether its Chrome
+ * metrics are required depends on its siblings (chat-switch tests skip them), so a metrics
+ * failure is carried in `metrics` and judged by `buildReport`.
+ */
+export type ScenarioRead =
+  | ({
+      ok: true;
+      metrics: MetricsRead;
+      /** Present when the summary has a `chatSwitch` key. */
+      chatSwitch?: ChatSwitchRead;
+    } & ScenarioIdentity & { testKey: string; retry: number })
+  | ({ ok: false; reason: string } & ScenarioIdentity);
+
+function orderIndex(order: readonly string[], key: string): number {
+  const index = order.indexOf(key);
+  return index === -1 ? order.length : index;
+}
+
+function compareChatSwitchRows(a: ChatSwitchLegRow, b: ChatSwitchLegRow): number {
+  return (
+    orderIndex(CHAT_SWITCH_LEGS, a.leg) - orderIndex(CHAT_SWITCH_LEGS, b.leg) ||
+    a.leg.localeCompare(b.leg) ||
+    orderIndex(CHAT_SWITCH_TRANSPORTS, a.transport) -
+      orderIndex(CHAT_SWITCH_TRANSPORTS, b.transport) ||
+    a.transport.localeCompare(b.transport)
+  );
+}
+
+/** One row per leg × transport from `chatSwitch` (tests/e2e/utils/chatSwitchSummary.ts). */
+function readChatSwitch(value: unknown): ChatSwitchRead {
+  if (!isRecord(value)) return { ok: false, reason: "chatSwitch is not an object" };
+  if (value.medians !== undefined && !isRecord(value.medians)) {
+    return { ok: false, reason: "chatSwitch.medians is not an object" };
+  }
+  let byTransport: Record<string, unknown>;
+  if (value.mediansByTransport === undefined || value.mediansByTransport === null) {
+    // Files from before server-window switches only have `medians`, which are in-process.
+    if (!isRecord(value.medians)) return { ok: false, reason: "chatSwitch has no medians" };
+    byTransport = { "in-process": value.medians };
+  } else if (isRecord(value.mediansByTransport)) {
+    byTransport = value.mediansByTransport;
+  } else {
+    return { ok: false, reason: "chatSwitch.mediansByTransport is not an object" };
+  }
+  const rows: ChatSwitchLegRow[] = [];
+  for (const [rawTransport, legs] of Object.entries(byTransport)) {
+    const transport = sanitizeLabel(rawTransport);
+    if (!isRecord(legs)) {
+      return { ok: false, reason: `chatSwitch medians for ${transport} are not an object` };
+    }
+    for (const [rawLeg, legMedians] of Object.entries(legs)) {
+      const leg = sanitizeLabel(rawLeg);
+      if (!isRecord(legMedians)) {
+        return {
+          ok: false,
+          reason: `chatSwitch medians for ${leg} (${transport}) are not an object`,
+        };
+      }
+      const medians: Partial<Record<ChatSwitchMetricKey, number>> = {};
+      for (const metric of CHAT_SWITCH_METRICS) {
+        const median = finiteNonNegative(legMedians[metric.key]);
+        if (median !== undefined) medians[metric.key] = median;
+      }
+      rows.push({ transport, leg, count: finiteNonNegative(legMedians.count), medians });
+    }
+  }
+  rows.sort(compareChatSwitchRows);
+  return { ok: true, rows };
+}
+
+function readMetrics(summary: Record<string, unknown>, reactProfile: unknown): MetricsRead {
+  const chrome = isRecord(summary.chromeProfile) ? summary.chromeProfile : undefined;
+  if (!chrome) return { ok: false, reason: "missing chromeProfile" };
+  const metrics = isRecord(chrome.metrics) ? chrome.metrics : {};
+
+  const scriptSeconds = finiteNonNegative(metrics.ScriptDuration);
+  const taskSeconds = finiteNonNegative(metrics.TaskDuration);
+  // Required, not defaulted: without it task time would silently include profiler overhead.
+  const devToolsSeconds = finiteNonNegative(metrics.DevToolsCommandDuration);
+  const heapBytes = finiteNonNegative(metrics.JSHeapUsedSize);
+  const history = isRecord(summary.historyProfile) ? summary.historyProfile : undefined;
+  const iteration =
+    history && isRecord(history.iterationSummary) ? history.iterationSummary : undefined;
+  // Additive in schemaVersion 1; null or missing means not applicable or not recorded.
+  const milestones = isRecord(summary.milestones) ? summary.milestones : {};
+
+  const candidates: Partial<Record<MetricId, number | undefined>> = {
+    wallMs: finiteNonNegative(chrome.wallTimeMs),
+    scriptMs: scriptSeconds === undefined ? undefined : scriptSeconds * 1000,
+    taskMs:
+      taskSeconds === undefined || devToolsSeconds === undefined
+        ? undefined
+        : Math.max(0, taskSeconds - devToolsSeconds) * 1000,
+    layouts: finiteNonNegative(metrics.LayoutCount),
+    styleRecalcs: finiteNonNegative(metrics.RecalcStyleCount),
+    heapMb: heapBytes === undefined ? undefined : heapBytes / (1024 * 1024),
+    reactRenders: isRecord(reactProfile) ? finiteNonNegative(reactProfile.sampleCount) : undefined,
+    hunkStepMedianMs: iteration ? finiteNonNegative(iteration.medianMs) : undefined,
+    firstMessageMs: finiteNonNegative(milestones.firstMessageMs),
+    fullyLoadedMs: finiteNonNegative(milestones.fullyLoadedMs),
+    longestTaskMs: finiteNonNegative(milestones.longestTaskMs),
+  };
+  const missing = METRICS.filter((spec) => spec.required && candidates[spec.id] === undefined);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `missing or invalid metrics: ${missing.map((spec) => spec.id).join(", ")}`,
+    };
+  }
+  const values: Partial<Record<MetricId, number>> = {};
+  for (const spec of METRICS) {
+    const value = candidates[spec.id];
+    if (value !== undefined) values[spec.id] = value;
+  }
+  return { ok: true, values };
+}
+
+/**
+ * Validate one scenario's artifacts and extract its data. Bad data never throws: it comes back as
+ * `{ ok: false }` (with whatever identity could be read) so it can be reported.
  */
 export function readScenario(summary: unknown, reactProfile: unknown): ScenarioRead {
   if (!isRecord(summary))
@@ -151,46 +339,14 @@ export function readScenario(summary: unknown, reactProfile: unknown): ScenarioR
   if (key === undefined || retry === undefined) {
     return { ok: false, ...identity, reason: "missing test title, file or retry" };
   }
-  const chrome = isRecord(summary.chromeProfile) ? summary.chromeProfile : undefined;
-  if (!chrome) return { ok: false, ...identity, reason: "missing chromeProfile" };
-  const metrics = isRecord(chrome.metrics) ? chrome.metrics : {};
-
-  const scriptSeconds = finiteNonNegative(metrics.ScriptDuration);
-  const taskSeconds = finiteNonNegative(metrics.TaskDuration);
-  // Required, not defaulted: without it task time would silently include profiler overhead.
-  const devToolsSeconds = finiteNonNegative(metrics.DevToolsCommandDuration);
-  const heapBytes = finiteNonNegative(metrics.JSHeapUsedSize);
-  const history = isRecord(summary.historyProfile) ? summary.historyProfile : undefined;
-  const iteration =
-    history && isRecord(history.iterationSummary) ? history.iterationSummary : undefined;
-
-  const candidates: Partial<Record<MetricId, number | undefined>> = {
-    wallMs: finiteNonNegative(chrome.wallTimeMs),
-    scriptMs: scriptSeconds === undefined ? undefined : scriptSeconds * 1000,
-    taskMs:
-      taskSeconds === undefined || devToolsSeconds === undefined
-        ? undefined
-        : Math.max(0, taskSeconds - devToolsSeconds) * 1000,
-    layouts: finiteNonNegative(metrics.LayoutCount),
-    styleRecalcs: finiteNonNegative(metrics.RecalcStyleCount),
-    heapMb: heapBytes === undefined ? undefined : heapBytes / (1024 * 1024),
-    reactRenders: isRecord(reactProfile) ? finiteNonNegative(reactProfile.sampleCount) : undefined,
-    hunkStepMedianMs: iteration ? finiteNonNegative(iteration.medianMs) : undefined,
+  return {
+    ok: true,
+    label,
+    testKey: key,
+    retry,
+    metrics: readMetrics(summary, reactProfile),
+    ...("chatSwitch" in summary ? { chatSwitch: readChatSwitch(summary.chatSwitch) } : {}),
   };
-  const missing = METRICS.filter((spec) => spec.required && candidates[spec.id] === undefined);
-  if (missing.length > 0) {
-    return {
-      ok: false,
-      ...identity,
-      reason: `missing or invalid metrics: ${missing.map((spec) => spec.id).join(", ")}`,
-    };
-  }
-  const values: Partial<Record<MetricId, number>> = {};
-  for (const spec of METRICS) {
-    const value = candidates[spec.id];
-    if (value !== undefined) values[spec.id] = value;
-  }
-  return { ok: true, label, testKey: key, retry, values };
 }
 
 // ---------------------------------------------------------------------------
@@ -274,18 +430,31 @@ export function parsePlaywrightResults(json: unknown): PlaywrightResults {
 // ---------------------------------------------------------------------------
 
 export interface Problem {
-  /** Stable identity, for future consumers that track problems across runs. */
+  /** Stable identity, for future consumers that track problems across runs. Never printed. */
   key: string;
   /** Markdown; untrusted text inside is already sanitized. */
   text: string;
 }
 
+export interface ReportScenario {
+  label: string;
+  /** Scenario metrics; absent for chat-switch scenarios, whose Chrome totals are not reported. */
+  values?: Partial<Record<MetricId, number>>;
+  /** Leg × transport medians; only on the summary that holds `chatSwitch`, not its companions. */
+  chatSwitch?: ChatSwitchLegRow[];
+}
+
 export interface ReportRow {
   test: TestOutcome;
-  /** Present when the final attempt wrote a usable summary. */
-  label?: string;
-  values?: Partial<Record<MetricId, number>>;
-  /** Why there is no data, when `values` is absent. */
+  /**
+   * The final attempt wrote a `chatSwitch` summary. All of that attempt's scenarios (including
+   * profile-only companions) are chat-switch scenarios: their whole-scenario Chrome totals changed
+   * scope when server-window switches were added, so they are neither required nor reported.
+   */
+  chatSwitch: boolean;
+  /** Every usable summary of the final attempt, one scenario each, sorted by label. */
+  scenarios: ReportScenario[];
+  /** Why there is no data, when `scenarios` is empty. */
   unavailable?: string;
 }
 
@@ -366,39 +535,61 @@ export function buildReport(input: ReportInput): Report {
       warnings.push(`Test ${code(test.key)} passed only on retry (${test.attempts} attempts).`);
     } else if (test.status === "skipped") {
       warnings.push(`Test ${code(test.key)} was skipped.`);
-      rows.push({ test, unavailable: "test skipped" });
+      rows.push({ test, chatSwitch: false, scenarios: [], unavailable: "test skipped" });
       continue;
     }
 
     const final = input.reads.filter(
       (read) => read.testKey === test.key && read.retry === test.finalRetry
     );
-    const usable = final.filter((read) => read.ok);
-    if (usable.length > 1) {
-      warnings.push(
-        `Test ${code(test.key)} wrote ${usable.length} summaries in its final attempt; showing the first.`
-      );
+    const chatSwitch = final.some((read) => read.ok && read.chatSwitch !== undefined);
+    const scenarios: ReportScenario[] = [];
+    const invalid: string[] = [];
+    let chatSwitchInvalid: string | undefined;
+    for (const read of final) {
+      if (!read.ok) {
+        invalid.push(read.reason);
+      } else if (!chatSwitch) {
+        if (read.metrics.ok) scenarios.push({ label: read.label, values: read.metrics.values });
+        else invalid.push(read.metrics.reason);
+      } else if (read.chatSwitch?.ok === false) {
+        chatSwitchInvalid ??= read.chatSwitch.reason;
+      } else {
+        scenarios.push({ label: read.label, chatSwitch: read.chatSwitch?.rows });
+      }
     }
-    const [read] = usable;
-    if (read?.ok) {
-      rows.push({ test, label: read.label, values: read.values });
-      continue;
-    }
-    const invalid = final.find((entry) => !entry.ok);
-    if (invalid?.ok === false) {
-      rows.push({ test, unavailable: "final attempt wrote an unusable summary" });
+    scenarios.sort((a, b) => a.label.localeCompare(b.label));
+
+    if (invalid[0] !== undefined) {
+      const more = invalid.length > 1 ? ` (and ${invalid.length - 1} more)` : "";
       problems.push({
         key: `summary-invalid:${test.key}`,
-        text: `Test ${code(test.key)} wrote an unusable summary: ${code(invalid.reason)}.`,
+        text: `Test ${code(test.key)} wrote an unusable summary: ${code(invalid[0])}${more}.`,
       });
-      continue;
     }
-    rows.push({ test, unavailable: "final attempt wrote no summary" });
-    if (test.status !== "unexpected") {
+    if (chatSwitchInvalid !== undefined) {
       problems.push({
-        key: `summary-missing:${test.key}`,
-        text: `Test ${code(test.key)} passed but its final attempt wrote no perf summary.`,
+        key: `chat-switch-invalid:${test.key}`,
+        text: `Test ${code(test.key)} wrote an unusable chat-switch summary: ${code(chatSwitchInvalid)}.`,
       });
+    }
+    if (scenarios.length > 0) {
+      rows.push({ test, chatSwitch, scenarios });
+    } else if (invalid.length > 0 || chatSwitchInvalid !== undefined) {
+      rows.push({
+        test,
+        chatSwitch,
+        scenarios,
+        unavailable: "final attempt wrote an unusable summary",
+      });
+    } else {
+      rows.push({ test, chatSwitch, scenarios, unavailable: "final attempt wrote no summary" });
+      if (test.status !== "unexpected") {
+        problems.push({
+          key: `summary-missing:${test.key}`,
+          text: `Test ${code(test.key)} passed but its final attempt wrote no perf summary.`,
+        });
+      }
     }
   }
 
@@ -415,8 +606,16 @@ export function buildReport(input: ReportInput): Report {
 }
 
 // ---------------------------------------------------------------------------
-// Step summary
+// Step summary and job log
 // ---------------------------------------------------------------------------
+
+/**
+ * The only report line written to the job log. It holds counts only: artifact text (test titles,
+ * labels, errors) never reaches stdout/stderr, where the runner would parse workflow commands.
+ */
+export function formatLogLine(report: Report): string {
+  return `perf report: ${report.problems.length} problem(s), ${report.warnings.length} warning(s); details in the job summary`;
+}
 
 function outcome(test: TestOutcome): string {
   switch (test.status) {
@@ -429,6 +628,21 @@ function outcome(test: TestOutcome): string {
     case "skipped":
       return "skipped";
   }
+}
+
+function formatValue(value: number | undefined, decimals: number): string {
+  return value === undefined ? "—" : value.toFixed(decimals);
+}
+
+function unavailable(row: ReportRow): string {
+  return `unavailable: ${sanitizeInline(row.unavailable ?? "no data")}`;
+}
+
+function tableHeader(columns: readonly string[], leftColumns: number): string[] {
+  return [
+    `| ${columns.join(" | ")} |`,
+    `|${columns.map((_, index) => (index < leftColumns ? "---" : "---:")).join("|")}|`,
+  ];
 }
 
 export function renderSummary(input: {
@@ -454,32 +668,85 @@ export function renderSummary(input: {
   if (problems.length > 0) {
     lines.push("### Problems", "", ...problems.map((problem) => `- ${problem.text}`), "");
   }
+
   if (rows.length > 0) {
-    lines.push(
-      "### Tests",
-      "",
-      `| Test | Result | Scenario | ${METRICS.map((spec) => spec.label).join(" | ")} |`,
-      `|---|---|---|${METRICS.map(() => "---:").join("|")}|`
-    );
+    lines.push("### Tests", "", ...tableHeader(["Test", "Result", "Scenarios"], 3));
     for (const row of rows) {
-      const cells = METRICS.map((spec) => {
-        if (!row.values) return "unavailable";
-        const value = row.values[spec.id];
-        return value === undefined ? "—" : value.toFixed(spec.decimals);
-      });
-      const scenario = row.label
-        ? code(row.label)
-        : `unavailable: ${sanitizeInline(row.unavailable ?? "no data")}`;
+      const scenarios =
+        row.scenarios.length > 0
+          ? row.scenarios.map((scenario) => code(scenario.label)).join(", ")
+          : unavailable(row);
+      lines.push(`| ${code(row.test.key)} | ${outcome(row.test)} | ${scenarios} |`);
+    }
+    lines.push("", "Every value below comes from each test's final attempt only.", "");
+  }
+
+  // Scenario metrics: every non-chat-switch scenario, plus an unavailable row for each such test
+  // that has none.
+  const metricRows: string[] = [];
+  for (const row of rows.filter((entry) => !entry.chatSwitch)) {
+    if (row.scenarios.length === 0) {
+      const cells = METRICS.map(() => "unavailable");
+      metricRows.push(`| ${code(row.test.key)} | ${unavailable(row)} | ${cells.join(" | ")} |`);
+    }
+    for (const scenario of row.scenarios) {
+      const cells = METRICS.map((spec) => formatValue(scenario.values?.[spec.id], spec.decimals));
+      metricRows.push(`| ${code(row.test.key)} | ${code(scenario.label)} | ${cells.join(" | ")} |`);
+    }
+  }
+  const chatSwitchLabels = rows
+    .filter((row) => row.chatSwitch)
+    .flatMap((row) => row.scenarios.map((scenario) => code(scenario.label)));
+  if (metricRows.length > 0 || chatSwitchLabels.length > 0) {
+    lines.push("### Scenario metrics", "");
+    if (metricRows.length > 0) {
       lines.push(
-        `| ${code(row.test.key)} | ${outcome(row.test)} | ${scenario} | ${cells.join(" | ")} |`
+        ...tableHeader(["Test", "Scenario", ...METRICS.map((spec) => spec.label)], 2),
+        ...metricRows,
+        ""
       );
     }
+    lines.push("— means the scenario does not record that metric.");
+    if (chatSwitchLabels.length > 0) {
+      lines.push(
+        "",
+        `Chat-switch scenarios (${chatSwitchLabels.join(", ")}) are not listed: their whole-scenario Chrome totals changed scope when server-window switches were added, so they are not comparable over time. See Chat switch.`
+      );
+    }
+    lines.push("");
+  }
+
+  const chatSwitchRows: string[] = [];
+  for (const row of rows) {
+    for (const scenario of row.scenarios) {
+      for (const leg of scenario.chatSwitch ?? []) {
+        const cells = CHAT_SWITCH_METRICS.map((metric) =>
+          formatValue(leg.medians[metric.key], metric.decimals)
+        );
+        chatSwitchRows.push(
+          `| ${code(scenario.label)} | ${code(leg.leg)} | ${code(leg.transport)} | ${formatValue(
+            leg.count,
+            0
+          )} | ${cells.join(" | ")} |`
+        );
+      }
+    }
+  }
+  if (chatSwitchRows.length > 0) {
     lines.push(
+      "### Chat switch",
       "",
-      "Values come from each test's final attempt only. — means the scenario does not record that metric.",
+      ...tableHeader(
+        ["Scenario", "Leg", "Transport", "Count", ...CHAT_SWITCH_METRICS.map((m) => m.label)],
+        3
+      ),
+      ...chatSwitchRows,
+      "",
+      "Medians per leg and transport. — means not recorded.",
       ""
     );
   }
+
   if (warnings.length > 0) {
     lines.push("### Warnings", "", ...warnings.map((warning) => `- ${warning}`), "");
   }
