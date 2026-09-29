@@ -2556,6 +2556,8 @@ describe("vscode webview background processes strip (#5092)", () => {
     await click(view.getByRole("button", { name: /1 background bash/ }));
     const script = view.container.querySelector('[title="sleep 600"]');
     if (!script) throw new Error("the expanded strip does not list the process");
+    // The output dialog (it polls getOutput) is not offered in the webview (#5196).
+    expect(view.queryByRole("button", { name: "View output" })).toBeNull();
     // Each row ends with its Terminate button.
     const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
     await click(rowButtons[rowButtons.length - 1]);

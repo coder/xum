@@ -56,13 +56,13 @@ const ALLOWED_PROCEDURES = {
 } as const;
 
 // The only nested procedures the webview may call: the background processes strip lists
-// (subscribe) and terminates a workspace's background bashes, and its output dialog peeks their
-// output (#5092). sendToBackground stays blocked (bashForegroundControls is unsupported).
+// (subscribe) and terminates a workspace's background bashes (#5092). sendToBackground stays
+// blocked (bashForegroundControls is unsupported), and so does getOutput: the output dialog is not
+// offered in the webview (backgroundBashOutput is unsupported, #5196).
 // sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
 const ALLOWED_NESTED_PROCEDURES = new Set([
   "workspace.backgroundBashes.subscribe",
   "workspace.backgroundBashes.terminate",
-  "workspace.backgroundBashes.getOutput",
 ]);
 
 export function isAllowedOrpcPath(path: string[]): boolean {
@@ -250,9 +250,9 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
  * {workspaceId, options} is forwarded.
  *
- * workspace.backgroundBashes.* (#5092): only for a workspace the extension sent. subscribe forwards
- * {workspaceId}, terminate {workspaceId, processId}, and getOutput also its read window
- * (fromOffset, tailBytes). The backend refuses a processId of another workspace.
+ * workspace.backgroundBashes.subscribe / terminate (#5092): only for a workspace the extension sent.
+ * subscribe forwards {workspaceId} and terminate {workspaceId, processId}. The backend refuses a
+ * processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -346,18 +346,6 @@ function sanitizeBackgroundBashAction(
   if (typeof record.processId !== "string") {
     return { ok: false, error: `${procedure} requires a processId` };
   }
-  if (procedure === "workspace.backgroundBashes.terminate") {
-    return { ok: true, input: { workspaceId, processId: record.processId } };
-  }
-  assert(procedure === "workspace.backgroundBashes.getOutput", `unexpected procedure ${procedure}`);
-  // The backend validates the read window's values.
-  return {
-    ok: true,
-    input: {
-      workspaceId,
-      processId: record.processId,
-      ...(record.fromOffset !== undefined ? { fromOffset: record.fromOffset } : {}),
-      ...(record.tailBytes !== undefined ? { tailBytes: record.tailBytes } : {}),
-    },
-  };
+  assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
+  return { ok: true, input: { workspaceId, processId: record.processId } };
 }

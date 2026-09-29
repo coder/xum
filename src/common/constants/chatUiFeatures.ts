@@ -15,6 +15,8 @@ export const CHAT_UI_FEATURE_IDS = [
   "contextSwitchWarning",
   "chatInstructions",
   "queuedMessage",
+  // Viewing a background bash's output (the output dialog, which polls it while open).
+  "backgroundBashOutput",
 ] as const;
 
 export type ChatUiFeatureId = (typeof CHAT_UI_FEATURE_IDS)[number];

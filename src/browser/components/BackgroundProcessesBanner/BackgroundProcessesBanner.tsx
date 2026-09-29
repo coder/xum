@@ -10,6 +10,7 @@ import {
   useBackgroundProcesses,
 } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 
 /**
  * Truncate script to reasonable display length.
@@ -38,6 +39,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const processes = useBackgroundProcesses(props.workspaceId);
   const terminatingIds = useBackgroundBashTerminatingIds(props.workspaceId);
   const { terminate } = useBackgroundBashActions();
+  // Hosts without the output dialog (the VS Code webview) hide the View output action.
+  const canViewOutput = useChatHostContext().uiSupport.backgroundBashOutput === "supported";
 
   // Keep running processes visible, plus exited processes whose monitor matched but whose
   // wake has not been delivered yet — otherwise a one-shot watcher that matched and exited
@@ -151,11 +154,12 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         behind them, so fetching output is guaranteed to fail. Keyed on the
                         explicit marker, not the pid: migrated processes also use pid 0 but
                         remain fully queryable. */}
-                    {proc.synthesized !== true && (
+                    {proc.synthesized !== true && canViewOutput && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button
                             type="button"
+                            aria-label="View output"
                             disabled={isTerminating}
                             onClick={(e) => handleViewOutput(proc.id, e)}
                             className={cn(

@@ -28,6 +28,9 @@ describe("isAllowedOrpcPath", () => {
   test("rejects nested routers other than the background processes strip's", () => {
     expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"]))
       .toBe(false);
+    // The output dialog polls getOutput and is not offered in the webview (#5196).
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "getOutput"]))
+      .toBe(false);
     expect(isAllowedOrpcPath(["workspace", "goal", "get"]))
       .toBe(false);
     expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"]))
@@ -253,23 +256,13 @@ describe("background processes strip (#5092)", () => {
   const known = new Set(["ws-1"]);
   const path = (procedure: string) => ["workspace", "backgroundBashes", procedure];
 
-  test("lists, terminates and reads a known workspace's processes with only the fields each needs", () => {
+  test("lists and terminates a known workspace's processes with only the fields each needs", () => {
     for (const [procedure, input, forwarded] of [
       ["subscribe", { workspaceId: "ws-1", processId: "p1" }, { workspaceId: "ws-1" }],
       [
         "terminate",
         { workspaceId: "ws-1", processId: "p1", extra: true },
         { workspaceId: "ws-1", processId: "p1" },
-      ],
-      [
-        "getOutput",
-        { workspaceId: "ws-1", processId: "p1", tailBytes: 64, extra: true },
-        { workspaceId: "ws-1", processId: "p1", tailBytes: 64 },
-      ],
-      [
-        "getOutput",
-        { workspaceId: "ws-1", processId: "p1", fromOffset: 10 },
-        { workspaceId: "ws-1", processId: "p1", fromOffset: 10 },
       ],
     ] as const) {
       expect(isAllowedOrpcPath(path(procedure))).toBe(true);
@@ -286,8 +279,6 @@ describe("background processes strip (#5092)", () => {
       ["subscribe", null],
       ["terminate", { workspaceId: "ws-2", processId: "p1" }],
       ["terminate", { workspaceId: "ws-1" }],
-      ["getOutput", { workspaceId: "ws-2", processId: "p1" }],
-      ["getOutput", { workspaceId: "ws-1", processId: 7 }],
     ] as const) {
       expect(sanitizeWebviewOrpcInput(path(procedure), input, known).ok).toBe(false);
     }

@@ -74,8 +74,10 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const { sendToBackground } = useBackgroundBashActions();
   // Hosts that cannot send a foreground bash to the background (the VS Code webview) hide the
   // control instead of offering an action their bridge refuses.
-  const canHostSendToBackground =
-    useChatHostContext().uiSupport.bashForegroundControls === "supported";
+  const { uiSupport } = useChatHostContext();
+  const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
+  // Hosts without the output dialog (the VS Code webview) hide its button.
+  const canViewOutput = uiSupport.backgroundBashOutput === "supported";
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
@@ -181,7 +183,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {bashCollapsedSummary.command}
           </span>
         )}
-        {isBackground && backgroundProcessId && workspaceId && (
+        {isBackground && backgroundProcessId && workspaceId && canViewOutput && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
