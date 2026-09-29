@@ -1396,6 +1396,14 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Tracked from here until the command is registered below, terminated after a failed
+          // migration, or found exited: a cleanup() in between waits for it (#4805), including
+          // the awaited name claim and exit grace (#4967). Refused (not admitted) once cleanup
+          // has started for the workspace (#4967).
+          using migration =
+            config.backgroundProcessManager && config.workspaceId
+              ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+              : undefined;
           // Claim the migrated record's name across backends BEFORE the exit check below
           // (#4878): the claim may wait on another backend's spawn lock, and a command that
           // exits during that wait must take the normal completion path, not be reported as
@@ -1423,16 +1431,11 @@ ${scriptWithEnv}`;
             // can outlast the exit (e.g. a grandchild holding stdout open).
             claimLock?.releaseName();
             await claimLock?.[Symbol.asyncDispose]();
+            // Nor is the command migrating any more; cleanup() must not wait for the drain.
+            migration?.[Symbol.dispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
-            // Held until the command is registered below or terminated after a failed
-            // migration: a removal's cleanup() in between waits for it (#4805). Refused
-            // (not admitted) once cleanup has started for the workspace (#4967).
-            using migration =
-              config.backgroundProcessManager && config.workspaceId
-                ? config.backgroundProcessManager.beginMigration(config.workspaceId)
-                : undefined;
             // Detach from abort signal as early as possible - process should continue running
             // even when the stream ends and fires abort.
             abortDetached = true;
