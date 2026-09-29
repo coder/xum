@@ -505,7 +505,14 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
       error: expect.stringContaining("spawn docker ENOENT") as unknown as string,
       leftoverPaths: [`devcontainer container labeled devcontainer.local_folder=${workspacePath}`],
     });
-    // The host worktree is still removed, as before.
+    // A forced delete (rollbacks, forced removal) still removes the host worktree, as before.
     expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
+
+    // A non-forced delete keeps the worktree, and with it the branch mapping a retry needs.
+    git("worktree", "add", "-b", "ws2", runtime.getWorkspacePath(projectPath, "ws2"));
+    const kept = await runtime.deleteWorkspace(projectPath, "ws2", false, undefined, true);
+    expect(kept.success).toBe(false);
+    expect(await fs.stat(runtime.getWorkspacePath(projectPath, "ws2"))).toBeTruthy();
+    expect(git("branch", "--list", "ws2")).not.toBe("");
   });
 });

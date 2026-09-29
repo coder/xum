@@ -849,6 +849,22 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       })
     );
 
+    const containerLeftover = `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
+    // A container that is still there is not a clean delete: removal and rollbacks report it, and
+    // name it so the user can remove it (#5120); a later workspace at this path would reuse it.
+    // A non-forced delete then stops before the host worktree, so the caller keeps the workspace
+    // and a retry deletes both: deleting the worktree first would drop its branch mapping, and a
+    // retry would then fall back to deleting the branch named after the workspace, which may not
+    // be this workspace's. A forced delete (rollbacks, forced removal) is not retried on the same
+    // entry, so it still removes the worktree.
+    if (containerStop.kind === "error" && !force) {
+      return {
+        success: false,
+        error: `Failed to remove the devcontainer: ${containerStop.message}`,
+        leftoverPaths: [containerLeftover],
+      };
+    }
+
     // Delete worktree on host
     const hostResult = await this.worktreeManager.deleteWorkspace(
       projectPath,
@@ -859,12 +875,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     );
     if (containerStop.kind !== "error") return hostResult;
 
-    // A container that is still there is not a clean delete: removal and rollbacks report it, and
-    // name it so the user can remove it (#5120). A later workspace at this path would reuse it.
     const errors = [`Failed to remove the devcontainer: ${containerStop.message}`];
-    const leftoverPaths = [
-      `devcontainer container labeled devcontainer.local_folder=${workspacePath}`,
-    ];
+    const leftoverPaths = [containerLeftover];
     if (!hostResult.success) {
       errors.push(hostResult.error);
       leftoverPaths.push(workspacePath);
