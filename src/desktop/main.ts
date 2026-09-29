@@ -697,6 +697,20 @@ function createTray() {
 }
 
 /**
+ * How long to leave the main thread idle after the splash window's `show` event so its first
+ * frame reaches the screen. The imports that are only needed once services run load
+ * synchronously inside loadServices() (kept off the pre-splash path, #4423), and it starts right
+ * after `show`; without this wait they block the main thread before the first frame is
+ * presented, so the window maps but stays blank (measured on Linux: the logo painted ~1.5 s
+ * after `show`; 30-100 ms waits painted it within ~10 ms).
+ * Electron has no "first frame presented" signal for an onscreen window: ready-to-show fires
+ * before `show`, and waiting on capturePage() or a double requestAnimationFrame painted in time
+ * in only 2/10 and 2/3 runs, so a short timer is the only option. It only bounds startup by this many ms;
+ * if it is too short, the result is today's behavior (logo late), never a hang.
+ */
+const SPLASH_FIRST_PAINT_WAIT_MS = 60;
+
+/**
  * Create and show splash screen - instant visual feedback (<100ms)
  *
  * Shows a lightweight native window with static HTML while services load.
@@ -731,8 +745,8 @@ async function showSplashScreen() {
     splashWindow!.once("show", () => {
       const loadTime = Date.now() - startTime;
       console.log(`[${timestamp()}] Splash screen shown (${loadTime}ms)`);
-      // Give one more event loop tick for the window to actually paint
-      setImmediate(resolve);
+      // Let the first frame reach the screen before loadServices() blocks the main thread.
+      setTimeout(resolve, SPLASH_FIRST_PAINT_WAIT_MS);
     });
     splashWindow!.show();
   });
