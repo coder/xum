@@ -1188,6 +1188,19 @@ const localPlugin = {
         const GLOBAL_OBJECTS = new Set(["window", "globalThis", "self"]);
         const report = (node, name) =>
           context.report({ node, messageId: "direct", data: { name } });
+        // `window as Window`, `window!` and `window satisfies ...` still name the global object.
+        const unwrapTypeOnly = (node) => {
+          let current = node;
+          while (
+            current?.type === "TSAsExpression" ||
+            current?.type === "TSNonNullExpression" ||
+            current?.type === "TSSatisfiesExpression" ||
+            current?.type === "TSTypeAssertion"
+          ) {
+            current = current.expression;
+          }
+          return current;
+        };
         const memberName = (node) => {
           if (!node.computed && node.property.type === "Identifier") return node.property.name;
           if (node.computed && node.property.type === "Literal") return node.property.value;
@@ -1195,7 +1208,8 @@ const localPlugin = {
         };
         // `const { localStorage } = window` reads the property without a MemberExpression, and the
         // new binding has a declaration, so the reference check below would not see it.
-        const checkDestructuring = (pattern, source) => {
+        const checkDestructuring = (pattern, rawSource) => {
+          const source = unwrapTypeOnly(rawSource);
           if (pattern.type !== "ObjectPattern" || source?.type !== "Identifier") return;
           if (!GLOBAL_OBJECTS.has(source.name)) return;
           for (const property of pattern.properties) {
@@ -1212,12 +1226,13 @@ const localPlugin = {
         return {
           MemberExpression(node) {
             const name = memberName(node);
+            const object = unwrapTypeOnly(node.object);
             if (
               STORAGE_GLOBALS.has(name) &&
-              node.object.type === "Identifier" &&
-              GLOBAL_OBJECTS.has(node.object.name)
+              object.type === "Identifier" &&
+              GLOBAL_OBJECTS.has(object.name)
             ) {
-              report(node, `${node.object.name}.${name}`);
+              report(node, `${object.name}.${name}`);
             }
           },
           VariableDeclarator(node) {
