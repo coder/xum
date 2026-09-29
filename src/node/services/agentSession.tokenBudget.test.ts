@@ -2276,7 +2276,6 @@ describe("AgentSession token-budget lifecycle", () => {
           await h.requests[0].onStepSettled?.(
             step(90_000, {
               sessionHistoryAvailable: previousEnabled,
-              memoryAvailable: previousEnabled,
             })
           )
         )?.decision

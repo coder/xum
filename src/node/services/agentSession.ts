@@ -734,10 +734,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
-    options?: {
-      includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
-    }
+    options?: { includeHotMemories?: boolean }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   isAgentPluginsEnabled?(): boolean;
@@ -11290,15 +11287,11 @@ export class AgentSession {
    */
   private async resolveMemoryContext(
     modelString: string,
-    options?: {
-      includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
-    },
+    options?: { includeHotMemories?: boolean },
     cache = this.memoryContextByModelString
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
-    const tokenBudgetActive = options?.tokenBudgetActive === true;
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);

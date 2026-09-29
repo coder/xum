@@ -3732,7 +3732,6 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     options: {
       countTokens: (text: string) => Promise<number>;
-      tokenBudgetActive?: boolean;
     }
   ): Promise<MemoryHotSetItem[]> {
     // The session scope is an agent's rollover checkpoint: it reads it on demand after a
@@ -3752,7 +3751,6 @@ export class MemoryService extends EventEmitter {
     const selected = await selectHotMemories({
       candidates,
       countTokens: options.countTokens,
-      tokenBudgetActive: options.tokenBudgetActive,
       readFile: async (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);

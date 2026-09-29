@@ -266,7 +266,6 @@ export class AIService extends EventEmitter {
     modelString: string,
     options?: {
       includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
     }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
@@ -303,7 +302,6 @@ export class AIService extends EventEmitter {
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
             countTokens: (text) => tokenizer.countTokens(text),
-            tokenBudgetActive: options?.tokenBudgetActive === true,
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
         } catch (error) {

@@ -141,7 +141,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     execute: async (input, { toolCallId, abortSignal }): Promise<MemoryToolResult> => {
-      // A stopped stream (including the automatic final step) must not commit a late write.
+      // A stopped stream must not commit a late write.
       return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
         abortSignal,
       });

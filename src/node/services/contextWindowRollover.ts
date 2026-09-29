@@ -129,7 +129,7 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     options;
   assert(
     Boolean(final) !== Boolean(handoff),
-    "A budget prompt is either the handoff request or the final step"
+    "A budget prompt is either the handoff request or the final prompt"
   );
   assert(
     options.handoffTokens == null ||

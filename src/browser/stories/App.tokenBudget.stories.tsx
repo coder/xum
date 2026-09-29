@@ -22,7 +22,7 @@ const WARNING =
 const HANDOFF =
   "The context handoff target has been reached. Save your checkpoint in /memories/session/, then call new_context.";
 const FINAL =
-  "The current context window is exhausted. In this step, save your checkpoint with the memory tool.";
+  "The current context window is exhausted. Save your checkpoint with the memory tool now, then call new_context.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
 function setupTokenBudgetStory(inputTokens = 2400) {

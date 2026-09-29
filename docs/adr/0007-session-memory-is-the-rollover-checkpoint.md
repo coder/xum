@@ -1,6 +1,6 @@
 ---
 title: Session Memory Is the Rollover Checkpoint
-description: Each agent keeps its own rollover checkpoint in the /memories/session/ scope, a fresh window injects nothing from the old one, and a final memory-only step gives a last chance to save it
+description: Each agent keeps its own rollover checkpoint in the /memories/session/ scope, a fresh window injects nothing from the old one, and a final prompt gives a last chance to save it
 ---
 
 # 0007. Session Memory Is the Rollover Checkpoint
@@ -28,7 +28,7 @@ Codex token-budget mode keeps a living checkpoint in a separate notes tool, inje
 - A fresh window injects nothing from the old one. The lead-in tells the agent to read its checkpoint first and then use `session_history`.
 - In token-budget mode, the system prompt shows the current and previous context window IDs, and each user row ends with its `session_history` item ID. The guidance asks the agent to record these IDs in its checkpoint.
 - `new_context` takes no arguments. It is offered only when `memory` and `session_history` are both allowed.
-- The ladder is **handoff request → final handoff step → forced rollover**. The final handoff step runs once per window, after a settled step, when the next request is close to the usable limit and still has headroom. It is one provider step with a bounded output. The tool policy enables only `memory`, and memory access is read-only except for the session scope. Xum seals the window after the step, so the step does not call `new_context`.
+- The ladder is **handoff request → final prompt → forced rollover**. The final prompt is a row on the ordinary turn, sent once per window when the next request is close to the usable limit and still has headroom. It follows the Codex fallback prompt: do not continue the task, save the checkpoint with `memory`, then call `new_context`, and use no other tools. The restriction is prompt-only. If the agent ignores it, the forced rollover at the usable limit seals the window. The handoff request always comes first: a high usage threshold is clamped below the final zone.
 - The old context-notes special cases are removed: no `context-notes.md` preload, no pinned write path, and no notes-only memory context.
 
 ## Consequences
@@ -36,12 +36,12 @@ Codex token-budget mode keeps a living checkpoint in a separate notes tool, inje
 - Every agent can save a checkpoint, including read-only agents and parallel sub-agents.
 - The checkpoint is only a memory file, so the agent can update it incrementally during the window instead of writing it once at the end.
 - Users with Token Budget on and Agent Memory off fall back to automatic summaries.
-- The persisted `contextBudgetFlush` key and the `final: true` warning row stay. A pending legacy flush turn resumes as a final handoff step. If `memory` is no longer allowed, the step runs without tools and the window still seals.
+- The persisted `final: true` warning row stays. Xum no longer reads the `contextBudgetFlush` key: a pending flush turn from an older build resumes as an ordinary continuation with the normal toolset and permissions, and the usable-limit rollover seals the window later.
 - Old histories still render: legacy warn rows show as **Context budget warning**.
 - Existing `context-notes.md` files stay as ordinary workspace memory. They follow the normal hot-set rules.
 
 ## Accepted limitations
 
 - The checkpoint is only as good as the agent writes it. The transcript stays retrievable through `session_history`.
-- The final handoff step is skipped when the window is too small, the queue has input, `memory` or `session_history` is not allowed, or a single step jumps past the final zone. The forced rollover then seals the window with whatever checkpoint exists.
+- The final prompt is skipped when the window is too small, `new_context` is not offered, or a single step jumps past the final zone. The forced rollover then seals the window with whatever checkpoint exists.
 - The session scope exists only in token-budget mode. With another compaction mode, the memory tool does not list or accept `/memories/session/`, and checkpoints written earlier stay on disk until token-budget mode returns or the workspace is deleted.

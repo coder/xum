@@ -1,5 +1,5 @@
 /** Shared limits for opt-in, lossless context-window rollover and history retrieval. */
-// Room reserved for the agent's checkpoint write in the final step.
+// Room reserved below the hard ceiling for the agent's final checkpoint write.
 export const CONTEXT_CHECKPOINT_MAX_TOKENS = 2_000;
 export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
@@ -9,7 +9,7 @@ export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
 // Headroom the final prompt needs below the hard ceiling: the prompt row plus a
 // checkpoint-sized margin.
-export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_NOTES_RESERVED_TOKENS;
+export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_CHECKPOINT_MAX_TOKENS;
 // The final prompt zone opens once the next request gets this close to the hard ceiling: the
 // prompt's own headroom plus roughly three working steps to save the checkpoint and call
 // new_context, so a normal step rarely jumps straight past it into a forced rollover.
