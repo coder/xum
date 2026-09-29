@@ -810,6 +810,47 @@ describe("Config", () => {
     });
   });
 
+  describe("delegated creation mark (#4983)", () => {
+    it("keeps a well-formed mark and drops malformed ones while loading", () => {
+      const mark = { handleId: "wst_1", ownerWorkspaceId: "owner" };
+      const rows = [
+        ["ws-ok", mark],
+        ["ws-flagged", { ...mark, interruptedAt: "2026-09-29T00:00:00.000Z" }],
+        ["ws-str", "wst_1"],
+        ["ws-no-owner", { handleId: "wst_1" }],
+      ] as const;
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: rows.map(([id, delegatedCreation]) => ({
+                  path: `/repo/${id}`,
+                  id,
+                  name: id,
+                  delegatedCreation,
+                })),
+              },
+            ],
+          ],
+        })
+      );
+
+      const kept = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, Object.hasOwn(workspace, "delegatedCreation")]
+      );
+
+      expect(kept).toEqual([
+        ["ws-ok", true],
+        ["ws-flagged", true],
+        ["ws-str", false],
+        ["ws-no-owner", false],
+      ]);
+    });
+  });
+
   describe("legacy PTC exclusive taskExperiments alias", () => {
     it("aliases programmaticToolCallingExclusive onto programmaticToolCalling at load time", () => {
       // Tasks stamped by pre-merge builds may carry only the exclusive flag;
