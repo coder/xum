@@ -341,6 +341,96 @@ describe("ReviewStateStore", () => {
     expect(backend.sections.hunkExpand).toEqual({ h0: true, h1: true });
   });
 
+  test("a send after a failed first subscription retries at once and reads the attached notes (#5011)", async () => {
+    const { backend, client } = createBackend({
+      reviews: { r1: makeReview("r1", "attached"), r2: makeReview("r2", "pending") },
+    });
+    backend.failNextSubscribe = true;
+    const store = connect(client);
+    await store.whenReady(WS);
+    expect(store.getAttachedReviews(WS)).toEqual([]);
+
+    // Well under the first resubscribe backoff would matter only if the read waited it out;
+    // the read retries the subscription itself instead.
+    const attached = await store.readAttachedReviewsForSend(WS, 2_000);
+    expect(attached?.map((review) => review.id)).toEqual(["r1"]);
+  });
+
+  test("a send reports missing notes (null) when hydration keeps failing (#5011)", async () => {
+    const { backend, client } = createBackend({ reviews: { r1: makeReview("r1", "attached") } });
+    const gate = deferred();
+    backend.failNextSubscribe = true;
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    // The immediate retry fails as well.
+    backend.failNextSubscribe = true;
+    expect(await store.readAttachedReviewsForSend(WS, 2_000)).toBeNull();
+
+    // A retry that never answers is bounded by the timeout.
+    backend.hydrationGate = gate.promise;
+    expect(await store.readAttachedReviewsForSend(WS, 50)).toBeNull();
+    gate.resolve();
+  });
+
+  test("a mutate after the last subscriber left runs against fresh server data (#5011)", async () => {
+    const { backend, client } = createBackend({ readMore: {} });
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+    await waitUntil(() => backend.openStreams === 0);
+
+    // Another renderer changes the section while no selector is mounted here.
+    backend.externalWrite({ readMore: { set: { h1: { up: 1, down: 0 } } } });
+
+    // The updater depends on the current value; the cached copy would not have h1.
+    store.mutate(WS, "readMore", (prev) => ({
+      set: { h1: { up: (prev.h1?.up ?? 0) + 1, down: 0 } },
+    }));
+    await waitUntil(() => backend.sections.readMore?.h1?.up === 2);
+    await waitUntil(() => backend.openStreams === 0);
+  });
+
+  test("a flush after the last subscriber left waits for the new snapshot (#5011)", async () => {
+    const { backend, client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+
+    const gate = deferred();
+    backend.hydrationGate = gate.promise;
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+    const flushed = store.flush(WS);
+    gate.resolve();
+    await flushed;
+    expect(backend.sections.hunkExpand).toEqual({ h1: true });
+  });
+
+  test("removing a workspace settles a pending whenReady and flush (#5011)", async () => {
+    const { backend, client } = createBackend();
+    backend.hydrationGate = new Promise<void>(() => undefined);
+    const store = connect(client);
+
+    const ready = store.whenReady(WS);
+    const flushed = store.flush(WS);
+    store.removeWorkspace(WS);
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("waiter never settled")), 1_000)
+    );
+    await Promise.race([ready, timeout]);
+    let flushError: unknown = null;
+    await Promise.race([
+      flushed.catch((error: unknown) => {
+        flushError = error;
+      }),
+      timeout,
+    ]);
+    expect(flushError).not.toBeNull();
+  });
+
   test("reports restored notes durable only once the backend acknowledged them (#4448)", async () => {
     const { backend, client } = createBackend();
     const store = connect(client);
