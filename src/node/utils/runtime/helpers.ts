@@ -284,7 +284,8 @@ export async function copyPlanFileAcrossRuntimes(
       continue; // Missing (or not a regular file): try the next candidate.
     }
     // A plan already at the target is not this copy's: fork() refuses names of live workspaces in
-    // its project (#5009), so it is an orphan of a removed workspace. Removal deletes plans since
+    // its project (#5009) and of workspaces that share its plan directory (#5139), so it is an
+    // orphan of a removed workspace. Removal deletes plans since
     // #5019, but orphans remain from older builds, failed or skipped deletions (unreachable host,
     // Docker/devcontainer, a same-basename project), so the copy overwrites instead of failing
     // closed. A probe that fails in transport counts as existing.

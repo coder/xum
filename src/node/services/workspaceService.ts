@@ -12769,11 +12769,19 @@ export class WorkspaceService
       // Fetch all metadata upfront for the branch name, title and explicit-name collision checks.
       // Registry fields suffice: probing checkouts could block on an unrelated stalled mount.
       const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      // Names this fork cannot take: those in its project, and those of workspaces that keep their
+      // plans in the same plan directory (a same-basename project on the same plan storage, #5139),
+      // whose plan the fork's copy would overwrite. The fork's own runtime is known only after
+      // orchestration; its plan storage is the source's or narrower (a Coder fork onto a new host
+      // shares nothing), so the source's is the stricter test. The registration write re-checks
+      // with the fork's own runtime.
+      const planTarget = { projectName, runtimeConfig: sourceRuntimeConfig };
+      const namesTakenFrom = allMetadata.filter(
+        (m) => m.projectPath === foundProjectPath || sharesPlanDirectory(m, planTarget)
+      );
       let resolvedName: string;
       if (isAutoName) {
-        const existingNamesSet = new Set(
-          allMetadata.filter((m) => m.projectPath === foundProjectPath).map((m) => m.name)
-        );
+        const existingNamesSet = new Set(namesTakenFrom.map((m) => m.name));
         // Also include local branch names to avoid silently reusing stale branches that
         // were left behind on disk but no longer exist in config metadata.
         try {
@@ -12827,12 +12835,20 @@ export class WorkspaceService
         return Err(resolvedNameValidation.error ?? "Invalid workspace name");
       }
       // Plan files live at plans/<projectName>/<name>.md, so a fork reusing the name of a workspace
-      // in this project would overwrite that workspace's plan (#5009). Project-dir forks never
-      // fail on the name by themselves; refuse for every runtime here, before anything is created
-      // or copied. Concurrent forks can both pass this check; the registration write re-checks
-      // the name (#5026).
-      if (allMetadata.some((m) => m.projectPath === foundProjectPath && m.name === resolvedName)) {
-        return Err(new WorkspaceNameTakenError(resolvedName).message);
+      // in this project (#5009), or in a same-basename project on the same plan storage (#5139),
+      // would overwrite that workspace's plan. Project-dir forks never fail on the name by
+      // themselves; refuse for every runtime here, before anything is created or copied.
+      // Concurrent forks can both pass this check; the registration write re-checks the name
+      // (#5026). A workspace being removed stays registered until its plan is deleted, so a fork
+      // cannot copy to that path in between.
+      const nameTakenBy = namesTakenFrom.find((m) => m.name === resolvedName);
+      if (nameTakenBy) {
+        return Err(
+          new WorkspaceNameTakenError(
+            resolvedName,
+            nameTakenBy.projectPath === foundProjectPath ? undefined : nameTakenBy.projectPath
+          ).message
+        );
       }
 
       const sourceWorkspace = this.config.findWorkspace(sourceWorkspaceId);
