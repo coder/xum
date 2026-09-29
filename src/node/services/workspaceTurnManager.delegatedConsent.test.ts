@@ -472,8 +472,8 @@ describe("delegated target default consent (#4453)", () => {
 
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
 
-    // Not flagged; the mark is a leftover beside a persisted record and is dropped.
-    expect(mark(a.config)).toBeUndefined();
+    // Not flagged, and the mark stays: the unreadable record cannot bind the target itself.
+    expect(mark(a.config)).toEqual({ handleId: "wst_handle", ownerWorkspaceId: a.parentId });
     await fsPromises.rm(handleRecordPath(a.parentId));
     await a.finish();
   });

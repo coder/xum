@@ -852,9 +852,14 @@ export class WorkspaceTurnManager {
     handleId: string
   ): Promise<void> {
     // Any record file, even one that reads as null (corrupt, or a newer build's schema), means the
-    // handle persisted: its mark is only a leftover (the creator died before clearing it).
+    // handle persisted: the target is not an orphan. Drop the leftover mark (the creator died
+    // before clearing it) only when the record itself binds this target; an unreadable record
+    // cannot, so the mark stays as the remaining evidence of the binding.
     if (await this.taskHandleStore.hasWorkspaceTurnFile(ownerId, handleId)) {
-      await this.workspaceService.clearDelegatedCreationMark(workspaceId, handleId);
+      const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+      if (record?.createdWorkspace === true && record.workspaceId === workspaceId) {
+        await this.workspaceService.clearDelegatedCreationMark(workspaceId, handleId);
+      }
       return;
     }
     // Records live in the owner's session dir and are deleted only with it, so a removed owner
