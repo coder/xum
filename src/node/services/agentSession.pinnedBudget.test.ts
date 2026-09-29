@@ -473,6 +473,35 @@ describe("pinned full-payload rollover admission", () => {
       }
     }
   );
+  test("the first fresh-window request shows the IDs its rows were appended with", async () => {
+    const fixture = await setup("small");
+    const { h, historyService, start } = fixture;
+    try {
+      const result = await h.session.sendMessage("Small follow-up", {
+        model,
+        agentId: "exec",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      expect(result.success).toBe(true);
+      const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!after.success) throw new Error(after.error);
+      const boundary = after.data[0];
+      const trigger = after.data.findLast((row) => row.role === "user");
+      expect(boundary.metadata?.muxMetadata?.type).toBe("context-window-rollover");
+      expect(start).toHaveBeenCalledTimes(1);
+      const request = start.mock.calls[0][0];
+      const system: unknown = request.system;
+      if (typeof system !== "string") throw new Error("Expected a string system prompt");
+      const windowSection = system.split("<context_window>")[1]?.split("</context_window>")[0];
+      expect(windowSection).toContain(`w:${String(boundary.metadata?.historySequence)}`);
+      expect(windowSection).toContain("w:0");
+      expect(JSON.stringify(request.messages)).toContain(
+        `[id: ${String(trigger?.metadata?.historySequence)}]`
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
   test.each(["dispose", "cancel", "admission-revoked"] as const)(
     "%s after preparation publishes no stream or accepted history",
     async (action) => {

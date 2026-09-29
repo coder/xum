@@ -461,8 +461,6 @@ export interface BuildStreamSystemContextOptions {
    */
   memoryToolAvailable?: boolean;
   tokenBudgetEnabled?: boolean;
-  /** Rendered as the <context_window> section while token budget is enabled. */
-  contextWindowIds?: ContextWindowIds;
   /** Effective workspace-scope permission, not merely memory tool visibility. */
   workspaceMemoryWritable?: boolean;
   /** Post-policy availability; never advertise recall when memory access is denied. */
@@ -733,7 +731,7 @@ export function buildContextWindowGuidance(): string {
   ].join("\n");
 }
 
-function buildContextWindowSection(ids: ContextWindowIds): string {
+export function buildContextWindowSection(ids: ContextWindowIds): string {
   return [
     "<context_window>",
     `Current context window id: ${ids.currentWindowId}`,
@@ -931,10 +929,6 @@ export async function buildStreamSystemContext(
     if (opts.intuitionToolAvailable) {
       agentSystemPromptSections.push(buildIntuitionGuidanceSection());
     }
-  }
-  // session_history needs the window IDs even when tool policy removes the memory tool.
-  if (opts.tokenBudgetEnabled === true && opts.contextWindowIds) {
-    agentSystemPromptSections.push(buildContextWindowSection(opts.contextWindowIds));
   }
 
   const ancestorPlanContext = resolveAncestorPlanContext({

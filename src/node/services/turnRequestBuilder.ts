@@ -205,6 +205,7 @@ import type { OauthServiceBindings, ProviderModelFactory } from "./providerModel
 import {
   assemblePromptPayload,
   buildPlanInstructions,
+  buildContextWindowSection,
   buildStreamSystemContext,
   formatMcpWarningPrefix,
   prepareProviderRequestMessages,
@@ -1824,7 +1825,6 @@ export class TurnRequestBuilder {
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
-    const contextWindowIds = tokenBudgetEnabled ? resolveContextWindowIds(messages) : undefined;
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1855,7 +1855,6 @@ export class TurnRequestBuilder {
         advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
-        contextWindowIds,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
         intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
@@ -2796,6 +2795,27 @@ export class TurnRequestBuilder {
           }
         }
 
+        // The window section goes last, resolved from the rows being sent, so start() can
+        // re-render it without rerunning assembly middleware or tool construction.
+        const baseSystem = attemptSystem;
+        const baseSystemTokens = attemptSystemTokens;
+        const renderContextWindowSection = async () => {
+          const ids = tokenBudgetEnabled
+            ? resolveContextWindowIds(options.sourceMessages)
+            : undefined;
+          attemptSystem = baseSystem;
+          attemptSystemTokens = baseSystemTokens;
+          if (ids == null) return;
+          const section = `\n\n${buildContextWindowSection(ids)}`;
+          attemptSystem += section;
+          const tokenizer = await getTokenizerForModel(
+            seed.rawModelString,
+            seed.capabilityModelString
+          );
+          attemptSystemTokens += await tokenizer.countTokens(section);
+        };
+        await renderContextWindowSection();
+
         if (options.initializeToolSearch && toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
@@ -2940,6 +2960,17 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
+          rebuildAfterSequencing: async () => {
+            await renderContextWindowSection();
+            const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+            return {
+              system: attemptSystem,
+              systemMessageTokens: attemptSystemTokens,
+              engineSystem: payload.system,
+              messages: payload.messages,
+              contextBudgetLimit: payload.contextBudgetLimit,
+            };
+          },
         };
       } catch (error) {
         if (options.cleanupModelOnError) {
@@ -2975,15 +3006,6 @@ export class TurnRequestBuilder {
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
-    const finalMessages = primaryRequest.messages;
-    // Debug sinks pair systemMessage with the message list, so when the
-    // assembler embedded the system prompt as a leading cached row
-    // (engineSystem undefined), drop that row to keep the system prompt
-    // single-sourced in captures.
-    const debugViewMessages =
-      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-        ? finalMessages.slice(1)
-        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -3014,11 +3036,37 @@ export class TurnRequestBuilder {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
-      if (context.admissionOnly)
+      if (context.admissionOnly) {
         requestHistorySequence = messages.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
+        // Rollover admission prepared before append sequenced these same rows, so the prompt
+        // lacked the window IDs and [id] markers. The re-assembly budget-checks them too.
+        try {
+          primaryRequest = {
+            ...primaryRequest,
+            ...(await primaryRequest.rebuildAfterSequencing()),
+          };
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        systemMessage = primaryRequest.system;
+        systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      const finalMessages = primaryRequest.messages;
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as a leading cached row
+      // (engineSystem undefined), drop that row to keep the system prompt
+      // single-sourced in captures.
+      const debugViewMessages =
+        primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
+          ? finalMessages.slice(1)
+          : finalMessages;
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",

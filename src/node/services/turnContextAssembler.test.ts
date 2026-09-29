@@ -101,7 +101,6 @@ async function buildSystemContextForTest(args: {
   planFilePath?: string;
   memoryToolAvailable?: boolean;
   tokenBudgetEnabled?: boolean;
-  contextWindowIds?: Parameters<typeof buildStreamSystemContext>[0]["contextWindowIds"];
   workspaceMemoryWritable?: boolean;
   hotMemoriesBlock?: string;
   intuitionToolAvailable?: boolean;
@@ -125,7 +124,6 @@ async function buildSystemContextForTest(args: {
     mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
     tokenBudgetEnabled: args.tokenBudgetEnabled,
-    contextWindowIds: args.contextWindowIds,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     hotMemoriesBlock: args.hotMemoriesBlock,
     intuitionToolAvailable: args.intuitionToolAvailable,
@@ -1069,20 +1067,6 @@ describe("buildStreamSystemContext", () => {
       expect(filtered).not.toContain("<memory-tool-guidance>");
       expect(filtered).toContain(pluginContext);
     }
-
-    // session_history needs the window IDs even when tool policy removes the memory tool.
-    const contextWindowIds = { currentWindowId: "w:12", previousWindowId: "w:5" };
-    const windowSection = (text: string) =>
-      text.split("<context_window>")[1]?.split("</context_window>")[0];
-    const budgetWithoutMemory = await buildSystemContextForTest({
-      ...buildArgs,
-      tokenBudgetEnabled: true,
-      contextWindowIds,
-    });
-    expect(windowSection(budgetWithoutMemory.systemMessage)).toContain("w:12");
-    expect(windowSection(budgetWithoutMemory.systemMessage)).toContain("w:5");
-    const budgetOff = await buildSystemContextForTest({ ...buildArgs, contextWindowIds });
-    expect(windowSection(budgetOff.systemMessage)).toBeUndefined();
   });
 
   test("uses the resolved agent discovery runtime for parent-only subagent prompts", async () => {
