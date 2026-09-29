@@ -639,6 +639,8 @@ describe("Claude tokenizer correction (#5219)", () => {
     // Catalog aliases with qualifiers or joined versions stay older; a newer base does not.
     expect(await estimate("github-copilot:claude-opus-4.6-fast")).toBe(older);
     expect(await estimate("github-copilot:claude-opus-41")).toBe(older);
+    expect(await estimate("anthropic:claude-4-opus-20250514")).toBe(older);
+    expect(await estimate("anthropic:claude-4.5-haiku")).toBe(older);
     expect(await estimate("anthropic:claude-opus-4-7-fast")).toBe(newTokenizer);
   });
 
