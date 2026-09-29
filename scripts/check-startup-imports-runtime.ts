@@ -25,7 +25,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -180,7 +180,7 @@ async function main(): Promise<number> {
   assert(desktopMain != null, "STARTUP_ENTRIES has no src/desktop/main.ts entry");
   // Electron launches package.json `main` (the CLI shim), not desktop main directly.
   const { main: packageMain } = JSON.parse(
-    readFileSync(path.join(rootDir, "package.json"), "utf8")
+    await readFile(path.join(rootDir, "package.json"), "utf8")
   ) as { main: string };
   const entry = STARTUP_ENTRIES.find((e) => e.dist === packageMain);
   assert(entry != null, `package.json main (${packageMain}) is not in STARTUP_ENTRIES`);
@@ -189,6 +189,7 @@ async function main(): Promise<number> {
     console.error(`❌ ${entry.dist} does not exist; run make build-main first`);
     return 1;
   }
+  const desktopMainFile = realpathSync(path.join(rootDir, desktopMain.dist));
 
   let failed = false;
   for (const platform of DESKTOP_PLATFORMS) {
@@ -206,7 +207,7 @@ async function main(): Promise<number> {
     }
     // The shim must have routed to desktop main, so this run covers everything a
     // desktop-main-only load would (and a whenReady() call before it cannot pass).
-    if (!modules.includes(realpathSync(path.join(rootDir, desktopMain.dist)))) {
+    if (!modules.includes(desktopMainFile)) {
       console.error(`❌ ${entry.dist} (${platform}) did not load ${desktopMain.dist}`);
       failed = true;
     }
