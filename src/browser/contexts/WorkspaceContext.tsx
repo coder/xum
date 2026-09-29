@@ -411,6 +411,15 @@ function isDraftEmpty(projectPath: string, draftId: string): boolean {
   return true;
 }
 
+/** Whether the project's default creation composer (bare project page) holds nothing. */
+function isDefaultCreationDraftEmpty(projectPath: string): boolean {
+  const draft = getDraftStore().getView(defaultCreationDraftScope(projectPath));
+  if (draft.text.trim().length > 0 || draft.attachmentCount > 0) return false;
+  // A workspace name typed there counts too, as in isDraftEmpty.
+  const scopeId = getPendingScopeId(projectPath);
+  return readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null) === null;
+}
+
 /**
  * Find an existing empty draft for a project (optionally within a specific sub-project).
  * Returns the draft ID if found, or null if no empty draft exists.
@@ -824,8 +833,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const pendingDeepLinksRef = useRef<DeepLinkPayload[]>([]);
-  /** Projects whose default creation draft is being moved into a listed draft. */
-  const defaultDraftMovesRef = useRef(new Set<string>());
 
   const handleDeepLink = useCallback(
     (payload: DeepLinkPayload) => {
@@ -1999,6 +2006,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       );
       const existingDrafts = freshDrafts[projectPath] ?? [];
 
+      // Text typed on the bare project page (no draft id) lives in the project's default creation
+      // draft, which only that page shows. While it holds anything, the project row opens it
+      // instead of a new draft, so typed text is never hidden behind an empty composer (#5071).
+      if (subProjectPath === undefined && !isDefaultCreationDraftEmpty(projectPath)) {
+        navigateToProject(projectPath, undefined, { replace: options?.replace });
+        return;
+      }
+
       // If there's an existing empty draft (optionally in the same sub-project), reuse it
       // instead of creating yet another empty draft.
       const existingEmptyDraftId = findExistingEmptyDraft(
@@ -2006,60 +2021,50 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         projectPath,
         subProjectPath
       );
-      const draftId = existingEmptyDraftId ?? createDraftId();
-
-      // Register a new draft before anything is moved into it: a draft without a list entry is
-      // unreachable from the UI. The direct write reports failure (e.g. a full origin), which
-      // the hook's setter would not.
-      const listed =
-        existingEmptyDraftId !== null ||
-        updatePersistedState<WorkspaceDraftsByProject>(
-          WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-          (prev) => {
-            const current = normalizeWorkspaceDraftsByProject(prev);
-            const draft: WorkspaceDraft = {
-              draftId,
-              subProjectPath: subProjectPath ?? null,
-              createdAt: Date.now(),
-            };
-            return { ...current, [projectPath]: [...(current[projectPath] ?? []), draft] };
-          },
-          {}
-        );
-
-      // Text typed on the bare project page (no draft id) lives in the default creation draft,
-      // which only that URL shows. Move it into the draft this opens, so the project row never
-      // hides it behind an empty composer (#5071). One move per project at a time: the source
-      // stays until the destination is saved, and a second click meanwhile must not copy it
-      // into yet another draft.
-      const defaultScope = defaultCreationDraftScope(projectPath);
-      const pending = getDraftStore().getView(defaultScope);
-      if (
-        listed &&
-        !defaultDraftMovesRef.current.has(projectPath) &&
-        (pending.text.trim().length > 0 || pending.attachmentCount > 0)
-      ) {
-        defaultDraftMovesRef.current.add(projectPath);
-        // Never rejects; the default draft is deleted only once the new one is saved.
-        getDraftStore()
-          .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
-          .catch(() => undefined)
-          .finally(() => defaultDraftMovesRef.current.delete(projectPath));
-        try {
-          // Scope-bound composer settings (model, workspace name) follow the draft. Best-effort:
-          // settings, not the draft (the copy can hit a full origin).
-          migrateWorkspaceStorage(
-            getPendingScopeId(projectPath),
-            getDraftScopeId(projectPath, draftId)
-          );
-        } catch (error) {
-          console.warn("Failed to move default creation draft settings:", error);
-        }
+      if (existingEmptyDraftId) {
+        navigateToProject(projectPath, existingEmptyDraftId, {
+          replace: options?.replace,
+        });
+        return;
       }
+
+      const draftId = createDraftId();
+      const createdAt = Date.now();
+      const draft: WorkspaceDraft = {
+        draftId,
+        subProjectPath: subProjectPath ?? null,
+        createdAt,
+      };
+
+      setWorkspaceDraftsByProjectState((prev) => {
+        const current = normalizeWorkspaceDraftsByProject(prev);
+        const existing = current[projectPath] ?? [];
+
+        // One-time migration: if the user has an old per-project pending draft, move it
+        // into the first draft scope so it stays accessible.
+        // The default creation composer's draft (no draft id) moves into the first listed one.
+        if (existing.length === 0) {
+          const pendingScopeId = getPendingScopeId(projectPath);
+          const defaultScope = defaultCreationDraftScope(projectPath);
+          const pending = getDraftStore().getView(defaultScope);
+          if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
+            // Never rejects; the default draft is deleted only once the new one is saved.
+            getDraftStore()
+              .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
+              .catch(() => undefined);
+            migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
+          }
+        }
+
+        return {
+          ...current,
+          [projectPath]: [...existing, draft],
+        };
+      });
 
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },
-    [navigateToProject]
+    [navigateToProject, setWorkspaceDraftsByProjectState]
   );
 
   useEffect(() => {

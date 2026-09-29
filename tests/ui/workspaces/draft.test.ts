@@ -27,7 +27,6 @@ import {
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
 
-import * as storage from "@/common/constants/storage";
 import { WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -174,82 +173,55 @@ describeIntegration("Draft workspace behavior", () => {
     }
   }, 60_000);
 
-  test.each([
-    { name: "a click", clicks: 1, failSettingsMove: false },
-    // The source stays until the destination is saved; a second click must not copy it again.
-    { name: "a double click", clicks: 2, failSettingsMove: false },
-    // Settings are copied with raw storage writes that throw at quota; the draft still moves.
-    { name: "a click whose settings move fails", clicks: 1, failSettingsMove: true },
-  ])(
-    "the project row moves the default creation draft into one listed draft ($name)",
-    async ({ clicks, failSettingsMove }) => {
-      const env = getSharedEnv();
-      const projectPath = getSharedRepoPath();
+  test("the project row opens a non-empty default creation draft instead of a new draft", async () => {
+    const env = getSharedEnv();
+    const projectPath = getSharedRepoPath();
 
-      const cleanupDom = setupTestDom();
-      updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
+    const cleanupDom = setupTestDom();
+    updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, null);
 
-      const view = renderApp({ apiClient: env.orpc });
-      const createdScopes: DraftStoreScope[] = [];
-      const settingsMove = jest.spyOn(storage, "migrateWorkspaceStorage");
+    const view = renderApp({ apiClient: env.orpc });
+    const createdScopes: DraftStoreScope[] = [];
 
-      try {
-        await view.waitForReady();
-        const normalizedProjectPath = await addProjectViaUI(view, projectPath);
-        const projectRow = await findProjectRow(view.container, normalizedProjectPath);
-        const scopeOf = (draftId: string): DraftStoreScope => ({
-          kind: "creation",
-          projectPath: normalizedProjectPath,
-          draftId,
-        });
+    try {
+      await view.waitForReady();
+      const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      const projectRow = await findProjectRow(view.container, normalizedProjectPath);
 
-        // A listed draft with text, so the project row cannot reuse it and has no
-        // "first listed draft" to move the default draft into.
+      // A listed draft with text, so the project row cannot reuse it.
+      fireEvent.click(projectRow);
+      const [listedDraftId] = await waitForDraftCount(normalizedProjectPath, 1);
+      const listedScope: DraftStoreScope = {
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId: listedDraftId,
+      };
+      // Text typed on the bare project page (no draft id) lives in the default creation draft.
+      const defaultScope = defaultCreationDraftScope(normalizedProjectPath);
+      createdScopes.push(listedScope, defaultScope);
+      getDraftStore().setText(listedScope, "listed draft text");
+      getDraftStore().setText(defaultScope, "default draft text");
+      await getDraftStore().flush(defaultScope);
+
+      // Twice: a repeated click must land on the same draft, never add one.
+      for (const _click of [1, 2]) {
         fireEvent.click(projectRow);
-        const [listedDraftId] = await waitForDraftCount(normalizedProjectPath, 1);
-        // Text typed on the bare project page (no draft id) lives in the default creation draft.
-        const defaultScope = defaultCreationDraftScope(normalizedProjectPath);
-        createdScopes.push(scopeOf(listedDraftId), defaultScope);
-        getDraftStore().setText(scopeOf(listedDraftId), "listed draft text");
-        getDraftStore().setText(defaultScope, "default draft text");
-        await getDraftStore().flush(defaultScope);
-
-        if (failSettingsMove) {
-          settingsMove.mockImplementation(() => {
-            throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
-          });
-        }
-        for (let click = 0; click < clicks; click++) fireEvent.click(projectRow);
-
-        if (clicks === 1) {
-          // The project row must not hide the default draft behind a fresh empty composer.
-          await waitFor(
-            () => {
-              const textarea = view.container.querySelector("textarea");
-              expect(textarea?.value).toBe("default draft text");
-            },
-            { timeout: 5_000 }
-          );
-        }
-        await waitFor(() => expect(getDraftStore().getView(defaultScope).text).toBe(""), {
-          timeout: 5_000,
-        });
-        const draftIds = getWorkspaceDraftIds(normalizedProjectPath);
-        createdScopes.push(...draftIds.map(scopeOf));
-        expect(
-          draftIds.filter(
-            (draftId) => getDraftStore().getView(scopeOf(draftId)).text === "default draft text"
-          )
-        ).toHaveLength(1);
-      } finally {
-        settingsMove.mockRestore();
-        // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
-        await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
-        await cleanupView(view, cleanupDom);
+        // The project row must not hide the default draft behind a fresh empty composer.
+        await waitFor(
+          () => {
+            const textarea = view.container.querySelector("textarea");
+            expect(textarea?.value).toBe("default draft text");
+          },
+          { timeout: 5_000 }
+        );
+        expect(getWorkspaceDraftIds(normalizedProjectPath)).toEqual([listedDraftId]);
       }
-    },
-    60_000
-  );
+    } finally {
+      // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
 
   test("clicking New Chat before typing reuses hidden draft without showing duplicates", async () => {
     const env = getSharedEnv();
