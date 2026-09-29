@@ -1,6 +1,7 @@
 import type {
   DraftAttachment,
   DraftEvent,
+  DraftListEntry,
   DraftScope,
   DraftUpdateInput,
 } from "@/common/orpc/schemas/drafts";
@@ -22,6 +23,15 @@ export function createMockDraftsApi() {
   const drafts = new Map<string, StoredDraft>();
   const listeners = new Set<(event: DraftEvent) => void>();
   let revision = 1;
+  let listEntries: DraftListEntry[] = [];
+  const isSame = (a: DraftListEntry, b: DraftListEntry) =>
+    a.projectPath === b.projectPath && a.draftId === b.draftId;
+  const setList = (next: DraftListEntry[]): { revision: number } => {
+    listEntries = next;
+    revision++;
+    emit({ type: "list", entries: listEntries, revision });
+    return { revision };
+  };
   const emit = (event: DraftEvent) => {
     for (const listener of listeners) listener(event);
   };
@@ -55,8 +65,37 @@ export function createMockDraftsApi() {
       });
     },
     update: (input: DraftUpdateInput) => Promise.resolve(write(input)),
-    delete: (input: { scope: DraftScope }) =>
-      Promise.resolve(write({ scope: input.scope, text: "", attachments: [] })),
+    delete: (input: { scope: DraftScope }) => {
+      const result = write({ scope: input.scope, text: "", attachments: [] });
+      const { scope } = input;
+      if (scope.kind === "creation") {
+        setList(
+          listEntries.filter(
+            (entry) => !isSame(entry, { ...scope, subProjectPath: null, createdAt: 0 })
+          )
+        );
+      }
+      return Promise.resolve(result);
+    },
+    putListEntry: (entry: DraftListEntry) => {
+      const existing = listEntries.find((listed) => isSame(listed, entry));
+      return Promise.resolve(
+        setList(
+          existing
+            ? listEntries.map((listed) =>
+                listed === existing ? { ...listed, subProjectPath: entry.subProjectPath } : listed
+              )
+            : [...listEntries, entry]
+        )
+      );
+    },
+    importLegacyList: (input: { entries: DraftListEntry[] }) =>
+      Promise.resolve(
+        setList([
+          ...listEntries,
+          ...input.entries.filter((entry) => !listEntries.some((listed) => isSame(listed, entry))),
+        ])
+      ),
     importLegacy: (input: DraftUpdateInput) => {
       if (drafts.has(draftScopeKey(input.scope))) {
         return Promise.resolve({ result: "present" as const, revision });
@@ -64,7 +103,9 @@ export function createMockDraftsApi() {
       return Promise.resolve({ result: "applied" as const, ...write(input) });
     },
     subscribe: async function* (_input?: void, opts?: { signal?: AbortSignal }) {
-      const queue: DraftEvent[] = [{ type: "snapshot", drafts: summaries() }];
+      const queue: DraftEvent[] = [
+        { type: "snapshot", drafts: summaries(), list: { entries: listEntries, revision } },
+      ];
       let wake: (() => void) | null = null;
       const listener = (event: DraftEvent) => {
         queue.push(event);

@@ -112,12 +112,37 @@ export const DraftImportLegacyOutputSchema = z.object({
 });
 
 /**
- * `drafts.subscribe` stream: a full snapshot first (the same data as `drafts.list`), then one event
- * per change. A resubscription starts with a fresh snapshot, so a client that missed events while
+ * One listed creation draft (a row under its project in the sidebar). The list lives in
+ * `<xumRoot>/drafts/list.json`, separate from draft bodies: a listed draft may be empty (no body),
+ * and clearing a draft's text never delists it. It used to be the renderer localStorage key
+ * `workspaceDraftsByProject`, whose size budget dropped newer entries after a restart (#5225).
+ */
+export const DraftListEntrySchema = z.object({
+  projectPath: z.string().min(1),
+  draftId: z.string().regex(DRAFT_ID_PATTERN),
+  /** Sub-project the workspace is created in; null for the project itself. */
+  subProjectPath: z.string().min(1).nullable(),
+  createdAt: z.number(),
+});
+
+/** The whole list with its revision (bumped on every change; starts at the process start time). */
+export const DraftListSchema = z.object({
+  entries: z.array(DraftListEntrySchema),
+  revision: DraftRevisionSchema,
+});
+
+/**
+ * `drafts.subscribe` stream: a full snapshot first (the same data as `drafts.list`, plus the
+ * creation draft list), then one event per change (the whole list on a list change). A resubscription starts with a fresh snapshot, so a client that missed events while
  * disconnected reconciles from it (including deletions).
  */
 export const DraftEventSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("snapshot"), drafts: z.array(DraftSummarySchema) }),
+  z.object({
+    type: z.literal("snapshot"),
+    drafts: z.array(DraftSummarySchema),
+    list: DraftListSchema,
+  }),
+  DraftListSchema.extend({ type: z.literal("list") }),
   DraftSummarySchema.extend({ type: z.literal("changed") }),
   z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
 ]);
@@ -131,3 +156,5 @@ export type DraftGetOutput = z.infer<typeof DraftGetOutputSchema>;
 export type DraftUpdateInput = z.infer<typeof DraftUpdateInputSchema>;
 export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSchema>;
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
+export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;
+export type DraftList = z.infer<typeof DraftListSchema>;

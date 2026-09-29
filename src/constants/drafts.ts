@@ -20,6 +20,13 @@ export const MAX_DRAFT_JSON_BYTES = 40 * 1024 * 1024;
 export const DRAFT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
+ * Draft id of a project's default creation composer (the project page opened without a draft
+ * id). Generated draft ids are UUIDs, so this fixed id never collides with a listed draft, and the
+ * backend never lists it.
+ */
+export const DEFAULT_CREATION_DRAFT_ID = "default";
+
+/**
  * Longest the app waits for the drafts subscription's first snapshot (and the legacy import)
  * before composers may render anyway; hydration continues in the background.
  */

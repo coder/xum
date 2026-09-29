@@ -35,6 +35,7 @@ import {
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  DEFAULT_CREATION_DRAFT_ID,
   DRAFT_ID_PATTERN,
   DRAFT_STORE_READY_TIMEOUT_MS,
   MAX_DRAFT_JSON_BYTES,
@@ -65,12 +66,6 @@ export interface PendingDraftScope {
 }
 
 export type DraftStoreScope = DraftScope | PendingDraftScope;
-
-/**
- * Draft id of a project's default creation composer (the project page opened without a draft
- * id). Generated draft ids are UUIDs, so this fixed id never collides with a listed draft.
- */
-const DEFAULT_CREATION_DRAFT_ID = "default";
 
 /**
  * Draft id a legacy pending-scope draft is imported under. Fixed (not generated) so that an
@@ -718,7 +713,7 @@ export class DraftStore {
     }
   }
 
-  private applyEvent(event: Exclude<DraftEvent, { type: "snapshot" }>): void {
+  private applyEvent(event: Extract<DraftEvent, { type: "changed" | "deleted" }>): void {
     const key = draftScopeKey(event.scope);
     if (this.pendingDeletes.has(key)) return;
     const existing = this.entries.get(key);
@@ -778,7 +773,8 @@ export class DraftStore {
             for (const key of [...this.pendingDeletes.keys()]) {
               this.sendDelete(key, 0).catch(() => undefined);
             }
-          } else {
+          } else if (event.type !== "list") {
+            // The creation draft list is not consumed here yet (WorkspaceContext still owns it).
             this.applyEvent(event);
           }
         }

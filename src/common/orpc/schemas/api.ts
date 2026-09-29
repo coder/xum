@@ -108,6 +108,7 @@ import {
   DraftEventSchema,
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
+  DraftListEntrySchema,
   DraftRevisionOutputSchema,
   DraftScopeSchema,
   DraftSummarySchema,
@@ -3311,6 +3312,16 @@ export const drafts = {
   importLegacy: {
     input: DraftUpdateInputSchema,
     output: DraftImportLegacyOutputSchema,
+  },
+  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
+  putListEntry: {
+    input: DraftListEntrySchema,
+    output: DraftRevisionOutputSchema,
+  },
+  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
+  importLegacyList: {
+    input: z.object({ entries: z.array(DraftListEntrySchema) }),
+    output: DraftRevisionOutputSchema,
   },
   subscribe: {
     input: z.void(),
