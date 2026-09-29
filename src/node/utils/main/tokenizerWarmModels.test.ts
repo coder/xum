@@ -83,6 +83,10 @@ describe("deriveWarmModels", () => {
   test("a config naming no model falls back to the default warm set", () => {
     expect(deriveWarmModels({ projects: new Map() })).toEqual(Array.from(DEFAULT_WARM_MODELS));
     expect(deriveWarmModels(configWith([{ id: "w1" }]))).toEqual(Array.from(DEFAULT_WARM_MODELS));
+    // A blank model string names no model, so it must not narrow the warm set to the default model.
+    expect(deriveWarmModels(configWith([{ aiSettings: { model: "  " } }]))).toEqual(
+      Array.from(DEFAULT_WARM_MODELS)
+    );
   });
 
   test("malformed entries are ignored without throwing", () => {
