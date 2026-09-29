@@ -633,6 +633,9 @@ describe("Claude tokenizer correction (#5219)", () => {
     const older = await estimate("anthropic:claude-sonnet-4-6");
     expect(older).toBeLessThan(newTokenizer);
     expect(await estimate("anthropic:claude-sonnet-4-5-20250929")).toBe(older);
+    // Pre-3 families predate the new tokenizer too (Bedrock "anthropic.claude-v2:1" style ids).
+    expect(await estimate("anthropic:claude-instant-v1")).toBe(older);
+    expect(await estimate("anthropic:claude-2.1")).toBe(older);
   });
 
   const smallTools = Object.fromEntries(
