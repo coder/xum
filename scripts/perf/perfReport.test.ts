@@ -585,7 +585,7 @@ describe("chat-switch coverage checks", () => {
     }
   });
 
-  test.each([0, -1, 2.5, "3", null, undefined, 1e999])(
+  test.each([0, -1, 2.5, "3", null, undefined, 1e999, Number.NaN])(
     "count %p is a problem and the row is unavailable",
     (count) => {
       const medians: Record<string, unknown> = { ...legMedians(1), count };
@@ -629,7 +629,7 @@ describe("chat-switch coverage checks", () => {
     }
   );
 
-  test.each(everyMetric(["12", -1, 1e999, true, {}]))(
+  test.each(everyMetric(["12", -1, 1e999, Number.NaN, true, {}]))(
     "an invalid median (%s = %p) is a problem and its cell is unavailable",
     (label, key, index, median) => {
       const medians: Record<string, unknown> = { ...legMedians(1), [key]: median };
@@ -653,6 +653,7 @@ describe("chat-switch coverage checks", () => {
         "in-process": {
           ...renamed.mediansByTransport["in-process"],
           "Cold-Open-Small": legMedians(1),
+          "COLD-OPEN-SMALL": legMedians(1),
         },
         "IN-PROCESS": { "cold-open-small": legMedians(1) },
       },
@@ -661,7 +662,8 @@ describe("chat-switch coverage checks", () => {
       `chat-switch-legs-missing:${CHAT_SWITCH_KEY}/chat-switch-mid-stream/in-process`,
     ]);
     expect(report.warnings).toHaveLength(1);
-    expect(report.warnings[0]).toContain("`in-process/cold-open-small`, `in-process`");
+    // Both renamed legs sanitize to the same name, which is listed once.
+    expect(report.warnings[0]).toContain(": `in-process/cold-open-small`, `in-process`.");
     expect(tableRows(render(report), "Chat switch")).toHaveLength(2 * CORE_LEGS.length - 1);
   });
 
@@ -742,7 +744,7 @@ describe("workspace-open milestones", () => {
 
   test.each(
     MILESTONES.flatMap((milestone, index) =>
-      [null, undefined, "12", -1, 1e999].map((value): [string, unknown, number] => [
+      [null, undefined, "12", -1, 1e999, Number.NaN].map((value): [string, unknown, number] => [
         milestone.id,
         value,
         index,
@@ -777,6 +779,8 @@ describe("workspace-open milestones", () => {
     const report = workspaceOpenReport(milestones);
     expect(keys(report)).toEqual([MILESTONE_KEY]);
     expect(milestoneCells(report)).toEqual(MILESTONES.map(() => "unavailable"));
+    const gap = milestones === undefined ? "missing" : milestones === null ? "null" : "invalid";
+    expect(report.problems[0]?.text).toContain(`First message ms (${gap})`);
   });
 
   test("other scenarios ignore milestones, so their cells are not applicable", () => {

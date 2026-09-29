@@ -317,11 +317,9 @@ function readChatSwitch(value: unknown): ChatSwitchRead {
 /** Additive in schemaVersion 1; judged only for workspace-open tests, which always write it. */
 function readMilestones(value: unknown): ValuesRead<MilestoneId> {
   const ids = MILESTONES.map((milestone) => milestone.id);
-  if (value === undefined || value === null) {
-    return { values: {}, gaps: ids.map((key) => ({ key, gap: "missing" as const })) };
-  }
   if (!isRecord(value)) {
-    return { values: {}, gaps: ids.map((key) => ({ key, gap: "invalid" as const })) };
+    const gap = valueGap(value) ?? "invalid";
+    return { values: {}, gaps: ids.map((key) => ({ key, gap })) };
   }
   return readValues(value, ids);
 }
@@ -633,12 +631,14 @@ function checkChatSwitch(
       );
     }
   }
-  if (read.unknown.length > 0) {
+  // Distinct raw keys can sanitize to the same name; list each name once.
+  const unknown = [...new Set(read.unknown)];
+  if (unknown.length > 0) {
     warnings.push(
-      `${where} has transports or legs this report does not know, not shown: ${read.unknown
+      `${where} has transports or legs this report does not know, not shown: ${unknown
         .slice(0, 10)
         .map(code)
-        .join(", ")}${read.unknown.length > 10 ? ` (and ${read.unknown.length - 10} more)` : ""}.`
+        .join(", ")}${unknown.length > 10 ? ` (and ${unknown.length - 10} more)` : ""}.`
     );
   }
   return { problems, warnings };
