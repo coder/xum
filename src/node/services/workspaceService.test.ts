@@ -1657,26 +1657,52 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     // #5043: a devcontainer's plan is inside its container, so the deletion runs in there. The
     // host file at the same path is not this workspace's (#4775) and is never touched; a container
     // that cannot be reached refuses the clear like an unreachable SSH host.
-    test("a devcontainer whose container cannot be reached refuses the full clear and leaves the host path", async () => {
-      const t = await setup("plan-devcontainer-unreachable", "canonical", true, {
-        type: "devcontainer",
-        configPath: ".devcontainer/devcontainer.json",
-      });
-      try {
-        const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockRejectedValue(
-          new RuntimeError("container is not running", "exec")
-        );
-        const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
-        exec.mockRestore();
-        expect(cleared.success ? "" : cleared.error).toStartWith(
-          PLAN_FILE_DELETE_UNREACHABLE_MESSAGE
-        );
-        expect(await t.historyIds()).toEqual(["user-1"]);
-        expect(existsSync(t.planPath)).toBe(true);
-      } finally {
-        await t.teardown();
+    const unreachableContainer = [
+      {
+        name: "cannot be started",
+        exec: () => Promise.reject(new RuntimeError("container is not running", "exec")),
+      },
+      {
+        // The devcontainer CLI starts and exits 1 for a stopped or missing container.
+        name: "is not found",
+        exec: () =>
+          Promise.resolve({
+            stdout: new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+            stderr: new ReadableStream<Uint8Array>({
+              start: (c) => {
+                c.enqueue(new TextEncoder().encode("Error: Dev container not found.\n"));
+                c.close();
+              },
+            }),
+            stdin: new WritableStream<Uint8Array>(),
+            exitCode: Promise.resolve(1),
+            duration: Promise.resolve(0),
+          }),
+      },
+    ];
+    test.each(unreachableContainer)(
+      "a devcontainer whose container $name refuses the full clear and leaves the host path",
+      async (container) => {
+        const t = await setup(`plan-devcontainer-${slug(container.name)}`, "canonical", true, {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        });
+        try {
+          const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(
+            container.exec
+          );
+          const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
+          exec.mockRestore();
+          expect(cleared.success ? "" : cleared.error).toStartWith(
+            PLAN_FILE_DELETE_UNREACHABLE_MESSAGE
+          );
+          expect(await t.historyIds()).toEqual(["user-1"]);
+          expect(existsSync(t.planPath)).toBe(true);
+        } finally {
+          await t.teardown();
+        }
       }
-    });
+    );
   });
 
   test("a destructive replacement without deletePlanFile keeps the plan file in place", async () => {

@@ -16294,11 +16294,13 @@ export class WorkspaceService
       }
       if (result.exitCode === 0) return Ok(undefined);
       // Fail closed either way (see PLAN_FILE_DELETE_UNREACHABLE_MESSAGE). ssh itself exits 255
-      // when it cannot connect; rm never does.
+      // when it cannot connect; rm never does. A container runtime's CLI exits nonzero for a
+      // stopped or missing container ("Dev container not found"), which its classifier knows.
       if (
         result.exitCode === EXIT_CODE_TIMEOUT ||
         result.exitCode === EXIT_CODE_ABORTED ||
-        (isSSHRuntime(runtimeConfig) && result.exitCode === 255)
+        (isSSHRuntime(runtimeConfig) && result.exitCode === 255) ||
+        runtime.isTransportFailureExit?.(result.exitCode, result.stderr) === true
       ) {
         return Err({
           type: "runtime_unreachable",
