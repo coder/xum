@@ -126,10 +126,11 @@ function collapseProjects() {
 }
 
 // Clear workspace drafts to ensure deterministic snapshots.
-// Drafts persist in localStorage and can leak between stories causing flaky diffs.
-// Uses updatePersistedState to notify subscribers (WorkspaceContext uses listener: true).
+// The draft list lives on the (mock) backend now; stories seed it through the legacy localStorage
+// list, which the DraftStore imports. Remove a leftover legacy list so only the story's own seed
+// is imported (the key is read-and-remove only, so writing "{}" would shadow the seed).
 function clearWorkspaceDrafts() {
-  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
+  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
 }
 
 const preview: Preview = {
