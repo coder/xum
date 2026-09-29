@@ -181,7 +181,16 @@ export interface ScenarioIdentity {
 }
 
 export type MetricsRead =
-  | { ok: true; values: Partial<Record<MetricId, number>> }
+  | {
+      ok: true;
+      values: Partial<Record<MetricId, number>>;
+      /**
+       * Metrics the scenario should have but whose source could not be read. Today only React
+       * renders: every non-chat-switch scenario writes react-profile.json, so a missing or
+       * malformed file is lost coverage, not an inapplicable metric.
+       */
+      unavailable: MetricId[];
+    }
   | { ok: false; reason: string };
 
 export interface ChatSwitchLegRow {
@@ -222,6 +231,44 @@ function compareChatSwitchRows(a: ChatSwitchLegRow, b: ChatSwitchLegRow): number
       orderIndex(CHAT_SWITCH_TRANSPORTS, b.transport) ||
     a.transport.localeCompare(b.transport)
   );
+}
+
+// Every transport a run measures covers these legs; the xl legs only run with
+// XUM_E2E_CHAT_SWITCH_XL=1, so their absence is not lost coverage.
+const CHAT_SWITCH_CORE_LEGS: readonly string[] = CHAT_SWITCH_LEGS.filter(
+  (leg) => !leg.endsWith("-xl")
+);
+
+/**
+ * Lost chat-switch coverage is reported, not hidden: a measured transport missing a core leg, or a
+ * leg with no value for one of the reported medians (all of them are recorded for every leg).
+ */
+function chatSwitchCoverageWarnings(label: string, rows: readonly ChatSwitchLegRow[]): string[] {
+  const warnings: string[] = [];
+  const transports = [...new Set(rows.map((row) => row.transport))];
+  if (!transports.includes("in-process")) {
+    warnings.push(`Chat switch ${code(label)} has no in-process medians.`);
+  }
+  for (const transport of transports) {
+    const legs = new Set(rows.filter((row) => row.transport === transport).map((row) => row.leg));
+    const missing = CHAT_SWITCH_CORE_LEGS.filter((leg) => !legs.has(leg));
+    if (missing.length > 0) {
+      warnings.push(
+        `Chat switch ${code(label)} (${code(transport)}) has no medians for ${missing.map(code).join(", ")}.`
+      );
+    }
+  }
+  for (const row of rows) {
+    const missing = CHAT_SWITCH_METRICS.filter((metric) => row.medians[metric.key] === undefined);
+    if (missing.length > 0) {
+      warnings.push(
+        `Chat switch ${code(label)} ${code(row.leg)} (${code(row.transport)}) has no value for ${missing
+          .map((metric) => metric.label)
+          .join(", ")}.`
+      );
+    }
+  }
+  return warnings;
 }
 
 /** One row per leg × transport from `chatSwitch` (tests/e2e/utils/chatSwitchSummary.ts). */
@@ -310,7 +357,11 @@ function readMetrics(summary: Record<string, unknown>, reactProfile: unknown): M
     const value = candidates[spec.id];
     if (value !== undefined) values[spec.id] = value;
   }
-  return { ok: true, values };
+  return {
+    ok: true,
+    values,
+    unavailable: values.reactRenders === undefined ? ["reactRenders"] : [],
+  };
 }
 
 /**
@@ -435,6 +486,8 @@ export interface ReportScenario {
   label: string;
   /** Scenario metrics; absent for chat-switch scenarios, whose Chrome totals are not reported. */
   values?: Partial<Record<MetricId, number>>;
+  /** Metrics that should exist but could not be read; shown as "unavailable". */
+  unavailable?: MetricId[];
   /** Leg × transport medians; only on the summary that holds `chatSwitch`, not its companions. */
   chatSwitch?: ChatSwitchLegRow[];
 }
@@ -545,12 +598,24 @@ export function buildReport(input: ReportInput): Report {
       if (!read.ok) {
         invalid.push(read.reason);
       } else if (!chatSwitch) {
-        if (read.metrics.ok) scenarios.push({ label: read.label, values: read.metrics.values });
-        else invalid.push(read.metrics.reason);
+        if (read.metrics.ok) {
+          const { values, unavailable } = read.metrics;
+          scenarios.push({ label: read.label, values, unavailable });
+          if (unavailable.includes("reactRenders")) {
+            problems.push({
+              key: `react-profile-unreadable:${test.key}/${read.label}`,
+              text: `Scenario ${code(read.label)} has no readable React profile (\`react-profile.json\` is missing or malformed), so React renders are unavailable.`,
+            });
+          }
+        } else {
+          invalid.push(read.metrics.reason);
+        }
       } else if (read.chatSwitch?.ok === false) {
         chatSwitchInvalid ??= read.chatSwitch.reason;
       } else {
         scenarios.push({ label: read.label, chatSwitch: read.chatSwitch?.rows });
+        if (read.chatSwitch)
+          warnings.push(...chatSwitchCoverageWarnings(read.label, read.chatSwitch.rows));
       }
     }
     scenarios.sort((a, b) => a.label.localeCompare(b.label));
@@ -685,7 +750,11 @@ export function renderSummary(input: {
       metricRows.push(`| ${code(row.test.key)} | ${unavailable(row)} | ${cells.join(" | ")} |`);
     }
     for (const scenario of row.scenarios) {
-      const cells = METRICS.map((spec) => formatValue(scenario.values?.[spec.id], spec.decimals));
+      const cells = METRICS.map((spec) =>
+        scenario.unavailable?.includes(spec.id)
+          ? "unavailable"
+          : formatValue(scenario.values?.[spec.id], spec.decimals)
+      );
       metricRows.push(`| ${code(row.test.key)} | ${code(scenario.label)} | ${cells.join(" | ")} |`);
     }
   }
@@ -716,7 +785,9 @@ export function renderSummary(input: {
     for (const scenario of row.scenarios) {
       for (const leg of scenario.chatSwitch ?? []) {
         const cells = CHAT_SWITCH_METRICS.map((metric) =>
-          formatValue(leg.medians[metric.key], metric.decimals)
+          leg.medians[metric.key] === undefined
+            ? "unavailable"
+            : formatValue(leg.medians[metric.key], metric.decimals)
         );
         chatSwitchRows.push(
           `| ${code(scenario.label)} | ${code(leg.leg)} | ${code(leg.transport)} | ${formatValue(
@@ -737,7 +808,7 @@ export function renderSummary(input: {
       ),
       ...chatSwitchRows,
       "",
-      "Medians per leg and transport. — means not recorded.",
+      "Medians per leg and transport.",
       ""
     );
   }

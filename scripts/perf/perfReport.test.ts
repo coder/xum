@@ -244,10 +244,34 @@ describe("buildReport attribution", () => {
       summary({ chromeProfile: { ...(summary().chromeProfile as object), wallTimeMs: 2618 } }),
       undefined
     );
-    const final = readScenario(summary({}, { retry: 1 }), undefined);
+    const final = readScenario(summary({}, { retry: 1 }), { sampleCount: 26 });
     const report = buildReport(input({ results: results("flaky", 2), reads: [final, first] }));
     expect(report.rows[0]?.scenarios[0]?.values?.wallMs).toBe(900);
     expect(report.problems).toEqual([]);
+  });
+
+  test("a missing or malformed React profile is a problem; the other metrics stay and the cell says unavailable", () => {
+    for (const react of [undefined, { sampleCount: "26" }]) {
+      const report = buildReport(input({ reads: [readScenario(summary(), react)] }));
+      expect(keys(report)).toEqual([`react-profile-unreadable:${KEY}/chat-typing-large-history`]);
+      const scenario = report.rows[0]?.scenarios[0];
+      expect(scenario?.values?.wallMs).toBe(900);
+      const markdown = renderSummary({
+        runUrl: "https://example.test/run",
+        perfResult: "success",
+        report,
+      });
+      const row =
+        markdown
+          .split("\n")
+          .find((line) => line.includes("| `chat-typing-large-history` | 900 |")) ?? "";
+      const reactColumn = METRICS.findIndex((spec) => spec.id === "reactRenders");
+      expect(row.split("|").map((cell) => cell.trim())[3 + reactColumn]).toBe("unavailable");
+    }
+    // A readable profile raises nothing.
+    expect(
+      keys(buildReport(input({ reads: [readScenario(summary(), { sampleCount: 26 })] })))
+    ).toEqual([]);
   });
 
   test("when the final attempt wrote no summary, the row is unavailable instead of using retry 0", () => {
@@ -459,9 +483,33 @@ describe("chat-switch scenarios", () => {
       ["`switch-back-xl`", "`server-window`"],
       ["`zz-new-leg`", "`in-process`"],
     ]);
-    // A null median renders as a dash; the other medians of that row still show.
-    expect(rows[0]?.slice(3, 5)).toEqual(["3", "—"]);
+    // A null median is lost coverage: the cell says unavailable and a warning names it; the other
+    // medians of that row still show.
+    expect(rows[0]?.slice(3, 5)).toEqual(["3", "unavailable"]);
     expect(rows[1]?.[4]).toBe("3.0");
+    expect(
+      report.warnings.some((w) => w.includes("`cold-open-small` (`in-process`) has no value"))
+    ).toBe(true);
+  });
+
+  test("a measured transport missing a core leg warns; missing xl legs do not", () => {
+    const full = (legs: string[]) => Object.fromEntries(legs.map((leg) => [leg, legMedians(1)]));
+    const core = ["cold-open-small", "cold-open-large", "switch-back-small", "switch-back-large"];
+    const complete = chatSwitchReport({
+      mediansByTransport: { "in-process": full(core), "server-window": full(core) },
+    });
+    expect(complete.warnings).toEqual([]);
+    const partial = chatSwitchReport({
+      mediansByTransport: {
+        "in-process": full(core),
+        "server-window": full(["cold-open-small", "cold-open-large"]),
+      },
+    });
+    expect(partial.problems).toEqual([]);
+    expect(partial.warnings).toHaveLength(1);
+    expect(partial.warnings[0]).toContain("`switch-back-small`, `switch-back-large`");
+    const noInProcess = chatSwitchReport({ mediansByTransport: { "server-window": full(core) } });
+    expect(noInProcess.warnings.some((w) => w.includes("no in-process medians"))).toBe(true);
   });
 
   test("older files without mediansByTransport report their medians as in-process", () => {
@@ -543,9 +591,9 @@ describe("workspace-open milestones", () => {
           { file: "scenarios/perf.workspaceOpen.spec.ts", title: `${WORKSPACE_TITLE} large` },
         ]),
         reads: [
-          readScenario(summary(), undefined),
-          readScenario(withMilestones, undefined),
-          readScenario(nullMilestones, undefined),
+          readScenario(summary(), { sampleCount: 26 }),
+          readScenario(withMilestones, { sampleCount: 24 }),
+          readScenario(nullMilestones, { sampleCount: 30 }),
         ],
       })
     );
