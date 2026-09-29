@@ -34,6 +34,7 @@ import {
 } from "./historyCursor";
 import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
 import { log } from "./log";
+import { projectStatusHistoryRow } from "./historyStatusProjection";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
 const resetTokenPattern = new RegExp(
@@ -572,12 +573,26 @@ interface HistorySnapshotFile {
   stamp: string;
 }
 
-/** Run `read` on open descriptors of both history files and fail closed if either was replaced. */
-async function withVerifiedHistorySnapshot<T>(
-  paths: Record<HistoryArtifact, string>,
-  read: (files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>) => Promise<T>
-): Promise<T> {
+/**
+ * Open descriptors of both history files, pinned with their stamps at open time. The status read
+ * (#4790) opens it under the history lock and scans it after releasing the lock, so opening,
+ * verifying and closing are separate steps. (Not historyCursor's HistorySnapshot, which is a
+ * persisted scan position.)
+ */
+export interface OpenHistorySnapshot {
+  files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>;
+  /** Throws "History changed during provider read" if either pathname was replaced or resized. */
+  verify(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export async function openHistorySnapshot(
+  paths: Record<HistoryArtifact, string>
+): Promise<OpenHistorySnapshot> {
   const files = new Map<HistoryArtifact, HistorySnapshotFile>();
+  const close = async () => {
+    await Promise.all([...files.values()].map((file) => file.handle.close()));
+  };
   try {
     for (const artifact of ["chat", "archive"] as const) {
       let handle: fs.FileHandle;
@@ -592,21 +607,41 @@ async function withVerifiedHistorySnapshot<T>(
       const stat = await handle.stat();
       files.set(artifact, { handle, size: stat.size, stamp: historyFileStamp(stat) });
     }
-    const result = await read(files);
-    // Foreign writers can replace either pathname while these descriptors stay
-    // open. Never release provider rows assembled from an obsolete raw offset.
-    for (const artifact of ["chat", "archive"] as const) {
-      const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
-        return undefined;
-      });
-      if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
-        throw new Error("History changed during provider read");
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  return {
+    files,
+    verify: async () => {
+      // Foreign writers can replace either pathname while these descriptors stay
+      // open. Never release provider rows assembled from an obsolete raw offset.
+      for (const artifact of ["chat", "archive"] as const) {
+        const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+          return undefined;
+        });
+        if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
+          throw new Error("History changed during provider read");
+        }
       }
-    }
+    },
+    close,
+  };
+}
+
+/** Run `read` on open descriptors of both history files and fail closed if either was replaced. */
+async function withVerifiedHistorySnapshot<T>(
+  paths: Record<HistoryArtifact, string>,
+  read: (files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>) => Promise<T>
+): Promise<T> {
+  const snapshot = await openHistorySnapshot(paths);
+  try {
+    const result = await read(snapshot.files);
+    await snapshot.verify();
     return result;
   } finally {
-    await Promise.all([...files.values()].map((file) => file.handle.close()));
+    await snapshot.close();
   }
 }
 
@@ -716,18 +751,30 @@ export function readProviderHistoryFromLatestBoundary(
 }
 
 /**
- * A suffix of readProviderHistoryFromLatestBoundary(paths, 0) holding at least `minMatching`
- * rows that satisfy `matches`, or the whole read when it has fewer. Same raw locator, snapshot
- * verification and row projection, but it stops at the first safe row once the window is full
- * instead of parsing the whole active epoch (#4720).
+ * The sidebar status read (#4720, #4790): a suffix of readProviderHistoryFromLatestBoundary(paths,
+ * 0) holding at least `minMatching` rows that satisfy `matches`, or the whole read when it has
+ * fewer. Same raw locator and snapshot verification, but it stops at the first safe row once the
+ * window is full instead of parsing the whole active epoch. The caller owns `snapshot.close()`.
+ *
+ * Rows over SESSION_HISTORY_MAX_LINE_BYTES are status-grade, never provider-grade: their tool
+ * payloads come back null and their file URLs "" (historyStatusProjection.ts), and the elided
+ * bytes are not validated. Status reads none of them; see projectStatusHistoryRow for why the
+ * row set and every field status reads stay equal.
  */
-export function readProviderHistorySuffix(
-  paths: Record<HistoryArtifact, string>,
+export async function readStatusHistorySuffix(
+  snapshot: OpenHistorySnapshot,
   minMatching: number,
   matches: (message: MuxMessage) => boolean
 ): Promise<MuxMessage[]> {
   assert(Number.isSafeInteger(minMatching) && minMatching > 0, "suffix window must be positive");
-  return scanProviderHistory(paths, { minMatching, matches });
+  const messages = await scanHistorySnapshot(
+    snapshot.files,
+    { minMatching, matches },
+    undefined,
+    true
+  );
+  await snapshot.verify();
+  return messages;
 }
 
 /**
@@ -740,7 +787,7 @@ export function readProviderHistorySuffix(
  *   always returns a start), so the two-pass reader's clamp branches never apply.
  * - Rows the classifier leaves null but the two-pass projection would accept (reset evidence with
  *   ambiguous keys, a stringify throw) floor themselves out: the start is at or after such a row,
- *   so it is never in the returned range (#4720; providerSuffix "unbounded window" cases).
+ *   so it is never in the returned range (#4720; statusSuffix "unbounded window" cases).
  * - A row up to the line limit keeps the locator's message, normalizePersistedMessage of the same
  *   JSON.parse the projection does; oversized rows are re-read and parsed by that projection.
  * `onBytesRead` keeps the replay-timing meaning (#4504): the raw tail bytes of each file whose
@@ -750,68 +797,76 @@ export function readProviderHistory(
   paths: Record<HistoryArtifact, string>,
   options?: { onBytesRead?: (bytes: number) => void }
 ): Promise<MuxMessage[]> {
-  return scanProviderHistory(paths, undefined, options?.onBytesRead);
+  return withVerifiedHistorySnapshot(paths, (files) =>
+    scanHistorySnapshot(files, undefined, options?.onBytesRead, false)
+  );
 }
 
-/** Shared scan of readProviderHistorySuffix (with `stop`) and readProviderHistory (without). */
-function scanProviderHistory(
-  paths: Record<HistoryArtifact, string>,
+/**
+ * Shared scan of readStatusHistorySuffix (with `stop`, projecting oversized rows) and
+ * readProviderHistory (without either). Every positional read checks its length: under the
+ * status read's released lock a foreign in-place shrink must fail closed, never parse a partial
+ * row (#4790).
+ */
+async function scanHistorySnapshot(
+  files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>,
   stop: { minMatching: number; matches: (message: MuxMessage) => boolean } | undefined,
-  onBytesRead?: (bytes: number) => void
+  onBytesRead: ((bytes: number) => void) | undefined,
+  projectOversized: boolean
 ): Promise<MuxMessage[]> {
-  return withVerifiedHistorySnapshot(paths, async (files) => {
-    // Newest file first; each file's rows are newest first and those starting before `from` are
-    // not part of the read.
-    const scanned: Array<{ file: HistorySnapshotFile; rows: ScannedHistoryRow[]; from: number }> =
-      [];
-    let matching = 0;
-    for (const artifact of ["chat", "archive"] as const) {
-      const file = files.get(artifact);
-      if (!file) continue;
-      const rows: ScannedHistoryRow[] = [];
-      const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
-        rows.push(row);
-        if (!stop) return false;
-        // Only rows the full read projects count; oversized rows are parsed below.
-        if (row.message !== null && stop.matches(row.message)) matching++;
-        // Monotonic: the stop stays requested across unreadable rows until a safe one.
-        return matching >= stop.minMatching;
-      });
-      assert(
-        stop !== undefined || location.kind !== "stopped",
-        "provider reads without a stop never stop"
-      );
-      scanned.push({ file, rows, from: location.kind === "start" ? location.offset : 0 });
-      // A start or a clean stop ends the read. An exhausted file keeps all its rows (no older
-      // file can exclude them); continue into the archive only while the window is short.
-      if (location.kind !== "exhausted" || (stop && matching >= stop.minMatching)) break;
-    }
-    const messages: MuxMessage[] = [];
-    for (let s = scanned.length - 1; s >= 0; s--) {
-      const { file, rows, from } = scanned[s];
-      onBytesRead?.(file.size - from);
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row = rows[i];
-        if (row.start < from) continue;
-        if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) {
-          if (row.message) messages.push(row.message);
-          continue;
-        }
-        // The locator does not parse oversized rows, but the full read's tail projection does.
-        const buffer = Buffer.alloc(row.size);
-        const read = await file.handle.read(buffer, 0, buffer.length, row.start);
-        if (read.bytesRead !== buffer.length)
-          throw new Error("History changed during provider read");
-        try {
-          const value: unknown = JSON.parse(buffer.toString("utf8"));
-          if (isReadableHistoryMessage(value)) messages.push(normalizePersistedMessage(value));
-        } catch {
-          // Same as the full read: unusable rows are not projected.
-        }
+  // Newest file first; each file's rows are newest first and those starting before `from` are
+  // not part of the read.
+  const scanned: Array<{ file: HistorySnapshotFile; rows: ScannedHistoryRow[]; from: number }> = [];
+  let matching = 0;
+  for (const artifact of ["chat", "archive"] as const) {
+    const file = files.get(artifact);
+    if (!file) continue;
+    const rows: ScannedHistoryRow[] = [];
+    const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
+      rows.push(row);
+      if (!stop) return false;
+      // Only rows the full read projects count; oversized rows are parsed below.
+      if (row.message !== null && stop.matches(row.message)) matching++;
+      // Monotonic: the stop stays requested across unreadable rows until a safe one.
+      return matching >= stop.minMatching;
+    });
+    assert(
+      stop !== undefined || location.kind !== "stopped",
+      "provider reads without a stop never stop"
+    );
+    scanned.push({ file, rows, from: location.kind === "start" ? location.offset : 0 });
+    // A start or a clean stop ends the read. An exhausted file keeps all its rows (no older
+    // file can exclude them); continue into the archive only while the window is short.
+    if (location.kind !== "exhausted" || (stop && matching >= stop.minMatching)) break;
+  }
+  const messages: MuxMessage[] = [];
+  for (let s = scanned.length - 1; s >= 0; s--) {
+    const { file, rows, from } = scanned[s];
+    onBytesRead?.(file.size - from);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.start < from) continue;
+      if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) {
+        if (row.message) messages.push(row.message);
+        continue;
+      }
+      // The locator does not parse oversized rows, but the full read's tail projection does.
+      // allocUnsafe is safe only because a short read throws before any byte is decoded.
+      const buffer = Buffer.allocUnsafe(row.size);
+      const read = await file.handle.read(buffer, 0, buffer.length, row.start);
+      if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+      try {
+        // Status only: cut the payloads it never reads before decoding (#4790).
+        const text =
+          (projectOversized ? projectStatusHistoryRow(buffer) : null) ?? buffer.toString("utf8");
+        const value: unknown = JSON.parse(text);
+        if (isReadableHistoryMessage(value)) messages.push(normalizePersistedMessage(value));
+      } catch {
+        // Same as the full read: unusable rows are not projected.
       }
     }
-    return messages;
-  });
+  }
+  return messages;
 }
 
 /** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */

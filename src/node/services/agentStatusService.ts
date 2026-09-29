@@ -567,7 +567,7 @@ export class AgentStatusService {
     // conversation. The window is counted in VISIBLE rows: counting before filtering would let
     // a burst of hidden records (resolving many threads) evict the recent conversation, and
     // each hidden append would change the hash by evicting a visible row.
-    const history = await this.historyService.getHistorySuffixFromLatestBoundary(
+    const history = await this.historyService.getStatusHistorySuffix(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES,
       isStatusTranscriptRow

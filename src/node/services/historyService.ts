@@ -16,7 +16,9 @@ import {
   scanHistoryFilesBounded,
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
-  readProviderHistorySuffix,
+  openHistorySnapshot,
+  readStatusHistorySuffix,
+  type OpenHistorySnapshot,
   readCompactionPendingHistoryBoundary,
   readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -112,6 +114,8 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+const STATUS_SUFFIX_ERROR_PREFIX = "Failed to read history suffix from boundary";
 
 export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
@@ -2589,7 +2593,7 @@ export class HistoryService {
    * that satisfy `matches` (or the whole read when it has fewer), so trailing-window readers
    * (sidebar status) do not parse the whole active epoch under the lock (#4720).
    */
-  async getHistorySuffixFromLatestBoundary(
+  async getStatusHistorySuffix(
     workspaceId: string,
     minMatching: number,
     matches: (message: MuxMessage) => boolean
@@ -2598,20 +2602,19 @@ export class HistoryService {
     // correctness nor for boundedness, and a background tick must stay read-only instead of
     // paying a one-time full-file scan under the cross-process write lock. Boundary writes,
     // replay and provider requests still rotate.
-    return this.withRecoveredHistoryResultLock(
-      workspaceId,
-      "Failed to read history suffix from boundary",
-      async () =>
-        Ok(
-          await readProviderHistorySuffix(
-            {
-              chat: this.getChatHistoryPath(workspaceId),
-              archive: this.getChatArchivePath(workspaceId),
-            },
-            minMatching,
-            matches
-          )
-        )
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    const read = async (snapshot: OpenHistorySnapshot) => {
+      try {
+        return Ok(await readStatusHistorySuffix(snapshot, minMatching, matches));
+      } finally {
+        await snapshot.close();
+      }
+    };
+    return this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
+      read(await openHistorySnapshot(paths))
     );
   }
 
