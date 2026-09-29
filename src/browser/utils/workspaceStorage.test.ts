@@ -6,6 +6,8 @@ import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import {
   getModelKey,
+  getPersistedKeyRegistration,
+  getWorkspaceNameStateKey,
   getDesktopPopoutKey,
   getDisableWorkspaceAgentsKey,
   getMCPTestResultsKey,
@@ -100,5 +102,23 @@ describe("migrateWorkspaceStorage", () => {
     migrateWorkspaceStorage("__pending__/repo", "ws-destination");
 
     expect(storage.getItem(sourceKey)).toBe(JSON.stringify("anthropic:claude-opus"));
+  });
+
+  // Older builds stored values larger than today's budgets (e.g. the whole creation message in
+  // workspaceNameState). The destination can only hold such a value in memory, so the source must
+  // stay the durable copy.
+  test("keeps a source value that is over its budget at the destination", () => {
+    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.window = domWindow;
+    globalThis.document = domWindow.document;
+    globalThis.localStorage = domWindow.localStorage;
+    const sourceKey = getWorkspaceNameStateKey("__pending__/repo2");
+    const budget = getPersistedKeyRegistration(sourceKey)!.maxValueChars;
+    const legacyValue = JSON.stringify({ lastGeneratedFor: "m".repeat(budget) });
+    localStorage.setItem(sourceKey, legacyValue);
+
+    migrateWorkspaceStorage("__pending__/repo2", "ws-destination2");
+
+    expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
   });
 });

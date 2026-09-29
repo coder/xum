@@ -391,18 +391,25 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   const [persistedExpandStateMap, setPersistedExpandStateMap] = usePersistedState<
     Record<string, boolean>
   >(expandStateKey, {}, { listener: true });
+  // `persisted` is the trimmed copy this window wrote; once the stored value differs (another
+  // window changed it), the stored value wins again so cross-window updates are not masked.
   const [liveExpandState, setLiveExpandState] = React.useState<{
     key: string;
     value: Record<string, boolean>;
+    persisted: string;
   } | null>(null);
   const expandStateMap =
-    liveExpandState?.key === expandStateKey ? liveExpandState.value : persistedExpandStateMap;
+    liveExpandState?.key === expandStateKey &&
+    liveExpandState.persisted === JSON.stringify(persistedExpandStateMap)
+      ? liveExpandState.value
+      : persistedExpandStateMap;
   const setExpandStateMap = (
     value: Record<string, boolean> | ((prev: Record<string, boolean>) => Record<string, boolean>)
   ) => {
     const next = typeof value === "function" ? value(expandStateMap) : value;
-    setLiveExpandState({ key: expandStateKey, value: next });
-    setPersistedExpandStateMap(trimRecordToChars(next, FILE_TREE_EXPAND_STATE_MAX_CHARS));
+    const persisted = trimRecordToChars(next, FILE_TREE_EXPAND_STATE_MAX_CHARS);
+    setLiveExpandState({ key: expandStateKey, value: next, persisted: JSON.stringify(persisted) });
+    setPersistedExpandStateMap(persisted);
   };
 
   const [viewMode, setViewMode] = usePersistedState<FileTreeViewMode>(

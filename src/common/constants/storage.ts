@@ -994,7 +994,9 @@ export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
  * (drafts, pending scopes, project-scoped keys), so a key+value budget would either refuse a
  * boolean under a long project path or need path headroom in every budget.
  */
-export const MAX_PERSISTED_KEY_CHARS = 1024;
+// Large enough for any valid absolute path (Linux PATH_MAX is 4096) plus a prefix and draft id:
+// a key over the cap is refused outright, which would freeze controls under that project.
+export const MAX_PERSISTED_KEY_CHARS = 8192;
 
 /**
  * Persisted key registry: classification and size budget of every key the app writes.
@@ -1203,7 +1205,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
   globalKey(RIGHT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(REMOTE_CONNECTION_URL_KEY, "ui", 2048),
-  globalKey(AUTH_TOKEN_KEY, "ui", 1024),
+  // Server tokens have no length limit elsewhere; a token kept only in memory would log the user
+  // out on reload.
+  globalKey(AUTH_TOKEN_KEY, "ui", 8192),
   // Action ids of the COMMAND_PALETTE_RECENT_MAX_ENTRIES most recent commands.
   globalKey(COMMAND_PALETTE_RECENT_KEY, "ui", 8192),
   globalKey(FIRST_LAUNCH_KEY, "ui", 16),

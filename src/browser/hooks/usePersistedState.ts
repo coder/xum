@@ -212,38 +212,44 @@ function writePersistedValue(key: string, newValue: unknown): boolean {
     window.localStorage.removeItem(key);
     return true;
   }
-  return writeSerializedValue(key, JSON.stringify(newValue));
+  return writeSerializedValue(key, JSON.stringify(newValue)) !== "failed";
 }
 
+/**
+ * Outcome of a write: on disk, in memory for this session only (over its budget), or not stored
+ * at all (refused, or the quota was full even after evicting caches).
+ */
+type WriteOutcome = "stored" | "session" | "failed";
+
 /** Store an already-serialized value (see writePersistedValue for the quota handling). */
-function writeSerializedValue(key: string, serialized: string): boolean {
+function writeSerializedValue(key: string, serialized: string): WriteOutcome {
   const violation = getBudgetViolation(key, serialized);
   if (violation !== null) {
     reportBudgetViolationOnce(key, violation);
-    if (!violation.overValueBudget) return false;
+    if (!violation.overValueBudget) return "failed";
     getOverBudgetSessionValues().set(key, serialized);
-    return true;
+    return "session";
   }
 
   const storage = window.localStorage;
   try {
     storage.setItem(key, serialized);
     getOverBudgetSessionValues().delete(key);
-    return true;
+    return "stored";
   } catch (error) {
     if (!isQuotaExceededError(error) || evictCacheKeys(storage) === 0) {
       reportWriteFailureOnce(key, error);
-      return false;
+      return "failed";
     }
   }
 
   try {
     storage.setItem(key, serialized);
     getOverBudgetSessionValues().delete(key);
-    return true;
+    return "stored";
   } catch (retryError) {
     reportWriteFailureOnce(key, retryError);
-    return false;
+    return "failed";
   }
 }
 
@@ -374,14 +380,16 @@ export function readPersistedRawString(key: string): string | null {
  * Store `value` verbatim (no JSON encoding) through the shared write path. Used for raw-format
  * keys and for copying already-serialized values (workspace fork). Does not notify subscribers:
  * raw keys have no hook consumers, and fork copies target a scope nothing has mounted yet.
- * Returns false when the value was refused or could not be stored (see writePersistedValue).
+ * Returns true only when the value reached localStorage. A value over its budget is still kept
+ * in memory for this session but reports false: callers copy or save durable data (a workspace
+ * migration deletes the source afterwards), so a session-only copy is not a success.
  */
 export function writePersistedRawString(key: string, value: string): boolean {
   if (typeof window === "undefined" || !window.localStorage) {
     return false;
   }
   try {
-    return writeSerializedValue(key, value);
+    return writeSerializedValue(key, value) === "stored";
   } catch (error) {
     reportWriteFailureOnce(key, error);
     return false;
