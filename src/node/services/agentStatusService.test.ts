@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
@@ -25,6 +26,7 @@ import type { TokenizerService } from "./tokenizerService";
 import { AgentStatusService } from "./agentStatusService";
 import * as workspaceStatusGenerator from "./workspaceStatusGenerator";
 import { createTestHistoryService } from "./testHistoryService";
+import { PAYLOAD_ROW_SHAPES, payloadRow } from "./historyScanner.generator.testHarness";
 import { createContextResetBoundaryMessageId } from "./utils/messageIds";
 
 interface AgentStatusServiceInternals {
@@ -486,6 +488,37 @@ describe("AgentStatusService", () => {
     expect(transcript).toContain("Summary: the parser refactor is underway");
     expect(transcript).toContain("User: Now write the tests");
     expect(transcript).not.toContain("PRE-COMPACTION-DETAIL");
+  });
+
+  test("payload size never changes the status transcript (#4790)", async () => {
+    // Rows over 1 MiB come back status-grade (null tool payloads, empty file URLs). The
+    // formatter must never read those fields: the same conversation with giant payloads (tool
+    // output and input, file URL, nested call output) and with tiny ones gives one transcript.
+    projectsConfig = makeProjectsConfig([
+      makeWorkspaceEntry({ id: "ws-giant", name: "ws-giant" }),
+      makeWorkspaceEntry({ id: "ws-tiny", name: "ws-tiny" }),
+    ]);
+    const service = createService();
+    const transcripts: string[] = [];
+    for (const [id, payload] of [
+      ["ws-giant", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 1)],
+      ["ws-tiny", "x"],
+    ] as const) {
+      await historyHandle.historyService.appendToHistory(
+        id,
+        createMuxMessage("u1", "user", "Please look at the logs")
+      );
+      for (let shape = 0; shape < PAYLOAD_ROW_SHAPES; shape++)
+        await historyHandle.historyService.appendToHistory(
+          id,
+          payloadRow(`p${shape}`, shape, payload)
+        );
+      await getInternals(service).runForWorkspace(id);
+      expect(generateSpy).toHaveBeenCalledTimes(transcripts.length + 1);
+      transcripts.push(generateSpy.mock.calls[transcripts.length][0]);
+    }
+    expect(transcripts[0]).toContain("payload row p3");
+    expect(transcripts[0]).toEqual(transcripts[1]);
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {

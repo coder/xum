@@ -560,7 +560,9 @@ export class AgentStatusService {
     // reset floors, so a malformed reset row still discards everything before it (#4555).
     // Only the trailing window is read: the suffix holds at least the last
     // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
-    // is unchanged without parsing the whole epoch under the history lock (#4720).
+    // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
+    // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
+    // never reads (#4790).
     //
     // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
     // must not leak into the request, and a readable reset marker is structure, not
@@ -572,7 +574,13 @@ export class AgentStatusService {
       AGENT_STATUS_MAX_TRAILING_MESSAGES,
       isStatusTranscriptRow
     );
-    if (!history.success) return "";
+    if (!history.success) {
+      log.debug("Agent status: history read failed; skipping this run", {
+        workspaceId,
+        error: history.error,
+      });
+      return "";
+    }
     const committedMessages = history.data
       .filter(isStatusTranscriptRow)
       .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
