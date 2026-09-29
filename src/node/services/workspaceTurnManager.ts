@@ -898,10 +898,11 @@ export class WorkspaceTurnManager {
       }
       const workspaceName = coerceNonEmptyString(row.name);
       const workspacePath = coerceNonEmptyString(row.path);
+      const runtimeConfig = row.runtimeConfig;
       // Other runtimes (project-dir local, SSH, Docker, devcontainer, Coder) are left for now:
       // each removes something different, and only a worktree checkout is judged below.
       if (
-        !isWorktreeRuntime(row.runtimeConfig) ||
+        !isWorktreeRuntime(runtimeConfig) ||
         (row.projects?.length ?? 0) > 1 ||
         workspaceName == null ||
         workspacePath == null
@@ -909,42 +910,50 @@ export class WorkspaceTurnManager {
         leave("only single-project worktree targets are removed");
         return;
       }
-      if (await this.historyService.hasHistory(workspaceId)) {
-        leave("it has chat history");
-        return;
-      }
-      const work = await findWorkInCheckoutWithoutBase({
-        runtime: createRuntimeForWorkspace({
-          runtimeConfig: row.runtimeConfig,
-          projectPath: entry.projectPath,
-          name: workspaceName,
-          namedWorkspacePath: workspacePath,
-        }),
-        projectRepo: {
-          projectPath: entry.projectPath,
-          projectName: path.basename(entry.projectPath),
-          repoCwd: workspacePath,
-        },
-      });
-      if (!work.success || work.data.kind !== "none") {
-        leave(
-          work.success ? "its checkout has work" : `its checkout cannot be judged: ${work.error}`
-        );
-        return;
-      }
+      // Judged by the removal itself, under its fences (#4983): its gate refuses any activity in
+      // this backend or another, and no turn can start between this check and the deletion.
+      let leftBecause: string | undefined;
+      const confirmUnused = async (): Promise<boolean> => {
+        if (await this.historyService.hasHistory(workspaceId)) {
+          leftBecause = "it has chat history";
+          return false;
+        }
+        const work = await findWorkInCheckoutWithoutBase({
+          runtime: createRuntimeForWorkspace({
+            runtimeConfig,
+            projectPath: entry.projectPath,
+            name: workspaceName,
+            namedWorkspacePath: workspacePath,
+          }),
+          projectRepo: {
+            projectPath: entry.projectPath,
+            projectName: path.basename(entry.projectPath),
+            repoCwd: workspacePath,
+          },
+        });
+        if (!work.success || work.data.kind !== "none") {
+          leftBecause = work.success
+            ? "its checkout has work"
+            : `its checkout cannot be judged: ${work.error}`;
+          return false;
+        }
+        return true;
+      };
       // Keep the branch: the creation's createdBranch was never persisted, so it may be one the
       // creation only reused. The check above found no commit that the branch alone holds.
       const removal = await this.workspaceService.removeWhileTaskTreeLocked(
         workspaceId,
         true,
         undefined,
-        { keepBranch: true }
+        { keepBranch: true, confirmUnused }
       );
+      if (leftBecause != null) {
+        leave(leftBecause);
+        return;
+      }
       if (!removal.success) {
-        log.warn("Failed to remove a delegated target whose creation was interrupted", {
-          workspaceId,
-          error: removal.error,
-        });
+        // Includes refusals of a workspace in use (the removal's gate).
+        leave(`the removal did not complete: ${removal.error}`);
         return;
       }
       log.info("Removed a delegated target whose creation was interrupted", {

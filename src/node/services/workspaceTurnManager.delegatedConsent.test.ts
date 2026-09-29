@@ -10,6 +10,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   workspaceTurnOwnerLockPath,
   type WorkspaceTurnManager,
@@ -449,6 +450,21 @@ describe("delegated target default consent (#4453)", () => {
       },
     },
   };
+  // The removal's gate refuses even the sweeping backend's own activity, which a plain removal
+  // ends itself.
+  test("the startup resolver keeps a delegated target its own backend is using (#4983)", async () => {
+    const a = await crashBeforeRecord({ creator: "dead" });
+    const b = await backend();
+    const lease = await workspaceUseLeasesFor(b.config).hold(TARGET, "exec");
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+    await lease.release();
+
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).not.toBeNull();
+    expect(await fsPromises.stat(a.checkout).then(() => true)).toBe(true);
+    await a.finish();
+  });
+
   for (const [reason, { creator = "dead", before }] of Object.entries(leftAlone)) {
     test(`the startup resolver keeps a delegated target when ${reason} (#4983)`, async () => {
       const a = await crashBeforeRecord({ creator });

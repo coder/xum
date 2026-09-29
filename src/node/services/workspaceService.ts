@@ -895,6 +895,11 @@ const REMOVAL_OWN_ACTIVITY_POLICY = {
   ignoreKinds: new Set<WorkspaceUseKind>(["turn", "terminal", "editor", "mcp", "init", "exec"]),
   backgroundProcesses: "allow",
 } as const;
+// #4983: an automatic removal of a workspace that must be unused refuses any activity, own included.
+const UNUSED_ONLY_REMOVAL_POLICY = {
+  ignoreKinds: new Set<WorkspaceUseKind>(),
+  backgroundProcesses: "refuse",
+} as const;
 
 /**
  * A failed rollback after a rejected registration write (#4745) is logged, never thrown: the
@@ -7099,8 +7104,13 @@ export class WorkspaceService
   ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
-    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
-    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
+    const { mutationGateHeld, confirmUnused, ...checkoutOptions } = options ?? {};
+    const runtimeOptions =
+      mutationGateHeld === undefined && confirmUnused === undefined ? options : checkoutOptions;
+    assert(
+      confirmUnused == null || mutationGateHeld !== true,
+      "confirmUnused needs removal to take its own strict gate"
+    );
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -7167,7 +7177,7 @@ export class WorkspaceService
       if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
-          REMOVAL_OWN_ACTIVITY_POLICY
+          confirmUnused == null ? REMOVAL_OWN_ACTIVITY_POLICY : UNUSED_ONLY_REMOVAL_POLICY
         );
         if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
         releaseMutationGate = gate.data;
@@ -7208,6 +7218,11 @@ export class WorkspaceService
       // was set, so joining the admitted ones leaves none that could publish servers after
       // the stopServers calls below (#4805).
       await this.abortAndJoinMcpPromptDiscoveries(workspaceId);
+      // #4983: judged only now, with every fence above held, so no activity can start between
+      // the check and the destructive steps below.
+      if (confirmUnused != null && !(await confirmUnused())) {
+        return Err("Workspace was not removed: it is in use or holds work");
+      }
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for

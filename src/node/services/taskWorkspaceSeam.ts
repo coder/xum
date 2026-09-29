@@ -274,6 +274,13 @@ export interface RemovalCheckoutOptions {
    * its whole sub-agent tree before removing any of it (#4477).
    */
   mutationGateHeld?: boolean;
+  /**
+   * Remove only a workspace nobody uses (#4983, the startup sweep of crash-orphaned delegated
+   * targets). The removal's gate then refuses this backend's own activity too, and this runs
+   * under every removal fence (gate, turn admission hold, pendingRemoval marker) before any
+   * destructive effect; false aborts the removal with nothing removed.
+   */
+  confirmUnused?: () => Promise<boolean>;
 }
 
 export interface ArchiveWorkspaceOptions {
