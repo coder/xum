@@ -43,4 +43,4 @@ export const CLAUDE_TOOL_PREAMBLE_TOKENS = 400;
  * id, newer or unknown, gets the conservative new-tokenizer ratio.
  */
 export const OLDER_CLAUDE_TOKENIZER_MODEL_ID =
-  /^claude-(?:v\d+|instant|2(?:[.-]\d)?|3(?:[.-]?[57])?-(?:haiku|sonnet|opus)|(?:sonnet|opus)-4(?:[.-]?[0-6])?|haiku-4(?:[.-]?[0-5])?|4(?:[.-]?[0-6])?-(?:sonnet|opus)|4(?:[.-]?[0-5])?-haiku)(?:-(?:\d{8}|[a-z][a-z0-9]*))*$/;
+  /^claude-(?:v[12]|instant|2(?:[.-]\d)?|3(?:[.-]?[57])?-(?:haiku|sonnet|opus)|(?:sonnet|opus)-4(?:[.-]?[0-6])?|haiku-4(?:[.-]?[0-5])?|4(?:[.-]?[0-6])?-(?:sonnet|opus)|4(?:[.-]?[0-5])?-haiku)(?:-(?:\d{8}|[a-z][a-z0-9]*))*$/;

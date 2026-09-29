@@ -642,6 +642,8 @@ describe("Claude tokenizer correction (#5219)", () => {
     expect(await estimate("anthropic:claude-4-opus-20250514")).toBe(older);
     expect(await estimate("anthropic:claude-4.5-haiku")).toBe(older);
     expect(await estimate("anthropic:claude-opus-4-7-fast")).toBe(newTokenizer);
+    // Only the real legacy v1/v2 ids are older; an unknown numbered v-id stays conservative.
+    expect(await estimate("anthropic:claude-v5")).toBe(newTokenizer);
   });
 
   const smallTools = Object.fromEntries(
