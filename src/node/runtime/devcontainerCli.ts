@@ -799,6 +799,6 @@ export async function devcontainerDown(
   workspaceFolder: string,
   _configPath?: string,
   _timeoutMs = 60_000
-): Promise<void> {
-  await stopDevcontainer(workspaceFolder);
+): Promise<DevcontainerStopResult> {
+  return stopDevcontainer(workspaceFolder);
 }

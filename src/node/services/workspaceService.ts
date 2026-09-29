@@ -3595,6 +3595,8 @@ export class WorkspaceService
   ): string[] {
     if (deleteResult.success) return [];
     if (runtime instanceof MultiProjectRuntime) return deleteResult.leftoverPaths ?? [];
+    // A devcontainer names its container this way too, which the workspace path is not (#5120).
+    if (deleteResult.leftoverPaths !== undefined) return deleteResult.leftoverPaths;
     // A Docker workspace path is the in-container /src; what is left is the container (#5117).
     if (runtime instanceof DockerRuntime) {
       return [`Docker container ${getContainerName(projectPath, workspaceName)}`];

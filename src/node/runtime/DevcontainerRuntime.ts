@@ -30,7 +30,12 @@ import {
   resolveSshAgentForwarding,
   type BindMount,
 } from "./credentialForwarding";
-import { devcontainerUp, devcontainerDown, spawnDevcontainer } from "./devcontainerCli";
+import {
+  devcontainerUp,
+  devcontainerDown,
+  spawnDevcontainer,
+  type DevcontainerStopResult,
+} from "./devcontainerCli";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
@@ -830,24 +835,41 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     _abortSignal?: AbortSignal,
     trusted?: boolean,
     options?: { keepBranch?: boolean }
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | { success: false; error: string; leftoverPaths?: string[] }
+  > {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
-    // Stop and remove container (best-effort)
-    try {
-      await devcontainerDown(workspacePath, this.configPath);
-    } catch (error) {
-      log.debug("devcontainerDown failed (container may not exist):", { error });
-    }
+    // Stop and remove the container, which is labeled with the host path.
+    const containerStop = await devcontainerDown(workspacePath, this.configPath).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
 
     // Delete worktree on host
-    return this.worktreeManager.deleteWorkspace(
+    const hostResult = await this.worktreeManager.deleteWorkspace(
       projectPath,
       workspaceName,
       force,
       trusted,
       options
     );
+    if (containerStop.kind !== "error") return hostResult;
+
+    // A container that is still there is not a clean delete: removal and rollbacks report it, and
+    // name it so the user can remove it (#5120). A later workspace at this path would reuse it.
+    const errors = [`Failed to remove the devcontainer: ${containerStop.message}`];
+    const leftoverPaths = [
+      `devcontainer container labeled devcontainer.local_folder=${workspacePath}`,
+    ];
+    if (!hostResult.success) {
+      errors.push(hostResult.error);
+      leftoverPaths.push(workspacePath);
+    }
+    return { success: false, error: errors.join("; "), leftoverPaths };
   }
 
   /**

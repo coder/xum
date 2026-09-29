@@ -1037,7 +1037,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     // someone else's.
     test("devcontainer fork rollback leaves the host plan path alone", async () => {
       await withTempMuxRoot(async (root) => {
-        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({ kind: "absent" });
         const source = await service.create(projectPath, "dc-src", "main", undefined, {
           type: "devcontainer",
           configPath: ".devcontainer/devcontainer.json",
@@ -1063,7 +1063,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       async ({ existingBranch }) => {
         await withTempMuxRoot(async () => {
           const tip = existingBranch ? branchWithOwnCommit(projectPath, "dc-a") : undefined;
-          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+            kind: "absent",
+          });
           const createDevcontainer = () =>
             service.create(projectPath, "dc-a", "main", undefined, {
               type: "devcontainer",
@@ -1093,7 +1095,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       "devcontainer fork rollback on $label removes its checkout and container",
       async ({ existingBranch }) => {
         await withTempMuxRoot(async () => {
-          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+            kind: "absent",
+          });
           spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
           const source = await service.create(projectPath, "dcf-src", "main", undefined, {
             type: "devcontainer",
@@ -1115,9 +1119,37 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       }
     );
 
+    // #5120: a container the rollback could not remove still holds the fork's plan copy, and a
+    // retry at the same path would reuse it, so the rollback names it.
+    test("devcontainer fork rollback names the container it could not remove", async () => {
+      await withTempMuxRoot(async () => {
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+        const source = await service.create(projectPath, "dce-src", "main", undefined, {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        });
+        if (!source.success) throw new Error(source.error);
+        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+          kind: "error",
+          message: "Failed to remove container: daemon down",
+        });
+
+        const publish = failConfigPublish();
+        const result = await service
+          .fork(source.data.metadata.id, "dce")
+          .finally(() => publish.mockRestore());
+        const error = result.success ? "" : result.error;
+        expect(error).toContain("EACCES");
+        // The label names the fork's host checkout, which the rollback removed.
+        expect(error).toMatch(
+          /could not be fully cleaned up: devcontainer container labeled devcontainer\.local_folder=\S+\/dce; delete it before retrying\.$/
+        );
+      });
+    });
+
     // Item 2, SSH forks (Coder forks too, in existing mode): the fork made its remote worktree at a
-    // path it checked was free, before registering. It is removed; the branch is kept, since the
-    // fork does not report whether it made it.
+    // path it checked was free, before registering. It is removed; the branch is kept unless the
+    // fork reports it made it (#5119), which this mock does not.
     test("SSH fork rollback removes the fork's checkout", async () => {
       const runtimeConfig = {
         type: "ssh" as const,

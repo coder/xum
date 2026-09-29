@@ -669,8 +669,9 @@ export interface Runtime {
         success: false;
         error: string;
         /**
-         * Set by a runtime that deletes several paths (MultiProjectRuntime): the disposable ones it
-         * could not delete, so a rollback can name them (#4936).
+         * Set by a runtime that deletes several things (MultiProjectRuntime, and a devcontainer's
+         * container plus worktree): the disposable ones it could not delete, so a rollback can
+         * name them (#4936, #5120).
          */
         leftoverPaths?: string[];
       }
