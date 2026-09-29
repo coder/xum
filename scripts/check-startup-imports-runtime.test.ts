@@ -35,7 +35,7 @@ async function writeFiles(files: Record<string, string>): Promise<void> {
 
 async function loadMain(source: string): Promise<string[]> {
   await writeFiles({ "main.js": source });
-  return loadEagerModules(path.join(rootDir, "main.js"));
+  return (await loadEagerModules(path.join(rootDir, "main.js"))).modules;
 }
 
 async function bannedPackagesOf(source: string): Promise<string[]> {
@@ -48,6 +48,21 @@ test.each([
   ["a module-scope import()", 'Promise.resolve().then(() => require("ai"));\n'],
   ["a computed require", 'const name = ["a", "i"].join("");\nrequire(name);\n'],
   ["an allowed package that loads a banned one", 'require("wrapper-pkg");\n'],
+  // main.ts awaits its storage setup (real file I/O) before it waits for the ready event.
+  [
+    "startup code that runs after real I/O but before the ready gate",
+    [
+      'const { app } = require("electron");',
+      'const fs = require("fs");',
+      "(async () => {",
+      "  await fs.promises.stat(__filename);",
+      "  await fs.promises.readFile(__filename);",
+      '  require("ai");',
+      "  await app.whenReady();",
+      "})();",
+      "",
+    ].join("\n"),
+  ],
 ])("reports a banned package loaded through %s", async (_name, source) => {
   expect(await bannedPackagesOf(source)).toEqual(["ai"]);
 });
@@ -78,6 +93,7 @@ test("top-level Electron calls and constructors do not throw", async () => {
       'ipcMain.handle("channel", () => {});',
       "if (app.isPackaged) {}",
       "const label = `${app.getVersion()}`;",
+      'const userData = require("path").join(app.getPath("appData"), "xum");',
       'require("ok-pkg");',
       "",
     ].join("\n")

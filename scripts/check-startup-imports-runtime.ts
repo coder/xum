@@ -7,13 +7,14 @@
  * but looks lazy) or computed loaders (`require(variable)`, `createRequire()` results).
  * This loads the built dist/desktop/main.js in plain Node with a stubbed `electron`
  * (scripts/check-startup-imports-runtime.cjs), so Electron's ready event never fires,
- * and fails when a BANNED_PACKAGES package is in require.cache anyway.
+ * and fails when a BANNED_PACKAGES package is in require.cache anyway. The module list
+ * is taken when startup reaches `app.whenReady()` (or goes idle first), so it includes
+ * code that runs after real I/O. The CLI shim and the preload are covered by the static
+ * guard only (#4423 tracks running the CLI shim here too).
  *
- * Limitation: the module list is taken after one setImmediate, so it covers module-scope
- * code and its microtasks, not work that resumes after real I/O. Electron stubs are not
- * strings either, so startup code that feeds e.g. `app.getPath()` into `path.join()`
- * throws (main.ts logs and swallows that); both only matter for code that runs before
- * the ready event, which main.ts keeps minimal.
+ * Limitation: only `app.getPath()` returns a real value (a path in a temp dir); other
+ * Electron values are stubs, so startup code that needs e.g. a real string from another
+ * Electron API may throw before reaching the ready gate.
  *
  * Needs a build: `make check-startup-imports-runtime` builds main first and runs in CI's
  * Smoke / Server job rather than static-check.
@@ -23,7 +24,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -38,6 +39,14 @@ const LOAD_TIMEOUT_MS = 60_000;
 
 interface HarnessResult {
   error: string | null;
+  trigger: string;
+  modules: string[];
+}
+
+export interface EagerModules {
+  /** What ended startup: `app.whenReady()` or an idle event loop. */
+  trigger: string;
+  /** Every file in require.cache at that point (real paths). */
   modules: string[];
 }
 
@@ -49,10 +58,10 @@ export interface BannedModule {
 
 /**
  * Loads `target` in plain Node with a stubbed `electron` and returns every file in
- * require.cache after module-scope work (including module-scope `import()`) has run.
+ * require.cache once startup reaches the ready gate (see the harness for the triggers).
  * Throws when the load throws, so a broken harness can never pass vacuously.
  */
-export async function loadEagerModules(requestedTarget: string): Promise<string[]> {
+export async function loadEagerModules(requestedTarget: string): Promise<EagerModules> {
   assert(path.isAbsolute(requestedTarget), `target must be absolute: ${requestedTarget}`);
   assert(existsSync(requestedTarget), `target does not exist: ${requestedTarget}`);
   // require.cache is keyed by real path.
@@ -60,8 +69,14 @@ export async function loadEagerModules(requestedTarget: string): Promise<string[
 
   const workDir = await mkdtemp(path.join(tmpdir(), "startup-imports-runtime-"));
   try {
-    // Loading main.js must never touch the developer's real ~/.xum.
+    // Startup now runs its home/userData migrations, so point every location it can
+    // touch (HOME, XUM_ROOT, Electron's app paths) into the temp dir: the check must never
+    // touch the developer's real ~/.xum.
     const xumRoot = path.join(workDir, "xum-root");
+    const home = path.join(workDir, "home");
+    const appData = path.join(workDir, "app-data");
+    await mkdir(home);
+    await mkdir(appData);
     const outFile = path.join(workDir, "out.json");
     const { code, signal, output, timedOut } = await new Promise<{
       code: number | null;
@@ -71,7 +86,13 @@ export async function loadEagerModules(requestedTarget: string): Promise<string[
     }>((resolve, reject) => {
       const child = spawn("node", [HARNESS, target, outFile], {
         cwd: workDir,
-        env: { ...process.env, XUM_ROOT: xumRoot, MUX_ROOT: xumRoot },
+        env: {
+          ...process.env,
+          HOME: home,
+          XUM_ROOT: xumRoot,
+          MUX_ROOT: xumRoot,
+          STARTUP_CHECK_APP_DATA: appData,
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let captured = "";
@@ -100,6 +121,9 @@ export async function loadEagerModules(requestedTarget: string): Promise<string[
         `Loading ${target} exited with ${code ?? signal} (harness failed):\n${output}`
       );
     }
+    if (!existsSync(outFile)) {
+      throw new Error(`${target} exited before startup reached app.whenReady():\n${output}`);
+    }
     const result = JSON.parse(await readFile(outFile, "utf8")) as HarnessResult;
     if (result.error != null) {
       throw new Error(`Loading ${target} threw:\n${result.error}\n${output}`);
@@ -108,7 +132,7 @@ export async function loadEagerModules(requestedTarget: string): Promise<string[
     if (!result.modules.includes(target)) {
       throw new Error(`Harness module list does not contain ${target}; the load did not run`);
     }
-    return result.modules;
+    return { trigger: result.trigger, modules: result.modules };
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -148,9 +172,11 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  const modules = await loadEagerModules(target);
+  const { trigger, modules } = await loadEagerModules(target);
   const packages = new Set(modules.map(packageOfLoadedFile).filter((p) => p != null));
-  console.log(`${desktopMain.dist}: ${modules.length} modules loaded (${packages.size} packages)`);
+  console.log(
+    `${desktopMain.dist}: ${modules.length} modules loaded (${packages.size} packages) until ${trigger}`
+  );
 
   const violations = findBannedModules(modules, BANNED_PACKAGES);
   if (violations.length === 0) {
