@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { HIGHLIGHT_CACHE_MAX_ENTRIES } from "./MarkdownComponents";
 import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
 
@@ -159,5 +160,63 @@ describe("TypewriterMarkdown during a transcript backfill", () => {
 
     renderScene(content, false);
     expect(normalizedMarkup()).toBe(duringBackfill);
+  });
+
+  test("a remounted growing block retires its old highlight, so a full cache keeps the reply's blocks (#4677)", async () => {
+    // Exactly as many fences as the cache holds: the finished block first, the growing block last.
+    const otherFences = Array.from(
+      { length: HIGHLIGHT_CACHE_MAX_ENTRIES - 2 },
+      (_, index) => "```ts\nconst reply" + index + " = " + index + ";\n```\n\n"
+    ).join("");
+    const renderReply = (content: string, isTranscriptBackfilling: boolean, isComplete: boolean) =>
+      flushSync(() => {
+        root?.render(
+          <ThemeProvider forcedTheme="dark">
+            <TranscriptBackfillContext.Provider value={isTranscriptBackfilling}>
+              <TypewriterMarkdown
+                content={content}
+                isComplete={isComplete}
+                streamKey="in-flight"
+                streamSource="replay"
+              />
+            </TranscriptBackfillContext.Provider>
+          </ThemeProvider>
+        );
+      });
+    const allHighlighted = () => {
+      const lines = Array.from(container.querySelectorAll(".code-line"));
+      return lines.length > 0 && lines.every((line) => line.querySelector("span") !== null);
+    };
+    const waitForHighlights = async () => {
+      for (let i = 0; i < 500 && !allHighlighted(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(allHighlighted()).toBe(true);
+    };
+
+    let content =
+      "```ts\nconst finishedFirst = 1;\n```\n\n" + otherFences + "```ts\nconst growingLast = 0;";
+    renderReply(content, true, false);
+    await waitForHighlights();
+    expect(container.querySelectorAll(".code-block-container")).toHaveLength(
+      HIGHLIGHT_CACHE_MAX_ENTRIES
+    );
+
+    // Backfill ends: every block remounts and paints from the cache.
+    renderReply(content, false, false);
+    await waitForHighlights();
+
+    // The remounted growing block highlights its next chunk. Its pre-remount highlight is stale
+    // now; if it stayed cached, this write would push the cache over its bound and evict the
+    // finished block, the oldest entry.
+    content += "\ngrowingLast += 1;";
+    renderReply(content, false, false);
+    await waitForHighlights();
+    for (let i = 0; i < 5; i++) await tick();
+
+    // Stream completes: the reply remounts once more and every block must paint highlighted in
+    // the commit that mounts it.
+    renderReply(content, false, true);
+    expect(allHighlighted()).toBe(true);
   });
 });

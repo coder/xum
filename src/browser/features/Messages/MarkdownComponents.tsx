@@ -167,7 +167,7 @@ export function getCurrentHighlightedCodeBlockLines(
 // the entry it wrote last, so it holds one entry; an entry other blocks also wrote (identical code)
 // stays until its last writer moves on. Bounded because the highlighted HTML of a large block can
 // be hundreds of KB; a reply with more fences than the bound falls back to re-highlighting.
-const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
+export const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
 
 interface HighlightCacheEntry {
   highlighted: HighlightedCodeBlockLines;
@@ -190,17 +190,41 @@ function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
   return cached.highlighted;
 }
 
+function releaseReplacedHighlight(key: string, writer: symbol, replacesKey: string | null): void {
+  if (replacesKey === null || replacesKey === key) return;
+  const replaced = highlightCache.get(replacesKey);
+  replaced?.writers.delete(writer);
+  if (replaced?.writers.size === 0) highlightCache.delete(replacesKey);
+}
+
+// A CodeBlock that paints from the cache after a remount takes over the entry its unmounted
+// predecessor wrote, so its next write retires that entry instead of leaving it to the LRU, where
+// it could evict a live block of the same reply (#4677).
+function adoptHighlightCacheEntry(key: string, writer: symbol, replacesKey: string | null): void {
+  releaseReplacedHighlight(key, writer, replacesKey);
+  highlightCache.get(key)?.writers.add(writer);
+}
+
+// Runs when a CodeBlock leaves the key it last wrote: it grew, or it unmounted. It stops owning the
+// entry but leaves it cached, because the instance that replaces it on a remount reads the entry and
+// adopts it. Without this, the unmounted instance would own the entry forever and the adopter's
+// next write could never retire it. An entry nobody adopts is retired by the next write that
+// replaces it, or by the LRU.
+function releaseHighlightCacheWriter(
+  lastWrittenKeyRef: { readonly current: string | null },
+  writer: symbol
+): void {
+  const key = lastWrittenKeyRef.current;
+  if (key !== null) highlightCache.get(key)?.writers.delete(writer);
+}
+
 function writeHighlightCache(
   key: string,
   highlighted: HighlightedCodeBlockLines,
   writer: symbol,
   replacesKey: string | null
 ): void {
-  if (replacesKey !== null && replacesKey !== key) {
-    const replaced = highlightCache.get(replacesKey);
-    replaced?.writers.delete(writer);
-    if (replaced?.writers.size === 0) highlightCache.delete(replacesKey);
-  }
+  releaseReplacedHighlight(key, writer, replacesKey);
   const writers = highlightCache.get(key)?.writers ?? new Set<symbol>();
   writers.add(writer);
   highlightCache.delete(key);
@@ -236,10 +260,17 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     .filter((line, idx, arr) => idx < arr.length - 1 || line !== "");
 
   useEffect(() => {
+    const cacheWriter = cacheWriterRef.current;
     const cached = readHighlightCache(cacheKey);
     if (cached) {
+      // Adopt here rather than in the useState initializer: render must stay side-effect free,
+      // and this branch also runs on the mount that the initializer seeded.
+      if (isStreaming) {
+        adoptHighlightCacheEntry(cacheKey, cacheWriter, lastWrittenCacheKeyRef.current);
+        lastWrittenCacheKeyRef.current = cacheKey;
+      }
       setHighlighted(cached);
-      return;
+      return () => releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
     }
 
     let cancelled = false;
@@ -265,7 +296,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
               writeHighlightCache(
                 cacheKey,
                 result,
-                cacheWriterRef.current,
+                cacheWriter,
                 lastWrittenCacheKeyRef.current
               );
               lastWrittenCacheKeyRef.current = cacheKey;
@@ -284,6 +315,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     void highlight();
     return () => {
       cancelled = true;
+      releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
     };
   }, [cacheKey, code, isStreaming, shikiLanguage, theme]);
 
