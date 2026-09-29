@@ -786,13 +786,13 @@ export class WorkspaceTurnManager {
       for (const workspace of project.workspaces) {
         const tags = workspace.tags ?? {};
         // The creator's own mark, which the public create API cannot write, outranks the tags.
-        const creationMark =
-          workspace.delegatedCreation?.interruptedAt == null
-            ? workspace.delegatedCreation
-            : undefined;
-        const handleId = creationMark?.handleId ?? tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        // A flagged mark still binds the row (a later pass may owe it a consent clear); only an
+        // unconfirmed one is flagged.
+        const bindingMark = workspace.delegatedCreation;
+        const creationMark = bindingMark?.interruptedAt == null ? bindingMark : undefined;
+        const handleId = bindingMark?.handleId ?? tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
         const ownerId =
-          creationMark?.ownerWorkspaceId ?? tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+          bindingMark?.ownerWorkspaceId ?? tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
         const workspaceId = workspace.id;
         const pending = workspace.unrelatedWorkspaceConsentPending === true;
         if ((!pending && creationMark == null) || workspaceId == null) continue;
@@ -807,7 +807,7 @@ export class WorkspaceTurnManager {
             // mark the handle must be real: its creator locked it before create(), and the lock
             // outlives the creator until the record settles. Without a lock only a record that
             // created this target counts.
-            if (creationMark == null) {
+            if (bindingMark == null) {
               const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
               const locked = await fsPromises.access(lockPath).then(
                 () => true,

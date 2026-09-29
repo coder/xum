@@ -551,6 +551,21 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
+  test("a flagged orphan whose consent clear failed gets it cleared next time (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    // The consent clear's write fails (it only logs); the flag write after it succeeds.
+    spyOn(b.config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(targetRow(a.config).pending).toBe(true);
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    expect(targetRow(a.config).pending).toBeUndefined();
+    await a.finish();
+  });
+
   test("a failed flag write never fails startup and is retried next time (#4983)", async () => {
     const a = await crashBeforeRecord({ disposable: true }); // No consent write comes first.
     const b = await backend();
