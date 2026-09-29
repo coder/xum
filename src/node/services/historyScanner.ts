@@ -1040,11 +1040,7 @@ export function readProviderHistoryWindow(
       kept.push(message);
     }
     assert(kept.length === cutter.keep, "window cut keeps exactly the rows it accepted");
-    const messages: MuxMessage[] = [];
-    for (let i = kept.length - 1; i >= 0; i--) {
-      const message = kept[i];
-      if (message) messages.push(message);
-    }
+    const messages = kept.filter((message) => message !== null).reverse();
     return {
       messages,
       reachedEpochStart: scan.reachedEpochStart && kept.length === scan.rows.length,
@@ -1099,17 +1095,17 @@ export interface HistoryPageOptions {
   throughSequence?: number;
 }
 
-/**
- * Chooses the newest-first rows of one page. `take` returns "take" for a row the page includes,
- * "skip" for a row it filters out, and "full" for the first row it would include past its caps.
- * A row that would exceed `maxBytes` is left out unless the page is still empty.
- */
 /** Whether a page may include this row at all (its sequence is an integer below `before`). */
 function isPageCandidate(message: MuxMessage | null, options: HistoryPageOptions): boolean {
   const sequence = message?.metadata?.historySequence;
   return isNonNegativeInteger(sequence) && sequence < options.beforeSequence;
 }
 
+/**
+ * Chooses the newest-first rows of one page. The selector returns "take" for a row the page
+ * includes, "skip" for a row it filters out, and "full" for the first row it would include past
+ * its caps. A row that would exceed `maxBytes` is left out unless the page is still empty.
+ */
 function createHistoryPageSelector(options: HistoryPageOptions) {
   let rows = 0;
   let bytes = 0;

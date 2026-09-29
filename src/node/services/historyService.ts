@@ -2644,9 +2644,9 @@ export class HistoryService {
     },
     observer?: HistoryReadObserver
   ): Promise<Result<{ messages: MuxMessage[]; reachedEpochStart: boolean }>> {
+    // Asserted here, outside the try below, so a bad cap throws instead of returning Err.
     assert(isPositiveInteger(caps.maxRows), "window maxRows must be a positive integer");
     assert(isPositiveInteger(caps.maxBytes), "window maxBytes must be a positive integer");
-    // Asserted here, outside the try below, so every bad cap throws instead of some returning Err.
     assert(isNonNegativeInteger(caps.extensionMaxRows), "window extension rows must be >= 0");
     assert(isNonNegativeInteger(caps.extensionMaxBytes), "window extension bytes must be >= 0");
     try {
