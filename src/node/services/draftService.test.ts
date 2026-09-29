@@ -194,7 +194,7 @@ describe("DraftService", () => {
     // The write lands while the scan runs (between its sessions-dir listing and its reads) and
     // fails, like ENOSPC/EACCES: a read-only session dir refuses the atomic write's temp file.
     const realReaddir = fs.readdir.bind(fs);
-    let failedWrite: Promise<unknown> | null = null;
+    let failedWrite = null as Promise<unknown> | null;
     const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
       ...args: Parameters<typeof fs.readdir>
     ) => {
