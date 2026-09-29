@@ -566,6 +566,50 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
+  test("the flag reaches the UI, and Keep drops only a flagged mark (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const flagOf = async () =>
+      (await a.config.getAllWorkspaceMetadata()).find((meta) => meta.id === TARGET)
+        ?.delegatedCreationInterrupted;
+    // Keep cannot erase the binding of a creation nobody flagged.
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)?.handleId).toBe("wst_handle");
+    const b = await backend();
+    const published: unknown[] = [];
+    const firstPublish = Promise.withResolvers<void>();
+    b.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId !== TARGET) return;
+      published.push(
+        (event.metadata as { delegatedCreationInterrupted?: true } | null)
+          ?.delegatedCreationInterrupted
+      );
+      firstPublish.resolve();
+    });
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    // Published detached from the startup pass (see the stalled-mount test below).
+    await firstPublish.promise;
+    expect(published).toEqual([true]);
+    expect(await flagOf()).toBe(true);
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)).toBeUndefined();
+    expect(await flagOf()).toBeUndefined();
+    await a.finish();
+  });
+
+  test("publishing the flag never holds up the startup pass (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    // A stalled mount: building probed metadata never finishes.
+    spyOn(b.config, "getAllWorkspaceMetadata").mockImplementation(() => new Promise(() => undefined));
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    await a.finish();
+  });
+
   test("a failed flag write never fails startup and is retried next time (#4983)", async () => {
     const a = await crashBeforeRecord({ disposable: true }); // No consent write comes first.
     const b = await backend();

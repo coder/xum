@@ -8864,7 +8864,47 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
+    // The resolver runs after the UI connected: publish the flag so its banner shows now.
+    if (flagged) await this.emitDelegatedCreationMetadata(workspaceId);
     return flagged;
+  }
+
+  /**
+   * The user keeps a flagged delegated target as an ordinary workspace (#4983): drop its mark.
+   * Only a flagged mark is dropped, so no client can erase the binding of a creation that is
+   * still in progress. Idempotent.
+   */
+  async keepInterruptedDelegatedWorkspace(workspaceId: string): Promise<Result<void>> {
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
+      return Err("Workspace not found");
+    }
+    let kept = false;
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry?.delegatedCreation?.interruptedAt != null) {
+          delete entry.delegatedCreation;
+          kept = true;
+        }
+        return freshConfig;
+      });
+    } catch (error) {
+      return Err(`Failed to keep workspace: ${getErrorMessage(error)}`);
+    }
+    if (kept) await this.emitDelegatedCreationMetadata(workspaceId);
+    return Ok(undefined);
+  }
+
+  /** Best effort: the change is durable, and the next metadata refresh shows it anyway. */
+  private async emitDelegatedCreationMetadata(workspaceId: string): Promise<void> {
+    try {
+      await this.emitCurrentWorkspaceMetadata(workspaceId);
+    } catch (error) {
+      log.warn("Failed to publish a delegated creation flag change", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   async setHeartbeatSettings(

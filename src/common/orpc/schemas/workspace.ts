@@ -271,6 +271,10 @@ export const WorkspaceMetadataSchema = z.object({
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
   }),
+  delegatedCreationInterrupted: z.literal(true).optional().meta({
+    description:
+      "The delegated task that created this workspace died before its setup finished, so the task never started here and its owner cannot reach it (#4983). The user removes or keeps it.",
+  }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
   }),

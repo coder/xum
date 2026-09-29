@@ -66,6 +66,7 @@ import {
 } from "@/browser/utils/rightSidebarTabFocus";
 
 import type { ProjectConfig } from "@/node/config";
+import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
@@ -488,14 +489,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               selectedMeta?.name ??
               selected.namedWorkspacePath.split("/").pop() ??
               selected.namedWorkspacePath;
-            const ok = await p.confirmDialog({
-              title: "Remove current workspace?",
-              description: `This will delete the worktree and local branch "${branchName}".`,
-              warning: "This cannot be undone.",
-              confirmLabel: "Remove",
-              confirmVariant: "destructive",
-            });
+            const ok = await p.confirmDialog(
+              removeWorkspaceConfirmOptions("Remove current workspace?", branchName)
+            );
             if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          },
+        });
+      }
+      // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
+      if (selectedMeta?.delegatedCreationInterrupted === true) {
+        list.push({
+          id: CommandIds.workspaceKeepInterruptedDelegated(),
+          title: "Keep Workspace After Interrupted Setup",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: async () => {
+            if (!p.api) return;
+            await p.api.workspace.keepInterruptedDelegatedWorkspace({
+              workspaceId: selected.workspaceId,
+            });
           },
         });
       }
@@ -711,13 +723,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             }
             const workspaceName = meta ? `${meta.projectName}/${meta.name}` : vals.workspaceId;
             const branchName = meta?.name ?? workspaceName.split("/").pop() ?? workspaceName;
-            const ok = await p.confirmDialog({
-              title: `Remove workspace ${workspaceName}?`,
-              description: `This will delete the worktree and local branch "${branchName}".`,
-              warning: "This cannot be undone.",
-              confirmLabel: "Remove",
-              confirmVariant: "destructive",
-            });
+            const ok = await p.confirmDialog(
+              removeWorkspaceConfirmOptions(`Remove workspace ${workspaceName}?`, branchName)
+            );
             if (ok) {
               await p.onRemoveWorkspace(vals.workspaceId);
             }

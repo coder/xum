@@ -26,6 +26,7 @@ export const CommandIds = {
   workspaceNewMultiProject: () => "ws:new-multi-project" as const,
   workspaceRemove: () => "ws:remove" as const,
   workspaceRemoveSubagent: () => "ws:remove-subagent" as const,
+  workspaceKeepInterruptedDelegated: () => "ws:keep-interrupted-delegated" as const,
   workspaceRemoveAny: () => "ws:remove-any" as const,
   workspaceEditTitle: () => "ws:edit-title" as const,
   workspaceEditTitleAny: () => "ws:edit-title-any" as const,

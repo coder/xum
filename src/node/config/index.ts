@@ -712,6 +712,15 @@ function healMalformedTaskAttemptId(
   persisted.taskAttemptUnproven = true;
 }
 
+/** #4983: the metadata flag for a delegated target the startup resolver flagged. */
+function delegatedCreationInterruptedField(workspace: Workspace): {
+  delegatedCreationInterrupted?: true;
+} {
+  return workspace.delegatedCreation?.interruptedAt != null
+    ? { delegatedCreationInterrupted: true }
+    : {};
+}
+
 function normalizePersistedWorkspace(
   workspace: ProjectConfig["workspaces"][number]
 ): ProjectConfig["workspaces"][number] {
@@ -3751,6 +3760,7 @@ export class Config {
               taskStatus: workspace.taskStatus,
               taskPendingGuidance: workspace.taskPendingGuidance,
               taskLaunchError: workspace.taskLaunchError,
+              ...delegatedCreationInterruptedField(workspace),
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
               taskThinkingLevel: workspace.taskThinkingLevel,
@@ -3934,6 +3944,8 @@ export class Config {
             metadata.taskStatus ??= workspace.taskStatus;
             metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
             metadata.taskLaunchError ??= workspace.taskLaunchError;
+            metadata.delegatedCreationInterrupted ??=
+              delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
             metadata.reportedAt ??= workspace.reportedAt;
             metadata.taskModelString ??= workspace.taskModelString;
             metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
@@ -4055,6 +4067,7 @@ export class Config {
               taskStatus: workspace.taskStatus,
               taskPendingGuidance: workspace.taskPendingGuidance,
               taskLaunchError: workspace.taskLaunchError,
+              ...delegatedCreationInterruptedField(workspace),
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
               taskThinkingLevel: workspace.taskThinkingLevel,
@@ -4137,6 +4150,7 @@ export class Config {
             taskStatus: workspace.taskStatus,
             taskPendingGuidance: workspace.taskPendingGuidance,
             taskLaunchError: workspace.taskLaunchError,
+            ...delegatedCreationInterruptedField(workspace),
             reportedAt: workspace.reportedAt,
             taskModelString: workspace.taskModelString,
             taskThinkingLevel: workspace.taskThinkingLevel,

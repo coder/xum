@@ -1511,6 +1511,11 @@ export const workspace = {
     input: z.object({ workspaceId: z.string(), pinned: z.boolean() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /** Keep a delegated workspace whose setup was interrupted (#4983): clears its flag. */
+  keepInterruptedDelegatedWorkspace: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   reorderPinned: {
     /**
      * Full desired pinned order for one project bucket. The server derives the
