@@ -12,6 +12,9 @@
  *   (min estimate/provider 1.016, median 1.36).
  * - Older Claude models count 1.02-1.16x the local encoding; the estimate's per-byte structure
  *   charge keeps them above the provider count on the replay (min 1.036), so they get no ratio.
+ * Trade-off: the corrected estimate runs above provider usage (median ~1.36x on long replayed
+ * sessions), so Token Budget rolls over earlier and its final checkpoint prompt rarely opens
+ * until #5223; anchoring to provider-reported input (#4858 Phase 1) tightens the estimate.
  */
 export const NEW_CLAUDE_TOKENIZER_RATIO = 1.55;
 
