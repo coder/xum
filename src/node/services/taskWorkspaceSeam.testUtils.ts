@@ -48,6 +48,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    preflightArchiveDescendants: () => Promise.resolve(Ok([])),
     // No live activity grants the hold so task tests reach interruption behavior.
     acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
     listLiveWorkspaceActivity: () => ({

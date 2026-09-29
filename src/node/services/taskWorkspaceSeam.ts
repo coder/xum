@@ -688,6 +688,10 @@ export interface WorkspaceLifecycleHost {
     workspaceId: string,
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>>;
+  preflightArchiveDescendants(
+    workspaceId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<Result<Array<{ workspaceId: string; title: string; paths: string[] }>>>;
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
     options: {

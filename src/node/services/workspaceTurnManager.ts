@@ -3861,6 +3861,41 @@ export class WorkspaceTurnManager {
             });
           }
 
+          // #4930: the archive cascades over the target's unarchived sub-agents. Refuse before
+          // anything is interrupted or archived when a sub-agent is active, the delete policy
+          // would delete its checkout, or its snapshot archive would lose untracked files: no
+          // tool acknowledgement can approve that loss (#3950), so list the paths instead.
+          const descendantPreflight = await this.workspaceService.preflightArchiveDescendants(
+            resolved.workspaceId,
+            worktreeArchiveBehavior
+          );
+          if (!descendantPreflight.success) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error: descendantPreflight.error,
+            });
+          }
+          if (descendantPreflight.data.length > 0) {
+            const subagents = descendantPreflight.data;
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              // Prefixed with the sub-agent's workspace ID: each path is relative to its checkout.
+              paths: subagents.flatMap((subagent) =>
+                subagent.paths.map((p) => `${subagent.workspaceId}: ${p}`)
+              ),
+              error:
+                `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${subagents
+                  .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
+                  .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
+                "This tool cannot approve that loss, and you must not delete the files to get around it. " +
+                "Ask the user to archive those sub-agents manually first; the archive dialog lists the files and asks for confirmation.",
+            });
+          }
+
           // Held (when interrupting) from before the first turn interruption through the
           // archive sink so user activity cannot be admitted between turn destruction and
           // the sink's refuseLiveUserActivity gate (see acquirePreInterruptionArchiveHold).

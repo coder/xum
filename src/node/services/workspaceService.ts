@@ -10919,6 +10919,71 @@ export class WorkspaceService
     );
   }
 
+  /** Unarchived sub-agents of a workspace, deepest-first: the ones its archive cascades over. */
+  private listUnarchivedDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
+    const config = this.config.loadConfigOrDefault();
+    let listed: WorkspaceRemovalDescendant[];
+    try {
+      listed = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? [];
+    } catch (error) {
+      // Malformed persisted ancestry (a parentWorkspaceId cycle) must not make the workspace
+      // impossible to archive: archive it alone, as before the cascade existed.
+      log.warn("Archiving without sub-agents: their ancestry could not be read", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      listed = [];
+    }
+    return listed.filter((descendant) => {
+      const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
+      return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
+    });
+  }
+
+  /**
+   * #4930: the model-facing archive cascades over sub-agents too, but no tool acknowledgement
+   * can approve losing a sub-agent's work (#3950). Run before anything is interrupted or
+   * archived, this lists the untracked files each sub-agent's snapshot archive would lose, and
+   * refuses a sub-agent the delete policy would delete, as the lifecycle tool does for its
+   * target. The sink rechecks each sub-agent under the gate, so a file created after this scan
+   * still refuses (with the generic cascade message).
+   */
+  async preflightArchiveDescendants(
+    workspaceId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<Result<Array<{ workspaceId: string; title: string; paths: string[] }>>> {
+    const descendants = this.listUnarchivedDescendants(workspaceId);
+    if (descendants.some((descendant) => descendant.active)) {
+      return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
+    }
+    const lossy: Array<{ workspaceId: string; title: string; paths: string[] }> = [];
+    for (const descendant of descendants) {
+      const label = `sub-agent ${descendant.title} (${descendant.workspaceId})`;
+      if (worktreeArchiveBehavior === "delete") {
+        const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
+        if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
+        if (archiveDeletesManagedWorktree(metadata.data, worktreeArchiveBehavior)) {
+          return Err(
+            `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
+          );
+        }
+        continue;
+      }
+      const preflight = await this.preflightArchive(descendant.workspaceId, {
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+      });
+      if (!preflight.success) return Err(`Cannot archive ${label}: ${preflight.error}`);
+      if (preflight.data.kind === "confirm-lossy-untracked-files") {
+        lossy.push({
+          workspaceId: descendant.workspaceId,
+          title: descendant.title,
+          paths: preflight.data.paths,
+        });
+      }
+    }
+    return Ok(lossy);
+  }
+
   /**
    * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
    * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
@@ -10933,23 +10998,7 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    const config = this.config.loadConfigOrDefault();
-    let listed: WorkspaceRemovalDescendant[];
-    try {
-      listed = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? [];
-    } catch (error) {
-      // Malformed persisted ancestry (a parentWorkspaceId cycle) must not make the workspace
-      // impossible to archive: archive it alone, as before the cascade existed.
-      log.warn("Archiving without sub-agents: their ancestry could not be read", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
-      listed = [];
-    }
-    const descendants = listed.filter((descendant) => {
-      const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
-      return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
-    });
+    const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) {
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
     }
@@ -10986,6 +11035,11 @@ export class WorkspaceService
     try {
       for (const descendant of descendants) {
         const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
+          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+          // user-facing archive passes none of them.
+          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+          refuseLiveUserActivity: options?.refuseLiveUserActivity,
+          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
           worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
           coderWorkspaceArchiveBehaviorOverride: "keep",
           mutationGateHeld: true,
@@ -11022,14 +11076,15 @@ export class WorkspaceService
    * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
    * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
-   * workspace lifecycle), so the sink must not re-acquire it.
+   * workspace lifecycle), so the sink must not re-acquire it. It cascades over the workspace's
+   * sub-agents like archive() does (#4930).
    */
   async archiveWhileTaskTreeLocked(
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
+    return await this.archiveWithDescendants(workspaceId, acknowledgedUntrackedPaths, options);
   }
 
   /**
