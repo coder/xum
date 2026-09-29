@@ -9,8 +9,9 @@ import { useRouting } from "@/browser/hooks/useRouting";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
-  applyFastModeServiceTierChange,
+  applyFastModeToggle,
   getFastModeProvider,
+  isFastModeActive,
 } from "@/browser/utils/fastModeServiceTier";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
@@ -151,7 +152,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
   const proModeActive =
     !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
   const fastModeActive =
-    fastModeProvider != null && providersConfig?.[fastModeProvider]?.serviceTier === "priority";
+    fastModeProvider != null &&
+    isFastModeActive(fastModeProvider, providersConfig?.[fastModeProvider]);
   const hasMenu =
     allowed.length > 1 ||
     proModeAvailable ||
@@ -179,18 +181,13 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
     setFastModeSaving(true);
     try {
-      const providerConfig = providersConfig[fastModeProvider];
-      const change = await applyFastModeServiceTierChange(
+      const patch = await applyFastModeToggle(
         api.providers,
         fastModeProvider,
-        providerConfig?.serviceTier,
-        providerConfig?.fastModePreviousServiceTier
+        providersConfig[fastModeProvider]
       );
-      if (change) {
-        updateOptimistically(fastModeProvider, {
-          serviceTier: change.serviceTier,
-          fastModePreviousServiceTier: change.previousServiceTier,
-        });
+      if (patch) {
+        updateOptimistically(fastModeProvider, patch);
       } else {
         await refresh();
       }

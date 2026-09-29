@@ -56,6 +56,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -1497,6 +1498,7 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
+    let anthropicFastModePinned = false;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1633,6 +1635,18 @@ export class ProviderModelFactory {
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
         }
+
+        // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
+        // like the OpenAI tier so fallbacks and headless callers cannot drift, and
+        // never send `speed` where it is unsupported (the API rejects it).
+        anthropicFastModePinned =
+          providerName === "anthropic" &&
+          !providerIsCustom &&
+          providersConfig.anthropic?.speed === "fast" &&
+          muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
+          anthropicFastModeAvailable(modelString, {
+            providersConfig: self.providerService.getConfig(providersConfig),
+          });
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
@@ -2808,6 +2822,10 @@ export class ProviderModelFactory {
           injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
             [serviceTierDefault.option]: serviceTierDefault.value,
           });
+        }
+        if (result.success && anthropicFastModePinned && typeof result.data !== "string") {
+          // @ai-sdk/anthropic adds the fast-mode beta header for this option.
+          injectProviderOptionsDefaults(result.data, "anthropic", { speed: "fast" });
         }
         return result;
       }),

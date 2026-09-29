@@ -2652,6 +2652,51 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
   return JSON.parse(call.init.body as string) as Record<string, unknown>;
 }
 
+describe("ProviderModelFactory Anthropic Fast mode", () => {
+  const sendOnce = async (
+    anthropicConfig: Record<string, unknown>,
+    modelString: string
+  ): Promise<CapturedFetchCall> => {
+    let captured: CapturedFetchCall | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key", ...anthropicConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(modelString);
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        captured = calls[0];
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    if (captured == null) throw new Error("expected a captured request");
+    return captured;
+  };
+  const betaHeader = (call: CapturedFetchCall) =>
+    new Headers(call.init.headers).get("anthropic-beta") ?? "";
+
+  it("pins speed=fast and the beta header for supported direct models", async () => {
+    const call = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5");
+    expect(parseSentBody(call)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(call)).toContain("fast-mode-2026-02-01");
+  });
+
+  it.each([
+    ["unsupported model", { speed: "fast" }, "anthropic:claude-opus-4-7"],
+    ["ZDR beta opt-out", { speed: "fast", disableBetaFeatures: true }, "anthropic:claude-opus-5-5"],
+    ["preference unset", {}, "anthropic:claude-opus-5-5"],
+  ] as const)("omits speed for %s", async (_label, anthropicConfig, modelString) => {
+    const call = await sendOnce(anthropicConfig, modelString);
+    expect(parseSentBody(call)).not.toHaveProperty("speed");
+    expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+});
+
 // @ai-sdk/openai strips reasoningEffort "none" for every gpt-6-* ID; Xum must still
 // serialize it for Sol/Luna (Chat Completions function calling requires it).
 describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {

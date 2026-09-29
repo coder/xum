@@ -687,6 +687,44 @@ describe("OpenAI service-tier pricing (#4352)", () => {
   });
 });
 
+describe("Anthropic Fast mode pricing", () => {
+  const display = (model: string, speed?: string) => {
+    const usage = createDisplayUsage(
+      { inputTokens: 300_000, outputTokens: 1_000, cachedInputTokens: 50_000 },
+      model,
+      speed === undefined ? undefined : { anthropic: { usage: { speed } } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const total = (usage: Parameters<typeof getTotalCost>[0]) => {
+    const value = getTotalCost(usage);
+    if (value === undefined) throw new Error("expected a priced total");
+    return value;
+  };
+
+  test("prices the speed Anthropic reported at 2x across every token class", () => {
+    for (const model of ["anthropic:claude-opus-5-5", "anthropic:claude-opus-4-8"]) {
+      const standard = display(model, "standard");
+      const fast = display(model, "fast");
+      expect(total(standard)).toBe(total(display(model)));
+      expect(fast.serviceTier).toBe("fast");
+      expect(standard.serviceTier).toBeUndefined();
+      expect(fast.input.cost_usd).toBeCloseTo(2 * (standard.input.cost_usd ?? NaN), 12);
+      expect(fast.cached.cost_usd).toBeCloseTo(2 * (standard.cached.cost_usd ?? NaN), 12);
+      expect(fast.output.cost_usd).toBeCloseTo(2 * (standard.output.cost_usd ?? NaN), 12);
+    }
+  });
+
+  test("reprices a stored Fast turn at Fast rates", () => {
+    const fast = display("anthropic:claude-opus-5-5", "fast");
+    expect(total(recomputeUsageCosts(fast, "anthropic:claude-opus-5-5"))).toBeCloseTo(
+      total(fast),
+      12
+    );
+  });
+});
+
 describe("repricing keeps the billed service tier (#4787)", () => {
   // gpt-5-mini has Fast and Flex rates but no long-context tier, so its session
   // aggregates are repriced rather than preserved.

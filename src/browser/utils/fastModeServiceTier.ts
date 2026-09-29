@@ -4,13 +4,16 @@ import type {
   ServiceTier,
 } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProviderConfigInfo, ProvidersConfigMap } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
+import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
-export type FastModeProvider = "openai" | "xai";
+export type FastModeProvider = "openai" | "xai" | "anthropic";
+/** Providers whose Fast mode is the priority service tier. */
+type ServiceTierFastModeProvider = Exclude<FastModeProvider, "anthropic">;
 
 export interface FastModeServiceTierChange {
   apiValue: ServiceTier | "";
@@ -32,6 +35,9 @@ export function getFastModeProvider(
 ): FastModeProvider | null {
   if (openaiServiceTierAvailable(modelString, options)) {
     return "openai";
+  }
+  if (anthropicFastModeAvailable(modelString, options)) {
+    return "anthropic";
   }
 
   const normalized = normalizeToCanonical(modelString);
@@ -63,7 +69,7 @@ export function getFastModeProvider(
  * providers.jsonc so every browser origin and desktop client observes the same state.
  */
 export function getFastModeServiceTierChange(
-  provider: FastModeProvider,
+  provider: ServiceTierFastModeProvider,
   currentServiceTier: ServiceTier | undefined,
   previousServiceTier?: FastModePreviousServiceTier
 ): FastModeServiceTierChange {
@@ -85,10 +91,58 @@ export function getFastModeServiceTierChange(
   };
 }
 
+/**
+ * OpenAI and xAI express Fast mode as the priority service tier; Anthropic uses a
+ * separate `speed` preference because its own service_tier means something else.
+ */
+export function isFastModeActive(
+  provider: FastModeProvider,
+  providerConfig: ProviderConfigInfo | undefined
+): boolean {
+  return provider === "anthropic"
+    ? providerConfig?.speed === "fast"
+    : providerConfig?.serviceTier === "priority";
+}
+
+/**
+ * Toggle Fast mode for the provider and return the persisted config patch to apply
+ * optimistically, or null when a write failed (callers should refresh).
+ */
+export async function applyFastModeToggle(
+  providers: ProviderConfigWriter,
+  provider: FastModeProvider,
+  providerConfig: ProviderConfigInfo | undefined
+): Promise<Partial<ProviderConfigInfo> | null> {
+  if (provider === "anthropic") {
+    const enable = providerConfig?.speed !== "fast";
+    // Standard is the API default, so disabling removes the key instead of
+    // persisting "standard" (keeps providers.jsonc minimal).
+    const result = await providers.setProviderConfig({
+      provider,
+      keyPath: ["speed"],
+      value: enable ? "fast" : "",
+    });
+    if (!result.success) return null;
+    return { speed: enable ? "fast" : undefined };
+  }
+
+  const change = await applyFastModeServiceTierChange(
+    providers,
+    provider,
+    providerConfig?.serviceTier,
+    providerConfig?.fastModePreviousServiceTier
+  );
+  if (change == null) return null;
+  return {
+    serviceTier: change.serviceTier,
+    fastModePreviousServiceTier: change.previousServiceTier,
+  };
+}
+
 /** Persist the provider-specific restore target and service-tier override in a safe order. */
 export async function applyFastModeServiceTierChange(
   providers: ProviderConfigWriter,
-  provider: FastModeProvider,
+  provider: ServiceTierFastModeProvider,
   currentServiceTier: ServiceTier | undefined,
   previousServiceTier?: FastModePreviousServiceTier
 ): Promise<FastModeServiceTierChange | null> {

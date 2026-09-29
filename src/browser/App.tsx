@@ -18,7 +18,11 @@ import {
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
-import { applyFastModeServiceTierChange, getFastModeProvider } from "./utils/fastModeServiceTier";
+import {
+  applyFastModeToggle,
+  getFastModeProvider,
+  isFastModeActive,
+} from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
 import {
@@ -678,7 +682,7 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider != null && providersConfig[provider]?.serviceTier === "priority";
+    return provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   const fastModeToggleInFlightRef = useRef(false);
@@ -701,18 +705,9 @@ function AppInner() {
     }
 
     try {
-      const providerConfig = providersConfig[provider];
-      const change = await applyFastModeServiceTierChange(
-        api.providers,
-        provider,
-        providerConfig?.serviceTier,
-        providerConfig?.fastModePreviousServiceTier
-      );
-      if (change) {
-        updateOptimistically(provider, {
-          serviceTier: change.serviceTier,
-          fastModePreviousServiceTier: change.previousServiceTier,
-        });
+      const patch = await applyFastModeToggle(api.providers, provider, providersConfig[provider]);
+      if (patch) {
+        updateOptimistically(provider, patch);
       } else {
         await refreshProvidersConfig();
       }

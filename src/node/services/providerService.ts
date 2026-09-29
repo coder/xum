@@ -393,6 +393,7 @@ export class ProviderService {
         store?: unknown;
         webSocketTransportEnabled?: unknown;
         cacheTtl?: unknown;
+        speed?: unknown;
         disableBetaFeatures?: unknown;
         /** OpenAI-only: default auth precedence for Codex-OAuth-allowed models. */
         codexOauthDefaultAuth?: unknown;
@@ -505,6 +506,11 @@ export class ProviderService {
       const cacheTtl = config.cacheTtl;
       if (provider === "anthropic" && (cacheTtl === "5m" || cacheTtl === "1h")) {
         providerInfo.cacheTtl = cacheTtl;
+      }
+
+      // Anthropic-specific: Fast mode preference (only "fast" changes requests).
+      if (provider === "anthropic" && config.speed === "fast") {
+        providerInfo.speed = "fast";
       }
 
       // Anthropic-specific: disable all beta features for ZDR orgs.

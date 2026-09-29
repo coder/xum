@@ -115,6 +115,8 @@ export interface EvaluationService {
  * so provider text can never ride along into persisted usage records.
  */
 const USAGE_PROVIDER_METADATA_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
+  // `anthropic.usage.speed` (Fast mode pricing) is intentionally omitted:
+  // evaluation models never request Fast mode, so they always bill Standard.
   anthropic: ["cacheCreationInputTokens"],
   openai: ["reasoningTokens", "serviceTier"],
   mux: ["costsIncluded"],

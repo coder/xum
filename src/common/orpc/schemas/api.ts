@@ -181,6 +181,7 @@ import {
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
 import {
+  AnthropicSpeedSchema,
   CacheTtlSchema,
   CodexOauthDefaultAuthSchema,
   FastModePreviousServiceTierSchema,
@@ -329,6 +330,8 @@ export const ProviderConfigInfoSchema = z.object({
   webSocketTransportEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
+  /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */
+  speed: AnthropicSpeedSchema.optional(),
   disableBetaFeatures: z.boolean().optional(),
   /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
   codexOauthSet: z.boolean().optional(),

@@ -3,8 +3,10 @@ import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import {
   applyFastModeServiceTierChange,
+  applyFastModeToggle,
   getFastModeProvider,
   getFastModeServiceTierChange,
+  isFastModeActive,
 } from "./fastModeServiceTier";
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
@@ -235,5 +237,95 @@ describe("fast mode service tier", () => {
         },
       ],
     ]);
+  });
+
+  test("offers Anthropic Fast mode only for supported Opus models on the direct API", () => {
+    const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    for (const model of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"]) {
+      expect(
+        getFastModeProvider(`anthropic:${model}`, {
+          resolvedRouteProvider: "direct",
+          providersConfig: { anthropic },
+        })
+      ).toBe("anthropic");
+    }
+    // Opus 4.7 errors and Opus 4.6 silently runs at standard speed.
+    for (const model of ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"]) {
+      expect(getFastModeProvider(`anthropic:${model}`, { resolvedRouteProvider: "direct" })).toBe(
+        null
+      );
+    }
+    // Mapped aliases inherit their target's support.
+    expect(
+      getFastModeProvider("anthropic:team-opus", {
+        resolvedRouteProvider: "direct",
+        providersConfig: {
+          anthropic: {
+            ...anthropic,
+            models: [{ id: "team-opus", mappedToModel: "anthropic:claude-opus-5-5" }],
+          },
+        },
+      })
+    ).toBe("anthropic");
+  });
+
+  test("hides Anthropic Fast mode on gateways, ZDR configs, and policy-denied providers", () => {
+    const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const gateway = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    for (const route of ["mux-gateway", "openrouter", "bedrock", "coder"]) {
+      expect(
+        getFastModeProvider("anthropic:claude-opus-5-5", {
+          resolvedRouteProvider: route,
+          providersConfig: { anthropic, [route]: gateway },
+        })
+      ).toBeNull();
+    }
+    expect(
+      getFastModeProvider("mux-gateway:anthropic/claude-opus-5-5", {
+        providersConfig: { anthropic, "mux-gateway": gateway },
+      })
+    ).toBeNull();
+    expect(
+      getFastModeProvider("anthropic:claude-opus-5-5", {
+        resolvedRouteProvider: "direct",
+        providersConfig: { anthropic: { ...anthropic, disableBetaFeatures: true } },
+      })
+    ).toBeNull();
+    expect(
+      getFastModeProvider("anthropic:claude-opus-5-5", {
+        resolvedRouteProvider: "direct",
+        providersConfig: { openai: anthropic },
+      })
+    ).toBeNull();
+  });
+
+  test("toggles Anthropic speed without touching service tiers", async () => {
+    const { providers, setProviderConfig } = createWriter();
+    const base = { apiKeySet: true, isEnabled: true, isConfigured: true };
+
+    expect(isFastModeActive("anthropic", base)).toBe(false);
+    const enabled = await applyFastModeToggle(providers, "anthropic", base);
+    expect(enabled).toEqual({ speed: "fast" });
+    expect(isFastModeActive("anthropic", { ...base, ...enabled })).toBe(true);
+    // A priority service tier on Anthropic config must not read as Fast mode.
+    expect(isFastModeActive("anthropic", { ...base, serviceTier: "priority" })).toBe(false);
+
+    const disabled = await applyFastModeToggle(providers, "anthropic", { ...base, speed: "fast" });
+    expect(disabled).toEqual({ speed: undefined });
+
+    expect(setProviderConfig.mock.calls).toEqual([
+      [{ provider: "anthropic", keyPath: ["speed"], value: "fast" }],
+      // Empty string removes the key; standard is the API default.
+      [{ provider: "anthropic", keyPath: ["speed"], value: "" }],
+    ]);
+  });
+
+  test("reports a failed Anthropic write so callers refresh", async () => {
+    const setProviderConfig = mock((_input: unknown) =>
+      Promise.resolve({ success: false as const, error: "denied" })
+    );
+    const providers = { setProviderConfig } as unknown as ProviderConfigWriter;
+
+    expect(await applyFastModeToggle(providers, "anthropic", undefined)).toBeNull();
   });
 });

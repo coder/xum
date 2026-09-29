@@ -6,6 +6,9 @@ import { ModelParametersByModelSchema } from "./modelParameters";
 import { ProviderModelEntrySchema } from "./providerModelEntry";
 
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
+/** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
+export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
+export type AnthropicSpeed = z.infer<typeof AnthropicSpeedSchema>;
 export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority"]);
 export type ServiceTier = z.infer<typeof ServiceTierSchema>;
 export const FastModePreviousServiceTierSchema = z.enum(["auto", "default", "flex", "unset"]);
@@ -32,6 +35,7 @@ export const BaseProviderConfigSchema = z
 
 export const AnthropicProviderConfigSchema = BaseProviderConfigSchema.extend({
   cacheTtl: CacheTtlSchema.optional(),
+  speed: AnthropicSpeedSchema.optional(),
 });
 
 export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({

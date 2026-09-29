@@ -2,7 +2,8 @@ import type { ModelStats } from "./modelStats";
 import { resolveRawModelEntry } from "./modelStats";
 
 /**
- * OpenAI service-tier pricing (#4352).
+ * OpenAI service-tier pricing (#4352), plus Anthropic Fast mode (see
+ * readReportedServiceTier), which shares the "fast" tier and factor table.
  *
  * The tier that decides the bill is the one the provider reports in the
  * response (`service_tier`, surfaced as `providerMetadata.openai.serviceTier`),
@@ -36,6 +37,40 @@ export function normalizeOpenAIServiceTier(value: unknown): PricedServiceTier | 
     default:
       return "unknown";
   }
+}
+
+/**
+ * Anthropic reports the speed it actually ran at in `usage.speed`, surfaced raw as
+ * `providerMetadata.anthropic.usage.speed`. Fast mode is billed at Fast rates only
+ * when the response says "fast" (Opus 4.6 accepts the request but reports and
+ * bills "standard"). https://platform.claude.com/docs/en/build-with-claude/fast-mode
+ */
+function normalizeAnthropicSpeed(value: unknown): PricedServiceTier | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  switch (value) {
+    case "fast":
+      return "fast";
+    case "standard":
+      return "standard";
+    default:
+      return "unknown";
+  }
+}
+
+/** The billed tier any supported provider reported in response metadata. */
+export function readReportedServiceTier(
+  providerMetadata: Record<string, unknown> | undefined
+): PricedServiceTier | undefined {
+  const openaiTier = normalizeOpenAIServiceTier(
+    (providerMetadata?.openai as { serviceTier?: unknown } | undefined)?.serviceTier
+  );
+  if (openaiTier !== undefined) {
+    return openaiTier;
+  }
+  const anthropic = providerMetadata?.anthropic as { usage?: { speed?: unknown } } | undefined;
+  return normalizeAnthropicSpeed(anthropic?.usage?.speed);
 }
 
 const KNOWN_OPENAI_SERVICE_TIERS: ReadonlySet<string> = new Set([
@@ -88,49 +123,54 @@ const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: fa
  * the corresponding Standard rate"). Keys are the bare catalog keys the model's
  * Standard stats resolve from.
  */
-const OPENAI_SERVICE_TIER_FACTORS: Readonly<
-  Record<string, Partial<Record<"flex" | "fast", TierFactor>>>
-> = {
-  "gpt-6-astra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  // Catalog alias priced as gpt-5.6-sol (models-extra `"gpt-5.6": GPT_56_SOL_STATS`).
-  "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-5.5": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2.5) },
-  "gpt-5.5-pro": { flex: HALF_SHORT_ONLY },
-  "gpt-5.4": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2) },
-  "gpt-5.4-pro": { flex: HALF_BOTH_BANDS },
-  "gpt-5.4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-  "gpt-5.4-nano": { flex: HALF_SHORT_ONLY },
-  "gpt-5.3-codex": { fast: fastShortOnly(2) },
-  "gpt-5.2": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-  "gpt-5.1": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-  "gpt-5": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
-  "gpt-5-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.8) },
-  "gpt-5-nano": { flex: HALF_SHORT_ONLY },
-  o3: { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.75) },
-  "o4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(20 / 11) },
-  "gpt-4.1": { fast: fastShortOnly(1.75) },
-  "gpt-4.1-mini": { fast: fastShortOnly(1.75) },
-  "gpt-4.1-nano": { fast: fastShortOnly(2) },
-  "gpt-4o": { fast: fastShortOnly(1.7) },
-  "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
-  "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
-};
+const SERVICE_TIER_FACTORS: Readonly<Record<string, Partial<Record<"flex" | "fast", TierFactor>>>> =
+  {
+    "gpt-6-astra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    // Catalog alias priced as gpt-5.6-sol (models-extra `"gpt-5.6": GPT_56_SOL_STATS`).
+    "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+    "gpt-5.5": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2.5) },
+    "gpt-5.5-pro": { flex: HALF_SHORT_ONLY },
+    "gpt-5.4": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2) },
+    "gpt-5.4-pro": { flex: HALF_BOTH_BANDS },
+    "gpt-5.4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+    "gpt-5.4-nano": { flex: HALF_SHORT_ONLY },
+    "gpt-5.3-codex": { fast: fastShortOnly(2) },
+    "gpt-5.2": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+    "gpt-5.1": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+    "gpt-5": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+    "gpt-5-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.8) },
+    "gpt-5-nano": { flex: HALF_SHORT_ONLY },
+    o3: { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.75) },
+    "o4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(20 / 11) },
+    "gpt-4.1": { fast: fastShortOnly(1.75) },
+    "gpt-4.1-mini": { fast: fastShortOnly(1.75) },
+    "gpt-4.1-nano": { fast: fastShortOnly(2) },
+    "gpt-4o": { fast: fastShortOnly(1.7) },
+    "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
+    "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
+    // Anthropic Fast mode: 2× Standard across the full context window, with prompt
+    // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
+    // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
+    "claude-opus-5-5": { fast: DOUBLE_BOTH_BANDS },
+    "claude-opus-5": { fast: DOUBLE_BOTH_BANDS },
+    "claude-opus-4-8": { fast: DOUBLE_BOTH_BANDS },
+  };
 
 function lookupTierFactors(
   modelString: string
 ): Partial<Record<"flex" | "fast", TierFactor>> | undefined {
-  const key = resolveRawModelEntry(modelString)?.key.replace(/^openai\//, "");
+  const key = resolveRawModelEntry(modelString)?.key.replace(/^(?:openai|anthropic)\//, "");
   if (key === undefined) {
     return undefined;
   }
   return (
-    OPENAI_SERVICE_TIER_FACTORS[key] ??
-    OPENAI_SERVICE_TIER_FACTORS[key.replace(/-\d{4}-\d{2}-\d{2}$/, "")]
+    SERVICE_TIER_FACTORS[key] ??
+    SERVICE_TIER_FACTORS[key.replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, "")]
   );
 }
 

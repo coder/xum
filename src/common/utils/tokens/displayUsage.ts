@@ -6,7 +6,7 @@
  */
 
 import { getModelStats, type ModelStats } from "./modelStats";
-import { normalizeOpenAIServiceTier, withServiceTierPricing } from "./serviceTierPricing";
+import { readReportedServiceTier, withServiceTierPricing } from "./serviceTierPricing";
 import type { ChatUsageDisplay } from "./usageAggregator";
 import type { AiSdkUsageLike } from "./usageHelpers";
 
@@ -151,9 +151,7 @@ export function createDisplayUsage(
   // reported it billed (#4352); no reported tier keeps the base rates.
   const pricingModel = metadataModelOverride ?? model;
   const baseStats = getModelStats(pricingModel);
-  const serviceTier = normalizeOpenAIServiceTier(
-    (providerMetadata?.openai as { serviceTier?: unknown } | undefined)?.serviceTier
-  );
+  const serviceTier = readReportedServiceTier(providerMetadata);
   const modelStats =
     baseStats !== null && serviceTier !== undefined
       ? withServiceTierPricing(baseStats, pricingModel, serviceTier)
