@@ -93,7 +93,12 @@ const experimentKeys = [
 /** Every concrete key the worst-case model writes for one registration. */
 function modelledKeys(entry: PersistedKeyRegistration): string[] {
   if (entry.scope === "workspaceId") {
-    const scopeIds = entry.scopes === "draft" ? draftScopeIds : [...workspaceIds, ...draftScopeIds];
+    const scopeIds =
+      entry.scopes === "draft"
+        ? draftScopeIds
+        : entry.scopes === "webview"
+          ? workspaceIds
+          : [...workspaceIds, ...draftScopeIds];
     const keys = scopeIds.map(entry.getKey);
     if (PROJECT_SCOPED_WORKSPACE_KEYS.includes(entry.getKey)) {
       keys.push(...projectScopeIds.map(entry.getKey));
@@ -163,9 +168,16 @@ describe("localStorage budget", () => {
 
     let total = 0;
     let nonEvictable = 0;
+    // VS Code webview keys live in the webview's own origin, not the app's.
+    let webview = 0;
     for (let index = 0; index < storage.length; index++) {
       const key = storage.key(index)!;
       const chars = key.length + (storage.getItem(key)?.length ?? 0);
+      const registration = getPersistedKeyRegistration(key);
+      if (registration?.scope === "workspaceId" && registration.scopes === "webview") {
+        webview += chars;
+        continue;
+      }
       total += chars;
       if (getPersistedKeyKind(key) !== "cache") nonEvictable += chars;
     }
@@ -180,13 +192,18 @@ describe("localStorage budget", () => {
     const summary =
       `total ${total} / ${LOCAL_STORAGE_BUDGET_CEILING_CHARS} chars, ` +
       `non-evictable ${nonEvictable} / ${NON_EVICTABLE_CEILING_CHARS} chars, ` +
-      `per workspace ${perWorkspace} chars x ${WORKSPACE_COUNT + DRAFT_SCOPE_COUNT} scopes`;
+      `per workspace ${perWorkspace} chars x ${WORKSPACE_COUNT + DRAFT_SCOPE_COUNT} scopes, ` +
+      `VS Code webview origin ${webview} / ${NON_EVICTABLE_CEILING_CHARS} chars`;
     expect({ nonEvictableFits: nonEvictable <= NON_EVICTABLE_CEILING_CHARS, summary }).toEqual({
       nonEvictableFits: true,
       summary,
     });
     expect({ totalFits: total <= LOCAL_STORAGE_BUDGET_CEILING_CHARS, summary }).toEqual({
       totalFits: true,
+      summary,
+    });
+    expect({ webviewFits: webview <= NON_EVICTABLE_CEILING_CHARS, summary }).toEqual({
+      webviewFits: true,
       summary,
     });
   });
@@ -198,7 +215,6 @@ describe("localStorage budget", () => {
     const legacyOnly = new Set([
       "GATEWAY_MODELS_KEY",
       "GATEWAY_ENABLED_KEY",
-      "getInputKey",
       "getInputAttachmentsKey",
       "getAutoRetryKey",
     ]);

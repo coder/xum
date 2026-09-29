@@ -257,7 +257,9 @@ export function getAutoRoutingChoiceByAgentKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for the input text for a workspace
+ * Get the localStorage key for the input text for a workspace.
+ * Only the VS Code webview composer still writes it; the desktop/web composer keeps drafts on the
+ * backend and reads this key once for the legacy draft import.
  */
 export function getInputKey(workspaceId: string): string {
   return `input:${workspaceId}`;
@@ -1030,8 +1032,10 @@ export type PersistedKeyScope = "global" | "workspaceId";
 /**
  * Which scope ids a workspace key is written under, for the budget model: "workspace" keys are
  * counted for every workspace and creation draft, "draft" keys only for creation drafts.
+ * "webview" keys are written only by the VS Code webview, whose origin has its own quota, so they
+ * are modelled separately from the app's origin.
  */
-export type WorkspaceKeyScopes = "workspace" | "draft";
+export type WorkspaceKeyScopes = "workspace" | "draft" | "webview";
 
 /**
  * How many keys a global prefix registration expands to in the budget model: one per project,
@@ -1116,6 +1120,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only; lastGeneratedFor is capped at WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS.
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
+  // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
+  // memory); the webview then persists only the last text that fit.
+  workspaceKey(getInputKey, "draft", false, 8192, "webview"),
   workspaceKey(getAgentIdKey, "synced", true, 128),
   workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
   workspaceKey(getThinkingLevelKey, "ui", true, 32),
