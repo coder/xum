@@ -274,6 +274,19 @@ function ensureStorageListenerInstalled() {
   storageListenerInstalled = true;
 }
 /**
+ * Whether localStorage can be used. Browsers that deny storage access throw from the
+ * window.localStorage getter itself; reads run in render paths (state initializers), so they fall
+ * back to their defaults instead of throwing.
+ */
+function isLocalStorageReadable(): boolean {
+  try {
+    return typeof window !== "undefined" && Boolean(window.localStorage);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Read a persisted state value from localStorage (non-hook version)
  * Mirrors the reading logic from usePersistedState
  *
@@ -282,7 +295,7 @@ function ensureStorageListenerInstalled() {
  * @returns The parsed value or defaultValue
  */
 export function readPersistedState<T>(key: string, defaultValue: T): T {
-  if (typeof window === "undefined" || !window.localStorage) {
+  if (!isLocalStorageReadable()) {
     return defaultValue;
   }
 
@@ -319,7 +332,7 @@ export function listPersistedKeys(prefix: string): string[] {
  * strings (not JSON) by legacy code.
  */
 export function readPersistedString(key: string): string | undefined {
-  if (typeof window === "undefined" || !window.localStorage) {
+  if (!isLocalStorageReadable()) {
     return undefined;
   }
 
