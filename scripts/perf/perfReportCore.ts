@@ -248,13 +248,18 @@ export interface ChatSwitchLegRow extends ValuesRead<ChatSwitchMetricKey> {
   leg: string;
   /** Switches behind the medians; undefined when `count` is not a positive integer (row unusable). */
   count?: number;
+  /** Set when other legs of the same size recorded more switches (row unusable). */
+  shortOf?: number;
+}
+
+/** A row whose medians can be shown: a valid count, and no switches lost against its peers. */
+function chatSwitchRowUsable(row: ChatSwitchLegRow): boolean {
+  return row.count !== undefined && row.shortOf === undefined;
 }
 
 export type ChatSwitchRead =
   | {
       ok: true;
-      /** Pre-#4846 file with only in-process `medians`, so only in-process is expected. */
-      legacy: boolean;
       rows: ChatSwitchLegRow[];
       /** Sanitized transports (`t`) and legs (`t/leg`) the report does not know; not shown. */
       unknown: string[];
@@ -264,17 +269,13 @@ export type ChatSwitchRead =
 /** One row per known leg × transport from `chatSwitch` (tests/e2e/utils/chatSwitchSummary.ts). */
 function readChatSwitch(value: unknown): ChatSwitchRead {
   if (!isRecord(value)) return { ok: false, reason: "chatSwitch is not an object" };
-  let byTransport: Record<string, unknown>;
-  const legacy = value.mediansByTransport === undefined || value.mediansByTransport === null;
-  if (legacy) {
-    if (!isRecord(value.medians)) return { ok: false, reason: "chatSwitch has no medians" };
-    byTransport = { "in-process": value.medians };
-  } else if (isRecord(value.mediansByTransport)) {
-    // `medians` duplicates the in-process entry for older readers; mediansByTransport wins.
-    byTransport = value.mediansByTransport;
-  } else {
-    return { ok: false, reason: "chatSwitch.mediansByTransport is not an object" };
+  // The report reads only the current run, whose harness always writes mediansByTransport.
+  // `medians` (its in-process copy for older readers) is never used: falling back to it would
+  // hide a lost server-window transport.
+  if (!isRecord(value.mediansByTransport)) {
+    return { ok: false, reason: "chatSwitch.mediansByTransport is missing or not an object" };
   }
+  const byTransport = value.mediansByTransport;
   const rows: ChatSwitchLegRow[] = [];
   const unknown: string[] = [];
   const metricKeys = CHAT_SWITCH_METRICS.map((metric) => metric.key);
@@ -306,12 +307,22 @@ function readChatSwitch(value: unknown): ChatSwitchRead {
       });
     }
   }
+  // Every round records each core leg once per transport, and the xl round each xl leg once, so
+  // within a size class every leg has the same count. A leg below its class's largest count lost
+  // switches (a truncated artifact); its median is not comparable with the others.
+  for (const xl of [false, true]) {
+    const peers = rows.filter((row) => CHAT_SWITCH_XL_LEGS.includes(row.leg) === xl);
+    const expected = Math.max(0, ...peers.map((row) => row.count ?? 0));
+    for (const row of peers) {
+      if (row.count !== undefined && row.count < expected) row.shortOf = expected;
+    }
+  }
   rows.sort(
     (a, b) =>
       CHAT_SWITCH_LEGS.indexOf(a.leg) - CHAT_SWITCH_LEGS.indexOf(b.leg) ||
       CHAT_SWITCH_TRANSPORTS.indexOf(a.transport) - CHAT_SWITCH_TRANSPORTS.indexOf(b.transport)
   );
-  return { ok: true, legacy, rows, unknown };
+  return { ok: true, rows, unknown };
 }
 
 /** Additive in schemaVersion 1; judged only for workspace-open tests, which always write it. */
@@ -582,8 +593,7 @@ function checkChatSwitch(
   const where = `Chat switch ${code(label)} of ${code(test.key)}`;
   const xlRequired = expectXl || read.rows.some((row) => CHAT_SWITCH_XL_LEGS.includes(row.leg));
   const requiredLegs = xlRequired ? CHAT_SWITCH_LEGS : CHAT_SWITCH_CORE_LEGS;
-  const transports = read.legacy ? ["in-process"] : CHAT_SWITCH_TRANSPORTS;
-  for (const transport of transports) {
+  for (const transport of CHAT_SWITCH_TRANSPORTS) {
     const legs = new Set(
       read.rows.filter((row) => row.transport === transport).map((row) => row.leg)
     );
@@ -604,7 +614,16 @@ function checkChatSwitch(
         .join(", ")}, so those rows are unavailable.`,
     });
   }
-  const usable = read.rows.filter((row) => row.count !== undefined);
+  const short = read.rows.filter((row) => row.shortOf !== undefined);
+  if (short.length > 0) {
+    problems.push({
+      key: `chat-switch-count-short:${test.key}/${label}`,
+      text: `${where} recorded fewer switches than the other legs of the same size for ${short
+        .map((row) => `${code(row.leg)} (${code(row.transport)}, ${row.count} of ${row.shortOf})`)
+        .join(", ")}, so those rows are unavailable.`,
+    });
+  }
+  const usable = read.rows.filter(chatSwitchRowUsable);
   const invalid = usable.filter((row) => row.gaps.some((entry) => entry.gap === "invalid"));
   if (invalid.length > 0) {
     problems.push({
@@ -947,7 +966,7 @@ export function renderSummary(input: {
   for (const row of rows) {
     for (const scenario of row.scenarios) {
       for (const leg of scenario.chatSwitch ?? []) {
-        const usable = leg.count !== undefined;
+        const usable = chatSwitchRowUsable(leg);
         const cells = CHAT_SWITCH_METRICS.map((metric) =>
           usable && leg.values[metric.key] !== undefined
             ? formatValue(leg.values[metric.key], metric.decimals)
@@ -955,7 +974,7 @@ export function renderSummary(input: {
         );
         chatSwitchRows.push(
           `| ${code(scenario.label)} | ${code(leg.leg)} | ${code(leg.transport)} | ${
-            usable ? formatValue(leg.count, 0) : "unavailable"
+            leg.count === undefined ? "unavailable" : formatValue(leg.count, 0)
           } | ${cells.join(" | ")} |`
         );
       }

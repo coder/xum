@@ -535,12 +535,26 @@ describe("chat-switch scenarios", () => {
 });
 
 describe("chat-switch coverage checks", () => {
-  test("legacy files with only in-process medians expect only in-process", () => {
-    const report = chatSwitchReport({
-      medians: Object.fromEntries(CORE_LEGS.map((leg) => [leg, legMedians(1)])),
-    });
-    expect(report.problems).toEqual([]);
-    expect(tableRows(render(report), "Chat switch")).toHaveLength(CORE_LEGS.length);
+  test("a leg with fewer switches than its size class is a problem and unavailable", () => {
+    const withXl = fullChatSwitch([...CORE_LEGS, ...XL_LEGS]);
+    const report = chatSwitchReport(
+      withLeg("server-window", "cold-open-large", { ...legMedians(1), count: 2 }, withXl),
+      [],
+      true
+    );
+    expect(keys(report)).toEqual([
+      `chat-switch-count-short:${CHAT_SWITCH_KEY}/chat-switch-mid-stream`,
+    ]);
+    expect(report.problems[0]?.text).toContain("`cold-open-large` (`server-window`, 2 of 3)");
+    expect(chatRow(report, "cold-open-large", "server-window")?.slice(3)).toEqual([
+      "2",
+      ...CHAT_SWITCH_METRICS.map(() => "unavailable"),
+    ]);
+    // xl legs run once: their count of 1 is compared only with each other.
+    for (const legs of Object.values(withXl.mediansByTransport)) {
+      for (const leg of XL_LEGS) legs[leg] = { ...legMedians(1), count: 1 };
+    }
+    expect(chatSwitchReport(withXl, [], true).problems).toEqual([]);
   });
 
   test("mediansByTransport wins over the duplicated in-process medians", () => {
@@ -669,7 +683,9 @@ describe("chat-switch coverage checks", () => {
 
   test.each([
     ["chatSwitch", "x"],
-    ["no medians", {}],
+    ["no mediansByTransport", {}],
+    // The in-process copy alone would hide a lost server-window transport.
+    ["legacy medians only", { medians: { "cold-open-small": legMedians(1) } }],
     ["mediansByTransport", { mediansByTransport: [] }],
     ["transport", { mediansByTransport: { "in-process": 1 } }],
     ["leg", { mediansByTransport: { "in-process": { "cold-open-small": [] } } }],
