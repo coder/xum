@@ -2003,7 +2003,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
       // The old landing page is gone. Treat "/" as a compatibility entrypoint and
       // immediately replace it with a concrete project route instead of rendering a dashboard.
-      if (behavior === "new-chat") {
+      // Reusing an empty listed draft needs the real list; after a drafts timeout, open the
+      // project page instead of creating a draft that could duplicate an existing empty one.
+      if (behavior === "new-chat" && getDraftStore().isHydrated()) {
         createWorkspaceDraft(fallbackScope.projectPath, fallbackScope.subProjectPath ?? undefined, {
           replace: true,
         });

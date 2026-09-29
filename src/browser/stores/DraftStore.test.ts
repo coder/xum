@@ -433,6 +433,28 @@ describe("DraftStore", () => {
     );
   });
 
+  test("retries a list put that failed on a replaced client through the current one", async () => {
+    using tempDir = new TestTempDir("draft-store-list-reconnect");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    control.failListPuts = 1;
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Reconnect while the put is in flight; then the old request fails.
+    store.setClient(createClient(service).client);
+    // Let the new subscription's snapshot (and its resend attempt) run first.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    release();
+    await waitFor(async () => (await service.getList()).entries.length === 1, 5_000);
+  });
+
   test("a delete waits for the draft's list put, so it is not relisted", async () => {
     using tempDir = new TestTempDir("draft-store-list-delete-order");
     const { projectPath, service, client, control } = await createHarness(tempDir);

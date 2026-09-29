@@ -352,6 +352,11 @@ export class DraftStore {
     return this.ready;
   }
 
+  /** A real snapshot was applied (ready can also mean the wait for one timed out). */
+  isHydrated(): boolean {
+    return this.hydrated;
+  }
+
   subscribeReady = (listener: () => void): (() => void) => {
     this.readyListeners.add(listener);
     return () => this.readyListeners.delete(listener);
@@ -438,9 +443,9 @@ export class DraftStore {
       this.settleList();
     } catch (error) {
       console.warn("Failed to list a creation draft; retrying:", error);
-      setTimeout(() => {
-        if (this.client === client) this.startListPut(key, pending);
-      }, retryDelayMs(pending.attempt++));
+      // Retried through whichever client is current: a reconnect's resend was skipped while this
+      // request was in flight.
+      setTimeout(() => this.startListPut(key, pending), retryDelayMs(pending.attempt++));
     }
   }
 
