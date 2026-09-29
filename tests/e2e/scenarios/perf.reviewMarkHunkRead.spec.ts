@@ -85,12 +85,15 @@ test.describe("immersive review performance profiling", () => {
       // the composed store view the mark-read click updated.
       await expect
         .poll(
-          async () =>
-            Number(
-              await immersiveReview
-                .getByRole("progressbar", { name: "Review completion by changed lines" })
-                .getAttribute("aria-valuenow")
-            ),
+          async () => {
+            // aria-valuenow is a rounded percentage: one hunk out of this fixture's 1000 rounds
+            // to 0, so read the exact reviewed line count from aria-valuetext ("... (reviewed/total)").
+            const valueText = await immersiveReview
+              .getByRole("progressbar", { name: "Review completion by changed lines" })
+              .getAttribute("aria-valuetext");
+            const reviewedLines = /\((\d+)\/\d+\)$/.exec(valueText ?? "")?.[1];
+            return reviewedLines === undefined ? 0 : Number(reviewedLines);
+          },
           { timeout: 20_000 }
         )
         .toBeGreaterThan(0);
