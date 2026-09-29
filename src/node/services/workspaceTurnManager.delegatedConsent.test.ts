@@ -68,6 +68,7 @@ describe("delegated target default consent (#4453)", () => {
         (...args: Parameters<WorkspaceHost["removeWhileTaskTreeLocked"]>) =>
           real.removeWhileTaskTreeLocked(...args)
       ),
+      hasUntrackableExternalAppOpen: mock((id: string) => real.hasUntrackableExternalAppOpen(id)),
     });
     const { taskService: manager } = createWorkspaceTurnManagerHarness(config, {
       aiService,
@@ -450,6 +451,19 @@ describe("delegated target default consent (#4453)", () => {
       },
     },
   };
+  test("the startup resolver keeps a delegated target an external app was opened for (#4983)", async () => {
+    const a = await crashBeforeRecord({ creator: "dead" });
+    const b = await backend();
+    // Durable marker of a detached editor that may have outlived the crash (no lease).
+    spyOn(b.real, "hasUntrackableExternalAppOpen").mockResolvedValue(true);
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).not.toBeNull();
+    expect(await fsPromises.stat(a.checkout).then(() => true)).toBe(true);
+    await a.finish();
+  });
+
   // The removal's gate refuses even the sweeping backend's own activity, which a plain removal
   // ends itself.
   test("the startup resolver keeps a delegated target its own backend is using (#4983)", async () => {

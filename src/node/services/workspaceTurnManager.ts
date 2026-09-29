@@ -914,6 +914,11 @@ export class WorkspaceTurnManager {
       // this backend or another, and no turn can start between this check and the deletion.
       let leftBecause: string | undefined;
       const confirmUnused = async (): Promise<boolean> => {
+        // Detached apps leave durable markers and may outlive the crash; they take no leases.
+        if (await this.workspaceService.hasUntrackableExternalAppOpen(workspaceId)) {
+          leftBecause = "a native terminal or external editor was opened for it";
+          return false;
+        }
         if (await this.historyService.hasHistory(workspaceId)) {
           leftBecause = "it has chat history";
           return false;
