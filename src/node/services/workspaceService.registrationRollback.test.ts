@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import type { ExperimentsService } from "./experimentsService";
+import type { CoderService } from "./coderService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
@@ -1182,6 +1183,127 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "remote-fork", true]);
       expect(deleteWorkspace.mock.calls[0][5]).toEqual({ keepBranch: true });
       expect(persistedWorkspaceIds()).toEqual(["fffffffff1"]);
+    });
+
+    // #5114: a Coder fork marks its source as sharing the Coder workspace (existingWorkspace), so
+    // deleting the source no longer deletes it. That mark and the child's row form one rollback
+    // boundary: they are written together, and a rolled-back child undoes the mark.
+    describe("Coder fork source runtime update (#5114)", () => {
+      const sourceRuntimeConfig = {
+        type: "ssh" as const,
+        host: "coder-src.coder",
+        srcBaseDir: "/remote/src",
+        coder: { workspaceName: "coder-src", existingWorkspace: false },
+      };
+      const sourceId = "fffffffff5";
+      const forkId = "ddddddddd5";
+      const persistedRuntimeConfig = (id: string) =>
+        [...harness.config.loadConfigOrDefault().projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === id)?.runtimeConfig;
+
+      /** Registers a new-mode Coder source and stubs the remote fork and delete. */
+      async function setUpCoderFork() {
+        const realCreateRuntime = runtimeFactory.createRuntime;
+        // Coder runtimes need a CoderService; nothing on these paths calls it.
+        const coderService = {} as unknown as CoderService;
+        spyOn(runtimeFactory, "createRuntime").mockImplementation((config, options) =>
+          realCreateRuntime(config, { ...options, coderService })
+        );
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push({
+            id: sourceId,
+            name: "coder-src",
+            path: "/remote/src/project/coder-src",
+            runtimeConfig: sourceRuntimeConfig,
+          });
+          return cfg;
+        });
+        spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+        // CoderSSHRuntime.forkWorkspace wraps this and adds the shared (existingWorkspace) configs.
+        spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({
+          success: true,
+          workspacePath: "/remote/src/project/coder-fork",
+          sourceBranch: "coder-src",
+        });
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+        return spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+          success: true,
+          deletedPath: "/remote/src/project/coder-fork",
+        });
+      }
+
+      /** Forks the source with `duringSetup` run and then failing after the child registered. */
+      async function failCoderForkAfterRegistration(duringSetup?: () => Promise<void>) {
+        const deleteWorkspace = await setUpCoderFork();
+        const goals = new WorkspaceGoalService(
+          harness.config,
+          harness.historyService,
+          harness.extensionMetadata
+        );
+        service.setWorkspaceGoalService(goals);
+        spyOn(goals, "inheritFromFork").mockImplementationOnce(async () => {
+          // The child row and the source mark are persisted together at this point.
+          expect(persistedWorkspaceIds()).toContain(forkId);
+          expect(persistedRuntimeConfig(sourceId)).toMatchObject({
+            coder: { existingWorkspace: true },
+          });
+          await duringSetup?.();
+          throw new Error("goal store unavailable");
+        });
+        const result = await service.fork(sourceId, "coder-fork");
+        expect(result.success ? "" : result.error).toContain("goal store unavailable");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+      }
+
+      test("a rejected registration write removes the fork's checkout and leaves the source unmarked", async () => {
+        const deleteWorkspace = await setUpCoderFork();
+
+        await expectFailsWithSaveError(() => service.fork(sourceId, "coder-fork"));
+
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "coder-fork", true]);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
+      test("a fork rolled back after registration restores the source's runtime config", async () => {
+        await failCoderForkAfterRegistration();
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
+      test("the source stays marked while another workspace shares its Coder workspace", async () => {
+        const sibling = {
+          ...sourceRuntimeConfig,
+          coder: { workspaceName: "coder-src", existingWorkspace: true },
+        };
+        await failCoderForkAfterRegistration(async () => {
+          await harness.config.editConfig((cfg) => {
+            cfg.projects.get(projectPath)!.workspaces.push({
+              id: "eeeeeeeee5",
+              name: "coder-sibling",
+              path: "/remote/src/project/coder-sibling",
+              runtimeConfig: sibling,
+            });
+            return cfg;
+          });
+        });
+        expect(persistedRuntimeConfig(sourceId)).toMatchObject({
+          coder: { workspaceName: "coder-src", existingWorkspace: true },
+        });
+      });
+
+      test("the source keeps a runtime config that changed since the fork marked it", async () => {
+        const changed = {
+          ...sourceRuntimeConfig,
+          coder: { workspaceName: "coder-src", existingWorkspace: true, template: "other" },
+        };
+        await failCoderForkAfterRegistration(() =>
+          harness.config.updateWorkspaceMetadata(sourceId, { runtimeConfig: changed })
+        );
+        expect(persistedRuntimeConfig(sourceId)).toEqual(changed);
+      });
     });
 
     // #5117, Docker forks: the fork made its own container (DockerRuntime.forkWorkspace refuses a

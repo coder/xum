@@ -11,6 +11,7 @@ import {
   settleArchivedSharedDesktopTask,
 } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
+import { isDeepStrictEqual } from "util";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
@@ -12993,13 +12994,7 @@ export class WorkspaceService
         );
       }
 
-      if (sourceRuntimeConfigUpdate) {
-        await this.config.updateWorkspaceMetadata(sourceWorkspaceId, {
-          runtimeConfig: sourceRuntimeConfigUpdate,
-        });
-      }
-
-      if (sourceRuntimeConfigUpdated) {
+      const emitSourceMetadata = async (): Promise<void> => {
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
@@ -13009,7 +13004,44 @@ export class WorkspaceService
         } else {
           this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
         }
-      }
+      };
+
+      // The fork's registration also marked its source as sharing the Coder workspace (#5114).
+      // Undo that once the child row is gone, but keep it on any uncertainty: while another row
+      // still uses that Coder workspace (a concurrent fork or task child of the source), or when
+      // the source's config changed since, deleting the source must still keep the workspace.
+      const restoreSourceRuntimeConfig = async (): Promise<void> => {
+        const update = sourceRuntimeConfigUpdate;
+        const coderWorkspaceName = update?.type === "ssh" ? update.coder?.workspaceName : undefined;
+        if (update == null || coderWorkspaceName == null) {
+          return;
+        }
+        // Persisted configs drop undefined fields, so compare JSON forms.
+        const asPersisted = (value: unknown): unknown => JSON.parse(JSON.stringify(value ?? null));
+        let restored = false;
+        await this.config.editConfig((config) => {
+          const rows = [...config.projects.values()].flatMap((p) => p.workspaces);
+          const source = rows.find((w) => w.id === sourceWorkspaceId);
+          const shared = rows.some(
+            (w) =>
+              w.id !== sourceWorkspaceId &&
+              w.runtimeConfig?.type === "ssh" &&
+              w.runtimeConfig.coder?.workspaceName === coderWorkspaceName
+          );
+          if (
+            source != null &&
+            !shared &&
+            isDeepStrictEqual(asPersisted(source.runtimeConfig), asPersisted(update))
+          ) {
+            source.runtimeConfig = sourceRuntimeConfig;
+            restored = true;
+          }
+          return config;
+        });
+        if (restored) {
+          await emitSourceMetadata();
+        }
+      };
 
       // Compute namedWorkspacePath for frontend metadata
       const namedWorkspacePath = targetRuntime.getWorkspacePath(foundProjectPath, resolvedName);
@@ -13055,6 +13087,17 @@ export class WorkspaceService
         initAbortController.abort();
         await initSettled;
         const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+        if (rolledBack) {
+          // A failed restore leaves the source keeping the shared Coder workspace on delete, the
+          // safe side, so it is logged rather than reported as a leftover.
+          await restoreSourceRuntimeConfig().catch((error: unknown) => {
+            log.warn("Failed to restore the source runtime config of an aborted fork", {
+              newWorkspaceId,
+              sourceWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
         const leftovers: string[] = [];
         // These forks made their own checkout before registering: a new worktree (worktree,
         // devcontainer), a remote worktree at a path the fork checked was free (SSH; Coder forks
@@ -13161,6 +13204,16 @@ export class WorkspaceService
             unrelatedWorkspaceConsentPending: true,
             // A concurrent fork may have registered this name since the early check (#5026).
             refuseTakenName: true,
+            // In the same write, so a failed registration never leaves the source marked and a
+            // failed mark never leaves an unregistered checkout (#5114).
+            ...(sourceRuntimeConfigUpdate
+              ? {
+                  sourceRuntimeConfigUpdate: {
+                    workspaceId: sourceWorkspaceId,
+                    runtimeConfig: sourceRuntimeConfigUpdate,
+                  },
+                }
+              : {}),
           })
           .catch(async (error: unknown) => {
             if (error instanceof WorkspaceNameTakenError) {
@@ -13175,6 +13228,9 @@ export class WorkspaceService
             });
             throw registrationErrorWithLeftovers(error, rollback);
           });
+        if (sourceRuntimeConfigUpdated) {
+          await emitSourceMetadata();
+        }
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
         const abortForkRegistrationUnlessInUse = () =>

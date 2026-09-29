@@ -4199,9 +4199,29 @@ export class Config {
        * caller's to check up front; rows registered concurrently always carry one.
        */
       refuseTakenName?: true;
+      /**
+       * Also set this other workspace's runtimeConfig in the same write, so both land or neither
+       * does. A Coder fork marks its source as sharing the Coder workspace this way (#5114).
+       * Rejects, writing nothing, when that workspace is gone.
+       */
+      sourceRuntimeConfigUpdate?: {
+        workspaceId: string;
+        runtimeConfig: WorkspaceMetadata["runtimeConfig"];
+      };
     } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
+      const sourceUpdate = options.sourceRuntimeConfigUpdate;
+      if (sourceUpdate != null) {
+        const source = [...config.projects.values()]
+          .flatMap((p) => p.workspaces)
+          .find((w) => w.id === sourceUpdate.workspaceId);
+        if (source == null) {
+          throw new Error(`Workspace ${sourceUpdate.workspaceId} not found in config`);
+        }
+        source.runtimeConfig = sourceUpdate.runtimeConfig;
+      }
+
       let project = config.projects.get(projectPath);
 
       if (!project) {
