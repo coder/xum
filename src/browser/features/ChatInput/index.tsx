@@ -1219,17 +1219,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [applyDraftFromPending, focusMessageInput, setDraftReviews]
   );
 
+  // The edit whose draft a cancel restored. Recorded explicitly: the edit target also leaves the
+  // live transcript when the accepted edit replaces it (possibly before the send returns), and
+  // that is not a cancel.
+  const cancelledEditIdRef = useRef<string | null>(null);
   const restorePreEditDraft = useCallback(() => {
+    cancelledEditIdRef.current = editingMessageIdRef.current ?? null;
     setDraft(preEditDraftRef.current);
     setDraftReviews(preEditReviewsRef.current);
   }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
 
   // Completing an edit sends the edited message; the unsent draft from before the edit comes
   // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
-  // typed while the send was in flight, after the restored draft. Only for the edit still open:
-  // one the user cancelled meanwhile already got its draft back. Returns whether it restored.
+  // typed while the send was in flight, after the restored draft. Not for an edit the user
+  // cancelled meanwhile: that one already got its draft back. Returns whether it restored.
   const restorePreEditDraftAfterSend = (editMessageId: string | undefined): boolean => {
-    if (editMessageId === undefined || editingMessageIdRef.current !== editMessageId) return false;
+    if (editMessageId === undefined || cancelledEditIdRef.current === editMessageId) return false;
     const preEdit = preEditDraftRef.current;
     setInput((current) =>
       [preEdit.text, current].filter((part) => part.trim().length > 0).join("\n\n")
@@ -1353,6 +1358,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
     appliedEditIdRef.current = editingMessage.id;
+    cancelledEditIdRef.current = null;
     preEditDraftRef.current = getDraft();
     preEditReviewsRef.current = draftReviews;
     applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
@@ -1941,7 +1947,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // draft now, not the command, so the command's clears must not touch it.
     const editCancelled = () =>
       commandEnv.editMessageId !== undefined &&
-      editingMessageIdRef.current !== commandEnv.editMessageId;
+      cancelledEditIdRef.current === commandEnv.editMessageId;
     // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
     const applyCommandActions = (actions: CommandAction[]) => {
       for (const action of actions) {

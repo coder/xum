@@ -86,6 +86,42 @@ describe("Completing an edit of an older message", () => {
     }
   }, 120_000);
 
+  test("keeps the unsent draft when the edited row is replaced before the send returns", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-replaced-keeps-draft" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const editTextarea = await startEditWithUnsentDraft(app, scope);
+
+      // The backend emits the replacement row before its reply; hold the reply so the row (and
+      // the edit state it clears) lands first.
+      const workspaceService = app.env.services.workspaceService;
+      const realSend = workspaceService.sendMessage.bind(workspaceService);
+      let releaseReply: () => void = () => undefined;
+      const replyGate = new Promise<void>((resolve) => {
+        releaseReply = resolve;
+      });
+      const sendSpy = jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementation(async (...args: Parameters<typeof realSend>) => {
+          const result = await realSend(...args);
+          await replyGate;
+          return result;
+        });
+
+      getDraftStore().setText(scope, "edited message");
+      await waitFor(() => expect(editTextarea.value).toBe("edited message"));
+      fireEvent.keyDown(editTextarea, { key: "Enter" });
+      await app.chat.expectTranscriptContains("edited message", LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectTranscriptNotContains("first message", LOAD_TOLERANT_WAIT.timeout);
+      releaseReply();
+      await app.chat.expectStreamComplete();
+      await expectUnsentDraftKept(app, scope);
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
   test("keeps the unsent draft when the edit is a /compact command", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-compact-keeps-draft" });
     try {
