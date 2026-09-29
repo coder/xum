@@ -2,7 +2,7 @@
 // project to a temp dir and loads its main.js through the real Node harness.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { findBannedModules, loadEagerModules } from "./check-startup-imports-runtime";
 
@@ -104,6 +104,26 @@ test("top-level Electron calls and constructors do not throw", async () => {
 
 test("a target that throws at load fails instead of passing vacuously", async () => {
   await expect(loadMain('throw new Error("boom at load");\n')).rejects.toThrow(/boom at load/);
+});
+
+test("a target that exits before the ready gate fails instead of passing vacuously", async () => {
+  await expect(loadMain('require("ai");\nprocess.exit(0);\n')).rejects.toThrow(/exited before/);
+});
+
+test("startup cannot reach the real home or app data directories", async () => {
+  // Startup runs real home/userData migrations, so the check must sandbox them.
+  const modules = await loadMain(
+    [
+      'const { app } = require("electron");',
+      `const realHome = ${JSON.stringify(homedir())};`,
+      'if (process.env.HOME === realHome) throw new Error("HOME not sandboxed");',
+      'if (app.getPath("appData").startsWith(realHome)) throw new Error("appData not sandboxed");',
+      'require("ok-pkg");',
+      "",
+    ].join("\n")
+  );
+
+  expect(modules).toContain(path.join(rootDir, "node_modules/ok-pkg/index.js"));
 });
 
 test("attributes files to the innermost package and reports each package once", () => {
