@@ -43,12 +43,22 @@ describe("context budget warnings", () => {
       handoffTokens: 89_600,
       budgetTokens: 119_808,
     });
-    expect(handoff.parts).not.toEqual(warning.parts);
+    expect(handoff.metadata?.muxMetadata).not.toHaveProperty("final");
+    const final = createContextBudgetWarning({ ...options, final: true });
+    expect(final.metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(final.metadata?.muxMetadata).not.toHaveProperty("handoff");
+    expect(final.parts).not.toEqual(handoff.parts);
   });
 
-  test("rejects budgets outside the known limit", () => {
-    expect(() => createContextBudgetWarning({ ...options, budgetTokens: 128_001 })).toThrow();
-    expect(() => createContextBudgetWarning({ ...options, handoffTokens: 128_001 })).toThrow();
+  test("rejects contradictory stages and budgets outside the known limit", () => {
+    expect(() => createContextBudgetWarning({ ...options, final: true, handoff: true })).toThrow();
+    expect(() => createContextBudgetWarning(options)).toThrow();
+    const handoff = { ...options, handoff: true };
+    expect(() => createContextBudgetWarning({ ...handoff, budgetTokens: 128_001 })).toThrow();
+    expect(() => createContextBudgetWarning({ ...handoff, handoffTokens: 128_001 })).toThrow();
+    expect(() =>
+      createContextBudgetWarning({ ...options, final: true, sessionHistoryAvailable: false })
+    ).toThrow();
   });
 
   test("dispatch capabilities control handoff guidance without granting unavailable tools", () => {
@@ -81,6 +91,20 @@ describe("context window rollover recovery", () => {
       handoff: true,
     });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
+    const finalPrompt = createContextBudgetWarning({
+      contextTokens: 110_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+      final: true,
+    });
+    expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
+    expect(finalPrompt.metadata?.muxMetadata).toMatchObject({
+      type: "context-budget-warning",
+      final: true,
+    });
+    expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning, finalPrompt])).toBe(false);
     expect(
       hasRolloverEligibleMessages([
         old,

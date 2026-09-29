@@ -8,13 +8,13 @@ export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
-// Headroom one final checkpoint-writing step needs below the hard ceiling: the warning row plus
-// a checkpoint-sized margin.
+// Headroom the final prompt needs below the hard ceiling: the prompt row plus a
+// checkpoint-sized margin.
 export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_NOTES_RESERVED_TOKENS;
-// Absolute floor on how far ahead of the rollover point the advance warning fires. The
-// percent-based advance (WARNING_ADVANCE_PERCENT of the limit) shrinks with the window, so
-// reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
-export const WARNING_ADVANCE_MIN_TOKENS = 3 * WARNING_RESERVE_TOKENS;
+// The final prompt zone opens once the next request gets this close to the hard ceiling: the
+// prompt's own headroom plus roughly three working steps to save the checkpoint and call
+// new_context, so a normal step rarely jumps straight past it into a forced rollover.
+export const FINAL_HANDOFF_RESERVE_TOKENS = FLUSH_RESERVE_TOKENS + 3 * WARNING_RESERVE_TOKENS;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;
 export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;

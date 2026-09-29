@@ -43,9 +43,10 @@ function evaluate(overrides: Partial<StepBudgetInput> = {}) {
 
 describe("handoff point", () => {
   test.each([
-    [4096, [409, 2048, 2867, 3686], 3072],
-    [100_000, [10_000, 50_000, 70_000, 90_000], 91_808],
-    [128_000, [12_800, 64_000, 89_600, 115_200], 119_808],
+    // High targets are clamped to the final prompt zone (first half of the window at most).
+    [4096, [409, 1536, 1536, 1536], 3072],
+    [100_000, [10_000, 50_000, 70_000, 81_616], 91_808],
+    [128_000, [12_800, 64_000, 89_600, 109_616], 119_808],
     [200_000, [20_000, 100_000, 140_000, 180_000], 191_808],
     [1_000_000, [100_000, 500_000, 700_000, 900_000], 991_808],
   ] as const)(
@@ -290,17 +291,29 @@ describe("final handoff step", () => {
   const lastFinal = hardCeiling - FLUSH_RESERVE_TOKENS - 1;
 
   test.each([
-    [firstFinal - 1, "handoff"],
+    [firstFinal - 1, "continue"],
     [firstFinal, "final"],
     [lastFinal, "final"],
-    [lastFinal + 1, "handoff"],
+    [lastFinal + 1, "continue"],
     [hardCeiling, "rollover"],
-  ] as const)("ladder at %d", (contextTokens, decision) => {
-    expect(evaluate({ contextTokens, finalHandoffAvailable: true }).decision).toBe(decision);
+  ] as const)("ladder after the handoff request at %d", (contextTokens, decision) => {
+    expect(
+      evaluate({ contextTokens, finalHandoffAvailable: true, handoffRequested: true }).decision
+    ).toBe(decision);
   });
 
-  test("runs once per window even after the handoff request, and never at 100%", () => {
-    expect(evaluate({ contextTokens: firstFinal }).decision).toBe("handoff");
+  test("follows the handoff request, even at a high slider, and never runs at 100%", () => {
+    expect(evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true }).decision).toBe(
+      "handoff"
+    );
+    expect(
+      evaluate({
+        modelContextLimit: 128_000,
+        threshold: 0.9,
+        contextTokens: 109_616,
+        finalHandoffAvailable: true,
+      }).decision
+    ).toBe("handoff");
     expect(
       evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true, handoffRequested: true })
         .decision

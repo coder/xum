@@ -31,14 +31,29 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
-/** The slider is an agent handoff target, not a second forced-rollover ceiling. */
+/**
+ * Where the final handoff prompt zone opens. A window smaller than a few final reserves would
+ * reach the zone at once, so it never opens in the first half of the usable window.
+ */
+export function getContextBudgetFinalPoint(modelContextLimit: number): number {
+  const hardCeiling = getContextBudgetHardCeiling(modelContextLimit);
+  return Math.max(hardCeiling - FINAL_HANDOFF_RESERVE_TOKENS, Math.ceil(hardCeiling / 2));
+}
+
+/**
+ * The slider is an agent handoff target, not a second forced-rollover ceiling. A high slider is
+ * clamped to the final zone so the handoff request always comes before the final prompt.
+ */
 export function getContextBudgetHandoffPoint(modelContextLimit: number, threshold: number): number {
   assert(
     Number.isFinite(modelContextLimit) && modelContextLimit > 0,
     "Handoff requires a finite positive model context limit"
   );
   assert(threshold > 0 && threshold < 1, "Handoff point requires an enabled fractional threshold");
-  return Math.floor(modelContextLimit * threshold);
+  return Math.min(
+    Math.floor(modelContextLimit * threshold),
+    getContextBudgetFinalPoint(modelContextLimit)
+  );
 }
 
 export interface StepBudgetInput {
@@ -56,7 +71,7 @@ export interface StepBudgetInput {
   modelContextLimit: number | null | undefined;
   threshold: number;
   handoffRequested: boolean;
-  /** The caller can still run this window's single final handoff step. */
+  /** The caller can still publish this window's single final prompt. */
   finalHandoffAvailable: boolean;
 }
 
@@ -111,22 +126,22 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   }
   if (input.threshold >= 1) return result;
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
-  // the final assembled-payload preflight remains authoritative before dispatch.
-  // Last chance before the forced rollover: one step that may only call new_context. A window
-  // smaller than a few final reserves would reach this zone at once, so it never opens in the
-  // first half of the usable window.
+  // the final assembled-payload preflight remains authoritative before dispatch. Both stages
+  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  if (
+    !input.handoffRequested &&
+    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
+    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+  ) {
+    return { ...result, decision: "handoff" };
+  }
+  // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
   if (
     input.finalHandoffAvailable &&
     hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
-    hardProjected + FINAL_HANDOFF_RESERVE_TOKENS >= hardCeiling &&
-    hardProjected * 2 >= hardCeiling
+    projected >= getContextBudgetFinalPoint(limit)
   ) {
     return { ...result, decision: "final" };
-  }
-  if (input.handoffRequested || hardProjected + WARNING_RESERVE_TOKENS >= hardCeiling)
-    return result;
-  if (projected >= getContextBudgetHandoffPoint(limit, input.threshold)) {
-    return { ...result, decision: "handoff" };
   }
   return result;
 }

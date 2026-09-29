@@ -72,6 +72,7 @@ function budgetOf(h: AgentSessionHarness) {
   return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
     contextBudgetGeneration: number;
     contextBudgetHandoffClaimed: boolean;
+    contextBudgetFinalClaimed: boolean;
   };
 }
 
@@ -86,6 +87,7 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
+    newContextAvailable: true,
     ...overrides,
   };
 }
@@ -316,7 +318,8 @@ describe("AgentSession token-budget lifecycle", () => {
     );
     await seedHistory(h, 20_000);
     const state = budgetOf(h);
-    state.contextBudgetWarningClaimed = true;
+    state.contextBudgetHandoffClaimed = true;
+    state.contextBudgetFinalClaimed = true;
     const generation = state.contextBudgetGeneration;
     expect(
       (
@@ -328,7 +331,8 @@ describe("AgentSession token-budget lifecycle", () => {
       ).success
     ).toBe(true);
     expect(state.contextBudgetGeneration).toBeGreaterThan(generation);
-    expect(state.contextBudgetWarningClaimed).toBe(false);
+    expect(state.contextBudgetHandoffClaimed).toBe(false);
+    expect(state.contextBudgetFinalClaimed).toBe(false);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].onStepSettled).toBeUndefined();
     h.completions[0].settle({
@@ -1341,40 +1345,64 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
-  test("near the ceiling one memory-only final step saves the checkpoint and seals the window", async () => {
+  test("near the ceiling the final prompt follows the handoff on a normal turn, once per window", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    // Inside the final zone the handoff request still comes first.
+    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("warn");
     h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
-    const final = await h.waitForRequest(2);
-    // The request builder derives the memory-only ceiling from this flag.
-    expect(final.muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // Xum seals the window after the final step; it does not wait for new_context.
-    expect((await final.onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-    h.settleStream(1);
-    await h.waitForRequest(3);
-    const rows = await allRows(h);
-    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([true]);
+    const second = await h.waitForRequest(2);
+    // The final prompt is queued like the handoff: no rollover intent and no hidden step.
+    expect((await second.onStepSettled?.(step(111_000)))?.decision).toBe("warn");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.settleStream(1, { contextUsage: { inputTokens: 111_000 } });
+    const third = await h.waitForRequest(3);
+    expect(third.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    let rows = await allRows(h);
+    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    // Once claimed, the window gets no second prompt; the model's new_context seals it.
+    expect((await third.onStepSettled?.(step(112_000)))?.decision).toBe("continue");
+    expect(
+      (await third.onStepSettled?.(step(112_500, { newContextRequested: true })))?.decision
+    ).toBe("rollover");
+    h.settleStream(2);
+    await h.waitForRequest(4);
+    rows = await allRows(h);
     const resets = rolloverRows(rows);
     expect(resets).toHaveLength(1);
     expect(resets[0].metadata?.muxMetadata).toMatchObject({
-      reason: "mid-stream",
+      requestedBy: "model",
       flushOpportunity: true,
     });
-    expect(resets[0].metadata?.muxMetadata).not.toHaveProperty("requestedBy");
-    expect(text(rows.at(-1)!)).toBe("Continue");
   });
 
-  test("without the memory tool no final step is offered", async () => {
+  test("a text-only reply in the final zone gets the final prompt on the next send", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 92_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("Next real request", options)).success).toBe(true);
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("And another", options)).success).toBe(true);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    expect(text(rows.at(-1)!)).toBe("And another");
+  });
+
+  test("without new_context no final prompt is offered", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-    // Only the handoff advisory remains; no final step and rollover pair is queued.
+    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+    const second = await h.waitForRequest(2);
     expect(
-      (await h.requests[0].onStepSettled?.(step(110_000, { memoryAvailable: false })))?.decision
-    ).toBe("warn");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+      (await second.onStepSettled?.(step(111_000, { newContextAvailable: false })))?.decision
+    ).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
   });
 
   test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {

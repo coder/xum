@@ -90,6 +90,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
       toolResultChars: 0,
       imageParts: 0,
       sessionHistoryAvailable: true,
+      newContextAvailable: true,
     })
   ).toMatchObject({ decision: "warn" });
   // Settlement queues intent; only durable publication claims an advisory. Another

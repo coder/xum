@@ -287,6 +287,8 @@ export interface SettledStepBudget {
    */
   nextRequestTokens?: number;
   sessionHistoryAvailable: boolean;
+  /** The step's request advertised `new_context`, so the final prompt can be acted on. */
+  newContextAvailable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
   newContextRequested?: boolean;
 }
@@ -2650,6 +2652,7 @@ export class StreamManager {
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
+            newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
               (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
             ),

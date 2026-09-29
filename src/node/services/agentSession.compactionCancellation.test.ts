@@ -88,11 +88,11 @@ describe("compaction cancellation runtime", () => {
       const budget = Reflect.get(h.state.contextController, "tokenBudget") as {
         clearContextBudgetState(): void;
         contextBudgetGeneration: number;
-        contextBudgetWarningClaimed: boolean;
         contextBudgetHandoffClaimed: boolean;
+        contextBudgetFinalClaimed: boolean;
       };
-      budget.contextBudgetWarningClaimed = true;
       budget.contextBudgetHandoffClaimed = true;
+      budget.contextBudgetFinalClaimed = true;
       const generation = budget.contextBudgetGeneration;
       const token = pending ? h.state.coordinator.beginCompactionObservation("continuous") : null;
       if (pending) {
@@ -121,8 +121,8 @@ describe("compaction cancellation runtime", () => {
       try {
         // No await: admission and stale-work invalidation must precede the physical stop.
         expect(budget.contextBudgetGeneration).toBe(generation + 1);
-        expect(budget.contextBudgetWarningClaimed).toBe(false);
         expect(budget.contextBudgetHandoffClaimed).toBe(false);
+        expect(budget.contextBudgetFinalClaimed).toBe(false);
         // Ordinary Stop cancels compaction before budget cleanup. The later abandon branch
         // remains separate: moving either reset would change its synchronous admission fence.
         expect(order).toEqual([

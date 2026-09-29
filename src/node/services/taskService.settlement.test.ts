@@ -917,6 +917,7 @@ describe("TaskService", () => {
           toolResultChars: 0,
           imageParts: 0,
           sessionHistoryAvailable: true,
+          newContextAvailable: true,
         };
         const budgetOutcome = await requests[0].onStepSettled?.(budgetStep);
         expect(budgetOutcome?.decision).toBe("warn");

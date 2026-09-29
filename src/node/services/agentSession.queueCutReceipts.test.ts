@@ -32,6 +32,7 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
+    newContextAvailable: true,
     ...overrides,
   };
 }
@@ -203,33 +204,6 @@ describe("AgentSession queue-cut receipts", () => {
       await h.secondRequest;
       expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("streaming");
       expect(await h.requests[1].onStepSettled!(step(5_000))).toEqual({ decision: "continue" });
-    } finally {
-      await teardown(h);
-    }
-  });
-
-  test("a final handoff stop designates the final step first, the paired rollover only once that step ends for it", async () => {
-    const h = await setup();
-    try {
-      await h.startBudgetTurn();
-      const first = await h.requests[0].onStepSettled!(step(110_000));
-      const finalEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
-      const rolloverEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY);
-      expect(finalEntryId).toBeDefined();
-      expect(rolloverEntryId).toBeDefined();
-      expect(first).toEqual({ decision: "rollover", continuationEntryId: finalEntryId });
-      expect(h.session.getQueueCutReceipt(finalEntryId!)?.successor).toBe("pending");
-      // B has cut nothing yet: no receipt is invented for it.
-      expect(h.session.getQueueCutReceipt(rolloverEntryId!)).toBeUndefined();
-
-      // The final step (A) dispatches and ends after one step for B.
-      h.settleStream(0);
-      await h.secondRequest;
-      expect(h.requests[1].muxMetadata?.contextBudgetFlush).toBe(true);
-      expect(h.session.getQueueCutReceipt(finalEntryId!)?.successor).toBe("streaming");
-      const second = await h.requests[1].onStepSettled!(step(5_000));
-      expect(second).toEqual({ decision: "rollover", continuationEntryId: rolloverEntryId });
-      expect(h.session.getQueueCutReceipt(rolloverEntryId!)?.successor).toBe("pending");
     } finally {
       await teardown(h);
     }

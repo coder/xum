@@ -64,9 +64,9 @@ import type { ContinuationEntry, PreparationReceipt } from "../types";
 export class TokenBudgetStrategy {
   // Slider edits cannot expand the budget of a reset that has already been queued.
   private pendingRollover?: ContextWindowRollover & { budgetTokens: number };
-  private contextBudgetWarningClaimed = false;
   private contextBudgetHandoffClaimed = false;
-  private pendingBudgetPrompt?: "warn" | "handoff";
+  /** One final prompt per window; derived from history on restart. */
+  private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
 
   constructor(
@@ -102,9 +102,8 @@ export class TokenBudgetStrategy {
   clearContextBudgetState(): void {
     this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
-    this.pendingBudgetPrompt = undefined;
-    this.contextBudgetWarningClaimed = false;
     this.contextBudgetHandoffClaimed = false;
+    this.contextBudgetFinalClaimed = false;
     this.host.continuations.withdraw(
       [CONTEXT_CONTINUE_DEDUPE_KEY, CONTEXT_WARNING_DEDUPE_KEY],
       "withdrawn-cut"
@@ -286,6 +285,11 @@ export class TokenBudgetStrategy {
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
         row.metadata.muxMetadata.handoff === true
     );
+    this.contextBudgetFinalClaimed = history.data.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.final === true
+    );
     const providersConfig = this.host.state.providersConfig;
     const maxTokens = getEffectiveContextLimit(
       options.model,
@@ -358,7 +362,7 @@ export class TokenBudgetStrategy {
     const toolResultTokens = knownLimit
       ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
       : 0;
-    const evaluateBudget = (): StepBudgetEvaluation =>
+    const evaluateBudget = (finalHandoffAvailable: boolean): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
             contextTokens: contextTokens + newRequestTokens,
@@ -367,16 +371,17 @@ export class TokenBudgetStrategy {
             toolResultTokens,
             modelContextLimit: maxTokens,
             threshold,
-            handoffRequested: this.contextBudgetHandoffClaimed,
-            // Only a settled step can queue the final handoff step; a send never becomes one.
-            finalHandoffAvailable: false,
+            // The final prompt supersedes the handoff request.
+            handoffRequested: this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed,
+            finalHandoffAvailable,
           })
         : {
             decision: "continue",
             projected: contextTokens + newRequestTokens,
             hardCeiling: undefined,
           };
-    const decision = evaluateBudget();
+    // Only the rollover decision and measurements matter here; prompts are chosen below.
+    const decision = evaluateBudget(false);
     if (this.pendingRollover != null && threshold >= 1) {
       // Rollover was disabled after the intent was recorded: a stale intent must not seal a
       // later, unrelated send once rollover is re-enabled.
@@ -403,7 +408,7 @@ export class TokenBudgetStrategy {
             reason: "on-send",
             ...(modelRequested ? { requestedBy: "model" as const } : {}),
             previousWindowId: currentContextWindowId(history.data),
-            flushOpportunity: this.contextBudgetFlushClaimed,
+            flushOpportunity: this.contextBudgetFinalClaimed,
             contextTokens: decision.projected,
             maxTokens: recordedLimit,
             budgetTokens: getContextBudgetHardCeiling(recordedLimit),
@@ -457,12 +462,15 @@ export class TokenBudgetStrategy {
       const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
       // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
       // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
-      const advisory = evaluateBudget();
+      // The final prompt asks for new_context, so it is only offered when that tool is.
+      const advisory = evaluateBudget(
+        !this.contextBudgetFinalClaimed && permissions?.newContextAvailable === true
+      );
       if (
         permissions &&
         this.validatePreparation(receipt) &&
         this.isActive(options) &&
-        advisory.decision === "handoff"
+        (advisory.decision === "handoff" || advisory.decision === "final")
       ) {
         return Ok({
           prefix: [
@@ -470,8 +478,12 @@ export class TokenBudgetStrategy {
               contextTokens: advisory.projected,
               maxTokens: recordedLimit,
               budgetTokens: getContextBudgetHardCeiling(recordedLimit),
-              handoffTokens: getContextBudgetHandoffPoint(recordedLimit, threshold),
-              handoff: true,
+              ...(advisory.decision === "handoff"
+                ? {
+                    handoffTokens: getContextBudgetHandoffPoint(recordedLimit, threshold),
+                    handoff: true,
+                  }
+                : { final: true }),
               ...permissions,
             }),
           ],
@@ -520,14 +532,10 @@ export class TokenBudgetStrategy {
           nextRequestTokens: step.nextRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
-          handoffRequested: this.contextBudgetHandoffClaimed,
-          // The final step must be able to save the checkpoint, and its sealing reset needs
-          // history access.
-          finalHandoffAvailable:
-            !this.contextBudgetFlushClaimed &&
-            step.memoryAvailable &&
-            step.sessionHistoryAvailable &&
-            this.host.continuations.isEmpty(),
+          // The final prompt supersedes the handoff request.
+          handoffRequested: this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed,
+          // The final prompt asks for new_context, so skip it when this step could not call it.
+          finalHandoffAvailable: !this.contextBudgetFinalClaimed && step.newContextAvailable,
         })
       : { decision: "continue", projected: contextTokens, hardCeiling: undefined };
     // Rollover metadata records the limit the window was measured against; an unknown limit is
@@ -539,57 +547,54 @@ export class TokenBudgetStrategy {
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
     if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
-    const finalStep = decision.decision === "final" && !modelRequested;
-    if (decision.decision === "rollover" || modelRequested || finalStep) {
+    // The handoff request and the final prompt are prefix rows: the queued continuation's send
+    // re-evaluates the budget, publishes the row, and claims it (prepareContextBudgetSend).
+    const prompt =
+      !modelRequested && (decision.decision === "handoff" || decision.decision === "final");
+    if (!prompt) {
       const history = await this.deps.historyService.getHistoryFromLatestBoundary(
         this.host.workspaceId
       );
       if (!history.success) throw new Error(history.error);
       if (this.host.state.stream !== context || !this.validatePreparation(receipt))
         return { decision: "continue" };
-      // The usable ceiling is the only forced boundary.
-      this.pendingBudgetPrompt = undefined;
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
         reason: "mid-stream",
         ...(modelRequested ? { requestedBy: "model" as const } : {}),
         previousWindowId: currentContextWindowId(history.data),
-        flushOpportunity: this.contextBudgetFlushClaimed,
+        flushOpportunity: this.contextBudgetFinalClaimed,
         contextTokens: decision.projected,
         maxTokens: recordedLimit,
         budgetTokens: getContextBudgetHardCeiling(recordedLimit),
       };
-    } else {
-      assert(decision.decision === "handoff", "Expected a handoff request");
     }
     // Keep the continuation's delegated-turn/goal attribution; the prompt
     // itself is a separate durable prefix row when this entry dispatches.
-    // Capture the exact successor before publishing the queue so handoff stops retain
-    // upstream queue-cut attribution.
+    // Capture the exact successor before publishing the queue so the stop retains upstream
+    // queue-cut attribution.
     let continuationEntryId: string | undefined;
     if (this.host.continuations.isEmpty()) {
-      continuationEntryId = this.host.continuations.enqueue(
-        finalStep
-          ? [
-              entry("Save your checkpoint now.", CONTEXT_WARNING_DEDUPE_KEY, true),
-              entry("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false),
-            ]
-          : [
-              entry(
-                "Continue",
-                decision.decision === "handoff"
-                  ? CONTEXT_WARNING_DEDUPE_KEY
-                  : CONTEXT_CONTINUE_DEDUPE_KEY,
-                false
-              ),
-            ],
-        true
-      );
+      const entry: ContinuationEntry = {
+        admissionCapture: context.admissionCapture,
+        text: "Continue",
+        dedupeKey: prompt ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
+        options: context.options,
+        model: step.model,
+        muxMetadata: {
+          ...(context.workspaceTurnMetadata ?? { type: "normal" }),
+          contextBudgetContinuation: true,
+        },
+        autoModelRouting: context.autoModelRouting,
+        goalKind: context.goalKind,
+        goalId: context.goalId,
+      };
+      continuationEntryId = this.host.continuations.enqueue([entry], true);
     }
     // Nothing enqueued (unrelated input already queued): the stop designates no successor.
     return {
-      decision: decision.decision === "handoff" && !modelRequested ? "warn" : "rollover",
+      decision: prompt ? "warn" : "rollover",
       ...(continuationEntryId != null ? { continuationEntryId } : {}),
     };
   }
@@ -597,15 +602,15 @@ export class TokenBudgetStrategy {
   /** Re-derive this window's once-only claims from history before a stream resumes. */
   restoreStream(input: RestoreContextStreamInput): void {
     if (!this.isActive(input.options)) return;
-    this.contextBudgetWarningClaimed = input.history.some(
-      (row) =>
-        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
-        row.metadata.muxMetadata.handoff !== true
-    );
     this.contextBudgetHandoffClaimed = input.history.some(
       (row) =>
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
         row.metadata.muxMetadata.handoff === true
+    );
+    this.contextBudgetFinalClaimed = input.history.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.final === true
     );
   }
 
@@ -625,7 +630,11 @@ export class TokenBudgetStrategy {
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
         row.metadata.muxMetadata.handoff === true
     );
-    this.pendingBudgetPrompt = undefined;
+    this.contextBudgetFinalClaimed ||= published.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.final === true
+    );
   }
 
   /** `model` is the failing request's model: fallbacks may differ from the requested primary. */
