@@ -725,14 +725,22 @@ export function buildReport(input: ReportInput): Report {
       warnings.push(`Test ${code(test.key)} passed only on retry (${test.attempts} attempts).`);
     } else if (test.status === "skipped") {
       warnings.push(`Test ${code(test.key)} was skipped.`);
-      rows.push({ test, chatSwitch: false, scenarios: [], unavailable: "test skipped" });
+      rows.push({
+        test,
+        chatSwitch: test.spec === CHAT_SWITCH_SPEC,
+        scenarios: [],
+        unavailable: "test skipped",
+      });
       continue;
     }
 
     const final = input.reads.filter(
       (read) => read.testKey === test.key && read.retry === test.finalRetry
     );
-    const chatSwitch = final.some((read) => read.ok && read.chatSwitch !== undefined);
+    // The chat-switch spec is classified by file, so a summary that lost its medians never
+    // publishes its scope-dependent Chrome totals as an ordinary scenario.
+    const hasMedians = final.some((read) => read.ok && read.chatSwitch !== undefined);
+    const chatSwitch = test.spec === CHAT_SWITCH_SPEC || hasMedians;
     const workspaceOpen = test.spec === WORKSPACE_OPEN_SPEC;
     const scenarios: ReportScenario[] = [];
     const invalid: string[] = [];
@@ -778,9 +786,8 @@ export function buildReport(input: ReportInput): Report {
         }
       }
     }
-    // The chat-switch test must write its medians; without them it would look like an ordinary
-    // scenario with nothing lost.
-    if (test.spec === CHAT_SWITCH_SPEC && !chatSwitch && final.some((read) => read.ok)) {
+    // The chat-switch test must write its medians; without them its row would show nothing.
+    if (test.spec === CHAT_SWITCH_SPEC && !hasMedians && final.some((read) => read.ok)) {
       problems.push({
         key: `chat-switch-missing:${test.key}`,
         text: `Test ${code(test.key)} wrote no chat-switch medians in its final attempt.`,

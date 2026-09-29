@@ -713,6 +713,23 @@ describe("chat-switch coverage checks", () => {
       })
     );
     expect(keys(report)).toEqual([`chat-switch-missing:${CHAT_SWITCH_KEY}`]);
+    // Its scope-dependent Chrome totals are not published as an ordinary scenario.
+    expect(tableRows(render(report), "Scenario metrics")).toEqual([]);
+
+    const skipped = buildReport(
+      input({
+        results: playwright([
+          {
+            file: "scenarios/perf.chatSwitch.spec.ts",
+            title: CHAT_SWITCH_TITLE,
+            status: "skipped",
+            attempts: 0,
+          },
+        ]),
+        reads: [],
+      })
+    );
+    expect(tableRows(render(skipped), "Scenario metrics")).toEqual([]);
   });
 });
 
