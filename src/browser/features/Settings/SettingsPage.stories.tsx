@@ -91,6 +91,25 @@ async function waitForSettingsClosed(): Promise<void> {
   );
 }
 
+// Radix's DismissableLayer ignores Escape until one more render after the dialog mounts: its
+// `isHighestLayer` check uses a layer index computed during render, and the layer registers in
+// an effect that then forces that re-render. Nothing in the DOM marks the moment, so under CI
+// load a play that presses Escape right after the dialog appears can have the key dropped
+// (#5127). Press again while the dialog is still open; stop once it starts closing, so no extra
+// Escape reaches the element that gets focus back.
+async function closeSettingsWithEscape(): Promise<void> {
+  await waitFor(
+    async () => {
+      const dialog = within(document.body).queryByRole("dialog", { name: "Settings" });
+      if (dialog?.getAttribute("data-state") === "open") {
+        await userEvent.keyboard("{Escape}");
+      }
+      await expect(within(document.body).queryByRole("dialog", { name: "Settings" })).toBeNull();
+    },
+    { timeout: 5000 }
+  );
+}
+
 export const SectionsSmoke: AppStory = {
   // Pixel budget: the App task, advisor, and compaction settings stories already capture this
   // dialog on desktop, so this file's snapshot slot goes to PhoneFullScreen.
@@ -179,8 +198,7 @@ export const FocusReturnsWhenOpenerUnmounts: AppStory = {
     await userEvent.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
     await userEvent.keyboard(">Settings: Models{Enter}");
     await body.findByRole("dialog", { name: "Settings" });
-    await userEvent.keyboard("{Escape}");
-    await waitForSettingsClosed();
+    await closeSettingsWithEscape();
     await waitFor(() => expect(composer).toHaveFocus());
     await userEvent.keyboard("typed");
     await expect(composer).toHaveValue("typed");
@@ -194,8 +212,7 @@ export const FocusReturnsWhenOpenerUnmounts: AppStory = {
     await userEvent.click(within(modelSelector).getByRole("combobox"));
     await userEvent.click(await body.findByRole("button", { name: "Model settings" }));
     await body.findByRole("dialog", { name: "Settings" });
-    await userEvent.keyboard("{Escape}");
-    await waitForSettingsClosed();
+    await closeSettingsWithEscape();
     await waitFor(() => expect(composer).toHaveFocus());
   },
 };
