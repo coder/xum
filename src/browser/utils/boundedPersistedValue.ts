@@ -1,10 +1,11 @@
 /**
  * Keep growing persisted values inside their key budgets (PERSISTED_KEY_REGISTRY maxValueChars).
  *
- * A write over budget is refused and leaves the old value, which would freeze that UI state for
- * good because owners rewrite the whole value on every change. Owners of values that grow with use
- * (expansion maps, cached lists) therefore trim before writing; this also shrinks oversized values
- * that older builds wrote, on the next change.
+ * A value over budget is kept in memory for the session only; localStorage keeps the last value
+ * that fit, so after a reload that UI state would silently roll back, for good, because owners
+ * rewrite the whole value on every change. Owners of values that grow with use (expansion maps,
+ * cached lists) therefore trim before writing; this also shrinks oversized values that older
+ * builds wrote, on the next change.
  */
 
 /**

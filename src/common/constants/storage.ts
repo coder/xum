@@ -1002,8 +1002,8 @@ export const MAX_PERSISTED_KEY_CHARS = 1024;
  * localStorage is one ~5 MB origin quota shared by every feature; a single growing value or an
  * unbounded key family once filled it and stopped drafts from persisting. The shared write
  * (writePersistedValue in usePersistedState.ts) therefore refuses writes to unregistered keys and
- * values longer than `maxValueChars` (UTF-16 length of the serialized value), and
- * storageBudget.test.ts bounds the worst-case total derived from this registry.
+ * keeps values longer than `maxValueChars` (UTF-16 length of the serialized value) in memory only,
+ * and persistedStateBudget.test.ts bounds the worst-case total derived from this registry.
  *
  * - `cache`: derived data the app can refetch; the only kind the quota handler may evict.
  * - `draft`: unsent composer/creation input; never evicted.
