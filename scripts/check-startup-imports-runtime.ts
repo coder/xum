@@ -217,7 +217,8 @@ async function main(): Promise<number> {
       console.error(
         "   Load it with `await import()` inside the function that needs it." +
           " `bun scripts/check-startup-imports.ts` prints the static import chain; if it" +
-          " passes, look for a module-scope import() or a computed require() in" +
+          " passes, look for an import() that runs during startup (at module scope or in a" +
+          " startup function) or a computed require() in" +
           " src/cli/index.ts, src/desktop/main.ts or the modules they load."
       );
       failed = true;
