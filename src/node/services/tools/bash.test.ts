@@ -2318,6 +2318,7 @@ describe("bash tool - background execution", () => {
       const tempDir = new TestTempDir("test-bash-migrate-cleanup-seal");
       const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
       const finishTerminate = Promise.withResolvers<void>();
+      let otherClaim: AsyncDisposable | undefined;
       let pid = 0;
       try {
         const command = await startCommand(tempDir, manager);
@@ -2338,6 +2339,12 @@ describe("bash tool - background execution", () => {
           return terminate(...args);
         });
 
+        // Another migration holds the record-name lock: a refused command must not wait for it
+        // (up to its 30 s timeout) while cleanup waits for the command.
+        const held = await manager.claimMigrationProcessId(command.workspaceId, "other");
+        if (!held.success) throw new Error(held.error);
+        otherClaim = held;
+
         const cleanup = manager.cleanup(command.workspaceId);
         await terminating.promise; // cleanup has taken its snapshot and is still running
         expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
@@ -2352,6 +2359,7 @@ describe("bash tool - background execution", () => {
         expect(isAlive(pid)).toBe(false);
       } finally {
         finishTerminate.resolve();
+        await otherClaim?.[Symbol.asyncDispose]();
         await manager.cleanup("test-workspace");
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();

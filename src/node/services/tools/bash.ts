@@ -1408,9 +1408,10 @@ ${scriptWithEnv}`;
           // (#4878): the claim may wait on another backend's spawn lock, and a command that
           // exits during that wait must take the normal completion path, not be reported as
           // backgrounded (or as a failed migration). The lock stays held until the migrated
-          // record directory exists (end of this block).
+          // record directory exists (end of this block). A refused migration claims nothing:
+          // cleanup() is waiting for it, and the lock can be held for its whole timeout.
           const claim =
-            config.backgroundProcessManager && config.workspaceId
+            config.backgroundProcessManager && config.workspaceId && migration?.admitted
               ? await config.backgroundProcessManager.claimMigrationProcessId(
                   config.workspaceId,
                   safeDisplayName
@@ -1467,10 +1468,7 @@ ${scriptWithEnv}`;
                 : claim?.success === false
                   ? claim.error
                   : "background process manager unavailable";
-            if (migration?.admitted === false) {
-              // Nothing was written under the claimed name.
-              claimLock?.releaseName();
-            } else if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams
