@@ -900,13 +900,23 @@ async function scanActiveEpochNewestFirst(
   // return. Only pass it for rows the caller never projects; oversized rows must be kept because
   // only the final pass can parse them.
   keepRow?: (row: ScannedHistoryRow) => boolean
-): Promise<{ rows: ActiveEpochRow[]; reachedEpochStart: boolean }> {
+): Promise<{
+  rows: ActiveEpochRow[];
+  reachedEpochStart: boolean;
+  /**
+   * In-epoch rows keepRow dropped (count and bytes), or null when a file's epoch start falls
+   * between its dropped rows, where the exact split would need every dropped row.
+   */
+  dropped: { rows: number; bytes: number } | null;
+}> {
   const rows: ActiveEpochRow[] = [];
+  let dropped: { rows: number; bytes: number } | null = { rows: 0, bytes: 0 };
   let stopRequested = false;
   for (const artifact of ["chat", "archive"] as const) {
     const file = files.get(artifact);
     if (!file) continue;
     const visited: ScannedHistoryRow[] = [];
+    const fileDropped = { rows: 0, bytes: 0, minStart: Infinity, maxStart: -Infinity };
     // Rows arrive newest first, so the last visited row starts lowest (for onBytesRead).
     let lastVisitedStart: number | null = null;
     const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
@@ -915,22 +925,34 @@ async function scanActiveEpochNewestFirst(
       const keep = keepRow === undefined || keepRow(row);
       assert(keep || row.size <= SESSION_HISTORY_MAX_LINE_BYTES, "oversized rows must be kept");
       if (keep) visited.push(row);
+      else {
+        fileDropped.rows++;
+        fileDropped.bytes += row.size;
+        fileDropped.minStart = Math.min(fileDropped.minStart, row.start);
+        fileDropped.maxStart = Math.max(fileDropped.maxStart, row.start);
+      }
       return stopRequested;
     });
     const from = location.kind === "start" ? location.offset : 0;
     for (const row of visited) if (row.start >= from) rows.push({ file, row });
+    if (dropped && fileDropped.rows > 0) {
+      if (from <= fileDropped.minStart) {
+        dropped.rows += fileDropped.rows;
+        dropped.bytes += fileDropped.bytes;
+      } else if (from <= fileDropped.maxStart) dropped = null;
+    }
     // Same as scanProviderHistory: the raw bytes from the oldest in-epoch row to EOF. Every row
     // from `from` on was visited, so that row starts at max(from, the last visited start).
     const oldestStart: number | null = lastVisitedStart;
     onBytesRead?.(oldestStart === null ? 0 : file.size - Math.max(from, oldestStart));
-    if (location.kind === "start") return { rows, reachedEpochStart: true };
-    if (location.kind === "stopped") return { rows, reachedEpochStart: false };
+    if (location.kind === "start") return { rows, reachedEpochStart: true, dropped };
+    if (location.kind === "stopped") return { rows, reachedEpochStart: false, dropped };
     // Exhausted, possibly with a stop still waiting for a readable row (e.g. requested on a
     // malformed row): continue into the archive, where the sticky request is honored after its
     // first readable row. Callers trim rows visited after their cut, and a cut decided on rows
     // that parsed to nothing still needs that older readable row.
   }
-  return { rows, reachedEpochStart: true };
+  return { rows, reachedEpochStart: true, dropped };
 }
 
 /** The row's projected message: the locator's parse, or a re-read for an oversized row. */
@@ -1027,6 +1049,15 @@ function createHistoryWindowCutter(caps: HistoryWindowCaps) {
     get keep() {
       return keep;
     },
+    /**
+     * Same as pushing `count` rows that project nothing (and are not oversized) totaling `size`
+     * bytes, before any other row: they only add to `keep` and the byte count.
+     */
+    pushLeadingUnprojected(count: number, size: number) {
+      assert(phase === "fill" && keep === 0, "leading rows come before every other row");
+      keep += count;
+      bytes += size;
+    },
     push(row: ScannedHistoryRow, message: WindowCutMessage): boolean {
       if (phase === "done") return true;
       // A malformed row projects nothing even when oversized, so it must not use up the caps'
@@ -1099,24 +1130,44 @@ export function readProviderHistoryWindow(
   assert(isNonNegativeInteger(caps.extensionMaxBytes), "window extension bytes must be >= 0");
   return withVerifiedHistorySnapshot(paths, async (files) => {
     const scanCutter = createHistoryWindowCutter(caps);
+    // The cutter cannot stop before a row projects, so a corrupted epoch ending in a long run of
+    // malformed rows would otherwise be retained whole before the older readable row (#5220).
+    // Those leading normal-size unprojected rows are dropped during the scan; only their count
+    // and bytes reach the final cut. Oversized rows project "unknown", so they end the run.
+    let projectedSeen = false;
     const scan = await scanActiveEpochNewestFirst(
       files,
-      (row) => scanCutter.push(row, scanCutMessage(row)),
-      options?.onBytesRead
+      (row) => {
+        const message = scanCutMessage(row);
+        projectedSeen ||= message !== null;
+        return scanCutter.push(row, message);
+      },
+      options?.onBytesRead,
+      () => projectedSeen
     );
+    // Each file's dropped rows are its newest rows with no readable row among them, so its epoch
+    // start never falls between them: it is either an older readable row (all are in) or the end
+    // of that unreadable run, which drops the whole run (a fragmented reset).
+    assert(scan.dropped !== null, "the epoch start never splits the leading unprojected rows");
     // Decide the cut again over the rows actually in the epoch: a privacy floor can drop visited
     // unreadable rows, and rows visited after the stop request must be trimmed.
     // Oversized rows are re-read here so their types count.
     const cutter = createHistoryWindowCutter(caps);
+    cutter.pushLeadingUnprojected(scan.dropped.rows, scan.dropped.bytes);
     const kept: Array<MuxMessage | null> = [];
     for (const entry of scan.rows) {
       const message = await readActiveEpochRowMessage(entry);
       if (cutter.push(entry.row, message)) break;
       kept.push(message);
     }
-    // A rolled-back prompt makes the cut keep fewer rows than it accepted.
-    assert(cutter.keep <= kept.length, "window cut keeps at most the rows it accepted");
-    kept.length = cutter.keep;
+    // A rolled-back prompt makes the cut keep fewer rows than it accepted. The cut never lands
+    // inside the leading rows: it needs a projected row, and a rolled-back prompt is one.
+    const keptScanned = cutter.keep - scan.dropped.rows;
+    assert(
+      keptScanned >= 0 && keptScanned <= kept.length,
+      "window cut keeps at most the rows it accepted"
+    );
+    kept.length = keptScanned;
     const messages = kept.filter((message) => message !== null).reverse();
     return {
       messages,

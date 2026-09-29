@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { heapStats } from "bun:jsc";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
@@ -270,6 +271,50 @@ describe("HistoryService bounded active-epoch reads", () => {
       expect(ids(afterMalformed.messages)).toEqual(["a1002"]);
       expect(afterMalformed.reachedEpochStart).toBe(false);
       expectSuffix(await full(malformedWs), afterMalformed.messages);
+    });
+
+    test("a trailing run of malformed rows is not retained but its bytes still count", async () => {
+      // #5220: the cutter cannot stop before a row projects, so retaining the run would hold one
+      // row object per malformed row until the older readable row is found.
+      const ws = "window-malformed-run";
+      const run = 50_000;
+      const broken = `{"broken": "${"z".repeat(90)}`;
+      await writeLayout(ws, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 3),
+        ...Array.from({ length: run }, () => broken),
+      ]);
+      Bun.gc(true);
+      const liveBefore = heapStats().objectCount;
+      // onBytesRead runs right after the scan of chat.jsonl, while the scan still holds its rows.
+      let liveDuringScan = Infinity;
+      const result = await window(
+        ws,
+        { maxRows: 1, maxBytes: BIG, extensionMaxRows: 0, extensionMaxBytes: BIG },
+        {
+          onBytesRead: () => {
+            Bun.gc(true);
+            liveDuringScan = heapStats().objectCount;
+          },
+        }
+      );
+      expect(ids(result.messages)).toEqual(["a1003"]);
+      expect(result.reachedEpochStart).toBe(false);
+      expectSuffix(await full(ws), result.messages);
+      expect(liveDuringScan - liveBefore).toBeLessThan(run / 5);
+
+      // The dropped rows' bytes still reach the cap: past maxBytes the window ends at the first
+      // readable row instead of also taking a1004.
+      const bytesWs = "window-malformed-run-bytes";
+      await writeLayout(bytesWs, null, [...assistants(1, 5), broken, broken, broken]);
+      const byBytes = await window(bytesWs, {
+        maxRows: BIG,
+        maxBytes: 3 * broken.length,
+        extensionMaxRows: 0,
+        extensionMaxBytes: BIG,
+      });
+      expect(ids(byBytes.messages)).toEqual(["a1005"]);
+      expectSuffix(await full(bytesWs), byBytes.messages);
     });
 
     test("starts on a real user turn and keeps its snapshot cluster", async () => {
