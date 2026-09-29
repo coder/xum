@@ -324,7 +324,7 @@ describe("delegated target default consent (#4453)", () => {
     expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
 
     // The next startup's resolver clears it (the lock was released with the settlement).
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
@@ -339,7 +339,7 @@ describe("delegated target default consent (#4453)", () => {
       return cfg;
     });
 
-    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(targetRow(config).pending).toBe(true);
   });
 
@@ -351,8 +351,8 @@ describe("delegated target default consent (#4453)", () => {
       await created.promise; // The row exists with its mark; the handle record does not yet.
       if (creator === "dead") await markCreatorDead();
 
-      await a.manager.clearOrphanedDelegatedConsentDefaults();
-      await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+      await a.manager.resolveOrphanedDelegatedTargets();
+      await (await backend()).manager.resolveOrphanedDelegatedTargets();
       expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
 
       paused.resolve();

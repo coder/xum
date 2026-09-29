@@ -776,7 +776,7 @@ export class WorkspaceTurnManager {
    * has a live holder, here or in another backend, is still being created and is left alone.
    * Never throws: startup must not fail.
    */
-  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+  async resolveOrphanedDelegatedTargets(): Promise<void> {
     for (const project of this.config.loadConfigOrDefault().projects.values()) {
       for (const workspace of project.workspaces) {
         const tags = workspace.tags ?? {};
