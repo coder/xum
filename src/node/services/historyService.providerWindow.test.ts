@@ -148,6 +148,17 @@ describe("HistoryService bounded active-epoch reads", () => {
       // A row larger than the byte cap still yields one row.
       const tiny = await window(ws, { maxRows: BIG, maxBytes: 1, ...noExtension });
       expect(ids(tiny.messages)).toEqual([fullRead.at(-1)!.id]);
+
+      // An unreadable newest row reaches the byte cap but projects nothing: the window still
+      // holds one projected row instead of opening empty.
+      const unreadableTail = "window-unreadable-tail";
+      await writeLayout(unreadableTail, null, [...assistants(0, 4), "{broken json"]);
+      const afterBroken = await window(unreadableTail, {
+        maxRows: BIG,
+        maxBytes: 1,
+        ...noExtension,
+      });
+      expect(ids(afterBroken.messages)).toEqual(["a1004"]);
     });
 
     test("never crosses the latest compaction boundary, even while extending to a turn", async () => {
@@ -219,7 +230,9 @@ describe("HistoryService bounded active-epoch reads", () => {
       const ws = "window-turn";
       await writeLayout(ws, null, [
         row("u0", "user", 0),
-        ...assistants(1, 2),
+        ...assistants(1, 1),
+        // A snapshot row without a numeric sequence ends the cluster, as in keepRecentTail.
+        row("x2", "user", "2", { synthetic: true, fileAtMentionSnapshot: ["@b.ts"] }),
         fileSnapshot("s3", 3),
         skillSnapshot("s4", 4),
         mcpSnapshot("s5", 5),
@@ -248,7 +261,7 @@ describe("HistoryService bounded active-epoch reads", () => {
       expect(atStart.messages[0].id).toBe("s3");
     });
 
-    test("an oversized prompt starts a turn with its snapshot cluster", async () => {
+    test("oversized prompt and snapshot rows keep the turn's snapshot cluster", async () => {
       const ws = "window-oversized-prompt";
       const bigPrompt = json(
         createMuxMessage("big-user", "user", "y".repeat(OVERSIZED), { historySequence: 5 })
@@ -264,6 +277,41 @@ describe("HistoryService bounded active-epoch reads", () => {
       expect(ids(result.messages)).toEqual(["s4", "big-user", "a1006", "a1007", "a1008"]);
       expect(result.reachedEpochStart).toBe(false);
       expectSuffix(await full(ws), result.messages);
+
+      // An oversized snapshot inside a readable prompt's cluster does not end the cluster during
+      // the scan (its type is unknown there), so older snapshots before it stay in the window.
+      const bigSnapshotWs = "window-oversized-snapshot";
+      const bigSnapshot = json(
+        createMuxMessage("big-snap", "user", "y".repeat(OVERSIZED), {
+          historySequence: 4,
+          synthetic: true,
+          fileAtMentionSnapshot: ["@big.ts"],
+        })
+      );
+      await writeLayout(bigSnapshotWs, null, [
+        row("u0", "user", 0),
+        ...assistants(1, 1),
+        fileSnapshot("s2", 2),
+        fileSnapshot("s3", 3),
+        bigSnapshot,
+        row("u5", "user", 5),
+        ...assistants(6, 8),
+      ]);
+      const withBigSnapshot = await window(bigSnapshotWs, {
+        maxRows: 2,
+        maxBytes: BIG,
+        ...UNBOUNDED_EXTENSION,
+      });
+      expect(ids(withBigSnapshot.messages)).toEqual([
+        "s2",
+        "s3",
+        "big-snap",
+        "u5",
+        "a1006",
+        "a1007",
+        "a1008",
+      ]);
+      expectSuffix(await full(bigSnapshotWs), withBigSnapshot.messages);
     });
 
     test("cuts mid-turn when the extension bound is hit first", async () => {
