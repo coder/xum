@@ -88,8 +88,16 @@ describe("HistoryService bounded active-epoch reads", () => {
     if (!result.success) throw new Error(result.error);
     return readProviderHistoryFromLatestBoundary(pathsFor(workspaceId), 0);
   }
-  async function window(workspaceId: string, caps: HistoryWindowCaps) {
-    const result = await h.historyService.getHistoryWindowFromLatestBoundary(workspaceId, caps);
+  async function window(
+    workspaceId: string,
+    caps: HistoryWindowCaps,
+    observer?: Parameters<typeof h.historyService.getHistoryWindowFromLatestBoundary>[2]
+  ) {
+    const result = await h.historyService.getHistoryWindowFromLatestBoundary(
+      workspaceId,
+      caps,
+      observer
+    );
     if (!result.success) throw new Error(result.error);
     return result.data;
   }
@@ -320,6 +328,14 @@ describe("HistoryService bounded active-epoch reads", () => {
       expect(ids(result.messages)).toEqual(["a1008", "a1009", "a1010", "a1011", "a1012"]);
       expect(result.reachedEpochStart).toBe(false);
       expectSuffix(await full(ws), result.messages);
+      // The same rollback when the fill cap lands on the prompt itself.
+      const capOnPrompt = await window(ws, {
+        maxRows: 6,
+        maxBytes: BIG,
+        extensionMaxRows: 1,
+        extensionMaxBytes: BIG,
+      });
+      expect(ids(capOnPrompt.messages)).toEqual(ids(result.messages));
 
       // A prompt that is the only projected row stays, even without its whole cluster.
       const onlyPromptWs = "window-only-prompt";
@@ -440,10 +456,18 @@ describe("HistoryService bounded active-epoch reads", () => {
         if (random() < 0.5) await writeLayout(ws, null, rows);
         else await writeLayout(ws, rows.slice(0, split), rows.slice(split));
         const fullRead = await full(ws);
+        let fullBytes = 0;
+        await readProviderHistoryFromLatestBoundary(pathsFor(ws), 0, {
+          onBytesRead: (n) => (fullBytes += n),
+        });
         for (const caps of capsList) {
           const label = `seed ${seed} caps ${JSON.stringify(caps)}`;
-          const result = await window(ws, caps);
+          let bytes = 0;
+          const result = await window(ws, caps, { onBytesRead: (n) => (bytes += n) });
           const tail = result.messages;
+          // Replay timing (#4504): a window that covers the epoch reports the full read's bytes.
+          if (result.reachedEpochStart && bytes !== fullBytes)
+            problems.push(`${label}: replay bytes differ from the full read`);
           if (
             tail.length > fullRead.length ||
             !deepEqualAnyDepth(tail, fullRead.slice(fullRead.length - tail.length))
