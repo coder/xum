@@ -10,7 +10,7 @@ import { withTargetMutationLock } from "@/node/services/refinement/targetMutatio
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { DRAFT_ID_PATTERN, MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
+import { DRAFT_ID_PATTERN, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import type {
   Draft,
   DraftEvent,
@@ -22,7 +22,7 @@ import type {
 } from "@/common/orpc/schemas/drafts";
 import {
   createEmptyDraft,
-  draftJsonChars,
+  draftJsonBytes,
   draftScopeKey,
   draftTooLargeMessage,
   isDraftEmpty,
@@ -138,9 +138,9 @@ export class DraftService extends EventEmitter {
         text: input.text ?? current.text,
         attachments: input.attachments ?? current.attachments,
       };
-      const chars = draftJsonChars(next);
-      if (chars > MAX_DRAFT_JSON_CHARS) {
-        throw new Error(draftTooLargeMessage(chars));
+      const bytes = draftJsonBytes(next);
+      if (bytes > MAX_DRAFT_JSON_BYTES) {
+        throw new Error(draftTooLargeMessage(bytes));
       }
       if (!(await this.hasOwner(scope))) {
         return { revision: this.getRevision(draftScopeKey(scope)) };
@@ -179,9 +179,9 @@ export class DraftService extends EventEmitter {
       text: input.text ?? "",
       attachments: input.attachments ?? [],
     }).draft;
-    const chars = draftJsonChars(legacy);
-    if (chars > MAX_DRAFT_JSON_CHARS) {
-      throw new Error(draftTooLargeMessage(chars));
+    const bytes = draftJsonBytes(legacy);
+    if (bytes > MAX_DRAFT_JSON_BYTES) {
+      throw new Error(draftTooLargeMessage(bytes));
     }
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
@@ -358,7 +358,8 @@ export class DraftService extends EventEmitter {
    */
   private async persist(scope: DraftScope, filePath: string, draft: Draft): Promise<number> {
     const key = draftScopeKey(scope);
-    this.scanTouched?.add(key);
+    // A running scan skips keys written meanwhile (the write's entry is newer), so a key is marked
+    // only once its write landed: a failed write must not hide the draft still on disk.
     if (isDraftEmpty(draft)) {
       let existed = true;
       try {
@@ -367,6 +368,7 @@ export class DraftService extends EventEmitter {
         if (!hasErrorCode(error, "ENOENT")) throw error;
         existed = false;
       }
+      this.scanTouched?.add(key);
       if (!existed && !this.index.has(key)) return this.getRevision(key);
       const revision = this.bumpRevision(key);
       this.index.delete(key);
@@ -380,6 +382,7 @@ export class DraftService extends EventEmitter {
         : { version: DRAFT_FILE_VERSION };
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await writeFileAtomic(filePath, JSON.stringify({ ...file, ...draft }));
+    this.scanTouched?.add(key);
     const revision = this.bumpRevision(key);
     const summary = summarizeDraft(scope, draft, revision);
     this.index.set(key, { summary, filePath });
@@ -425,7 +428,8 @@ export class DraftService extends EventEmitter {
         }
       }
       for (const dirName of await readDirNames(this.creationRoot, { dirsOnly: true })) {
-        for (const file of await this.readCreationDraftFiles(
+        // One file at a time: only its metadata is kept, so near-limit payloads never pile up.
+        for await (const file of this.readCreationDraftFiles(
           path.join(this.creationRoot, dirName)
         )) {
           add(file.scope, file.filePath, file.draft);
@@ -440,17 +444,17 @@ export class DraftService extends EventEmitter {
     }
   }
 
-  /** The well-formed creation draft files of one project dir (unreadable ones are skipped). */
-  private async readCreationDraftFiles(projectDir: string): Promise<
-    Array<{
-      scope: CreationScope;
-      projectPath: string;
-      draftId: string;
-      filePath: string;
-      draft: Draft | null;
-    }>
-  > {
-    const files = [];
+  /**
+   * The well-formed creation draft files of one project dir, read one at a time (unreadable ones
+   * are skipped).
+   */
+  private async *readCreationDraftFiles(projectDir: string): AsyncGenerator<{
+    scope: CreationScope;
+    projectPath: string;
+    draftId: string;
+    filePath: string;
+    draft: Draft | null;
+  }> {
     for (const name of await readDirNames(projectDir)) {
       if (!name.endsWith(".json")) continue;
       const filePath = path.join(projectDir, name);
@@ -479,15 +483,14 @@ export class DraftService extends EventEmitter {
       if (droppedEntries > 0) {
         log.warn(`Dropped malformed entries from draft file ${filePath}`, { droppedEntries });
       }
-      files.push({
+      yield {
         scope: { kind: "creation" as const, projectPath, draftId },
         projectPath,
         draftId,
         filePath,
         draft,
-      });
+      };
     }
-    return files;
   }
 
   /** Hashed dir names of the configured projects plus scratch. */
@@ -511,7 +514,7 @@ export class DraftService extends EventEmitter {
         scopes.set(key, scope);
       }
     }
-    for (const file of await this.readCreationDraftFiles(projectDir)) {
+    for await (const file of this.readCreationDraftFiles(projectDir)) {
       scopes.set(draftScopeKey(file.scope), file.scope);
     }
     for (const scope of scopes.values()) {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { sanitizeDraftAttachments } from "./drafts";
+import { draftJsonBytes, sanitizeDraftAttachments } from "./drafts";
 
 // Draft files and legacy localStorage values are untrusted input (hand-edited, truncated, or
 // written by an older build): each malformed attachment is dropped on its own so the rest of the
@@ -55,5 +55,15 @@ describe("sanitizeDraftAttachments", () => {
   test("a non-array value is one dropped entry; a missing value is none", () => {
     expect(sanitizeDraftAttachments({})).toEqual({ attachments: [], droppedEntries: 1 });
     expect(sanitizeDraftAttachments(undefined)).toEqual({ attachments: [], droppedEntries: 0 });
+  });
+});
+
+describe("draftJsonBytes", () => {
+  // The limit protects byte-counting transports (the 50 MB HTTP body cap), so size is UTF-8 bytes.
+  test("counts UTF-8 bytes of the JSON, including multi-byte text and surrogate pairs", () => {
+    const draft = { text: "ascii é € 😀 \ud800 end", attachments: [] };
+    expect(draftJsonBytes(draft)).toBe(
+      Buffer.byteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }))
+    );
   });
 });

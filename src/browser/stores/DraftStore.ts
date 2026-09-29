@@ -26,9 +26,10 @@ import type {
   DraftSummary,
 } from "@/common/orpc/schemas/drafts";
 import {
-  draftJsonChars,
+  draftJsonBytes,
   draftScopeKey,
   draftTooLargeMessage,
+  isDraftTooLargeError,
   sanitizeDraftAttachments,
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
@@ -36,7 +37,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import {
   DRAFT_ID_PATTERN,
   DRAFT_STORE_READY_TIMEOUT_MS,
-  MAX_DRAFT_JSON_CHARS,
+  MAX_DRAFT_JSON_BYTES,
 } from "@/constants/drafts";
 
 /**
@@ -923,11 +924,11 @@ export class DraftStore {
       // The backend refuses drafts over the limit. That failure is permanent, so check here and
       // wait for the next change instead of pushing a multi-MB payload through the transport on
       // every retry. Only a loaded draft is measurable; otherwise the backend check applies.
-      const chars = entry.payloadsLoaded
-        ? draftJsonChars({ text: entry.text, attachments: entry.attachments })
+      const bytes = entry.payloadsLoaded
+        ? draftJsonBytes({ text: entry.text, attachments: entry.attachments })
         : 0;
-      if (chars > MAX_DRAFT_JSON_CHARS) {
-        const error = new Error(draftTooLargeMessage(chars));
+      if (bytes > MAX_DRAFT_JSON_BYTES) {
+        const error = new Error(draftTooLargeMessage(bytes));
         this.reportSaveError(entry, key, error);
         throw error;
       }
@@ -958,6 +959,10 @@ export class DraftStore {
         }
         entry.revision = Math.max(entry.revision, reply.revision);
       } catch (error) {
+        this.reportSaveError(entry, key, error);
+        // The backend's size refusal (measurable only there while payloads are unloaded) is
+        // permanent until the draft changes, like the local check above: no retry loop.
+        if (isDraftTooLargeError(error)) throw error;
         // Keep the change (never silently drop it) and retry with backoff.
         const delay = retryDelayMs(entry.flushAttempt++);
         if (entry.flushTimer) clearTimeout(entry.flushTimer);
@@ -965,7 +970,6 @@ export class DraftStore {
           entry.flushTimer = null;
           this.flushInBackground(entry);
         }, delay);
-        this.reportSaveError(entry, key, error);
         throw error;
       } finally {
         entry.inFlight = null;

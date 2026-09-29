@@ -16,7 +16,7 @@ import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
 import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
-import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
+import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
@@ -272,7 +272,7 @@ describe("DraftStore", () => {
     const huge: DraftAttachment = {
       ...image,
       id: "huge",
-      url: `data:image/png;base64,${"A".repeat(MAX_DRAFT_JSON_CHARS)}`,
+      url: `data:image/png;base64,${"A".repeat(MAX_DRAFT_JSON_BYTES)}`,
     };
     store.setAttachments(WS_SCOPE, [huge]);
     let flushError: unknown;
@@ -487,6 +487,31 @@ describe("DraftStore", () => {
     releaseSubscribe();
     await waitFor(async () => (await service.get(WS_SCOPE)).text === "typed while loading");
     expect(store.getText(WS_SCOPE)).toBe("typed while loading");
+  });
+
+  test("does not retry the backend's size refusal of a draft whose payloads are not loaded", async () => {
+    using tempDir = new TestTempDir("draft-store-backend-too-large");
+    const { service, client, control } = await createHarness(tempDir);
+    // Near the limit on the backend; the store knows only its metadata.
+    const big: DraftAttachment = {
+      ...image,
+      id: "big",
+      url: `data:image/png;base64,${"A".repeat(MAX_DRAFT_JSON_BYTES - 200)}`,
+    };
+    await service.update({ scope: WS_SCOPE, attachments: [big] });
+    const store = createStore(client);
+    await store.whenReady();
+    const errors: string[] = [];
+    store.subscribeSaveErrors(WS_SCOPE, (message) => errors.push(message));
+
+    store.setText(WS_SCOPE, "x".repeat(400));
+    await store.flush(WS_SCOPE).catch(() => undefined);
+    const updates = control.updates;
+    // Past the first retry delays: a permanent refusal must not be sent again.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    expect(control.updates).toBe(updates);
+    expect(errors).toHaveLength(1);
+    expect(store.getText(WS_SCOPE)).toBe("x".repeat(400));
   });
 
   test("reports a save failure to the next composer when none was listening", async () => {

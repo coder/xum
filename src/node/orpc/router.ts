@@ -147,6 +147,18 @@ import {
   subscribeWorkflowRuns,
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
+import { isDraftTooLargeError } from "@/common/utils/drafts";
+
+/**
+ * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
+ * renderer as itself: it is permanent until the draft changes, so DraftStore stops retrying it.
+ */
+function rethrowDraftTooLarge(error: unknown): never {
+  if (isDraftTooLargeError(error)) {
+    throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
+  }
+  throw error;
+}
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
   return request().catch(throwWorkflowOrpcError);
@@ -606,7 +618,9 @@ export const router = (authToken?: string) => {
       update: t
         .input(schemas.drafts.update.input)
         .output(schemas.drafts.update.output)
-        .handler(({ context, input }) => context.draftService.update(input)),
+        .handler(({ context, input }) =>
+          context.draftService.update(input).catch(rethrowDraftTooLarge)
+        ),
       delete: t
         .input(schemas.drafts.delete.input)
         .output(schemas.drafts.delete.output)
@@ -614,7 +628,9 @@ export const router = (authToken?: string) => {
       importLegacy: t
         .input(schemas.drafts.importLegacy.input)
         .output(schemas.drafts.importLegacy.output)
-        .handler(({ context, input }) => context.draftService.importLegacy(input)),
+        .handler(({ context, input }) =>
+          context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
+        ),
       subscribe: t
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)

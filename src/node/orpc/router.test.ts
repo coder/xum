@@ -7,6 +7,7 @@ import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
 import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
@@ -136,6 +137,24 @@ describe("config.previewAutoModelRouting", () => {
     expect(result.success).toBe(false);
     expect(classifyEffect).not.toHaveBeenCalled();
     expect(recordHeadlessUsage).not.toHaveBeenCalled();
+  });
+});
+
+describe("router drafts.update", () => {
+  test("the size refusal reaches the client with its message, so it is not retried", async () => {
+    const message = draftTooLargeMessage(41 * 1024 * 1024);
+    const context = {
+      draftService: { update: mock(() => Promise.reject(new Error(message))) },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+
+    let refused: unknown;
+    await client.drafts
+      .update({ scope: { kind: "workspace", workspaceId: "ws-1" }, text: "x" })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("BAD_REQUEST");
+    expect(isDraftTooLargeError(refused)).toBe(true);
   });
 });
 

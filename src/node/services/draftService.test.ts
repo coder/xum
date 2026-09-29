@@ -1,11 +1,11 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
-import { draftTooLargeMessage } from "@/common/utils/drafts";
+import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 import { DraftService } from "./draftService";
@@ -153,7 +153,7 @@ describe("DraftService", () => {
     using tempDir = new TestTempDir("drafts-import-too-large");
     const { config, workspaceFile } = await createHarness(tempDir);
     const service = new DraftService(config);
-    const text = "x".repeat(MAX_DRAFT_JSON_CHARS);
+    const text = "x".repeat(MAX_DRAFT_JSON_BYTES);
 
     let error: unknown;
     try {
@@ -166,6 +166,56 @@ describe("DraftService", () => {
       draftTooLargeMessage(JSON.stringify({ text, attachments: [] }).length)
     );
     expect(await exists(workspaceFile)).toBe(false);
+  });
+
+  it("measures the size limit in UTF-8 bytes", async () => {
+    using tempDir = new TestTempDir("drafts-too-large-bytes");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    // Under the limit in UTF-16 code units, over it in bytes (2 bytes per "é").
+    const text = "é".repeat(Math.ceil(MAX_DRAFT_JSON_BYTES * 0.6));
+
+    let error: unknown;
+    try {
+      await service.update({ scope: WORKSPACE_SCOPE, text });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(isDraftTooLargeError(error)).toBe(true);
+    expect(await exists(workspaceFile)).toBe(false);
+  });
+
+  it("a write that fails during the first scan does not hide the draft on disk", async () => {
+    using tempDir = new TestTempDir("drafts-scan-failed-write");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    await new DraftService(config).update({ scope: WORKSPACE_SCOPE, text: "on disk" });
+    const service = new DraftService(config);
+
+    // The write lands while the scan runs (between its sessions-dir listing and its reads) and
+    // fails, like ENOSPC/EACCES: a read-only session dir refuses the atomic write's temp file.
+    const realReaddir = fs.readdir.bind(fs);
+    let failedWrite: Promise<unknown> | null = null;
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      const listing = await (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
+      if (failedWrite === null && args[0] === config.sessionsDir) {
+        await fs.chmod(path.dirname(workspaceFile), 0o500);
+        failedWrite = service
+          .update({ scope: WORKSPACE_SCOPE, text: "lost write" })
+          .catch((error: unknown) => error);
+        await failedWrite;
+        await fs.chmod(path.dirname(workspaceFile), 0o700);
+      }
+      return listing;
+    }) as typeof fs.readdir);
+    try {
+      const summaries = await service.list();
+      expect(await failedWrite).toBeInstanceOf(Error);
+      expect(summaries.map((summary) => summary.text)).toEqual(["on disk"]);
+    } finally {
+      readdirSpy.mockRestore();
+    }
   });
 
   it("rejects scopes that would resolve outside their storage dir", async () => {

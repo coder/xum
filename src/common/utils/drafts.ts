@@ -6,7 +6,7 @@ import {
   type DraftScope,
   type DraftSummary,
 } from "@/common/orpc/schemas/drafts";
-import { MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
+import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
 /** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
 export function draftScopeKey(scope: DraftScope): string {
@@ -37,15 +37,45 @@ export function isDraftEmpty(draft: Draft): boolean {
   return draft.text.length === 0 && draft.attachments.length === 0;
 }
 
-/** JSON size of a draft, compared against MAX_DRAFT_JSON_CHARS. */
-export function draftJsonChars(draft: Draft): number {
-  return JSON.stringify({ text: draft.text, attachments: draft.attachments }).length;
+/** UTF-8 byte length of a string, without allocating an encoded copy of a multi-MB draft. */
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      (value.charCodeAt(index + 1) & 0xfc00) === 0xdc00
+    ) {
+      // A surrogate pair is one 4-byte code point.
+      bytes += 4;
+      index++;
+    } else bytes += 3;
+  }
+  return bytes;
 }
 
-/** The save error for a draft over MAX_DRAFT_JSON_CHARS (shown by the composer as a toast). */
-export function draftTooLargeMessage(chars: number): string {
+/**
+ * JSON size of a draft in UTF-8 bytes, compared against MAX_DRAFT_JSON_BYTES. Bytes, because the
+ * transport limits count bytes: UTF-16 code units undercount non-ASCII text up to 3x.
+ */
+export function draftJsonBytes(draft: Draft): number {
+  return utf8ByteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }));
+}
+
+const DRAFT_TOO_LARGE_PREFIX = "Draft is too large to save";
+
+/** The save error for a draft over MAX_DRAFT_JSON_BYTES (shown by the composer as a toast). */
+export function draftTooLargeMessage(bytes: number): string {
   const toMb = (value: number) => Math.ceil(value / (1024 * 1024));
-  return `Draft is too large to save (${toMb(chars)} MB; the limit is ${toMb(MAX_DRAFT_JSON_CHARS)} MB). Remove an attachment.`;
+  return `${DRAFT_TOO_LARGE_PREFIX} (${toMb(bytes)} MB; the limit is ${toMb(MAX_DRAFT_JSON_BYTES)} MB). Remove an attachment.`;
+}
+
+/** Whether an error is the size refusal: permanent until the draft changes, so not retried. */
+export function isDraftTooLargeError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(DRAFT_TOO_LARGE_PREFIX);
 }
 
 /**
