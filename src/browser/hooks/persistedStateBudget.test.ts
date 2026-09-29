@@ -170,8 +170,12 @@ describe("localStorage budget", () => {
     let nonEvictable = 0;
     // VS Code webview keys live in the webview's own origin, not the app's.
     let webview = 0;
-    for (let index = 0; index < storage.length; index++) {
-      const key = storage.key(index)!;
+    // Snapshot the stored keys once. happy-dom's `length` and `key(index)` each rebuild the full
+    // key list, so indexing through ~8k keys was quadratic and took seconds, near bun's 5 s
+    // timeout under CI load (#5244). The size check keeps the scan covering exactly what is stored.
+    const storedKeys = Object.keys(storage);
+    expect(storedKeys.length).toBe(storage.length);
+    for (const key of storedKeys) {
       const chars = key.length + (storage.getItem(key)?.length ?? 0);
       const registration = getPersistedKeyRegistration(key);
       if (registration?.scope === "workspaceId" && registration.scopes === "webview") {
