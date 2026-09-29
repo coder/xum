@@ -968,6 +968,8 @@ export const EXPANDED_TASK_GROUPS_KEY = "expandedTaskGroups";
 // Budgets that owners also use to keep growing values inside them (see trimRecordToChars).
 /** fileTreeExpandState:{workspaceId}: only directory overrides of the default expansion. */
 export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 1024;
+/** auto-expand:{workspaceId}: the per-tool map keeps the most recently toggled tools that fit. */
+export const AUTO_EXPAND_PREFS_MAX_CHARS = 768;
 /** Each left sidebar expansion map; entries accumulate per project/workspace/group forever. */
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
@@ -1095,7 +1097,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
   workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, 384),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
-  workspaceKey(getAutoExpandPrefsKey, "ui", true, 768),
+  workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only; lastGeneratedFor is capped at WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS.
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
   workspaceKey(getAgentIdKey, "synced", true, 128),
