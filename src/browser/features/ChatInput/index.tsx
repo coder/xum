@@ -1224,6 +1224,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setDraftReviews(preEditReviewsRef.current);
   }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
 
+  // Completing an edit sends the edited message; the unsent draft from before the edit comes
+  // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
+  // typed while the send was in flight, after the restored draft.
+  const restorePreEditDraftAfterSend = () => {
+    const preEdit = preEditDraftRef.current;
+    setInput((current) =>
+      [preEdit.text, current].filter((part) => part.trim().length > 0).join("\n\n")
+    );
+    if (preEdit.attachments.length > 0) {
+      setAttachments((current) => [...preEdit.attachments, ...current]);
+    }
+    setDraftReviews(preEditReviewsRef.current);
+  };
+
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
     (text: string) => {
@@ -1957,6 +1971,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
             break;
           case "cancel-edit":
+            // Emitted once an editing command (/compact) was accepted: the edit is complete.
+            restorePreEditDraftAfterSend();
             commandOnCancelEdit?.();
             break;
           case "edit-history-changed":
@@ -2719,6 +2735,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
+          if (editMessageForSend) {
+            restorePreEditDraftAfterSend();
+          }
           if (editMessageForSend && props.onCancelEdit) {
             props.onCancelEdit();
           } else if (editMessageForSend) {
