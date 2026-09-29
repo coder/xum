@@ -581,6 +581,17 @@ export interface Runtime {
   ): Promise<Result<void, string>>;
 
   /**
+   * Release what finalizeConfig/validateBeforePersist prepared for a creation that is rolled
+   * back before init, so postCreateSetup never consumes it.
+   *
+   * Use cases:
+   * - Coder: dispose the provisioning session (a short-lived deployment token) (#5113)
+   *
+   * Best-effort: must not throw.
+   */
+  releaseCreationSetup?(): Promise<void>;
+
+  /**
    * Optional long-running setup that runs after mux persists workspace metadata.
    * Used for provisioning steps that must happen before initWorkspace but after
    * the workspace is registered (e.g., creating Coder workspaces, pulling Docker images).

@@ -3539,8 +3539,8 @@ export class WorkspaceService
     // the checkout, container or Coder workspace comes from init, which starts after publication,
     // when no rollback point is left. Their runtime deletes would instead reach state this
     // creation did not make: an existing remote directory, or a container or Coder workspace of
-    // the same name. So nothing is deleted. (A new-mode Coder creation's provisioning token is
-    // not disposed here: #5113.)
+    // the same name. So nothing is deleted. A new-mode Coder creation's provisioning token, which
+    // only init would consume, is released below (#5113).
     if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
       const force = checkout.startsWith("force-");
       const deleteOptions = { keepBranch: checkout.endsWith("-keep-branch") };
@@ -3575,6 +3575,8 @@ export class WorkspaceService
         leftovers.push(args.runtime.getWorkspacePath(args.projectPath, args.workspaceName));
       }
     }
+    // Init never runs for this creation, whether or not the entry is gone.
+    await args.runtime.releaseCreationSetup?.();
     // Tear down the in-memory state registered earlier in this creation
     // (session, init record, abort controller) exactly like workspace
     // removal would; without this every aborted retry against the same bad

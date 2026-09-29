@@ -315,11 +315,25 @@ function sanitizeCoderCliErrorForUi(error: unknown): string {
   );
 }
 
+/** Lifetime of the short-lived API tokens `createApiSession` requests. */
+const API_TOKEN_LIFETIME_MINUTES = 5;
+/**
+ * A provisioning session is reused only while its token has at least a minute left, so the
+ * provisioning step that takes it has time to use it.
+ */
+const PROVISIONING_SESSION_REUSE_MS = (API_TOKEN_LIFETIME_MINUTES - 1) * 60_000;
+
 export class CoderService {
   // Ephemeral API sessions scoped to workspace provisioning.
   // This keeps token reuse explicit without persisting anything to disk.
   private provisioningSessionPromises = new Map<string, Promise<CoderApiSession>>();
-  private provisioningSessions = new Map<string, CoderApiSession>();
+  private provisioningSessions = new Map<
+    string,
+    {
+      session: CoderApiSession;
+      /** Date.now() before the token was requested. */ createdAt: number;
+    }
+  >();
   private cachedInfo: CoderInfo | null = null;
   // Cache whoami results so later URL lookups can reuse the last CLI response.
   private cachedWhoami: CoderWhoamiData | null = null;
@@ -499,7 +513,7 @@ export class CoderService {
   private async createApiSession(tokenName: string): Promise<CoderApiSession> {
     using tokenProc = execFileAsync(
       "coder",
-      ["tokens", "create", "--lifetime", "5m", "--name", tokenName],
+      ["tokens", "create", "--lifetime", `${API_TOKEN_LIFETIME_MINUTES}m`, "--name", tokenName],
       { timeoutMs: 30_000 }
     );
     const { stdout: token } = await tokenProc.result;
@@ -536,7 +550,12 @@ export class CoderService {
   async ensureProvisioningSession(workspaceName: string): Promise<CoderApiSession> {
     const existing = this.provisioningSessions.get(workspaceName);
     if (existing) {
-      return existing;
+      // A creation that never reached init (a rollback, #5113) leaves its session here; a retry
+      // must not get a token that has expired, or will before provisioning can use it.
+      if (Date.now() - existing.createdAt < PROVISIONING_SESSION_REUSE_MS) {
+        return existing.session;
+      }
+      await this.disposeProvisioningSession(workspaceName);
     }
 
     const pending = this.provisioningSessionPromises.get(workspaceName);
@@ -544,10 +563,11 @@ export class CoderService {
       return pending;
     }
 
-    const tokenName = `mux-${workspaceName}-${Date.now().toString(36)}`;
+    const createdAt = Date.now();
+    const tokenName = `mux-${workspaceName}-${createdAt.toString(36)}`;
     const sessionPromise = this.createApiSession(tokenName)
       .then((session) => {
-        this.provisioningSessions.set(workspaceName, session);
+        this.provisioningSessions.set(workspaceName, { session, createdAt });
         this.provisioningSessionPromises.delete(workspaceName);
         return session;
       })
@@ -560,20 +580,20 @@ export class CoderService {
   }
 
   takeProvisioningSession(workspaceName: string): CoderApiSession | undefined {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (entry) {
       this.provisioningSessions.delete(workspaceName);
     }
-    return session;
+    return entry?.session;
   }
 
   async disposeProvisioningSession(workspaceName: string): Promise<void> {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (!session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (!entry) {
       return;
     }
     this.provisioningSessions.delete(workspaceName);
-    await session.dispose();
+    await entry.session.dispose();
   }
 
   /**

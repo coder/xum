@@ -1,6 +1,6 @@
 import { EventEmitter } from "events";
 import { Readable } from "stream";
-import { describe, it, expect, vi, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, vi, beforeEach, afterEach, spyOn, setSystemTime } from "bun:test";
 import { CoderService, compareVersions } from "./coderService";
 import * as childProcess from "child_process";
 import * as muxSshConfigWriter from "@/node/runtime/muxSshConfigWriter";
@@ -790,6 +790,29 @@ describe("CoderService", () => {
 
       await service.disposeProvisioningSession("ws");
       expect(execFileAsyncSpy).toHaveBeenCalledTimes(2);
+    });
+
+    // #5113: a session left by a creation that never reached init must not hand a retry a token
+    // that has expired (or is about to) on the deployment.
+    it("replaces a provisioning session older than its token lifetime", async () => {
+      mockTokenCommands();
+      const start = Date.now();
+      try {
+        setSystemTime(new Date(start));
+        const stale = await service.ensureProvisioningSession("ws");
+        setSystemTime(new Date(start + 5 * 60_000));
+        const fresh = await service.ensureProvisioningSession("ws");
+
+        expect(fresh).not.toBe(stale);
+        expect(service.takeProvisioningSession("ws")).toBe(fresh);
+        // The stale token is deleted on the deployment, best-effort.
+        const deletes = execFileAsyncSpy!.mock.calls.filter(
+          ([file, args]) => file === "coder" && args?.[0] === "tokens" && args[1] === "delete"
+        );
+        expect(deletes).toHaveLength(1);
+      } finally {
+        setSystemTime();
+      }
     });
 
     it("takeProvisioningSession returns and clears the session", async () => {

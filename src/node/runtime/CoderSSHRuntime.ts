@@ -794,6 +794,15 @@ export class CoderSSHRuntime extends SSHRuntime {
     };
   }
 
+  /** A new-mode creation's provisioning session is consumed only by postCreateSetup (#5113). */
+  async releaseCreationSetup(): Promise<void> {
+    const coderWorkspaceName = this.coderConfig.workspaceName;
+    if (this.coderConfig.existingWorkspace || !coderWorkspaceName) {
+      return;
+    }
+    await this.coderService.disposeProvisioningSession(coderWorkspaceName).catch(() => undefined);
+  }
+
   /**
    * Post-create setup: provision Coder workspace and configure SSH.
    * This runs after mux persists workspace metadata, so build logs stream to UI.

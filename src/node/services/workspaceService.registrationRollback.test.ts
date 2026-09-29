@@ -7,7 +7,8 @@ import * as path from "node:path";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import type { ExperimentsService } from "./experimentsService";
-import type { CoderService } from "./coderService";
+import { CoderService } from "./coderService";
+import * as disposableExec from "@/node/utils/disposableExec";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
@@ -1322,6 +1323,45 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         );
         expect(persistedRuntimeConfig(sourceId)).toEqual(changed);
       });
+    });
+
+    // #5113: a new-mode Coder creation prepares a provisioning session (a short-lived deployment
+    // token) in finalizeConfig; only init consumes it. A creation rolled back before init disposes
+    // it, so the token does not linger and a retry cannot get it back.
+    test("new-mode Coder creation whose registration write rejects disposes its provisioning session", async () => {
+      const coderService = new CoderService();
+      spyOn(coderService, "verifyAuthenticatedSession").mockResolvedValue(undefined);
+      spyOn(coderService, "workspaceExists").mockResolvedValue(false);
+      const tokenCommands = spyOn(disposableExec, "execFileAsync").mockImplementation(((
+        file: string,
+        args: string[]
+      ) => {
+        if (file !== "coder" || args[0] !== "tokens") {
+          throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
+        }
+        const result = Promise.resolve({
+          stdout: args[1] === "create" ? "token-1\n" : "",
+          stderr: "",
+        });
+        return { result, child: {}, [Symbol.dispose]: () => undefined };
+      }) as unknown as typeof disposableExec.execFileAsync);
+      const realCreateRuntime = runtimeFactory.createRuntime;
+      spyOn(runtimeFactory, "createRuntime").mockImplementation((config, options) =>
+        realCreateRuntime(config, { ...options, coderService })
+      );
+
+      await expectFailsWithSaveError(() =>
+        service.create(projectPath, "coder-new", "main", undefined, {
+          type: "ssh",
+          host: "coder",
+          srcBaseDir: "/remote/src",
+          coder: { template: "tmpl" },
+        })
+      );
+
+      const tokenCalls = tokenCommands.mock.calls.map(([, args]) => args?.slice(0, 2).join(" "));
+      expect(tokenCalls).toEqual(["tokens create", "tokens delete"]);
+      expect(coderService.takeProvisioningSession("mux-coder-new")).toBeUndefined();
     });
 
     // #5117, Docker forks: the fork made its own container (DockerRuntime.forkWorkspace refuses a
