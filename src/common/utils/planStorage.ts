@@ -90,5 +90,11 @@ export function sharesPlanDirectory(
   a: { projectName: string; runtimeConfig: RuntimeConfig },
   b: { projectName: string; runtimeConfig: RuntimeConfig }
 ): boolean {
-  return a.projectName === b.projectName && sharesPlanStorage(a.runtimeConfig, b.runtimeConfig);
+  // Case-insensitive: on the default macOS and Windows filesystems `App` and `app` are one
+  // directory. On a case-sensitive one this only errs towards sharing, which refuses a name or
+  // keeps a plan, never overwrites one.
+  return (
+    a.projectName.toLowerCase() === b.projectName.toLowerCase() &&
+    sharesPlanStorage(a.runtimeConfig, b.runtimeConfig)
+  );
 }

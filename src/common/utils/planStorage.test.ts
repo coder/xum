@@ -1,4 +1,4 @@
-import { getPlanFilePath, getLegacyPlanFilePath } from "./planStorage";
+import { getPlanFilePath, getLegacyPlanFilePath, sharesPlanDirectory } from "./planStorage";
 
 describe("planStorage", () => {
   // Plan paths use tilde prefix for portability across local/remote runtimes
@@ -56,6 +56,19 @@ describe("planStorage", () => {
       const result = getLegacyPlanFilePath("a1b2c3d4e5", "/var/mux");
       expect(result).toBe("/var/mux/plans/a1b2c3d4e5.md");
       expect(result).not.toContain("~/.xum");
+    });
+  });
+
+  describe("sharesPlanDirectory", () => {
+    // Case-insensitive filesystems (macOS, Windows defaults) resolve both to one directory.
+    it("treats project names that differ only in case as one plan directory", () => {
+      const local = { type: "local" } as const;
+      expect(
+        sharesPlanDirectory(
+          { projectName: "App", runtimeConfig: local },
+          { projectName: "app", runtimeConfig: local }
+        )
+      ).toBe(true);
     });
   });
 });
