@@ -33,7 +33,7 @@ import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { getProjectName } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { syncProjectViaGitBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, syncProjectViaGitBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import {
   readHostGitconfig,
@@ -1228,6 +1228,16 @@ export class DockerRuntime extends RemoteRuntime {
             );
           }
         }
+      } catch {
+        // Ignore - best-effort
+      }
+
+      // Record the copied branches and stash before step 8 can remove origin/*, so the task_remove
+      // lossy check counts only the fork's own commits (#5105). Best-effort: without it the check
+      // counts every other branch.
+      try {
+        const snapshotCmd = `cd ${CONTAINER_SRC_DIR} && ${buildSourceRefSnapshotCommand(gitNoHooksPrefix(params.trusted))}`;
+        await runDockerCommand(`exec ${destContainerName} sh -c ${shescape.quote(snapshotCmd)}`, 30000);
       } catch {
         // Ignore - best-effort
       }

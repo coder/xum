@@ -5,6 +5,7 @@ import { execSync } from "child_process";
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 
 import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefinitions";
+import { buildSourceRefSnapshotCommand } from "@/node/runtime/gitBundleSync";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getSubagentGitPatchMboxPath } from "@/node/services/subagentGitPatchArtifacts";
 import { initGitRepo } from "@/node/services/taskService.testHarness";
@@ -95,26 +96,85 @@ describe("findUnpreservedSubagentWork", () => {
       success: true,
       data: { kind: "lossy", paths: [], uncapturedCommitCount: 0, otherRefCommitCount: 1 },
     });
-    // Other runtimes keep the scope at base..HEAD: a worktree's repository survives removal, and
-    // cp-based SSH copies inherit local-only branches this check cannot attribute.
-    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
 
     // A stash also lives only in the copy (clones never fetch refs/stash).
     execSync("git branch -D -q side", { cwd: repo });
-    await fsPromises.writeFile(path.join(repo, "README.md"), "stashed\n");
-    execSync("git stash -q", { cwd: repo });
-    const result = await check({ dockerCopy: true });
-    expect(result.success ? result.data : null).toMatchObject({ kind: "lossy", paths: [] });
+    await addStash();
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(2);
   });
 
-  test("a Docker copy without remote-tracking refs skips the other-branch count (#4761 gap 2)", async () => {
-    makeStandaloneCopy();
-    // A project without an origin URL loses its origin/* refs at creation, so nothing tells source
-    // branches from branches the child made. Counting them would refuse every such removal.
-    execSync("git remote remove origin", { cwd: repo });
+  /** Commits that only other branches or the stash hold; throws unless the check succeeded. */
+  function otherRefCount(result: Awaited<ReturnType<typeof check>>): number {
+    if (!result.success) throw new Error(result.error);
+    return result.data.kind === "lossy" ? (result.data.otherRefCommitCount ?? 0) : 0;
+  }
+
+  async function addStash() {
+    await fsPromises.writeFile(path.join(repo, "README.md"), `stashed ${Math.random()}\n`);
+    execSync("git stash -q", { cwd: repo });
+  }
+
+  function commitOnSideBranch() {
     execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
     execSync("git checkout -q task", { cwd: repo });
+  }
+
+  test("a Docker copy without remote-tracking refs counts every other branch and the stash (#5105)", async () => {
+    makeStandaloneCopy();
+    // A project without an origin URL loses its origin/* refs at creation. With no snapshot either
+    // (a copy made before #5105), nothing proves the source has `feature`, so it counts.
+    execSync("git remote remove origin", { cwd: repo });
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(1);
+    // A stash is counted even without remote-tracking refs.
+    execSync("git branch -D -q feature", { cwd: repo });
+    await addStash();
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(2);
+  });
+
+  test("the creation snapshot records the source's branches, so only the child's commits count (#5105)", async () => {
+    makeStandaloneCopy();
+    // Docker creation writes the snapshot and then removes a URL-less origin.
+    execSync(buildSourceRefSnapshotCommand(), { cwd: repo });
+    execSync("git remote remove origin", { cwd: repo });
     expect(await check({ dockerCopy: true })).toEqual({ success: true, data: { kind: "none" } });
+
+    commitOnSideBranch();
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(1);
+    execSync("git branch -D -q side", { cwd: repo });
+    await addStash();
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(2);
+  });
+
+  test("a cp -R -P copy (SSH fork fallback) counts inherited refs unless the snapshot records them (#5105)", async () => {
+    // The source holds a local-only branch and a stash that a `cp` copy inherits.
+    execSync("git checkout -q -b local && git commit -q --allow-empty -m local", { cwd: repo });
+    execSync("git checkout -q main", { cwd: repo });
+    await addStash();
+    const copy = path.join(rootDir, "copy");
+    execSync(`cp -R -P ${repo} ${copy}`);
+    const source = repo;
+    repo = copy;
+    execSync("git checkout -q -b task", { cwd: repo });
+    // Removal runs `rm -rf` on this standalone repository. Without a snapshot the check cannot
+    // attribute the inherited refs to the source, so they count (fail closed).
+    expect(otherRefCount(await check())).toBe(3);
+
+    // The fork writes the snapshot before creating the task branch.
+    execSync(`rm -rf ${copy} && cp -R -P ${source} ${copy}`);
+    execSync(buildSourceRefSnapshotCommand(), { cwd: repo });
+    execSync("git checkout -q -b task", { cwd: repo });
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+    await addStash();
+    expect(otherRefCount(await check())).toBe(2);
+  });
+
+  test("a linked worktree keeps the base..HEAD scope: its repository survives removal", async () => {
+    const worktree = path.join(rootDir, "worktree");
+    execSync(`git worktree add -q -b task ${worktree}`, { cwd: repo });
+    repo = worktree;
+    commitOnSideBranch();
+    await addStash();
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
   });
 
   test("a clean checkout with no new commits has nothing to preserve", async () => {

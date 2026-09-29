@@ -14031,7 +14031,11 @@ export class TaskService implements AgentTaskIntegration {
         ? [`${work.uncapturedCommitCount} commit(s) not captured by a ready patch artifact`]
         : []),
       ...(otherRefCommitCount > 0
-        ? [`${otherRefCommitCount} commit(s) held only by other local branches or the stash`]
+        ? // Copies without a source record count every other branch (#5105), so do not claim the
+          // commits exist nowhere else; only that nothing proves they do.
+          [
+            `${otherRefCommitCount} commit(s) on other local branches or in the stash that nothing shows exist outside this checkout`,
+          ]
         : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");

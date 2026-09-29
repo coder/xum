@@ -44,6 +44,7 @@ import { createSSHTransport } from "@/node/runtime/transports";
 import { runFullInit } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
+import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWorkCheck";
 
 const SSH_TEST_CWD = "/home/testuser";
 const execSSH = (runtime: Runtime, command: string, timeout = 30) =>
@@ -1217,7 +1218,12 @@ describeIntegration("Runtime integration tests", () => {
             `echo "legacy content" > legacy.txt`,
             `git add legacy.txt`,
             `git commit -m "legacy initial"`,
-            `git checkout -b legacy-branch`,
+            // A local-only branch and a stash the cp copy inherits (#5105).
+            `git checkout -b local-only`,
+            `git commit --allow-empty -m "local only"`,
+            `git checkout -b legacy-branch HEAD~1`,
+            `echo "stashed" >> legacy.txt`,
+            `git stash`,
           ].join(" && ")
         );
 
@@ -1250,6 +1256,30 @@ describeIntegration("Runtime integration tests", () => {
         // Verify content was copied.
         const fileCheck = await execSSH(runtime, `cat "${newWorkspacePath}/legacy.txt"`);
         expect(fileCheck.stdout.trim()).toBe("legacy content");
+
+        // #5105: removal deletes this copy with `rm -rf`. The fork recorded the inherited branch and
+        // stash, so the task_remove lossy check counts only commits the fork made itself.
+        const forkHead = (
+          await execSSH(runtime, `git -C "${newWorkspacePath}" rev-parse HEAD`)
+        ).stdout.trim();
+        const checkForkWork = () =>
+          findUnpreservedSubagentWork({
+            runtime,
+            projectRepos: [{ projectPath, projectName, repoCwd: newWorkspacePath }],
+            patchArtifact: null,
+            patchArtifactSessionDir: "/nonexistent-session-dir",
+            taskBaseCommitShaByProjectPath: { [projectPath]: forkHead },
+            removalDeletesBundleClone: false,
+          });
+        expect(await checkForkWork()).toEqual({ success: true, data: { kind: "none" } });
+        await execSSH(
+          runtime,
+          `cd "${newWorkspacePath}" && git checkout -q -b side && git commit -q --allow-empty -m side && git checkout -q ${newWorkspaceName}`
+        );
+        expect(await checkForkWork()).toEqual({
+          success: true,
+          data: { kind: "lossy", paths: [], uncapturedCommitCount: 0, otherRefCommitCount: 1 },
+        });
       } finally {
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
       }

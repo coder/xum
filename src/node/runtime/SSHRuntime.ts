@@ -50,7 +50,7 @@ import {
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
 } from "./sshConnectionPool";
-import { getOriginUrlForBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { syncRuntimeGitSubmodules } from "./submoduleSync";
@@ -3683,6 +3683,18 @@ export class SSHRuntime extends RemoteRuntime {
           await execBuffered(
             this,
             `cd ${stagingPathArg} && for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'origin/HEAD'); do localname=\${branch#origin/}; git show-ref --verify --quiet refs/heads/$localname || git branch $localname $branch; done`,
+            { cwd: "/tmp", timeout: 30 }
+          );
+        } catch {
+          // Ignore - best-effort.
+        }
+
+        // Best-effort: record the inherited branches and stash before origin/* can go away, so the
+        // task_remove lossy check counts only the fork's own commits (#5105).
+        try {
+          await execBuffered(
+            this,
+            `cd ${stagingPathArg} && ${buildSourceRefSnapshotCommand(nhp)}`,
             { cwd: "/tmp", timeout: 30 }
           );
         } catch {
