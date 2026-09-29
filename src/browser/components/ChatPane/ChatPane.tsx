@@ -406,12 +406,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         : previous
     );
   };
-  // The workspace whose edit send is unresolved. No edit starts meanwhile (#5226): overlapping
-  // edits would each restore and clear the composer by reply timing.
-  const [editSendPendingWorkspaceId, setEditSendPendingWorkspaceId] = useState<string | null>(null);
-  const editSendPending = editSendPendingWorkspaceId === workspaceId;
+  // The workspace with an unresolved edit send: no edit starts there meanwhile (#5226).
+  const [editSendPendingIn, setEditSendPendingIn] = useState<string | null>(null);
+  const editSendPending = editSendPendingIn === workspaceId;
   const handleEditSendPendingChange = (pending: boolean) =>
-    setEditSendPendingWorkspaceId((current) =>
+    setEditSendPendingIn((current) =>
       pending ? workspaceId : current === workspaceId ? null : current
     );
   /**
