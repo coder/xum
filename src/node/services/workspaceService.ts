@@ -45,6 +45,7 @@ import {
   ProvidersConfigStore,
   SecretsStore,
   WorkspaceNameTakenError,
+  workspacesSharingPlanDirectory,
   type Config,
 } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
@@ -437,6 +438,7 @@ import { secretsToRecord } from "@/common/types/secrets";
 import {
   copyPlanFileAcrossRuntimes,
   execBuffered,
+  getProjectName,
   movePlanFile,
 } from "@/node/utils/runtime/helpers";
 import {
@@ -5955,6 +5957,28 @@ export class WorkspaceService
       );
     }
 
+    // Create runtime for workspace creation
+    // Default to worktree runtime for backward compatibility
+    let finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
+      type: "worktree",
+      srcBaseDir: this.config.srcDir,
+    };
+
+    // Names whose plan file another workspace already uses: plans live at
+    // plans/<projectName>/<name>.md, and same-basename projects on the same plan storage share that
+    // directory (#5139). A new row under owningProjectPath reads back with its basename.
+    const planTarget = {
+      projectName: getProjectName(owningProjectPath),
+      runtimeConfig: finalRuntimeConfig,
+    };
+    const planDirectoryNames = new Set<string>();
+    for (const { workspace } of workspacesSharingPlanDirectory(
+      configSnapshot.projects,
+      planTarget
+    )) {
+      if (typeof workspace.name === "string") planDirectoryNames.add(workspace.name);
+    }
+
     // Auto-generate a branch name when the caller omits one (used by /new to
     // mirror /fork's seamless creation flow). Mirrors fork's auto-naming: scan
     // existing workspace names AND local git branches so numbering is stable.
@@ -5962,7 +5986,7 @@ export class WorkspaceService
     // owningProjectPath even when a sub-project initiated creation.
     let resolvedBranchName: string;
     if (branchName == null) {
-      const existingNamesSet = new Set<string>();
+      const existingNamesSet = new Set<string>(planDirectoryNames);
       for (const entry of projectConfig.workspaces ?? []) {
         if (typeof entry.name === "string") {
           existingNamesSet.add(entry.name);
@@ -6001,13 +6025,6 @@ export class WorkspaceService
     }
 
     const workspaceId = this.config.generateStableId();
-
-    // Create runtime for workspace creation
-    // Default to worktree runtime for backward compatibility
-    let finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
-      type: "worktree",
-      srcBaseDir: this.config.srcDir,
-    };
 
     if (this.policyService?.isEnforced()) {
       if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
@@ -6065,14 +6082,18 @@ export class WorkspaceService
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: WorkspaceCreationResult;
 
-      // If runtime uses config-level collision detection (e.g., Coder - can't reach host),
-      // check against existing workspace names before createWorkspace.
+      // A name another workspace's plan file uses (#5139) is occupied on every runtime, like a
+      // taken checkout directory: it gets the same collision suffix (or, for a sanitized branch
+      // name, the same refusal). If runtime uses config-level collision detection (e.g., Coder -
+      // can't reach host), the project's existing workspace names are checked here too.
+      const existingNames = new Set<string | undefined>(planDirectoryNames);
       if (runtime.createFlags?.configLevelCollisionDetection) {
-        const existingNames = new Set(
-          (this.config.loadConfigOrDefault().projects.get(owningProjectPath)?.workspaces ?? []).map(
-            (w) => w.name
-          )
-        );
+        for (const w of this.config.loadConfigOrDefault().projects.get(owningProjectPath)
+          ?.workspaces ?? []) {
+          existingNames.add(w.name);
+        }
+      }
+      if (existingNames.size > 0) {
         const configConflict = getBranchWorkspaceNameConflict(finalBranchName, existingNames);
         if (configConflict) {
           initLogger.logComplete(-1);
