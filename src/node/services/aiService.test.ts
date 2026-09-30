@@ -2581,7 +2581,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(result.success).toBe(true);
     };
 
-    const user1 = createMuxMessage("user-1", "user", "hello");
+    // The harness appends every row at sequence 7; a snapshot tail of 6 keeps
+    // the appended row contiguous with the request's history.
+    const user1 = createMuxMessage("user-1", "user", "hello", { historySequence: 6 });
     await send([user1], [lesson]);
     expect(listingRows()).toHaveLength(1);
     const firstRow = listingRows()[0];
@@ -2603,6 +2605,76 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const partial = createMuxMessage("assistant-2", "assistant", "working", { partial: true });
     await send([user1, firstRow, assistant1, user2, partial], [lesson]);
     expect(listingRows()).toHaveLength(2);
+  });
+
+  it("keeps listing rows out of a request whose history snapshot went stale", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing-race");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-context-listing-race";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const send = async (tailSequence: number) =>
+      harness.service.streamMessage({
+        messages: [createMuxMessage("user-1", "user", "hello", { historySequence: tailSequence })],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () =>
+          Promise.resolve({ indexEntries: [lesson], hotMemoriesBlock: null }),
+      });
+
+    // The harness appends every row at sequence 7. Snapshot tail 6: nothing
+    // was written in between, so the row joins this request.
+    expect((await send(6)).success).toBe(true);
+    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
+
+    // Snapshot tail 5: another writer took sequence 6 after the snapshot. The
+    // row stays in history for the next turn but not in this request.
+    expect((await send(5)).success).toBe(true);
+    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).not.toContain(lesson.path);
+  });
+
+  it("carries listing rows in a rollover candidate without persisting them", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing-candidate");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-context-listing-candidate";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const options = {
+      messages: [createMuxMessage("user-1", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off" as const,
+      experiments: { memory: true },
+      resolveMemoryContext: () =>
+        Promise.resolve({ indexEntries: [lesson], hotMemoriesBlock: null }),
+    };
+
+    const prepared = await harness.service.prepareStreamMessage(options);
+    if (!prepared.success) throw new Error("Expected a prepared candidate");
+    // The first turn of the new window still sees the listing...
+    expect((await prepared.data.start(options)).success).toBe(true);
+    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
+    // ...while accepted history stays untouched until a live turn persists it.
+    const appended = harness.appendToHistorySpy.mock.calls.map(([, message]) => message);
+    expect(appended.filter(isContextListingMessage)).toHaveLength(0);
   });
 
   it("keeps the tool definitions byte-identical when the memory index changes", async () => {
