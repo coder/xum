@@ -819,6 +819,20 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
       };
     })(),
     (() => {
+      // Git-less builds keep git_describe "unknown" and set only the commit.
+      const original = VERSION.git_commit;
+      return {
+        name: "a commit-only version change",
+        change: () => {
+          VERSION.git_commit = `${original}-next`;
+          return Promise.resolve();
+        },
+        restore: () => {
+          VERSION.git_commit = original;
+        },
+      };
+    })(),
+    (() => {
       const original = process.env.XUM_FORCE_REAL_TOKENIZER;
       return {
         name: "an approx-tokenizer flag flip",

@@ -1,4 +1,4 @@
-import { hash } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   countTokens,
   countTokensBatch,
@@ -91,13 +91,15 @@ export class TokenizerService {
     const providersConfig = this.providerService.getConfig();
     const parentWorkspaceId = metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null;
     // Built from the exact objects that go into the count, never re-read after an await.
-    const inputsKey = hash(
-      "sha256",
+    // createHash, not crypto.hash: the headless CLI still accepts Node 20 before 20.12.
+    const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+    const inputsKey = sha256(
       JSON.stringify({
         v: 1,
-        partial: partial === null ? null : hash("sha256", JSON.stringify(partial)),
+        partial: partial === null ? null : sha256(JSON.stringify(partial)),
         hasParent: Boolean(parentWorkspaceId),
-        app: VERSION.git_describe,
+        // git_describe is "unknown" in git-less builds that set only XUM_GIT_COMMIT.
+        app: [VERSION.git_describe, VERSION.git_commit],
         approx: shouldUseApproxTokenizer(),
       })
     );
