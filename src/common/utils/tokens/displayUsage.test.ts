@@ -596,6 +596,27 @@ describe("OpenAI service-tier pricing (#4352)", () => {
     expect(ratio(272_001)).toBeCloseTo(ratio(272_000), 12);
   });
 
+  test("charges the highest published rate for an unpublished Fast long-context cell", () => {
+    // gpt-5.5 publishes Fast short-context rates only.
+    const fastShort = display("openai:gpt-5.5", 272_000, "priority");
+    const standardLong = display("openai:gpt-5.5", 272_001);
+    const fastLong = display("openai:gpt-5.5", 272_001, "priority");
+    const perToken = (value: number | undefined, tokens: number) => (value ?? NaN) / tokens;
+    expect(getTotalCost(fastLong)).toBeGreaterThan(getTotalCost(standardLong) ?? Infinity);
+    expect(fastLong.input.cost_usd).toBeCloseTo(
+      272_001 *
+        Math.max(
+          perToken(fastShort.input.cost_usd, 272_000),
+          perToken(standardLong.input.cost_usd, 272_001)
+        ),
+      12
+    );
+    expect(fastLong.output.cost_usd).toBeCloseTo(
+      Math.max(fastShort.output.cost_usd ?? NaN, standardLong.output.cost_usd ?? NaN),
+      12
+    );
+  });
+
   test("prices an unknown reported tier at least as high as Fast", () => {
     const unknown = cost("openai:gpt-6.1-sol", 100_000, "hyperfast");
     expect(unknown).toBeGreaterThan(cost("openai:gpt-6.1-sol", 100_000));

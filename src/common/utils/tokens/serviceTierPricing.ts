@@ -23,7 +23,7 @@ export function normalizeOpenAIServiceTier(value: unknown): PricedServiceTier | 
     return undefined;
   }
   switch (value) {
-    // Priority was renamed Fast on 2026-07-30; older models answer "priority".
+    // Priority was renamed Fast on 2026-07-30; GPT-5.6 and earlier still answer "priority".
     case "priority":
     case "fast":
       return "fast";
@@ -129,10 +129,10 @@ type PricedTierWithFactors = "flex" | "fast" | "ultrafast";
 
 /**
  * Factors reproduce every published Flex/Fast cell from the model's Standard
- * rates (the page rounds a few cells). Factors rather than copied rate cards so
- * a Standard change carries over ("Fast mode costs twice the corresponding
- * Standard rate"). Keys are the bare catalog keys the model's
- * Standard stats resolve from.
+ * rates (the page rounds a few cells, e.g. gpt-5.4 Flex cached shows $0.13 for
+ * 0.5 × $0.25). Factors rather than copied rate cards so a Standard change carries
+ * over ("Fast mode costs twice the corresponding Standard rate"). Keys are the bare
+ * catalog keys the model's Standard stats resolve from.
  */
 const SERVICE_TIER_FACTORS: Readonly<
   Record<string, Partial<Record<PricedTierWithFactors, TierFactor>>>
@@ -144,8 +144,33 @@ const SERVICE_TIER_FACTORS: Readonly<
   },
   "gpt-6.1-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
   "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  // Unsupported older models stay here: they remain routable as custom/persisted
+  // strings and LiteLLM still prices their Standard rates, so dropping the factor
+  // would bill a reported Fast/Flex response at Standard (under-counting budgets).
+  "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-5.5": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2.5) },
+  "gpt-5.5-pro": { flex: HALF_SHORT_ONLY },
+  "gpt-5.4": { flex: HALF_BOTH_BANDS, fast: fastShortOnly(2) },
+  "gpt-5.4-pro": { flex: HALF_BOTH_BANDS },
+  "gpt-5.4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5.4-nano": { flex: HALF_SHORT_ONLY },
+  "gpt-5.3-codex": { fast: fastShortOnly(2) },
+  "gpt-5.2": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5.1": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(2) },
+  "gpt-5-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.8) },
+  "gpt-5-nano": { flex: HALF_SHORT_ONLY },
   o3: { flex: HALF_SHORT_ONLY, fast: fastShortOnly(1.75) },
   "o4-mini": { flex: HALF_SHORT_ONLY, fast: fastShortOnly(20 / 11) },
+  "gpt-4.1": { fast: fastShortOnly(1.75) },
+  "gpt-4.1-mini": { fast: fastShortOnly(1.75) },
+  "gpt-4.1-nano": { fast: fastShortOnly(2) },
+  "gpt-4o": { fast: fastShortOnly(1.7) },
+  "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
+  "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
   // Anthropic Fast mode: 2× Standard across the full context window, with prompt
   // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
   // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
