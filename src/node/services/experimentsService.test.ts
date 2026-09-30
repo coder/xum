@@ -296,6 +296,30 @@ describe("ExperimentsService", () => {
     expect((await readOverridesFile()).overrides).toEqual({});
   });
 
+  test("rewrites keep overrides for experiments this build does not know", async () => {
+    // Promoted experiments are unknown here but still gate features in older builds.
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: { "advisor-tool": true, timeline: false },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.MEMORY, true);
+
+    expect((await readOverridesFile()).overrides).toEqual({
+      "advisor-tool": true,
+      timeline: false,
+      [EXPERIMENT_IDS.MEMORY]: true,
+    });
+    expect(await service.getOverrides()).toEqual({ [EXPERIMENT_IDS.MEMORY]: true });
+  });
+
   test("a client with empty local state does not clear overrides it never knew about", async () => {
     await fs.writeFile(
       path.join(tempDir, OVERRIDES_FILE),
