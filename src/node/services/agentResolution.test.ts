@@ -879,7 +879,7 @@ describe("resolveAgentForStream strict resolution", () => {
 });
 
 describe("resolveAgentForStream advisor defaults", () => {
-  test("enables advisor by default for Exec and Plan sub-agents when the experiment is enabled", async () => {
+  test("enables advisor by default for Exec and Plan sub-agents", async () => {
     const [execPolicy, planPolicy] = await Promise.all([
       resolvePolicyForAgent({ agentId: "exec" }),
       resolvePolicyForAgent({ agentId: "plan" }),
