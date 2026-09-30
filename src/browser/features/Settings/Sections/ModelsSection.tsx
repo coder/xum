@@ -41,7 +41,6 @@ import { formatProviderDisplayName } from "@/common/utils/providers/customProvid
 import {
   CUSTOM_MODELS_PAGE_SIZE,
   MAX_RENDERED_MODELS,
-  MODEL_CATALOG_MIN_QUERY_LENGTH,
   MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
 } from "@/common/constants/ui";
 import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
@@ -131,7 +130,7 @@ export function ModelsSection() {
     policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
   const { api } = useAPI();
-  const { open: openSettings } = useSettings();
+  const { open: openSettings, close: closeSettings } = useSettings();
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
   const [newModelId, setNewModelId] = useState("");
@@ -253,6 +252,10 @@ export function ModelsSection() {
   const handleAddModel = (modelId = newModelId) => {
     const trimmedModelId = modelId.trim();
     if (!lastProvider || !trimmedModelId) return;
+    if (/\s/.test(trimmedModelId)) {
+      setError("Model IDs can't contain spaces");
+      return;
+    }
 
     if (addModel(lastProvider, trimmedModelId)) {
       resetAddField();
@@ -268,7 +271,7 @@ export function ModelsSection() {
   };
 
   const catalogQuery = newModelId.trim();
-  const catalogQueryActive = catalogQuery.length >= MODEL_CATALOG_MIN_QUERY_LENGTH;
+  const catalogQueryActive = catalogQuery.length > 0;
   useEffect(() => {
     if (!suggestionsSession || !catalogQueryActive || !api) {
       return;
@@ -306,31 +309,6 @@ export function ModelsSection() {
     catalog?.policy === effectivePolicy
       ? catalog
       : null;
-
-  const loadMoreCatalog = () => {
-    const current = activeCatalog;
-    const offset = current?.result.nextOffset ?? null;
-    if (!current || offset === null || !api) return;
-    api.providers
-      .searchModelCatalog({
-        query: current.query,
-        offset,
-        limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
-      })
-      .then(
-        (page) =>
-          // Append only onto the exact result this page continues.
-          setCatalog((prev) =>
-            prev === current
-              ? {
-                  ...current,
-                  result: { ...page, models: [...current.result.models, ...page.models] },
-                }
-              : prev
-          ),
-        () => undefined
-      );
-  };
 
   useEffect(() => {
     // Coder already publishes its routing catalog; discovery must not invoke its writers.
@@ -401,13 +379,12 @@ export function ModelsSection() {
   }));
   // Built-in and already-added models are selectable elsewhere, so they are not
   // offered; neither are rows already listed as discovered for this provider.
+  const isOfferableCatalogModel = (model: ModelCatalogEntry) =>
+    !model.builtIn &&
+    !modelExists(model.provider, model.providerModelId) &&
+    !(model.provider === lastProvider && suggestions.includes(model.providerModelId));
   const catalogOptions: SuggestionOption[] = (activeCatalog?.result.models ?? [])
-    .filter(
-      (model) =>
-        !model.builtIn &&
-        !modelExists(model.provider, model.providerModelId) &&
-        !(model.provider === lastProvider && suggestions.includes(model.providerModelId))
-    )
+    .filter(isOfferableCatalogModel)
     .map((model) => ({ key: `catalog:${model.id}`, kind: "catalog", model }));
   const catalogRemaining =
     activeCatalog?.result.nextOffset != null
@@ -426,6 +403,42 @@ export function ModelsSection() {
     highlightedModel?.policy === effectivePolicy
       ? options.findIndex((option) => option.key === highlightedModel.key)
       : -1;
+
+  const loadMoreCatalog = () => {
+    const current = activeCatalog;
+    const offset = current?.result.nextOffset ?? null;
+    if (!current || offset === null || !api) return;
+    api.providers
+      .searchModelCatalog({
+        query: current.query,
+        offset,
+        limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+      })
+      .then(
+        (page) => {
+          // Append only onto the exact result this page continues.
+          setCatalog((prev) =>
+            prev === current
+              ? {
+                  ...current,
+                  result: { ...page, models: [...current.result.models, ...page.models] },
+                }
+              : prev
+          );
+          // The last page removes "Show more"; move a keyboard highlight onto a model row so
+          // the next Enter cannot fall through to adding the typed query as a model ID.
+          const next =
+            page.models.find(isOfferableCatalogModel) ??
+            (page.nextOffset === null
+              ? current.result.models.findLast(isOfferableCatalogModel)
+              : undefined);
+          setHighlightedModel((prev) =>
+            prev?.key === "catalog-more" && next ? { ...prev, key: `catalog:${next.id}` } : prev
+          );
+        },
+        () => undefined
+      );
+  };
 
   const selectOption = (option: SuggestionOption) => {
     if (option.kind === "discovered") handleAddModel(option.modelId);
@@ -466,7 +479,10 @@ export function ModelsSection() {
         ) : option.kind === "catalog" ? (
           <>
             <span className="text-muted inline-flex items-center gap-1 whitespace-nowrap">
-              <ProviderIcon provider={option.model.provider} />
+              {/* Some icon SVGs carry a <title>; the visible name already labels the row. */}
+              <span aria-hidden className="inline-flex">
+                <ProviderIcon provider={option.model.provider} />
+              </span>
               {formatProviderDisplayName(option.model.provider, config?.[option.model.provider])}
             </span>
             <span className="truncate font-mono">{option.model.providerModelId}</span>
@@ -717,12 +733,12 @@ export function ModelsSection() {
           value={modelFilter}
           onChange={(e) => setModelFilter(e.target.value)}
           onKeyDown={(e) => {
-            // Only a non-empty filter consumes Escape; otherwise it still closes Settings.
-            if (e.key === "Escape" && modelFilter) {
-              e.preventDefault();
-              stopKeyboardPropagation(e);
-              setModelFilter("");
-            }
+            if (e.key !== "Escape") return;
+            e.preventDefault();
+            stopKeyboardPropagation(e);
+            // The dialog ignores Escape from inputs, so an empty filter closes Settings itself.
+            if (modelFilter) setModelFilter("");
+            else closeSettings();
           }}
           className="bg-background border-border-medium focus:border-accent h-8 w-full rounded border py-1 pr-2 pl-7 text-xs focus:outline-none"
         />
@@ -734,7 +750,7 @@ export function ModelsSection() {
 
         {/* Add new model form - styled to match table */}
         <div className="border-border-medium rounded-md border">
-          <div className="border-border-medium bg-background-secondary/50 flex flex-wrap items-center gap-1.5 border-b px-2 py-1.5 md:px-3">
+          <div className="border-border-medium bg-background-secondary/50 relative flex flex-wrap items-center gap-1.5 border-b px-2 py-1.5 md:px-3">
             <Select
               value={lastProvider}
               onValueChange={(provider) => {
@@ -760,8 +776,9 @@ export function ModelsSection() {
                 ))}
               </SelectContent>
             </Select>
+            {/* Below md the suggestions span the whole add row, not just the narrow input. */}
             <div
-              className="relative min-w-[8rem] flex-1"
+              className="min-w-[8rem] flex-1 md:relative"
               onBlur={(e) => {
                 if (!e.currentTarget.contains(e.relatedTarget)) {
                   setSuggestionsSession(null);
@@ -769,77 +786,79 @@ export function ModelsSection() {
                 }
               }}
             >
-              <input
-                ref={modelInputRef}
-                type="text"
-                role="combobox"
-                aria-label="Model ID"
-                aria-autocomplete="list"
-                aria-describedby={discoveryMessage ? `${suggestionsId}-status` : undefined}
-                aria-expanded={showSuggestions}
-                aria-controls={showSuggestions ? suggestionsId : undefined}
-                aria-activedescendant={
-                  highlightedIndex >= 0 ? `${suggestionsId}-${highlightedIndex}` : undefined
-                }
-                autoComplete="off"
-                value={newModelId}
-                onChange={(e) => {
-                  setNewModelId(e.target.value);
-                  setHighlightedModel(null);
-                  setSuggestionsSession((session) => session ?? {});
-                }}
-                onFocus={() => setSuggestionsSession((session) => session ?? {})}
-                onClick={() => setSuggestionsSession((session) => session ?? {})}
-                placeholder="model-id"
-                className="bg-background border-border-medium focus:border-accent h-7 w-full rounded border py-1 pr-6 pl-2 font-mono text-xs focus:outline-none"
-                onKeyDown={(e) => {
-                  if (e.nativeEvent.isComposing) return;
-                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setSuggestionsSession((session) => session ?? {});
-                    const next =
-                      e.key === "ArrowDown"
-                        ? Math.min(highlightedIndex + 1, options.length - 1)
-                        : highlightedIndex < 0
-                          ? options.length - 1
-                          : Math.max(highlightedIndex - 1, 0);
-                    const option = options[next];
-                    setHighlightedModel(
-                      option
-                        ? {
-                            key: option.key,
-                            api,
-                            provider: lastProvider,
-                            config,
-                            policy: effectivePolicy,
-                          }
-                        : null
-                    );
-                  } else if (e.key === "Enter") {
-                    e.preventDefault();
-                    const option = highlightedIndex >= 0 ? options[highlightedIndex] : undefined;
-                    if (option) selectOption(option);
-                    else handleAddModel();
-                  } else if (e.key === "Escape" && suggestionsSession) {
-                    e.preventDefault();
-                    stopKeyboardPropagation(e);
-                    setSuggestionsSession(null);
-                    setHighlightedModel(null);
+              <div className="relative">
+                <input
+                  ref={modelInputRef}
+                  type="text"
+                  role="combobox"
+                  aria-label="Model ID"
+                  aria-autocomplete="list"
+                  aria-describedby={discoveryMessage ? `${suggestionsId}-status` : undefined}
+                  aria-expanded={showSuggestions}
+                  aria-controls={showSuggestions ? suggestionsId : undefined}
+                  aria-activedescendant={
+                    highlightedIndex >= 0 ? `${suggestionsId}-${highlightedIndex}` : undefined
                   }
-                }}
-              />
-              {discoveredUnconfigured.length > 0 && (
-                <ChevronDown
-                  aria-hidden
-                  className="text-muted pointer-events-none absolute top-2 right-2 h-3 w-3"
+                  autoComplete="off"
+                  value={newModelId}
+                  onChange={(e) => {
+                    setNewModelId(e.target.value);
+                    setHighlightedModel(null);
+                    setSuggestionsSession((session) => session ?? {});
+                  }}
+                  onFocus={() => setSuggestionsSession((session) => session ?? {})}
+                  onClick={() => setSuggestionsSession((session) => session ?? {})}
+                  placeholder="model-id"
+                  className="bg-background border-border-medium focus:border-accent h-7 w-full rounded border py-1 pr-6 pl-2 font-mono text-xs focus:outline-none"
+                  onKeyDown={(e) => {
+                    if (e.nativeEvent.isComposing) return;
+                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSuggestionsSession((session) => session ?? {});
+                      const next =
+                        e.key === "ArrowDown"
+                          ? Math.min(highlightedIndex + 1, options.length - 1)
+                          : highlightedIndex < 0
+                            ? options.length - 1
+                            : Math.max(highlightedIndex - 1, 0);
+                      const option = options[next];
+                      setHighlightedModel(
+                        option
+                          ? {
+                              key: option.key,
+                              api,
+                              provider: lastProvider,
+                              config,
+                              policy: effectivePolicy,
+                            }
+                          : null
+                      );
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      const option = highlightedIndex >= 0 ? options[highlightedIndex] : undefined;
+                      if (option) selectOption(option);
+                      else handleAddModel();
+                    } else if (e.key === "Escape" && suggestionsSession) {
+                      e.preventDefault();
+                      stopKeyboardPropagation(e);
+                      setSuggestionsSession(null);
+                      setHighlightedModel(null);
+                    }
+                  }}
                 />
-              )}
+                {discoveredUnconfigured.length > 0 && (
+                  <ChevronDown
+                    aria-hidden
+                    className="text-muted pointer-events-none absolute top-2 right-2 h-3 w-3"
+                  />
+                )}
+              </div>
               {showSuggestions && (
                 <div
                   id={suggestionsId}
                   role="listbox"
                   aria-label="Model suggestions"
-                  className="bg-background border-border-medium absolute top-full z-50 mt-1 max-h-60 w-full overflow-y-auto rounded border p-1 shadow-md"
+                  className="bg-background border-border-medium absolute inset-x-2 top-full z-50 mt-1 max-h-60 overflow-y-auto rounded border p-1 shadow-md md:inset-x-0"
                 >
                   {discoveredOptions.length > 0 && (
                     <div role="group" aria-label="Discovered models">
@@ -899,7 +918,7 @@ export function ModelsSection() {
           </div>
         )}
         {pagedCustomModels.length > 0 && (
-          <div className="border-border-medium overflow-hidden rounded-md border">
+          <div className="border-border-medium overflow-x-auto rounded-md border">
             <table className="w-full">
               <ModelsTableHeader />
               <tbody>
@@ -1028,7 +1047,7 @@ export function ModelsSection() {
             No built-in models match the filter.
           </div>
         ) : (
-          <div className="border-border-medium overflow-hidden rounded-md border">
+          <div className="border-border-medium overflow-x-auto rounded-md border">
             <table className="w-full">
               <ModelsTableHeader />
               <tbody>

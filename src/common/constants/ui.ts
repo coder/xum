@@ -7,8 +7,6 @@ export const MAX_RENDERED_MODELS = 200;
 
 /** Settings > Models: catalogue suggestions fetched per page while typing. */
 export const MODEL_CATALOG_SUGGESTION_PAGE_SIZE = 20;
-/** Settings > Models: shorter queries skip the catalogue search. */
-export const MODEL_CATALOG_MIN_QUERY_LENGTH = 2;
 /** Settings > Models: custom model rows rendered per table page. */
 export const CUSTOM_MODELS_PAGE_SIZE = 25;
 

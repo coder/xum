@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { wrapAsyncIterator } from "@orpc/shared";
 import { useImperativeHandle, useState, type ReactNode, type RefObject } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { useSettings } from "@/browser/contexts/SettingsContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
@@ -33,6 +34,15 @@ interface DiscoveryRequest {
 }
 
 // A reconnect hands the settings tree a new API client while config and policy stay put.
+function SettingsProbe() {
+  const settings = useSettings();
+  return (
+    <button type="button" onClick={() => settings.open("models")}>
+      {settings.isOpen ? "Settings open" : "Settings closed"}
+    </button>
+  );
+}
+
 function SwappableAPI(props: {
   initial: APIClient;
   handle: RefObject<((client: APIClient) => void) | null>;
@@ -112,6 +122,7 @@ async function setup(
       <TooltipProvider>
         <SwappableAPI initial={client} handle={swapHandle}>
           <ModelsSection />
+          <SettingsProbe />
         </SwappableAPI>
       </TooltipProvider>
     </SettingsSectionStory>
@@ -489,10 +500,37 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "OpenAIvendor-late"]);
     expect(ui.save).not.toHaveBeenCalled();
 
-    ui.key("ArrowUp");
+    // The last page removes "Show more"; the highlight must land on a model, not vanish.
     expect(activeName()).toBe("OpenAIvendor-late");
     ui.key("Enter");
     expect(ui.save.mock.calls[0][0]).toEqual({ provider: "openai", models: ["vendor-late"] });
+  });
+});
+
+describe("ModelsSection filter Escape", () => {
+  test("clears a non-empty filter, then closes Settings", async () => {
+    const ui = await setup();
+    fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    await ui.user.type(filter, "gpt");
+    fireEvent.keyDown(filter, { key: "Escape" });
+    expect([
+      (filter as HTMLInputElement).value,
+      ui.view.queryByText("Settings open") !== null,
+    ]).toEqual(["", true]);
+    fireEvent.keyDown(filter, { key: "Escape" });
+    await ui.view.findByText("Settings closed");
+  });
+});
+
+describe("ModelsSection manual model IDs", () => {
+  test("rejects an ID containing whitespace instead of saving it", async () => {
+    const ui = await setup();
+    await ui.type("sonnet 4");
+    ui.key("Enter");
+    fireEvent.click(ui.add);
+    expect(ui.save).not.toHaveBeenCalled();
+    expect(ui.input.value).toBe("sonnet 4");
   });
 });
 
