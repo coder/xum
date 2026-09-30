@@ -2769,7 +2769,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       agentId?: string;
     }
 
-    async function streamPair(xumHomePath: string, states: [PrefixState, PrefixState]) {
+    // Captured right after each request, while its state is current.
+    type Observe = (
+      request: TurnExecutionOptions,
+      toolConfig: Parameters<typeof realGetToolsForModel>[1] | undefined
+    ) => unknown;
+
+    async function streamPair(
+      xumHomePath: string,
+      states: [PrefixState, PrefixState],
+      observe?: Observe
+    ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(projectPath, { recursive: true });
       const workspaceId = "workspace-prefix-guard";
@@ -2792,7 +2802,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       );
       // Real tools, agent resolution, system prompt and message preparation:
       // the serialized request is under test.
-      harness.getToolsForModelSpy.mockRestore();
+      // Call through, so each request's tool configuration is recorded too.
+      harness.getToolsForModelSpy.mockImplementation(realGetToolsForModel);
       spyOn(agentResolution, "resolveAgentForStream").mockRestore();
       spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
       spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
@@ -2840,9 +2851,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           };
           return Promise.resolve(state.goalStatus == null ? null : (goal as GoalRecordV1));
         }),
+        setGoal: mock(() => Promise.resolve({ success: true, data: { goalId: "goal-1" } })),
       } as unknown as WorkspaceGoalService;
 
       const requests: TurnExecutionOptions[] = [];
+      const observations: string[] = [];
       for (const next of states) {
         state = next;
         const result = await harness.service.streamMessage({
@@ -2856,16 +2869,25 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           workspaceGoalService: goalService,
         });
         expect(result.success).toBe(true);
-        requests.push(harness.startStreamCalls.at(-1)!);
+        const request = harness.startStreamCalls.at(-1)!;
+        requests.push(request);
+        observations.push(
+          JSON.stringify(
+            (await observe?.(request, harness.getToolsForModelSpy.mock.calls.at(-1)?.[1])) ?? null
+          )
+        );
       }
-      return requests;
+      return { requests, observations };
     }
 
-    // Ordered, so a reorder or a moved cache breakpoint is a difference too (#5252).
+    // Ordered, so a reorder or a moved cache breakpoint is a difference too
+    // (#5252). Provider-native tools are identified by id and args on the wire.
     const toolBlock = (request: TurnExecutionOptions) =>
       JSON.stringify(
         Object.entries(request.tools ?? {}).map(([name, requestTool]) => [
           name,
+          requestTool.type ?? "function",
+          requestTool.type === "provider" ? [requestTool.id, requestTool.args] : null,
           requestTool.description,
           asSchema(requestTool.inputSchema).jsonSchema,
           requestTool.providerOptions ?? null,
@@ -2883,50 +2905,55 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       return JSON.stringify(row);
     };
 
-    const systemText = (request: TurnExecutionOptions) =>
-      JSON.stringify(request.messages.filter((message) => message.role === "system"));
+    const systemTail = (request: TurnExecutionOptions) =>
+      JSON.stringify(request.messages.slice(1).filter((message) => message.role === "system"));
+    // Goal status is read by the handlers at execution time (#5247), so the
+    // flip shows in what complete_goal does, not in the request.
+    const completeGoal: Observe = (request) =>
+      request.tools?.complete_goal?.execute?.(
+        { summary: "done", goalId: null },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      );
 
     it.each<{
       label: string;
       states: [PrefixState, PrefixState];
-      // Proves the flipped state reached the request, so equality is not vacuous.
-      observed: (request: TurnExecutionOptions) => boolean;
+      // Must differ between the two requests, so the flipped state provably
+      // reached them and the equality below is not vacuous.
+      observe: Observe;
     }>([
-      {
-        label: "goal status",
-        states: [{}, { goalStatus: "active" }],
-        observed: (request) => request.tools?.complete_goal !== undefined,
-      },
+      { label: "goal status", states: [{}, { goalStatus: "active" }], observe: completeGoal },
       {
         label: "goal completion",
         states: [{ goalStatus: "active" }, { goalStatus: "complete" }],
-        observed: (request) => request.tools?.set_goal !== undefined,
+        observe: completeGoal,
       },
       {
         label: "rollover availability",
         states: [{ rolloverAvailable: false }, { rolloverAvailable: true }],
-        observed: (request) => request.tools?.new_context !== undefined,
+        observe: (_request, toolConfig) => toolConfig?.contextBudgetRolloverAvailable,
       },
       // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
       {
         label: "tool-search experiment",
         states: [{ toolSearch: false }, { toolSearch: true }],
-        observed: (request) => request.tools?.alpha_lookup !== undefined,
+        observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
       },
       {
         // The <mcp> inventory lists configured servers; the failure goes to the uncached tail.
         label: "MCP server failure",
         states: [{}, { failedMcpServers: ["beta"] }],
-        observed: (request) =>
-          stableSystemRow(request).includes("beta") &&
-          systemText(request).split("beta").length > stableSystemRow(request).split("beta").length,
+        observe: (request) => systemTail(request),
       },
     ])(
       "keeps the tool block and the cached system row across $label",
-      async ({ states, observed }) => {
+      async ({ states, observe }) => {
         using xumHome = new DisposableTempDir("ai-service-prefix-guard");
-        const [before, after] = await streamPair(xumHome.path, states);
-        expect(observed(after)).toBe(true);
+        const {
+          requests: [before, after],
+          observations,
+        } = await streamPair(xumHome.path, states, observe);
+        expect(observations[1]).not.toBe(observations[0]);
         expect(breakpointTools(before)).toHaveLength(1);
         expect(breakpointTools(after)).toEqual(breakpointTools(before));
         expect(toolBlock(after)).toBe(toolBlock(before));
@@ -2936,10 +2963,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     it("keeps the tool block across a root agent switch", async () => {
       using xumHome = new DisposableTempDir("ai-service-prefix-guard");
-      const [exec, plan] = await streamPair(xumHome.path, [
-        { agentId: "exec" },
-        { agentId: "plan" },
-      ]);
+      const {
+        requests: [exec, plan],
+      } = await streamPair(xumHome.path, [{ agentId: "exec" }, { agentId: "plan" }]);
       expect(breakpointTools(exec)).toHaveLength(1);
       expect(toolBlock(plan)).toBe(toolBlock(exec));
       // Expected difference until #5292: the system prompt still carries the
