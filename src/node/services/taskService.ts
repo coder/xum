@@ -2071,6 +2071,12 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopEpochs = new Map<string, number>();
   /**
+   * User Stops per workspace (markParentWorkspaceInterrupted). The stop epoch above also counts
+   * owner interrupts of a delegated turn, which a message waiting for that turn survives (see
+   * flushParkedPeerSends), so parking needs this separate count to tell a user Stop apart.
+   */
+  private readonly workspaceUserStopEpochs = new Map<string, number>();
+  /**
    * #4997: peer messages to a root whose running delegated workspace turn the sender does not
    * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
    * are delivered as ordinary new turns once its live registration is released (see
@@ -9729,7 +9735,14 @@ export class TaskService implements AgentTaskIntegration {
           return awaitDelegatedTurn;
         }
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        if (live == null) return null;
+        // A send that resolved a correlation continues that turn only while it is registered:
+        // once it settled (for example by a read of its handle, which does not take this lock),
+        // the correlation is stale and must not reach the session (finding F3).
+        if (live == null) {
+          return delegatedTurnCorrelation != null && delegatedTurnCorrelation !== "unresolved"
+            ? delegatedRootStartingRefusal
+            : null;
+        }
         // A retry never joins a delegated turn, not even one its own sender started meanwhile.
         if (live.ownerWorkspaceId !== senderWorkspaceId || awaitedDelegatedTurn != null) {
           return awaitDelegatedTurn;
@@ -9841,6 +9854,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       const chainStopEpochChanged = (chainIds: string[]): boolean =>
         chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
+      // Only a first attempt parks, and only root targets wait, so the target's own count is
+      // the one that matters (see park()).
+      const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
 
       // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
       // unarchived: refuse before any envelope row is persisted, instead of
@@ -9918,12 +9934,20 @@ export class TaskService implements AgentTaskIntegration {
       // attribution stays on the assistant payload row, so no provenance is lost; the queue
       // still counts these entries by their dedupe-key prefix.
       // A retry after a delegated turn never carries a correlation (#4997).
-      const workspaceTurnMuxMetadata =
+      const resolvedTurnMuxMetadata =
         awaitedDelegatedTurn == null
           ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
               targetId,
               { requireAcceptedRegistration: true }
             )
+          : undefined;
+      // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
+      // it, so it never needs the correlation, and must not carry it if the turn settles before
+      // the admission gates look again (finding F3). Reawakened agent-task children are continued
+      // by any peer.
+      const workspaceTurnMuxMetadata =
+        targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
+          ? resolvedTurnMuxMetadata
           : undefined;
       delegatedTurnCorrelation = workspaceTurnMuxMetadata;
       // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
@@ -10124,6 +10148,14 @@ export class TaskService implements AgentTaskIntegration {
       const park = (): void => {
         assert(firstAttempt, "sendTreeMessage: a retry after a delegated turn never waits again");
         if (parkedThisAttempt) return;
+        // A user Stop since this attempt was admitted refuses it, even when the stop landed after
+        // the refusing gate (the final gate awaits its rollback before onCanceled parks). The
+        // Stop already dropped the parked list, and the flush takes a new target stop baseline,
+        // so a message parked now would run after the Stop once the user resumes (finding F1).
+        if ((this.workspaceUserStopEpochs.get(targetId) ?? 0) !== capturedUserStopEpoch) {
+          admissionRefusal = interruptedRefusal;
+          return;
+        }
         parkedThisAttempt = true;
         this.parkPeerSend({
           ...spec,
@@ -10137,6 +10169,7 @@ export class TaskService implements AgentTaskIntegration {
       };
       const waitForDelegatedTurn = () => {
         park();
+        if (!parkedThisAttempt) return Err(admissionRefusal ?? interruptedRefusal);
         this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
         return Ok({ delivery: "queued" as const, relation, awaitsDelegatedTurn: true as const });
       };
@@ -16007,6 +16040,10 @@ export class TaskService implements AgentTaskIntegration {
     // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
     // in-flight peer-send admission also needs the monotonic generation to observe the stop.
     this.bumpWorkspaceStopEpoch(workspaceId);
+    this.workspaceUserStopEpochs.set(
+      workspaceId,
+      (this.workspaceUserStopEpochs.get(workspaceId) ?? 0) + 1
+    );
     // A user Stop refuses agent messages that were not admitted yet, including those waiting
     // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
     // sendTreeMessage), so drop them here rather than let them run after a resume.

@@ -38,11 +38,13 @@ CONSTANTS
     MaxOwnerInts,    \* owner interrupts allowed
     AllowWithdraw,   \* may the owner's continuation be withdrawn (#5261)
     Fix5277,         \* park records the epoch seen by the refusing gate
-    Fix5261,         \* withdrawing the last correlated continuation settles the turn
+    Fix5261,         \* a withdrawn correlated continuation's deferred turn is settled once
+                     \* the target is idle with an empty queue (#5308)
     FixStopPark,     \* a park after a user Stop drops the message (finding F1)
     FixRegReplace,   \* a reservation never replaces a live registration (finding F2)
-    FixStaleCorr     \* only the owner resolves a correlation, and a correlation whose
+    FixStaleCorr,    \* only the owner resolves a correlation, and a correlation whose
                      \* registration is gone refuses (finding F3)
+    SettleUnderLock  \* Fix5261's settlement takes the target's event lock
 
 Msgs  == 1..NM
 Turns == 1..NT
@@ -72,11 +74,13 @@ VARIABLES
     pendingAbort, \* turns whose stream was aborted; stream-abort handler not yet run
     intr,       \* owner interrupt in progress: [pc |-> "idle"|"stopping", t]
     ustop,      \* user stop in progress: "idle" | "stopping"
+    wsettle,    \* Fix5261: per turn, "pending" while a withdrawn continuation's reconcile
+                \* has not run (TS scheduleWithdrawnWorkspaceTurnContinuationReconcile), else "none"
     m           \* per-message state (see MsgInit)
 
 vars == <<reg, regEpoch, turn, nextTurn, create, slot, queue, stopEpoch, latch,
           interrupted, userStops, ownerInts, ownerGone, parked, listExists, listGen,
-          fl, lock, pendingEnd, pendingAbort, intr, ustop, m>>
+          fl, lock, pendingEnd, pendingAbort, intr, ustop, wsettle, m>>
 
 StreamLock == NM + 1
 
@@ -110,6 +114,7 @@ Init ==
     /\ pendingAbort = {}
     /\ intr = [pc |-> "idle", t |-> 0]
     /\ ustop = "idle"
+    /\ wsettle = [t \in Turns |-> "none"]
     /\ m = [i \in Msgs |-> MsgInit]
 
 -----------------------------------------------------------------------------
@@ -184,19 +189,12 @@ ContinuationPending(t) ==
     \/ \E k \in 1..Len(queue) : queue[k].kind = "msg" /\ m[queue[k].id].corr = t
     \/ slot.k # "idle" /\ slot.kind = "msg" /\ m[slot.id].corr = t
 
-\* Same, ignoring message i (the entry being withdrawn).
-OtherContinuation(t, i) ==
-    \/ \E k \in 1..Len(queue) : queue[k].kind = "msg" /\ queue[k].id # i /\ m[queue[k].id].corr = t
-    \/ slot.k # "idle" /\ slot.kind = "msg" /\ slot.id # i /\ m[slot.id].corr = t
-
-\* Fix5261 (the issue's suggested direction, compare WTM
-\* settleWorkspaceTurnContinuationFailure 5632): withdrawing the last
-\* correlated continuation of a deferred turn settles it once and releases it.
-SettleWithdrawn(i, r) ==
-    IF Fix5261 /\ r.corr # 0 /\ turn[r.corr] = "deferred" /\ ~OtherContinuation(r.corr, i)
-    THEN /\ turn' = [turn EXCEPT ![r.corr] = "done"]
-         /\ ReleaseIf(r.corr)
-    ELSE UNCHANGED <<turn, reg, fl>>
+\* Fix5261 (#5308, TS scheduleWithdrawnWorkspaceTurnContinuationReconcile): withdrawing a
+\* correlated continuation schedules a reconcile of its turn; WithdrawSettle runs it.
+ScheduleWithdrawn(r) ==
+    IF Fix5261 /\ r.corr # 0
+    THEN wsettle' = [wsettle EXCEPT ![r.corr] = "pending"]
+    ELSE UNCHANGED wsettle
 
 -----------------------------------------------------------------------------
 (* Peer / owner message pipeline: TS sendTreeMessage (9532-10214) *)
@@ -329,7 +327,8 @@ Rollback(i) ==
     /\ LET r == m[i]
            doPark == ~r.retry /\ r.refusal = "await"
                      /\ ~(FixStopPark /\ userStops # r.ustopAt)
-           \* #5277: park() reads the registration count NOW, after the await (TS 10124).
+           \* #5277: park() read the registration count NOW, after the await; since
+           \* #5303 it stores the count seen by the refusing gate (Fix5277).
            epoch == IF Fix5277 THEN r.met ELSE regEpoch
        IN
        /\ IF doPark
@@ -338,11 +337,11 @@ Rollback(i) ==
                /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done", !.told = "queued"]]
                /\ UNCHANGED <<turn, reg>>
           ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, r.refusal)]
-               /\ UNCHANGED <<parked, listExists>>
-               /\ SettleWithdrawn(i, r)
+               /\ UNCHANGED <<parked, listExists, fl>>
+       /\ ScheduleWithdrawn(r)
        /\ slot' = IdleSlot
        /\ lock' = ReleaseLock(i)
-    /\ UNCHANGED <<regEpoch, nextTurn, create, queue, stopEpoch, latch, interrupted,
+    /\ UNCHANGED <<turn, reg, regEpoch, nextTurn, create, queue, stopEpoch, latch, interrupted,
                    userStops, ownerInts, ownerGone, listGen, pendingEnd, pendingAbort,
                    intr, ustop>>
 
@@ -363,7 +362,7 @@ Dequeue ==
                     /\ reg' = [t |-> e.id, acc |-> TRUE]
                     /\ regEpoch' = IF reg.t # e.id THEN regEpoch + 1 ELSE regEpoch  \* WTM 644-649
                ELSE UNCHANGED <<slot, turn, reg, regEpoch>>
-            /\ UNCHANGED <<m, parked, listExists, fl>>
+            /\ UNCHANGED <<m, parked, listExists, fl, wsettle>>
        ELSE
        LET i == e.id
            r0 == m[i]
@@ -373,18 +372,18 @@ Dequeue ==
        /\ queue' = Tail(queue)
        /\ IF s # "none"
           THEN \* removeEntry + notifyQueuedMessageCleared -> onCanceled, synchronously (AS 9757-9767)
-               IF ~r.retry /\ s = "await"
-               THEN /\ Park(i, r, regEpoch)
-                    /\ fl' = [fl EXCEPT !.sched = TRUE]
-                    /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done"]]
-                    /\ UNCHANGED <<slot, turn, reg>>
-               ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, s)]
-                    /\ UNCHANGED <<parked, listExists, slot>>
-                    /\ SettleWithdrawn(i, r)
+               /\ IF ~r.retry /\ s = "await"
+                  THEN /\ Park(i, r, regEpoch)
+                       /\ fl' = [fl EXCEPT !.sched = TRUE]
+                       /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done"]]
+                       /\ UNCHANGED slot
+                  ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, s)]
+                       /\ UNCHANGED <<parked, listExists, slot, fl>>
+               /\ ScheduleWithdrawn(r)
           ELSE /\ slot' = [k |-> "prep", kind |-> "msg", id |-> i]
                /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "qpersist"]]
-               /\ UNCHANGED <<parked, listExists, fl, turn, reg>>
-       /\ UNCHANGED regEpoch
+               /\ UNCHANGED <<parked, listExists, fl, wsettle>>
+       /\ UNCHANGED <<regEpoch, turn, reg>>
     /\ UNCHANGED <<nextTurn, create, stopEpoch, latch, interrupted, userStops, ownerInts,
                    ownerGone, listGen, lock, pendingEnd, pendingAbort, intr, ustop>>
 
@@ -407,13 +406,18 @@ CreateDecide ==
 CreateRegister(t) ==
     /\ create[t].pc = "register"
     /\ IF create[t].mode = "reserve"
-       THEN \* Map.set with a new handle: a live entry is replaced without release (WTM 644-649).
-            /\ FixRegReplace => reg.t = None
-            /\ reg' = [t |-> t, acc |-> FALSE]
-            /\ regEpoch' = regEpoch + 1                        \* WTM 648 -> TS 2491-2496
-            /\ turn' = [turn EXCEPT ![t] = "reserved"]
-            /\ create' = [create EXCEPT ![t] = [pc |-> "launch", mode |-> "reserve"]]
-            /\ UNCHANGED queue
+       THEN IF FixRegReplace /\ reg.t # None /\ ~Idle
+            THEN \* F2 fix: recheck busy-ness under the lifecycle lock and refuse a
+                 \* reservation over a running turn's registration (WTM "target_busy").
+                 /\ turn' = [turn EXCEPT ![t] = "error"]
+                 /\ create' = [create EXCEPT ![t] = [pc |-> "done", mode |-> "none"]]
+                 /\ UNCHANGED <<queue, reg, regEpoch>>
+            ELSE \* Map.set with a new handle: a live entry is replaced without release (WTM 644-649).
+                 /\ reg' = [t |-> t, acc |-> FALSE]
+                 /\ regEpoch' = regEpoch + 1                   \* WTM 648 -> TS 2491-2496
+                 /\ turn' = [turn EXCEPT ![t] = "reserved"]
+                 /\ create' = [create EXCEPT ![t] = [pc |-> "launch", mode |-> "reserve"]]
+                 /\ UNCHANGED queue
        ELSE /\ queue' = Append(queue, [kind |-> "turn", id |-> t])
             /\ turn' = [turn EXCEPT ![t] = "queued"]
             /\ create' = [create EXCEPT ![t] = [pc |-> "done", mode |-> "none"]]
@@ -428,16 +432,19 @@ CreateLaunch(t) ==
     /\ create[t].pc = "launch"
     /\ create' = [create EXCEPT ![t] = [pc |-> "done", mode |-> "none"]]
     /\    IF turn[t] # "reserved"
-          THEN UNCHANGED <<reg, turn, slot, fl>>              \* interrupted meanwhile
+          THEN UNCHANGED <<reg, regEpoch, turn, slot, fl>>    \* interrupted meanwhile
           ELSE IF Idle
           THEN /\ slot' = [k |-> "stream", kind |-> "turn", id |-> t]
                /\ turn' = [turn EXCEPT ![t] = "running"]
-               /\ reg' = IF reg.t = t THEN [t |-> t, acc |-> TRUE] ELSE reg
+               \* markWorkspaceTurnAccepted registers this turn even if another
+               \* reservation replaced it (WTM 1995-1999, 644-649).
+               /\ reg' = [t |-> t, acc |-> TRUE]
+               /\ regEpoch' = IF reg.t # t THEN regEpoch + 1 ELSE regEpoch
                /\ UNCHANGED fl
           ELSE /\ turn' = [turn EXCEPT ![t] = "error"]
                /\ ReleaseIf(t)
-               /\ UNCHANGED slot
-    /\ UNCHANGED <<regEpoch, nextTurn, queue, stopEpoch, latch, interrupted, userStops,
+               /\ UNCHANGED <<slot, regEpoch>>
+    /\ UNCHANGED <<nextTurn, queue, stopEpoch, latch, interrupted, userStops,
                    ownerInts, ownerGone, parked, listExists, listGen, lock, pendingEnd,
                    pendingAbort, intr, ustop, m>>
 
@@ -563,6 +570,36 @@ UserResume ==
                    pendingEnd, pendingAbort, intr, ustop, m>>
 
 -----------------------------------------------------------------------------
+(* Fix5261 (#5308): reconcile after a withdrawn continuation *)
+
+\* TS scheduleWithdrawnWorkspaceTurnContinuationReconcile -> WTM
+\* reconcileWithdrawnWorkspaceTurnContinuation -> settleStaleWorkspaceTurn, one await-free
+\* step: the sweep decides once its admission exclusion and stream-start lock are held, so no
+\* stream starts or ends meanwhile. The reconcile first waits for the target to be idle with an
+\* empty queue (waitForIdleAndNoQueuedMessages), then takes the target's event lock
+\* (SettleUnderLock). The lock is FIFO, and a stream end/abort/error handler is queued on it in
+\* the event's own tick, before the session reads idle, so every handler of an ended stream runs
+\* first (pendingEnd and pendingAbort are empty). Only a turn whose stream end deferred to a
+\* continuation is settled; any other turn is left alone. With the session idle and the queue
+\* empty nothing is pending, so the reconcile's "retry" (streaming or queued/preparing work) is
+\* never taken here: the reconcile is done after this step. The checked invariants do not compare
+\* turn results, so neither the idle wait nor the handler ordering is load-bearing for them (both
+\* removed, MC_Search stays clean); the regression test "the settlement does not overtake a newer
+\* correlated stream end" covers the ordering. Fix5261 itself is (off: NoOrphanedTurn fails).
+WithdrawSettle(t) ==
+    /\ wsettle[t] = "pending"
+    /\ Idle /\ queue = <<>>
+    /\ SettleUnderLock => (lock = 0 /\ pendingEnd = {} /\ pendingAbort = {})
+    /\ IF turn[t] = "deferred"
+       THEN /\ turn' = [turn EXCEPT ![t] = "done"]
+            /\ ReleaseIf(t)
+       ELSE UNCHANGED <<turn, reg, fl>>
+    /\ wsettle' = [wsettle EXCEPT ![t] = "none"]
+    /\ UNCHANGED <<regEpoch, nextTurn, create, slot, queue, stopEpoch, latch, interrupted,
+                   userStops, ownerInts, ownerGone, parked, listExists, listGen, lock,
+                   pendingEnd, pendingAbort, intr, ustop, m>>
+
+-----------------------------------------------------------------------------
 (* TS flushParkedPeerSends 2527-2572 (one flush at a time per target) *)
 
 FlushBegin ==
@@ -611,9 +648,9 @@ FlushAwait ==
 
 -----------------------------------------------------------------------------
 
-Next ==
-    \/ \E i \in Msgs : Enter(i) \/ Corr(i) \/ Gate1(i) \/ WsGate(i) \/ Gate2(i) \/ Rollback(i)
-    \/ Dequeue
+\* Actions that leave wsettle unchanged.
+NextBase ==
+    \/ \E i \in Msgs : Enter(i) \/ Corr(i) \/ Gate1(i) \/ WsGate(i) \/ Gate2(i)
     \/ CreateDecide
     \/ StreamEnd
     \/ \E t \in Turns : CreateRegister(t) \/ CreateLaunch(t)
@@ -621,6 +658,12 @@ Next ==
     \/ OwnerInterruptDone \/ OwnerWithdraw
     \/ UserStop \/ UserStopDone \/ UserResume
     \/ FlushBegin \/ FlushStep \/ FlushAwait
+
+Next ==
+    \/ NextBase /\ UNCHANGED wsettle
+    \/ \E i \in Msgs : Rollback(i)
+    \/ Dequeue
+    \/ \E t \in Turns : WithdrawSettle(t)
 
 Spec == Init /\ [][Next]_vars
 
@@ -662,6 +705,7 @@ Orphaned(t) ==
     /\ t \notin pendingEnd
     /\ t \notin pendingAbort
     /\ ~\E i \in Msgs : m[i].pc \in {"persist", "qpersist"} /\ m[i].corr = t
+    /\ wsettle[t] = "none"
 NoOrphanedTurn == \A t \in Turns : ~Orphaned(t)
 
 \* No parked message is stranded: something will flush it.
@@ -675,7 +719,7 @@ Quiescent ==
     /\ \A i \in Msgs : m[i].pc \in {"unsent", "done"}
     /\ ~fl.run /\ ~fl.sched /\ queue = <<>> /\ slot.k = "idle"
     /\ pendingEnd = {} /\ pendingAbort = {} /\ intr.pc = "idle" /\ ustop = "idle"
-    /\ \A t \in Turns : create[t].pc \in {"idle", "done"}
+    /\ \A t \in Turns : create[t].pc \in {"idle", "done"} /\ wsettle[t] = "none"
     /\ lock = 0
 NoSilentLoss ==
     Quiescent => \A i \in Msgs :

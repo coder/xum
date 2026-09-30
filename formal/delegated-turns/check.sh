@@ -3,11 +3,14 @@
 #
 # `DelegatedTurns.tla` models peer-message (`task_send_message`) delivery into one root
 # workspace that runs delegated workspace turns owned by another workspace. It was written to
-# check the protocol from #4997, #5263 and #5272 at commit `491bb881b5`, and to reproduce the
-# open issues #5277 and #5261.
+# check the protocol from #4997, #5263 and #5272 at commit `491bb881b5`, and it reproduced
+# #5277, #5261 and findings F1-F3 below. Each has a fix flag. With every flag on, the model
+# matches the fixed code: #5277 by #5303, #5261 by #5308, and F1-F3 by the change that added
+# this sentence.
 #
-# Run `./check.sh` (TLC at `~/.local/bin/tlc`). Every `MC_<finding>.cfg` must find its
-# violation (TLC exit 12). Every `MC_Search*.cfg` enables all fix flags and must find none.
+# Run `./check.sh` (TLC at `~/.local/bin/tlc`). The `MC_<finding>.cfg` configs are pre-fix
+# configs: they turn their finding's fix off and must still find its violation (TLC exit 12),
+# which shows the model can see the bug the fix removes. Every `MC_Search*.cfg` must find none.
 # Print a counterexample with `python3 show_trace.py <dump>.json`.
 #
 # What is modeled
@@ -40,7 +43,9 @@
 # - User streams, multiple backends, compaction and agent-task targets are not modeled.
 # - The read-time self-heal (`normalizeWorkspaceTurnRecord` → `settleStaleWorkspaceTurn`,
 #   workspaceTurnManager.ts 3244-3257, 4623) is not modeled. `NoOrphanedTurn` therefore flags a
-#   handle that stays running until something reads it.
+#   handle that stays running until something reads it. The #5261 fix reuses that self-heal
+#   (`WithdrawSettle`), but a read can still run it outside the event lock, which is why the code
+#   keeps both F3 defenses (see `MC_Search_NoStaleCorr`).
 #
 # Invariants
 #
@@ -53,15 +58,38 @@
 #
 # | Config             | Bounds                                                                      | Result                                                   | Code repro (`src/node/services/taskService.delegatedTurnFormalRepro.test.ts`) |
 # | ------------------ | --------------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------- |
-# | `MC_5277`          | 1 peer, 2 turns                                                             | `NoDeliveryIntoReplacement` violated (1,743 states)      | confirmed                                                                     |
+# | `MC_5277`          | 1 peer, 2 turns                                                             | `NoDeliveryIntoReplacement` violated (4,530 states)      | confirmed                                                                     |
 # | `MC_5261`          | owner msg, 1 turn, withdraw                                                 | `NoOrphanedTurn` violated (198 states)                   | confirmed (handle stays running until a read normalizes it)                   |
 # | `MC_F1_StopPark`   | 1 peer, 1 turn, 1 user Stop                                                 | `UserStopRespected` violated (1,173 states)              | confirmed                                                                     |
-# | `MC_F2_RegReplace` | 1 peer, 2 turns                                                             | `NonOwnerNeverCorrelated` violated (~2.7k states)        | consequence confirmed; trigger from code reading                              |
-# | `MC_F3_StaleCorr`  | as `MC_Search`, `FixStaleCorr` off                                          | `NonOwnerNeverCorrelated` violated                       | latent (see below)                                                            |
-# | `MC_Search`        | 1 peer + owner msg, 2 turns, 1 Stop, 1 owner interrupt, withdraw, all fixes | no violation: 3,670,803 distinct states, depth 45, ~17 s | —                                                                             |
-# | `MC_SearchBig`     | as `MC_Search` with 2 peers | no violation in 118,052,419 distinct states (not exhaustive: stopped after ~15 min with 1.06M states queued) | — |
+# | `MC_F2_RegReplace` | 1 peer, 2 turns                                                             | `NonOwnerNeverCorrelated` violated (5,011 states)        | confirmed (through `createWorkspaceTurn`)                                     |
+# | `MC_F3_StaleCorr`  | as `MC_Search`, `FixStaleCorr` and `SettleUnderLock` off                    | `NonOwnerNeverCorrelated` violated                       | `F3` test (guard only)                                                        |
+# | `MC_Search`        | 1 peer + owner msg, 2 turns, 1 Stop, 1 owner interrupt, withdraw, all fixes | no violation: 12,218,576 distinct states, ~1.5 min      | —                                                                             |
+# | `MC_Search_NoStaleCorr` | as `MC_Search`, `FixStaleCorr` off: #5308's lock alone closes F3       | no violation: 14,172,438 distinct states                 | —                                                                             |
+# | `MC_SearchBig`     | as `MC_Search` with 2 peers | no violation in 118,052,419 distinct states before the #5261 and F2 fixes were modeled as implemented (not exhaustive: stopped after ~15 min with 1.06M states queued); not rerun | — |
 #
 # Each fix flag, turned on alone in its own config, removes that config's violation.
+#
+# The fixes, as modeled:
+#
+# - `Fix5277` (#5303): `park()` stores the registration count seen by the refusing gate.
+# - `Fix5261` (#5308): a withdrawn correlated continuation schedules a reconcile
+#   (`scheduleWithdrawnWorkspaceTurnContinuationReconcile`, taskService.ts). It waits until the
+#   target is idle with an empty queue, then takes the target's event lock and settles the turn
+#   through `settleStaleWorkspaceTurn` if its stream end deferred to a continuation
+#   (`WithdrawSettle`). The event lock is FIFO, and stream event handlers are queued on it in the
+#   event's own tick, before the session reads idle, so a queued handler with a newer result runs
+#   first. Waiting for idle also covers a queued delegated turn that dispatches right after the
+#   withdrawal: an earlier single-attempt design without that wait orphaned the turn in
+#   `MC_Search`.
+# - `FixStopPark` (F1): `park()` refuses once a user Stop happened since first admission
+#   (`workspaceUserStopEpochs`), and the sender gets the interrupted refusal.
+# - `FixRegReplace` (F2): under the workspace lifecycle lock, `createWorkspaceTurn` rechecks
+#   whether the target is busy and refuses a reservation over a running turn's registration. An
+#   idle target keeps the replacement; the replaced turn's acceptance registers it again, which
+#   the model now includes (`CreateLaunch`).
+# - `FixStaleCorr` (F3): only the owner resolves a root turn's correlation, and a send whose
+#   resolved correlation has no live registration is refused. `SettleUnderLock` alone also
+#   closes F3 in the model.
 #
 # - **F1**: the user Stops the target while a first attempt awaits its row rollback. The Stop
 #   drops the parked list before `onCanceled` parks the message (taskService.ts 15953 vs
@@ -75,12 +103,11 @@
 #   message whose correlation was resolved against turn A is then dispatched with A's
 #   correlation (taskService.ts 9731-9732), even from a non-owner. The event lock currently
 #   prevents the release from happening in that window. A #5261 fix that settles the turn
-#   outside the event lock would open it.
+#   outside the event lock would open it; #5308 settles under it.
 #
 # Run the repros with:
 # `bun test src/node/services/taskService.delegatedTurnFormalRepro.test.ts`.
-# They are `test.failing`. When a fix lands, bun reports the test as unexpectedly passing, and
-# that test should become a plain `test`.
+# Each failed before its fix and passes now.
 #
 # Model-check DelegatedTurns.tla. Usage: ./check.sh [config...]  (default: all MC_*.cfg but
 # MC_SearchBig). Exit 0 when every config behaves as expected: the MC_<finding> configs must

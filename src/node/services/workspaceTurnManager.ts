@@ -521,6 +521,15 @@ function isSupersededWorkspaceTurnInterrupt(
   );
 }
 
+/** A copy of the record that cannot enqueue a terminal wake when it settles. */
+function withoutAttentionPolicy(
+  record: WorkspaceTurnTaskHandleRecord
+): WorkspaceTurnTaskHandleRecord {
+  const quiet = { ...record };
+  delete quiet.attentionPolicy;
+  return quiet;
+}
+
 /**
  * Terminal settlements whose owner terminal-attention wake is suppressed. A
  * pure function of the settled record so live settlement, startup recovery,
@@ -1873,7 +1882,7 @@ export class WorkspaceTurnManager {
         : [ownerWorkspaceId, targetWorkspaceId].sort();
     const persisted = await this.withWorkspaceLifecycleLockKeys(
       lifecycleLockKeys,
-      async (): Promise<"persisted" | "target_archived" | "owner_archived"> => {
+      async (): Promise<"persisted" | "target_archived" | "owner_archived" | "target_busy"> => {
         if (isArchivedInConfig(targetWorkspaceId)) return "target_archived";
         if (isArchivedInConfig(ownerWorkspaceId)) return "owner_archived";
         return await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, async () => {
@@ -1884,6 +1893,26 @@ export class WorkspaceTurnManager {
           await this.taskHandleStore.upsertWorkspaceTurn(record);
           persistedHandle = true;
           if (record.status !== "queued") {
+            // Finding F2: the busy check above ran before several awaits, so two concurrent calls
+            // can both take the reserve path, and the other turn may be running by now. Recheck
+            // in the same synchronous block as the reservation: replacing a running turn's
+            // registration would let this call's requireIdle send fail and release that
+            // registration while the turn runs. An idle target keeps the old replacement: the
+            // other turn is not running (its stream ended, or its send has not started, and its
+            // acceptance registers it again). An accepted registration does not read idle before
+            // its stream: this call holds the task-creation lock across its own send, which
+            // returns only after PREPARING, and a queued dispatch claims PREPARING before
+            // onAccepted runs.
+            if (
+              this.activeWorkspaceTurnHandleByWorkspaceId.get(targetWorkspaceId) != null &&
+              this.workspaceService.isBusyForMessage(targetWorkspaceId)
+            ) {
+              // The caller gets this refusal synchronously. Persist the handle without
+              // attentionPolicy first, as for a synchronous validation failure, so settling it
+              // enqueues no duplicate terminal wake. Only this call knows the fresh handle.
+              await this.taskHandleStore.upsertWorkspaceTurn(withoutAttentionPolicy(record));
+              return "target_busy" as const;
+            }
             this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
               handleId,
               ownerWorkspaceId,
@@ -1922,6 +1951,18 @@ export class WorkspaceTurnManager {
     }
     if (persisted === "target_archived") {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
+    }
+    if (persisted === "target_busy") {
+      const error =
+        "Task.createWorkspaceTurn: target workspace started another delegated workspace turn during turn creation; retry after it finishes";
+      const quietRecord = withoutAttentionPolicy(record);
+      await this.settleWorkspaceTurn({
+        cause: { kind: "creation-admission-failure" },
+        record: quietRecord,
+        next: { ...quietRecord, status: "error", updatedAt: getIsoNow(), error },
+        waiterSettlement: { status: "error", error: new Error(error) },
+      });
+      return Err(error);
     }
     if (persisted === "owner_archived") {
       // A workspace created in this call is removed by _creationFinalizer (the archived owner
