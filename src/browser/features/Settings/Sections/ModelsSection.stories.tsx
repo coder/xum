@@ -332,7 +332,7 @@ export const CatalogueSuggestionsPhone: Story = {
     docs: {
       description: {
         story:
-          "Pins the phone-width contract for catalogue suggestions: provider labels and truncated model IDs fit without horizontal overflow.",
+          "Pins the phone-width contract for catalogue suggestions: provider labels and wrapped model IDs fit without horizontal overflow.",
       },
     },
   },

@@ -43,7 +43,10 @@ import {
   MAX_RENDERED_MODELS,
   MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
 } from "@/common/constants/ui";
-import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
+import {
+  CUSTOM_MODEL_HIDDEN_PROVIDERS,
+  CUSTOM_MODEL_ID_PATTERN,
+} from "@/common/constants/providers";
 import {
   matchesModelQueryTokens,
   tokenizeModelQuery,
@@ -249,11 +252,11 @@ export function ModelsSection() {
     setHighlightedModel(null);
   };
 
-  const handleAddModel = (modelId = newModelId) => {
-    const trimmedModelId = modelId.trim();
+  const handleAddModel = () => {
+    const trimmedModelId = newModelId.trim();
     if (!lastProvider || !trimmedModelId) return;
-    if (/\s/.test(trimmedModelId)) {
-      setError("Model IDs can't contain spaces");
+    if (!CUSTOM_MODEL_ID_PATTERN.test(trimmedModelId)) {
+      setError("Model IDs can only contain letters, numbers, and . - _ : / @");
       return;
     }
 
@@ -269,6 +272,8 @@ export function ModelsSection() {
       resetAddField();
     }
   };
+
+  const addError = editing ? null : error;
 
   const catalogQuery = newModelId.trim();
   const catalogQueryActive = catalogQuery.length > 0;
@@ -408,6 +413,15 @@ export function ModelsSection() {
     const current = activeCatalog;
     const offset = current?.result.nextOffset ?? null;
     if (!current || offset === null || !api) return;
+    // Keep the highlight on "Show more" (also after a click) so Enter pages again rather
+    // than adding a model the user never picked or the typed query.
+    setHighlightedModel({
+      key: "catalog-more",
+      api,
+      provider: lastProvider,
+      config,
+      policy: effectivePolicy,
+    });
     api.providers
       .searchModelCatalog({
         query: current.query,
@@ -425,24 +439,15 @@ export function ModelsSection() {
                 }
               : prev
           );
-          // The last page removes "Show more"; move a keyboard highlight onto a model row so
-          // the next Enter cannot fall through to adding the typed query as a model ID.
-          const next =
-            page.models.find(isOfferableCatalogModel) ??
-            (page.nextOffset === null
-              ? current.result.models.findLast(isOfferableCatalogModel)
-              : undefined);
-          setHighlightedModel((prev) =>
-            prev?.key === "catalog-more" && next ? { ...prev, key: `catalog:${next.id}` } : prev
-          );
         },
         () => undefined
       );
   };
 
   const selectOption = (option: SuggestionOption) => {
-    if (option.kind === "discovered") handleAddModel(option.modelId);
-    else if (option.kind === "catalog") handleAddCatalogModel(option.model);
+    if (option.kind === "discovered") {
+      if (addModel(lastProvider, option.modelId)) resetAddField();
+    } else if (option.kind === "catalog") handleAddCatalogModel(option.model);
     else loadMoreCatalog();
   };
 
@@ -470,7 +475,7 @@ export function ModelsSection() {
           option.kind === "catalog"
             ? `${baseClassName} grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2`
             : option.kind === "discovered"
-              ? `${baseClassName} block truncate font-mono`
+              ? `${baseClassName} block font-mono wrap-anywhere`
               : `${baseClassName} text-muted block`
         }
       >
@@ -479,13 +484,14 @@ export function ModelsSection() {
         ) : option.kind === "catalog" ? (
           <>
             <span className="text-muted inline-flex items-center gap-1 whitespace-nowrap">
-              {/* Some icon SVGs carry a <title>; the visible name already labels the row. */}
-              <span aria-hidden className="inline-flex">
+              {/* Some icon SVGs carry a <title>; the visible name labels the row, so keep the
+                  title out of the accessible name and off hover (native tooltip). */}
+              <span aria-hidden className="pointer-events-none inline-flex">
                 <ProviderIcon provider={option.model.provider} />
               </span>
               {formatProviderDisplayName(option.model.provider, config?.[option.model.provider])}
             </span>
-            <span className="truncate font-mono">{option.model.providerModelId}</span>
+            <span className="font-mono wrap-anywhere">{option.model.providerModelId}</span>
           </>
         ) : (
           <>
@@ -793,7 +799,15 @@ export function ModelsSection() {
                   role="combobox"
                   aria-label="Model ID"
                   aria-autocomplete="list"
-                  aria-describedby={discoveryMessage ? `${suggestionsId}-status` : undefined}
+                  aria-describedby={
+                    [
+                      discoveryMessage && `${suggestionsId}-status`,
+                      addError && `${suggestionsId}-error`,
+                    ]
+                      .filter(Boolean)
+                      .join(" ") || undefined
+                  }
+                  aria-invalid={addError ? true : undefined}
                   aria-expanded={showSuggestions}
                   aria-controls={showSuggestions ? suggestionsId : undefined}
                   aria-activedescendant={
@@ -804,6 +818,7 @@ export function ModelsSection() {
                   onChange={(e) => {
                     setNewModelId(e.target.value);
                     setHighlightedModel(null);
+                    if (addError) setError(null);
                     setSuggestionsSession((session) => session ?? {});
                   }}
                   onFocus={() => setSuggestionsSession((session) => session ?? {})}
@@ -837,12 +852,17 @@ export function ModelsSection() {
                       e.preventDefault();
                       const option = highlightedIndex >= 0 ? options[highlightedIndex] : undefined;
                       if (option) selectOption(option);
-                      else handleAddModel();
-                    } else if (e.key === "Escape" && suggestionsSession) {
+                      // Once the last page removes "Show more", Enter must not add the typed query.
+                      else if (highlightedModel?.key !== "catalog-more") handleAddModel();
+                    } else if (e.key === "Escape") {
                       e.preventDefault();
                       stopKeyboardPropagation(e);
-                      setSuggestionsSession(null);
-                      setHighlightedModel(null);
+                      // Matches the filter: close the list, then clear, then close Settings.
+                      if (showSuggestions || discoveryMessage) {
+                        setSuggestionsSession(null);
+                        setHighlightedModel(null);
+                      } else if (newModelId) resetAddField();
+                      else closeSettings();
                     }
                   }}
                 />
@@ -906,8 +926,10 @@ export function ModelsSection() {
               {discoveryMessage}
             </div>
           )}
-          {error && !editing && (
-            <div className="text-error px-2 py-1.5 text-xs md:px-3">{error}</div>
+          {addError && (
+            <div id={`${suggestionsId}-error`} className="text-error px-2 py-1.5 text-xs md:px-3">
+              {addError}
+            </div>
           )}
         </div>
 

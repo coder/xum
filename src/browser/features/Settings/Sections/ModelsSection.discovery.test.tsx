@@ -449,65 +449,80 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(ui.input.value).toBe("");
   });
 
-  test("keyboard spans both groups and Show more loads the next page", async () => {
-    const entry = (provider: string, providerModelId: string, builtIn = false) =>
-      ({
-        id: `${provider}:${providerModelId}`,
-        provider,
-        providerModelId,
-        contextWindowTokens: null,
-        builtIn,
-      }) satisfies ModelCatalogEntry;
-    const catalog = [
-      entry("anthropic", "vendor-builtin", true),
-      entry("anthropic", "vendor-added"),
-      entry("openai", "vendor-first"),
-      entry("openai", "vendor-late"),
-    ];
-    const pageSize = 3;
-    const ui = await setup("anthropic", null, {
-      anthropicModels: ["vendor-added"],
-      catalog: (input) => {
-        const offset = input.offset ?? 0;
-        const end = offset + pageSize;
-        return {
-          models: catalog.slice(offset, end),
-          total: catalog.length,
-          nextOffset: end < catalog.length ? end : null,
-        };
-      },
-    });
-    ui.open();
-    await ui.type("vendor");
-    await ui.reply(0, { status: "ok", modelIds: ["vendor-disc"] });
-    const optionNames = () => ui.view.getAllByRole("option").map((option) => option.textContent);
-    expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "Show more (1)"]);
-    const activeName = () =>
-      document.getElementById(ui.input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+  test.each(["keyboard", "pointer"])(
+    "%s Show more keeps its highlight, so Enter pages and never adds the query",
+    async (method) => {
+      const entry = (provider: string, providerModelId: string, builtIn = false) =>
+        ({
+          id: `${provider}:${providerModelId}`,
+          provider,
+          providerModelId,
+          contextWindowTokens: null,
+          builtIn,
+        }) satisfies ModelCatalogEntry;
+      const catalog = [
+        entry("anthropic", "vendor-builtin", true),
+        entry("anthropic", "vendor-added"),
+        entry("openai", "vendor-first"),
+        entry("openai", "vendor-second"),
+        entry("openai", "vendor-third"),
+        entry("openai", "vendor-fourth"),
+        entry("openai", "vendor-late"),
+      ];
+      const pageSize = 3;
+      const ui = await setup("anthropic", null, {
+        anthropicModels: ["vendor-added"],
+        catalog: (input) => {
+          const offset = input.offset ?? 0;
+          const end = offset + pageSize;
+          return {
+            models: catalog.slice(offset, end),
+            total: catalog.length,
+            nextOffset: end < catalog.length ? end : null,
+          };
+        },
+      });
+      ui.open();
+      await ui.type("vendor");
+      await ui.reply(0, { status: "ok", modelIds: ["vendor-disc"] });
+      const optionNames = () => ui.view.getAllByRole("option").map((option) => option.textContent);
+      expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "Show more (4)"]);
+      const activeName = () =>
+        document.getElementById(ui.input.getAttribute("aria-activedescendant") ?? "")?.textContent;
 
-    ui.key("ArrowDown");
-    expect(activeName()).toBe("vendor-disc");
-    ui.key("ArrowDown");
-    expect(activeName()).toBe("OpenAIvendor-first");
-    ui.key("ArrowDown");
-    ui.key("Enter");
-    await ui.view.findByRole("option", { name: /vendor-late/ });
-    expect(ui.catalogRequests.at(-1)).toEqual({
-      query: "vendor",
-      offset: pageSize,
-      limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
-    });
-    expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "OpenAIvendor-late"]);
-    expect(ui.save).not.toHaveBeenCalled();
+      if (method === "keyboard") {
+        ui.key("ArrowDown");
+        expect(activeName()).toBe("vendor-disc");
+        ui.key("ArrowDown");
+        expect(activeName()).toBe("OpenAIvendor-first");
+        ui.key("ArrowDown");
+        ui.key("Enter");
+      } else {
+        fireEvent.click(ui.view.getByRole("option", { name: /^Show more/ }));
+      }
+      await ui.view.findByRole("option", { name: /vendor-fourth/ });
+      expect(ui.catalogRequests.at(-1)).toEqual({
+        query: "vendor",
+        offset: pageSize,
+        limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+      });
+      expect(activeName()).toBe("Show more (1)");
 
-    // The last page removes "Show more"; the highlight must land on a model, not vanish.
-    expect(activeName()).toBe("OpenAIvendor-late");
-    ui.key("Enter");
-    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "openai", models: ["vendor-late"] });
-  });
+      ui.key("Enter");
+      await ui.view.findByRole("option", { name: /vendor-late/ });
+      expect(optionNames().at(-1)).toBe("OpenAIvendor-late");
+      // The last page removes "Show more"; Enter must neither add the query nor a model.
+      ui.key("Enter");
+      expect(ui.save).not.toHaveBeenCalled();
+
+      ui.key("ArrowUp");
+      ui.key("Enter");
+      expect(ui.save.mock.calls[0][0]).toEqual({ provider: "openai", models: ["vendor-late"] });
+    }
+  );
 });
 
-describe("ModelsSection filter Escape", () => {
+describe("ModelsSection Escape", () => {
   test("clears a non-empty filter, then closes Settings", async () => {
     const ui = await setup();
     fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
@@ -521,17 +536,35 @@ describe("ModelsSection filter Escape", () => {
     fireEvent.keyDown(filter, { key: "Escape" });
     await ui.view.findByText("Settings closed");
   });
+
+  test("in Model ID closes the list, then clears the field, then closes Settings", async () => {
+    const ui = await setup();
+    fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
+    await ui.type("claude");
+    await ui.reply(0, { status: "ok", modelIds: ["claude-x"] });
+    ui.key("Escape");
+    expect([ui.input.getAttribute("aria-expanded"), ui.input.value]).toEqual(["false", "claude"]);
+    ui.key("Escape");
+    expect([ui.input.value, ui.view.queryByText("Settings open") !== null]).toEqual(["", true]);
+    ui.key("Escape");
+    await ui.view.findByText("Settings closed");
+  });
 });
 
 describe("ModelsSection manual model IDs", () => {
-  test("rejects an ID containing whitespace instead of saving it", async () => {
-    const ui = await setup();
-    await ui.type("sonnet 4");
-    ui.key("Enter");
-    fireEvent.click(ui.add);
-    expect(ui.save).not.toHaveBeenCalled();
-    expect(ui.input.value).toBe("sonnet 4");
-  });
+  test.each(["sonnet 4", "tab\tid", "bogus<script>"])(
+    "rejects %p, flags the field until it is edited",
+    async (modelId) => {
+      const ui = await setup();
+      await ui.type(modelId);
+      ui.key("Enter");
+      fireEvent.click(ui.add);
+      expect(ui.save).not.toHaveBeenCalled();
+      expect([ui.input.value, ui.input.getAttribute("aria-invalid")]).toEqual([modelId, "true"]);
+      await ui.user.type(ui.input, "x");
+      expect(ui.input.hasAttribute("aria-invalid")).toBe(false);
+    }
+  );
 });
 
 describe("ModelsSection table filter and paging", () => {
