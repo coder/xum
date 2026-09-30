@@ -27,14 +27,12 @@ import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  NEXT_TURN_RECOUNT_SKIP_FACTOR,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
   getContextBudgetHandoffPoint,
-  getContextBudgetFinalPoint,
 } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
@@ -528,26 +526,20 @@ export class TokenBudgetStrategy {
       // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
       if (!modelRequested) return { decision: "continue" };
     }
-    // The full next-turn estimate is a full recount (p95 ~26 ms per step at 200k, #5223), so ask
-    // for it only when a stage could open on it: some stage is still open and even the anchored
-    // estimate times the skip factor reaches that stage's point. Below that the full estimate
-    // cannot reach a stage point either, so skipping it opens nothing that it would have opened.
+    // The full next-turn estimate is a full recount (#5223), and only the stages consume it, so it
+    // runs only while at least one stage is still open (unclaimed). That skip is exact: with no
+    // open stage the estimate cannot change the decision.
     const handoffRequested = this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed;
     const finalHandoffAvailable = !this.contextBudgetFinalClaimed && step.newContextAvailable;
-    const lowestOpenStagePoint =
-      !knownLimit || threshold >= 1
-        ? undefined
-        : !handoffRequested
-          ? getContextBudgetHandoffPoint(maxTokens, threshold)
-          : finalHandoffAvailable
-            ? getContextBudgetFinalPoint(maxTokens)
-            : undefined;
-    const nextTurnRequestTokens =
-      lowestOpenStagePoint != null &&
-      step.nextRequestTokens != null &&
-      step.nextRequestTokens * NEXT_TURN_RECOUNT_SKIP_FACTOR >= lowestOpenStagePoint
-        ? await step.estimateNextTurnRequestTokens?.()
-        : undefined;
+    const stageOpen = knownLimit && threshold < 1 && (!handoffRequested || finalHandoffAvailable);
+    let nextTurnRequestTokens: number | undefined;
+    if (stageOpen && step.estimateNextTurnRequestTokens != null) {
+      nextTurnRequestTokens = await step.estimateNextTurnRequestTokens();
+      // An interrupt or clear during the recount withdrew this stream's continuation; never queue
+      // a stale one (same check as the rollover path below).
+      if (this.host.state.stream !== context || !this.validatePreparation(receipt))
+        return { decision: "continue" };
+    }
     this.settledNextTurn = nextTurnRequestTokens;
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({

@@ -2724,26 +2724,62 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
   });
 
-  test.each([
-    { anchored: 20_000, recounts: 0 },
-    { anchored: 40_000, recounts: 1 },
-  ])(
-    "settlement recounts the full request only when a stage could open ($anchored)",
-    async ({ anchored, recounts }) => {
-      const h = await setup();
-      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-      const recount = mock(fullEstimate(96_000));
-      const settled = await h.requests[0].onStepSettled?.(
-        step(0, {
-          usage: undefined,
-          nextRequestTokens: anchored,
-          estimateNextTurnRequestTokens: recount,
-        })
-      );
-      expect(recount).toHaveBeenCalledTimes(recounts);
-      expect(settled?.decision).toBe(recounts === 0 ? "continue" : "warn");
-    }
-  );
+  test("settlement recounts the full request only while a stage is still open", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    const first = mock(fullEstimate(96_000));
+    const settled = await h.requests[0].onStepSettled?.(
+      step(80_000, { nextRequestTokens: 81_000, estimateNextTurnRequestTokens: first })
+    );
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(settled?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 80_000 } });
+    await h.waitForRequest(2);
+    expect(budgetOf(h).contextBudgetHandoffClaimed).toBe(true);
+    // Handoff claimed and the final prompt unavailable: no stage can consume the recount.
+    const second = mock(fullEstimate(100_000));
+    await h.requests[1].onStepSettled?.(
+      step(82_000, {
+        nextRequestTokens: 83_000,
+        estimateNextTurnRequestTokens: second,
+        newContextAvailable: false,
+      })
+    );
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  test("an interrupt during the settled recount queues no stale Continue", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    spyOn(h.aiService, "stopStream").mockImplementation(() => {
+      h.aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: "assistant-1",
+        abortReason: "user",
+        metadata: { duration: 1 },
+      });
+      h.completions[0].settle({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+    // The user stops the turn while settlement is still counting the next request.
+    const recount = mock(async () => {
+      expect((await h.session.interruptStream()).success).toBe(true);
+      return 96_000;
+    });
+    const settled = await h.requests[0].onStepSettled?.(
+      step(80_000, { nextRequestTokens: 81_000, estimateNextTurnRequestTokens: recount })
+    );
+    expect(recount).toHaveBeenCalledTimes(1);
+    expect(settled?.decision).toBe("continue");
+    await h.session.waitForIdle();
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    expect(h.requests).toHaveLength(1);
+  });
 
   test("an edited request can recover its own pre-handle budget overflow", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
