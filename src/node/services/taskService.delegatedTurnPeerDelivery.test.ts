@@ -47,11 +47,14 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
 
   async function setUp() {
     const peerSends: SendArgs[] = [];
-    let notifyPeerSend: (() => void) | undefined;
+    const peerSendWaiters = new Set<() => void>();
+    // While set, peer deliveries block after being recorded (to hold the target's event lock).
+    let peerGate: Promise<void> | undefined;
     const sendMessage = mock(async (...args: SendArgs): Promise<Result<void>> => {
       if (isPeerSend(args)) {
         peerSends.push(args);
-        notifyPeerSend?.();
+        for (const waiter of peerSendWaiters) waiter();
+        await peerGate;
       } else {
         // The delegated turn's own prompt: accept it so the registration is live and accepted.
         await args[3]?.onAccepted?.();
@@ -101,14 +104,22 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
       TARGET_ID,
       createMuxMessage("delegated-output", "assistant", "Delegated work", { agentId: "plan" })
     );
-    // Resolves on the next peer sendMessage call (the flush runs after settlement, off this call).
-    const nextPeerSend = () =>
-      new Promise<SendArgs>((resolve) => {
-        const count = peerSends.length;
-        notifyPeerSend = () => {
-          if (peerSends.length > count) resolve(peerSends[count]);
+    // Resolves once `count` peer sendMessage calls happened (deliveries after settlement run off
+    // the settling call, so tests wait on this instead of sleeping).
+    const peerSendCount = (count: number) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (peerSends.length < count) return;
+          peerSendWaiters.delete(check);
+          resolve();
         };
+        peerSendWaiters.add(check);
+        check();
       });
+    const nextPeerSend = () => {
+      const index = peerSends.length;
+      return peerSendCount(index + 1).then(() => peerSends[index]);
+    };
     const edit = (workspaceId: string, update: (workspace: Record<string, unknown>) => void) =>
       config.editConfig((cfg) => {
         const workspace = cfg.projects
@@ -118,7 +129,15 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
         update(workspace as unknown as Record<string, unknown>);
         return cfg;
       });
-    return { parentId, taskService, peerSends, nextPeerSend, edit };
+    const holdPeerSends = () => {
+      let release!: () => void;
+      peerGate = new Promise((resolve) => (release = resolve));
+      return () => {
+        peerGate = undefined;
+        release();
+      };
+    };
+    return { parentId, taskService, peerSends, peerSendCount, nextPeerSend, edit, holdPeerSends };
   }
 
   type Setup = Awaited<ReturnType<typeof setUp>>;
@@ -167,6 +186,28 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
       });
     }
   );
+
+  test("a fresh message queues behind messages still draining after the turn", async () => {
+    const s = await setUp();
+    for (const message of ["first", "second"]) {
+      expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, message)).success).toBe(
+        true
+      );
+    }
+    const release = s.holdPeerSends();
+    await settle.completed(s);
+    // "first" is being delivered and holds the target's event lock; "third" arrives meanwhile.
+    await s.peerSendCount(1);
+    const third = s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "third");
+    release();
+    expect(await third).toMatchObject(Ok({ delivery: "queued", awaitsDelegatedTurn: true }));
+    await s.peerSendCount(3);
+    expect(s.peerSends.map((args) => /first|second|third/.exec(payloadText(args))?.[0])).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+  });
 
   test.each(["completed", "error", "interrupted"] as const)(
     "a %s delegated turn releases the waiting message",
