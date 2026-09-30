@@ -17,8 +17,10 @@ import {
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
   readProviderHistoryPage,
+  readProviderHistorySince,
   readProviderHistoryWindow,
   type HistoryPage,
+  type HistorySinceRange,
   type HistoryWindow,
   type HistoryWindowCaps,
   openHistorySnapshot,
@@ -2641,6 +2643,26 @@ export class HistoryService {
           archive: this.getChatArchivePath(workspaceId),
         };
         return Ok(await readProviderHistoryPage(paths, caps, beforeHistorySequence));
+      }
+    );
+  }
+
+  /** Since reconnect range of a windowed client (#4961); see readProviderHistorySince. */
+  async getHistorySinceFromLatestBoundary(
+    workspaceId: string,
+    caps: HistoryWindowCaps,
+    since: { floor: number; anchor: number }
+  ): Promise<Result<HistorySinceRange>> {
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history since range",
+      async () => {
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        const paths = {
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        };
+        return Ok(await readProviderHistorySince(paths, caps, since));
       }
     );
   }

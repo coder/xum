@@ -15,6 +15,7 @@ import {
 import {
   readProviderHistoryFromLatestBoundary,
   readProviderHistoryPage,
+  readProviderHistorySince,
   readProviderHistoryWindow,
   type HistoryWindowCaps,
 } from "./historyScanner";
@@ -61,39 +62,42 @@ function sequencedRows(seed: number): GeneratedRow[] {
   return out;
 }
 
+let dir: string;
+beforeEach(async () => {
+  dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-page-"));
+});
+afterEach(async () => {
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+let layouts = 0;
+async function writeLayout(archive: GeneratedRow[] | null, chat: GeneratedRow[]) {
+  const base = path.join(dir, `l${layouts++}`);
+  await fs.mkdir(base);
+  const paths = {
+    chat: path.join(base, "chat.jsonl"),
+    archive: path.join(base, "archive.jsonl"),
+  };
+  if (archive) await fs.writeFile(paths.archive, rowsToBytes(archive));
+  await fs.writeFile(paths.chat, rowsToBytes(chat));
+  return paths;
+}
+
+/** Half the generated layouts span the archive, like an epoch that began before a rotation. */
+function generatedLayout(seed: number) {
+  const rows = sequencedRows(seed);
+  const split = Math.floor(mulberry32(seed + 7)() * (rows.length + 1));
+  return seed % 2 === 0
+    ? writeLayout(null, rows)
+    : writeLayout(rows.slice(0, split), rows.slice(split));
+}
+
 describe("readProviderHistoryPage", () => {
-  let dir: string;
-  beforeEach(async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-page-"));
-  });
-  afterEach(async () => {
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  let layouts = 0;
-  async function writeLayout(archive: GeneratedRow[] | null, chat: GeneratedRow[]) {
-    const base = path.join(dir, `l${layouts++}`);
-    await fs.mkdir(base);
-    const paths = {
-      chat: path.join(base, "chat.jsonl"),
-      archive: path.join(base, "archive.jsonl"),
-    };
-    if (archive) await fs.writeFile(paths.archive, rowsToBytes(archive));
-    await fs.writeFile(paths.chat, rowsToBytes(chat));
-    return paths;
-  }
-
   test("the window plus every page before it equals the full read", async () => {
     const problems: string[] = [];
     const seen = { complete: 0, pages: 0, notPageable: 0 };
     for (let seed = 0; seed < 200; seed++) {
-      const rows = sequencedRows(seed);
-      const split = Math.floor(mulberry32(seed + 7)() * (rows.length + 1));
-      // Half the layouts span the archive, like an epoch that began before a rotation.
-      const paths =
-        seed % 2 === 0
-          ? await writeLayout(null, rows)
-          : await writeLayout(rows.slice(0, split), rows.slice(split));
+      const paths = await generatedLayout(seed);
       const fullRead = await readProviderHistoryFromLatestBoundary(paths, 0);
       for (const caps of [
         { maxRows: 3, maxBytes: BIG },
@@ -212,5 +216,120 @@ describe("readProviderHistoryPage", () => {
     expect(await readProviderHistoryPage(paths, { maxRows: BIG, maxBytes: OVERSIZED }, 4)).toEqual({
       kind: "not-pageable",
     });
+  });
+});
+
+// Since reconnects of a windowed client (#4961). Contract: "range" is full replay's suffix from the
+// floor row, at most two windows, with at most one window after the anchor row; otherwise
+// "not-in-range". The oracle is again the independent full read.
+describe("readProviderHistorySince", () => {
+  const seqOf = (message: MuxMessage) => message.metadata?.historySequence;
+  const lastIndexOf = (messages: MuxMessage[], seq: number) =>
+    messages.findLastIndex((m) => seqOf(m) === seq);
+
+  test("a range is the full read from the floor row, within its budget", async () => {
+    const problems: string[] = [];
+    const seen = { range: 0, notInRange: 0 };
+    for (let seed = 0; seed < 200; seed++) {
+      const paths = await generatedLayout(seed);
+      const fullRead = await readProviderHistoryFromLatestBoundary(paths, 0);
+      const sequenced = fullRead.flatMap((m, i) => (typeof seqOf(m) === "number" ? [i] : []));
+      if (sequenced.length === 0) continue;
+      const random = mulberry32(seed + 11);
+      const pick = () => sequenced[Math.floor(random() * sequenced.length)];
+      // A floor older than the epoch is never in range.
+      const epochFloor = seqOf(fullRead[sequenced[0]])!;
+      if (epochFloor > 0) {
+        const older = await readProviderHistorySince(
+          paths,
+          { maxRows: BIG, maxBytes: BIG },
+          { floor: epochFloor - 1, anchor: epochFloor }
+        );
+        if (older.kind !== "not-in-range") problems.push(`seed ${seed}: floor before the epoch`);
+      }
+      for (const caps of [
+        { maxRows: 3, maxBytes: BIG },
+        { maxRows: 10, maxBytes: 4096 },
+        { maxRows: 40, maxBytes: 2 * OVERSIZED },
+        { maxRows: BIG, maxBytes: BIG },
+      ] satisfies HistoryWindowCaps[]) {
+        for (let k = 0; k < 4; k++) {
+          const [a, b] = [pick(), pick()];
+          const floor = seqOf(fullRead[Math.min(a, b)])!;
+          const anchor = seqOf(fullRead[Math.max(a, b)])!;
+          const label = `seed ${seed} rows=${caps.maxRows} bytes=${caps.maxBytes} ${floor}..${anchor}`;
+          const range = await readProviderHistorySince(paths, caps, { floor, anchor });
+          if (range.kind === "not-in-range") {
+            seen.notInRange++;
+            // Unbounded, only an oversized floor or anchor row (never parsed) is out of range.
+            if (caps.maxRows === BIG && seed % 20 !== 0) problems.push(`${label}: not in range`);
+            continue;
+          }
+          seen.range++;
+          const from = lastIndexOf(fullRead, floor);
+          if (!deepEqualAnyDepth(range.messages, fullRead.slice(from))) {
+            problems.push(`${label}: range != full read suffix`);
+          }
+          if (range.messages.length > 2 * caps.maxRows) problems.push(`${label}: over two windows`);
+          if (fullRead.length - 1 - lastIndexOf(fullRead, anchor) > caps.maxRows) {
+            problems.push(`${label}: delta over one window`);
+          }
+        }
+      }
+    }
+    expect(problems).toEqual([]);
+    // Both outcomes occur, so the comparison is not vacuous.
+    expect(Math.min(seen.range, seen.notInRange)).toBeGreaterThan(20);
+  }, 120_000);
+
+  test("each fallback returns not-in-range, and every row counts toward the budget", async () => {
+    const two = { maxRows: 2, maxBytes: BIG };
+    const base = Array.from({ length: 6 }, (_, i) =>
+      row(`${i % 2 === 0 ? "u" : "a"}${i}`, i % 2 === 0 ? "user" : "assistant", i)
+    );
+    const since = async (
+      rows: GeneratedRow[],
+      floor: number,
+      anchor: number,
+      archive?: GeneratedRow[]
+    ) => {
+      const result = await readProviderHistorySince(await writeLayout(archive ?? null, rows), two, {
+        floor,
+        anchor,
+      });
+      return result.kind === "range" ? ids(result.messages) : result.kind;
+    };
+    // The delta fits one window, the whole range two.
+    expect(await since(base, 3, 3)).toEqual(["a3", "u4", "a5"]);
+    expect(await since([...base, row("u6", "user", 6)], 3, 3)).toBe("not-in-range");
+    expect(await since(base, 2, 3)).toEqual(["u2", "a3", "u4", "a5"]);
+    expect(await since(base, 1, 3)).toBe("not-in-range");
+    // A malformed row counts too.
+    expect(await since([...base.slice(0, 4), "{not json", ...base.slice(4)], 2, 3)).toBe(
+      "not-in-range"
+    );
+    // The floor row is gone, or the anchor's sequence repeats.
+    expect(
+      await since(
+        base.filter((_, i) => i !== 3),
+        3,
+        3
+      )
+    ).toBe("not-in-range");
+    expect(await since([...base, row("x5", "assistant", 5)], 4, 5)).toBe("not-in-range");
+    // A compaction since the floor starts a new epoch; a floor at the boundary is in range.
+    const boundary = json(
+      createMuxMessage("b4", "assistant", "summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        historySequence: 4,
+      })
+    );
+    const compacted = [...base.slice(0, 4), boundary, base[5]];
+    expect(await since(compacted, 3, 3)).toBe("not-in-range");
+    expect(await since(compacted, 4, 4)).toEqual(["b4", "a5"]);
+    // A range may reach into the archive.
+    expect(await since(base.slice(4), 3, 3, base.slice(0, 4))).toEqual(["a3", "u4", "a5"]);
   });
 });

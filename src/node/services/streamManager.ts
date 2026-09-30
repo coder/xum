@@ -121,6 +121,7 @@ import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/me
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
+import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
@@ -409,6 +410,20 @@ function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]
     neutralizeAgentEnvelopeLookalikesInModelToolParts(
       stripWorkflowRunRecordsFromModelMessages(messages)
     )
+  );
+}
+
+function sendsBetweenToolsThinking(providerOptions: Record<string, unknown> | undefined): boolean {
+  const anthropic = providerOptions?.anthropic;
+  if (typeof anthropic !== "object" || anthropic === null || !("thinking" in anthropic)) {
+    return false;
+  }
+  const thinking = anthropic.thinking;
+  return (
+    typeof thinking === "object" &&
+    thinking !== null &&
+    "type" in thinking &&
+    thinking.type === "between_tools"
   );
 }
 
@@ -2849,6 +2864,9 @@ export class StreamManager {
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
+    // #5086: see the `between_tools` replay guard in prepareStep.
+    let previousToolSetKey: string | undefined;
+    let inTurnPrefixChanged = false;
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3003,6 +3021,36 @@ export class StreamManager {
             log.warn("First-step message rebuild for thinking override failed", {
               error: getErrorMessage(error),
             });
+          }
+        }
+        // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
+        // thinking block stays valid only while everything before it is unchanged.
+        // A consumed prefix swap or a change to the advertised tool set edits that
+        // prefix; from then on this stream replays no reasoning on those requests.
+        const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
+        if (
+          stepTracker?.consumedPrefixSwap != null ||
+          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
+        ) {
+          inTurnPrefixChanged = true;
+        }
+        previousToolSetKey = toolSetKey;
+        const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
+        if (
+          inTurnPrefixChanged &&
+          sendsBetweenToolsThinking(request.providerOptions) &&
+          outgoing.some(
+            (message) =>
+              message.role === "assistant" &&
+              typeof message.content !== "string" &&
+              message.content.some((part) => part.type === "reasoning")
+          )
+        ) {
+          const stripped = stripAnthropicReasoning(outgoing);
+          if (rebuiltFirstStepMessages != null) {
+            rebuiltFirstStepMessages = stripped;
+          } else {
+            effectiveMessages = stripped;
           }
         }
         // Taken before this step records its own request; step zero has no settled step.

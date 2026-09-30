@@ -13,6 +13,7 @@ import {
   resolveEffectiveThinkingLevel,
   getAvailableThinkingLevels,
   isXaiGrokFastVariantSwap,
+  resolveBetweenToolsThinkingLevel,
 } from "./policy";
 
 describe("getThinkingPolicyForModel", () => {
@@ -377,15 +378,23 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  test("drops 'off' for Sonnet 5.5 (provisional always-thinking) but not Sonnet 5", () => {
-    const noOff: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-5")).toEqual(noOff);
-    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-5-20261001")).toEqual(noOff);
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5-5")).toEqual(noOff);
-    expect(enforceThinkingPolicy("anthropic:claude-sonnet-5-5", "off")).toBe("low");
-    expect(resolveEffectiveThinkingLevel("bedrock:anthropic.claude-sonnet-5-5", "off")).toBe("low");
-    // Sonnet 5 keeps its "off" level.
-    expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-5", undefined)).toBe("off");
+  test("offers 'off' for Sonnet 5.5 (between_tools) but not for Opus 5.5", () => {
+    const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const model of [
+      "anthropic:claude-sonnet-5-5",
+      "anthropic:claude-sonnet-5-5-20261001",
+      "mux-gateway:anthropic/claude-sonnet-5-5",
+      "bedrock:anthropic.claude-sonnet-5-5",
+    ]) {
+      expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
+        model,
+        policy: allLevels,
+      });
+      expect(enforceThinkingPolicy(model, "off")).toBe("off");
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("off");
+    }
+    // Opus 5.5 has no between_tools, so "off" still clamps to low.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
   test("returns 5 levels including xhigh for Sonnet 4.6", () => {
@@ -855,5 +864,25 @@ describe("isXaiGrokFastVariantSwap", () => {
     // Other models never swap instances on thinking-level changes.
     expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast-reasoning", "off", "high")).toBe(false);
     expect(isXaiGrokFastVariantSwap("anthropic:claude-sonnet-4-5", "off", "high")).toBe(false);
+  });
+});
+
+describe("resolveBetweenToolsThinkingLevel", () => {
+  const sonnet55 = "anthropic:claude-sonnet-5-5";
+  test.each([
+    // "off" and "low" turns ran at effort low; rows without a level are ignored.
+    { model: sonnet55, route: true, prior: ["off", undefined, "low"], expected: "off" },
+    { model: sonnet55, route: true, prior: ["off", "medium"], expected: "low" },
+    { model: sonnet55, route: true, prior: ["max"], expected: "low" },
+    { model: sonnet55, route: false, prior: [], expected: "low" },
+    { model: "anthropic:claude-sonnet-5", route: false, prior: ["high"], expected: "off" },
+  ] as const)("$model off, route=$route, prior=$prior → $expected", (testCase) => {
+    expect(
+      resolveBetweenToolsThinkingLevel(testCase.model, "off", testCase.route, testCase.prior)
+    ).toBe(testCase.expected);
+  });
+
+  test("leaves levels other than off unchanged", () => {
+    expect(resolveBetweenToolsThinkingLevel(sonnet55, "high", false, ["max"])).toBe("high");
   });
 });

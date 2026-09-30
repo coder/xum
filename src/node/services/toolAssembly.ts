@@ -169,6 +169,17 @@ export function resolveBackendGatedPtcExperiments(
   };
 }
 
+/** Same name, description and schema; execute refuses before any side effect (#5253). */
+function refuseToolForAgent(name: string, tool: Tool, activeAgentId: string): Tool {
+  const refused = cloneToolPreservingDescriptors(tool);
+  refused.execute = () =>
+    Promise.resolve({
+      success: false,
+      error: `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`,
+    });
+  return refused;
+}
+
 /**
  * One tool set across agent-mode switches (#5253, user decision): every tool
  * some switchable agent allows stays advertised, so switching between exec,
@@ -194,13 +205,11 @@ function applySwitchableAgentPolicies(
       // execute never run the refusal below, so a denied one stays absent:
       // a switch then changes the tool block, but the policy still holds.
       if (tool.type === "provider" || tool.execute == null) continue;
-      const refused = cloneToolPreservingDescriptors(tool);
-      refused.execute = () =>
-        Promise.resolve({
-          success: false,
-          error: `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`,
-        });
-      result[name] = refused;
+      // Memory's description carries the memory index, so an agent denied
+      // memory must not see it: memory stays absent (and so does intuition,
+      // which reads memory directly). One cache miss on such a switch.
+      if (name === "memory") continue;
+      result[name] = refuseToolForAgent(name, tool, activeAgentId);
     }
   }
   // Keep the input record's order so the advertised order does not depend on

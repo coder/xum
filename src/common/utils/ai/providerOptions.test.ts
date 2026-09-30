@@ -221,9 +221,207 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(
         anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
       ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
-      // Sonnet 5.5 is provisionally treated the same way (see anthropicRejectsDisabledThinking).
-      expect(buildProviderOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({
-        anthropic: { ...baseAnthropicOptions, effort: "low" },
+    });
+  });
+
+  describe("Sonnet 5.5 'off' → between_tools (#5086)", () => {
+    const sonnet55 = "anthropic:claude-sonnet-5-5";
+    const directConfig = (
+      overrides: Partial<NonNullable<ProvidersConfigMap["anthropic"]>> = {}
+    ): ProvidersConfigMap => ({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, ...overrides },
+    });
+    const coderConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+      },
+    };
+    const coderInstance = (name: string, type: string): ProvidersConfigMap => ({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name, type }],
+      },
+    });
+    const optionsFor = (
+      model: string,
+      level: Parameters<typeof buildProviderOptions>[1],
+      config: ProvidersConfigMap | null | undefined,
+      route: Parameters<typeof buildProviderOptions>[8]
+    ) =>
+      buildProviderOptions(
+        model,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        config,
+        route
+      );
+    const betweenTools = {
+      anthropic: {
+        disableParallelToolUse: false,
+        sendReasoning: true,
+        thinking: { type: "between_tools" },
+        effort: "low",
+      },
+    } as const;
+
+    test("sends between_tools only on routes that forward it verbatim", () => {
+      const eligible: Array<
+        [string, string, ProvidersConfigMap, Parameters<typeof optionsFor>[3]]
+      > = [
+        ["direct", sonnet55, directConfig(), "anthropic"],
+        [
+          "direct with a base URL",
+          sonnet55,
+          directConfig({ baseUrl: "https://gateway.example.com/v1" }),
+          "anthropic",
+        ],
+        ["Coder gateway", "coder:anthropic/claude-sonnet-5-5", coderConfig, "coder"],
+        ["canonical id routed through Coder", sonnet55, coderConfig, "coder"],
+        [
+          "custom-named anthropic-typed Coder instance",
+          "coder:prod-claude/claude-sonnet-5-5",
+          coderInstance("prod-claude", "anthropic"),
+          "coder",
+        ],
+      ];
+      for (const [label, model, config, route] of eligible) {
+        expect({ label, options: optionsFor(model, "off", config, route) }).toEqual({
+          label,
+          options: betweenTools,
+        });
+      }
+
+      // Everything else runs "off" exactly like "low" adaptive, the #4978 clamp.
+      const ineligible: Array<
+        [string, string, ProvidersConfigMap | null | undefined, Parameters<typeof optionsFor>[3]]
+      > = [
+        ["Xum gateway", "mux-gateway:anthropic/claude-sonnet-5-5", directConfig(), "mux-gateway"],
+        ["no resolved route", sonnet55, directConfig(), undefined],
+        ["no providers config", sonnet55, null, "anthropic"],
+        [
+          "custom Anthropic-compatible provider",
+          "my-claude:claude-sonnet-5-5",
+          {
+            "my-claude": {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              providerType: "anthropic-messages",
+            },
+          } as unknown as ProvidersConfigMap,
+          undefined,
+        ],
+        ["OpenRouter", "openrouter:anthropic/claude-sonnet-5-5", directConfig(), "openrouter"],
+        ["Bedrock", "bedrock:anthropic.claude-sonnet-5-5", directConfig(), "bedrock"],
+        // The Coder route allows only an instance whose type is exactly "anthropic".
+        [
+          "bedrock-typed Coder instance",
+          "coder:bedrock/anthropic.claude-sonnet-5-5",
+          coderInstance("bedrock", "bedrock"),
+          "coder",
+        ],
+        [
+          "canonical id routed to a bedrock-typed Coder instance",
+          sonnet55,
+          coderInstance("anthropic", "bedrock"),
+          "coder",
+        ],
+        [
+          "unknown-typed Coder instance",
+          "coder:prod-claude/claude-sonnet-5-5",
+          coderInstance("prod-claude", "future-type"),
+          "coder",
+        ],
+        [
+          "Coder instance with no type",
+          "coder:prod-claude/claude-sonnet-5-5",
+          {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              discoveredProviders: [{ name: "prod-claude" }],
+            },
+          } as unknown as ProvidersConfigMap,
+          "coder",
+        ],
+      ];
+      for (const [label, model, config, route] of ineligible) {
+        expect({ label, options: optionsFor(model, "off", config, route) }).toEqual({
+          label,
+          options: optionsFor(model, "low", config, route),
+        });
+      }
+    });
+
+    test("pins the effort for headless callers that pass the history", () => {
+      const earlierHigh = [
+        createMuxMessage("u", "user", "question"),
+        createMuxMessage("a", "assistant", "answer", { thinkingLevel: "high" }),
+      ];
+      expect(
+        buildProviderOptions(
+          sonnet55,
+          "off",
+          earlierHigh,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          directConfig(),
+          "anthropic"
+        )
+      ).toEqual(optionsFor(sonnet55, "low", directConfig(), "anthropic"));
+    });
+
+    test("the SDK sends the between_tools shape", async () => {
+      const bodies: Array<Record<string, unknown>> = [];
+      const captureFetch = Object.assign(
+        (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (typeof init?.body !== "string") throw new Error("Expected a JSON request body");
+          bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          const content = [{ type: "text", text: "ok" }];
+          const usage = { input_tokens: 1, output_tokens: 1 };
+          return Promise.resolve(
+            Response.json({ id: "m", type: "message", role: "assistant", content, usage })
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const send = async (level: "off" | "low") => {
+        await generateText({
+          model: createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-sonnet-5-5"),
+          prompt: "Return ok.",
+          providerOptions: optionsFor(sonnet55, level, directConfig(), "anthropic") as Parameters<
+            typeof generateText
+          >[0]["providerOptions"],
+          maxRetries: 0,
+        });
+        const body = bodies[bodies.length - 1];
+        return { thinking: body.thinking, outputConfig: body.output_config };
+      };
+
+      // No display, budget_tokens or block_binding: the API rejects each with it.
+      expect(await send("off")).toEqual({
+        thinking: { type: "between_tools" },
+        outputConfig: { effort: "low" },
+      });
+      expect(await send("low")).toEqual({
+        thinking: {
+          type: "adaptive",
+          display: "summarized",
+          block_binding: { prefix_mismatch_behavior: "drop_block" },
+        },
+        outputConfig: { effort: "low" },
       });
     });
   });

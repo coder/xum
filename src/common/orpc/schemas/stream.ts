@@ -77,6 +77,8 @@ export const OnChatDowngradeReasonSchema = z.enum([
   "oldest-mismatch",
   "fingerprint-mismatch",
   "history-read-failed",
+  /** A windowed client's since range could not be read within the window budget (#4961). */
+  "outside-window",
 ]);
 
 export const CaughtUpMessageSchema = z.object({

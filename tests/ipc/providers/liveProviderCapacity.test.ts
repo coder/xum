@@ -2,6 +2,7 @@
 import {
   ProviderCapacityError,
   isProviderCapacityError,
+  isProviderStall,
   retryOnProviderCapacity,
 } from "./liveProviderCapacity";
 
@@ -51,6 +52,24 @@ describe("isProviderCapacityError", () => {
     { error: `Tool output: "${OPENAI_OVERLOADED}"`, errorType: "unknown", capacity: false },
   ])("$errorType: $error -> $capacity", ({ error, errorType, capacity }) => {
     expect(isProviderCapacityError({ error, errorType })).toBe(capacity);
+  });
+});
+
+describe("isProviderStall", () => {
+  test.each([
+    // The request left Mux and the provider never answered: a stall.
+    { eventTypes: ["caught-up", "stream-start"], stall: true },
+    // Nothing was sent: a Mux hang before the request, not the provider.
+    { eventTypes: ["caught-up"], stall: false },
+    { eventTypes: [], stall: false },
+    // Output arrived, so a missing terminal event is Mux failing to finish the stream.
+    { eventTypes: ["stream-start", "stream-delta"], stall: false },
+    { eventTypes: ["stream-start", "reasoning-delta"], stall: false },
+    { eventTypes: ["stream-start", "reasoning-end"], stall: false },
+    { eventTypes: ["stream-start", "tool-call-start"], stall: false },
+    { eventTypes: ["stream-start", "usage-delta"], stall: false },
+  ])("$eventTypes -> $stall", ({ eventTypes, stall }) => {
+    expect(isProviderStall(eventTypes)).toBe(stall);
   });
 });
 

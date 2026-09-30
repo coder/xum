@@ -84,8 +84,9 @@ import {
 } from "@/node/services/utils/messageIds";
 import { defaultModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -1312,10 +1313,24 @@ export class WorkspaceTurnManager {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, ownerWorkspaceId);
-    if (parentEntry?.workspace.kind === "scratch") {
-      return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
+    // Scratch (project-less) owners have no project or branch: mode="new" creates a fresh
+    // scratch chat (createScratch) and mode="existing" continues their own targets, including
+    // reawakening inactive sub-agents. Their trust lives in the scratch config bucket
+    // (parentMeta.projectPath is the scratch workdir), as in Task.create.
+    const ownerIsScratch = parentEntry?.workspace.kind === "scratch";
+    if (
+      ownerIsScratch &&
+      mode === "new" &&
+      (coerceNonEmptyString(args.workspace?.branchName) != null ||
+        coerceNonEmptyString(args.workspace?.trunkBranch) != null)
+    ) {
+      return Err(
+        "Task.createWorkspaceTurn: workspace.branchName/trunkBranch are not supported from a scratch workspace (scratch chats have no git branch)"
+      );
     }
-    const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const taskProjectConfig = cfg.projects.get(
+      ownerIsScratch ? SCRATCH_PROJECT_CONFIG_KEY : stripTrailingSlashes(parentMeta.projectPath)
+    );
     if ((parentMeta.projects?.length ?? 0) > 1) {
       // The host's create() only materializes one project checkout; fail loudly instead of
       // silently dropping secondary repos from a multi-project caller's task context.
@@ -1637,26 +1652,37 @@ export class WorkspaceTurnManager {
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
         [WORKSPACE_TURN_TASK_TAGS.turn]: turnId,
       };
-      const createResult = await this.workspaceService.create(
-        parentMeta.projectPath,
-        args.workspace?.branchName,
-        args.workspace?.trunkBranch ?? parentMeta.name,
-        title,
-        parentMeta.runtimeConfig,
-        parentMeta.subProjectPath,
-        false,
-        tags,
-        // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves. The default consent is
-        // granted when this turn settles (afterHandleWrite); disposable targets never get it.
-        {
-          awaitMaterialization: true,
-          defaultUnrelatedConsent:
-            args.workspace?.disposable === true ? "none" : "caller-finalizes",
-          // Binds the row to this handle and owner until the record below persists (#4983).
-          delegatedCreation: { handleId, ownerWorkspaceId },
-        }
-      );
+      const delegatedCreation = { handleId, ownerWorkspaceId };
+      const defaultUnrelatedConsent =
+        args.workspace?.disposable === true ? ("none" as const) : ("caller-finalizes" as const);
+      const createResult: Result<
+        { metadata: FrontendWorkspaceMetadata; createdBranch?: boolean },
+        string
+      > = ownerIsScratch
+        ? // A scratch chat is materialized once createScratch resolves (plain directory, no init).
+          await this.workspaceService.createScratch(title, tags, {
+            defaultUnrelatedConsent,
+            delegatedCreation,
+          })
+        : await this.workspaceService.create(
+            parentMeta.projectPath,
+            args.workspace?.branchName,
+            args.workspace?.trunkBranch ?? parentMeta.name,
+            title,
+            parentMeta.runtimeConfig,
+            parentMeta.subProjectPath,
+            false,
+            tags,
+            // The agentId validation below reads the target checkout under the task mutex, so
+            // a local worktree must be populated before create() resolves. The default consent is
+            // granted when this turn settles (afterHandleWrite); disposable targets never get it.
+            {
+              awaitMaterialization: true,
+              defaultUnrelatedConsent,
+              // Binds the row to this handle and owner until the record below persists (#4983).
+              delegatedCreation,
+            }
+          );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
       }
