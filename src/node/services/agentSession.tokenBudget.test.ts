@@ -2651,6 +2651,38 @@ describe("AgentSession token-budget lifecycle", () => {
     estimate: 127_000,
     hardCeiling: 119_808,
   };
+  // #5223: a stage prompt reaches the model as a new turn, so it must pass that turn's
+  // turn-start check. This fake check refuses a turn whose full estimate (6/5 of the provider
+  // count, which settlement reports as nextTurnRequestTokens) exceeds the 119,808 ceiling.
+  test.each([
+    { input: 80_000, published: 1 },
+    { input: 100_000, published: 0 },
+  ])(
+    "a published stage prompt is never refused by the turn-start check ($input)",
+    async ({ input, published }) => {
+      const nextTurn = (input * 6) / 5;
+      const refused: number[] = [];
+      const h = await setup({
+        failure: (attempt) => {
+          if (attempt === 1 || nextTurn <= 119_808) return undefined;
+          refused.push(attempt);
+          return exceeded;
+        },
+      });
+      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+      const settled = await h.requests[0].onStepSettled?.(
+        step(input, { nextRequestTokens: input + 1_000, nextTurnRequestTokens: nextTurn })
+      );
+      // A queued prompt is delivered by the next turn; dispatch it through the fake check.
+      if (settled?.decision === "warn") {
+        h.settleStream(0, { contextUsage: { inputTokens: input } });
+        await h.waitForRequest(2);
+      }
+      expect(warningRows(await allRows(h))).toHaveLength(published);
+      expect(refused).toEqual([]);
+    }
+  );
+
   test("an edited request can recover its own pre-handle budget overflow", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
     await seedHistory(h, 20_000);

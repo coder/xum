@@ -524,9 +524,10 @@ describe("settled context hard ceiling", () => {
           expect(anchor?.providerTokens).toBe(100);
           const anchored = await estimateAnchoredRequestTokensForModel(payload, budget, anchor);
           expect(settled[0].nextRequestTokens).toBe(anchored!.estimate);
-          expect(anchored!.estimate).toBeLessThan(
-            (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
-          );
+          // #5223: stages use the full estimate a turn-start check would apply to that request.
+          const full = (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate;
+          expect(settled[0].nextTurnRequestTokens).toBe(full);
+          expect(anchored!.estimate).toBeLessThan(full);
         }
       } finally {
         preflights.mockRestore();

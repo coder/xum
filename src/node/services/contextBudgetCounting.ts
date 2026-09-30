@@ -231,6 +231,29 @@ export async function estimateAnchoredRequestTokensForModel(
   return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling };
 }
 
+/**
+ * Both settled-step measures, counting the full request once: `anchored` is the next step's
+ * in-stream estimate (what its preflight enforces), `full` is what a turn-start check would
+ * enforce on the same request. A stage prompt is delivered as a new turn, so stages use `full`.
+ */
+export async function estimateNextRequestTokensForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor: ContextBudgetAnchor | undefined
+): Promise<{ anchored: number; full: number } | undefined> {
+  const full = await estimateAssembledRequestTokensForModel(payload, options);
+  if (full == null) return undefined;
+  const anchored =
+    anchor != null && isExactAppend(payload, options, anchor)
+      ? await estimateAnchoredRequestTokensForModel(payload, options, anchor)
+      : full;
+  assert(anchored != null, "An anchored estimate exists whenever the full estimate does");
+  return { anchored: anchored.estimate, full: full.estimate };
+}
+
 export async function checkAssembledRequestBudgetForModel(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & {

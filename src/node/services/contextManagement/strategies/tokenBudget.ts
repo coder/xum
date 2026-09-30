@@ -66,6 +66,11 @@ export class TokenBudgetStrategy {
   /** One final prompt per window; derived from history on restart. */
   private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
+  /**
+   * The last settled step's full next-turn estimate (#5223), keyed by that step's provider input
+   * so a send only carries it while the window's latest usage is still that step's.
+   */
+  private settledNextTurn?: { contextTokens: number; tokens: number };
 
   constructor(
     private readonly deps: ContextManagementDependencies,
@@ -102,6 +107,7 @@ export class TokenBudgetStrategy {
     this.pendingRollover = undefined;
     this.contextBudgetHandoffClaimed = false;
     this.contextBudgetFinalClaimed = false;
+    this.settledNextTurn = undefined;
     this.host.continuations.withdraw(
       [CONTEXT_CONTINUE_DEDUPE_KEY, CONTEXT_WARNING_DEDUPE_KEY],
       "withdrawn-cut"
@@ -349,6 +355,11 @@ export class TokenBudgetStrategy {
     const toolResultTokens = knownLimit
       ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
       : 0;
+    // The stages must open here exactly as settlement opened them, so carry its full next-turn
+    // estimate while the latest usage is still the step it measured, plus this send's text.
+    const carried = this.settledNextTurn;
+    const nextTurnRequestTokens =
+      carried?.contextTokens === contextTokens ? carried.tokens + newRequestTokens : undefined;
     const evaluateBudget = (finalHandoffAvailable: boolean): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
@@ -356,6 +367,7 @@ export class TokenBudgetStrategy {
             outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
             ...estimateLastStepToolResults(lastAssistant),
             toolResultTokens,
+            ...(nextTurnRequestTokens != null ? { nextTurnRequestTokens } : {}),
             modelContextLimit: maxTokens,
             threshold,
             // The final prompt supersedes the handoff request.
@@ -497,6 +509,10 @@ export class TokenBudgetStrategy {
     const contextTokens = usage
       ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
       : 0;
+    this.settledNextTurn =
+      step.nextTurnRequestTokens != null && contextTokens > 0
+        ? { contextTokens, tokens: step.nextTurnRequestTokens }
+        : undefined;
     // A settled successful new_context result asks for a rollover regardless of usage. Without
     // session_history nothing could be retrieved from the sealed window (and the reset could not
     // be admitted), and with automatic rollover disabled nothing could seal it, so such requests
@@ -517,6 +533,7 @@ export class TokenBudgetStrategy {
           imageParts: step.imageParts,
           toolResultTokens: step.toolResultTokens,
           nextRequestTokens: step.nextRequestTokens,
+          nextTurnRequestTokens: step.nextTurnRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
           // The final prompt supersedes the handoff request.

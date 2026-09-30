@@ -4,7 +4,7 @@ import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./context
 import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
-  estimateAnchoredRequestTokensForModel,
+  estimateNextRequestTokensForModel,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -289,6 +289,11 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
+  /**
+   * Full estimate of that request, the measure a turn-start check applies (#5223): a stage
+   * prompt is delivered as a new turn, so the stages open on it. Absent with nextRequestTokens.
+   */
+  nextTurnRequestTokens?: number;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -2654,40 +2659,40 @@ export class StreamManager {
           // budget decision can roll over before the preflight blocks. Invariant: this measure
           // is never below the one prepareStep will enforce for the next step. The SDK builds
           // the next input as this step's input plus its response messages.
-          const nextRequestTokens =
+          const next =
             request.contextBudgetLimit == null
               ? undefined
-              : (
-                  await estimateAnchoredRequestTokensForModel(
-                    {
-                      system: request.system,
-                      messages: await transformStepMessages([
-                        ...(stepTracker?.latestMessages ?? [
-                          ...request.messages,
-                          ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                        ]),
-                        ...step.response.messages,
+              : await estimateNextRequestTokensForModel(
+                  {
+                    system: request.system,
+                    messages: await transformStepMessages([
+                      ...(stepTracker?.latestMessages ?? [
+                        ...request.messages,
+                        ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
                       ]),
-                      tools: request.tools,
-                    },
-                    {
-                      model: request.modelString,
-                      metadataModel: request.budgetMetadataModel,
-                      modelContextLimit: request.contextBudgetLimit,
-                      activeTools: computeActiveToolNames(request.toolSearchState),
-                    },
-                    // prepareStep anchors the next step on this same request and usage, so both
-                    // measures take the same anchored-or-full branch and the invariant holds.
-                    createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
-                  )
-                )?.estimate;
+                      ...step.response.messages,
+                    ]),
+                    tools: request.tools,
+                  },
+                  {
+                    model: request.modelString,
+                    metadataModel: request.budgetMetadataModel,
+                    modelContextLimit: request.contextBudgetLimit,
+                    activeTools: computeActiveToolNames(request.toolSearchState),
+                  },
+                  // prepareStep anchors the next step on this same request and usage, so both
+                  // measures take the same anchored-or-full branch and the invariant holds.
+                  createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
+                );
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
             ...size,
             toolResultTokens,
-            ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
+            ...(next != null
+              ? { nextRequestTokens: next.anchored, nextTurnRequestTokens: next.full }
+              : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
