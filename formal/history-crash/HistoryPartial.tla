@@ -27,7 +27,7 @@ CONSTANTS
   MaxCrashes,            \* total crashes
   MaxParts,              \* partial flushes per turn
   CrossBackendBusyGuard, \* TRUE = hypothetical guard: edit refused while ANY backend streams
-  CompleteDeletesFirst,  \* TRUE = code order streamManager.ts:4935 (deletePartial before updateHistory)
+  CompleteDeletesFirst,  \* TRUE = pre-fix order (deletePartial before updateHistory); FALSE = code
   RetirePartialOnEdit,   \* TRUE = code (historyService.ts:5478); FALSE = pre-retirement builds
   CommitRequiresRow,     \* FIX (current code, F1/F2): commitPartial retires a partial whose id has no row
   UpdateMatchesId,       \* FIX (current code, F1/F2): updateHistory refuses a same-seq row with another id
@@ -195,14 +195,16 @@ WritePartial(b) ==
   /\ UNCHANGED <<chat, lock, pc, counter, pend, nextId, turns, edits, crashes, committed,
                  discarded, commitErrs>>
 
-\* Normal completion (streamManager.ts:4914-4946): deletePartial + updateHistory(final).
+\* Normal completion (streamManager.ts:4916-4960): updateHistory(final), then on success
+\* deletePartialIfMessageIdMatches (CompleteDeletesFirst = the pre-fix reverse order).
 FinishBegin(b) ==
   /\ pc[b] = "stream" /\ turn[b].parts > 0
   /\ pc' = [pc EXCEPT ![b] = IF CompleteDeletesFirst THEN "fin_del" ELSE "fin_upd"]
   /\ UNCHANGED <<chat, partial, lock, turn, counter, pend, nextId, turns, edits, crashes,
                  committed, discarded, streamed, commitErrs>>
 
-\* streamManager.ts:4935 deletePartial -> fs.unlink (3107), in-process lock only.
+\* streamManager.ts:4952 deletePartialIfMessageIdMatches (pre-fix: unconditional deletePartial)
+\* -> fs.unlink, in-process lock only.
 FinishDelete(b) ==
   /\ pc[b] = "fin_del"
   /\ partial' = IF CompleteDeletesFirst \/ (partial # NoRec /\ partial.id = turn[b].id)
@@ -212,7 +214,7 @@ FinishDelete(b) ==
   /\ UNCHANGED <<chat, lock, counter, pend, nextId, turns, edits, crashes, committed,
                  discarded, streamed, commitErrs>>
 
-\* streamManager.ts:4943 updateHistory -> updateHistoryUnderWriteLock (4785): replaces the
+\* streamManager.ts:4940 updateHistory -> updateHistoryUnderWriteLock (4785): replaces the
 \* FIRST row whose historySequence matches (4812), whatever its id; Err if none (4844).
 \* UpdateMatchesId = TRUE (current code): the row must also carry the message id.
 FinishUpdate(b) ==
@@ -222,8 +224,9 @@ FinishUpdate(b) ==
          hit == ei # 0 /\ (UpdateMatchesId => chat[ei].id = t.id)
      IN /\ chat' = IF hit THEN [chat EXCEPT ![ei] = Row(t.id, "assistant", t.seq, t.parts)] ELSE chat
         /\ committed' = IF hit THEN committed \cup {t.id} ELSE committed
-  /\ pc' = [pc EXCEPT ![b] = IF CompleteDeletesFirst THEN "idle" ELSE "fin_del"]
-  /\ turn' = IF CompleteDeletesFirst THEN [turn EXCEPT ![b] = NoRec] ELSE turn
+        \* An Err keeps partial.json for recovery (streamManager.ts:4944): no delete.
+        /\ pc' = [pc EXCEPT ![b] = IF CompleteDeletesFirst \/ ~hit THEN "idle" ELSE "fin_del"]
+        /\ turn' = IF CompleteDeletesFirst \/ ~hit THEN [turn EXCEPT ![b] = NoRec] ELSE turn
   /\ UNCHANGED <<partial, lock, counter, pend, nextId, turns, edits, crashes, discarded,
                  streamed, commitErrs>>
 

@@ -918,8 +918,8 @@ interface WorkspaceStreamInfo {
   // first await) so concurrent cancellers — a user stop racing shutdown's
   // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
   cancelPromise?: Promise<void>;
-  // Set by the completion path right before it deletes partial.json and writes
-  // the final message to chat.jsonl. From then on no partial may be written for
+  // Set by the completion path right before it writes the final message to
+  // chat.jsonl and deletes partial.json. From then on no partial may be written for
   // this stream: a cancel landing between deletePartial and COMPLETED (the
   // state flips late, see processStreamWithCleanup) would otherwise resurrect
   // partial.json through its pre-abort flush.
@@ -4948,27 +4948,37 @@ export class StreamManager {
                 parts: streamInfo.parts,
               };
 
-              // CRITICAL: Delete partial.json before updating chat.jsonl
-              // On successful completion, partial.json becomes stale and must be removed.
               // Retire partial writes first: a cancel (user stop, shutdown) landing
               // between here and COMPLETED must not flush partial.json back to disk.
               streamInfo.partialRetired = true;
-              const deleteResult = await this.historyService.deletePartial(workspaceId as string);
-              if (!deleteResult.success) {
-                workspaceLog.warn("Failed to delete partial on stream end", {
-                  error: deleteResult.error,
-                });
-              }
 
-              // Update the placeholder message in chat.jsonl with final content
+              // CRITICAL: Persist the final message to chat.jsonl BEFORE deleting
+              // partial.json (same order as commitPartial). Deleting first left a window
+              // (a crash, or an updateHistory failure such as the history-lock timeout)
+              // with an empty placeholder row and no partial: the completed reply was
+              // lost for good. partial.json already holds the final parts (flushed
+              // above), so on failure keep it for commitPartial recovery.
               const updateResult = await this.historyService.updateHistory(
                 workspaceId as string,
                 finalAssistantMessage
               );
               if (!updateResult.success) {
-                workspaceLog.warn("Failed to update history on stream end", {
+                workspaceLog.warn("Failed to update history on stream end; keeping partial", {
                   error: updateResult.error,
                 });
+              } else {
+                // On successful completion, partial.json becomes stale and must be removed.
+                // Only this stream's own partial: the row just written covers nothing else
+                // (the order formal/history-crash/HistoryPartial.tla checks as crash-safe).
+                const deleteResult = await this.historyService.deletePartialIfMessageIdMatches(
+                  workspaceId,
+                  streamInfo.messageId
+                );
+                if (!deleteResult.success) {
+                  workspaceLog.warn("Failed to delete partial on stream end", {
+                    error: deleteResult.error,
+                  });
+                }
               }
 
               // Update cumulative session usage (if service is available)
