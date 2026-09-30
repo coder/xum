@@ -50,6 +50,17 @@ export function invalidateHistoryAppendProvenance(): void {
   const transaction = transactions.getStore();
   if (transaction?.active) transaction.certified = false;
 }
+/** Canonical string identity of a receipt: fixed key order, so equal receipts give equal keys. */
+export function historyAppendReceiptKey(receipt: HistoryAppendReceipt): string {
+  const stamp = (s: HistoryFileStamps["chat"]) =>
+    s && { dev: s.dev, ino: s.ino, size: s.size, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
+  return JSON.stringify({
+    version: receipt.version,
+    epoch: receipt.epoch,
+    state: receipt.state,
+    files: { chat: stamp(receipt.files.chat), archive: stamp(receipt.files.archive) },
+  });
+}
 function sameStamps(a: HistoryFileStamps, b: HistoryFileStamps): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }

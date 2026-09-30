@@ -1,6 +1,6 @@
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { HistoryService } from "./historyService";
+import { HistoryService, mergeTranscriptPartial } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
@@ -669,5 +669,84 @@ describe("HistoryService partial persistence - Orphaned partials", () => {
     expect(await ids(a, workspaceId)).toEqual(before);
     expect((await row(a, workspaceId, "a0"))?.parts).toEqual([]);
     await expectNextTurnCommits(a, workspaceId);
+  });
+
+  // The transcript overlay (tokenizer, subagent transcripts) must apply the same ownership rule
+  // as commitPartial until the orphan is retired: it only ever replaces the partial's own row.
+  describe("mergeTranscriptPartial", () => {
+    async function merged(service: HistoryService, workspaceId: string): Promise<string[][]> {
+      const history = await service.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return mergeTranscriptPartial(history.data, await service.readPartial(workspaceId)).map(
+        (message) => [message.id, ...message.parts.map((part) => ("text" in part ? part.text : ""))]
+      );
+    }
+
+    /** F2: a foreign edit discards A's turn and A's next delta recreates its partial. */
+    async function discardTurnAndRecreatePartial(workspaceId: string): Promise<HistoryService> {
+      const b = new HistoryService(config);
+      const partial = await startTurn(a, workspaceId, "u0", "a0");
+      expect((await b.truncateAfterMessage(workspaceId, "u0")).success).toBe(true);
+      const more = {
+        ...partial,
+        parts: [
+          { type: "text" as const, text: "discarded a0" },
+          { type: "text" as const, text: "discarded a0 more" },
+        ],
+      };
+      expect((await a.writePartial(workspaceId, more)).success).toBe(true);
+      return b;
+    }
+
+    test("does not show a discarded partial over a newer row that reused its sequence", async () => {
+      const workspaceId = "orphan-f2-overwrite-overlay";
+      const b = await discardTurnAndRecreatePartial(workspaceId);
+      const u1 = createMuxMessage("u1", "user", "new prompt");
+      expect((await b.appendToHistory(workspaceId, u1)).success).toBe(true);
+      const a1 = createMuxMessage("a1", "assistant", "fresh answer");
+      expect((await b.appendToHistory(workspaceId, a1)).success).toBe(true);
+      expect(a1.metadata?.historySequence).toBe(
+        (await a.readPartial(workspaceId))?.metadata?.historySequence
+      );
+
+      expect(await merged(b, workspaceId)).toEqual([
+        ["u1", "new prompt"],
+        ["a1", "fresh answer"],
+      ]);
+    });
+
+    test("does not slot a discarded partial in between newer rows", async () => {
+      const workspaceId = "orphan-f2-gap-overlay";
+      const b = await discardTurnAndRecreatePartial(workspaceId);
+      for (const message of [
+        createMuxMessage("u1", "user", "new prompt"),
+        createMuxMessage("a1", "assistant", "fresh answer"),
+        createMuxMessage("u2", "user", "next prompt"),
+      ]) {
+        expect((await b.appendToHistory(workspaceId, message)).success).toBe(true);
+      }
+      // Leaves no row at the orphan's sequence, with newer rows after it.
+      expect((await b.deleteMessage(workspaceId, "a1")).success).toBe(true);
+
+      expect(await merged(b, workspaceId)).toEqual([
+        ["u1", "new prompt"],
+        ["u2", "next prompt"],
+      ]);
+    });
+
+    test("does not duplicate a partial whose own row sits at another historySequence", async () => {
+      const workspaceId = "orphan-wrong-sequence-overlay";
+      const partial = await startTurn(a, workspaceId, "u0", "a0");
+      const misplaced = {
+        ...partial,
+        metadata: {
+          ...partial.metadata,
+          historySequence: (partial.metadata?.historySequence ?? 0) + 5,
+        },
+      };
+      expect((await a.writePartial(workspaceId, misplaced)).success).toBe(true);
+
+      expect(await merged(a, workspaceId)).toEqual([["u0", "prompt u0"], ["a0"]]);
+    });
   });
 });

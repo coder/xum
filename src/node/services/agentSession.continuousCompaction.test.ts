@@ -700,6 +700,16 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     expect(compacting.success).toBe(true);
     const summaryId = "test-assistant-message";
+    // The compaction's stream identity, as the provider stream start supplies it: only the
+    // operation that streamed a message may register a wait for its decision (#5326).
+    h.aiEmitter.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: summaryId,
+      model,
+      historySequence: 1,
+      startTime: Date.now(),
+    });
     const completion = h.session.waitForPendingCompactionCompletionDecision(summaryId);
     void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",

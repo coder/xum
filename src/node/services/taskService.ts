@@ -2071,6 +2071,12 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopEpochs = new Map<string, number>();
   /**
+   * User Stops per workspace (markParentWorkspaceInterrupted). The stop epoch above also counts
+   * owner interrupts of a delegated turn, which a message waiting for that turn survives (see
+   * flushParkedPeerSends), so parking needs this separate count to tell a user Stop apart.
+   */
+  private readonly workspaceUserStopEpochs = new Map<string, number>();
+  /**
    * #4997: peer messages to a root whose running delegated workspace turn the sender does not
    * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
    * are delivered as ordinary new turns once its live registration is released (see
@@ -2548,7 +2554,9 @@ export class TaskService implements AgentTaskIntegration {
         const epoch = this.getWorkspaceStopEpoch(targetId);
         for (const waiting of parked) waiting.awaitedDelegatedTurn.stopEpochs.set(targetId, epoch);
       }
-      const spec = parked.shift();
+      // The retry removes itself from the list under the target's admission lock (see
+      // sendTreeMessage), so it stays counted against the queue cap until then.
+      const spec = parked[0];
       if (spec == null) {
         this.parkedPeerSendsByTarget.delete(targetId);
         return;
@@ -2572,6 +2580,9 @@ export class TaskService implements AgentTaskIntegration {
           targetId,
           error: getErrorMessage(error),
         });
+      } finally {
+        // A retry that never reached the lock (it threw first) must not be retried forever.
+        if (parked[0] === spec) parked.shift();
       }
     }
   }
@@ -2711,9 +2722,12 @@ export class TaskService implements AgentTaskIntegration {
       const cleanup = (async () => {
         if (options.clearQueue) {
           // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
-          // descendant must not keep pending input; issued once, never re-issued later.
+          // descendant must not keep pending input; issued once, never re-issued later. The
+          // user's queued messages are handed back as held input, never silently dropped.
           try {
-            const clearQueueResult = this.workspaceService.clearQueue(id);
+            const clearQueueResult = this.workspaceService.clearQueue(id, {
+              preserveUserInput: true,
+            });
             if (!clearQueueResult.success) {
               log.debug(`${options.label}: clearQueue failed`, {
                 taskId: id,
@@ -9415,8 +9429,9 @@ export class TaskService implements AgentTaskIntegration {
       // A code_execution loop can call these helpers far faster than a model emits tool calls,
       // so they share task_send_message's peer throttles (rate limits, duplicate suppression,
       // queue cap) instead of a per-session budget that refused long conversations until
-      // restart. Checked and recorded under the target's delivery lock so concurrent sends
-      // cannot both pass the same slot.
+      // restart. Checked and recorded under the target's delivery lock, which task_send_message
+      // also holds from admission through dispatch (withPeerAdmissionLock), so concurrent sends
+      // on either route cannot both pass the same slot, duplicate or queue position.
       const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
         spec.senderWorkspaceId,
         targetWorkspaceId,
@@ -9512,6 +9527,21 @@ export class TaskService implements AgentTaskIntegration {
     return recipient === "turn-end" ? "turn-end" : (requested ?? recipient);
   }
 
+  /**
+   * task_send_message's per-target admission lock. task_message_parent/sibling share its peer
+   * throttles, so both routes must also hold one lock from admission through dispatch: with
+   * separate locks a family
+   * send admitted while a peer send was in flight passed the same rate slot, duplicate check and
+   * queue position (formal/peer-limits, MC_cross_route). The broker's delivery lock is the one
+   * the family route holds; it is taken before the event lock, the family route's nesting (its
+   * sibling dispatch takes the event lock inside it).
+   */
+  private withPeerAdmissionLock<T>(targetId: string, fn: () => Promise<T>): Promise<T> {
+    return this.agentPeerMessageBroker.withDeliveryLock(targetId, () =>
+      this.workspaceEventLocks.withLock(targetId, fn)
+    );
+  }
+
   private sendTreeMessage(
     spec: Extract<TreeMessageSpec, { relation: "descendant" }>
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>>;
@@ -9571,7 +9601,14 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const { senderWorkspaceId, targetId, targetRelation: relation, awaitedDelegatedTurn } = spec;
-    return this.workspaceEventLocks.withLock(targetId, async () => {
+    return this.withPeerAdmissionLock(targetId, async () => {
+      if (awaitedDelegatedTurn != null) {
+        // A retry leaves the parked list only here, under the target's admission lock: removed
+        // earlier, it was counted nowhere while it waited for the lock, and a fresh send
+        // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
+        const parked = this.parkedPeerSendsByTarget.get(targetId);
+        if (parked?.[0] === spec) parked.shift();
+      }
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
       const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
@@ -9729,7 +9766,14 @@ export class TaskService implements AgentTaskIntegration {
           return awaitDelegatedTurn;
         }
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        if (live == null) return null;
+        // A send that resolved a correlation continues that turn only while it is registered:
+        // once it settled (for example by a read of its handle, which does not take this lock),
+        // the correlation is stale and must not reach the session (finding F3).
+        if (live == null) {
+          return delegatedTurnCorrelation != null && delegatedTurnCorrelation !== "unresolved"
+            ? delegatedRootStartingRefusal
+            : null;
+        }
         // A retry never joins a delegated turn, not even one its own sender started meanwhile.
         if (live.ownerWorkspaceId !== senderWorkspaceId || awaitedDelegatedTurn != null) {
           return awaitDelegatedTurn;
@@ -9841,6 +9885,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       const chainStopEpochChanged = (chainIds: string[]): boolean =>
         chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
+      // Only a first attempt parks, and only root targets wait, so the target's own count is
+      // the one that matters (see park()).
+      const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
 
       // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
       // unarchived: refuse before any envelope row is persisted, instead of
@@ -9869,6 +9916,12 @@ export class TaskService implements AgentTaskIntegration {
           : null;
       if (throttleError != null) {
         return Err(throttleError);
+      }
+      // Charge the rate slot at admission, like the family route: sendMessage can persist the
+      // payload row and still report failure, and charging only successes let a failing loop
+      // land a payload per call without limit. A retry was charged when it was first admitted.
+      if (awaitedDelegatedTurn == null) {
+        this.agentPeerMessageBroker.recordPeerAttempt(senderWorkspaceId, targetId);
       }
 
       const rawSenderTitle =
@@ -9918,12 +9971,20 @@ export class TaskService implements AgentTaskIntegration {
       // attribution stays on the assistant payload row, so no provenance is lost; the queue
       // still counts these entries by their dedupe-key prefix.
       // A retry after a delegated turn never carries a correlation (#4997).
-      const workspaceTurnMuxMetadata =
+      const resolvedTurnMuxMetadata =
         awaitedDelegatedTurn == null
           ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
               targetId,
               { requireAcceptedRegistration: true }
             )
+          : undefined;
+      // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
+      // it, so it never needs the correlation, and must not carry it if the turn settles before
+      // the admission gates look again (finding F3). Reawakened agent-task children are continued
+      // by any peer.
+      const workspaceTurnMuxMetadata =
+        targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
+          ? resolvedTurnMuxMetadata
           : undefined;
       delegatedTurnCorrelation = workspaceTurnMuxMetadata;
       // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
@@ -10124,6 +10185,14 @@ export class TaskService implements AgentTaskIntegration {
       const park = (): void => {
         assert(firstAttempt, "sendTreeMessage: a retry after a delegated turn never waits again");
         if (parkedThisAttempt) return;
+        // A user Stop since this attempt was admitted refuses it, even when the stop landed after
+        // the refusing gate (the final gate awaits its rollback before onCanceled parks). The
+        // Stop already dropped the parked list, and the flush takes a new target stop baseline,
+        // so a message parked now would run after the Stop once the user resumes (finding F1).
+        if ((this.workspaceUserStopEpochs.get(targetId) ?? 0) !== capturedUserStopEpoch) {
+          admissionRefusal = interruptedRefusal;
+          return;
+        }
         parkedThisAttempt = true;
         this.parkPeerSend({
           ...spec,
@@ -10137,7 +10206,8 @@ export class TaskService implements AgentTaskIntegration {
       };
       const waitForDelegatedTurn = () => {
         park();
-        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+        if (!parkedThisAttempt) return Err(admissionRefusal ?? interruptedRefusal);
+        this.agentPeerMessageBroker.recordPeerDelivery(senderWorkspaceId, targetId, message);
         return Ok({ delivery: "queued" as const, relation, awaitsDelegatedTurn: true as const });
       };
       // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
@@ -10222,7 +10292,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       if (firstAttempt) {
-        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+        this.agentPeerMessageBroker.recordPeerDelivery(senderWorkspaceId, targetId, message);
       }
       return Ok(
         accepted
@@ -16007,6 +16077,10 @@ export class TaskService implements AgentTaskIntegration {
     // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
     // in-flight peer-send admission also needs the monotonic generation to observe the stop.
     this.bumpWorkspaceStopEpoch(workspaceId);
+    this.workspaceUserStopEpochs.set(
+      workspaceId,
+      (this.workspaceUserStopEpochs.get(workspaceId) ?? 0) + 1
+    );
     // A user Stop refuses agent messages that were not admitted yet, including those waiting
     // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
     // sendTreeMessage), so drop them here rather than let them run after a resume.

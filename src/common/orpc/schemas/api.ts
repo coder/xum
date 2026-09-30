@@ -292,7 +292,7 @@ export const tokenizer = {
       workspaceId: z.string(),
       model: z.string(),
     }),
-    output: ChatStatsSchema,
+    output: ChatStatsSchema.omit({ usageHistory: true }),
   },
 };
 

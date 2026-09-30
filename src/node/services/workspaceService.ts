@@ -2167,6 +2167,11 @@ export class WorkspaceService
   implements WorkspaceHost, WorkflowArchiveAdmissionGuard
 {
   private readonly sessions = new Map<string, AgentSession>();
+  /** Last Context-tab file list per workspace, keyed by the history receipt it came from. */
+  private readonly editedFilePathsByReceipt = new Map<
+    string,
+    { receiptKey: string; paths: string[] }
+  >();
   private shuttingDown = false;
   private readonly shutdownSessions = new Set<AgentSession>();
   private readonly pendingWorkspaceCleanup = new Set<Promise<void>>();
@@ -5552,9 +5557,7 @@ export class WorkspaceService
     // Fallback: compute tracked files from message history (survives reloads).
     // Only the current compaction epoch matters — post-compaction files are from
     // the active epoch only.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    const messages = historyResult.success ? historyResult.data : [];
-    const allPaths = extractEditedFilePaths(messages);
+    const allPaths = await this.getActiveEpochEditedFilePaths(workspaceId);
 
     // Exclude plan file from tracked files since it has its own section
     // Filter out both new and legacy plan file paths
@@ -5564,6 +5567,28 @@ export class WorkspaceService
       trackedFilePaths,
       excludedItems: exclusions.excludedItems,
     };
+  }
+
+  /**
+   * The Context tab read the whole active epoch under the history lock (17–19 s at 1.24M rows,
+   * #5315). It now uses the token-stats snapshot reader (#5329): the same rows as
+   * getHistoryFromLatestBoundary, scanned with the locks released, plus a receipt key that
+   * certifies them. The paths depend only on those rows, so an unchanged history reuses them.
+   * A snapshot that stays stale rejects (the tab keeps its last state) instead of reporting none.
+   */
+  private async getActiveEpochEditedFilePaths(workspaceId: string): Promise<string[]> {
+    const cached = this.editedFilePathsByReceipt.get(workspaceId);
+    if (cached) {
+      const receiptKey = await this.historyService.captureTokenStatsReceiptKey(workspaceId);
+      if (receiptKey === cached.receiptKey) return cached.paths;
+    }
+    const read = await this.historyService.getHistoryForTokenStats(workspaceId);
+    if (!read.success) throw new Error(read.error);
+    const paths = extractEditedFilePaths(read.data.messages);
+    const { receiptKey } = read.data;
+    if (receiptKey === null) this.editedFilePathsByReceipt.delete(workspaceId);
+    else this.editedFilePathsByReceipt.set(workspaceId, { receiptKey, paths });
+    return paths;
   }
 
   /**
@@ -14990,10 +15015,17 @@ export class WorkspaceService
       // to start the later one. Queue behind the earlier in-preflight send instead.
       // requireIdle callers keep their skip semantics below (and are never waited on, see
       // sessionInvisiblePreflights); edits bypass the queue by design.
+      // An idle session can still hold queued work: a report-decision hold (see
+      // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
+      // started directly here would run before that entry, so queue behind it; the queue then
+      // dispatches both in order (formal/message-queue, invariant UserOrder).
+      const hasEarlierPreflight = sessionInvisiblePreflight.hasEarlierPreflight();
+      const queuesBehindIdleQueue = !session.isBusy() && session.hasQueuedMessages();
       const shouldQueue =
         !normalizedOptions?.editMessageId &&
         (session.isBusy() ||
-          (sessionInvisiblePreflight.hasEarlierPreflight() && !yieldsToPreflightSends));
+          queuesBehindIdleQueue ||
+          (hasEarlierPreflight && !yieldsToPreflightSends));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -15051,6 +15083,13 @@ export class WorkspaceService
             internal.cancelState.canceledBeforeAcceptance = true;
           }
           return Ok(undefined);
+        }
+        // Stop-cascade barrier, re-checked at the synchronous enqueue point: the entry check ran
+        // before this send's preflight awaits, and a Stop latched during them clears the queue
+        // (Phase B) at most once. An entry queued after the latch would be cleared or would run
+        // after the Stop; refuse visibly instead, as the direct path's session admission does.
+        if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+          return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
         }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued. The task-attempt token is bound first so its
@@ -15211,6 +15250,13 @@ export class WorkspaceService
 
         if (effectiveQueueDispatchMode === "tool-end") {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
+        }
+
+        // No stream end will drain an idle session's queue. A held head keeps holding (its
+        // decision re-runs the drain); otherwise this starts the oldest entry. An earlier
+        // in-preflight send drains on its own disposal instead, so it is not overtaken.
+        if (queuesBehindIdleQueue && !hasEarlierPreflight) {
+          session.drainQueuedMessagesIfIdle();
         }
 
         return Ok(undefined);
@@ -16228,9 +16274,16 @@ export class WorkspaceService
     }
   }
 
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void> {
     try {
-      this.sessions.get(workspaceId.trim())?.clearQueue(options?.cancelReason);
+      const session = this.sessions.get(workspaceId.trim());
+      // Stop cascades revoke execution, not the user's input: queued manual sends are handed back
+      // (held input + composer restore, as the workspace's own Stop does) instead of discarded.
+      if (options?.preserveUserInput === true) session?.restoreQueueToInput();
+      else session?.clearQueue(options?.cancelReason);
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);

@@ -22,7 +22,7 @@ export interface Tokenizer {
 
 const APPROX_ENCODING = "approx-4";
 
-function shouldUseApproxTokenizer(): boolean {
+export function shouldUseApproxTokenizer(): boolean {
   // XUM_FORCE_REAL_TOKENIZER=1 overrides approx mode (for tests that need real tokenization)
   // XUM_APPROX_TOKENIZER=1 enables fast approximate mode (default in Jest)
   if (resolveXumEnvironmentValue("FORCE_REAL_TOKENIZER", process.env) === "1") {

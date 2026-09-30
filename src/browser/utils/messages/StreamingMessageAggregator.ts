@@ -93,7 +93,13 @@ import {
   type PendingInitialUserMessage,
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
-import { getStatusStateKey } from "@/common/constants/storage";
+import {
+  STATUS_STATE_EMOJI_MAX_CHARS,
+  STATUS_STATE_MESSAGE_MAX_CHARS,
+  STATUS_STATE_URL_MAX_CHARS,
+  getStatusStateKey,
+} from "@/common/constants/storage";
+import { truncateStringToChars } from "@/browser/utils/boundedPersistedValue";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   CONTEXT_BOUNDARY_KINDS,
@@ -841,7 +847,16 @@ export class StreamingMessageAggregator {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
     if (!parsed.success) return;
-    updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
+    // Persist a copy that fits the key budget; a cut URL would be a broken link, so it is dropped.
+    const { emoji, message, url } = parsed.data;
+    updatePersistedState(getStatusStateKey(this.workspaceId), {
+      emoji: truncateStringToChars(emoji, STATUS_STATE_EMOJI_MAX_CHARS),
+      message: truncateStringToChars(message, STATUS_STATE_MESSAGE_MAX_CHARS),
+      url:
+        url !== undefined && JSON.stringify(url).length <= STATUS_STATE_URL_MAX_CHARS
+          ? url
+          : undefined,
+    });
   }
 
   private clearPersistedAgentStatus(): void {

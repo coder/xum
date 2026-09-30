@@ -1,3 +1,6 @@
+import { getPersistedStateStorage } from "@/browser/hooks/usePersistedState";
+import { MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+
 /**
  * Keep growing persisted values inside their key budgets (PERSISTED_KEY_REGISTRY maxValueChars).
  *
@@ -63,4 +66,71 @@ export function trimArrayToChars<T>(items: readonly T[], maxChars: number): T[] 
     kept++;
   }
   return items.slice(0, kept);
+}
+
+/**
+ * Keep the longest prefix of `value` that serializes to at most `maxChars` (quotes and escapes
+ * included). Cuts only between code points, so a surrogate pair is never split.
+ */
+export function truncateStringToChars(value: string, maxChars: number): string {
+  if (JSON.stringify(value).length <= maxChars) return value;
+  let total = 2; // '""'
+  let end = 0;
+  for (const char of value) {
+    const charChars = JSON.stringify(char).length - 2;
+    if (total + charChars > maxChars) break;
+    total += charChars;
+    end += char.length;
+  }
+  return value.slice(0, end);
+}
+
+/**
+ * Full values of this session whose persisted copy their owner bounded, by storage key. Kept per
+ * persisted-state Storage, like usePersistedState's over-budget values: a remount keeps them, and
+ * a restart (a new Storage) drops them so the bounded persisted copy comes back. Read with
+ * useSyncExternalStore(store.subscribe, () => store.get(key)).
+ */
+export function createSessionValueStore<T>() {
+  const valuesByStorage = new WeakMap<Storage, Map<string, T>>();
+  const listeners = new Set<() => void>();
+  return {
+    get: (key: string): T | undefined => {
+      const storage = getPersistedStateStorage();
+      return storage ? valuesByStorage.get(storage)?.get(key) : undefined;
+    },
+    set: (key: string, value: T | undefined): void => {
+      const storage = getPersistedStateStorage();
+      if (!storage) return;
+      let values = valuesByStorage.get(storage);
+      if (!values) {
+        values = new Map();
+        valuesByStorage.set(storage, values);
+      }
+      if (value === undefined) values.delete(key);
+      else values.set(key, value);
+      for (const listener of listeners) listener();
+    },
+    subscribe: (listener: () => void): (() => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+/**
+ * Why a custom model id is too long to select, or null: a selected "provider:modelId" that does
+ * not fit the per-workspace model key would be lost on restart.
+ */
+export function getModelIdLengthError(provider: string, modelId: string): string | null {
+  if (JSON.stringify(`${provider}:${modelId}`).length <= MODEL_KEY_MAX_CHARS) return null;
+  const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify(`${provider}:`).length;
+  // The limit applies to the stored JSON string, where escaped characters take two or more.
+  const hasEscapes = JSON.stringify(modelId).length - 2 > modelId.length;
+  return (
+    `Model IDs for ${provider} can be at most ${maxIdChars} characters` +
+    (hasEscapes ? " (quotes and backslashes count twice)" : "")
+  );
 }

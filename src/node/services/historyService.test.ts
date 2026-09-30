@@ -3990,6 +3990,56 @@ describe("HistoryService", () => {
       expect(archiveRows.map((m) => m.id)).toEqual(["old-0"]);
     });
 
+    it("windowed chat-open reads skip the rotation scan on legacy files (#5300)", async () => {
+      const boundary = boundaryMessage("boundary-1", 1);
+      const lines = [
+        messageLine(wsId, createMuxMessage("old-0", "user", "old", { historySequence: 0 })),
+        messageLine(wsId, createMuxMessage("old-1", "assistant", "old", { historySequence: 1 })),
+        messageLine(wsId, { ...boundary, metadata: { ...boundary.metadata, historySequence: 2 } }),
+        messageLine(wsId, createMuxMessage("post-0", "user", "after", { historySequence: 3 })),
+        messageLine(wsId, createMuxMessage("post-1", "assistant", "reply", { historySequence: 4 })),
+      ];
+      await writeHistoryLines(config, wsId, lines);
+      const legacyBytes = await fs.readFile(chatPath(wsId), "utf8");
+      const internals = service as unknown as {
+        findLastBoundaryByteOffset(filePath: string, skip?: number): Promise<number | null>;
+      };
+      const scan = spyOn(internals, "findLastBoundaryByteOffset");
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      try {
+        const window = await service.getHistoryWindowFromLatestBoundary(wsId, caps);
+        const page = await service.getHistoryPageFromLatestBoundary(wsId, caps, 4);
+        const since = await service.getHistorySinceFromLatestBoundary(wsId, caps, {
+          floor: 2,
+          anchor: 3,
+        });
+        assert(window.success && window.data.kind === "window");
+        assert(page.success && page.data.kind === "page");
+        assert(since.success && since.data.kind === "range");
+        expect(scan).not.toHaveBeenCalled();
+        // The unrotated sealed prefix stays in chat.jsonl and is never returned.
+        expect(await fs.readFile(chatPath(wsId), "utf8")).toBe(legacyBytes);
+        expect(await fs.stat(archivePath(wsId)).catch(() => null)).toBeNull();
+
+        // The full read still rotates lazily and returns the same epoch.
+        const latest = await service.getHistoryFromLatestBoundary(wsId);
+        assert(latest.success);
+        expect(scan).toHaveBeenCalled();
+        expect(latest.data.map((m) => m.id)).toEqual(["boundary-1", "post-0", "post-1"]);
+        expect(window.data.messages).toEqual(latest.data);
+        expect(since.data.messages).toEqual(latest.data);
+        expect(page.data.messages).toEqual(latest.data.slice(0, 2));
+      } finally {
+        scan.mockRestore();
+      }
+      expect((await readJsonlFile(chatPath(wsId))).map((m) => m.id)).toEqual([
+        "boundary-1",
+        "post-0",
+        "post-1",
+      ]);
+      expect((await readJsonlFile(archivePath(wsId))).map((m) => m.id)).toEqual(["old-0", "old-1"]);
+    });
+
     it("reads boundary windows across the archive seam (skip + paging)", async () => {
       await service.appendToHistory(wsId, createMuxMessage("e1-user", "user", "msg")); // seq 0
       await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 1
@@ -4066,6 +4116,49 @@ describe("HistoryService", () => {
 
       const full = await collectFullHistory(restarted, wsId);
       expect(full.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2", "boundary-1", "post-0"]);
+    });
+
+    it("pages older epochs once when a crash replayed the sealed prefix (#5300)", async () => {
+      await appendNumberedMessages(service, wsId, 3); // seq 0..2 → archived after boundary
+      await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3
+      await service.appendToHistory(wsId, createMuxMessage("post-0", "user", "after")); // seq 4
+      const archived = await fs.readFile(archivePath(wsId), "utf-8");
+      const active = await fs.readFile(chatPath(wsId), "utf-8");
+      await fs.writeFile(chatPath(wsId), archived + active);
+
+      // A fresh process pages windowed: no full read has repaired the layout yet.
+      const restarted = new HistoryService(config);
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      const page = await restarted.getHistoryPageFromLatestBoundary(wsId, caps, 3);
+      assert(page.success && page.data.kind === "before-epoch");
+      const older = await restarted.getHistoryBoundaryWindow(wsId, 3);
+      assert(older.success);
+      expect(older.data.messages.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2"]);
+    });
+
+    it("window and since reads return the active epoch once after a crash replay (#5300)", async () => {
+      await appendNumberedMessages(service, wsId, 3); // seq 0..2 → archived after boundary
+      await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3
+      await service.appendToHistory(wsId, createMuxMessage("post-0", "user", "after")); // seq 4
+      const archived = await fs.readFile(archivePath(wsId), "utf-8");
+      const active = await fs.readFile(chatPath(wsId), "utf-8");
+      // The sealed prefix sits in the archive AND again at the head of chat.jsonl.
+      await fs.writeFile(chatPath(wsId), archived + active);
+
+      const restarted = new HistoryService(config);
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      const window = await restarted.getHistoryWindowFromLatestBoundary(wsId, caps);
+      const since = await restarted.getHistorySinceFromLatestBoundary(wsId, caps, {
+        floor: 3,
+        anchor: 4,
+      });
+      assert(window.success && window.data.kind === "window");
+      assert(since.success && since.data.kind === "range");
+      expect(window.data.messages.map((m) => m.id)).toEqual(["boundary-1", "post-0"]);
+      expect(since.data.messages.map((m) => m.id)).toEqual(["boundary-1", "post-0"]);
+      const latest = await restarted.getHistoryFromLatestBoundary(wsId);
+      assert(latest.success);
+      expect(window.data.messages).toEqual(latest.data);
     });
 
     it("deduplicates verified reset copies while preserving their post-reset archive", async () => {
@@ -4544,7 +4637,8 @@ describe("HistoryService", () => {
     it("reads cross-session fixtures, filters malformed lines, and merges partials", async () => {
       const committed = createMuxMessage("committed", "assistant", "old", { historySequence: 1 });
       const next = createMuxMessage("next", "user", "next", { historySequence: 2 });
-      const partial = createMuxMessage("partial", "assistant", "new", { historySequence: 1 });
+      // The partial overlays its own row (same id and sequence, the commitPartial rule).
+      const partial = createMuxMessage("committed", "assistant", "new", { historySequence: 1 });
       partial.parts?.push({ type: "text", text: "continued" });
       await writeArtifact(
         "owner",
@@ -4557,7 +4651,8 @@ describe("HistoryService", () => {
         { taskId: "merged-task", requestingWorkspaceId: null },
         dependencies
       );
-      expect(merged.messages.map((message) => message.id)).toEqual(["partial", "next"]);
+      expect(merged.messages.map((message) => message.id)).toEqual(["committed", "next"]);
+      expect(merged.messages[0]?.parts).toEqual(partial.parts);
       expect(merged).toMatchObject({ model: "openai:gpt-5", thinkingLevel: "high" });
 
       const partialOnly = createMuxMessage("partial-only", "assistant", "saved", {

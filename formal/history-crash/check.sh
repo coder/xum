@@ -23,8 +23,8 @@ cases=(
   # and updateHistory matches rows by message id (historyService.ts).
   "HistoryPartial|P4-fixed-all|pass|B=2 C=1 T=3 E=1 P=1 DF=FALSE RR=TRUE UI=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoLostStreamedContent NoCommitError"
   "HistoryPartial|P4-fixed-concurrent|pass|B=2 C=1 T=2 E=1 P=1 DF=FALSE RR=TRUE UI=TRUE CS=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoCommitError"
-  # F3, not fixed yet: stream completion deletes partial.json before updateHistory (DF=TRUE).
-  "HistoryPartial|P1-finish-order|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=2 DF=TRUE RR=TRUE UI=TRUE|NoLostStreamedContent"
+  # F3 is fixed (DF=FALSE): stream completion writes the final row, then deletes its partial.
+  "HistoryPartial|P1-finish-order-fixed|pass|B=1 C=1 T=2 E=0 P=2 DF=FALSE RR=TRUE UI=TRUE|NoLostStreamedContent"
   # F4, not fixed (DF=FALSE isolates it from F3): concurrent streams share partial.json.
   "HistoryPartial|P5-concurrent-streams|NoLostStreamedContent|B=2 C=0 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE CS=TRUE|NoLostStreamedContent"
   # --- HistoryPartial: before the F1/F2 fix (RR=FALSE UI=FALSE) ----------------
@@ -36,26 +36,30 @@ cases=(
   "HistoryPartial|P3-two-backend-commit-err|NoCommitError|B=2 C=0 T=2 E=1 P=2 DF=FALSE|NoCommitError"
   "HistoryPartial|P3-two-backend-overwrite|NoLostCommittedRow|B=2 C=0 T=2 E=1 P=1 DF=FALSE CS=TRUE|NoLostCommittedRow"
   "HistoryPartial|P3-two-backend-guarded|pass|B=2 C=0 T=2 E=1 P=2 DF=FALSE G=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoLostStreamedContent NoCommitError"
-  # --- HistoryPartial: candidate F3 fix + mutation sanity ----------------------
-  "HistoryPartial|P1-finish-order-fixed|pass|B=1 C=1 T=2 E=0 P=2 DF=FALSE RR=TRUE UI=TRUE|NoLostStreamedContent"
+  # --- HistoryPartial: mutation sanity -----------------------------------------
+  # Pre-F3-fix completion order (deletePartial, then updateHistory) loses the reply.
+  "HistoryPartial|P1-finish-order|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=2 DF=TRUE RR=TRUE UI=TRUE|NoLostStreamedContent"
   "HistoryPartial|M1-unlink-before-commit|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MU=TRUE|NoLostStreamedContent"
   "HistoryPartial|M2-no-torn-separator|NoLostCommittedRow|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MS=TRUE|NoLostCommittedRow"
   # --- ArchiveSwap: current code -------------------------------------------
-  "ArchiveSwap|A1-single-backend|pass|B=1 C=1 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  "ArchiveSwap|A1-single-backend-2crash|pass|B=1 C=2 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  # F5, not fixed yet: read-path rotation skips truncate recovery. Checks NoLostRow only:
-  # TLC's parallel workers otherwise report NoLostRow or TruncationAtomic nondeterministically.
-  "ArchiveSwap|A2-two-backend-rotation|NoLostRow|B=2 C=1 A=3 R=2 X=1|NoLostRow"
-  "ArchiveSwap|A2-two-backend-no-crash|pass|B=2 C=0 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  # --- ArchiveSwap: candidate F5 fix + mutation sanity ---------------------
+  # F5 is fixed (RR=TRUE): rotateSealedHistoryUnlocked re-runs truncate recovery under its
+  # own lock hold, so rotation never appends over a crashed foreign truncation.
+  "ArchiveSwap|A1-single-backend|pass|B=1 C=1 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|A1-single-backend-2crash|pass|B=1 C=2 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
   "ArchiveSwap|A3-rotation-recovers|pass|B=2 C=1 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
-  "ArchiveSwap|M3-unlink-tombstone-first|TruncationAtomic|B=1 C=1 A=3 R=1 X=1 MU=TRUE|TruncationAtomic"
-  "ArchiveSwap|M4-recover-forward-only|NoLostRow|B=1 C=1 A=3 R=1 X=1 MR=TRUE|NoLostRow"
-  "ArchiveSwap|M5-no-torn-separator|NoLostRow|B=1 C=1 A=2 R=0 X=0 MT=TRUE|NoLostRow"
+  "ArchiveSwap|A2-two-backend-no-crash|pass|B=2 C=0 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
+  # --- ArchiveSwap: before the F5 fix (RR=FALSE) --------------------------------
+  # Read-path rotation skipped truncate recovery. Checks NoLostRow only: TLC's parallel
+  # workers otherwise report NoLostRow or TruncationAtomic nondeterministically.
+  "ArchiveSwap|A2-two-backend-rotation|NoLostRow|B=2 C=1 A=3 R=2 X=1|NoLostRow"
+  # --- ArchiveSwap: mutation sanity --------------------------------------------
+  "ArchiveSwap|M3-unlink-tombstone-first|TruncationAtomic|B=1 C=1 A=3 R=1 X=1 RR=TRUE MU=TRUE|TruncationAtomic"
+  "ArchiveSwap|M4-recover-forward-only|NoLostRow|B=1 C=1 A=3 R=1 X=1 RR=TRUE MR=TRUE|NoLostRow"
+  "ArchiveSwap|M5-no-torn-separator|NoLostRow|B=1 C=1 A=2 R=0 X=0 RR=TRUE MT=TRUE|NoLostRow"
 )
 
 render_partial_cfg() {
-  local kv="$1" invs="$2" B=1 C=1 T=2 E=1 P=1 G=FALSE DF=TRUE RE=TRUE RR=FALSE UI=FALSE MU=FALSE MS=FALSE CS=FALSE backends
+  local kv="$1" invs="$2" B=1 C=1 T=2 E=1 P=1 G=FALSE DF=FALSE RE=TRUE RR=FALSE UI=FALSE MU=FALSE MS=FALSE CS=FALSE backends
   local pair
   for pair in $kv; do
     case "$pair" in

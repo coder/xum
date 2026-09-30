@@ -995,8 +995,22 @@ export const TERMINAL_TITLES_MAX_CHARS = 768;
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
-/** workspaceNameState stores at most this much of the creation message it was generated for. */
+/** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
 export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
+/**
+ * workspaceNameState stores at most this much (serialized) of a typed manual name. Valid names are
+ * at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
+ */
+export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
+/**
+ * model:{workspaceId} holds a "provider:modelId" string. Custom model ids are checked against it
+ * where they are entered (getModelIdLengthError); built-in ids are far shorter.
+ */
+export const MODEL_KEY_MAX_CHARS = 128;
+/** statusState:{workspaceId} field caps (serialized chars); a longer URL is dropped, not cut. */
+export const STATUS_STATE_EMOJI_MAX_CHARS = 32;
+export const STATUS_STATE_MESSAGE_MAX_CHARS = 192;
+export const STATUS_STATE_URL_MAX_CHARS = 256;
 
 /**
  * Every key's length is capped too. Budgets bound values only: scope ids embed project paths
@@ -1120,18 +1134,19 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // embedded copy), and the budget derives from that bound. Data that has no natural bound belongs on
 // the backend, as composer drafts do (DraftService). The session-only fallback for an
 // over-budget value is a safety net for bugs, not a supported path: a value that can legitimately
-// exceed its budget is a bug in its owner. Known instances are tracked in #5237.
+// exceed its budget is a bug in its owner.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
   workspaceKey(getWorkspaceAISettingsByAgentKey, "synced", true, 1024),
-  workspaceKey(getModelKey, "ui", true, 128),
+  workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
   workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
   workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
-  // Creation-draft scopes only; lastGeneratedFor is capped at WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS.
+  // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
+  // plus suffix, title <= 60) + lastGeneratedFor 2000 + manualName 1024 (the caps above).
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
@@ -1152,6 +1167,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
   // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
   // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
+  // ~28 skeleton + the STATUS_STATE_*_MAX_CHARS field caps.
   workspaceKey(getStatusStateKey, "workspace-scoped", true, 512),
   // Note: auto-compaction threshold is per-model, not per-workspace.
 
@@ -1189,7 +1205,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(UI_THEME_KEY, "synced", 64),
   globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
-  globalKey(SELECTED_WORKSPACE_KEY, "ui", 2048),
+  // { workspaceId } (older builds also stored paths; readers use only the id).
+  globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
   globalKey(LAST_VISITED_ROUTE_KEY, "ui", 4096),
   globalKey(LAUNCH_BEHAVIOR_KEY, "synced", 32),
   globalKey(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "synced", 16),

@@ -1,13 +1,12 @@
 import type { WorkspaceConsumersState } from "./WorkspaceStore";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
-import type { ChatStats } from "@/common/types/chatStats";
 
 const TOKENIZER_CANCELLED_MESSAGE = "Cancelled by newer request";
 
 let globalTokenStatsRequestId = 0;
 const latestRequestByWorkspace = new Map<string, number>();
 
-async function calculateTokenStatsLatest(workspaceId: string, model: string): Promise<ChatStats> {
+async function calculateTokenStatsLatest(workspaceId: string, model: string) {
   const orpcClient = window.__ORPC_CLIENT__;
   if (!orpcClient) {
     throw new Error("ORPC client not initialized");
