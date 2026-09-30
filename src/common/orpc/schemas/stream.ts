@@ -946,7 +946,6 @@ export const ExperimentsSchema = z.preprocess(
      * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
      */
     rlm: z.boolean().optional(),
-    advisorTool: z.boolean().optional(),
     dynamicWorkflows: z.boolean().optional(),
     memory: z.boolean().optional(),
     memoryIntuition: z.boolean().optional(),

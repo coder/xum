@@ -1,6 +1,6 @@
 import { normalizeAgentId } from "@/common/utils/agentIds";
 
-/** Default per-turn usage cap for the experimental advisor tool. */
+/** Default per-turn usage cap for the advisor tool. */
 export const ADVISOR_DEFAULT_MAX_USES_PER_TURN = 3;
 
 /** Upper bound on the advisor tool's `question` input (schema and description share it). */

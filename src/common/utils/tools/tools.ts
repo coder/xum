@@ -331,7 +331,6 @@ export interface ToolConfiguration {
     programmaticToolCalling?: boolean;
     /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
     rlm?: boolean;
-    advisorTool?: boolean;
     dynamicWorkflows?: boolean;
     tokenBudget?: boolean;
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */

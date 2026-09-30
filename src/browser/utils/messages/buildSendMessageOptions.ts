@@ -7,7 +7,6 @@ export interface ExperimentValues {
   programmaticToolCalling: boolean | undefined;
   /** RLM mode (sub-experiment of PTC): backend ignores it unless PTC is on. */
   rlm: boolean | undefined;
-  advisorTool: boolean | undefined;
   dynamicWorkflows: boolean | undefined;
   memory: boolean | undefined;
   memoryIntuition: boolean | undefined;

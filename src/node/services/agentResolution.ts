@@ -74,8 +74,6 @@ export interface ResolveAgentOptions {
   cfg: ProjectsConfig;
   /** Emit an error event on the AIService EventEmitter (for disabled-agent subagent errors). */
   emitError: (event: ErrorEvent) => void;
-  /** Whether the advisor-tool experiment is enabled (from ExperimentsService). */
-  isAdvisorExperimentEnabled?: boolean;
   /** agent-plugins experiment: also resolve agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
   /**
@@ -229,7 +227,6 @@ export async function resolveAgentForStream(
     callerToolPolicy,
     cfg,
     emitError,
-    isAdvisorExperimentEnabled,
     includeAgentPlugins,
     agentDefinitionCache: cache,
   } = opts;
@@ -522,12 +519,10 @@ export async function resolveAgentForStream(
   // --- Tool policy composition ---
   // Agent policy establishes baseline (deny-all + enable whitelist + runtime restrictions).
   // Caller policy then narrows further if needed.
-  const advisorEnabled =
-    isAdvisorExperimentEnabled === true &&
-    resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
-    );
+  const advisorEnabled = resolveAdvisorEnabledForAgent(
+    effectiveAgentId,
+    cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+  );
   const agentToolPolicy = resolveToolPolicyForAgent({
     agents: agentsForInheritance,
     isSubagent: isSubagentWorkspace,

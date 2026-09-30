@@ -85,6 +85,7 @@ import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
 import {
   EXPERIMENT_IDS,
+  GRADUATED_EXPERIMENT_IDS,
   LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   type ExperimentId,
 } from "../common/constants/experiments";
@@ -296,9 +297,6 @@ const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
   //   tempDir config root, so persistent memories under the user's Xum home
   //   would be invisible and new writes deleted on process exit.
-  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
-  //   has a non-empty advisorModelString, which the CLI's ephemeral config
-  //   never carries over.
   [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
   [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
 } as const satisfies Partial<
@@ -321,6 +319,9 @@ function collectExperiments(value: string, previous: string[]): string[] {
   // automation that passes the removed ID working instead of erroring.
   if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
     experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
+  if (GRADUATED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
   }
   // App-level experiments (e.g. agent-browser) have no send-options field and
   // would be silent no-ops in a headless run, so reject them loudly.

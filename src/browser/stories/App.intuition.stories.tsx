@@ -166,7 +166,6 @@ export const ReasoningSettings: AppStory = {
       setup={() => {
         updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
         updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), true);
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ADVISOR_TOOL), true);
         return createMockORPCClient({
           agentDefinitions: FALLBACK_AGENTS,
           agentAiDefaults: {

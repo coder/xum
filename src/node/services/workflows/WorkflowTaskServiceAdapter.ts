@@ -22,7 +22,6 @@ export const DEFAULT_WORKFLOW_AGENT_ID = "exec";
 
 interface WorkflowTaskExperiments {
   programmaticToolCalling?: boolean;
-  advisorTool?: boolean;
   workspaceHeartbeats?: boolean;
   subagentFileReports?: boolean;
   dynamicWorkflows?: boolean;

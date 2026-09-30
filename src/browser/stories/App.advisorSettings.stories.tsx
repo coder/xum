@@ -3,7 +3,6 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { APIClient } from "@/browser/contexts/API";
 
 export default { ...appMeta, title: "App/AdvisorSettings" };
@@ -11,7 +10,6 @@ export default { ...appMeta, title: "App/AdvisorSettings" };
 function setupAdvisorSettings() {
   expandLeftSidebar();
   const client = setupSettingsStory({
-    experiments: { [EXPERIMENT_IDS.ADVISOR_TOOL]: true },
     providersConfig: {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
     },
@@ -40,8 +38,11 @@ function setupAdvisorSettings() {
 }
 
 async function exerciseAdvisorMode(canvasElement: HTMLElement) {
-  const canvas = within(await openSettingsDialog(canvasElement));
-  await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
+  const settings = within(await openSettingsDialog(canvasElement));
+  await userEvent.click(await settings.findByRole("button", { name: "Agents" }));
+  // Agent default cards also render Reasoning pickers; scope to the Advisor block.
+  const heading = await settings.findByRole("heading", { name: "Advisor", level: 3 });
+  const canvas = within(heading.parentElement!);
   const trigger = await canvas.findByRole("button", { name: "Reasoning" });
   await expect(trigger).toHaveTextContent("Low");
   trigger.scrollIntoView({ block: "center" });

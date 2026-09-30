@@ -14,7 +14,6 @@ export const EXPERIMENT_IDS = {
   MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
   AGENT_BROWSER: "agent-browser",
-  ADVISOR_TOOL: "advisor-tool",
   WORKSPACE_HEARTBEATS: "workspace-heartbeats",
   PORTABLE_DESKTOP: "portable-desktop",
   DYNAMIC_WORKFLOWS: "dynamic-workflows",
@@ -34,6 +33,12 @@ export const EXPERIMENT_IDS = {
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
+
+/**
+ * Experiments that graduated to always-on. CLI entry points accept their old
+ * IDs as no-ops so existing `-e` automation keeps working after upgrade.
+ */
+export const GRADUATED_EXPERIMENT_IDS: ReadonlySet<string> = new Set(["advisor-tool"]);
 
 /**
  * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
@@ -168,13 +173,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.AGENT_BROWSER,
     name: "Agent Browser",
     description: "Show the Browser tab in the right sidebar for live agent-browser viewing",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.ADVISOR_TOOL]: {
-    id: EXPERIMENT_IDS.ADVISOR_TOOL,
-    name: "Advisor Tool",
-    description: "Enable the experimental client-side advisor tool foundation",
     enabledByDefault: false,
     showInSettings: true,
   },

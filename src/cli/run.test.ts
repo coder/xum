@@ -284,6 +284,18 @@ describe("xum CLI", () => {
       expect(result.output).not.toContain("Unknown or unsupported experiment");
     });
 
+    test("graduated advisor-tool experiment is accepted as a no-op", async () => {
+      const result = await runRunDirect([
+        "-e",
+        "advisor-tool",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
     test("nonexistent directory shows error", async () => {
       const result = await runRunDirect([
         "--dir",
