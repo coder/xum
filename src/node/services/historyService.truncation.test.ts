@@ -460,12 +460,19 @@ describe("HistoryService rotation over a crashed foreign truncation", () => {
   function crashForeignTruncationAtProbe(
     tombstone: string,
     crashAt: "after" | "before",
-    percentage?: number
+    percentage?: number,
+    failNextProbe = false
   ) {
     const originalStat = fs.stat;
-    const state = { raced: false };
+    const state = { raced: false, probeFailed: false };
     spyOn(fs, "stat").mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
-      if (state.raced || String(args[0]) !== tombstone) return originalStat(...args);
+      if (String(args[0]) !== tombstone) return originalStat(...args);
+      // The next tombstone stat after the race is rotation's own artifact probe.
+      if (state.raced && failNextProbe && !state.probeFailed) {
+        state.probeFailed = true;
+        throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+      }
+      if (state.raced) return originalStat(...args);
       state.raced = true;
       if (crashAt === "before") runCrashingForeignTruncation(h.config.rootDir, ws, percentage);
       try {
@@ -503,18 +510,28 @@ describe("HistoryService rotation over a crashed foreign truncation", () => {
     60_000
   );
 
-  test.skipIf(process.platform === "win32")(
-    "fails the read when recovery inside rotation fails, then heals on retry",
-    async () => {
+  test.skipIf(process.platform === "win32").each(["artifact probe", "rollback rename"] as const)(
+    "fails the read when the %s inside rotation fails, then heals on retry",
+    async (failure) => {
       const { archive, tombstone } = await seedUnrotatedEpoch();
       // Removing chat rows too keeps B's transaction uncommitted, so recovery rolls it back.
-      const race = crashForeignTruncationAtProbe(tombstone, "after", 0.5);
-      // Recovery's rollback (tombstone -> archive) fails once with a transient error.
+      const race = crashForeignTruncationAtProbe(
+        tombstone,
+        "after",
+        0.5,
+        failure === "artifact probe"
+      );
+      // Or recovery's rollback (tombstone -> archive) fails once with a transient error.
       const originalRename = fs.rename;
-      let failed = false;
+      let renameFailed = false;
       spyOn(fs, "rename").mockImplementation((async (...args: Parameters<typeof fs.rename>) => {
-        if (!failed && String(args[0]) === tombstone && String(args[1]) === archive) {
-          failed = true;
+        if (
+          failure === "rollback rename" &&
+          !renameFailed &&
+          String(args[0]) === tombstone &&
+          String(args[1]) === archive
+        ) {
+          renameFailed = true;
           throw Object.assign(new Error("injected EIO"), { code: "EIO" });
         }
         return originalRename(...args);
@@ -524,7 +541,7 @@ describe("HistoryService rotation over a crashed foreign truncation", () => {
       const read = await new HistoryService(h.config).getHistoryFromLatestBoundary(ws, 2);
       mock.restore();
       expect(race.raced).toBe(true);
-      expect(failed).toBe(true);
+      expect(failure === "artifact probe" ? race.probeFailed : renameFailed).toBe(true);
       expect(read.success).toBe(false);
 
       const retry = await new HistoryService(h.config).getHistoryFromLatestBoundary(ws, 2);

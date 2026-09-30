@@ -2925,13 +2925,14 @@ export class HistoryService {
     // recovery cannot match to the marker, so recovery deletes it with the rotated rows
     // (TLA+ formal/history-crash ArchiveSwap A2 vs A3). Rolling back first restores the
     // tombstoned archive, and rotation appends to it. Two stats when there is nothing to do.
-    if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {
-      invalidateHistoryAppendProvenance();
-      try {
+    // The artifact probe is part of recovery: a failed stat must not pass as a rotation error.
+    try {
+      if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {
+        invalidateHistoryAppendProvenance();
         await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
-      } catch (error) {
-        throw new TruncateRecoveryError(getErrorMessage(error), { cause: error });
       }
+    } catch (error) {
+      throw new TruncateRecoveryError(getErrorMessage(error), { cause: error });
     }
 
     const boundaryOffset = await this.findLastBoundaryByteOffset(chatPath);
