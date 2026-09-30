@@ -578,6 +578,87 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  describe("partials of turns the provider finished (#5322)", () => {
+    /** User row plus the turn's assistant row (the empty placeholder unless `row` is given). */
+    async function seedTurn(
+      historyService: HistoryService,
+      workspaceId: string,
+      row?: MuxMessage["parts"]
+    ) {
+      const user = createMuxMessage("user-1", "user", "Question", { timestamp: Date.now() });
+      expect((await historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+      const assistant = { ...createMuxMessage("assistant-1", "assistant", ""), parts: row ?? [] };
+      expect((await historyService.appendToHistory(workspaceId, assistant)).success).toBe(true);
+      return assistant.metadata?.historySequence;
+    }
+
+    async function writeKeptPartial(
+      historyService: HistoryService,
+      workspaceId: string,
+      historySequence: number | undefined,
+      metadata: Record<string, unknown> = {}
+    ) {
+      const partial = createMuxMessage("assistant-1", "assistant", "Final answer", {
+        historySequence,
+        ...metadata,
+      });
+      expect((await historyService.writePartial(workspaceId, partial)).success).toBe(true);
+    }
+
+    async function assistantRow(historyService: HistoryService, workspaceId: string) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data.find((message) => message.id === "assistant-1");
+    }
+
+    test("a finalized partial after a failed final write is committed, not retried", async () => {
+      const workspaceId = "startup-finalized-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: true });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const row = await assistantRow(historyService, workspaceId);
+      expect(row?.parts).toMatchObject([{ type: "text", text: "Final answer" }]);
+      expect(row?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    test("a stale partial left after the final row was written is discarded, not retried", async () => {
+      const workspaceId = "startup-stale-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId, [
+        { type: "text", text: "Final answer" },
+      ]);
+      await writeKeptPartial(historyService, workspaceId, sequence);
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect((await assistantRow(historyService, workspaceId))?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    test("a malformed flag keeps the interrupted-turn retry", async () => {
+      const workspaceId = "startup-malformed-finalized-flag";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: "yes" });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
+      await session.dispose();
+    });
+  });
+
   test("hidden completed subagent reports preserve the existing startup retry fallback", async () => {
     const workspaceId = "startup-retry-hidden-subagent-report";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);

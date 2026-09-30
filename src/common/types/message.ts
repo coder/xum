@@ -1048,6 +1048,12 @@ export interface MuxMetadata {
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
+  /**
+   * partial.json only, never a chat.jsonl row: the provider finished this turn but its final
+   * history write failed, so the kept partial is a completed reply, not an interrupted one
+   * (#5322). Read it through isStreamFinalizedPartial.
+   */
+  streamFinalized?: boolean;
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
    * For queue-dispatched user turns: when the user last added to the queued

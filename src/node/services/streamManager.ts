@@ -4966,6 +4966,26 @@ export class StreamManager {
                 workspaceLog.warn("Failed to update history on stream end; keeping partial", {
                   error: updateResult.error,
                 });
+                // The provider finished this turn: keep the final message as the partial, marked
+                // finalized, so startup recovery commits it instead of treating the turn as
+                // interrupted and auto-retrying an extra continuation (#5322). Only this stream's
+                // own partial. If this write fails too, the partial stays unmarked: today's
+                // interrupted-turn recovery, which loses nothing.
+                const markResult = await this.historyService.updatePartialIfMessageIdMatches(
+                  workspaceId,
+                  streamInfo.messageId,
+                  () => ({
+                    ...finalAssistantMessage,
+                    metadata: { ...finalAssistantMessage.metadata, streamFinalized: true },
+                  })
+                );
+                if (!markResult.success || !markResult.data) {
+                  workspaceLog.warn("Failed to mark the kept partial finalized", {
+                    error: markResult.success
+                      ? "partial belongs to another message"
+                      : markResult.error,
+                  });
+                }
               } else {
                 // On successful completion, partial.json becomes stale and must be removed.
                 // Only this stream's own partial: the row just written covers nothing else

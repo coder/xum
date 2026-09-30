@@ -750,3 +750,87 @@ describe("HistoryService partial persistence - Orphaned partials", () => {
     });
   });
 });
+
+// #5322: a partial kept after the provider finished (the final history write failed) carries
+// streamFinalized. Its commit is the row that write would have produced: no `partial: true`,
+// and the flag itself never reaches chat.jsonl.
+describe("HistoryService partial persistence - Finalized partials", () => {
+  let config: Config;
+  let service: HistoryService;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ config, historyService: service, cleanup } = await createTestHistoryService());
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  /** User row, empty placeholder, and a partial of that placeholder with `metadata`. */
+  async function keptPartial(workspaceId: string, metadata: Record<string, unknown>) {
+    const user = createMuxMessage("u0", "user", "prompt");
+    expect((await service.appendToHistory(workspaceId, user)).success).toBe(true);
+    const partial = createMuxMessage("a0", "assistant", "final answer", {
+      historySequence: 1,
+      ...metadata,
+    });
+    await appendPlaceholder(service, workspaceId, partial);
+    expect((await service.writePartial(workspaceId, partial)).success).toBe(true);
+  }
+
+  async function committedRow(target: HistoryService, workspaceId: string) {
+    const history = await target.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    return history.data.find((message) => message.id === "a0");
+  }
+
+  test("commitPartial commits a finalized partial as a completed row", async () => {
+    const workspaceId = "finalized-commit";
+    await keptPartial(workspaceId, { streamFinalized: true });
+
+    expect((await service.commitPartial(workspaceId)).success).toBe(true);
+
+    const row = await committedRow(service, workspaceId);
+    expect(row?.parts).toMatchObject([{ type: "text", text: "final answer" }]);
+    expect(row?.metadata?.partial).toBeUndefined();
+    expect(row?.metadata).not.toHaveProperty("streamFinalized");
+    expect(await service.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("a crash in commitPartial's own window leaves a completed row and a finalized partial", async () => {
+    const workspaceId = "finalized-commit-crash";
+    await keptPartial(workspaceId, { streamFinalized: true });
+    // commitPartial writes chat.jsonl, then dies before partial.json is retired.
+    const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
+    const unlink = fs.unlink;
+    const unlinkSpy = spyOn(fs, "unlink").mockImplementation(async (target) => {
+      if (String(target) === partialPath) throw Object.assign(new Error("crash"), { code: "EIO" });
+      return unlink(target);
+    });
+    try {
+      await service.commitPartial(workspaceId);
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+
+    const restarted = new HistoryService(config);
+    expect((await committedRow(restarted, workspaceId))?.metadata?.partial).toBeUndefined();
+    expect((await restarted.readPartial(workspaceId))?.metadata?.streamFinalized).toBe(true);
+    // The next commit retires the leftover without touching the completed row.
+    expect((await restarted.commitPartial(workspaceId)).success).toBe(true);
+    expect(await restarted.readPartial(workspaceId)).toBeNull();
+    expect((await committedRow(restarted, workspaceId))?.metadata?.partial).toBeUndefined();
+  });
+
+  test("a malformed flag commits like an interrupted partial and is not persisted", async () => {
+    const workspaceId = "finalized-malformed";
+    await keptPartial(workspaceId, { streamFinalized: "yes" });
+
+    expect((await service.commitPartial(workspaceId)).success).toBe(true);
+
+    const row = await committedRow(service, workspaceId);
+    expect(row?.metadata?.partial).toBe(true);
+    expect(row?.metadata).not.toHaveProperty("streamFinalized");
+  });
+});

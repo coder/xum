@@ -469,6 +469,16 @@ export function mergeTranscriptPartial(
 }
 
 /**
+ * Whether partial.json holds a turn the provider finished whose final history write failed
+ * (#5322). Self-healing and downgrade-safe: only a literal `true` counts. An absent, unknown or
+ * malformed flag (and any build that predates it) keeps today's reading of the partial as an
+ * interrupted turn, which startup recovery may retry.
+ */
+export function isStreamFinalizedPartial(partial: MuxMessage | null | undefined): boolean {
+  return partial?.metadata?.streamFinalized === true;
+}
+
+/**
  * Error prefix for an edit refused because its history precondition no longer matched under
  * the write lock. The session maps it to the typed `history-changed` send error.
  */
@@ -3389,6 +3399,21 @@ export class HistoryService {
       if (partial.metadata?.error) {
         const { error, errorType, ...cleanMetadata } = partial.metadata;
         partial = { ...partial, metadata: cleanMetadata };
+      }
+
+      // A finalized partial is the completed row the failed final history write would have
+      // produced, so it commits without `partial: true`. The flag belongs to partial.json only:
+      // strip it from the row whatever its value (#5322).
+      if (partial.metadata && "streamFinalized" in partial.metadata) {
+        const {
+          streamFinalized: _streamFinalized,
+          partial: wasPartial,
+          ...rest
+        } = partial.metadata;
+        partial = {
+          ...partial,
+          metadata: isStreamFinalizedPartial(partial) ? rest : { ...rest, partial: wasPartial },
+        };
       }
 
       const partialSeq = partial.metadata?.historySequence;
