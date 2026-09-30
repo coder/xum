@@ -45,7 +45,7 @@ function failConfigPublish(options: { corruptConfig?: boolean } = {}) {
   ) => {
     if (path.basename(String(to)) === "config.json") {
       if (options.corruptConfig) cjsFs.writeFileSync(String(to), "{ not json");
-      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
       return;
     }
     realRename(from, to, callback);
@@ -57,7 +57,7 @@ async function expectFailsWithSaveError(fn: () => Promise<Result<unknown>>): Pro
   const publish = failConfigPublish();
   const result = await fn().finally(() => publish.mockRestore());
   expect(result.success).toBe(false);
-  expect(result.success ? "" : result.error).toContain("EACCES");
+  expect(result.success ? "" : result.error).toContain("EROFS");
 }
 
 function git(cwd: string, ...args: string[]): string {
@@ -395,7 +395,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       .rename(created.data.metadata.id, "keep-after")
       .finally(() => publish.mockRestore());
 
-    expect(result.success ? "" : result.error).toContain("EACCES");
+    expect(result.success ? "" : result.error).toContain("EROFS");
     // Unreadable config is not proof the rename did not land, so the move stays.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("keep-after");
   });
@@ -415,7 +415,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     const publish = failConfigPublish({ corruptConfig: true });
     const result = await createWorktree("feature-c").finally(() => publish.mockRestore());
 
-    expect(result.success ? "" : result.error).toContain("EACCES");
+    expect(result.success ? "" : result.error).toContain("EROFS");
     // Unreadable is not proof the entry is gone, so nothing is deleted.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("feature-c");
   });
@@ -583,7 +583,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       const publish = failConfigPublish();
       const result = await createWorktree("leftover-b").finally(() => publish.mockRestore());
       const error = result.success ? "" : result.error;
-      expect(error).toContain("EACCES");
+      expect(error).toContain("EROFS");
       expect(error).toContain(`could not be fully cleaned up: ${leftoverCheckout("leftover-b")!}`);
     });
 
@@ -1141,7 +1141,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           .fork(source.data.metadata.id, "dce")
           .finally(() => publish.mockRestore());
         const error = result.success ? "" : result.error;
-        expect(error).toContain("EACCES");
+        expect(error).toContain("EROFS");
         // The label names the fork's host checkout, which the rollback removed.
         expect(error).toMatch(
           /could not be fully cleaned up: devcontainer container labeled devcontainer\.local_folder=\S+\/dce; delete it before retrying\.$/
@@ -1408,7 +1408,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         const { error, deleteWorkspace } = await dockerFork({
           deleteResult: { success: true, deletedPath: "/src" },
         });
-        expect(error).toContain("EACCES");
+        expect(error).toContain("EROFS");
         expect(error).not.toContain("could not be fully cleaned up");
         expect(deleteWorkspace).toHaveBeenCalledTimes(1);
         expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([

@@ -57,7 +57,7 @@ function failConfigPublish() {
     callback: cjsFs.NoParamCallback
   ) => {
     if (path.basename(String(to)) === "config.json") {
-      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
       return;
     }
     realRename(from, to, callback);
@@ -92,7 +92,7 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
 
     expect(result.success).toBe(false);
     if (result.success) throw new Error("expected Err");
-    expect(result.error).toContain("EACCES");
+    expect(result.error).toContain("EROFS");
     expect(harness.persistedConsent()).toBeUndefined();
     expect(metadataEvents.some((event) => event.metadata?.unrelatedWorkspaceConsent != null)).toBe(
       false

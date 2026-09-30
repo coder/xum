@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import writeFileAtomic, { sync as writeFileAtomicSync } from "./writeFileAtomic";
+import writeFileAtomic, { renameRetryTiming, sync as writeFileAtomicSync } from "./writeFileAtomic";
 
 type BufferWrite = (
   fd: number,
@@ -171,6 +171,91 @@ describe("writeFileAtomic", () => {
     const fresh = path.join(dir, "fresh.json");
     await writeFileAtomic(fresh, payload, { mode: 0o640 });
     expect((await fs.promises.stat(fresh)).mode & 0o777).toBe(0o640);
+  });
+
+  describe("rename retry", () => {
+    const budgetMs = 2000;
+    const maxDelayMs = 100;
+    let clock: number;
+    let sleeps: number[];
+    let restores: Array<() => void>;
+
+    beforeEach(() => {
+      clock = 0;
+      sleeps = [];
+      const now = spyOn(renameRetryTiming, "now").mockImplementation(() => clock);
+      const sleep = spyOn(renameRetryTiming, "sleep").mockImplementation((ms) => {
+        sleeps.push(ms);
+        clock += ms;
+        return Promise.resolve();
+      });
+      restores = [() => now.mockRestore(), () => sleep.mockRestore()];
+    });
+
+    afterEach(() => {
+      for (const restore of restores) restore();
+    });
+
+    // Fails renames onto the destination with `error` for the first `failures` attempts.
+    function failRenames(error: NodeJS.ErrnoException, failures: number): () => number {
+      const realRename = fs.rename.bind(fs);
+      let attempts = 0;
+      const spy = spyOn(fs, "rename").mockImplementation(((
+        from: fs.PathLike,
+        to: fs.PathLike,
+        callback: fs.NoParamCallback
+      ) => {
+        if (String(to) !== target) return realRename(from, to, callback);
+        attempts += 1;
+        if (attempts <= failures) return callback(error);
+        realRename(from, to, callback);
+      }) as typeof fs.rename);
+      restores.push(() => spy.mockRestore());
+      return () => attempts;
+    }
+
+    const errno = (code: string): NodeJS.ErrnoException =>
+      Object.assign(new Error(`${code}: rename failed`), { code });
+
+    it.each(["EPERM", "EBUSY"])("lands the write after transient %s failures", async (code) => {
+      const attempts = failRenames(errno(code), 3);
+      await writeFileAtomic(target, payload);
+      expect(attempts()).toBe(4);
+      expect(sleeps.length).toBe(3);
+      expect(await contents(target)).toBe(payload);
+      expect(await siblings()).toEqual(["config.json"]);
+    });
+
+    it("rethrows the original error once the budget is spent", async () => {
+      const error = errno("EPERM");
+      failRenames(error, Infinity);
+      let failure: unknown;
+      try {
+        await writeFileAtomic(target, payload);
+      } catch (caught) {
+        failure = caught;
+      }
+      expect(failure).toBe(error);
+      expect(clock).toBeGreaterThanOrEqual(budgetMs);
+      expect(clock).toBeLessThanOrEqual(budgetMs + maxDelayMs);
+      expect(await contents(target)).toBe(previous);
+      expect(await siblings()).toEqual(["config.json"]);
+    });
+
+    it("fails a non-retryable rename at once", async () => {
+      const error = errno("EXDEV");
+      const attempts = failRenames(error, Infinity);
+      let failure: unknown;
+      try {
+        await writeFileAtomic(target, payload);
+      } catch (caught) {
+        failure = caught;
+      }
+      expect(failure).toBe(error);
+      expect(attempts()).toBe(1);
+      expect(sleeps).toEqual([]);
+      expect(await siblings()).toEqual(["config.json"]);
+    });
   });
 
   it("serializes concurrent writes to the same path", async () => {

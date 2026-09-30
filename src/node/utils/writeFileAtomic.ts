@@ -153,6 +153,38 @@ async function applyOwnership(tempFile: string, options: ResolvedOptions): Promi
   }
 }
 
+// Windows reports these while another handle (an antivirus scanner, or an in-process reader such
+// as the unlocked history status scan) has the destination open. On POSIX they are persistent,
+// so retrying only delays an already-failing write by at most the budget, and one code path
+// keeps Linux CI exercising the logic Windows depends on.
+const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_RETRY_BUDGET_MS = 2000;
+const RENAME_RETRY_INITIAL_DELAY_MS = 10;
+const RENAME_RETRY_MAX_DELAY_MS = 100;
+
+/** Clock and sleep for the rename retry; tests replace them to run it in virtual time. */
+export const renameRetryTiming = {
+  now: (): number => performance.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+async function renameWithRetry(tempFile: string, target: string): Promise<void> {
+  const deadline = renameRetryTiming.now() + RENAME_RETRY_BUDGET_MS;
+  let delay = RENAME_RETRY_INITIAL_DELAY_MS;
+  for (;;) {
+    try {
+      await promisify(fs.rename)(tempFile, target);
+      return;
+    } catch (error) {
+      const remaining = deadline - renameRetryTiming.now();
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === undefined || !RETRYABLE_RENAME_CODES.has(code) || remaining <= 0) throw error;
+      await renameRetryTiming.sleep(Math.min(delay, remaining));
+      delay = Math.min(delay * 2, RENAME_RETRY_MAX_DELAY_MS);
+    }
+  }
+}
+
 async function writeFileAtomicUnserialized(
   filename: string,
   data: string | Buffer,
@@ -175,7 +207,7 @@ async function writeFileAtomicUnserialized(
     await promisify(fs.close)(fd);
     fd = undefined;
     await applyOwnership(tempFile, options);
-    await promisify(fs.rename)(tempFile, target);
+    await renameWithRetry(tempFile, target);
   } finally {
     if (fd !== undefined) {
       await promisify(fs.close)(fd).catch(() => undefined);
@@ -281,6 +313,9 @@ export function sync(
     fs.closeSync(fd);
     fd = undefined;
     applyOwnershipSync(tempFile, resolved);
+    // No retry: a synchronous one would block the event loop, so an in-process reader holding
+    // the destination could never close it. Its callers write providers.jsonc, which no
+    // in-process reader holds open.
     fs.renameSync(tempFile, target);
   } finally {
     if (fd !== undefined) {
