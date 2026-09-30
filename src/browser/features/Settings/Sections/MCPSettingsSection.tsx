@@ -816,6 +816,11 @@ function ToolSearchSetting() {
   const { api } = useAPI();
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Serialize writes so rapid toggles persist the last choice, and roll back only when the
+  // latest selection fails, to the last value the backend accepted.
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  const latestChangeRef = useRef(0);
+  const savedRef = useRef(true);
 
   useEffect(() => {
     if (!api) return;
@@ -823,7 +828,9 @@ function ToolSearchSetting() {
     api.config
       .getConfig()
       .then((cfg) => {
-        if (!cancelled) setEnabled(cfg.toolSearchEnabled);
+        if (cancelled) return;
+        savedRef.current = cfg.toolSearchEnabled;
+        setEnabled(cfg.toolSearchEnabled);
       })
       .catch(() => {
         // Keep the switch disabled; the next settings visit retries the read.
@@ -833,17 +840,21 @@ function ToolSearchSetting() {
     };
   }, [api]);
 
-  const handleChange = async (next: boolean) => {
+  const handleChange = (next: boolean) => {
     if (!api) return;
-    const previous = enabled;
+    const change = ++latestChangeRef.current;
     setEnabled(next);
     setError(null);
-    try {
-      await api.config.updateToolSearchEnabled({ enabled: next });
-    } catch (err) {
-      setEnabled(previous);
-      setError(err instanceof Error ? err.message : "Failed to update tool search");
-    }
+    writeChainRef.current = writeChainRef.current.then(async () => {
+      try {
+        await api.config.updateToolSearchEnabled({ enabled: next });
+        savedRef.current = next;
+      } catch (err) {
+        if (change !== latestChangeRef.current) return;
+        setEnabled(savedRef.current);
+        setError(err instanceof Error ? err.message : "Failed to update tool search");
+      }
+    });
   };
 
   return (
@@ -860,7 +871,7 @@ function ToolSearchSetting() {
       <Switch
         checked={enabled ?? true}
         disabled={enabled === null}
-        onCheckedChange={(checked) => void handleChange(checked)}
+        onCheckedChange={handleChange}
         aria-label="Toggle MCP tool search"
       />
     </div>
