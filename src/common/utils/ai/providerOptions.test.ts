@@ -320,7 +320,8 @@ describe("buildProviderOptions - Anthropic", () => {
       const bodies: Array<Record<string, unknown>> = [];
       const captureFetch = Object.assign(
         (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-          bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          if (typeof init?.body !== "string") throw new Error("Expected a JSON request body");
+          bodies.push(JSON.parse(init.body) as Record<string, unknown>);
           const content = [{ type: "text", text: "ok" }];
           const usage = { input_tokens: 1, output_tokens: 1 };
           return Promise.resolve(
