@@ -224,13 +224,18 @@ describe("StreamManager - completion persistence is crash-consistent", () => {
     }
 
     const restarted = new HistoryService(historyConfig);
-    expect((await restarted.readPartial(workspaceId))?.id).toBe(messageId);
+    const kept = await restarted.readPartial(workspaceId);
+    expect(kept?.id).toBe(messageId);
+    // The provider finished this turn, so the kept partial says so: startup must not treat it as
+    // interrupted and auto-retry an extra continuation (#5322).
+    expect(kept?.metadata?.streamFinalized).toBe(true);
     expect(await restarted.commitPartial(workspaceId)).toEqual({ success: true, data: undefined });
     const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
-    expect(history.data.find((message) => message.id === messageId)?.parts).toMatchObject([
-      { type: "text", text },
-    ]);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(row?.parts).toMatchObject([{ type: "text", text }]);
+    expect(row?.metadata?.partial).toBeUndefined();
+    expect(row?.metadata).not.toHaveProperty("streamFinalized");
   });
 });
 

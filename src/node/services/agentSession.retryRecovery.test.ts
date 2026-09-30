@@ -169,7 +169,8 @@ test("closing joins a held history read even when its sibling read rejects", asy
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const read = h.historyService.getLastMessages.bind(h.historyService);
-  spyOn(h.historyService, "readPartial").mockRejectedValueOnce(new Error("partial read failed"));
+  // Every partial read rejects: startup also reads the partial before the recovery's tail read.
+  spyOn(h.historyService, "readPartial").mockRejectedValue(new Error("partial read failed"));
   spyOn(h.historyService, "getLastMessages").mockImplementation(async (id, count) => {
     if (count === 20) {
       entered.resolve();

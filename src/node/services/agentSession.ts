@@ -317,7 +317,7 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
-import { isHistoryEditPreconditionMismatch } from "./historyService";
+import { isHistoryEditPreconditionMismatch, isStreamFinalizedPartial } from "./historyService";
 
 /**
  * Result shape for turn-starting session methods. failureHandled marks errors
@@ -1167,6 +1167,7 @@ export class AgentSession {
     // Persisted compaction follow-ups precede goal continuation recovery. Each successful
     // step is checkpointed, so retrying a later read cannot replay an earlier side effect.
     steps: [
+      () => this.runStartupRecoveryStep(() => this.settleFinishedStartupPartial()),
       () =>
         this.runStartupRecoveryStep(() => this.requireGoalAcknowledgmentForCrashRecoveredPartial()),
       () => this.runStartupRecoveryStep(() => this.contextController.recover()),
@@ -2357,6 +2358,56 @@ export class AgentSession {
     );
   }
 
+  /**
+   * Whether partial.json belongs to a turn the provider already finished (#5322), so startup must
+   * not treat it as interrupted:
+   * - finalized: the final history write failed and the completion path marked the kept partial;
+   * - stale: the crash came after the final row was written but before partial.json was deleted.
+   *   Its own row (same id and sequence) is then a completed row (no `partial: true`) holding at
+   *   least its parts. An interrupted stream's own row is the empty placeholder, so it never
+   *   qualifies.
+   */
+  private isFinishedStartupPartial(partial: MuxMessage | null, history: MuxMessage[]): boolean {
+    if (partial?.role !== "assistant") return false;
+    if (isStreamFinalizedPartial(partial)) return true;
+    const sequence = partial.metadata?.historySequence;
+    if (sequence === undefined) return false;
+    const row = history.find(
+      (message) => message.id === partial.id && message.metadata?.historySequence === sequence
+    );
+    return (
+      row?.metadata?.partial !== true &&
+      (row?.parts.length ?? 0) > 0 &&
+      (row?.parts.length ?? 0) >= partial.parts.length
+    );
+  }
+
+  /**
+   * Commit a finalized partial (without `partial: true`) or retire a stale one before the other
+   * startup steps read it, so the transcript shows the completed reply (#5322). Best effort: on
+   * failure the partial stays, the startup classifier still does not retry it, and the next
+   * commitPartial settles it the same way.
+   */
+  private async settleFinishedStartupPartial(): Promise<void> {
+    if (this.coordinator.closing || this.isBusy() || this.isAiStreaming()) return;
+    // A failed read just skips settling; the startup classifier reads again. History is read only
+    // for an unmarked assistant partial, so a workspace without one pays one partial read.
+    const partial = await this.historyService.readPartial(this.workspaceId).catch(() => null);
+    if (this.coordinator.closing || partial?.role !== "assistant") return;
+    if (!isStreamFinalizedPartial(partial)) {
+      const history = await this.historyService.getLastMessages(this.workspaceId, 20);
+      if (this.coordinator.closing || !history.success) return;
+      if (!this.isFinishedStartupPartial(partial, history.data)) return;
+    }
+    const settled = await this.historyService.commitPartial(this.workspaceId, partial.id);
+    if (!settled.success) {
+      log.warn("Failed to settle the partial of a finished turn at startup", {
+        workspaceId: this.workspaceId,
+        error: settled.error,
+      });
+    }
+  }
+
   private async requireGoalAcknowledgmentForCrashRecoveredPartial(): Promise<void> {
     const goalService = this.workspaceGoalService;
     if (!goalService || this.coordinator.closing) {
@@ -2370,15 +2421,19 @@ export class AgentSession {
     // the model's last action was safe to continue, so goal loops must wait for user acknowledgment.
     const partial = await this.historyService.readPartial(this.workspaceId);
     if (this.coordinator.closing) return;
-    if (partial?.role === "assistant" && !this.isPendingAskUserQuestion(partial)) {
+    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
+    if (this.coordinator.closing) return;
+    // A partial of a finished turn is still here only if settling it failed (#5322); it is a
+    // completed reply, not crash-recovered work, so it does not gate the goal.
+    if (
+      partial?.role === "assistant" &&
+      !this.isPendingAskUserQuestion(partial) &&
+      !this.isFinishedStartupPartial(partial, historyResult.success ? historyResult.data : [])
+    ) {
       await goalService.requireUserAcknowledgmentForCrashRecovery(this.workspaceId);
       return;
     }
-
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
-    if (this.coordinator.closing || !historyResult.success) {
-      return;
-    }
+    if (!historyResult.success) return;
 
     const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
     if (
@@ -2807,7 +2862,9 @@ export class AgentSession {
 
   private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
     if (this.isPendingAskUserQuestion(partial)) return false;
-    if (partial?.role === "assistant") return true;
+    if (partial?.role === "assistant" && !this.isFinishedStartupPartial(partial, history)) {
+      return true;
+    }
     const last = this.getLastNonSystemHistoryMessage(history);
     return last?.role === "user"
       ? !this.isVisibleCompletedSubagentReportMessage(last)
