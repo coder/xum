@@ -429,11 +429,16 @@ interface SubagentTranscriptDependencies {
 }
 
 /**
- * Overlay partial.json onto persisted history rows. The row sharing the partial's
- * historySequence is the in-flight turn's placeholder; the partial replaces it only when it
- * carries more parts. The partial and history are read without a shared lock, so a partial
- * read just before commitPartial can be staler than the durable row the history read then
- * sees; the part-count guard keeps the fuller durable row in that window.
+ * Overlay partial.json onto persisted history rows. The partial's own row (same message id AND
+ * historySequence, the rule commitPartial applies) is the in-flight turn's placeholder; the
+ * partial replaces it only when it carries more parts. The partial and history are read without
+ * a shared lock, so a partial read just before commitPartial can be staler than the durable row
+ * the history read then sees; the part-count guard keeps the fuller durable row in that window.
+ *
+ * A partial whose id already has a row elsewhere, or whose sequence a row at or after it has
+ * moved past, is orphaned (an edit truncation, crash, or second backend left it behind) and
+ * stays on disk until the next commitPartial retires it. Showing it would put the discarded
+ * reply over a newer row that reused its sequence, or between newer rows, so skip it.
  */
 export function mergeTranscriptPartial(
   messages: MuxMessage[],
@@ -444,26 +449,22 @@ export function mergeTranscriptPartial(
   const partialSeq = partial.metadata?.historySequence;
   if (partialSeq === undefined) return [...messages, partial];
 
-  const existingIndex = messages.findIndex(
-    (message) => message.metadata?.historySequence === partialSeq
+  const ownIndex = messages.findIndex(
+    (message) => message.id === partial.id && message.metadata?.historySequence === partialSeq
   );
-  if (existingIndex >= 0) {
-    const existing = messages[existingIndex];
-    if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
+  if (ownIndex >= 0) {
+    const own = messages[ownIndex];
+    if ((partial.parts?.length ?? 0) <= (own.parts?.length ?? 0)) return messages;
     const next = [...messages];
-    next[existingIndex] = partial;
+    next[ownIndex] = partial;
     return next;
   }
 
-  const insertIndex = messages.findIndex((message) => {
+  const orphaned = messages.some((message) => {
     const sequence = message.metadata?.historySequence;
-    return typeof sequence === "number" && sequence > partialSeq;
+    return message.id === partial.id || (typeof sequence === "number" && sequence >= partialSeq);
   });
-  if (insertIndex < 0) return [...messages, partial];
-
-  const next = [...messages];
-  next.splice(insertIndex, 0, partial);
-  return next;
+  return orphaned ? messages : [...messages, partial];
 }
 
 /**

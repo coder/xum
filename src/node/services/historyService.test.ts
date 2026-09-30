@@ -4612,7 +4612,8 @@ describe("HistoryService", () => {
     it("reads cross-session fixtures, filters malformed lines, and merges partials", async () => {
       const committed = createMuxMessage("committed", "assistant", "old", { historySequence: 1 });
       const next = createMuxMessage("next", "user", "next", { historySequence: 2 });
-      const partial = createMuxMessage("partial", "assistant", "new", { historySequence: 1 });
+      // The partial overlays its own row (same id and sequence, the commitPartial rule).
+      const partial = createMuxMessage("committed", "assistant", "new", { historySequence: 1 });
       partial.parts?.push({ type: "text", text: "continued" });
       await writeArtifact(
         "owner",
@@ -4625,7 +4626,8 @@ describe("HistoryService", () => {
         { taskId: "merged-task", requestingWorkspaceId: null },
         dependencies
       );
-      expect(merged.messages.map((message) => message.id)).toEqual(["partial", "next"]);
+      expect(merged.messages.map((message) => message.id)).toEqual(["committed", "next"]);
+      expect(merged.messages[0]?.parts).toEqual(partial.parts);
       expect(merged).toMatchObject({ model: "openai:gpt-5", thinkingLevel: "high" });
 
       const partialOnly = createMuxMessage("partial-only", "assistant", "saved", {
