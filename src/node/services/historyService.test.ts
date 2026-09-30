@@ -4136,6 +4136,31 @@ describe("HistoryService", () => {
       expect(older.data.messages.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2"]);
     });
 
+    it("window and since reads return the active epoch once after a crash replay (#5300)", async () => {
+      await appendNumberedMessages(service, wsId, 3); // seq 0..2 → archived after boundary
+      await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3
+      await service.appendToHistory(wsId, createMuxMessage("post-0", "user", "after")); // seq 4
+      const archived = await fs.readFile(archivePath(wsId), "utf-8");
+      const active = await fs.readFile(chatPath(wsId), "utf-8");
+      // The sealed prefix sits in the archive AND again at the head of chat.jsonl.
+      await fs.writeFile(chatPath(wsId), archived + active);
+
+      const restarted = new HistoryService(config);
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      const window = await restarted.getHistoryWindowFromLatestBoundary(wsId, caps);
+      const since = await restarted.getHistorySinceFromLatestBoundary(wsId, caps, {
+        floor: 3,
+        anchor: 4,
+      });
+      assert(window.success && window.data.kind === "window");
+      assert(since.success && since.data.kind === "range");
+      expect(window.data.messages.map((m) => m.id)).toEqual(["boundary-1", "post-0"]);
+      expect(since.data.messages.map((m) => m.id)).toEqual(["boundary-1", "post-0"]);
+      const latest = await restarted.getHistoryFromLatestBoundary(wsId);
+      assert(latest.success);
+      expect(window.data.messages).toEqual(latest.data);
+    });
+
     it("deduplicates verified reset copies while preserving their post-reset archive", async () => {
       await appendNumberedMessages(service, wsId, 2);
       await service.appendToHistory(

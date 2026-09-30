@@ -20,6 +20,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "./aiService";
 import { VERSION } from "@/version";
+import * as historyScanner from "./historyScanner";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import {
   buildPlanReviewMetadata,
@@ -276,10 +277,10 @@ describe("TokenizerService", () => {
       // The history read starts only after the cache/receipt probes, so signal it explicitly.
       const readSettled = [0, 1].map(() => Promise.withResolvers<void>());
       let reads = 0;
-      const realRead = historyService.getHistoryFromLatestBoundary.bind(historyService);
-      const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
-        (workspaceId, skip) => {
-          const read = realRead(workspaceId, skip);
+      const realRead = historyService.getHistoryForTokenStats.bind(historyService);
+      const readSpy = spyOn(historyService, "getHistoryForTokenStats").mockImplementation(
+        (workspaceId) => {
+          const read = realRead(workspaceId);
           const settled = readSettled[reads++];
           void read.then(() => settled.resolve());
           return read.then(
@@ -314,7 +315,7 @@ describe("TokenizerService", () => {
     });
 
     test("rejects when history cannot be read instead of tokenizing nothing", async () => {
-      const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+      const readSpy = spyOn(historyService, "getHistoryForTokenStats").mockResolvedValueOnce(
         Err("disk exploded")
       );
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
@@ -604,7 +605,7 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
   let tokenizer: TokenizerService;
   let parentWorkspaceId: string | undefined;
   let providersConfig: ProvidersConfigMap;
-  let readSpy: ReturnType<typeof spyOn<HistoryService, "getHistoryFromLatestBoundary">>;
+  let readSpy: ReturnType<typeof spyOn<HistoryService, "getHistoryForTokenStats">>;
   let nextId = 0;
 
   async function setup(): Promise<void> {
@@ -636,7 +637,7 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
       history
     );
     // No mockImplementation: the real read runs, calls are only counted.
-    readSpy = spyOn(history, "getHistoryFromLatestBoundary");
+    readSpy = spyOn(history, "getHistoryForTokenStats");
   }
 
   beforeEach(setup);
@@ -888,20 +889,60 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
     });
   }
 
-  test("does not certify a count whose history changed during the read", async () => {
+  test("certifies a count only with the receipt of the rows it counted", async () => {
     await seed();
-    const realRead = HistoryService.prototype.getHistoryFromLatestBoundary.bind(history);
-    readSpy.mockImplementationOnce(async (workspaceId, skip) => {
-      // A cooperating writer lands between the receipt capture and the read.
+    const realRead = HistoryService.prototype.getHistoryForTokenStats.bind(history);
+    readSpy.mockImplementationOnce(async (workspaceId) => {
+      // A cooperating writer lands between the hit probe's receipt capture and the read.
       await append("user");
-      return realRead(workspaceId, skip);
+      return realRead(workspaceId);
     });
     expect((await calculate()).read).toBe(true);
-    const cached = await usage.peekTokenStatsCache(WS);
-    expect(cached).toBeDefined();
-    expect(cached?.source).toBeUndefined();
-    expect((await calculate()).read).toBe(true);
+    // The read saw the append, so its source is the post-append receipt, not the probe's.
+    expect((await usage.peekTokenStatsCache(WS))?.source?.historyReceipt).toBe(
+      (await history.captureTokenStatsReceiptKey(WS))!
+    );
     expect((await calculate()).read).toBe(false);
+  });
+
+  test("an append parked inside the scan is recounted, never certified stale", async () => {
+    await seed();
+    const realScan = historyScanner.readProviderHistoryFromSnapshot;
+    const scanSpy = spyOn(historyScanner, "readProviderHistoryFromSnapshot");
+    try {
+      scanSpy.mockImplementationOnce(async (snapshot) => {
+        const rows = await realScan(snapshot);
+        await append("user");
+        return rows;
+      });
+      // The stale first scan is retried once; the result is the post-append state.
+      expect((await calculate()).read).toBe(true);
+      expect(scanSpy).toHaveBeenCalledTimes(2);
+      expect((await usage.peekTokenStatsCache(WS))?.source?.historyReceipt).toBe(
+        (await history.captureTokenStatsReceiptKey(WS))!
+      );
+      expect((await calculate()).read).toBe(false);
+
+      // Racing both attempts rejects without persisting anything new.
+      await append("user");
+      const before = await usage.peekTokenStatsCache(WS);
+      scanSpy.mockImplementation(async (snapshot) => {
+        const rows = await realScan(snapshot);
+        await append("user");
+        return rows;
+      });
+      const calls = scanSpy.mock.calls.length;
+      const error = await tokenizer.calculateWorkspaceStats({ workspaceId: WS, model: MODEL }).then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(scanSpy.mock.calls.length - calls).toBe(2);
+      expect(await usage.peekTokenStatsCache(WS)).toEqual(before);
+    } finally {
+      scanSpy.mockRestore();
+    }
+    expect((await calculate()).read).toBe(true);
   });
 
   test("randomized differential: every result equals a full recount", async () => {

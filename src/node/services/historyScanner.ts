@@ -1071,6 +1071,20 @@ export function readProviderHistory(
 }
 
 /**
+ * readProviderHistory on a snapshot the caller opened under the history lock and scans after
+ * releasing it (token stats, #5301). The scan never reads past the sizes captured at open (every
+ * positional read is bounded by `file.size` and length-checked); verify() rejects a replaced or
+ * resized pathname. The caller closes the snapshot.
+ */
+export async function readProviderHistoryFromSnapshot(
+  snapshot: OpenHistorySnapshot
+): Promise<MuxMessage[]> {
+  const messages = await scanHistorySnapshot(snapshot.files, undefined, undefined, false);
+  await snapshot.verify();
+  return messages;
+}
+
+/**
  * Shared scan of readStatusHistorySuffix (with `stop`, projecting oversized rows) and
  * readProviderHistory (without either). Every positional read checks its length: under the
  * status read's released lock a foreign in-place shrink must fail closed, never parse a partial

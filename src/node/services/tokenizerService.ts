@@ -52,7 +52,7 @@ export class TokenizerService {
     private readonly providerService: Pick<ProviderService, "getConfig">,
     private readonly historyService: Pick<
       HistoryService,
-      "getHistoryFromLatestBoundary" | "readPartial" | "captureTokenStatsReceiptKey"
+      "getHistoryForTokenStats" | "readPartial" | "captureTokenStatsReceiptKey"
     >
   ) {
     this.sessionUsageService = sessionUsageService;
@@ -66,7 +66,7 @@ export class TokenizerService {
    * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
    * backend reads partial.json, then chat.jsonl, not under one lock; mergeTranscriptPartial's
    * part-count guard keeps a row committed in between from being replaced by the stale partial
-   * (and the commit changes the history receipt, so that count is not cached). The partial read is
+   * (the cached count is keyed by that partial and the rows' receipt). The partial read is
    * strict: a missing file is a normal "no in-flight turn" (null), and malformed JSON still
    * self-heals to null inside readPartial, but an I/O or permission failure rejects like a
    * history-read failure does, instead of silently persisting a cache that omits the turn.
@@ -75,7 +75,7 @@ export class TokenizerService {
    * orders overlapping requests by arrival: a request that read an older transcript but
    * finished its reads later must not become "latest" and persist the older snapshot.
    * The cache is served without reading history only if the receipt and every input match;
-   * a recount records its source only if the receipt is identical before and after the read.
+   * a recount records the receipt that certifies the rows it counted (getHistoryForTokenStats).
    */
   async calculateWorkspaceStats(input: {
     workspaceId: string;
@@ -117,17 +117,18 @@ export class TokenizerService {
       return { consumers, totalTokens, model: input.model, tokenizerName, topFilePaths };
     }
     const { workspaceId } = input;
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId, 0);
+    const historyResult = await this.historyService.getHistoryForTokenStats(workspaceId);
     if (!historyResult.success) {
       throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
     }
-    const after = await this.historyService.captureTokenStatsReceiptKey(workspaceId);
-    const source =
-      before !== null && after === before ? { historyReceipt: before, inputsKey } : undefined;
+    // The key certifies exactly the rows counted; a write during the read made the service
+    // retry or fail, so no uncertified count is ever recorded.
+    const { messages, receiptKey } = historyResult.data;
+    const source = receiptKey !== null ? { historyReceipt: receiptKey, inputsKey } : undefined;
     const { usageHistory: _usageHistory, ...stats } = await this.calculateStatsForGeneration(
       calcId,
       input.workspaceId,
-      mergeTranscriptPartial(historyResult.data, partial),
+      mergeTranscriptPartial(messages, partial),
       input.model,
       providersConfig,
       parentWorkspaceId,

@@ -16,6 +16,7 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistory,
+  readProviderHistoryFromSnapshot,
   readProviderHistoryFromLatestBoundary,
   readProviderHistoryPage,
   readProviderHistorySince,
@@ -694,9 +695,13 @@ export class HistoryService {
 
   /** Token-stats cache identity of the history files under both history locks (like the
    * bounded scan: no cooperating writer mid-write, no recovery). Null means untrusted. */
-  async captureTokenStatsReceiptKey(workspaceId: string): Promise<string | null> {
+  async captureTokenStatsReceiptKey(
+    workspaceId: string,
+    /** Only for a caller that already holds both history locks (getHistoryForTokenStats). */
+    locksHeld = false
+  ): Promise<string | null> {
     try {
-      return await this.withHistoryScanLocks(workspaceId, async () => {
+      const capture = async () => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return null;
         for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
           // Any error but ENOENT rethrows, which also yields null below.
@@ -711,9 +716,67 @@ export class HistoryService {
         const files = await provenance.stamps();
         if (files.chat === null && files.archive === null) return null;
         return historyAppendReceiptKey((await provenance.forScan()).receipt);
-      });
+      };
+      return await (locksHeld ? capture() : this.withHistoryScanLocks(workspaceId, capture));
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * getHistoryFromLatestBoundary(workspaceId, 0) for a token-stats miss (#5301), with the receipt
+   * key certifying those rows (null: no history or an untrusted receipt; never cached). Locks
+   * cover recovery + receipt + open and the final receipt check, not the scan, which runs on the
+   * pinned descriptors (safe as in getStatusHistorySuffix; any cooperating write also changes the
+   * receipt). No rotation, as in the window reads (#5321): the skip-0 scan is correct on
+   * unrotated and crash-replayed files, and a first rotation is a whole-file scan under the lock.
+   * A stale snapshot is retried once, then Err; a removed workspace is Err.
+   */
+  async getHistoryForTokenStats(
+    workspaceId: string
+  ): Promise<Result<{ messages: MuxMessage[]; receiptKey: string | null }>> {
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    // Same order as withHistoryScanLocks (mutex, then the cross-process lock), with the
+    // read-path truncate recovery of every other full read first. On Windows an open handle
+    // breaks rewrites (STATUS_SCAN_RELEASES_HISTORY_LOCK), so the whole attempt stays locked.
+    const underLocks = <T>(operation: () => Promise<T>) =>
+      this.withRecoveredHistoryLock(workspaceId, () =>
+        this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            throw new Error("workspace was removed");
+          }
+          return operation();
+        })
+      );
+    const locked = <T>(operation: () => Promise<T>) =>
+      STATUS_SCAN_RELEASES_HISTORY_LOCK ? underLocks(operation) : operation();
+    const attempt = async () => {
+      const opened = await locked(async () => ({
+        receiptKey: await this.captureTokenStatsReceiptKey(workspaceId, true),
+        snapshot: await openHistorySnapshot(paths),
+      }));
+      try {
+        const messages = await readProviderHistoryFromSnapshot(opened.snapshot);
+        const after = await locked(() => this.captureTokenStatsReceiptKey(workspaceId, true));
+        if (after !== opened.receiptKey) throw new Error("History changed during token stats read");
+        return { messages, receiptKey: after };
+      } finally {
+        await opened.snapshot.close();
+      }
+    };
+    const run = () => (STATUS_SCAN_RELEASES_HISTORY_LOCK ? attempt() : underLocks(attempt));
+    try {
+      try {
+        return Ok(await run());
+      } catch {
+        // Exactly one retry: never a loop, and never a fallback to a locked full read.
+        return Ok(await run());
+      }
+    } catch (error) {
+      return Err(`Failed to read history for token stats: ${getErrorMessage(error)}`);
     }
   }
 
