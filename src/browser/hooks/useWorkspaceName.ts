@@ -1,8 +1,11 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { truncateStringToChars } from "@/browser/utils/boundedPersistedValue";
+import {
+  createSessionValueStore,
+  truncateStringToChars,
+} from "@/browser/utils/boundedPersistedValue";
 import {
   WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
   WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
@@ -144,6 +147,10 @@ export function boundWorkspaceNamePersistedState(
   };
 }
 
+// Full manual names whose persisted copy is a bounded prefix (see setNameManual), so they stay
+// visible for the rest of the session, also after the creation controls remount.
+const sessionManualNames = createSessionValueStore<{ name: string; persisted: string }>();
+
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
   manualName: "",
@@ -210,17 +217,13 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
-  // Only a bounded prefix of a very long typed name persists; the full name stays visible for this
-  // session while the stored value is still the prefix this hook wrote (another tab's edit wins).
-  const [manualNameOverride, setManualNameOverride] = useState<{
-    key: string;
-    name: string;
-    persisted: string;
-  } | null>(null);
+  // Only a bounded prefix of a very long typed name persists; the full name stays visible while the
+  // stored value is still that prefix (another tab's edit wins).
+  const sessionManualName = useSyncExternalStore(sessionManualNames.subscribe, () =>
+    sessionManualNames.get(persistedKey)
+  );
   const displayedManualName =
-    manualNameOverride?.key === persistedKey && manualNameOverride.persisted === manualName
-      ? manualNameOverride.name
-      : manualName;
+    sessionManualName?.persisted === manualName ? sessionManualName.name : manualName;
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
@@ -418,8 +421,9 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const setNameManual = useCallback(
     (newName: string) => {
       const persisted = truncateStringToChars(newName, WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS);
-      setManualNameOverride(
-        persisted === newName ? null : { key: persistedKey, name: newName, persisted }
+      sessionManualNames.set(
+        persistedKey,
+        persisted === newName ? undefined : { name: newName, persisted }
       );
       setStored((prev) => ({ ...prev, manualName: persisted }));
       setError(null);

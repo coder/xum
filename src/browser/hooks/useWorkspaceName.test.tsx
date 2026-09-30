@@ -6,7 +6,10 @@ import { restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createTestApiClient } from "@/browser/testUtils";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import { useWorkspaceName } from "./useWorkspaceName";
 
 const generateMock = mock(() =>
@@ -54,8 +57,9 @@ describe("useWorkspaceName persisted draft state", () => {
     restartLocalStorage();
     const restored = renderWorkspaceName("");
     expect(restored.result.current.autoGenerate).toBe(false);
-    expect(longName.startsWith(restored.result.current.name)).toBe(true);
-    expect(restored.result.current.name.length).toBeGreaterThan(64);
+    expect(restored.result.current.name).toBe(
+      longName.slice(0, WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS - 2)
+    );
     expect(restored.result.current.error?.kind).toBe("validation");
 
     act(() => restored.result.current.setName("my-feature"));
@@ -64,6 +68,18 @@ describe("useWorkspaceName persisted draft state", () => {
     const valid = renderWorkspaceName("");
     expect(valid.result.current.name).toBe("my-feature");
     expect(valid.result.current.error).toBeNull();
+  });
+
+  // Switching projects remounts the creation controls; only a restart may cut the name.
+  test("a very long manual name stays whole when the creation controls remount", () => {
+    const longName = "a".repeat(5000);
+    const first = renderWorkspaceName("");
+    act(() => first.result.current.setAutoGenerate(false));
+    act(() => first.result.current.setName(longName));
+    first.unmount();
+
+    const remounted = renderWorkspaceName("");
+    expect(remounted.result.current.name).toBe(longName);
   });
 
   test("another tab's manual name replaces the full name kept for this session", () => {

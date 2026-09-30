@@ -6,7 +6,11 @@ import React from "react";
 import { extractNewPath, type FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FileChangeType } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { trimRecordToChars, withRecordEntry } from "@/browser/utils/boundedPersistedValue";
+import {
+  createSessionValueStore,
+  trimRecordToChars,
+  withRecordEntry,
+} from "@/browser/utils/boundedPersistedValue";
 import {
   getFileTreeExpandStateKey,
   REVIEW_FILE_TREE_VIEW_MODE_KEY,
@@ -381,20 +385,9 @@ interface SessionExpandState {
   persisted: string;
 }
 
-// Full expansion maps of this session by key. Module-level rather than component state so that a
-// Review panel remount keeps every toggle instead of only the trimmed persisted copy.
-const sessionExpandStates = new Map<string, SessionExpandState>();
-const sessionExpandStateListeners = new Set<() => void>();
-
-function subscribeSessionExpandStates(listener: () => void): () => void {
-  sessionExpandStateListeners.add(listener);
-  return () => sessionExpandStateListeners.delete(listener);
-}
-
-function setSessionExpandState(key: string, state: SessionExpandState): void {
-  sessionExpandStates.set(key, state);
-  for (const listener of sessionExpandStateListeners) listener();
-}
+// Full expansion maps of this session, so a Review panel remount keeps every toggle instead of
+// only the trimmed persisted copy.
+const sessionExpandStates = createSessionValueStore<SessionExpandState>();
 
 export const FileTree: React.FC<FileTreeExternalProps> = ({
   root,
@@ -414,7 +407,7 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   >(expandStateKey, {}, { listener: true });
   // Once the stored value differs from the trimmed copy this window wrote (another window changed
   // it), the stored value wins again so cross-window updates are not masked.
-  const liveExpandState = React.useSyncExternalStore(subscribeSessionExpandStates, () =>
+  const liveExpandState = React.useSyncExternalStore(sessionExpandStates.subscribe, () =>
     sessionExpandStates.get(expandStateKey)
   );
   const expandStateMap =
@@ -426,7 +419,7 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   ) => {
     const next = typeof value === "function" ? value(expandStateMap) : value;
     const persisted = trimRecordToChars(next, FILE_TREE_EXPAND_STATE_MAX_CHARS);
-    setSessionExpandState(expandStateKey, { value: next, persisted: JSON.stringify(persisted) });
+    sessionExpandStates.set(expandStateKey, { value: next, persisted: JSON.stringify(persisted) });
     setPersistedExpandStateMap(persisted);
   };
 
