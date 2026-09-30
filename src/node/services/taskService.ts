@@ -2711,9 +2711,12 @@ export class TaskService implements AgentTaskIntegration {
       const cleanup = (async () => {
         if (options.clearQueue) {
           // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
-          // descendant must not keep pending input; issued once, never re-issued later.
+          // descendant must not keep pending input; issued once, never re-issued later. The
+          // user's queued messages are handed back as held input, never silently dropped.
           try {
-            const clearQueueResult = this.workspaceService.clearQueue(id);
+            const clearQueueResult = this.workspaceService.clearQueue(id, {
+              preserveUserInput: true,
+            });
             if (!clearQueueResult.success) {
               log.debug(`${options.label}: clearQueue failed`, {
                 taskId: id,

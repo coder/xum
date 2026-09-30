@@ -476,7 +476,14 @@ export interface WorkspaceTurnHost {
       turnAdmission?: TurnAdmissionToken;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
+  /**
+   * `preserveUserInput`: hand queued manual sends back as held input (restore-to-input) instead
+   * of discarding them; every entry still leaves the runnable queue.
+   */
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,

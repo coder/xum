@@ -26,7 +26,9 @@ CONSTANTS
   AllowWithdraw,  \* cancel signals may fire on withdrawable entries
   AllowRemove,    \* removeWorkspaceTurn / removeByDedupeKeyPrefix / removeEntry
   AllowReorder,   \* setVisibleQueueDispatchMode / prioritizeNextUserEntry
+  AllowStop,      \* one Stop cascade (latch, one queue clear, release) may run
   Mutant          \* "none" | "noDequeue" | "decisionNoDrain" | "directSend" | "trailingRun"
+                  \* | "noEnqueueBarrier" | "clearDrops"
 
 Modes == {"tool", "turn"}
 \* Send shapes that matter for placement. "plain" batches (messageQueue.ts:747-759);
@@ -53,10 +55,16 @@ VARIABLES
   drainPending, \* a sendQueuedMessages call is due
   decision,   \* a report decision is pending (resolveDispatch may answer "hold")
   decisions,  \* report decisions started so far
-  owed        \* a stream was cut for the queue and no successor turn started yet
+  owed,       \* a stream was cut for the queue and no successor turn started yet
+  stopLatched, \* TaskService.isWorkspaceStopInProgress
+  stopCleared, \* the latched cascade already ran its queue clear (Phase B)
+  stops,      \* Stop cascades begun so far
+  kept,       \* user messages handed back (held input) or refused visibly: not run, not lost
+  stopped     \* messages admitted before or during a Stop: they must never start a turn
 
+stopVars == <<stopLatched, stopCleared, stops, kept, stopped>>
 vars == <<sent, attr, entries, phase, dispatched, removed, drainPending, decision, decisions,
-          owed>>
+          owed, stopVars>>
 
 NoAttr == [user |-> FALSE, mode |-> "turn", kind |-> "plain", withdrawable |-> FALSE,
            holdable |-> FALSE]
@@ -72,6 +80,11 @@ Init ==
   /\ decision = FALSE
   /\ decisions = 0
   /\ owed = FALSE
+  /\ stopLatched = FALSE
+  /\ stopCleared = FALSE
+  /\ stops = 0
+  /\ kept = {}
+  /\ stopped = {}
 
 Range(s) == {s[i] : i \in 1..Len(s)}
 Flatten(es) == IF es = <<>> THEN <<>> ELSE
@@ -134,21 +147,32 @@ Enqueue(m, a) ==
 \* (drainQueuedMessagesIfIdle). Otherwise the send starts its turn directly
 \* (AgentSession.sendMessage). Mutant "directSend": the pre-fix rule, which queued only while
 \* busy (finding F2).
+\* Send is the queue-or-send decision; the send passed the entry barrier earlier, so a decision
+\* under the stop latch is a send admitted before the Stop. The latch is re-checked at the
+\* enqueue point, and the direct path's session admission refuses too: the caller keeps the
+\* refused message. Mutant "noEnqueueBarrier": the queue path does not re-check the latch.
 Send ==
   /\ sent < N
   /\ \E a \in Attrs :
-       LET m == sent + 1 IN
+       LET m == sent + 1
+           direct == phase = "idle" /\ (NextIdx = 0 \/ Mutant = "directSend")
+       IN
        /\ sent' = m
        /\ attr' = [attr EXCEPT ![m] = a]
-       /\ IF phase = "idle" /\ (NextIdx = 0 \/ Mutant = "directSend")
+       /\ stopped' = IF stopLatched THEN stopped \cup {m} ELSE stopped
+       /\ IF stopLatched /\ (direct \/ Mutant # "noEnqueueBarrier")
+            THEN /\ IF a.user THEN kept' = kept \cup {m} /\ UNCHANGED removed
+                               ELSE removed' = removed \cup {m} /\ UNCHANGED kept
+                 /\ UNCHANGED <<entries, dispatched, phase, owed, drainPending>>
+            ELSE IF direct
             THEN /\ dispatched' = Append(dispatched, m)
                  /\ phase' = "streaming"
                  /\ owed' = FALSE
-                 /\ UNCHANGED <<entries, drainPending>>
+                 /\ UNCHANGED <<entries, drainPending, removed, kept>>
             ELSE /\ Enqueue(m, a)
                  /\ drainPending' = (drainPending \/ phase = "idle")
-                 /\ UNCHANGED <<dispatched, phase, owed>>
-       /\ UNCHANGED <<removed, decision, decisions>>
+                 /\ UNCHANGED <<dispatched, phase, owed, removed, kept>>
+       /\ UNCHANGED <<decision, decisions, stopLatched, stopCleared, stops>>
 
 \* A tool boundary where the stop condition sees a tool-end next entry: the stream ends and
 \* its stream-end drains the queue (agentSession.ts:9150 sendQueuedMessages("terminal")).
@@ -160,12 +184,14 @@ Cut ==
   /\ owed' = TRUE
   /\ drainPending' = TRUE
   /\ UNCHANGED <<sent, attr, entries, dispatched, removed, decision, decisions>>
+  /\ UNCHANGED stopVars
 
 TurnEnd ==
   /\ phase = "streaming"
   /\ phase' = "draining"
   /\ drainPending' = TRUE
   /\ UNCHANGED <<sent, attr, entries, dispatched, removed, decision, decisions, owed>>
+  /\ UNCHANGED stopVars
 
 \* agentSession.ts:10540-10686 sendQueuedMessages (closing, edit and mid-stream compaction
 \* gates are not modelled). The session stays busy ("draining") until the drain chain either
@@ -173,6 +199,8 @@ TurnEnd ==
 Drain ==
   /\ drainPending
   /\ phase \in {"idle", "draining"}
+  /\ ~stopLatched                                           \* stop-cascade barrier
+  /\ UNCHANGED stopVars
   /\ IF entries = <<>>
        THEN /\ drainPending' = FALSE                           \* :10555-10557
             /\ phase' = "idle"
@@ -205,6 +233,7 @@ StartDecision ==
   /\ decision' = TRUE
   /\ decisions' = decisions + 1
   /\ UNCHANGED <<sent, attr, entries, phase, dispatched, removed, drainPending, owed>>
+  /\ UNCHANGED stopVars
 
 \* TaskService resolves the report decision and re-runs the idle drain.
 ResolveDecision ==
@@ -212,6 +241,7 @@ ResolveDecision ==
   /\ decision' = FALSE
   /\ drainPending' = IF Mutant = "decisionNoDrain" THEN drainPending ELSE TRUE
   /\ UNCHANGED <<sent, attr, entries, phase, dispatched, removed, decisions, owed>>
+  /\ UNCHANGED stopVars
 
 \* A cancel signal fires (e.g. the bash-monitor reconciler withdraws a wake). No drain.
 Withdraw ==
@@ -220,6 +250,7 @@ Withdraw ==
        /\ entries[i].withdrawable /\ ~entries[i].aborted
        /\ entries' = [entries EXCEPT ![i].aborted = TRUE]
   /\ UNCHANGED <<sent, attr, phase, dispatched, removed, drainPending, decision, decisions, owed>>
+  /\ UNCHANGED stopVars
 
 \* agentSession.ts:9780-9835 removal of a sealed hidden entry; it publishes the queue change
 \* but does not drain.
@@ -230,6 +261,7 @@ Remove ==
        /\ removed' = removed \cup Range(entries[i].msgs)
        /\ entries' = SubSeq(entries, 1, i - 1) \o SubSeq(entries, i + 1, Len(entries))
   /\ UNCHANGED <<sent, attr, phase, dispatched, drainPending, decision, decisions, owed>>
+  /\ UNCHANGED stopVars
 
 UserIdx == {i \in 1..Len(entries) : entries[i].user}
 Seqify(S) == \* the elements of a finite set of indices, ascending
@@ -251,6 +283,7 @@ SetVisibleMode ==
        IN entries' = [k \in 1..Len(us) |-> [entries[us[k]] EXCEPT !.mode = mode]]
                      \o [k \in 1..Len(hs) |-> entries[hs[k]]]
   /\ UNCHANGED <<sent, attr, phase, dispatched, removed, drainPending, decision, decisions, owed>>
+  /\ UNCHANGED stopVars
 
 \* messageQueue.ts:1137-1148 prioritizeNextUserEntry (Send now), then sendQueuedMessages.
 SendNow ==
@@ -261,12 +294,51 @@ SendNow ==
                    \o SubSeq(entries, i + 1, Len(entries))
   /\ drainPending' = TRUE
   /\ UNCHANGED <<sent, attr, phase, dispatched, removed, decision, decisions, owed>>
+  /\ UNCHANGED stopVars
+
+\* TaskService beginWorkspaceStop (Phase A): bump the epoch and latch. The stopped stream
+\* ends; its stream-end drain waits for the latch.
+BeginStop ==
+  /\ AllowStop
+  /\ stops = 0
+  /\ stopLatched' = TRUE
+  /\ stops' = 1
+  /\ stopped' = stopped \cup Queued
+  /\ IF phase = "streaming"
+       THEN phase' = "draining" /\ drainPending' = TRUE
+       ELSE UNCHANGED <<phase, drainPending>>
+  /\ UNCHANGED <<sent, attr, entries, dispatched, removed, decision, decisions, owed,
+                 stopCleared, kept>>
+
+\* runWorkspaceStopCleanup (Phase B), once per latch: the queue is emptied; user-authored
+\* messages are handed back as held input (clearQueue preserveUserInput), background ones
+\* canceled. Mutant "clearDrops": the plain clear, which discards user messages too.
+StopClear ==
+  /\ stopLatched /\ ~stopCleared
+  /\ LET keep == IF Mutant = "clearDrops" THEN {}
+              ELSE {m \in Queued : attr[m].user /\ ~attr[m].withdrawable}
+     IN /\ kept' = kept \cup keep
+        /\ removed' = removed \cup (Queued \ keep)
+  /\ entries' = <<>>
+  /\ stopCleared' = TRUE
+  /\ UNCHANGED <<sent, attr, phase, dispatched, drainPending, decision, decisions, owed,
+                 stopLatched, stops, stopped>>
+
+\* Phase C: the latch drops only after the cleanup ran.
+EndStop ==
+  /\ stopLatched /\ stopCleared
+  /\ stopLatched' = FALSE
+  /\ stopCleared' = FALSE
+  /\ UNCHANGED <<sent, attr, entries, phase, dispatched, removed, drainPending, decision,
+                 decisions, owed, stops, kept, stopped>>
 
 Done == sent = N /\ entries = <<>> /\ phase = "idle" /\ ~drainPending /\ ~decision
+        /\ ~stopLatched
 
 Next ==
   \/ Send \/ Cut \/ TurnEnd \/ Drain \/ StartDecision \/ ResolveDecision
   \/ Withdraw \/ Remove \/ SetVisibleMode \/ SendNow
+  \/ BeginStop \/ StopClear \/ EndStop
   \/ (Done /\ UNCHANGED vars)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Drain) /\ WF_vars(ResolveDecision) /\ WF_vars(TurnEnd)
@@ -278,10 +350,11 @@ Sent == 1..sent
 NoLossNoDup ==
   /\ Len(dispatched) = Cardinality(Range(dispatched))
   /\ Len(Flatten(entries)) = Cardinality(Queued)
-  /\ Range(dispatched) \cup Queued \cup removed = Sent
+  /\ Range(dispatched) \cup Queued \cup removed \cup kept = Sent
   /\ Range(dispatched) \cap Queued = {}
   /\ Range(dispatched) \cap removed = {}
   /\ Queued \cap removed = {}
+  /\ kept \cap (Range(dispatched) \cup Queued \cup removed) = {}
 
 \* User-authored messages start turns in the order they were sent.
 UserOrder ==
@@ -302,6 +375,15 @@ PromotedNotBlockedByHidden ==
       \A i \in 1..(j - 1) :
         (Live(entries[i]) /\ ~entries[i].user /\ entries[i].mode = "turn") =>
           \E k \in (i + 1)..(j - 1) : entries[k].user
+
+\* A user-authored message is never discarded: it starts a turn, stays queued, or is handed
+\* back / refused visibly (withdrawable messages are background-only in the code).
+UserInputNeverLost ==
+  \A m \in Sent : (attr[m].user /\ ~attr[m].withdrawable) => m \notin removed
+
+\* Input admitted before a Stop (queued when it began, or deciding under its latch) never
+\* starts a turn.
+NoRunAfterStop == Range(dispatched) \cap stopped = {}
 
 \* A stream cut for a queued entry is continued by a successor turn.
 QueueCutPreserved == (phase = "idle" /\ entries = <<>> /\ ~drainPending) => ~owed

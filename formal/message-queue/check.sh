@@ -24,6 +24,9 @@ runs=(
   $'MQ_mutant_nodrain\t12'
   $'MQ_mutant_trailingrun\t12'
   $'MQ_mutant_directsend\t12'
+  $'MQ_stop\t0'
+  $'MQ_mutant_nobarrier\t12'
+  $'MQ_mutant_cleardrops\t12'
 )
 
 status=0

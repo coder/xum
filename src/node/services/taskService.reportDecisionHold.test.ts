@@ -1149,9 +1149,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(await taskService.terminateAllDescendantAgentTasks(rootId)).toEqual([]);
       await yieldMacrotasks(3);
       expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
-      // Cascade clears never restore input (a descendant stopped by its parent keeps no pending
-      // input); the callback is notified exactly once and the obligation discharged.
+      // A descendant stopped by its parent keeps no runnable input, but the user's queued text is
+      // handed back as held input (never dropped); the callback is notified exactly once and the
+      // obligation discharged.
       expect(stack.restoreEvents()).toHaveLength(0);
+      expect(stack.heldInputs().map((held) => held.send.displayText)).toEqual(["follow-up text"]);
       expect(onCanceled).toHaveBeenCalledTimes(1);
       expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
       expect(outstanding(svc, childId)).toHaveLength(0);
@@ -1172,7 +1174,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(streamStarts.map((start) => start.messageId)).toEqual(["assistant-1"]);
       expect(stack.restoreEvents()).toHaveLength(0);
-      expect(stack.heldInputs()).toHaveLength(0);
+      // Held once, and it stays held: it never runs without a fresh user Send.
+      expect(stack.heldInputs().map((held) => held.send.displayText)).toEqual(["follow-up text"]);
       expect(outstanding(svc, childId)).toHaveLength(0);
     } finally {
       gate.resolve();
