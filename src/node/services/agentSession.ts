@@ -2421,15 +2421,19 @@ export class AgentSession {
     // the model's last action was safe to continue, so goal loops must wait for user acknowledgment.
     const partial = await this.historyService.readPartial(this.workspaceId);
     if (this.coordinator.closing) return;
-    if (partial?.role === "assistant" && !this.isPendingAskUserQuestion(partial)) {
+    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
+    if (this.coordinator.closing) return;
+    // A partial of a finished turn is still here only if settling it failed (#5322); it is a
+    // completed reply, not crash-recovered work, so it does not gate the goal.
+    if (
+      partial?.role === "assistant" &&
+      !this.isPendingAskUserQuestion(partial) &&
+      !this.isFinishedStartupPartial(partial, historyResult.success ? historyResult.data : [])
+    ) {
       await goalService.requireUserAcknowledgmentForCrashRecovery(this.workspaceId);
       return;
     }
-
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
-    if (this.coordinator.closing || !historyResult.success) {
-      return;
-    }
+    if (!historyResult.success) return;
 
     const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
     if (

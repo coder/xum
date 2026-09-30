@@ -25,6 +25,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
@@ -72,6 +73,7 @@ async function createSessionBundle(
      * stream manager's runner, so a test fires a scheduled retry with `fireScheduledRetry`.
      */
     clock?: TestEffectRunner;
+    workspaceGoalService?: WorkspaceGoalService;
   }
 ): Promise<SessionBundle> {
   const workspaceMetadata: WorkspaceMetadata = {
@@ -101,6 +103,7 @@ async function createSessionBundle(
       ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: options.clock.runner } }
       : {}),
     captureEvents: true,
+    workspaceGoalService: options?.workspaceGoalService,
   });
 }
 
@@ -642,6 +645,36 @@ describe("AgentSession startup auto-retry recovery", () => {
       expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
       expect(await historyService.readPartial(workspaceId)).toBeNull();
       expect((await assistantRow(historyService, workspaceId))?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    // Settling can fail too (another lock timeout); the goal crash-recovery gate must still not
+    // pause an active goal for a reply the provider finished.
+    test.each([
+      { name: "a finalized partial whose settling failed", finalized: true, gated: false },
+      { name: "an interrupted partial", finalized: false, gated: true },
+    ])("goal crash-recovery gate: $name", async ({ finalized, gated }) => {
+      const workspaceId = `startup-goal-gate-${finalized}`;
+      const requireAck = mock(() => Promise.resolve());
+      const goals = {
+        requireUserAcknowledgmentForCrashRecovery: requireAck,
+        recoverPendingDispatchAfterRestart: mock(() => Promise.resolve()),
+      } as unknown as WorkspaceGoalService;
+      const { session, historyService, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { workspaceGoalService: goals }
+      );
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, {
+        streamFinalized: finalized,
+      });
+      spyOn(historyService, "commitPartial").mockResolvedValueOnce(Err("history lock timeout"));
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(requireAck).toHaveBeenCalledTimes(gated ? 1 : 0);
       await session.dispose();
     });
 
