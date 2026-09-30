@@ -2723,10 +2723,11 @@ export class TurnRequestBuilder {
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
         // tool list stable" cannot disagree (#5250): these attempts use native
         // Anthropic deferred loading instead of activeTools scoping (#5262).
-        const toolSearchPromptCacheActive = supportsAnthropicCache(
-          seed.rawModelString,
-          seed.providersConfig
-        );
+        // A request-level beta opt-out also makes the provider strip cache
+        // markers, and must keep defer_loading/tool_reference off the wire too.
+        const toolSearchPromptCacheActive =
+          supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true;
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({

@@ -1,4 +1,5 @@
 import nodeAssert from "node:assert/strict";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 import * as fs from "node:fs/promises";
 import { promises as fsPromises } from "node:fs";
@@ -2239,7 +2240,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
   // first) on every tool_catalog_search activation, so prompt-cache models use
   // native deferred loading instead (#5262).
-  async function startToolSearchStream(modelString: string, toolSearch: boolean) {
+  async function startToolSearchStream(
+    modelString: string,
+    toolSearch: boolean,
+    muxProviderOptions?: MuxProviderOptions
+  ) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
@@ -2273,6 +2278,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString,
       thinkingLevel: "off",
       experiments: { toolSearch },
+      muxProviderOptions,
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
@@ -2293,6 +2299,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.toolNames).toEqual([...off.toolNames, "tool_catalog_search"].sort());
     expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
     expect(off.deferLoadingNames).toEqual([]);
+  });
+
+  it("keeps scoped tool search when the request disables Anthropic beta features", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true, {
+      anthropic: { disableBetaFeatures: true },
+    });
+    expect(on.state?.native).toBe(false);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.deferLoadingNames).toEqual([]);
   });
 
   it("keeps scoped tool-search deferral on models without Anthropic prompt caching", async () => {
