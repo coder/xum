@@ -1979,9 +1979,9 @@ export class TurnRequestBuilder {
       }
     }
 
-    // Tool search: assembly-time gate. The runtime
-    // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
-    // is assigned only after policy filtering builds the deferred catalog
+    // Tool search: assembly-time gate. The runtime holder makes getToolsForModel
+    // create the tool_catalog_search tool; its `state` is assigned only after
+    // policy filtering builds the deferred catalog
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =

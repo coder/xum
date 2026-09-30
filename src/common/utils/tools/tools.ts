@@ -416,8 +416,8 @@ export interface ToolConfiguration {
   };
   /**
    * Runtime holder for the tool_catalog_search tool (present only when MCP tools
-   * exist for this stream).
-   * `state` is assigned by aiService after policy filtering builds the catalog.
+   * exist for this stream). `state` is assigned by aiService after policy
+   * filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;
   /**

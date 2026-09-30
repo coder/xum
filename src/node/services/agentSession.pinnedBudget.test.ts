@@ -253,9 +253,10 @@ describe("pinned full-payload rollover admission", () => {
           experiments: { tokenBudget: true, memory: true },
           // Tool search defers MCP schemas by default; disabling the search tool
           // is the fallback that keeps them advertised.
-          ...(kind === "advertised-schema"
-            ? { toolPolicy: [{ regex_match: "tool_catalog_search", action: "disable" as const }] }
-            : {}),
+          toolPolicy:
+            kind === "advertised-schema"
+              ? [{ regex_match: "tool_catalog_search", action: "disable" }]
+              : undefined,
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);
