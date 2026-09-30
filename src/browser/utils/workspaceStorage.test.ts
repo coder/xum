@@ -135,7 +135,8 @@ describe("migrateWorkspaceStorage", () => {
     globalThis.document = domWindow.document;
     globalThis.localStorage = domWindow.localStorage;
     const sourceKey = getWorkspaceNameStateKey("__pending__/repo3");
-    const destinationKey = getWorkspaceNameStateKey(getDraftScopeId("/repo3", "draft-1"));
+    const destinationScopeId = getDraftScopeId("/repo3", "draft-1");
+    const destinationKey = getWorkspaceNameStateKey(destinationScopeId);
     const generatedIdentity = { name: "sidebar-a1b2", title: "Fix sidebar" };
     localStorage.setItem(
       sourceKey,
@@ -147,7 +148,7 @@ describe("migrateWorkspaceStorage", () => {
       })
     );
 
-    migrateWorkspaceStorage("__pending__/repo3", getDraftScopeId("/repo3", "draft-1"));
+    migrateWorkspaceStorage("__pending__/repo3", destinationScopeId);
     const restarted = restartLocalStorage();
 
     const moved: unknown = JSON.parse(restarted.getItem(destinationKey) ?? "null");

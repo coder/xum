@@ -997,8 +997,10 @@ export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
 /** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
 export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
-/** workspaceNameState stores at most this much (serialized) of a typed manual name. */
-// Valid names are at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
+/**
+ * workspaceNameState stores at most this much (serialized) of a typed manual name. Valid names are
+ * at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
+ */
 export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
  * model:{workspaceId} holds a "provider:modelId" string. Custom model ids are checked against it
