@@ -333,7 +333,6 @@ export interface ToolConfiguration {
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
-    toolSearch?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
     /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
@@ -416,8 +415,8 @@ export interface ToolConfiguration {
     abortSignal: AbortSignal;
   };
   /**
-   * Runtime holder for the tool_catalog_search tool (tool-search experiment; present
-   * only when the experiment is enabled and MCP tools exist for this stream).
+   * Runtime holder for the tool_catalog_search tool (present only when MCP tools
+   * exist for this stream).
    * `state` is assigned by aiService after policy filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;

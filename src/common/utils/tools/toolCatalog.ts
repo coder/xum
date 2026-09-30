@@ -1,5 +1,5 @@
 /**
- * Tool search catalog (tool-search experiment, Phase 1).
+ * Tool search catalog.
  *
  * Client-side deferred MCP tool loading: MCP tool schemas stay out of the
  * model-visible tool list until the model discovers them via the `tool_catalog_search`
@@ -343,7 +343,7 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
  *   without deferral. (Exclusive mode removes MCP tools from the record, so
  *   the empty-catalog branch deactivates it anyway.)
  * - `tool_catalog_search` absent (policy-disabled) ⇒ safe fallback: no state, tools
- *   unchanged — MCP tools stay advertised exactly as without the experiment.
+ *   unchanged — MCP tools stay advertised exactly as without deferral.
  * - Nothing deferred (all MCP tools policy-disabled / PTC-removed) ⇒ drop
  *   `tool_catalog_search` from the record (a search tool with an empty catalog is
  *   noise) and return no state.
@@ -368,7 +368,7 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   // bridged MCP tool in its description and exposes them as callable `mux.*`
   // functions, so activeTools scoping could neither reduce context nor gate
   // access. Deferral would be ineffective and silently bypassable ⇒ drop
-  // tool_catalog_search and run without deferral when both experiments are enabled.
+  // tool_catalog_search and run without deferral whenever PTC is enabled.
   // Gated on the actual PTC flag, not record presence: a `code_execution`
   // record entry may be a same-named MCP tool (classified as normal deferred).
   if (inputs.ptcEnabled === true) {

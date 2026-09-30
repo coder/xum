@@ -11,7 +11,6 @@ export interface ExperimentValues {
   dynamicWorkflows: boolean | undefined;
   memory: boolean | undefined;
   memoryIntuition: boolean | undefined;
-  toolSearch: boolean | undefined;
   continuousCompaction: boolean | undefined;
   tokenBudget: boolean | undefined;
 }

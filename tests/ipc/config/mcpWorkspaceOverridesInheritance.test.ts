@@ -33,10 +33,7 @@ async function captureMcpToolSurface(
     throw new Error("request captured; no provider call");
   };
   try {
-    await sendMessageWithModel(env, workspaceId, "hello", HAIKU_MODEL, {
-      agentId: "exec",
-      experiments: { toolSearch: true },
-    });
+    await sendMessageWithModel(env, workspaceId, "hello", HAIKU_MODEL, { agentId: "exec" });
   } finally {
     streamManager.startStream = original;
   }

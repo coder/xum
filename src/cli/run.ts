@@ -300,7 +300,6 @@ const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   //   has a non-empty advisorModelString, which the CLI's ephemeral config
   //   never carries over.
   [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
-  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
 } as const satisfies Partial<
   Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
 >;
@@ -314,6 +313,10 @@ function isSendMessageExperimentId(
   return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
 }
 
+// Experiments that graduated to always-on. Accepting their old IDs as no-ops
+// keeps existing `-e` automation working instead of erroring after upgrade.
+const GRADUATED_EXPERIMENT_IDS: ReadonlySet<string> = new Set(["tool-search"]);
+
 function collectExperiments(value: string, previous: string[]): string[] {
   let experimentId = value.trim().toLowerCase();
   // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
@@ -321,6 +324,9 @@ function collectExperiments(value: string, previous: string[]): string[] {
   // automation that passes the removed ID working instead of erroring.
   if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
     experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
+  if (GRADUATED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
   }
   // App-level experiments (e.g. agent-browser) have no send-options field and
   // would be silent no-ops in a headless run, so reject them loudly.
