@@ -25,7 +25,7 @@ CONSTANTS
   RecheckFollowUpUnderLock, \* FIX candidate: the follow-up send re-verifies the handoff under the lock
   EditClearsFollowUp,       \* FIX candidate: an edit that exposes a summary clears its pendingFollowUp
   MutJournalIgnoresGeneration, \* mutation: journal fold skips the stale-generation discard (272)
-  MutNoInMemoryFence,       \* mutation: publish/dispatch ignore the Stop's in-memory fence
+  MutNoInMemoryFence,       \* mutation: publish/dispatch ignore the Stop's in-memory fence and send-admission record check
   MutNoFoldIdempotence      \* mutation: journal fold ignores an already-present boundary
 
 NONE == "none"
@@ -139,8 +139,8 @@ StopRecord(b) ==                                                      \* 340
 ---------------------------------------------------------------------------
 (* Follow-up dispatch (agentSession.ts:10759). d_check reads history and    *)
 (* the cancellation record outside the history write lock; d_send is        *)
-(* sendMessage (11176), which appends the user row without re-verifying the *)
-(* handoff under the lock.                                                  *)
+(* sendMessage (11176): automatic-send admission re-reads the cancellation  *)
+(* record (4172-4186), but nothing re-verifies the handoff under the lock.  *)
 Handoff(c) == Last.k = "sum" /\ Last.fu /\ (c = 0 \/ Last.cid = c)
 Canceled == record.cid # 0 /\ record.cid = Last.cid
 
@@ -160,7 +160,8 @@ DCheck(b) ==
 
 DSend(b) ==
   /\ pc[b] = "d_send" /\ Free
-  /\ IF (stopping[b] # 0 /\ ~MutNoInMemoryFence) \/ (RecheckFollowUpUnderLock /\ ~(Handoff(dcid[b]) /\ ~Canceled))
+  /\ IF (stopping[b] # 0 /\ ~MutNoInMemoryFence) \/ (record.cid # 0 /\ ~MutNoInMemoryFence)
+        \/ (RecheckFollowUpUnderLock /\ ~(Handoff(dcid[b]) /\ ~Canceled))
        THEN /\ Goto(b, "idle") /\ UNCHANGED <<hist, nextId, dispatched, violations>>
        ELSE /\ hist' = hist \o <<Row(nextId, "fuUser", dcid[b], FALSE),
                                   Row(nextId + 1, "asst", 0, FALSE)>>
