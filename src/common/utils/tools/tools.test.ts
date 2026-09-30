@@ -296,6 +296,51 @@ describe("getToolsForModel", () => {
     expect(withoutGoalService.complete_goal).toBeUndefined();
   });
 
+  test("registers an identical new_context whether or not rollover is available", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+    const build = (config: Partial<ToolConfiguration>) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          // session_history ships with new_context; it only needs the service handle here.
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+          historyService: {} as never,
+          experiments: { tokenBudget: true },
+          ...config,
+        },
+        "ws-1",
+        initStateManager
+      );
+    // Auto-compaction at 100% disables rollover. That is a settings edit during the
+    // workspace's life, so it must not change the tool block (prompt cache, #5249).
+    const serialized: string[] = [];
+    for (const contextBudgetRolloverAvailable of [true, false, undefined]) {
+      const tools = await build({ contextBudgetRolloverAvailable });
+      expect(tools.new_context).toBeDefined();
+      serialized.push(
+        JSON.stringify(
+          Object.entries(tools).map(([name, tool]) => ({
+            name,
+            description: tool.description,
+            inputSchema: asSchema(tool.inputSchema).jsonSchema,
+          }))
+        )
+      );
+    }
+    expect(new Set(serialized).size).toBe(1);
+
+    // Experiment combinations that replace rollover still withhold the tool.
+    const continuous = await build({
+      experiments: { tokenBudget: true, continuousCompaction: true },
+    });
+    expect(continuous.new_context).toBeUndefined();
+  });
+
   test("withholds review_pane_* tools from sub-agents (enableAgentReport=true)", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();

@@ -2604,11 +2604,19 @@ export const TOOL_DEFINITIONS = {
       `Save your checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} first: the new window does not include this conversation or a summary of it, so you recover only through that checkpoint and session_history. ` +
       "The new window starts after this tool step settles, so sibling tool calls in the same step still complete. A request is honored once per window; if automatic rollover is disabled (threshold 100%), the request is ignored.",
     schema: z.object({}).strict(),
-    resultSchema: z.object({
-      success: z.boolean(),
-      status: z.literal("scheduled"),
-      message: z.string(),
-    }),
+    resultSchema: z.union([
+      z.object({
+        success: z.literal(true),
+        status: z.literal("scheduled"),
+        message: z.string(),
+      }),
+      // Typed refusal: the tool stays registered while rollover is disabled (#5249).
+      z.object({
+        success: z.literal(false),
+        code: z.literal("rollover_disabled"),
+        error: z.string(),
+      }),
+    ]),
   },
   memory: {
     resultSchema: MemoryToolResultSchema,

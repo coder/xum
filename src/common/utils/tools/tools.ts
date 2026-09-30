@@ -864,10 +864,11 @@ export async function getToolsForModel(
       ? {
           session_history: wrap(createSessionHistoryTool(config)),
           // Continuous compaction and PTC+RLM take precedence over token-budget rollover
-          // (AgentSession.isTokenBudgetActive), and a 100% threshold disables sealing; a
-          // request nothing could honor is not offered, so no stale receipt can be persisted.
-          ...(config.contextBudgetRolloverAvailable !== false &&
-          config.experiments.continuousCompaction !== true &&
+          // (AgentSession.isTokenBudgetActive), so the tool is not offered with them. A 100%
+          // threshold also disables sealing, but that is a settings edit during the
+          // workspace's life: the tool stays registered (stable tool block for prompt
+          // caching, #5249) and refuses at execution, so no stale receipt is persisted.
+          ...(config.experiments.continuousCompaction !== true &&
           !(config.experiments.programmaticToolCalling === true && config.experiments.rlm === true)
             ? { new_context: wrap(createNewContextTool(config)) }
             : {}),
