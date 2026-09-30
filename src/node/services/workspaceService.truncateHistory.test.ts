@@ -1251,7 +1251,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           return stat(...args);
         }) as typeof fsPromises.stat);
         const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
-        const fallback = spyOn(historyService, "getHistoryFromLatestBoundary");
+        const fallback = spyOn(historyService, "getHistoryForTokenStats");
         using _spies = {
           [Symbol.dispose]: () => {
             probe.mockRestore();
@@ -1265,7 +1265,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           ).toEqual(["/tmp/from-history.ts"]);
         }
         expect(proof).toHaveBeenCalledTimes(state === "absent" ? 0 : 2);
-        expect(fallback).toHaveBeenCalledTimes(2);
+        // The unchanged history is read once; the second call reuses its receipt-keyed paths.
+        expect(fallback).toHaveBeenCalledTimes(1);
         probe.mockRestore();
 
         // A fresh store models another backend publishing after the earlier absence checks.

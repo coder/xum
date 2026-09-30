@@ -2167,6 +2167,11 @@ export class WorkspaceService
   implements WorkspaceHost, WorkflowArchiveAdmissionGuard
 {
   private readonly sessions = new Map<string, AgentSession>();
+  /** Last Context-tab file list per workspace, keyed by the history receipt it came from. */
+  private readonly editedFilePathsByReceipt = new Map<
+    string,
+    { receiptKey: string; paths: string[] }
+  >();
   private shuttingDown = false;
   private readonly shutdownSessions = new Set<AgentSession>();
   private readonly pendingWorkspaceCleanup = new Set<Promise<void>>();
@@ -5552,9 +5557,7 @@ export class WorkspaceService
     // Fallback: compute tracked files from message history (survives reloads).
     // Only the current compaction epoch matters — post-compaction files are from
     // the active epoch only.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    const messages = historyResult.success ? historyResult.data : [];
-    const allPaths = extractEditedFilePaths(messages);
+    const allPaths = await this.getActiveEpochEditedFilePaths(workspaceId);
 
     // Exclude plan file from tracked files since it has its own section
     // Filter out both new and legacy plan file paths
@@ -5564,6 +5567,28 @@ export class WorkspaceService
       trackedFilePaths,
       excludedItems: exclusions.excludedItems,
     };
+  }
+
+  /**
+   * The Context tab read the whole active epoch under the history lock (17–19 s at 1.24M rows,
+   * #5315). It now uses the token-stats snapshot reader (#5329): the same rows as
+   * getHistoryFromLatestBoundary, scanned with the locks released, plus a receipt key that
+   * certifies them. The paths depend only on those rows, so an unchanged history reuses them.
+   * A snapshot that stays stale rejects (the tab keeps its last state) instead of reporting none.
+   */
+  private async getActiveEpochEditedFilePaths(workspaceId: string): Promise<string[]> {
+    const cached = this.editedFilePathsByReceipt.get(workspaceId);
+    if (cached) {
+      const receiptKey = await this.historyService.captureTokenStatsReceiptKey(workspaceId);
+      if (receiptKey === cached.receiptKey) return cached.paths;
+    }
+    const read = await this.historyService.getHistoryForTokenStats(workspaceId);
+    if (!read.success) throw new Error(read.error);
+    const paths = extractEditedFilePaths(read.data.messages);
+    const { receiptKey } = read.data;
+    if (receiptKey === null) this.editedFilePathsByReceipt.delete(workspaceId);
+    else this.editedFilePathsByReceipt.set(workspaceId, { receiptKey, paths });
+    return paths;
   }
 
   /**

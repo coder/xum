@@ -732,7 +732,8 @@ export class HistoryService {
   }
 
   /**
-   * getHistoryFromLatestBoundary(workspaceId, 0) for a token-stats miss (#5301), with the receipt
+   * getHistoryFromLatestBoundary(workspaceId, 0) for a token-stats miss (#5301) and the Context
+   * tab's edited-file list (#5315), with the receipt
    * key certifying those rows (null: no history or an untrusted receipt; never cached). Locks
    * cover recovery + receipt + open and the final receipt check, not the scan, which runs on the
    * pinned descriptors (safe as in getStatusHistorySuffix; any cooperating write also changes the
