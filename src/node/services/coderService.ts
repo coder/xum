@@ -1,6 +1,6 @@
 /**
  * Service for interacting with the Coder CLI.
- * Used to create/manage Coder workspaces as SSH targets for Mux workspaces.
+ * Used to create/manage Coder workspaces as SSH targets for Xum workspaces.
  */
 import { ensureMuxCoderSSHConfigFile } from "@/node/runtime/muxSshConfigWriter";
 import { execAsync, execFileAsync } from "@/node/utils/disposableExec";
@@ -155,12 +155,20 @@ async function* streamCoderCommand(
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  const exitPromise = new Promise<number | null>((resolve) => {
+    child.on("close", resolve);
+    child.on("error", () => resolve(null));
+  });
+
   const terminator = createGracefulTerminator(child);
 
   const abortHandler = () => {
     terminator.terminate();
   };
-  abortSignal?.addEventListener("abort", abortHandler);
+  abortSignal?.addEventListener("abort", abortHandler, { once: true });
+  if (abortSignal?.aborted) {
+    abortHandler();
+  }
 
   try {
     // Use an async queue to stream lines as they arrive
@@ -231,11 +239,8 @@ async function* streamCoderCommand(
       }
     }
 
-    // Wait for process to exit
-    const exitCode = await new Promise<number | null>((resolve) => {
-      child.on("close", resolve);
-      child.on("error", () => resolve(null));
-    });
+    // Wait for process to exit; listener is attached before stream draining to avoid missing close.
+    const exitCode = await exitPromise;
 
     if (abortSignal?.aborted) {
       throw new Error(abortMessage);
@@ -310,10 +315,25 @@ function sanitizeCoderCliErrorForUi(error: unknown): string {
   );
 }
 
+/** Lifetime of the short-lived API tokens `createApiSession` requests. */
+const API_TOKEN_LIFETIME_MINUTES = 5;
+/**
+ * A provisioning session is reused only while its token has at least a minute left, so the
+ * provisioning step that takes it has time to use it.
+ */
+const PROVISIONING_SESSION_REUSE_MS = (API_TOKEN_LIFETIME_MINUTES - 1) * 60_000;
+
 export class CoderService {
   // Ephemeral API sessions scoped to workspace provisioning.
   // This keeps token reuse explicit without persisting anything to disk.
-  private provisioningSessions = new Map<string, CoderApiSession>();
+  private provisioningSessionPromises = new Map<string, Promise<CoderApiSession>>();
+  private provisioningSessions = new Map<
+    string,
+    {
+      session: CoderApiSession;
+      /** Date.now() before the token was requested. */ createdAt: number;
+    }
+  >();
   private cachedInfo: CoderInfo | null = null;
   // Cache whoami results so later URL lookups can reuse the last CLI response.
   private cachedWhoami: CoderWhoamiData | null = null;
@@ -374,8 +394,9 @@ export class CoderService {
     const binaryPath = await this.resolveCoderBinaryPath();
 
     try {
-      using proc = execFileAsync("coder", ["version", "--output=json"]);
-      const { stdout } = await proc.result;
+      const stdout = await this.runCoderJsonCommand(["version", "--output=json"], {
+        timeoutMs: 10_000,
+      });
 
       // Parse JSON output
       const data = JSON.parse(stdout) as { version?: string };
@@ -490,14 +511,11 @@ export class CoderService {
    * Create a short-lived Coder API token for deployment endpoints.
    */
   private async createApiSession(tokenName: string): Promise<CoderApiSession> {
-    using tokenProc = execFileAsync("coder", [
-      "tokens",
-      "create",
-      "--lifetime",
-      "5m",
-      "--name",
-      tokenName,
-    ]);
+    using tokenProc = execFileAsync(
+      "coder",
+      ["tokens", "create", "--lifetime", `${API_TOKEN_LIFETIME_MINUTES}m`, "--name", tokenName],
+      { timeoutMs: 30_000 }
+    );
     const { stdout: token } = await tokenProc.result;
     const trimmed = token.trim();
 
@@ -505,7 +523,9 @@ export class CoderService {
       token: trimmed,
       dispose: async () => {
         try {
-          using deleteProc = execFileAsync("coder", ["tokens", "delete", tokenName]);
+          using deleteProc = execFileAsync("coder", ["tokens", "delete", tokenName], {
+            timeoutMs: 30_000,
+          });
           await deleteProc.result;
         } catch {
           // Best-effort cleanup; token will expire in 5 minutes anyway.
@@ -530,30 +550,50 @@ export class CoderService {
   async ensureProvisioningSession(workspaceName: string): Promise<CoderApiSession> {
     const existing = this.provisioningSessions.get(workspaceName);
     if (existing) {
-      return existing;
+      // A creation that never reached init (a rollback, #5113) leaves its session here; a retry
+      // must not get a token that has expired, or will before provisioning can use it.
+      if (Date.now() - existing.createdAt < PROVISIONING_SESSION_REUSE_MS) {
+        return existing.session;
+      }
+      await this.disposeProvisioningSession(workspaceName);
     }
 
-    const tokenName = `mux-${workspaceName}-${Date.now().toString(36)}`;
-    const session = await this.createApiSession(tokenName);
-    this.provisioningSessions.set(workspaceName, session);
-    return session;
+    const pending = this.provisioningSessionPromises.get(workspaceName);
+    if (pending) {
+      return pending;
+    }
+
+    const createdAt = Date.now();
+    const tokenName = `mux-${workspaceName}-${createdAt.toString(36)}`;
+    const sessionPromise = this.createApiSession(tokenName)
+      .then((session) => {
+        this.provisioningSessions.set(workspaceName, { session, createdAt });
+        this.provisioningSessionPromises.delete(workspaceName);
+        return session;
+      })
+      .catch((error: unknown) => {
+        this.provisioningSessionPromises.delete(workspaceName);
+        throw error;
+      });
+    this.provisioningSessionPromises.set(workspaceName, sessionPromise);
+    return sessionPromise;
   }
 
   takeProvisioningSession(workspaceName: string): CoderApiSession | undefined {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (entry) {
       this.provisioningSessions.delete(workspaceName);
     }
-    return session;
+    return entry?.session;
   }
 
   async disposeProvisioningSession(workspaceName: string): Promise<void> {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (!session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (!entry) {
       return;
     }
     this.provisioningSessions.delete(workspaceName);
-    await session.dispose();
+    await entry.session.dispose();
   }
 
   /**
@@ -564,23 +604,20 @@ export class CoderService {
     await this.getWhoamiData({ useCache: false });
   }
 
-  /**
-   * Clear cached Coder info. Used for testing.
-   */
-  clearCache(): void {
-    this.cachedInfo = null;
-    this.cachedWhoami = null;
-  }
-
   // Preserve the old behavior: explicit whoami checks should hit the CLI even if cached.
   // The cache only exists so later URL lookups can reuse the last whoami response.
-  private async getWhoamiData(options?: { useCache?: boolean }): Promise<CoderWhoamiData> {
+  private async getWhoamiData(options?: {
+    useCache?: boolean;
+    signal?: AbortSignal;
+  }): Promise<CoderWhoamiData> {
     if (options?.useCache && this.cachedWhoami) {
       return this.cachedWhoami;
     }
 
-    using proc = execFileAsync("coder", ["whoami", "--output=json"]);
-    const { stdout } = await proc.result;
+    const stdout = await this.runCoderJsonCommand(["whoami", "--output=json"], {
+      timeoutMs: 10_000,
+      signal: options?.signal,
+    });
 
     const data = JSON.parse(stdout) as Array<Partial<CoderWhoamiData>>;
     if (!data[0]?.url) {
@@ -600,8 +637,8 @@ export class CoderService {
    * Get the Coder deployment URL via `coder whoami`.
    * Throws if Coder CLI is not configured/logged in.
    */
-  private async getDeploymentUrl(): Promise<string> {
-    const { url } = await this.getWhoamiData({ useCache: true });
+  private async getDeploymentUrl(signal?: AbortSignal): Promise<string> {
+    const { url } = await this.getWhoamiData({ useCache: true, signal });
     return url;
   }
 
@@ -609,10 +646,15 @@ export class CoderService {
    * Get the active template version ID for a template.
    * Throws if template not found.
    */
-  private async getActiveTemplateVersionId(templateName: string, org?: string): Promise<string> {
+  private async getActiveTemplateVersionId(
+    templateName: string,
+    org?: string,
+    signal?: AbortSignal
+  ): Promise<string> {
     // Note: `coder templates list` doesn't support --org flag, so we filter client-side
-    using proc = execFileAsync("coder", ["templates", "list", "--output=json"]);
-    const { stdout } = await proc.result;
+    const stdout = await this.runCoderJsonCommand(["templates", "list", "--output=json"], {
+      signal,
+    });
 
     if (!stdout.trim()) {
       throw new Error(`Template "${templateName}" not found (no templates exist)`);
@@ -645,13 +687,13 @@ export class CoderService {
   private async getPresetParamNames(
     templateName: string,
     presetName: string,
-    org?: string
+    org?: string,
+    signal?: AbortSignal
   ): Promise<Set<string>> {
     try {
       const args = ["templates", "presets", "list", templateName, "--output=json"];
       if (org) args.push("--org", org);
-      using proc = execFileAsync("coder", args);
-      const { stdout } = await proc.result;
+      const stdout = await this.runCoderJsonCommand(args, { signal });
 
       // Same non-JSON guard as listPresets (CLI prints info message for no presets)
       if (!stdout.trim() || !stdout.trimStart().startsWith("[")) {
@@ -672,6 +714,9 @@ export class CoderService {
 
       return new Set(preset.TemplatePreset.Parameters.map((p) => p.Name));
     } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
       log.debug("Failed to get preset param names", { templateName, presetName, error });
       return new Set();
     }
@@ -714,7 +759,8 @@ export class CoderService {
     deploymentUrl: string,
     versionId: string,
     workspaceName: string,
-    session?: CoderApiSession
+    session?: CoderApiSession,
+    signal?: AbortSignal
   ): Promise<
     Array<{
       name: string;
@@ -730,10 +776,22 @@ export class CoderService {
         deploymentUrl
       ).toString();
 
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const onAbort = () => controller.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        controller.abort();
+      }
+
       const response = await fetch(url, {
         headers: {
           "Coder-Session-Token": api.token,
         },
+        signal: controller.signal,
+      }).finally(() => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
       });
 
       if (!response.ok) {
@@ -831,8 +889,7 @@ export class CoderService {
    */
   async listTemplates(): Promise<CoderListTemplatesResult> {
     try {
-      using proc = execFileAsync("coder", ["templates", "list", "--output=json"]);
-      const { stdout } = await proc.result;
+      const stdout = await this.runCoderJsonCommand(["templates", "list", "--output=json"]);
 
       // Handle empty output (no templates)
       if (!stdout.trim()) {
@@ -873,8 +930,7 @@ export class CoderService {
     try {
       const args = ["templates", "presets", "list", templateName, "--output=json"];
       if (org) args.push("--org", org);
-      using proc = execFileAsync("coder", args);
-      const { stdout } = await proc.result;
+      const stdout = await this.runCoderJsonCommand(args);
 
       // Handle empty output or non-JSON info messages (no presets).
       // CLI prints "No presets found for template ..." to stdout even with --output=json
@@ -918,13 +974,12 @@ export class CoderService {
    */
   async workspaceExists(workspaceName: string): Promise<boolean> {
     try {
-      using proc = execFileAsync("coder", [
+      const stdout = await this.runCoderJsonCommand([
         "list",
         "--search",
         `name:${workspaceName}`,
         "--output=json",
       ]);
-      const { stdout } = await proc.result;
 
       if (!stdout.trim()) {
         return false;
@@ -948,8 +1003,7 @@ export class CoderService {
     const KNOWN_STATUSES = new Set<string>(CoderWorkspaceStatusSchema.options);
 
     try {
-      using proc = execFileAsync("coder", ["list", "--output=json"]);
-      const { stdout } = await proc.result;
+      const stdout = await this.runCoderJsonCommand(["list", "--output=json"]);
 
       // Handle empty output (no workspaces)
       if (!stdout.trim()) {
@@ -1078,6 +1132,18 @@ export class CoderService {
 
       options.signal?.addEventListener("abort", onAbort);
     });
+  }
+
+  private async runCoderJsonCommand(
+    args: string[],
+    options: { timeoutMs?: number; signal?: AbortSignal } = {}
+  ): Promise<string> {
+    using proc = execFileAsync("coder", args, {
+      timeoutMs: options.timeoutMs ?? 30_000,
+      signal: options.signal,
+    });
+    const { stdout } = await proc.result;
+    return stdout;
   }
 
   /**
@@ -1237,18 +1303,36 @@ export class CoderService {
     }
 
     // 1. Get deployment URL
-    const deploymentUrl = await this.getDeploymentUrl();
+    const deploymentUrl = await this.getDeploymentUrl(abortSignal);
+
+    if (abortSignal?.aborted) {
+      throw new Error("Coder workspace creation aborted");
+    }
 
     // 2. Get active template version ID
-    const versionId = await this.getActiveTemplateVersionId(template, org);
+    const versionId = await this.getActiveTemplateVersionId(template, org, abortSignal);
+
+    if (abortSignal?.aborted) {
+      throw new Error("Coder workspace creation aborted");
+    }
 
     // 3. Get parameter names covered by preset (if any)
     const coveredByPreset = preset
-      ? await this.getPresetParamNames(template, preset, org)
+      ? await this.getPresetParamNames(template, preset, org, abortSignal)
       : new Set<string>();
 
+    if (abortSignal?.aborted) {
+      throw new Error("Coder workspace creation aborted");
+    }
+
     // 4. Fetch all template parameters from API
-    const allParams = await this.getTemplateRichParameters(deploymentUrl, versionId, name, session);
+    const allParams = await this.getTemplateRichParameters(
+      deploymentUrl,
+      versionId,
+      name,
+      session,
+      abortSignal
+    );
 
     // 5. Validate required params have values
     this.validateRequiredParams(allParams, coveredByPreset);
@@ -1335,7 +1419,7 @@ export class CoderService {
     const startTime = Date.now();
 
     // Safety: never delete Coder workspaces mux didn't create.
-    // Mux-created workspaces always use the mux- prefix.
+    // Xum-created workspaces always use the mux- prefix.
     if (!name.startsWith("mux-")) {
       log.warn("Refusing to delete Coder workspace without mux- prefix", { name });
       return Ok(undefined);

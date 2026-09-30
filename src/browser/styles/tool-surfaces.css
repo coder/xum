@@ -1,0 +1,92 @@
+/* Shared by src/browser/styles/globals.css (desktop) and vscode/src/webview/webview.css (VS Code webview). */
+@utility plan-surface {
+  background: var(--surface-plan-gradient);
+  border: 1px solid var(--surface-plan-border);
+}
+
+@utility plan-divider {
+  border-color: var(--surface-plan-divider);
+}
+
+@utility plan-divider-strong {
+  border-color: var(--surface-plan-border-strong);
+}
+
+@utility plan-chip {
+  color: var(--color-plan-mode);
+  background: var(--surface-plan-chip-bg);
+  border: 1px solid var(--surface-plan-chip-border);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+@utility plan-chip-hover {
+  background: var(--surface-plan-chip-hover);
+  border-color: var(--surface-plan-chip-border-strong);
+}
+
+@utility plan-chip-active {
+  background: var(--surface-plan-chip-active);
+  border-color: var(--surface-plan-chip-border-strong);
+}
+
+@utility plan-chip-ghost {
+  color: var(--color-muted);
+  background: transparent;
+  border: 1px solid var(--surface-plan-neutral-border);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+@utility plan-chip-ghost-hover {
+  color: var(--color-plan-mode);
+  background: var(--surface-plan-chip-hover);
+  border-color: var(--surface-plan-chip-border-strong);
+}
+
+@utility assistant-chip {
+  background: var(--surface-assistant-chip-bg);
+  border: 1px solid var(--surface-assistant-chip-border);
+  color: var(--color-foreground);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease;
+}
+
+@utility assistant-chip-hover {
+  background: var(--surface-assistant-chip-hover);
+  border-color: var(--surface-assistant-chip-border-strong);
+}
+
+@utility edit-cutoff-divider {
+  border-bottom: 3px solid;
+  border-image: repeating-linear-gradient(
+      45deg,
+      var(--color-editing-mode),
+      var(--color-editing-mode) 10px,
+      transparent 10px,
+      transparent 20px
+    )
+    1;
+}
+@utility border-dashed-warning {
+  border-style: dashed;
+  border-color: var(--border-warning-dashed);
+}
+
+@utility warning-text {
+  color: var(--color-warning-text);
+}
+
+@utility task-surface {
+  background: var(--surface-task-gradient);
+  border: 1px solid var(--surface-task-border);
+}
+
+@utility task-divider {
+  border-color: var(--surface-task-divider);
+}

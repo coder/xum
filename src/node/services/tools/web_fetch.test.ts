@@ -2,16 +2,15 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { createWebFetchTool } from "./web_fetch";
-import type { WebFetchToolArgs, WebFetchToolResult } from "@/common/types/tools";
+import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
-import { isMuxMdUrl, parseMuxMdUrl, uploadToMuxMd, deleteFromMuxMd } from "@/common/lib/muxMd";
 import type { ToolExecutionOptions } from "ai";
 import { WEB_FETCH_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 
-const itIntegration = process.env.TEST_INTEGRATION === "1" ? it : it.skip;
-const toolCallOptions: ToolExecutionOptions = {
+const toolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 function createTestWebFetchTool() {
@@ -56,108 +55,49 @@ function getCurlMaxTime(command: string): number {
 }
 
 afterEach(() => {
+  // Restore all spies (including the Date.now spy in the shared-timeout-budget
+  // test) so they never leak across test files: a frozen Date.now leaks
+  // process-wide and breaks downstream suites in the same `bun test` run, e.g.
+  // WorkflowService's crash-recovery retry test, whose retry delay never
+  // reaches 0 when time stands still. Do not remove this without restoring
+  // each global spy individually.
   mock.restore();
 });
 
-describe("mux.md URL helpers", () => {
-  describe("isMuxMdUrl", () => {
-    it("should detect valid mux.md URLs", () => {
-      expect(isMuxMdUrl("https://mux.md/abc123#key456")).toBe(true);
-      expect(isMuxMdUrl("https://mux.md/RQJe3#Fbbhosspt9q9Ig")).toBe(true);
-    });
-
-    it("should reject mux.md URLs without hash", () => {
-      expect(isMuxMdUrl("https://mux.md/abc123")).toBe(false);
-    });
-
-    it("should reject mux.md URLs with empty hash", () => {
-      expect(isMuxMdUrl("https://mux.md/abc123#")).toBe(false);
-    });
-
-    it("should reject non-mux.md URLs", () => {
-      expect(isMuxMdUrl("https://example.com/page#hash")).toBe(false);
-      expect(isMuxMdUrl("https://other.md/abc#key")).toBe(false);
-    });
-
-    it("should handle invalid URLs gracefully", () => {
-      expect(isMuxMdUrl("not-a-url")).toBe(false);
-      expect(isMuxMdUrl("")).toBe(false);
-    });
-  });
-
-  describe("parseMuxMdUrl", () => {
-    it("should extract id and key from valid mux.md URL", () => {
-      const result = parseMuxMdUrl("https://mux.md/abc123#key456");
-      expect(result).toEqual({ id: "abc123", key: "key456" });
-    });
-
-    it("should handle base64url characters in key", () => {
-      const result = parseMuxMdUrl("https://mux.md/RQJe3#Fbbhosspt9q9Ig");
-      expect(result).toEqual({ id: "RQJe3", key: "Fbbhosspt9q9Ig" });
-    });
-
-    it("should return null for URLs without hash", () => {
-      expect(parseMuxMdUrl("https://mux.md/abc123")).toBeNull();
-    });
-
-    it("should return null for URLs with empty id", () => {
-      expect(parseMuxMdUrl("https://mux.md/#key")).toBeNull();
-    });
-
-    it("should return null for invalid URLs", () => {
-      expect(parseMuxMdUrl("not-a-url")).toBeNull();
-    });
-  });
-});
-
 describe("web_fetch tool", () => {
-  itIntegration("should fetch and convert a real web page to markdown", async () => {
+  // These cases used to hit live sites behind TEST_INTEGRATION, which nothing in CI sets.
+  // Canned curl output keeps each response-handling branch deterministic; HTML-to-markdown
+  // extraction and resolver failures are covered by the fixture tests below.
+  it("returns plain text responses verbatim without HTML processing", async () => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://example.com",
-    };
+    const url = "https://93.184.216.34/cdn-cgi/trace";
+    const body = "fl=123f45\nh=example.com\n<b>not html</b>\n";
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        stdout: "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body,
+      })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!({ url }, toolCallOptions)) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.title).toContain("Example Domain");
-      expect(result.url).toBe("https://example.com");
-      expect(result.content).toContain("documentation");
-      expect(result.length).toBeGreaterThan(0);
-    }
+    expect(result).toEqual({ success: true, title: url, content: body, url, length: body.length });
   });
 
-  itIntegration("should fetch plain text content without HTML processing", async () => {
+  it.each([
+    { exitCode: 6, error: "Failed to fetch URL: Could not resolve host" },
+    { exitCode: 7, error: "Failed to fetch URL: Failed to connect" },
+  ])("maps curl exit $exitCode to a readable error", async ({ exitCode, error }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://cloudflare.com/cdn-cgi/trace",
-    };
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({ exitCode, stderr: "curl: transport failure" })
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/page" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.content).toContain("fl=");
-      expect(result.content).toContain("h=");
-      expect(result.content).toContain("ip=");
-      expect(result.title).toBe("https://cloudflare.com/cdn-cgi/trace");
-      expect(result.length).toBeGreaterThan(0);
-    }
-  });
-
-  itIntegration("should handle DNS failure gracefully", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://this-domain-does-not-exist.invalid/page",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Failed to fetch URL");
-    }
+    expect(result).toEqual({ success: false, error });
   });
 
   it.each(["file:///tmp/secret.txt", "data:text/plain,hello", "javascript:alert(1)"])(
@@ -377,6 +317,53 @@ describe("web_fetch tool", () => {
     expect(isCurlCommand(execSpy.mock.calls[0]?.[1] ?? "")).toBe(true);
   });
 
+  it("extracts readable article content while removing heavy and non-article chrome", async () => {
+    using testEnv = createTestWebFetchTool();
+    const articleHtml = `<!DOCTYPE html>
+      <html>
+        <head>
+          <title>Happy DOM Article</title>
+          <style>.secret-style { color: red; }</style>
+          <script>window.secretScript = "hidden";</script>
+        </head>
+        <body>
+          <nav>Navigation chrome that should be removed</nav>
+          <main>
+            <article>
+              <h1>Reliable streaming</h1>
+              <p>Docker users can read <strong>complete responses</strong> again.</p>
+              <p><a href="/details">Read the implementation details</a>.</p>
+            </article>
+          </main>
+          <footer>Footer chrome that should be removed</footer>
+        </body>
+      </html>`;
+    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        stdout:
+          "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
+      })
+    );
+
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/article" },
+      toolCallOptions
+    )) as WebFetchToolResult;
+
+    expect(execSpy).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.title).toBe("Happy DOM Article");
+      expect(result.content).toContain("# Reliable streaming");
+      expect(result.content).toContain("**complete responses**");
+      expect(result.content).toContain("https://93.184.216.34/details");
+      expect(result.content).not.toContain("Navigation chrome");
+      expect(result.content).not.toContain("Footer chrome");
+      expect(result.content).not.toContain("secret-style");
+      expect(result.content).not.toContain("secretScript");
+    }
+  });
+
   it("follows validated public redirects and returns the final content", async () => {
     using testEnv = createTestWebFetchTool();
 
@@ -474,111 +461,50 @@ describe("web_fetch tool", () => {
     }
   });
 
-  it("does not treat non-mux.md URLs with fragments as mux.md shares", async () => {
+  it("reports the HTTP status for non-2xx responses", async () => {
     using testEnv = createTestWebFetchTool();
-
-    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue({
-      stdout:
-        "HTTP/1.1 200 OK\r\n" +
-        "Content-Type: text/html; charset=utf-8\r\n\r\n" +
-        "<!DOCTYPE html><html><head><title>Fragment Page</title></head><body><article><h1>Hello</h1><p>This is a fragment test.</p></article></body></html>",
-      stderr: "",
-      exitCode: 0,
-      duration: 1,
-    });
+    // curl --fail-with-body exits 22 on HTTP errors but still prints the response.
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        exitCode: 22,
+        stdout:
+          "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<html><body></body></html>",
+      })
+    );
 
     const result = (await testEnv.tool.execute!(
-      { url: "https://93.184.216.34/page#section1" },
+      { url: "https://93.184.216.34/missing" },
       toolCallOptions
     )) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.title).toBe("Fragment Page");
-      expect(result.content).toContain("This is a fragment test.");
-    }
+    expect(result).toEqual({ success: false, error: "HTTP 404" });
   });
 
-  itIntegration("should include HTTP status code in error for non-2xx responses", async () => {
+  it.each([
+    {
+      name: "cf-mitigated header",
+      headers: "HTTP/2 403\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><body>Blocked</body></html>",
+    },
+    {
+      name: "interstitial body",
+      headers: "HTTP/2 403\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><title>Just a moment...</title><body>Enable JavaScript and cookies to continue</body></html>",
+    },
+  ])("detects Cloudflare challenge pages from the $name", async ({ headers, body }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://httpbin.dev/status/404",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("HTTP 404");
-    }
-  });
-
-  itIntegration("should detect Cloudflare challenge pages", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://platform.openai.com",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Cloudflare");
-      expect(result.error).toContain("JavaScript");
-    }
-  });
-
-  itIntegration("should handle expired/missing mux.md share links", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://mux.md/nonexistent123#somekey456",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("expired or not found");
-    }
-  });
-
-  it("should return error for mux.md URLs without valid key format", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://mux.md/someid",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Invalid mux.md URL format");
-    }
-  });
-
-  itIntegration("should decrypt and return mux.md content correctly", async () => {
-    using testEnv = createTestWebFetchTool();
-
-    const testContent = "# Test Heading\n\nThis is **test content** for web_fetch decryption.";
-    const uploadResult = await uploadToMuxMd(
-      testContent,
-      { name: "test.md", type: "text/markdown", size: testContent.length },
-      { expiresAt: new Date(Date.now() + 60000) }
+    spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({ exitCode: 22, stdout: headers + body })
     );
 
-    try {
-      const args: WebFetchToolArgs = { url: uploadResult.url };
-      const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.content).toBe(testContent);
-        expect(result.title).toBe("test.md");
-        expect(result.url).toBe(uploadResult.url);
-        expect(result.length).toBe(testContent.length);
-      }
-    } finally {
-      await deleteFromMuxMd(uploadResult.id, uploadResult.mutateKey);
-    }
+    expect(result).toEqual({
+      success: false,
+      error: "HTTP 403: Cloudflare security challenge (page requires JavaScript)",
+    });
   });
 });

@@ -8,13 +8,15 @@ import React, {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useImperativeHandle,
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { Check, ChevronDown, Eye, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, ShieldCheck, Star } from "lucide-react";
 
+import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -26,12 +28,25 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
 import {
+  formatCompactModelStringForDisplay,
+  formatModelStringForDisplay,
   getExplicitGatewayPrefix,
   getModelName,
   getModelProvider,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { Button } from "../Button/Button";
+import { modelMatchesQuery } from "./modelFilter";
+import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
+
+// The dropdown opens upward, so in short windows it can extend past the top of
+// the viewport and under the title/menu bar (a window-drag region in desktop
+// mode that swallows clicks). Clamp its height to the space above the trigger,
+// keeping clear of the bar.
+const PANEL_TOP_CLEARANCE_PX = DESKTOP_TITLEBAR_HEIGHT_PX + 8;
+// Below this the panel is unusable; prefer slight bar overlap in pathological layouts.
+const PANEL_MIN_HEIGHT_PX = 150;
+
 interface ModelSelectorProps {
   value: string;
   onChange: (value: string) => void;
@@ -48,6 +63,14 @@ interface ModelSelectorProps {
   variant?: "default" | "box";
   className?: string;
   tooltipExtraContent?: React.ReactNode;
+  /**
+   * Auto-model-routing experiment: when provided, an "Auto" row is pinned above the
+   * model list. While active the trigger reads "Auto" and no concrete model is marked
+   * selected; picking a concrete model still calls onChange (the owner turns Auto off).
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
+  /** Accessible name for the trigger when no visible label identifies the picker. */
+  triggerAriaLabel?: string;
 }
 
 export interface ModelSelectorRef {
@@ -72,6 +95,8 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       variant = "default",
       className,
       tooltipExtraContent,
+      autoRouting,
+      triggerAriaLabel,
     },
     ref
   ) => {
@@ -97,6 +122,22 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setHighlightedIndex(0);
     }, []);
 
+    // Clamp the panel to the space above the trigger so it stays fully visible.
+    const [panelMaxHeight, setPanelMaxHeight] = useState<number | null>(null);
+    useLayoutEffect(() => {
+      if (!isOpen) return;
+
+      const updatePanelMaxHeight = () => {
+        const triggerTop = containerRef.current?.getBoundingClientRect().top;
+        if (triggerTop === undefined) return;
+        setPanelMaxHeight(Math.max(triggerTop - PANEL_TOP_CLEARANCE_PX, PANEL_MIN_HEIGHT_PX));
+      };
+
+      updatePanelMaxHeight();
+      window.addEventListener("resize", updatePanelMaxHeight);
+      return () => window.removeEventListener("resize", updatePanelMaxHeight);
+    }, [isOpen]);
+
     // Close dropdown on outside click
     useEffect(() => {
       if (!isOpen) return;
@@ -121,14 +162,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setInputValue(""); // Clear input to show all models
       setShowAllModels(false);
 
-      // Start with current value highlighted
+      // Start with current value highlighted (the Auto row while Auto is active, so
+      // Enter keeps the routing choice instead of committing the fallback model).
       const currentIndex = models.indexOf(value);
-      setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      setHighlightedIndex(autoRouting?.active === true ? -1 : currentIndex >= 0 ? currentIndex : 0);
 
       // Focus input after dropdown renders.
       const timer = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(timer);
-    }, [isOpen, models, value]);
+    }, [isOpen, models, value, autoRouting?.active]);
 
     // Build model list: visible models + (if showAllModels) hidden models
     const baseModels = showAllModels ? [...models, ...hiddenModels] : models;
@@ -137,7 +179,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
     const filteredModels =
       inputValue.trim() === ""
         ? baseModels
-        : baseModels.filter((model) => model.toLowerCase().includes(inputValue.toLowerCase()));
+        : baseModels.filter((model) => modelMatchesQuery(model, inputValue.toLowerCase()));
 
     // Track which models are hidden (for rendering)
     const hiddenSet = new Set(hiddenModels);
@@ -153,18 +195,33 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       }
     }
 
+    // The pinned Auto row lives at index -1 so ArrowUp from the first model reaches it.
+    const autoRowIndex = autoRouting ? -1 : 0;
+    const autoRowHighlighted = autoRouting != null && highlightedIndex === -1;
+
     // If the list shrinks (e.g., a model is hidden), keep the highlight in-bounds.
     useEffect(() => {
+      if (highlightedIndex < autoRowIndex) {
+        setHighlightedIndex(autoRowIndex);
+        return;
+      }
       if (filteredModels.length === 0) {
-        setHighlightedIndex(0);
+        if (highlightedIndex > 0) setHighlightedIndex(0);
         return;
       }
       if (highlightedIndex >= filteredModels.length) {
         setHighlightedIndex(filteredModels.length - 1);
       }
-    }, [filteredModels.length, highlightedIndex]);
+    }, [autoRowIndex, filteredModels.length, highlightedIndex]);
+
+    const canSave = autoRowHighlighted || filteredModels.length > 0;
 
     const handleSave = () => {
+      if (autoRowHighlighted) {
+        autoRouting.onSelect();
+        handleCancel();
+        return;
+      }
       // No matches - do nothing, let user keep typing or cancel
       if (filteredModels.length === 0) {
         return;
@@ -189,7 +246,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       if (e.key === "Enter") {
         e.preventDefault();
         // Only call onComplete if save succeeded (had matches)
-        if (filteredModels.length > 0) {
+        if (canSave) {
           handleSave();
           onComplete?.();
         }
@@ -214,7 +271,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setHighlightedIndex((prev) => Math.max(prev - 1, 0));
+        setHighlightedIndex((prev) => Math.max(prev - 1, autoRowIndex));
         return;
       }
     };
@@ -267,18 +324,29 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
     }, [highlightedIndex]);
 
     const isBoxVariant = variant === "box";
-    const containerClassName = cn("relative flex items-center gap-1", isBoxVariant && "w-full");
+    // min-w-0 lets the clamped trigger shrink without pushing sibling controls outside the row.
+    const containerClassName = cn(
+      "relative flex min-w-0 items-center gap-1",
+      isBoxVariant && "w-full"
+    );
     const triggerClassName = isBoxVariant
       ? cn("border-border-medium h-9 flex-1 min-w-0 rounded border", className)
-      : cn("bg-background rounded-sm text-[11px]", className ?? "w-32");
+      : cn("bg-transparent rounded-sm text-[11px]", className ?? "w-32");
 
     const hasValue = value.trim().length > 0;
+    const autoActive = autoRouting?.active === true;
+    // While Auto is active the concrete value is only the fallback, not the selection.
+    const isModelSelected = (model: string) => value === model && !autoActive;
     const explicitGateway = hasValue ? getExplicitGatewayPrefix(value) : undefined;
     const canonicalValue = hasValue ? normalizeToCanonical(value) : "";
-    const selectedProvider = hasValue ? getModelProvider(canonicalValue) : "";
-    const displayValue = hasValue
-      ? formatModelDisplayName(getModelName(canonicalValue))
-      : (emptyLabel ?? "");
+    const selectedProvider = hasValue && !autoActive ? getModelProvider(canonicalValue) : "";
+    const displayValue = autoActive
+      ? "Auto"
+      : hasValue
+        ? formatModelStringForDisplay(canonicalValue)
+        : (emptyLabel ?? "");
+    const compactDisplayValue =
+      hasValue && !autoActive ? formatCompactModelStringForDisplay(canonicalValue) : displayValue;
 
     // Explicit gateway selections short-circuit route resolution: the user
     // intentionally pinned a gateway, so display that gateway directly instead
@@ -299,31 +367,59 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               type="button"
               className={cn(
                 triggerClassName,
-                "text-foreground hover:bg-hover flex cursor-pointer items-center justify-between gap-1 px-1.5 py-0.5 transition-colors duration-300"
+                "text-foreground hover:bg-hover flex cursor-pointer items-center justify-between gap-1 px-1.5 py-0.5 transition-[background-color] duration-150"
               )}
               role="combobox"
               aria-expanded={isOpen}
+              aria-label={triggerAriaLabel}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}
             >
               <span className="flex min-w-0 items-center gap-1.5">
+                {autoActive && <Route aria-hidden="true" className="h-3 w-3 shrink-0 opacity-70" />}
                 {selectedProvider && (
                   <ProviderIcon
                     provider={selectedProvider}
                     className="h-3 w-3 shrink-0 opacity-70"
                   />
                 )}
-                <span className="min-w-0 truncate">{displayValue}</span>
+                {compactDisplayValue === displayValue ? (
+                  <span className="min-w-0 truncate">{displayValue}</span>
+                ) : (
+                  <>
+                    <span
+                      data-model-label="full"
+                      className="min-w-0 truncate [@container(max-width:500px)]:hidden"
+                    >
+                      {displayValue}
+                    </span>
+                    <span
+                      data-model-label="compact"
+                      className="hidden min-w-0 truncate [@container(max-width:500px)]:block"
+                    >
+                      {compactDisplayValue}
+                    </span>
+                  </>
+                )}
               </span>
-              <ChevronDown className="text-muted h-3 w-3 shrink-0" />
+              <ChevronDown
+                className={cn(
+                  "text-muted h-3 w-3 shrink-0 transition-transform duration-150",
+                  isOpen && "rotate-180"
+                )}
+              />
             </Button>
           </TooltipTrigger>
           <TooltipContent
             align={tooltipExtraContent ? "start" : "center"}
             className={cn(tooltipExtraContent && "max-w-80 whitespace-normal")}
           >
-            {explicitGateway ? value.trim() : canonicalValue}
+            {autoActive
+              ? `Auto: routes each prompt by difficulty (falls back to ${canonicalValue})`
+              : explicitGateway
+                ? value.trim()
+                : canonicalValue}
             {routedViaDisplayName ? (
               <>
                 <br />
@@ -342,9 +438,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
         {/* Dropdown content - rendered inline for testability */}
         {isOpen && (
-          <div className="bg-dark border-border absolute bottom-full left-0 z-[1020] mb-1 w-82 overflow-hidden rounded-md border shadow-md">
+          <div
+            style={panelMaxHeight != null ? { maxHeight: panelMaxHeight } : undefined}
+            className={cn(
+              "absolute bottom-full left-0 z-[1020] mb-1 flex w-82 flex-col",
+              COMPOSER_PICKER_PANEL_CLASS
+            )}
+          >
             {/* Search input */}
-            <div className="border-border border-b px-2 py-1">
+            <div className="border-border-light shrink-0 border-b px-2.5 py-1.5">
               <input
                 ref={inputRef}
                 type="text"
@@ -357,8 +459,42 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               {error && <div className="text-danger-soft mt-1 text-[10px]">{error}</div>}
             </div>
 
+            {autoRouting && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={autoActive}
+                data-auto-routing-option
+                data-highlighted={autoRowHighlighted}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setHighlightedIndex(-1)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  autoRouting.onSelect();
+                  handleCancel();
+                }}
+                className={cn(
+                  composerPickerOptionClass(
+                    { isHighlighted: autoRowHighlighted, isSelected: autoActive },
+                    "py-1"
+                  ),
+                  "border-border-light w-full shrink-0 border-b text-left"
+                )}
+              >
+                <Route
+                  aria-hidden="true"
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                />
+                <span className="flex min-w-0 flex-1 items-baseline gap-1">
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent")}>Auto</span>
+                  <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
+                </span>
+              </button>
+            )}
+
             {/* Scrollable list */}
-            <div ref={listRef} className="max-h-[280px] overflow-y-auto p-1">
+            <div ref={listRef} className="max-h-[280px] min-h-0 overflow-y-auto py-1">
               {filteredModels.length === 0 ? (
                 <div className="text-muted py-2 text-center text-[10px]">No matching models</div>
               ) : (
@@ -373,27 +509,32 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       key={model}
                       data-highlighted={index === highlightedIndex}
                       onMouseEnter={() => setHighlightedIndex(index)}
-                      className={cn(
-                        "flex w-full items-center gap-1.5 rounded-sm px-2 py-0.5 text-xs cursor-pointer",
-                        index === highlightedIndex ? "bg-hover" : "hover:bg-hover",
+                      className={composerPickerOptionClass(
+                        {
+                          isHighlighted: index === highlightedIndex,
+                          isSelected: isModelSelected(model),
+                        },
+                        "py-1",
                         hiddenSet.has(model) && "opacity-50"
                       )}
                       onClick={() => handleSelectModel(model)}
                       role="option"
-                      aria-selected={value === model}
+                      aria-selected={isModelSelected(model)}
                     >
-                      <Check
-                        className={cn(
-                          "h-3 w-3 shrink-0",
-                          value === model ? "opacity-100" : "opacity-0"
-                        )}
-                      />
                       <ProviderIcon
                         provider={modelProvider}
-                        className="text-muted h-3 w-3 shrink-0"
+                        className={cn(
+                          "h-3 w-3 shrink-0",
+                          isModelSelected(model) ? "text-accent" : "text-muted"
+                        )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                        <span className="min-w-0 truncate">
+                        <span
+                          className={cn(
+                            "min-w-0 truncate",
+                            isModelSelected(model) && "text-accent"
+                          )}
+                        >
                           {formatModelDisplayName(modelName)}
                         </span>
                         {showProviderLabel && (
@@ -501,7 +642,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
             {/* Footer actions (last row in dropdown) */}
             {(hiddenModels.length > 0 || onOpenSettings) && (
-              <div className="border-border flex flex-col gap-1 border-t px-2 py-1">
+              <div className="border-border-light flex shrink-0 flex-col gap-1 border-t py-1">
                 {hiddenModels.length > 0 && (
                   <button
                     type="button"
@@ -513,14 +654,14 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       setInputValue("");
                       setHighlightedIndex(0);
                     }}
-                    className="text-muted hover:text-foreground text-[10px] transition-colors"
+                    className="text-muted hover:text-foreground px-2.5 text-left text-[10px] transition-colors"
                   >
                     {showAllModels ? "Show fewer models" : "Show all models…"}
                   </button>
                 )}
 
                 {policyEnforced && (
-                  <div className="text-muted flex items-center gap-1 text-[10px]">
+                  <div className="text-muted flex items-center gap-1 px-2.5 text-[10px]">
                     <ShieldCheck className="h-3 w-3" aria-hidden />
                     <span>Your settings are controlled by a policy.</span>
                   </div>
@@ -536,7 +677,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       onOpenSettings();
                       handleCancel();
                     }}
-                    className="text-muted hover:bg-hover hover:text-foreground flex w-full items-center justify-start gap-1.5 rounded-sm px-2 py-1 text-[11px] transition-colors"
+                    className="text-muted hover:bg-hover hover:text-foreground flex w-full items-center justify-start gap-2.5 px-2.5 py-1 text-[11px] font-medium transition-colors"
                   >
                     <Settings className="h-3 w-3 shrink-0" />
                     Model settings

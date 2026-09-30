@@ -30,7 +30,8 @@ coverage/
 # Documentation build
 docs/book/
 
-# Mobile app (not needed for server)
+# Removed mobile/ Expo prototype: upgraded checkouts may keep untracked
+# leftovers (node_modules, .expo, ios, android); keep them out of the context.
 mobile/
 
 # Electron-specific (not needed for server)

@@ -20,22 +20,63 @@ describe("ACP slash command support", () => {
     },
     {
       name: "deep-review",
-      description: "Hidden skill",
+      description: "Unadvertised skill stays user-invocable",
       scope: "built-in",
       advertise: false,
     },
+    {
+      name: "model-only",
+      description: "Hidden from user-facing surfaces",
+      scope: "global",
+      userInvocable: false,
+    },
+    {
+      name: "triage",
+      description: "Skill with an argument hint",
+      scope: "project",
+      argumentHint: "[issue-number]",
+    },
   ];
 
-  it("builds ACP available command list with server commands and advertised skills", () => {
+  it("builds ACP available command list with server commands and user-invocable skills", () => {
     const availableCommands = buildAcpAvailableCommands(skills);
     const commandNames = availableCommands.map((command) => command.name);
 
-    expect(commandNames).toEqual(["clear", "compact", "fork", "new", "react-effects"]);
+    // `advertise` gates the MODEL-facing index only: unadvertised skills like
+    // deep-review remain user-invocable commands. Only user-invocable: false hides
+    // a skill from the user's command list.
+    expect(commandNames).toEqual([
+      "clear",
+      "compact",
+      "fork",
+      "new",
+      "send-held",
+      "discard-held",
+      "react-effects",
+      "deep-review",
+      "triage",
+    ]);
 
     const skillCommand = availableCommands.find((command) => command.name === "react-effects");
     expect(skillCommand).toBeDefined();
     expect(skillCommand?.description).toContain("Guidance on avoiding unnecessary useEffect");
     expect(skillCommand?.input?.hint).toContain("Describe how to apply this skill");
+  });
+
+  it("uses argument-hint as the command input hint when present", () => {
+    const availableCommands = buildAcpAvailableCommands(skills);
+
+    const withHint = availableCommands.find((command) => command.name === "triage");
+    expect(withHint?.input?.hint).toBe("[issue-number]");
+
+    // Fallback hint remains for skills without argument-hint.
+    const withoutHint = availableCommands.find((command) => command.name === "deep-review");
+    expect(withoutHint?.input?.hint).toBe("Describe how to apply this skill");
+  });
+
+  it("does not resolve user-invocable: false skills as slash commands", () => {
+    const parsed = parseAcpSlashCommand("/model-only do something", mapSkillsByName(skills));
+    expect(parsed).toBeNull();
   });
 
   it("rejects malformed /compact -t values", () => {
@@ -50,7 +91,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command to parse");
     }
 
@@ -66,7 +107,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command with explicit gateway prefix to parse");
     }
 
@@ -80,7 +121,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command with mux-gateway prefix to parse");
     }
 
@@ -103,7 +144,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected one-line /compact command to parse");
     }
 
@@ -118,7 +159,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected numeric one-line /compact command to parse");
     }
 
@@ -156,20 +197,37 @@ describe("ACP slash command support", () => {
 
     const parsed = parseAcpSlashCommand("/react-effects reduce useEffect churn", skillsByName);
     expect(parsed?.kind).toBe("skill");
-    if (parsed == null || parsed.kind !== "skill") {
+    if (parsed?.kind !== "skill") {
       throw new Error("Expected skill command to parse");
     }
 
     expect(parsed.descriptor.name).toBe("react-effects");
     expect(parsed.formattedMessage).toBe("Using skill react-effects: reduce useEffect churn");
+    expect(parsed.argumentText).toBe("reduce useEffect churn");
 
     const noArgs = parseAcpSlashCommand("/react-effects", skillsByName);
     expect(noArgs?.kind).toBe("skill");
-    if (noArgs == null || noArgs.kind !== "skill") {
+    if (noArgs?.kind !== "skill") {
       throw new Error("Expected skill command without args to parse");
     }
 
     expect(noArgs.formattedMessage).toBe("Use skill react-effects");
+    expect(noArgs.argumentText).toBe("");
+  });
+
+  it("parses /send-held and /discard-held with an optional positive number", () => {
+    const parse = (input: string) => parseAcpSlashCommand(input, mapSkillsByName(skills));
+    expect(parse("/discard-held")).toEqual({ kind: "discard-held" });
+    expect(parse("/send-held 3")).toEqual({ kind: "send-held", number: 3 });
+    expect(parse("/discard-held 2")).toEqual({ kind: "discard-held", number: 2 });
+    for (const input of [
+      "/discard-held 0",
+      "/send-held one",
+      "/discard-held 1 2",
+      "/send-held -1",
+    ]) {
+      expect(parse(input)?.kind).toBe("invalid");
+    }
   });
 
   it("leaves unknown slash commands untouched for normal prompt handling", () => {

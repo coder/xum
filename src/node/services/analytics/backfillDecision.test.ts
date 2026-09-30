@@ -8,6 +8,9 @@ function makeInput(overrides: Partial<SyncPlanInput> = {}): SyncPlanInput {
     knownWorkspaceIds: new Set(),
     watermarkWorkspaceIds: new Set(),
     hasAnyWatermarkAtOrAboveZero: false,
+    pricingFingerprintChanged: false,
+    semanticsVersionChanged: false,
+    changedSignalWorkspaceIds: new Set(),
     ...overrides,
   };
 }
@@ -88,6 +91,46 @@ describe("decideSyncPlan", () => {
       ).toEqual({
         action: "incremental",
         workspaceIdsToIngest: ["w2"],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("returns incremental for watermarked workspaces with drifted change signals", () => {
+      // Crash-stranded writes: chat or headless-usage sidecar appended after
+      // the last ingest but before app exit. The ID diff alone would noop.
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 4,
+            watermarkCount: 2,
+            knownWorkspaceIds: new Set(["w1", "w2"]),
+            watermarkWorkspaceIds: new Set(["w1", "w2"]),
+            hasAnyWatermarkAtOrAboveZero: true,
+            changedSignalWorkspaceIds: new Set(["w2"]),
+          })
+        )
+      ).toEqual({
+        action: "incremental",
+        workspaceIdsToIngest: ["w2"],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("combines missing-watermark and changed-signal workspaces in one plan", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 4,
+            watermarkCount: 1,
+            knownWorkspaceIds: new Set(["w1", "w2"]),
+            watermarkWorkspaceIds: new Set(["w1"]),
+            hasAnyWatermarkAtOrAboveZero: true,
+            changedSignalWorkspaceIds: new Set(["w1"]),
+          })
+        )
+      ).toEqual({
+        action: "incremental",
+        workspaceIdsToIngest: ["w2", "w1"],
         workspaceIdsToPurge: [],
       });
     });
@@ -189,6 +232,80 @@ describe("decideSyncPlan", () => {
         )
       ).toEqual({
         action: "full_rebuild",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("returns full_rebuild to reprice existing events when pricing tables changed", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 10,
+            watermarkCount: 2,
+            knownWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            watermarkWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            hasAnyWatermarkAtOrAboveZero: true,
+            pricingFingerprintChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "full_rebuild",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("does not rebuild for a pricing change when no events exist", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 0,
+            watermarkCount: 1,
+            knownWorkspaceIds: new Set(["ws-1"]),
+            watermarkWorkspaceIds: new Set(["ws-1"]),
+            pricingFingerprintChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "noop",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("returns full_rebuild to backfill existing events when ETL semantics changed", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 10,
+            watermarkCount: 2,
+            knownWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            watermarkWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            hasAnyWatermarkAtOrAboveZero: true,
+            semanticsVersionChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "full_rebuild",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("does not rebuild for a semantics change when no events exist", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 0,
+            watermarkCount: 1,
+            knownWorkspaceIds: new Set(["ws-1"]),
+            watermarkWorkspaceIds: new Set(["ws-1"]),
+            semanticsVersionChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "noop",
         workspaceIdsToIngest: [],
         workspaceIdsToPurge: [],
       });

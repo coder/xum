@@ -8,6 +8,8 @@ import type { AgentSkillDescriptor, AgentSkillFrontmatter } from "@/common/types
 import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
+  MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -17,21 +19,35 @@ import type {
   BashToolResultSchema,
   FileEditInsertToolResultSchema,
   FileEditReplaceStringToolResultSchema,
-  MuxConfigReadToolResultSchema,
-  MuxConfigWriteToolResultSchema,
-  MuxAgentsReadToolResultSchema,
-  MuxAgentsWriteToolResultSchema,
+  XumConfigReadToolResultSchema,
+  XumConfigWriteToolResultSchema,
+  XumAgentsReadToolResultSchema,
+  XumAgentsWriteToolResultSchema,
   FileReadToolResultSchema,
+  HeartbeatToolResultSchema,
+  MemoryToolResultSchema,
+  IntuitionToolResultSchema,
+  IntuitionMemorySchema,
+  IntuitionCandidateSchema,
+  IntuitionStatsSchema,
   AttachFileToolResultSchema,
-  ImageGenerateToolResultSchema,
-  ImageEditToolResultSchema,
   TaskToolResultSchema,
+  TaskSendMessageToolResultSchema,
+  TaskRetitleToolResultSchema,
   TaskAwaitToolResultSchema,
   TaskApplyGitPatchToolResultSchema,
   TaskListToolResultSchema,
+  TaskStopToolResultSchema,
+  TaskRemoveToolResultSchema,
+  TaskTerminateToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
   TaskTerminateToolResultSchema,
+  TaskWorkspaceLifecycleToolResultSchema,
+  TimelineEventToolResultSchema,
   TOOL_DEFINITIONS,
   WebFetchToolResultSchema,
+  WorkflowRunToolResultSchema,
+  WorkflowResumeToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
 
 // Bash Tool Types, derived from schema (avoid drift)
@@ -39,14 +55,6 @@ export type BashToolArgs = z.infer<typeof TOOL_DEFINITIONS.bash.schema>;
 
 // BashToolResult derived from Zod schema (single source of truth)
 export type BashToolResult = z.infer<typeof BashToolResultSchema>;
-
-// Image generation tool types, derived from schema (avoid drift)
-export type ImageGenerateToolArgs = z.infer<typeof TOOL_DEFINITIONS.image_generate.schema>;
-export type ImageGenerateToolResult = z.infer<typeof ImageGenerateToolResultSchema>;
-
-// Image edit tool types, derived from schema (avoid drift)
-export type ImageEditToolArgs = z.infer<typeof TOOL_DEFINITIONS.image_edit.schema>;
-export type ImageEditToolResult = z.infer<typeof ImageEditToolResultSchema>;
 
 // File Read Tool Types, derived from schema (avoid drift)
 export type FileReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.file_read.schema>;
@@ -60,11 +68,18 @@ export type AgentSkillReadFileToolArgs = z.infer<
   typeof TOOL_DEFINITIONS.agent_skill_read_file.schema
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
+export type MCPPromptGetToolResult = z.infer<typeof MCPPromptGetToolResultSchema>;
 
-// agent_skill_list result
+// agent_skill_list args + result
+export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill_list.schema>;
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
+
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
 
 // agent_skill_write result
 export type AgentSkillWriteToolResult =
@@ -74,6 +89,23 @@ export type AgentSkillWriteToolResult =
 // agent_skill_delete result
 export type AgentSkillDeleteToolResult =
   | { success: true; deleted: "file" | "skill" }
+  | { success: false; error: string };
+
+// refinement_rollback result (RLM mode only)
+export type RefinementRollbackToolResult =
+  | {
+      success: true;
+      /** Refinement row id that was rolled back. */
+      rollbackOf: string;
+      /** Envelope id of the journaled rollback row; null if journaling failed. */
+      rollbackRowId: string | null;
+      /** Files restored to their recorded prior contents. */
+      restored: string[];
+      /** Files deleted (the target row had created them). */
+      deleted: string[];
+      /** Rename that was undone. */
+      renamed?: { from: string; to: string };
+    }
   | { success: false; error: string };
 
 // skills_catalog_search result
@@ -137,23 +169,48 @@ export interface ToolOutputUiOnlyFields {
 // FileReadToolResult derived from Zod schema (single source of truth)
 export type FileReadToolResult = z.infer<typeof FileReadToolResultSchema>;
 
+// Heartbeat tool types, derived from schema (avoid drift)
+export type HeartbeatToolArgs = z.infer<typeof TOOL_DEFINITIONS.heartbeat.schema>;
+export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
+
+// Timeline-event tool types, derived from schema (avoid drift)
+export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
+export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
+
+// Session-history tool types, derived from schema (avoid drift)
+export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
+export type SessionHistoryToolResult = z.infer<
+  typeof TOOL_DEFINITIONS.session_history.resultSchema
+>;
+
+// Memory tool types, derived from schema (avoid drift)
+export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
+export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
+
+export type IntuitionToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition.schema>;
+export type IntuitionToolResult = z.infer<typeof IntuitionToolResultSchema>;
+export type IntuitionMemory = z.infer<typeof IntuitionMemorySchema>;
+export type IntuitionCandidate = z.infer<typeof IntuitionCandidateSchema>;
+export type IntuitionStats = z.infer<typeof IntuitionStatsSchema>;
+export type IntuitionReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition_report.schema>;
+
 // AttachFileToolResult derived from Zod schema (single source of truth)
 export type AttachFileToolResult = z.infer<typeof AttachFileToolResultSchema>;
 
-// mux_config_read tool types
-export type MuxConfigReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_read.schema>;
-export type MuxConfigReadToolResult = z.infer<typeof MuxConfigReadToolResultSchema>;
+// xum_config_read tool types
+export type XumConfigReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_read.schema>;
+export type XumConfigReadToolResult = z.infer<typeof XumConfigReadToolResultSchema>;
 
-// mux_config_write tool types
-export type MuxConfigWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_write.schema>;
-export type MuxConfigWriteToolResult = z.infer<typeof MuxConfigWriteToolResultSchema>;
+// xum_config_write tool types
+export type XumConfigWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_write.schema>;
+export type XumConfigWriteToolResult = z.infer<typeof XumConfigWriteToolResultSchema>;
 
-// mux_agents_read tool types
-export type MuxAgentsReadToolResult = z.infer<typeof MuxAgentsReadToolResultSchema>;
+// xum_agents_read tool types
+export type XumAgentsReadToolResult = z.infer<typeof XumAgentsReadToolResultSchema>;
 
-// mux_agents_write tool types
-export type MuxAgentsWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_agents_write.schema>;
-export type MuxAgentsWriteToolResult = z.infer<typeof MuxAgentsWriteToolResultSchema>;
+// xum_agents_write tool types
+export type XumAgentsWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_agents_write.schema>;
+export type XumAgentsWriteToolResult = z.infer<typeof XumAgentsWriteToolResultSchema>;
 
 export interface FileEditDiffSuccessBase extends ToolOutputUiOnlyFields {
   success: true;
@@ -204,6 +261,13 @@ export const FILE_EDIT_TOOL_NAMES = [
 ] as const;
 
 /**
+ * Read-flavored tools whose successful results mark a workspace file as
+ * "already seen" for RLM post-compaction read tracking (paths only, never
+ * contents).
+ */
+export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
+
+/**
  * Prefix for edit failure notes (agent-only messages).
  * This prefix signals to the agent that the file was not modified.
  */
@@ -215,7 +279,6 @@ export const EDIT_FAILED_NOTE_PREFIX = "EDIT FAILED - file was NOT modified.";
 export const NOTE_READ_FILE_RETRY = "Read the file to get current content, then retry.";
 export const NOTE_READ_FILE_FIRST_RETRY =
   "Read the file first to get the exact current content, then retry.";
-export const NOTE_READ_FILE_AGAIN_RETRY = "Read the file again and retry.";
 
 /**
  * Tool description warning for file edit tools
@@ -264,10 +327,57 @@ export type TaskListToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_list.schema>
 
 export type TaskListToolSuccessResult = z.infer<typeof TaskListToolResultSchema>;
 
+// Task Send Message Tool Types
+export type TaskSendMessageToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_send_message.schema>;
+
+export type TaskSendMessageToolSuccessResult = z.infer<typeof TaskSendMessageToolResultSchema>;
+
+// Task Retitle Tool Types
+export type TaskRetitleToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_retitle.schema>;
+export type TaskRetitleToolSuccessResult = z.infer<typeof TaskRetitleToolResultSchema>;
+
+// Task Stop Tool Types
+export type TaskStopToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_stop.schema>;
+export type TaskStopToolSuccessResult = z.infer<typeof TaskStopToolResultSchema>;
+
+// Task Remove Tool Types
+export type TaskRemoveToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_remove.schema>;
+export type TaskRemoveToolSuccessResult = z.infer<typeof TaskRemoveToolResultSchema>;
+
 // Task Terminate Tool Types
-export type TaskTerminateToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_terminate.schema>;
+export type TaskTerminateToolArgs = z.infer<typeof TaskTerminateToolArgsSchema>;
 
 export type TaskTerminateToolSuccessResult = z.infer<typeof TaskTerminateToolResultSchema>;
+
+// Task Workspace Lifecycle Tool Types (parent-owned archive/delete_worktree/remove)
+export type TaskWorkspaceLifecycleToolArgs = z.infer<typeof TaskWorkspaceLifecycleToolArgsSchema>;
+
+// Success shape is `{ results: [...] }` (no top-level `success`); a thrown execute()
+// surfaces as ToolErrorResult, so the renderable result is the union of both.
+export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
+  typeof TaskWorkspaceLifecycleToolResultSchema
+>;
+
+// One per-target outcome row, discriminated on `status` (12 lifecycle states).
+export type TaskWorkspaceLifecycleTargetResult =
+  TaskWorkspaceLifecycleToolSuccessResult["results"][number];
+
+export type TaskWorkspaceLifecycleStatus = TaskWorkspaceLifecycleTargetResult["status"];
+
+// Workflow Definition Tool Types
+// Workflow Run Tool Types
+export type WorkflowRunToolArgs = z.infer<typeof TOOL_DEFINITIONS.workflow_run.schema>;
+
+export type WorkflowRunToolSuccessResult = z.infer<typeof WorkflowRunToolResultSchema>;
+
+export type WorkflowRunToolResult = WorkflowRunToolSuccessResult | ToolErrorResult;
+
+// Workflow Resume Tool Types
+export type WorkflowResumeToolArgs = z.infer<typeof TOOL_DEFINITIONS.workflow_resume.schema>;
+
+export type WorkflowResumeToolSuccessResult = z.infer<typeof WorkflowResumeToolResultSchema>;
+
+export type WorkflowResumeToolResult = WorkflowResumeToolSuccessResult | ToolErrorResult;
 
 // Agent Report Tool Types
 export type AgentReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_report.schema>;
@@ -390,6 +500,17 @@ export type WebFetchToolArgs = z.infer<typeof TOOL_DEFINITIONS.web_fetch.schema>
 
 // WebFetchToolResult derived from Zod schema (single source of truth)
 export type WebFetchToolResult = z.infer<typeof WebFetchToolResultSchema>;
+
+// Tool Search Tool Types (tool-search experiment), derived from schema (avoid drift)
+export type ToolSearchToolArgs = z.infer<typeof TOOL_DEFINITIONS.tool_catalog_search.schema>;
+
+export interface ToolSearchToolResult {
+  query: string;
+  /** serverName is a bounded display label, not the raw server-config key. */
+  matches: Array<{ name: string; description: string; serverName?: string }>;
+  /** Total deferred-catalog size, so the model/UI can see there are more undiscovered tools. */
+  totalDeferred: number;
+}
 
 // Notify Tool Types
 export type NotifyToolResult =

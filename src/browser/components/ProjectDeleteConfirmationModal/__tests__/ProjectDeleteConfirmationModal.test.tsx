@@ -5,6 +5,10 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps, KeyboardEvent, ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: {

@@ -2,7 +2,14 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { INSTRUCTION_SCOPE } from "@/common/types/instructions";
-import { readInstructionSet, gatherInstructionSets } from "./instructionFiles";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import {
+  readClaudeCompatGlobalInstructionSet,
+  readInstructionSet,
+  readInstructionSetFromRuntime,
+} from "./instructionFiles";
 
 describe("instructionFiles", () => {
   let tempDir: string;
@@ -115,85 +122,194 @@ describe("instructionFiles", () => {
       expect(result?.projectName).toBe("my-project");
       expect(result?.files[0]?.projectName).toBe("my-project");
     });
+
+    it("should mark shared base files as not xumOnly", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "base instructions");
+      await fs.writeFile(path.join(tempDir, "AGENTS.local.md"), "local overrides");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.files.map((f) => f.xumOnly)).toEqual([false, false]);
+    });
+
+    it("should read .mux/AGENTS.md as a xumOnly file even without a shared base file", async () => {
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "mux-only directives");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.combinedContent).toBe("mux-only directives");
+      expect(result?.files).toHaveLength(1);
+      expect(result?.files[0]?.filename).toBe("AGENTS.md");
+      expect(result?.files[0]?.path).toBe(path.join(tempDir, ".mux", "AGENTS.md"));
+      expect(result?.files[0]?.xumOnly).toBe(true);
+    });
+
+    it("prefers .xum/AGENTS.md without combining the legacy tree", async () => {
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "legacy directives");
+      await fs.mkdir(path.join(tempDir, ".xum"));
+      await fs.writeFile(path.join(tempDir, ".xum", "AGENTS.md"), "canonical directives");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.combinedContent).toBe("canonical directives");
+      expect(result?.files[0]?.path).toBe(path.join(tempDir, ".xum", "AGENTS.md"));
+    });
+
+    it("should append .mux/AGENTS.md (+ .local.md) after the shared files", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "shared base");
+      await fs.writeFile(path.join(tempDir, "AGENTS.local.md"), "shared local");
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "mux base");
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.local.md"), "mux local");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.combinedContent).toBe("shared base\n\nshared local\n\nmux base\n\nmux local");
+      expect(result?.files.map((f) => f.xumOnly)).toEqual([false, false, true, true]);
+      expect(result?.files.map((f) => f.isLocal)).toEqual([false, true, false, true]);
+    });
+
+    it("should ignore .mux/AGENTS.local.md when .mux/AGENTS.md is missing", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "shared base");
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.local.md"), "mux local only");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.combinedContent).toBe("shared base");
+    });
+
+    it("should mark global files as xumOnly and skip nested .mux lookup", async () => {
+      // Global scope reads ~/.mux itself, which is Xum-dedicated by construction.
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "global instructions");
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "should not be read");
+
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.GLOBAL);
+      expect(result?.combinedContent).toBe("global instructions");
+      expect(result?.files).toHaveLength(1);
+      expect(result?.files[0]?.xumOnly).toBe(true);
+    });
   });
 
-  describe("gatherInstructionSets", () => {
-    it("should return empty array when no instructions exist", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result).toEqual([]);
+  describe("readClaudeCompatGlobalInstructionSet", () => {
+    it("returns null when CLAUDE.md is missing", async () => {
+      expect(await readClaudeCompatGlobalInstructionSet(tempDir)).toBeNull();
     });
 
-    it("should gather instructions from multiple directories", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
+    it("reads only CLAUDE.md as a shared global instruction file", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "native candidate");
+      await fs.writeFile(path.join(tempDir, "AGENT.md"), "secondary candidate");
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
 
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "global instructions");
-      await fs.writeFile(path.join(dir2, "AGENTS.md"), "workspace instructions");
+      const result = await readClaudeCompatGlobalInstructionSet(tempDir);
 
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result).toHaveLength(2);
-      expect(result[0]?.combinedContent).toBe("global instructions");
-      expect(result[0]?.scope).toBe(INSTRUCTION_SCOPE.GLOBAL);
-      expect(result[1]?.combinedContent).toBe("workspace instructions");
-      expect(result[1]?.scope).toBe(INSTRUCTION_SCOPE.WORKSPACE);
+      expect(result?.combinedContent).toBe("claude instructions");
+      expect(result?.scope).toBe(INSTRUCTION_SCOPE.GLOBAL);
+      expect(result?.files).toHaveLength(1);
+      expect(result?.files[0]).toMatchObject({
+        filename: "CLAUDE.md",
+        isLocal: false,
+        xumOnly: false,
+        scope: INSTRUCTION_SCOPE.GLOBAL,
+      });
     });
 
-    it("should include local files in gathered instructions", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
+    it("does not append local or nested Xum instruction files", async () => {
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      await fs.writeFile(path.join(tempDir, "AGENTS.local.md"), "local instructions");
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "nested instructions");
 
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "global base");
-      await fs.writeFile(path.join(dir1, "AGENTS.local.md"), "global local");
-      await fs.writeFile(path.join(dir2, "AGENTS.md"), "workspace base");
-      await fs.writeFile(path.join(dir2, "AGENTS.local.md"), "workspace local");
+      const result = await readClaudeCompatGlobalInstructionSet(tempDir);
 
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result.map((s) => s.combinedContent)).toEqual([
-        "global base\n\nglobal local",
-        "workspace base\n\nworkspace local",
-      ]);
-      expect(result[0]?.files).toHaveLength(2);
-      expect(result[1]?.files).toHaveLength(2);
+      expect(result?.files.map((file) => file.content)).toEqual(["claude instructions"]);
+    });
+  });
+
+  // #4438: on SSH runtimes a read that failed in transport says nothing about the file.
+  // It must fail loudly instead of letting a lower-priority file (CLAUDE.md, the legacy
+  // .mux tree) or a missing .local.md silently change the instructions.
+  describe("readInstructionSetFromRuntime transport failures", () => {
+    function failInTransport(runtime: LocalRuntime, failingPath: string) {
+      const readFile = runtime.readFile.bind(runtime);
+      spyOn(runtime, "readFile").mockImplementation((filePath, ...rest) => {
+        if (filePath !== failingPath) return readFile(filePath, ...rest);
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(
+              new RuntimeError(`Failed to read file ${filePath}: Connection refused`, "network")
+            );
+          },
+        });
+      });
+    }
+
+    it.each([
+      // An unreadable AGENTS.md must not let CLAUDE.md win.
+      ["AGENTS.md", ["AGENTS.md", "CLAUDE.md"]],
+      // An unreadable companion must not silently drop local instructions.
+      ["AGENTS.local.md", ["AGENTS.md", "AGENTS.local.md"]],
+      // An unreadable .xum/AGENTS.md must not fall back to the legacy .mux tree.
+      [".xum/AGENTS.md", [".xum/AGENTS.md", ".mux/AGENTS.md"]],
+    ])("rejects when %s fails in transport", async (failing, files) => {
+      for (const file of files) {
+        await fs.mkdir(path.dirname(path.join(tempDir, file)), { recursive: true });
+        await fs.writeFile(path.join(tempDir, file), `${file} instructions`);
+      }
+      const runtime = new LocalRuntime(tempDir);
+      failInTransport(runtime, path.join(tempDir, failing));
+
+      const error: unknown = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      ).then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toMatchObject({ type: "network" });
     });
 
-    it("should skip directories without instruction files", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      const dir3 = path.join(tempDir, "dir3");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-      await fs.mkdir(dir3);
+    // #4827: a remote permission error is not a missing file either.
+    it("rejects when AGENTS.md is unreadable instead of using CLAUDE.md", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "agents instructions");
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      const runtime = new LocalRuntime(tempDir);
+      const agentsPath = path.join(tempDir, "AGENTS.md");
+      const readFile = runtime.readFile.bind(runtime);
+      spyOn(runtime, "readFile").mockImplementation((filePath, ...rest) => {
+        if (filePath !== agentsPath) return readFile(filePath, ...rest);
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(
+              new RuntimeError(
+                `Failed to read file ${filePath}: cat: ${filePath}: Permission denied`,
+                "file_io"
+              )
+            );
+          },
+        });
+      });
 
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "dir1 content");
-      await fs.writeFile(path.join(dir3, "AGENTS.md"), "dir3 content");
-      // dir2 has no instruction files
+      const error: unknown = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      ).then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toMatchObject({ type: "file_io" });
+    });
 
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-        { directory: dir3, scope: INSTRUCTION_SCOPE.PROJECT, projectName: "p3" },
-      ]);
-      expect(result.map((s) => s.combinedContent)).toEqual(["dir1 content", "dir3 content"]);
-      expect(result[1]?.scope).toBe(INSTRUCTION_SCOPE.PROJECT);
-      expect(result[1]?.projectName).toBe("p3");
+    it("still falls back to CLAUDE.md when AGENTS.md is missing", async () => {
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      const runtime = new LocalRuntime(tempDir);
+
+      const result = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      );
+      expect(result?.files.map((file) => file.filename)).toEqual(["CLAUDE.md"]);
     });
   });
 });

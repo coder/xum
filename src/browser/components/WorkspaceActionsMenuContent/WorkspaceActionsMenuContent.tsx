@@ -1,6 +1,17 @@
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
-import { GitBranch, HeartPulse, Link2, Maximize2, Pencil, Server, Square } from "lucide-react";
+import {
+  GitBranch,
+  HeartPulse,
+  History,
+  Maximize2,
+  MessagesSquare,
+  Pencil,
+  Pin,
+  PinOff,
+  Server,
+  Square,
+} from "lucide-react";
 import React from "react";
 
 interface WorkspaceActionButtonProps {
@@ -16,15 +27,19 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      className="text-content-secondary bg-surface-primary hover:bg-hover w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
+      className="text-content-secondary bg-surface-primary hover:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
       onClick={props.onClick}
       data-testid={props.testId}
     >
       <span className="flex items-center gap-2">
         <span className="h-3 w-3 shrink-0 [&_svg]:h-3 [&_svg]:w-3">{props.icon}</span>
-        {props.label}
+        {/* Label truncates and the shortcut never shrinks, so a narrow menu cannot
+            push the shortcut outside the row. */}
+        <span className="min-w-0 truncate">{props.label}</span>
         {props.shortcut && (
-          <span className={`text-muted ml-auto text-[10px] ${props.shortcutClassName ?? ""}`}>
+          <span
+            className={`text-muted ml-auto shrink-0 pl-2 text-[10px] ${props.shortcutClassName ?? ""}`}
+          >
             ({props.shortcut})
           </span>
         )}
@@ -40,15 +55,20 @@ interface WorkspaceActionsMenuContentProps {
   onConfigureMcp?: (() => void) | null;
   /** Experiment-gated workspace heartbeat settings action. */
   onConfigureHeartbeat?: (() => void) | null;
+  /** Recipient consent for discovery/messages from unrelated workspaces (menu bar only). */
+  onConfigureUnrelatedMessaging?: (() => void) | null;
   /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
   onOpenTouchFullscreenReview?: (() => void) | null;
   onEnterImmersiveReview?: (() => void) | null;
+  /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
+  onOpenTimeline?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
   onForkChat?: ((anchorEl: HTMLElement) => void) | null;
-  onShareTranscript?: (() => void) | null;
+  /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
+  onTogglePinned?: (() => void) | null;
+  isPinned?: boolean;
   onArchiveChat?: ((anchorEl: HTMLElement) => void) | null;
   onCloseMenu: () => void;
-  linkSharingEnabled: boolean;
   shortcutClassName?: string;
   configureMcpTestId?: string;
 }
@@ -100,6 +120,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
+      {props.onConfigureUnrelatedMessaging && (
+        <WorkspaceActionButton
+          label="Messages from other workspaces"
+          shortcut={formatKeybind(KEYBINDS.CONFIGURE_UNRELATED_MESSAGING)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<MessagesSquare className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onConfigureUnrelatedMessaging?.();
+          }}
+          testId="workspace-unrelated-messaging-button"
+        />
+      )}
       {props.onOpenTouchFullscreenReview && (
         <WorkspaceActionButton
           label="Mobile full-screen review"
@@ -124,6 +158,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
+      {props.onOpenTimeline && (
+        <WorkspaceActionButton
+          label="Timeline"
+          shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<History className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenTimeline?.();
+          }}
+          testId="workspace-timeline-button"
+        />
+      )}
       {props.onStopRuntime && (
         <WorkspaceActionButton
           label="Stop container"
@@ -146,16 +194,22 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-      {props.onShareTranscript && props.linkSharingEnabled === true && (
+      {props.onTogglePinned && (
         <WorkspaceActionButton
-          label="Share transcript"
-          shortcut={formatKeybind(KEYBINDS.SHARE_TRANSCRIPT)}
+          label={props.isPinned ? "Unpin chat" : "Pin chat"}
+          shortcut={formatKeybind(KEYBINDS.PIN_WORKSPACE)}
           shortcutClassName={props.shortcutClassName}
-          icon={<Link2 className="h-3 w-3 shrink-0" />}
+          icon={
+            props.isPinned ? (
+              <PinOff className="h-3 w-3 shrink-0" />
+            ) : (
+              <Pin className="h-3 w-3 shrink-0" />
+            )
+          }
           onClick={(e) => {
             e.stopPropagation();
             props.onCloseMenu();
-            props.onShareTranscript?.();
+            props.onTogglePinned?.();
           }}
         />
       )}

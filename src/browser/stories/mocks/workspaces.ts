@@ -20,9 +20,15 @@ export interface WorkspaceFixture {
   projectName: string;
   runtimeConfig?: RuntimeConfig;
   createdAt?: string;
+  parentWorkspaceId?: string;
+  taskStatus?: FrontendWorkspaceMetadata["taskStatus"];
   bestOf?: FrontendWorkspaceMetadata["bestOf"];
+  workflowTask?: FrontendWorkspaceMetadata["workflowTask"];
   title?: string;
   transcriptOnly?: boolean;
+  pinnedAt?: string;
+  /** Recipient consent generation; present means cross-tree discovery/messaging is on. */
+  unrelatedWorkspaceConsent?: string;
 }
 
 /** Create a workspace with sensible defaults */
@@ -41,8 +47,13 @@ export function createWorkspace(
     // Default to current time so workspaces aren't filtered as "old" by age-based UI
     createdAt: opts.createdAt ?? new Date().toISOString(),
     title: opts.title,
+    parentWorkspaceId: opts.parentWorkspaceId,
+    taskStatus: opts.taskStatus,
     bestOf: opts.bestOf,
+    workflowTask: opts.workflowTask,
     transcriptOnly: opts.transcriptOnly,
+    pinnedAt: opts.pinnedAt,
+    unrelatedWorkspaceConsent: opts.unrelatedWorkspaceConsent,
   };
 }
 
@@ -83,7 +94,7 @@ export function createIncompatibleWorkspace(
     ...createWorkspace(opts),
     incompatibleRuntime:
       opts.incompatibleReason ??
-      "This workspace was created with a newer version of mux.\nPlease upgrade mux to use this workspace.",
+      "This workspace was created with a newer version of xum.\nPlease upgrade xum to use this workspace.",
   };
 }
 
@@ -101,15 +112,6 @@ export function createArchivedWorkspace(
     archivedAt: opts.archivedAt ?? new Date(NOW - 86400000).toISOString(), // 1 day ago
     // No unarchivedAt means it's archived (archivedAt > unarchivedAt where unarchivedAt is undefined)
   };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROJECT FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface ProjectFixture {
-  path: string;
-  workspaces: FrontendWorkspaceMetadata[];
 }
 
 /** Create project config from workspaces */

@@ -21,6 +21,8 @@ const BUILT_IN_SOURCES: BuiltInSource[] = [
   { id: "desktop", content: BUILTIN_AGENT_CONTENT.desktop },
   { id: "explore", content: BUILTIN_AGENT_CONTENT.explore },
   { id: "name_workspace", content: BUILTIN_AGENT_CONTENT.name_workspace },
+  { id: "dream", content: BUILTIN_AGENT_CONTENT.dream },
+  { id: "intuition", content: BUILTIN_AGENT_CONTENT.intuition },
 ];
 
 let cachedPackages: AgentDefinitionPackage[] | null = null;
@@ -43,9 +45,4 @@ function parseBuiltIns(): AgentDefinitionPackage[] {
 export function getBuiltInAgentDefinitions(): AgentDefinitionPackage[] {
   cachedPackages ??= parseBuiltIns();
   return cachedPackages;
-}
-
-/** Exposed for testing - clears cached parsed packages */
-export function clearBuiltInAgentCache(): void {
-  cachedPackages = null;
 }

@@ -29,7 +29,7 @@ async function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<vo
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() >= deadline) {
-      throw new Error("Timed out waiting for passive PR refresh");
+      throw new Error("Timed out waiting for passive GitHub refresh");
     }
     await sleep(10);
   }
@@ -74,8 +74,7 @@ async function runPassiveRefreshScenario(
   shouldRun: boolean
 ): Promise<number> {
   const executeBash = mock(() => {
-    // Return a top-level failure so detectWorkspacePR exits before JSON parsing.
-    // These tests only care whether passive refresh attempted the gh command.
+    // Return failures because these tests only assert whether runtime gating invokes both commands.
     return Promise.resolve({ success: false as const, error: "gh unavailable" });
   });
 
@@ -95,7 +94,7 @@ async function runPassiveRefreshScenario(
     store.subscribeWorkspace(metadata.id, () => undefined);
 
     if (shouldRun) {
-      await waitUntil(() => executeBash.mock.calls.length > 0);
+      await waitUntil(() => executeBash.mock.calls.length === 2);
     } else {
       await sleep(100);
     }
@@ -134,7 +133,7 @@ describe("passive refresh runtime gating", () => {
       true
     );
 
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
   });
 
   it("retries PR refresh when devcontainer runtime transitions from null to running", async () => {
@@ -162,8 +161,8 @@ describe("passive refresh runtime gating", () => {
       runtimeStatusStore.setStatus("running");
       runtimeStatusStore.emit(metadata.id);
 
-      await waitUntil(() => executeBash.mock.calls.length > 0);
-      expect(executeBash.mock.calls.length).toBe(1);
+      await waitUntil(() => executeBash.mock.calls.length === 2);
+      expect(executeBash.mock.calls.length).toBe(2);
     } finally {
       store.dispose();
     }
@@ -208,8 +207,62 @@ describe("passive refresh runtime gating", () => {
       true
     );
 
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
   });
+});
+
+// #4662: opening a workspace must not spawn gh pr/stack probes while its chat replay runs.
+describe("chat replay gating", () => {
+  it.each(["the chat replay settles", "the last subscriber leaves"] as const)(
+    "defers PR and stack probes until %s",
+    async (release) => {
+      const metadata = createWorkspaceMetadata("replay-pending", DEFAULT_RUNTIME_CONFIG);
+      const executeBash = mock(() =>
+        Promise.resolve({ success: false as const, error: "gh unavailable" })
+      );
+      let pending = true;
+      const gateListeners = new Set<() => void>();
+      const store = new PRStatusStore({ getStatus: () => null });
+
+      try {
+        store.setChatReplayGate({
+          isReplayPending: () => pending,
+          subscribeKey: (_workspaceId, listener) => {
+            gateListeners.add(listener);
+            return () => gateListeners.delete(listener);
+          },
+        });
+        store.setClient({
+          workspace: { executeBash },
+        } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+        store.syncWorkspaces(new Map([[metadata.id, metadata]]));
+        const unsubscribe = store.subscribeWorkspace(metadata.id, () => undefined);
+
+        await waitUntil(() => gateListeners.size === 1);
+        expect(executeBash.mock.calls.length).toBe(0);
+
+        if (release === "the last subscriber leaves") {
+          // The last subscriber leaving must release the watcher on WorkspaceStore.
+          unsubscribe();
+          expect(gateListeners.size).toBe(0);
+          return;
+        }
+        pending = false;
+        for (const listener of Array.from(gateListeners)) listener();
+
+        await waitUntil(() => executeBash.mock.calls.length === 2);
+        const scripts = executeBash.mock.calls.map(
+          (call) => ((call as unknown[])[0] as { script: string }).script
+        );
+        expect(scripts.some((script) => script.includes("gh pr view"))).toBe(true);
+        expect(scripts.some((script) => script.includes("gh stack view"))).toBe(true);
+        expect(gateListeners.size).toBe(0);
+        unsubscribe();
+      } finally {
+        store.dispose();
+      }
+    }
+  );
 });
 
 describe("parseMergeQueueEntry", () => {

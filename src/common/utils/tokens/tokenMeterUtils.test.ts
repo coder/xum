@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { calculateTokenMeterData, formatTokens } from "./tokenMeterUtils";
 
@@ -78,7 +77,21 @@ describe("calculateTokenMeterData", () => {
   });
 
   test("uses the Codex OAuth cap for GPT-5.5 token meter percentages", () => {
-    const result = calculateTokenMeterData(SAMPLE_USAGE, KNOWN_MODELS.GPT.id, false, false, {
+    const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-5.5", false, false, {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+      },
+    });
+
+    expect(result.maxTokens).toBe(272_000);
+    expect(result.totalPercentage).toBeCloseTo((11_000 / 272_000) * 100);
+  });
+
+  test("uses the Codex OAuth cap for GPT-5.6 token meter percentages", () => {
+    const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-5.6-sol", false, false, {
       openai: {
         apiKeySet: false,
         isEnabled: true,

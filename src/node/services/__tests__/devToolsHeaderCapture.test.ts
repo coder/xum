@@ -4,7 +4,11 @@ import {
   DEVTOOLS_STEP_ID_HEADER,
   captureAndStripDevToolsHeader,
   consumeCapturedRequestHeaders,
+  closeCapturedRequestBody,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
+  resolveDevToolsCaptureBody,
 } from "../devToolsHeaderCapture";
 
 describe("devToolsHeaderCapture", () => {
@@ -117,6 +121,89 @@ describe("devToolsHeaderCapture", () => {
 
     consumeCapturedRequestHeaders("step-1"); // first read
     expect(consumeCapturedRequestHeaders("step-1")).toBeNull(); // second read → null
+  });
+
+  it("never persists a request body it cannot parse and redact", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-text" }),
+      "api_key=sk-plain-text-secret"
+    );
+    expect(consumeRedactedRequestBody("step-text")).toBeNull();
+  });
+
+  it("redacts the shared credential vocabulary in request bodies", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-creds" }),
+      JSON.stringify({
+        auth_token: "a",
+        privateKey: "b",
+        credentials: { user: "c", pass: "d" },
+        jwt: "e",
+        max_tokens: 64,
+        prompt_cache_key: "visible",
+      })
+    );
+    expect(consumeRedactedRequestBody("step-creds")).toEqual({
+      auth_token: "[REDACTED]",
+      privateKey: "[REDACTED]",
+      credentials: "[REDACTED]",
+      jwt: "[REDACTED]",
+      max_tokens: 64,
+      prompt_cache_key: "visible",
+    });
+  });
+
+  it("redacts Anthropic redacted_thinking payloads but keeps unrelated data fields", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-anthropic" }),
+      JSON.stringify({
+        messages: [
+          { type: "redacted_thinking", data: "opaque-blob" },
+          { type: "document", data: "visible" },
+        ],
+      })
+    );
+    expect(consumeRedactedRequestBody("step-anthropic")).toEqual({
+      messages: [
+        { type: "redacted_thinking", data: "[REDACTED 11 chars]" },
+        { type: "document", data: "visible" },
+      ],
+    });
+  });
+
+  it("drops a discarded body so a later read finds nothing", () => {
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-ok" }), "{}");
+    discardCapturedRequestBody("step-ok");
+    expect(consumeRedactedRequestBody("step-ok")).toBeNull();
+  });
+
+  it("reads the body of a Request input only for a DevTools-tracked request", async () => {
+    const body = JSON.stringify({ model: "m" });
+    const tracked = new Request("https://api.example/v1", {
+      method: "POST",
+      headers: { [DEVTOOLS_STEP_ID_HEADER]: "step-request" },
+      body,
+    });
+    expect(await resolveDevToolsCaptureBody(tracked.headers, tracked, undefined)).toBe(body);
+    // The caller's Request stays readable: the helper reads a clone.
+    expect(await tracked.text()).toBe(body);
+    // `init.body` wins, as fetch itself would send it.
+    expect(
+      await resolveDevToolsCaptureBody(tracked.headers, "https://api.example", { body: "{}" })
+    ).toBe("{}");
+    const untracked = new Request("https://api.example/v1", { method: "POST", body });
+    expect(
+      await resolveDevToolsCaptureBody(untracked.headers, untracked, undefined)
+    ).toBeUndefined();
+  });
+
+  it("ignores a capture that arrives after its step was closed by an abort", () => {
+    closeCapturedRequestBody("step-late");
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-late" }), "{}");
+    expect(consumeRedactedRequestBody("step-late")).toBeNull();
+    // Settling the step clears the closed mark, so the id holds no state afterwards.
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-late" }), "{}");
+    expect(consumeRedactedRequestBody("step-late")).toEqual({});
   });
 
   it("strips run metadata header even without step header", () => {

@@ -82,23 +82,28 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     /\bHTTP\s*529\b|overloaded/i.test(message.error);
   const isEmptyOutputError = message.errorType === "empty_output";
   const isMaxOutputTokensError = message.errorType === "max_output_tokens";
+  // Terminal refusal: distinct from network/empty-output messaging because retrying
+  // the same request will refuse again (no auto-retry is scheduled for this type).
+  const isModelRefusalError = message.errorType === "model_refusal";
   // Gateway quota failures need explicit attribution so users know mux gateway credits,
   // not a provider quota, are blocking the request.
   const isMuxGatewayQuotaError =
     message.errorType === "quota" && message.routedThroughGateway === true;
 
   const title = isMuxGatewayQuotaError
-    ? "Mux Gateway credits depleted"
+    ? "Xum Gateway credits depleted"
     : isAnthropicOverloaded
       ? "Service overloaded"
       : isEmptyOutputError
         ? "No assistant output"
         : isMaxOutputTokensError
           ? "Response truncated"
-          : "Stream Error";
+          : isModelRefusalError
+            ? "Model refused to respond"
+            : "Stream Error";
   const pill = isAnthropicOverloaded ? "overloaded" : message.errorType;
   const body = isMuxGatewayQuotaError
-    ? "Your Mux Gateway credits have been depleted. Add credits or configure another provider to continue."
+    ? "Your Xum Gateway credits have been depleted. Add credits or configure another provider to continue."
     : message.error;
 
   const ctaAction = isMuxGatewayQuotaError ? (

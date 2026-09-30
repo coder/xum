@@ -1,15 +1,16 @@
 import type {
   EnsureReadyOptions,
   EnsureReadyResult,
+  PendingMaterialization,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
   WorkspaceInitResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
+  WorkspaceMaterializeParams,
 } from "./Runtime";
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
-import { runWorkspaceInitHook } from "./initHook";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { isGitRepository } from "@/node/utils/pathUtils";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
@@ -26,21 +27,37 @@ export class WorktreeRuntime extends LocalBaseRuntime {
   private readonly worktreeManager: WorktreeManager;
   private readonly currentProjectPath?: string;
   private readonly currentWorkspaceName?: string;
+  // Persisted checkout path for this runtime's own workspace. Set when a workspace's on-disk path
+  // diverges from the name-derived worktree path — e.g. an isolation: "none" task that shares its
+  // parent's checkout (its name is unique but its path points at the parent's worktree).
+  private readonly currentWorkspacePath?: string;
 
   constructor(
     srcBaseDir: string,
     options?: {
       projectPath?: string;
       workspaceName?: string;
+      workspacePath?: string;
     }
   ) {
     super();
     this.worktreeManager = new WorktreeManager(srcBaseDir);
     this.currentProjectPath = options?.projectPath;
     this.currentWorkspaceName = options?.workspaceName;
+    this.currentWorkspacePath = options?.workspacePath;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
+    // Honor an explicit persisted path for this runtime's own workspace so callers (cwd resolution,
+    // ensureReady, agent discovery) land in the shared parent checkout instead of a name-derived
+    // directory that was never created. Mirrors SSHRuntime.getWorkspacePath.
+    if (
+      this.currentWorkspacePath &&
+      this.currentProjectPath === projectPath &&
+      this.currentWorkspaceName === workspaceName
+    ) {
+      return this.currentWorkspacePath;
+    }
     return this.worktreeManager.getWorkspacePath(projectPath, workspaceName);
   }
 
@@ -88,18 +105,32 @@ export class WorktreeRuntime extends LocalBaseRuntime {
       abortSignal: params.abortSignal,
       env: params.env,
       trusted: params.trusted,
+      deferMaterialization: params.deferMaterialization,
     });
   }
 
-  async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
-    return runWorkspaceInitHook({
-      params,
-      runtimeType: "worktree",
-      hookCheckPath: params.projectPath,
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
-        await this.runInitHook(params.workspacePath, muxEnv, initLogger, abortSignal);
+  async materializeWorkspace(
+    params: WorkspaceMaterializeParams,
+    pending: PendingMaterialization
+  ): Promise<void> {
+    return this.worktreeManager.materializeWorkspace(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        branchName: params.branchName,
+        trunkBranch: params.trunkBranch,
+        initLogger: params.initLogger,
+        abortSignal: params.abortSignal,
+        checkoutAbortSignal: params.checkoutAbortSignal,
+        env: params.env,
+        trusted: params.trusted,
       },
-    });
+      pending
+    );
+  }
+
+  async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
+    return this.initLocalWorkspace(params, "worktree");
   }
 
   async renameWorkspace(
@@ -107,12 +138,14 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     oldName: string,
     newName: string,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   > {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted);
+    return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted, options);
   }
 
   async canDeleteWorkspaceWithoutForce(
@@ -128,13 +161,25 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     workspaceName: string,
     force: boolean,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    return this.worktreeManager.deleteWorkspace(projectPath, workspaceName, force, trusted);
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
-    return this.worktreeManager.forkWorkspace(params);
+    // Resolve the source path through this runtime's override-aware getWorkspacePath so forks
+    // FROM a workspace with a persisted path override (e.g. an isolation: "none" task sharing
+    // its parent's checkout) read the real source checkout, not a name-derived path.
+    return this.worktreeManager.forkWorkspace(params, {
+      sourceWorkspacePath: this.getWorkspacePath(params.projectPath, params.sourceWorkspaceName),
+    });
   }
 }

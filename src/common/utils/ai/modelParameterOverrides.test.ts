@@ -22,6 +22,16 @@ function withOllamaModelParameters(
   });
 }
 
+function withGoogleModelParameters(
+  modelParameters: Record<string, Record<string, unknown>>
+): ProvidersConfig {
+  return asProvidersConfig({
+    google: {
+      modelParameters,
+    },
+  });
+}
+
 function asProvidersConfig(value: unknown): ProvidersConfig {
   return value as ProvidersConfig;
 }
@@ -408,6 +418,157 @@ describe("resolveModelParameterOverrides", () => {
     );
 
     expect(result).toEqual({ standard: {} });
+  });
+
+  it("strips deprecated sampling parameters for Gemini 3.6 Flash", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.6-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 32768,
+      },
+    });
+  });
+
+  it("strips deprecated sampling parameters for Gemini 3.7 Flash", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.7-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 32768,
+      },
+    });
+  });
+
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.8-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 32768,
+      },
+    });
+  });
+
+  it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {
+    const providersConfig = withGoogleModelParameters({
+      "gemini-3.5-flash-lite": {
+        temperature: 0.5,
+        seed: 42,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.5-flash-lite"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        seed: 42,
+      },
+    });
+  });
+
+  it("strips sampling parameters based on the gateway-routed effective model", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        temperature: 0.7,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash"
+    );
+
+    expect(result).toEqual({ standard: {} });
+  });
+
+  it("strips sampling parameters for custom entries mapped to a sampling-rejecting model", () => {
+    const providersConfig = asProvidersConfig({
+      google: {
+        models: [{ id: "team-flash", mappedToModel: "google:gemini-3.8-flash" }],
+        modelParameters: {
+          "*": {
+            temperature: 0.7,
+            max_output_tokens: 4096,
+          },
+        },
+      },
+    });
+
+    const result = resolveModelParameterOverrides(providersConfig, "google", "google:team-flash");
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 4096,
+      },
+    });
+  });
+
+  it("keeps sampling parameters for Gemini models that still support them", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        temperature: 0.7,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.5-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        temperature: 0.7,
+        topK: 40,
+      },
+    });
   });
 
   it("treats prototype-collision keys as providerExtras", () => {

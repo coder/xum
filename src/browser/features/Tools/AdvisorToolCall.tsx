@@ -7,6 +7,7 @@ import {
   type AdvisorLivePhaseState,
   useAdvisorToolLiveOutput,
   useAdvisorToolLivePhase,
+  useAdvisorToolLiveReasoning,
 } from "@/browser/stores/WorkspaceStore";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { getModelName } from "@/common/utils/ai/models";
@@ -41,14 +42,12 @@ type AdvisorToolResult =
   | {
       type: "advice";
       advice: string;
-      advisorName: string;
       advisorModel: string;
       reasoningLevel?: string;
       remainingUses: number | null;
     }
   | {
       type: "limit_reached";
-      advisorName: string;
       advisorModel: string;
       reasoningLevel?: string;
       message: string;
@@ -100,29 +99,6 @@ function getAdvisorQuestion(args: Record<string, unknown>): string | undefined {
   return question.length > 0 ? question : undefined;
 }
 
-/**
- * Extract the advisor name from the tool input args.
- *
- * The header surfaces the advisor name as the lead identity pill — model and
- * thinking metadata live in the expanded details. This stays available even
- * when the tool errors before producing a result (e.g., unknown advisor name)
- * because the args are still emitted on the tool-call boundary.
- */
-function getAdvisorName(
-  args: Record<string, unknown>,
-  result: AdvisorToolResult | null
-): string | undefined {
-  if (result?.type === "advice" || result?.type === "limit_reached") {
-    return result.advisorName;
-  }
-  const rawName = args.advisor_name;
-  if (typeof rawName !== "string") {
-    return undefined;
-  }
-  const name = rawName.trim();
-  return name.length > 0 ? name : undefined;
-}
-
 function isRemainingUses(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isInteger(value) && value >= 0);
 }
@@ -140,14 +116,12 @@ function isAdvisorToolResult(value: unknown): value is AdvisorToolResult {
     case "advice":
       return (
         isNonEmptyString(record.advice) &&
-        isNonEmptyString(record.advisorName) &&
         isNonEmptyString(record.advisorModel) &&
         hasValidReasoningLevel &&
         isRemainingUses(record.remainingUses)
       );
     case "limit_reached":
       return (
-        isNonEmptyString(record.advisorName) &&
         isNonEmptyString(record.advisorModel) &&
         hasValidReasoningLevel &&
         isNonEmptyString(record.message)
@@ -244,7 +218,6 @@ export const AdvisorToolCall: React.FC<AdvisorToolCallProps> = (props) => {
   const toolStatus = isToolStatus(props.status) ? props.status : "pending";
   const question = getAdvisorQuestion(props.args);
   const advisorResult = isAdvisorToolResult(props.result) ? props.result : null;
-  const advisorName = getAdvisorName(props.args, advisorResult);
   const hasUnrecognizedResult =
     props.result !== undefined && props.result !== null && advisorResult === null;
   const isExecutingWithoutResult =
@@ -257,7 +230,6 @@ export const AdvisorToolCall: React.FC<AdvisorToolCallProps> = (props) => {
       {...props}
       toolStatus={toolStatus}
       question={question}
-      advisorName={advisorName}
       advisorResult={advisorResult}
       hasUnrecognizedResult={hasUnrecognizedResult}
       isExecutingWithoutResult={isExecutingWithoutResult}
@@ -268,7 +240,6 @@ export const AdvisorToolCall: React.FC<AdvisorToolCallProps> = (props) => {
 interface AdvisorToolCallContentProps extends AdvisorToolCallProps {
   toolStatus: ToolStatus;
   question: string | undefined;
-  advisorName: string | undefined;
   advisorResult: AdvisorToolResult | null;
   hasUnrecognizedResult: boolean;
   isExecutingWithoutResult: boolean;
@@ -281,17 +252,26 @@ const AdvisorToolCallContent: React.FC<AdvisorToolCallContentProps> = ({
   startedAt,
   toolStatus,
   question,
-  advisorName,
   advisorResult,
   hasUnrecognizedResult,
   isExecutingWithoutResult,
 }) => {
-  // Streamed chunks need expansion to be visible.
-  // Remount on settle so completed rows keep their collapsed default.
-  const { expanded, toggleExpanded } = useToolExpansion(isExecutingWithoutResult);
-  const livePhase = useAdvisorToolLivePhase(workspaceId, toolCallId);
-  const liveOutput = useAdvisorToolLiveOutput(workspaceId, toolCallId);
+  // A live advisor streams chunks that are only visible while expanded, so force the
+  // row open while executing — otherwise a stored `tools: false` preference would mount
+  // it collapsed and hide the live output. The key={… "executing"/"settled"} remount
+  // above means a settled row mounts fresh (forceExpanded=false) and then follows the
+  // sticky preference / collapsed default.
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: isExecutingWithoutResult,
+  });
+  const liveWorkspaceId = isExecutingWithoutResult ? workspaceId : undefined;
+  const liveToolCallId = isExecutingWithoutResult ? toolCallId : undefined;
+  const livePhase = useAdvisorToolLivePhase(liveWorkspaceId, liveToolCallId);
+  const liveOutput = useAdvisorToolLiveOutput(liveWorkspaceId, liveToolCallId);
+  const liveReasoning = useAdvisorToolLiveReasoning(liveWorkspaceId, liveToolCallId);
   const liveAdviceText = isExecutingWithoutResult && liveOutput?.text ? liveOutput.text : undefined;
+  const liveReasoningText =
+    isExecutingWithoutResult && liveReasoning?.text ? liveReasoning.text : undefined;
   const detailsText =
     advisorResult?.type === "advice"
       ? advisorResult.advice
@@ -320,11 +300,6 @@ const AdvisorToolCallContent: React.FC<AdvisorToolCallContentProps> = ({
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName="advisor" />
         <ToolName>advisor</ToolName>
-        {advisorName && (
-          // Lead identity pill — which advisor handled this turn matters more
-          // than the underlying model when multiple advisors are configured.
-          <MetadataBadge className="text-foreground">{advisorName}</MetadataBadge>
-        )}
         <StatusIndicator
           status={statusPresentation.status}
           className={statusPresentation.className}
@@ -365,6 +340,15 @@ const AdvisorToolCallContent: React.FC<AdvisorToolCallContentProps> = ({
                 </DetailSection>
               )}
             </>
+          )}
+
+          {advisorResult === null && liveReasoningText && (
+            <DetailSection>
+              <DetailLabel>Thinking</DetailLabel>
+              <div className="bg-code-bg text-secondary rounded px-3 py-2 text-[12px] leading-relaxed">
+                <MarkdownRenderer content={liveReasoningText} preserveLineBreaks />
+              </div>
+            </DetailSection>
           )}
 
           {advisorResult === null && liveAdviceText && (

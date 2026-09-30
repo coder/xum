@@ -1,8 +1,5 @@
-import * as path from "path";
-import assert from "@/common/utils/assert";
 import { createPatch } from "diff";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 
 /**
@@ -150,120 +147,6 @@ export function validateNoRedundantPrefix(
     return {
       correctedPath: relativePath,
       warning: `Note: Using relative paths like '${relativePath}' instead of '${filePath}' saves tokens. The path has been auto-corrected for you.`,
-    };
-  }
-
-  return null;
-}
-
-interface RuntimePathModule {
-  isAbsolute(filePath: string): boolean;
-  relative(from: string, to: string): string;
-}
-
-type ComparablePathKind = "absolute" | "home";
-
-interface ComparablePath {
-  kind: ComparablePathKind;
-  value: string;
-}
-
-function getRuntimePathModule(runtime: Runtime): RuntimePathModule {
-  return runtime instanceof RemoteRuntime ? path.posix : path;
-}
-
-function isRuntimeAbsolutePath(filePath: string, runtime: Runtime): boolean {
-  const trimmedPath = filePath.trim();
-  if (runtime instanceof RemoteRuntime) {
-    return trimmedPath.startsWith("/") || trimmedPath === "~" || trimmedPath.startsWith("~/");
-  }
-  return path.isAbsolute(trimmedPath);
-}
-
-function toComparablePath(normalizedPath: string): ComparablePath {
-  if (normalizedPath === "~") {
-    return {
-      kind: "home",
-      value: "/__mux_home__",
-    };
-  }
-
-  if (normalizedPath.startsWith("~/")) {
-    return {
-      kind: "home",
-      value: path.posix.join("/__mux_home__", normalizedPath.slice(2)),
-    };
-  }
-
-  return {
-    kind: "absolute",
-    value: normalizedPath,
-  };
-}
-
-function isWithinAllowedRoot(
-  allowedRoot: ComparablePath,
-  targetPath: ComparablePath,
-  pathModule: RuntimePathModule
-): boolean {
-  if (allowedRoot.kind !== targetPath.kind) {
-    return false;
-  }
-
-  const relativePath = pathModule.relative(allowedRoot.value, targetPath.value);
-  return !relativePath.startsWith("..") && !pathModule.isAbsolute(relativePath);
-}
-
-/**
- * Validates that a file path is within the allowed working directory.
- * Returns an error object if the path is outside cwd (and any optional allowlisted roots),
- * null if valid.
- *
- * @param filePath - The file path to validate (can be relative or absolute)
- * @param cwd - The working directory that file operations are restricted to
- * @param runtime - The runtime whose path semantics should be used for validation
- * @param extraAllowedDirs - Additional absolute directories that are allowlisted for access.
- * Note: this is a lexical containment check on normalized paths; it does not resolve symlink targets.
- * @returns Error object if invalid, null if valid
- */
-export function validatePathInCwd(
-  filePath: string,
-  cwd: string,
-  runtime: Runtime,
-  extraAllowedDirs: string[] = []
-): { error: string } | null {
-  const trimmedExtraAllowedDirs = extraAllowedDirs
-    .map((dir) => dir.trim())
-    .filter((dir) => dir.length > 0);
-  const pathModule = getRuntimePathModule(runtime);
-
-  // extraAllowedDirs are an internal allowlist (e.g., stream-scoped runtimeTempDir).
-  // For safety, require absolute paths so misconfiguration doesn't widen access.
-  for (const dir of trimmedExtraAllowedDirs) {
-    assert(
-      isRuntimeAbsolutePath(dir, runtime),
-      `extraAllowedDir must be an absolute path: '${dir}'`
-    );
-  }
-
-  const normalizedCwd = runtime.normalizePath(".", cwd);
-  const normalizedPath = runtime.normalizePath(filePath, normalizedCwd);
-  const filePathIsAbsolute = isRuntimeAbsolutePath(filePath, runtime);
-  const comparablePath = toComparablePath(normalizedPath);
-
-  // Only allow extraAllowedDirs when the caller provides an absolute path.
-  // This prevents relative-path escapes (e.g., ../...) from bypassing cwd restrictions.
-  const allowedRoots = [normalizedCwd, ...(filePathIsAbsolute ? trimmedExtraAllowedDirs : [])].map(
-    (dir) => toComparablePath(runtime.normalizePath(dir, normalizedCwd))
-  );
-
-  const isWithinRoot = allowedRoots.some((root) =>
-    isWithinAllowedRoot(root, comparablePath, pathModule)
-  );
-
-  if (!isWithinRoot) {
-    return {
-      error: `File operations are restricted to the workspace directory (${normalizedCwd}). The path '${filePath}' resolves outside this directory. If you need to modify files outside the workspace, please ask the user for permission first.`,
     };
   }
 

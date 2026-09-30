@@ -3,19 +3,20 @@ import {
   isBuiltInProvider,
   isValidCustomProviderId,
 } from "@/common/utils/providers/customProviders";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
 export const PolicyFormatVersionSchema = z.literal("0.1");
-export type PolicyFormatVersion = z.infer<typeof PolicyFormatVersionSchema>;
 
+// The TypeSafe evaluation provider (auto routing) is gated by provider_access like a chat
+// provider, but its id is reserved (not a valid custom provider id), so admit it explicitly.
 export const PolicyProviderIdSchema = z
   .string()
-  .refine((id) => isBuiltInProvider(id) || isValidCustomProviderId(id), {
-    message: "Invalid provider id",
-  });
-export type PolicyProviderId = z.infer<typeof PolicyProviderIdSchema>;
+  .refine(
+    (id) => isBuiltInProvider(id) || id === TYPESAFE_PROVIDER_KEY || isValidCustomProviderId(id),
+    { message: "Invalid provider id" }
+  );
 
 export const PolicyProviderNameSchema = PolicyProviderIdSchema;
-export type PolicyProviderName = PolicyProviderId;
 
 export const PolicyProviderAccessSchema = z
   .object({
@@ -26,7 +27,6 @@ export const PolicyProviderAccessSchema = z
     model_access: z.array(z.string()).optional(),
   })
   .strict();
-export type PolicyProviderAccess = z.infer<typeof PolicyProviderAccessSchema>;
 
 export const PolicyAllowUserDefinedMCPSchema = z
   .object({
@@ -34,14 +34,12 @@ export const PolicyAllowUserDefinedMCPSchema = z
     remote: z.boolean(),
   })
   .strict();
-export type PolicyAllowUserDefinedMCP = z.infer<typeof PolicyAllowUserDefinedMCPSchema>;
 
 export const PolicyToolsSchema = z
   .object({
     allow_user_defined_mcp: PolicyAllowUserDefinedMCPSchema.optional(),
   })
   .strict();
-export type PolicyTools = z.infer<typeof PolicyToolsSchema>;
 
 export const PolicyRuntimeIdSchema = z.enum([
   "local",
@@ -58,7 +56,6 @@ export const PolicyRuntimeAccessSchema = z
     id: PolicyRuntimeIdSchema,
   })
   .strict();
-export type PolicyRuntimeAccess = z.infer<typeof PolicyRuntimeAccessSchema>;
 
 export const PolicyFileSchema = z
   .object({
@@ -75,7 +72,6 @@ export const PolicyFileSchema = z
     runtimes: z.array(PolicyRuntimeAccessSchema).optional(),
   })
   .strict();
-export type PolicyFile = z.infer<typeof PolicyFileSchema>;
 
 export const PolicyStatusSchema = z
   .object({

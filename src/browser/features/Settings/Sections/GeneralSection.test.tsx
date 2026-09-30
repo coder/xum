@@ -1,10 +1,24 @@
+// Keep this first: tests/ui/dom installs a baseline DOM on import, and GeneralSection reads
+// `window` (browser vs Electron mode) when its module evaluates below.
+import { installDom } from "../../../../../tests/ui/dom";
 import React from "react";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { installDom } from "../../../../../tests/ui/dom";
-import { BASH_COLLAPSED_SUMMARY_MODE_KEY } from "@/common/constants/storage";
+import { APIProvider } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
+import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
+import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
+import { GeneralSection } from "./GeneralSection";
+import {
+  EXPERIMENT_IDS,
+  getExperimentKey,
+  type ExperimentId,
+} from "@/common/constants/experiments";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -14,20 +28,28 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 
-interface MockConfig {
-  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
-  worktreeArchiveBehavior: WorktreeArchiveBehavior;
-  llmDebugLogs: boolean;
-}
+type MockConfig = TestClientConfig;
+
+type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
 interface MockAPIClient {
+  experiments: {
+    getOverrides: () => Promise<ExperimentOverrides>;
+    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
+  };
   config: {
     getConfig: () => Promise<MockConfig>;
     updateCoderPrefs: (input: {
       coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
       worktreeArchiveBehavior: WorktreeArchiveBehavior;
     }) => Promise<void>;
+    updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
+    updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    onConfigChanged: (
+      input?: unknown,
+      options?: { signal?: AbortSignal }
+    ) => Promise<AsyncIterableIterator<void>>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -40,8 +62,11 @@ interface MockAPIClient {
 }
 
 let mockApi: MockAPIClient;
+const experimentOverriddenMock = mock<(experimentId: string, enabled: boolean) => void>(
+  () => undefined
+);
 
-void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => {
+const mockSelectPrimitive = (() => {
   const SelectContext = React.createContext<{
     value?: string;
     disabled?: boolean;
@@ -151,27 +176,45 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => {
     SelectContent,
     SelectItem,
   };
-});
+})();
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
+// Snapshot the real exports before mocking so later suites get them back after this file.
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...RealSelectPrimitiveModule }],
+  ["@/browser/hooks/useTelemetry", { ...RealTelemetryModule }],
+]);
+void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => mockSelectPrimitive);
+void mock.module("@/browser/hooks/useTelemetry", () => ({
+  useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
 }));
 
-import { GeneralSection } from "./GeneralSection";
+function TestProviders(props: { children: React.ReactNode }) {
+  return (
+    <APIProvider client={createTestApiClient(mockApi)}>
+      <ExperimentsProvider>
+        <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
+      </ExperimentsProvider>
+    </APIProvider>
+  );
+}
 
 interface RenderGeneralSectionOptions {
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
+  chatTranscriptFullWidth?: boolean;
+  keepScreenAwake?: boolean;
+  /** Render as the Electron app (window.api set by the preload) instead of browser mode. */
+  desktop?: boolean;
+  localOverrides?: ExperimentOverrides;
+  backendOverrides?: ExperimentOverrides;
+  children?: React.ReactNode;
 }
 
 interface MockAPISetup {
   api: MockAPIClient;
+  backendOverrides: ExperimentOverrides;
+  setOverrideMock: ReturnType<typeof mock<MockAPIClient["experiments"]["setOverride"]>>;
+  getOverridesMock: ReturnType<typeof mock<MockAPIClient["experiments"]["getOverrides"]>>;
   getConfigMock: ReturnType<typeof mock<() => Promise<MockConfig>>>;
   updateCoderPrefsMock: ReturnType<
     typeof mock<
@@ -181,15 +224,38 @@ interface MockAPISetup {
       }) => Promise<void>
     >
   >;
+  updateChatTranscriptFullWidthMock: ReturnType<
+    typeof mock<(input: { enabled: boolean }) => Promise<void>>
+  >;
+  updateKeepScreenAwakeMock: ReturnType<
+    typeof mock<(input: { enabled: boolean }) => Promise<void>>
+  >;
+  getSshHostMock: ReturnType<typeof mock<() => Promise<string | null>>>;
+  setSshHostMock: ReturnType<typeof mock<(input: { sshHost: string | null }) => Promise<void>>>;
+  /** Mutable backing config, so tests can simulate edits made outside this section. */
+  config: MockConfig;
+  /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
+  emitConfigChanged: () => void;
 }
 
-function createMockAPI(configOverrides: Partial<MockConfig> = {}): MockAPISetup {
-  const config: MockConfig = {
-    coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-    worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    llmDebugLogs: false,
-    ...configOverrides,
-  };
+function createMockAPI(
+  configOverrides: Partial<MockConfig> = {},
+  experimentOverrides: ExperimentOverrides = {}
+): MockAPISetup {
+  const backendOverrides = { ...experimentOverrides };
+  const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
+  const setOverrideMock = mock(
+    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
+      // Like the backend, a null/omitted value clears the override.
+      if (enabled == null) {
+        delete backendOverrides[experimentId];
+      } else {
+        backendOverrides[experimentId] = enabled;
+      }
+      return Promise.resolve();
+    }
+  );
+  const config: MockConfig = createTestConfig(configOverrides);
 
   const getConfigMock = mock(() => Promise.resolve({ ...config }));
   const updateCoderPrefsMock = mock(
@@ -204,28 +270,95 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}): MockAPISetup 
     }
   );
 
+  const updateChatTranscriptFullWidthMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.chatTranscriptFullWidth = enabled;
+
+    return Promise.resolve();
+  });
+
+  const updateKeepScreenAwakeMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.keepScreenAwake = enabled;
+
+    return Promise.resolve();
+  });
+
+  const getSshHostMock = mock(() => Promise.resolve<string | null>(null));
+  const setSshHostMock = mock((_input: { sshHost: string | null }) => Promise.resolve());
+
+  // Minimal stand-in for the backend's config-change event stream: each subscriber
+  // counts its own pending notifications.
+  const configChangeNotifiers = new Set<() => void>();
+  const emitConfigChanged = () => {
+    for (const notify of Array.from(configChangeNotifiers)) notify();
+  };
+  const onConfigChanged = (_input?: unknown, options?: { signal?: AbortSignal }) => {
+    let pending = 0;
+    let wake: (() => void) | null = null;
+    const notify = () => {
+      pending += 1;
+      wake?.();
+    };
+    configChangeNotifiers.add(notify);
+    const done = () => {
+      configChangeNotifiers.delete(notify);
+      wake?.();
+    };
+    options?.signal?.addEventListener("abort", done, { once: true });
+    // The real procedure resolves to an async-iterable iterator; GeneralSection drives it with next().
+    const iterator: AsyncIterableIterator<void> = {
+      [Symbol.asyncIterator]: () => iterator,
+      next: async () => {
+        while (pending === 0 && !options?.signal?.aborted) {
+          await new Promise<void>((resolve) => (wake = resolve));
+          wake = null;
+        }
+        if (options?.signal?.aborted) return { done: true, value: undefined };
+        pending -= 1;
+        return { done: false, value: undefined };
+      },
+      return: () => {
+        done();
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+    return Promise.resolve(iterator);
+  };
+
   return {
     api: {
+      experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,
+        updateChatTranscriptFullWidth: updateChatTranscriptFullWidthMock,
         updateLlmDebugLogs: mock(({ enabled }: { enabled: boolean }) => {
           config.llmDebugLogs = enabled;
 
           return Promise.resolve();
         }),
+        updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        onConfigChanged,
       },
       server: {
-        getSshHost: mock(() => Promise.resolve(null)),
-        setSshHost: mock((_input: { sshHost: string | null }) => Promise.resolve()),
+        getSshHost: getSshHostMock,
+        setSshHost: setSshHostMock,
       },
       projects: {
         getDefaultProjectDir: mock(() => Promise.resolve("")),
         setDefaultProjectDir: mock((_input: { path: string }) => Promise.resolve()),
       },
     },
+    backendOverrides,
+    setOverrideMock,
+    getOverridesMock,
     getConfigMock,
     updateCoderPrefsMock,
+    updateChatTranscriptFullWidthMock,
+    updateKeepScreenAwakeMock,
+    getSshHostMock,
+    setSshHostMock,
+    config,
+    emitConfigChanged,
   };
 }
 
@@ -234,33 +367,40 @@ describe("GeneralSection", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    experimentOverriddenMock.mockClear();
   });
 
   afterEach(() => {
     cleanup();
     mock.restore();
-    void mock.module(
-      "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
-    );
     cleanupDom?.();
     cleanupDom = null;
   });
 
   function renderGeneralSection(options: RenderGeneralSectionOptions = {}) {
-    const { api, updateCoderPrefsMock } = createMockAPI({
-      coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
-      worktreeArchiveBehavior: options.worktreeArchiveBehavior,
-    });
-    mockApi = api;
+    for (const [id, enabled] of Object.entries(options.localOverrides ?? {})) {
+      window.localStorage.setItem(getExperimentKey(id as ExperimentId), JSON.stringify(enabled));
+    }
+    const setup = createMockAPI(
+      {
+        chatTranscriptFullWidth: options.chatTranscriptFullWidth,
+        keepScreenAwake: options.keepScreenAwake,
+        coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
+        worktreeArchiveBehavior: options.worktreeArchiveBehavior,
+      },
+      options.backendOverrides
+    );
+    mockApi = setup.api;
+    if (options.desktop) window.api = { platform: "linux", versions: {} };
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+        {options.children}
+      </TestProviders>
     );
 
-    return { updateCoderPrefsMock, view };
+    return { ...setup, view };
   }
 
   function getSelectTrigger(view: ReturnType<typeof render>, label: string): HTMLElement {
@@ -303,6 +443,228 @@ describe("GeneralSection", () => {
     });
   }
 
+  const legacyStrategies = [
+    { continuous: false, budget: false, label: "Summarize" },
+    { continuous: true, budget: false, label: "Continuous" },
+    { continuous: false, budget: true, label: "Token Budget" },
+    { continuous: true, budget: true, label: "Continuous" },
+  ];
+
+  /**
+   * Settle the mount-time config and SSH host reads inside act. The mocks resolve at once, but
+   * the commits they trigger land outside act, so polling for them with waitFor raced its 1 s
+   * wall-clock budget on loaded CI runners (#4463). Awaiting the reads themselves inside act
+   * flushes those commits before returning, with no wall-clock budget.
+   */
+  async function settleMountLoads(setup: MockAPISetup) {
+    const reads = [...setup.getConfigMock.mock.results, ...setup.getSshHostMock.mock.results];
+    expect(reads.length).toBeGreaterThan(0);
+    await act(async () => {
+      await Promise.all(reads.map((result) => result.value));
+    });
+  }
+
+  async function hydrateExperiments(setup: MockAPISetup) {
+    await act(async () => {
+      await waitFor(() => expect(setup.getOverridesMock).toHaveBeenCalledTimes(1));
+    });
+  }
+
+  for (const source of ["localOverrides", "backendOverrides"] as const) {
+    test.each(legacyStrategies)(
+      `displays ${source} continuous=$continuous budget=$budget without normalizing on mount`,
+      async ({ continuous, budget, label }) => {
+        const overrides = {
+          [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+          [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+          [EXPERIMENT_IDS.MEMORY]: true,
+        };
+        const setup = renderGeneralSection({ [source]: overrides });
+        await hydrateExperiments(setup);
+        expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+          label
+        );
+        expect(setup.backendOverrides).toEqual(overrides);
+        expect(experimentOverriddenMock).not.toHaveBeenCalled();
+        // The provider uploads explicit local values; mounting the dropdown must add no writes.
+        if (source === "localOverrides") {
+          for (const [experimentId, enabled] of Object.entries(overrides)) {
+            expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
+          }
+        }
+        expect(setup.setOverrideMock).toHaveBeenCalledTimes(
+          source === "localOverrides" ? Object.keys(overrides).length : 0
+        );
+        for (const [id, enabled] of Object.entries(overrides)) {
+          expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
+            source === "localOverrides" ? JSON.stringify(enabled) : null
+          );
+        }
+      }
+    );
+  }
+
+  test("defaults to Summarize without persisting an implicit choice", async () => {
+    const setup = renderGeneralSection();
+    await hydrateExperiments(setup);
+    expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+      "Summarize"
+    );
+    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.backendOverrides).toEqual({});
+    expect(
+      window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
+    ).toBeNull();
+    expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBeNull();
+  });
+
+  test.each([
+    {
+      local: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false },
+      backend: {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+        [EXPERIMENT_IDS.MEMORY]: true,
+      },
+      label: "Token Budget",
+    },
+    {
+      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: false },
+      backend: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+      label: "Summarize",
+    },
+    {
+      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+      backend: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true },
+      label: "Continuous",
+    },
+  ])(
+    "resolves local overrides before backend values and defaults ($label)",
+    async ({ local, backend, label }) => {
+      const setup = renderGeneralSection({ localOverrides: local, backendOverrides: backend });
+      await hydrateExperiments(setup);
+      expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+        label
+      );
+      expect(setup.backendOverrides).toEqual({ ...backend, ...local });
+      expect(setup.setOverrideMock).toHaveBeenCalledTimes(Object.keys(local).length);
+    }
+  );
+
+  for (const initial of legacyStrategies) {
+    test.each(legacyStrategies.slice(0, 3).filter((next) => next.label !== initial.label))(
+      `selecting $label from continuous=${initial.continuous} budget=${initial.budget} persists both flags only`,
+      async ({ continuous, budget, label }) => {
+        const unrelated = {
+          [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+          [EXPERIMENT_IDS.RLM]: true,
+          [EXPERIMENT_IDS.MEMORY]: true,
+        };
+        const setup = renderGeneralSection({
+          backendOverrides: {
+            ...unrelated,
+            [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: initial.continuous,
+            [EXPERIMENT_IDS.TOKEN_BUDGET]: initial.budget,
+          },
+        });
+        await hydrateExperiments(setup);
+        await chooseSelectOption(setup.view, "Compaction strategy", label);
+        await waitFor(() =>
+          expect(setup.backendOverrides).toEqual({
+            ...unrelated,
+            [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+            [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+          })
+        );
+        expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(experimentOverriddenMock).toHaveBeenCalledTimes(2);
+        expect(experimentOverriddenMock).toHaveBeenCalledWith(
+          EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+          continuous
+        );
+        expect(experimentOverriddenMock).toHaveBeenCalledWith(EXPERIMENT_IDS.TOKEN_BUDGET, budget);
+        expect(
+          window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
+        ).toBe(JSON.stringify(continuous));
+        expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBe(
+          JSON.stringify(budget)
+        );
+        expect(Boolean(setup.view.queryByRole("status"))).toBe(label === "Token Budget");
+      }
+    );
+  }
+
+  test("keeps Token Budget selectable and tracks live PTC/RLM conflicts without changing the strategy", async () => {
+    function ConflictToggles() {
+      const [ptc, setPtc] = useExperiment(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+      const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
+      return (
+        <>
+          <button onClick={() => setPtc(!ptc)}>Toggle PTC fixture</button>
+          <button onClick={() => setRlm(!rlm)}>Toggle RLM fixture</button>
+        </>
+      );
+    }
+    const setup = renderGeneralSection({
+      children: <ConflictToggles />,
+      backendOverrides: { [EXPERIMENT_IDS.MEMORY]: true },
+    });
+    await hydrateExperiments(setup);
+    await chooseSelectOption(setup.view, "Compaction strategy", "Token Budget");
+    const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
+    const warning = setup.view.getByRole("status");
+    expect(trigger.getAttribute("aria-describedby")).toBe(warning.id);
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.getByRole("status")).toBeTruthy();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    expect(trigger.textContent).toBe("Token Budget");
+    await waitFor(() =>
+      expect(setup.backendOverrides).toEqual({
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+        [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
+        [EXPERIMENT_IDS.RLM]: true,
+        [EXPERIMENT_IDS.MEMORY]: true,
+      })
+    );
+  });
+
+  test("hides Token Budget without Agent Memory and keeps the saved preference", async () => {
+    const setup = renderGeneralSection({
+      backendOverrides: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+    });
+    await hydrateExperiments(setup);
+    const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
+    expect(trigger.textContent).toBe("Summarize");
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    const portalRoot = setup.view.baseElement.ownerDocument.body;
+    await waitFor(() =>
+      expect(within(portalRoot).getAllByText("Continuous").length).toBeGreaterThan(0)
+    );
+    expect(within(portalRoot).queryAllByText("Token Budget")).toHaveLength(0);
+    expect(setup.backendOverrides).toEqual({ [EXPERIMENT_IDS.TOKEN_BUDGET]: true });
+    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+  });
+
+  test("persists flat chat list mode from the Sidebar group", () => {
+    const { view } = renderGeneralSection();
+    const sidebarHeading = view.getByRole("heading", { name: "Sidebar" });
+    const sidebarGroup = sidebarHeading.parentElement;
+    expect(sidebarGroup).not.toBeNull();
+    const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
+
+    fireEvent.click(toggle);
+
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+  });
+
   test("persists the collapsed bash summaries display mode", async () => {
     const { view } = renderGeneralSection();
 
@@ -317,6 +679,219 @@ describe("GeneralSection", () => {
     expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
       JSON.stringify("intent")
     );
+  });
+
+  test("loads the SSH host setting in browser mode", async () => {
+    // Browser mode means no window.api. It is read at render time, so this holds even when
+    // another test file in the same process imported GeneralSection before the DOM existed.
+    const setup = renderGeneralSection();
+    // The mount effect requests the host synchronously; a missing call means browser mode was
+    // not detected, which is a different failure from a slow load.
+    expect(setup.getSshHostMock).toHaveBeenCalledTimes(1);
+
+    await settleMountLoads(setup);
+    expect(setup.view.getByText("SSH Host")).toBeTruthy();
+  });
+
+  test("shows the saved SSH host again when saving an edit fails (#4748)", async () => {
+    const setup = renderGeneralSection();
+    await settleMountLoads(setup);
+    // What the backend still holds after the rejected save.
+    setup.getSshHostMock.mockResolvedValue("saved-host");
+    setup.setSshHostMock.mockRejectedValueOnce(new Error("config write failed"));
+    const label = await setup.view.findByText("SSH Host");
+    const input = label.parentElement?.parentElement?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error("SSH host input not found");
+
+    await userEvent.setup({ document: input.ownerDocument }).type(input, "n");
+
+    // The backend kept the old host, so the field must not keep advertising the unsaved one.
+    await waitFor(() => {
+      expect(setup.setSshHostMock).toHaveBeenCalledWith({ sshHost: "n" });
+      expect(input.value).toBe("saved-host");
+    });
+  });
+
+  test("loads and persists the full-width chat transcript toggle", async () => {
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const { updateChatTranscriptFullWidthMock, view } = setup;
+
+    const toggle = view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false });
+    });
+  });
+
+  test("shows the keep screen awake toggle only in the desktop app", async () => {
+    const browser = renderGeneralSection();
+    await settleMountLoads(browser);
+    expect(browser.view.queryByText("Keep screen awake while agents are working")).toBeNull();
+    browser.view.unmount();
+
+    const desktop = renderGeneralSection({ desktop: true });
+    await settleMountLoads(desktop);
+    expect(desktop.view.getByText("Keep screen awake while agents are working")).toBeTruthy();
+  });
+
+  test("loads and persists the keep screen awake toggle", async () => {
+    const setup = renderGeneralSection({ desktop: true, keepScreenAwake: true });
+    const { updateKeepScreenAwakeMock, view } = setup;
+
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: false });
+    });
+  });
+
+  test.each([true, false])("reverts a rejected keep-awake save from %s", async (saved) => {
+    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: saved,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await act(() => Promise.resolve());
+    expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    updateKeepScreenAwakeMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe(String(!saved));
+    await waitFor(() => {
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: !saved });
+      expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    });
+  });
+
+  test.each([true, false])(
+    "rolls rapid keep-awake toggles back to the confirmed value (first save succeeds: %s)",
+    async (firstSucceeds) => {
+      const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+        desktop: true,
+        keepScreenAwake: true,
+      });
+      const toggle = view.getByRole("switch", {
+        name: "Toggle keep screen awake while agents are working",
+      });
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+      const writes: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+      updateKeepScreenAwakeMock.mockImplementation(
+        () => new Promise<void>((resolve, reject) => writes.push({ resolve, reject }))
+      );
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(writes).toHaveLength(1));
+      fireEvent.click(toggle);
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(writes).toHaveLength(1);
+
+      act(() => {
+        if (firstSucceeds) writes[0].resolve();
+        else writes[0].reject(new Error("first save failed"));
+      });
+      await waitFor(() => expect(writes).toHaveLength(2));
+      // A stale failure must not replace the newer selection, even before its write starts.
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[1].reject(new Error("second save failed")));
+      await waitFor(() => expect(writes).toHaveLength(3));
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[2].reject(new Error("last save failed")));
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe(String(!firstSucceeds)));
+    }
+  );
+
+  test("follows keep-awake changes made outside the mounted section", async () => {
+    // e.g. the "Toggle Keep Screen Awake" palette command runs while Settings is open.
+    const { config, emitConfigChanged, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+
+    config.keepScreenAwake = true;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  test("an external config change does not override an in-flight keep-awake save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let finishWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      return new Promise<void>((resolve) => {
+        finishWrite = () => {
+          config.keepScreenAwake = enabled;
+          resolve();
+        };
+      });
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(finishWrite).not.toBeNull());
+    // An unrelated config edit lands while our write is still pending (disk still says false).
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => finishWrite?.());
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  test("replays an external keep-awake change that landed during a local save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      desktop: true,
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let resolveWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      // The backend applies our write right away, but its response is still in flight.
+      config.keepScreenAwake = enabled;
+      return new Promise<void>((resolve) => (resolveWrite = resolve));
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(resolveWrite).not.toBeNull());
+    // The palette command then turns it back off before our response arrives.
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    act(() => resolveWrite?.());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
   });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {
@@ -382,9 +957,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {
@@ -433,9 +1008,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {
@@ -476,9 +1051,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {

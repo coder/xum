@@ -27,7 +27,7 @@ export const ContextSwitchWarning: React.FC<Props> = (props) => {
   return (
     <div
       data-testid="context-switch-warning"
-      className="bg-background-secondary border-plan-mode mx-4 rounded-md border px-4 py-3"
+      className="bg-background-secondary border-plan-mode rounded-md border px-4 py-3"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1">

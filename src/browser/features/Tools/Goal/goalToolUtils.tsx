@@ -22,10 +22,15 @@ export function formatGoalElapsed(startedAtMs: number, nowMs: number = Date.now(
   return `${hours}h ${minutes % 60}m`;
 }
 
+// Shared turn-count pluralization so the goal toolcards render "1 turn" /
+// "N turns" consistently (was open-coded in formatGoalTurns and the set_goal
+// toolcard's requested-turns formatter).
+export function pluralizeTurns(count: number): string {
+  return `${count} turn${count === 1 ? "" : "s"}`;
+}
+
 export function formatGoalTurns(turnsUsed: number, turnCap: number | null): string {
-  return turnCap == null
-    ? `${turnsUsed} turn${turnsUsed === 1 ? "" : "s"}`
-    : `${turnsUsed} / ${turnCap} turns`;
+  return turnCap == null ? pluralizeTurns(turnsUsed) : `${turnsUsed} / ${turnCap} turns`;
 }
 
 export function formatGoalBudgetSummary(costCents: number, budgetCents: number | null): string {

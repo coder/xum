@@ -55,8 +55,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message Claude"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -67,6 +67,30 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
       }
 
       return enabled;
+    },
+    { timeout: 10_000 }
+  );
+}
+
+async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLTextAreaElement> {
+  return waitFor(
+    () => {
+      const dock = container.querySelector('[data-testid="chat-composer-dock"]');
+      if (!dock) {
+        throw new Error("Chat composer dock not found");
+      }
+
+      const textarea = dock.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Message Claude"]'
+      );
+      if (!textarea) {
+        throw new Error("Composer textarea not found");
+      }
+      if (textarea.disabled) {
+        throw new Error("Composer textarea is disabled");
+      }
+
+      return textarea;
     },
     { timeout: 10_000 }
   );
@@ -83,8 +107,8 @@ async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLB
   return waitFor(
     () => {
       const buttons = Array.from(
-        container.querySelectorAll('button[aria-label="Send message"]')
-      ) as HTMLButtonElement[];
+        container.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')
+      );
       const trigger = [...buttons]
         .reverse()
         .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);
@@ -132,7 +156,7 @@ describe("Send dispatch modes (mock AI router)", () => {
     }
   }, 60_000);
 
-  test("running goals steer by default and expose an explicit pause send action", async () => {
+  test("running goals pause on manual sends and omit a redundant pause send action", async () => {
     const app = await createAppHarness({ branchPrefix: "send-mode-goal-policy" });
 
     try {
@@ -149,38 +173,193 @@ describe("Send dispatch modes (mock AI router)", () => {
         );
       });
 
-      await app.chat.typeWithoutSending("Steer without pausing");
-      const sendButton = await waitForSendModeMenuTrigger(app.view.container);
-      fireEvent.click(sendButton);
-      await app.chat.expectStreamComplete();
-
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("active");
-      });
-
-      await app.chat.typeWithoutSending("Pause after this steering note");
+      await app.chat.typeWithoutSending("Manual note pauses the goal");
       await openSendModeMenu(app.view.container);
-      const pauseRow = await waitFor(() => {
-        const rows = Array.from(app.view.container.querySelectorAll("button"));
-        const row = rows.find((button) => button.textContent?.includes("Send and pause goal"));
-        if (!row) {
-          throw new Error("Send and pause goal row not found");
-        }
-        return row;
-      });
-      fireEvent.click(pauseRow);
+      const rows = Array.from(app.view.container.querySelectorAll("button"));
+      expect(rows.some((button) => button.textContent?.includes("Send and pause goal"))).toBe(
+        false
+      );
+      const sendAfterTurnRow = rows.find((button) =>
+        button.textContent?.includes("Send after turn")
+      );
+      if (!sendAfterTurnRow) {
+        throw new Error("Send after turn row not found");
+      }
+      fireEvent.click(sendAfterTurnRow);
       await app.chat.expectStreamComplete();
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("paused");
-      });
+      // Backend round trip per poll: waitFor's default 1 s is too short under CI load (#5029).
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.status).toBe("paused");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
   }, 60_000);
 
+  test("send after step waits for every tool call emitted in the current step", async () => {
+    const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
+
+    try {
+      await app.chat.send("[mock:tool:parallel-step] Run both sibling tool calls");
+      await waitFor(() => {
+        const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
+        if (!state.canInterrupt) {
+          throw new Error("Expected the source turn to be streaming before queueing");
+        }
+      });
+
+      const queuedText = "follow up after the complete tool step";
+      await app.chat.typeWithoutSending(queuedText);
+      const sendButton = await waitForSendModeMenuTrigger(app.view.container);
+      fireEvent.click(sendButton);
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Queued");
+        expect(app.view.container.textContent).toContain("Sends after this step");
+      });
+
+      await app.chat.expectTranscriptContains("parallel-step-a.txt");
+      await app.chat.expectTranscriptContains("parallel-step-b.txt");
+      await app.chat.expectTranscriptContains(
+        "Finished both sibling tool calls before continuing."
+      );
+      await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`);
+      await app.chat.expectStreamComplete();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("queued send keybinds update the boundary and can send immediately", async () => {
+    const app = await createAppHarness({ branchPrefix: "queued-enter-send-now" });
+
+    try {
+      await startStreamingTurn(app, "queued enter source");
+      await waitFor(
+        () => {
+          const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
+          if (!state.canInterrupt) {
+            throw new Error("Expected source stream to be interruptible");
+          }
+        },
+        { timeout: 30_000 }
+      );
+
+      const queuedText = "queued enter send now test";
+      await app.chat.typeWithoutSending(queuedText);
+      await openSendModeMenu(app.view.container);
+      const sendAfterTurnRow = await waitFor(
+        () => {
+          const row = Array.from(app.view.container.querySelectorAll("button")).find((button) =>
+            button.textContent?.includes("Send after turn")
+          );
+          if (!row) {
+            throw new Error("Send after turn row not found");
+          }
+          return row;
+        },
+        { timeout: 30_000 }
+      );
+      fireEvent.click(sendAfterTurnRow);
+
+      await waitFor(() => {
+        const textContent = app.view.container.textContent ?? "";
+        expect(textContent).toContain("Queued");
+        expect(textContent).toContain("Sends after this turn");
+        expect(
+          app.view.container.querySelector('[data-component="QueuedMessageDispatchMenu"]')
+        ).toBeNull();
+      });
+
+      const queuedDispatchButton = app.view.container.querySelector<HTMLButtonElement>(
+        '[data-component="QueuedMessageStatus"]'
+      );
+      if (!queuedDispatchButton) {
+        throw new Error("Queued dispatch dropdown not found");
+      }
+      fireEvent.click(queuedDispatchButton);
+      const queuedDispatchMenu = await waitFor(() => {
+        const menu = app.view.container.querySelector<HTMLElement>(
+          '[data-component="QueuedMessageDispatchMenu"]'
+        );
+        expect(menu?.textContent).toContain("Send after step");
+        expect(menu?.textContent).toContain("Send after turn");
+        expect(menu?.textContent).toContain("Send now");
+        if (!menu) throw new Error("Queued dispatch menu not rendered");
+        return menu;
+      });
+      const sendAfterStepRow = Array.from(queuedDispatchMenu.querySelectorAll("button")).find(
+        (button) => button.textContent?.includes("Send after step")
+      );
+      if (!sendAfterStepRow) throw new Error("Queued Send after step action not found");
+      fireEvent.click(sendAfterStepRow);
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+        expect(app.view.container.textContent).not.toContain("Sends after this turn");
+        expect(app.view.container.textContent).toContain(queuedText);
+      });
+
+      const textarea = await getComposerDockTextarea(app.view.container);
+      await waitFor(() => {
+        expect(textarea.value).toBe("");
+      });
+
+      textarea.focus();
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+      });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this turn");
+      });
+
+      fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+      });
+
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+      });
+      // A fast repeated send-now shortcut should be ignored while the interrupt is in flight.
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+        repeat: true,
+      });
+
+      await waitFor(
+        () => {
+          expect(app.view.container.textContent).not.toContain("Sends after this step");
+        },
+        { timeout: 30_000 }
+      );
+      await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`, 60_000);
+      await app.chat.expectStreamComplete(60_000);
+      const responseMatches = app.view.container.textContent?.match(
+        new RegExp(`Mock response: ${queuedText}`, "g")
+      );
+      expect(responseMatches).toHaveLength(1);
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  // This end-to-end-style case drives several streaming turns and foreground-tool transitions,
+  // so give loaded CI runners more than the default per-test budget.
   test("click sends tool-end by default while context menu + keybind dispatch modes remain", async () => {
     const app = await createAppHarness({ branchPrefix: "send-mode-pointer" });
 
@@ -332,5 +511,5 @@ describe("Send dispatch modes (mock AI router)", () => {
       unregisterStep?.();
       await app.dispose();
     }
-  }, 60_000);
+  }, 120_000);
 });

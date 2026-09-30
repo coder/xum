@@ -44,10 +44,18 @@ interface ReviewControlsProps {
   onToggleImmersive?: () => void;
   /**
    * Number of agent-flagged "Assisted" hunks the agent has pinned via
-   * the `review_pane_update` tool. When zero, the Assisted toggle is hidden
-   * so the control bar stays compact for normal review sessions.
+   * the `review_pane_update` tool. When zero AND the user isn't currently
+   * in Assisted mode, the toggle is hidden so the control bar stays compact
+   * for normal review sessions. If the user already flipped Assisted on we
+   * keep the toggle so they can flip back out without using the keyboard.
    */
   assistedCount?: number;
+  /**
+   * Number of unread assisted hunks. Surfaced next to the Assisted toggle so
+   * the count tracks the remaining worklist rather than the static total,
+   * matching the Review tab badge.
+   */
+  assistedUnreadCount?: number;
 }
 
 export const ReviewControls: React.FC<ReviewControlsProps> = ({
@@ -64,6 +72,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
   isImmersive = false,
   onToggleImmersive,
   assistedCount = 0,
+  assistedUnreadCount = 0,
 }) => {
   // Per-project default base (used for new workspaces in this project)
   const [defaultBase, setDefaultBase] = usePersistedState<string>(
@@ -91,9 +100,18 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
     onFiltersChange((prev) => ({ ...prev, includeUncommitted: checked }));
   };
 
+  // While Assisted is on the "Read:" toggle binds to the assisted-scoped
+  // flag so toggling it in worklist mode doesn't reach back into the user's
+  // general review preference (and vice versa). The two flags persist
+  // independently so a user who turns off "show read" globally still gets
+  // the worklist default ("hide done") when they enter Assisted mode.
   const handleShowReadToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
     const checked = e.target.checked;
-    onFiltersChange((prev) => ({ ...prev, showReadHunks: checked }));
+    if (filters.assistedOnly) {
+      onFiltersChange((prev) => ({ ...prev, assistedShowReadHunks: checked }));
+    } else {
+      onFiltersChange((prev) => ({ ...prev, showReadHunks: checked }));
+    }
   };
 
   const handleAssistedToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -176,33 +194,69 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
 
       <div className="bg-border-light h-3 w-px" />
 
-      <label className="text-muted hover:text-foreground flex cursor-pointer items-center gap-1 whitespace-nowrap">
-        <span>Uncommitted:</span>
-        <input
-          type="checkbox"
-          checked={filters.includeUncommitted}
-          onChange={handleUncommittedToggle}
-          className="h-3 w-3 cursor-pointer"
-        />
-      </label>
+      {/* Uncommitted is force-enabled while Assisted is on so agent pins that
+          target uncommitted edits cannot disappear because of a stale toggle.
+          We render the checkbox in a disabled state (rather than hiding it)
+          so the user can tell why the value isn't editable. */}
+      <TooltipIfPresent
+        tooltip={
+          filters.assistedOnly
+            ? "Always on while Assisted is enabled — agent pins often target uncommitted edits"
+            : undefined
+        }
+        side="bottom"
+      >
+        <label
+          className={`flex items-center gap-1 whitespace-nowrap ${
+            filters.assistedOnly
+              ? "text-dim cursor-not-allowed"
+              : "text-muted hover:text-foreground cursor-pointer"
+          }`}
+        >
+          <span>Uncommitted:</span>
+          <input
+            type="checkbox"
+            checked={filters.assistedOnly ? true : filters.includeUncommitted}
+            disabled={filters.assistedOnly}
+            onChange={handleUncommittedToggle}
+            className={`h-3 w-3 ${filters.assistedOnly ? "cursor-not-allowed" : "cursor-pointer"}`}
+          />
+        </label>
+      </TooltipIfPresent>
 
       <div className="bg-border-light h-3 w-px" />
 
-      <label className="text-muted hover:text-foreground flex cursor-pointer items-center gap-1 whitespace-nowrap">
-        <span>Read:</span>
-        <input
-          type="checkbox"
-          checked={filters.showReadHunks}
-          onChange={handleShowReadToggle}
-          className="h-3 w-3 cursor-pointer"
-        />
-      </label>
+      <TooltipIfPresent
+        tooltip={
+          filters.assistedOnly
+            ? "Show pins you've already marked as read (Assisted-scoped — your general 'Read:' preference is unaffected)"
+            : undefined
+        }
+        side="bottom"
+      >
+        <label className="text-muted hover:text-foreground flex cursor-pointer items-center gap-1 whitespace-nowrap">
+          <span>Read:</span>
+          <input
+            type="checkbox"
+            checked={filters.assistedOnly ? filters.assistedShowReadHunks : filters.showReadHunks}
+            onChange={handleShowReadToggle}
+            className="h-3 w-3 cursor-pointer"
+            data-testid="review-show-read-toggle"
+          />
+        </label>
+      </TooltipIfPresent>
 
-      {assistedCount > 0 && (
+      {(assistedCount > 0 || filters.assistedOnly) && (
         <>
           <div className="bg-border-light h-3 w-px" />
           <TooltipIfPresent
-            tooltip={`Show only the ${assistedCount} hunk${assistedCount === 1 ? "" : "s"} the agent flagged for review`}
+            tooltip={
+              assistedCount === 0
+                ? `No agent-flagged hunks remain — toggle off to see the full diff (${formatKeybind(KEYBINDS.TOGGLE_ASSISTED_REVIEW)})`
+                : assistedUnreadCount === assistedCount
+                  ? `Show only the ${assistedCount} hunk${assistedCount === 1 ? "" : "s"} the agent flagged for review (${formatKeybind(KEYBINDS.TOGGLE_ASSISTED_REVIEW)})`
+                  : `${assistedUnreadCount} of ${assistedCount} agent-flagged hunk${assistedCount === 1 ? "" : "s"} still unread (${formatKeybind(KEYBINDS.TOGGLE_ASSISTED_REVIEW)})`
+            }
             side="bottom"
           >
             <label className="text-muted hover:text-foreground flex cursor-pointer items-center gap-1 whitespace-nowrap">
@@ -215,7 +269,12 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
                 onChange={handleAssistedToggle}
                 className="h-3 w-3 cursor-pointer"
               />
-              <span className="text-dim text-[10px]">({assistedCount})</span>
+              <span className="text-dim text-[10px]" data-testid="review-assisted-count">
+                {/* Show "unread/total" in worklist mode and the total elsewhere.
+                    The two-number form mirrors the Review tab badge and keeps
+                    the user's remaining work front-and-center. */}
+                ({assistedUnreadCount}/{assistedCount})
+              </span>
             </label>
           </TooltipIfPresent>
         </>

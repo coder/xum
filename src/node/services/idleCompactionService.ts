@@ -1,18 +1,42 @@
+import { Duration, Effect, Exit, Schedule, Scope } from "effect";
 import assert from "@/common/utils/assert";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "./taskUtils";
 import type { Config } from "@/node/config";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
+import type { MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { log } from "./log";
 
-const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
-const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+export const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
+export const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const HOURS_TO_MS = 60 * 60 * 1000;
+
+/**
+ * Stop attempting idle compaction for a workspace once it has failed this many
+ * times in a row. The hourly loop would otherwise re-queue a persistently
+ * failing workspace forever (a failed compaction neither marks the workspace
+ * `compacted` nor refreshes recency, so it stays eligible).
+ */
+const MAX_CONSECUTIVE_IDLE_COMPACTION_FAILURES = 2;
 
 interface QueuedIdleCompaction {
   workspaceId: string;
   thresholdMs: number;
 }
+
+/**
+ * Terminal outcome of an idle compaction attempt, reported back to the service
+ * so it can decide whether to keep attempting compaction for a workspace.
+ *
+ * `modelNotFound` is treated as non-recoverable: the configured compaction model
+ * does not exist / is not available, and retrying will keep failing the same way,
+ * so we stop after a single occurrence rather than waiting for two failures.
+ */
+export type IdleCompactionOutcome = { success: true } | { success: false; modelNotFound: boolean };
 
 /**
  * IdleCompactionService monitors workspaces for idle time and executes
@@ -21,29 +45,51 @@ interface QueuedIdleCompaction {
  * Compactions are globally serialized to avoid thundering herd behavior when
  * one check cycle finds many idle workspaces at once.
  */
+/** Last row that is not a hidden plan-review record (see isPlanReviewRecordMessage). */
+function findLastNonRecordMessage(messages: readonly MuxMessage[]): MuxMessage | undefined {
+  return messages.findLast((message) => !isPlanReviewRecordMessage(message));
+}
+
 export class IdleCompactionService {
   private readonly config: Config;
   private readonly historyService: HistoryService;
   private readonly extensionMetadata: ExtensionMetadataService;
   private readonly executeIdleCompaction: (workspaceId: string) => Promise<void>;
-  private initialTimeout: ReturnType<typeof setTimeout> | null = null;
-  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Runs the checker fork and the scope close. Context-bound in the app (the
+   * checker reads the runtime's `Clock` — a `TestClock` in tests); the global
+   * runtime by default.
+   */
+  private readonly runner: EffectRunner;
+  /**
+   * Owns the checker fiber forked by start(): sleep(INITIAL_CHECK_DELAY_MS),
+   * then check immediately and every CHECK_INTERVAL_MS. Closing the scope in
+   * stop() interrupts the fiber, synchronously clearing its pending timer.
+   */
+  private lifecycleScope: Scope.Closeable | null = null;
   private readonly queue: QueuedIdleCompaction[] = [];
   private readonly queuedWorkspaceIds = new Set<string>();
   private readonly activeWorkspaceIds = new Set<string>();
   private isProcessingQueue = false;
   private stopped = false;
+  // Per-workspace count of consecutive failed idle compactions (reset on success).
+  private readonly consecutiveFailures = new Map<string, number>();
+  // Workspaces for which the idle compaction loop has been stopped after repeated
+  // (or non-recoverable) failures. Sticky for the service lifetime; cleared on restart.
+  private readonly suppressedWorkspaceIds = new Set<string>();
 
   constructor(
     config: Config,
     historyService: HistoryService,
     extensionMetadata: ExtensionMetadataService,
-    executeIdleCompaction: (workspaceId: string) => Promise<void>
+    executeIdleCompaction: (workspaceId: string) => Promise<void>,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.config = config;
     this.historyService = historyService;
     this.extensionMetadata = extensionMetadata;
     this.executeIdleCompaction = executeIdleCompaction;
+    this.runner = runner;
   }
 
   /**
@@ -53,14 +99,27 @@ export class IdleCompactionService {
   start(): void {
     this.stopped = false;
 
-    // First check after delay to let startup settle.
-    this.initialTimeout = setTimeout(() => {
-      void this.checkAllWorkspaces();
-      // Then periodically.
-      this.checkInterval = setInterval(() => {
-        void this.checkAllWorkspaces();
-      }, CHECK_INTERVAL_MS);
-    }, INITIAL_CHECK_DELAY_MS);
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    const scope = Scope.makeUnsafe();
+    this.lifecycleScope = scope;
+
+    const checker = Effect.gen(function* () {
+      // First check after delay to let startup settle.
+      yield* Effect.sleep(Duration.millis(INITIAL_CHECK_DELAY_MS));
+      // Effect.repeat runs the first check immediately (matching the legacy
+      // direct call when the initial timer fired), then Schedule.fixed
+      // reproduces setInterval cadence. The check stays fire-and-forget so a
+      // slow sweep never delays the next cadence slot (same as setInterval).
+      yield* Effect.sync(() => {
+        void self.checkAllWorkspaces();
+      }).pipe(Effect.repeat(Schedule.fixed(Duration.millis(CHECK_INTERVAL_MS))));
+    });
+    // Runs synchronously up to the checker's first sleep, so the initial-delay
+    // timer is registered before start() returns (same as the previous
+    // setTimeout call).
+    this.runner.runSync(Effect.forkIn(checker, scope));
+
     log.info("IdleCompactionService started", {
       initialDelayMs: INITIAL_CHECK_DELAY_MS,
       intervalMs: CHECK_INTERVAL_MS,
@@ -73,13 +132,12 @@ export class IdleCompactionService {
   stop(): void {
     this.stopped = true;
 
-    if (this.initialTimeout) {
-      clearTimeout(this.initialTimeout);
-      this.initialTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
+    if (this.lifecycleScope) {
+      const scope = this.lifecycleScope;
+      this.lifecycleScope = null;
+      // Interrupts the checker fiber, synchronously clearing its pending
+      // timer — the fiber only ever suspends on its clock timer.
+      this.runner.runSync(Scope.close(scope, Exit.void));
     }
 
     // Best-effort queue reset: do not start new compactions after stop().
@@ -103,6 +161,7 @@ export class IdleCompactionService {
       const thresholdMs = idleHours * HOURS_TO_MS;
 
       for (const workspace of projectConfig.workspaces) {
+        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
         const workspaceId = workspace.id ?? workspace.name;
         if (!workspaceId) continue;
 
@@ -223,6 +282,18 @@ export class IdleCompactionService {
     thresholdMs: number,
     now: number
   ): Promise<{ eligible: boolean; reason?: string }> {
+    // Recheck queued work too: a workspace can be archived while waiting for compaction.
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+      return { eligible: false, reason: "archived" };
+    }
+
+    // 0. Has the loop been stopped for this workspace after repeated/non-recoverable
+    // failures? Skip before touching history so a failing workspace stops re-queuing.
+    if (this.suppressedWorkspaceIds.has(workspaceId)) {
+      return { eligible: false, reason: "suppressed_after_failures" };
+    }
+
     // 1. Has messages? Only need tail messages — recency + last-message checks don't need full history.
     const historyResult = await this.historyService.getLastMessages(workspaceId, 50);
     if (!historyResult.success || historyResult.data.length === 0) {
@@ -246,18 +317,67 @@ export class IdleCompactionService {
       return { eligible: false, reason: "currently_streaming" };
     }
 
-    // 4. Already compacted? (last message is compacted summary)
-    const lastMessage = messages[messages.length - 1];
+    // 4./5. judge the tail by the last row the model would see. Hidden plan-review records
+    // (resolve/reopen or an on-demand snapshot appended while idle) are user-role rows but never
+    // a prompt awaiting a response, so they must not disable compaction; a real unanswered
+    // prompt before them keeps its protection.
+    let lastMessage = findLastNonRecordMessage(messages);
+    if (lastMessage === undefined) {
+      // The bounded tail held only hidden rows, so it cannot tell an answered turn from a
+      // pending prompt further back: consult the history since the latest boundary.
+      const fullHistory = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!fullHistory.success) {
+        return { eligible: false, reason: "no_messages" };
+      }
+      lastMessage = findLastNonRecordMessage(fullHistory.data);
+      if (lastMessage === undefined) {
+        return { eligible: false, reason: "no_messages" };
+      }
+    }
+    // Already compacted? (last message is compacted summary)
     // Support both new enum ("user"|"idle") and legacy boolean (true)
-    if (lastMessage?.metadata?.compacted) {
+    if (lastMessage.metadata?.compacted) {
       return { eligible: false, reason: "already_compacted" };
     }
 
-    // 5. Last message is user message with no response? (incomplete conversation)
-    if (lastMessage?.role === "user") {
+    // Last message is user message with no response? (incomplete conversation)
+    if (lastMessage.role === "user") {
       return { eligible: false, reason: "awaiting_response" };
     }
 
     return { eligible: true };
+  }
+
+  /**
+   * Record the terminal outcome of an idle compaction attempt so the loop can
+   * stop re-attempting a persistently failing workspace.
+   *
+   * - Success resets the failure count AND lifts any suppression — a compaction that
+   *   actually persisted means the workspace is healthy again (self-healing). This also
+   *   covers an in-flight retry that succeeds after suppression was set.
+   * - A `model_not_found` failure is non-recoverable, so the loop stops immediately.
+   * - Any other failure stops the loop once it happens twice in a row.
+   *
+   * Suppression is in-memory (also cleared on restart, e.g. after fixing the model config).
+   */
+  recordOutcome(workspaceId: string, outcome: IdleCompactionOutcome): void {
+    if (outcome.success) {
+      this.consecutiveFailures.delete(workspaceId);
+      this.suppressedWorkspaceIds.delete(workspaceId);
+      return;
+    }
+
+    const failures = (this.consecutiveFailures.get(workspaceId) ?? 0) + 1;
+    this.consecutiveFailures.set(workspaceId, failures);
+
+    if (outcome.modelNotFound || failures >= MAX_CONSECUTIVE_IDLE_COMPACTION_FAILURES) {
+      this.suppressedWorkspaceIds.add(workspaceId);
+      this.consecutiveFailures.delete(workspaceId);
+      log.warn("Stopping idle compaction for workspace after failure", {
+        workspaceId,
+        reason: outcome.modelNotFound ? "model_not_found" : "consecutive_failures",
+        failures,
+      });
+    }
   }
 }

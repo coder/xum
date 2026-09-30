@@ -1,21 +1,32 @@
-/**
- * Component to display the PR badge in the workspace header.
- * PR is detected from the workspace's current branch via `gh pr view`.
- */
-
-import { useWorkspacePR } from "@/browser/stores/PRStatusStore";
+import { useWorkspacePR, useWorkspaceStack } from "@/browser/stores/PRStatusStore";
 import { PRLinkBadge } from "../PRLinkBadge/PRLinkBadge";
+import { PRStackBadge } from "../PRStackBadge/PRStackBadge";
 
 interface WorkspaceLinksProps {
   workspaceId: string;
+  /** Applied to each badge so callers can hide them without leaving empty flex items. */
+  className?: string;
+  menuDirection?: "up" | "down";
 }
 
-export function WorkspaceLinks({ workspaceId }: WorkspaceLinksProps) {
-  const workspacePR = useWorkspacePR(workspaceId);
+export function WorkspaceLinks(props: WorkspaceLinksProps) {
+  const workspacePR = useWorkspacePR(props.workspaceId);
+  const workspaceStack = useWorkspaceStack(props.workspaceId);
 
-  if (!workspacePR) {
+  if (!workspacePR && !workspaceStack) {
     return null;
   }
 
-  return <PRLinkBadge prLink={workspacePR} />;
+  return (
+    <>
+      {workspacePR && <PRLinkBadge prLink={workspacePR} className={props.className} />}
+      {workspaceStack && (
+        <PRStackBadge
+          stack={workspaceStack}
+          className={props.className}
+          menuDirection={props.menuDirection}
+        />
+      )}
+    </>
+  );
 }

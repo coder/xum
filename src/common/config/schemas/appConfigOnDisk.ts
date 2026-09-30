@@ -3,34 +3,71 @@ import { z } from "zod";
 import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
+import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
-import {
-  DEFAULT_IMAGE_GENERATION_MAX_IMAGES,
-  MAX_IMAGE_GENERATION_MAX_IMAGES,
-  MIN_IMAGE_GENERATION_MAX_IMAGES,
-} from "@/common/types/imageGeneration";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
+export { UserPreferencesSchema } from "./userPreferences";
+export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
 export type { TaskSettings } from "./taskSettings";
+// Managed Agent Plugin installs live in ~/.mux/plugins.json (see
+// ./agentPluginInstalls.ts for why they are NOT a config.json section).
+export {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+  AgentPluginInstallSourceSchema,
+} from "./agentPluginInstalls";
+export type {
+  AgentPluginGitSource,
+  AgentPluginInstallEntry,
+  AgentPluginInstallSource,
+} from "./agentPluginInstalls";
+
+/**
+ * Sparse delegated-run (sub-agent) override profile nested under an agent's
+ * canonical defaults entry. Missing fields inherit field-wise from the base
+ * (interactive) profile and lower precedence tiers.
+ */
+export const AgentAiSubagentProfileSchema = z.object({
+  modelString: z.string().optional(),
+  thinkingLevel: ThinkingLevelSchema.optional(),
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
+});
 
 export const AgentAiDefaultsEntrySchema = z.object({
   modelString: z.string().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  // Sparse like the other fields: only explicit "pro" is persisted; absent
+  // inherits the workspace's current reasoning mode.
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
+  // Auto routing is interactive-only; only `true` persists, while concrete values remain fallbacks.
+  autoModelRouting: z.boolean().optional(),
+  autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  advisorEnabled: z.boolean().optional(),
+  subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
 export const AgentAiDefaultsSchema = z.record(AgentIdSchema, AgentAiDefaultsEntrySchema);
 
+/**
+ * Legacy root map retained only as a one-way disk projection for downgrade
+ * compatibility: older builds read/write this map instead of the nested
+ * `subagent` profile. Current runtime code must never consume it outside the
+ * config load/serialization boundary.
+ */
 export const SubagentAiDefaultsEntrySchema = z.object({
   modelString: z.string().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
 });
 
 export const SubagentAiDefaultsSchema = z.record(AgentIdSchema, SubagentAiDefaultsEntrySchema);
@@ -52,27 +89,70 @@ export const GoalDefaultsSchema = z.object({
     .default(DEFAULT_GOAL_DEFAULTS.alwaysRequireExplicitBudget),
 });
 
-export const AppConfigMigrationsSchema = z.object({
-  execSubagentDefaultsSplit: z.boolean().optional(),
+/**
+ * Refusal-only at launch: silent fallback on quota/auth/context/rate-limit errors
+ * would cost money or hide configuration problems. Future opt-in triggers (e.g.
+ * model_not_found) can extend this union.
+ */
+export const ModelFallbackTriggerSchema = z.literal("model_refusal");
+
+export const ModelFallbackEntrySchema = z.object({
+  /** Default true when the entry exists. */
+  enabled: z.boolean().optional(),
+  /** Defaults to ["model_refusal"] (the only supported trigger today). */
+  triggers: z.array(ModelFallbackTriggerSchema).optional(),
+  /** Ordered fallback chain (canonical model strings); one attempt per model. */
+  models: z.array(z.string()),
 });
 
-export const ImageGenerationConfigSchema = z
+/** Per-model fallback chains, keyed by canonical source model. */
+export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchema);
+
+/**
+ * Settings → Tasks & Workflows → Evaluation model: the default for workflow
+ * `evaluate()` steps that do not pass `model` themselves (a `provider:model`
+ * string). Absent means "no default" — the step fails with
+ * `invalid-input/no-model`; it is never inferred from the chat model.
+ *
+ * Deliberately separate from `autoModelRouting.evaluationModel` below: that one
+ * selects the prompt-difficulty classifier for automatic chat model routing
+ * (defaulting to TypeSafe's Jev), whereas this one selects an explicit,
+ * author-invoked workflow evaluator with its own admission and billing
+ * semantics. Neither falls back to the other.
+ */
+export const EvaluationDefaultsSchema = z.object({
+  model: z.string().min(1).optional(),
+});
+
+export const AppConfigMigrationsSchema = z
   .object({
-    modelString: z.string().optional(),
-    maxImagesPerCall: z
-      .number()
-      .int()
-      .min(MIN_IMAGE_GENERATION_MAX_IMAGES)
-      .max(MAX_IMAGE_GENERATION_MAX_IMAGES)
-      .default(DEFAULT_IMAGE_GENERATION_MAX_IMAGES)
-      .optional(),
-    allowImageUploadsForEditing: z.boolean().default(false).optional(),
+    /**
+     * No longer consulted at load (legacy subagentAiDefaults now folds into the
+     * nested `subagent` profile); still written on save so downgraded builds do
+     * not re-run their exec split migration.
+     */
+    execSubagentDefaultsSplit: z.boolean().optional(),
+    userPreferencesInitialized: z.boolean().optional(),
+    daybreakModelsHidden: z.boolean().optional(),
+    // Default seeding must not claim legacy local-only hidden preferences.
+    hiddenModelsInitialized: z.boolean().optional(),
+    /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
+    defaultModelFallbacksSeeded: z.boolean().optional(),
+    /**
+     * One-time re-run of the fallback seed after the fable alias moved to
+     * Fable 5.1: configs seeded before the promotion lack a chain for the new
+     * source key.
+     */
+    defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
+    persistentSubagentsDefaulted: z.boolean().optional(),
   })
-  .optional();
+  // Preserve flags introduced by newer app versions: without the catchall a
+  // downgrade to this version would strip unknown flags on save, re-running
+  // their one-time migrations after re-upgrade (see normalizeConfigMigrations).
+  .catchall(z.boolean());
 
-export const FeatureFlagOverrideSchema = z.enum(["default", "on", "off"]);
-
-export const UpdateChannelSchema = z.enum(["stable", "nightly"]);
+export const UpdateChannelSchema = z.enum(["stable", "nightly", "npm"]);
 
 export const AppConfigOnDiskSchema = z
   .object({
@@ -86,11 +166,14 @@ export const AppConfigOnDiskSchema = z
     serverAuthGithubOwner: z.string().optional(),
     defaultProjectDir: z.string().optional(),
     viewedSplashScreens: z.array(z.string()).optional(),
-    featureFlagOverrides: z.record(z.string(), FeatureFlagOverrideSchema).optional(),
     layoutPresets: z.unknown().optional(),
+    userPreferences: UserPreferencesSchema.optional(),
     taskSettings: TaskSettingsSchema.optional(),
+    chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
+    /** Desktop only: hold a display-sleep blocker while any local agent is working. */
+    keepScreenAwake: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()
@@ -99,13 +182,44 @@ export const AppConfigOnDiskSchema = z
       .max(HEARTBEAT_MAX_INTERVAL_MS)
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
+    evaluationDefaults: EvaluationDefaultsSchema.optional(),
     muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
+    /**
+     * Per-model minimum thinking level (keyed by canonical model id). Hides thinking
+     * levels below the floor in the thinking slider so cycling is more efficient.
+     * Omitted entries fall back to the built-in default (medium for reasoning-capable
+     * models). See getDefaultMinimumThinkingLevel / getAvailableThinkingLevels.
+     */
+    minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
+    /**
+     * Per-model refusal-fallback chains (keyed by canonical source model). When a
+     * model refuses, the turn retries or continues on the next chain model
+     * instead of failing terminally. See resolveModelFallbackChain for the
+     * runtime sanitization rules (drop self, de-dupe, cap length).
+     */
+    modelFallbacks: ModelFallbacksSchema.optional(),
+    /**
+     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized on read
+     * (see normalizeAutoModelRoutingConfig), which heals each tier and field on its own;
+     * absent means the defaults. The document therefore only requires the block's shape:
+     * a hand-edited tier must neither fail the whole document (this schema also validates
+     * unrelated config-tool writes) nor take the valid tiers and evaluator down with it.
+     * `.catch`: anything that is not an object degrades to absent.
+     */
+    autoModelRouting: z
+      .object({ tiers: z.array(z.unknown()).optional(), evaluationModel: z.unknown().optional() })
+      .optional()
+      .catch(undefined),
     defaultModel: z.string().optional(),
+    advisorModelString: z.string().optional(),
+    advisorThinkingLevel: ThinkingLevelSchema.optional(),
+    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
+    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
+    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
-    imageGeneration: ImageGenerationConfigSchema.optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),
     /**
      * Sparse per-agent override that wins over agentAiDefaults when an agent runs as a
@@ -126,17 +240,25 @@ export const AppConfigOnDiskSchema = z
     updateChannel: UpdateChannelSchema.optional(),
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
+    // `.catch`: an unusable stored value must not fail the whole config parse. Degrading to
+    // "not configured" keeps every other setting loadable and lets the user re-enter this one.
+    settingsBackup: SettingsBackupSchema.optional().catch(undefined),
+    // Legacy: 1Password integration was removed. Old builds still read/write this
+    // key, so it is round-tripped for downgrade compatibility but unused at runtime.
     onePasswordAccountName: z.string().optional(),
+    // A fresh random value per save (see Config.configFileWriteGeneration): lets a reader
+    // tell two writes of the same bytes apart, which no timestamp or inode reliably can.
+    writeId: z.string().optional(),
   })
   .passthrough();
 
 export type AppConfigMigrations = z.infer<typeof AppConfigMigrationsSchema>;
+export type AgentAiSubagentProfile = z.infer<typeof AgentAiSubagentProfileSchema>;
 export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
-export type SubagentAiDefaultsEntry = z.infer<typeof SubagentAiDefaultsEntrySchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
-export type GoalDefaultsConfig = z.infer<typeof GoalDefaultsSchema>;
-export type FeatureFlagOverride = z.infer<typeof FeatureFlagOverrideSchema>;
+export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
+export type EvaluationDefaults = z.infer<typeof EvaluationDefaultsSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 
 export type AppConfigOnDisk = z.infer<typeof AppConfigOnDiskSchema>;

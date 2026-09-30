@@ -32,6 +32,7 @@ POLL_INTERVAL_SECS=30
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CHECK_REVIEWS_SCRIPT="$SCRIPT_DIR/check_pr_reviews.sh"
+CHECK_FILTERS_SCRIPT="$SCRIPT_DIR/lib/pr_check_filters.sh"
 SKIP_FETCH_SYNC="${MUX_SKIP_FETCH_SYNC:-0}"
 # shellcheck source=./lib/branch_sync_guard.sh
 # shellcheck disable=SC1091
@@ -46,6 +47,15 @@ if [ ! -x "$CHECK_REVIEWS_SCRIPT" ]; then
   echo "❌ assertion failed: missing executable helper script: $CHECK_REVIEWS_SCRIPT" >&2
   exit 1
 fi
+
+if [ ! -f "$CHECK_FILTERS_SCRIPT" ]; then
+  echo "❌ assertion failed: missing helper script: $CHECK_FILTERS_SCRIPT" >&2
+  exit 1
+fi
+
+# shellcheck source=./lib/pr_check_filters.sh
+# shellcheck disable=SC1091
+source "$CHECK_FILTERS_SCRIPT"
 
 if [ "$SKIP_FETCH_SYNC" != "0" ] && [ "$SKIP_FETCH_SYNC" != "1" ]; then
   echo "❌ assertion failed: MUX_SKIP_FETCH_SYNC must be '0' or '1' (got '$SKIP_FETCH_SYNC')" >&2
@@ -73,11 +83,12 @@ CHECK_PR_CHECKS_ONCE() {
   local pr_state
   local mergeable
   local merge_state
+  local review_decision
   local checks
   local reviews_output
 
   # Get PR status
-  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,state 2>/dev/null || echo "error")
+  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,reviewDecision,state,headRefOid 2>/dev/null || echo "error")
 
   if [ "$status" = "error" ]; then
     echo "❌ Failed to get PR status. Does PR #$PR_NUMBER exist?"
@@ -106,6 +117,8 @@ CHECK_PR_CHECKS_ONCE() {
   merge_state=$(echo "$status" | jq -r '.mergeStateStatus')
   LAST_MERGE_STATE="$merge_state"
 
+  review_decision=$(echo "$status" | jq -r '.reviewDecision // ""')
+
   case "$mergeable" in
     MERGEABLE | CONFLICTING | UNKNOWN) ;;
     *)
@@ -118,6 +131,14 @@ CHECK_PR_CHECKS_ONCE() {
     BEHIND | BLOCKED | CLEAN | DIRTY | DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE) ;;
     *)
       echo "❌ assertion failed: unexpected merge state '$merge_state' for PR #$PR_NUMBER" >&2
+      return 1
+      ;;
+  esac
+
+  case "$review_decision" in
+    "" | APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED) ;;
+    *)
+      echo "❌ assertion failed: unexpected review decision '$review_decision' for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
@@ -143,36 +164,83 @@ CHECK_PR_CHECKS_ONCE() {
     return 1
   fi
 
-  # Get check status
-  checks=$(gh pr checks "$PR_NUMBER" 2>&1 || echo "pending")
+  if [ "$review_decision" = "CHANGES_REQUESTED" ]; then
+    echo "❌ PR has a blocking changes-requested review."
+    return 1
+  fi
+
+  if [ "$review_decision" = "REVIEW_REQUIRED" ]; then
+    echo "❌ PR requires an approving GitHub review before merge."
+    return 1
+  fi
+
+  # Get check status. Pixel posts a persistent "Pixel / Review" status outside
+  # the PR workflow; it is useful visual-signal, but not a merge-readiness gate.
+  local checks_json
+  local jq_defs
+  local filtered_checks
+  local ignored_checks
+  local filtered_count
+  local ignored_unready_count
+  local ignored_unready_checks
+
+  checks_json=$(fetch_pr_checks "$PR_NUMBER" "$status" 2>&1) || {
+    local fetch_status=$?
+    if [ "$fetch_status" -eq 10 ]; then
+      echo "PR state changed while collecting checks; retrying."
+      return 10
+    fi
+    echo "❌ Failed to get PR checks for PR #$PR_NUMBER" >&2
+    echo "$checks_json" >&2
+    return 1
+  }
+
+  jq_defs=$(visual_check_jq_defs)
+  filtered_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check | not) ]")
+  ignored_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check) ]")
+  filtered_count=$(echo "$filtered_checks" | jq 'length')
+  checks=$(echo "$filtered_checks" | jq -r "$jq_defs if length == 0 then \"(no non-visual-review checks reported)\" else .[] | check_line end")
+  ignored_unready_count=$(echo "$ignored_checks" | jq "$jq_defs [ .[] | select(is_unready_check) ] | length")
+  ignored_unready_checks=$(echo "$ignored_checks" | jq -r "$jq_defs [ .[] | select(is_unready_check) ] | .[]? | check_line")
 
   local has_fail=0
   local has_pending=0
   local has_pass=0
 
-  if echo "$checks" | grep -q "fail"; then
+  if echo "$filtered_checks" | jq -e "$jq_defs any(.[]; is_failed_check)" >/dev/null; then
     has_fail=1
   fi
 
-  if echo "$checks" | grep -q "pending"; then
+  if echo "$filtered_checks" | jq -e "$jq_defs any(.[]; is_pending_check)" >/dev/null; then
     has_pending=1
   fi
 
-  if echo "$checks" | grep -q "pass"; then
+  if echo "$filtered_checks" | jq -e "$jq_defs any(.[]; is_passing_check)" >/dev/null; then
     has_pass=1
   fi
 
+  # Immediately after a push, GitHub may report no checks yet. Treat that as
+  # pending, not as a terminal failure.
+  if [ "$filtered_count" -eq 0 ]; then
+    return 10
+  fi
+
+  # Sometimes the only early status is a skipped informational check; wait for
+  # at least one pass/fail/pending non-visual-review signal before deciding.
   if [ "$has_fail" -eq 0 ] && [ "$has_pending" -eq 0 ] && [ "$has_pass" -eq 0 ]; then
-    echo "❌ assertion failed: unable to classify 'gh pr checks' output for PR #$PR_NUMBER" >&2
-    echo "$checks" >&2
-    return 1
+    return 10
   fi
 
   # Check for failures
   if [ "$has_fail" -eq 1 ]; then
-    echo "❌ Some checks failed:"
+    echo "❌ Some non-visual-review checks failed:"
     echo ""
-    echo "$checks"
+    echo "$filtered_checks" | jq -r "$jq_defs .[] | select(is_failed_check) | check_line"
+    if [ "$ignored_unready_count" -gt 0 ]; then
+      echo ""
+      echo "ℹ️ Ignoring visual-review unready checks:"
+      echo "$ignored_unready_checks"
+    fi
     echo ""
     echo "💡 To extract detailed logs from the failed run:"
     echo "   ./scripts/extract_pr_logs.sh $PR_NUMBER"
@@ -201,16 +269,23 @@ CHECK_PR_CHECKS_ONCE() {
       return 1
     fi
 
-    if [ "$merge_state" = "CLEAN" ]; then
-      echo "✅ All checks passed!"
+    # Optional visual checks can explain UNSTABLE, but their presence does not
+    # prove why GitHub is BLOCKED (for example, an unsatisfied repository rule).
+    if [ "$merge_state" = "CLEAN" ] || { [ "$merge_state" = "UNSTABLE" ] && [ "$ignored_unready_count" -gt 0 ]; }; then
+      echo "✅ All non-visual-review checks passed!"
       echo ""
       echo "$checks"
+      if [ "$ignored_unready_count" -gt 0 ]; then
+        echo ""
+        echo "ℹ️ Ignoring visual-review unready checks:"
+        echo "$ignored_unready_checks"
+      fi
       echo ""
       echo "✅ PR checks and mergeability gates passed."
       return 0
     fi
 
-    # GitHub can transiently report UNKNOWN/UNSTABLE/HAS_HOOKS even when checks have
+    # GitHub can transiently report UNKNOWN/HAS_HOOKS even when checks have
     # passed; treat these as still-pending rather than a terminal assertion failure.
     case "$merge_state" in
       BLOCKED | DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE)

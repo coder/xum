@@ -1,4 +1,5 @@
 import type { BrowserWindowConstructorOptions } from "electron";
+import { DEFAULT_CHROME_COLOR, TITLEBAR_SYMBOL_COLOR } from "@/common/constants/chromeColors";
 
 /**
  * Platform-specific BrowserWindow options for VSCode-like integrated titlebar.
@@ -23,9 +24,8 @@ export function getTitleBarOptions(
   return {
     titleBarStyle: "hidden",
     titleBarOverlay: {
-      // Match the sidebar background color (--color-sidebar from globals.css)
-      color: "#171717",
-      symbolColor: "#a3a3a3",
+      color: DEFAULT_CHROME_COLOR,
+      symbolColor: TITLEBAR_SYMBOL_COLOR,
       height: 32, // Match our header height (h-8 = 32px)
     },
   };

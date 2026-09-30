@@ -1,11 +1,16 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { AgentSkillScope } from "@/common/types/agentSkill";
 import {
   createMuxMessage,
   type AgentSkillReference,
   type DisplayedUserMessage,
+  type MCPPromptReference,
+  type MuxMessage,
 } from "@/common/types/message";
-import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import {
+  AgentSkillSnapshotMetadataSchema,
+  StreamingMessageAggregator,
+} from "./StreamingMessageAggregator";
 
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
 const WORKSPACE_ID = "test-workspace";
@@ -260,6 +265,52 @@ describe("Loaded skills tracking", () => {
     ]);
   });
 
+  it("parses agentSkillSnapshot metadata only for replayed rows that carry one", () => {
+    // Replay runs once per history row; parsing a missing snapshot builds a ZodError per
+    // row, which made the caught-up task take seconds on 500k+ row chats (#4869).
+    const aggregator = createAggregator();
+    const plainRows = Array.from({ length: 200 }, (_, index) =>
+      createMuxMessage(`plain-${index}`, index % 2 === 0 ? "user" : "assistant", `row ${index}`, {
+        historySequence: index + 1,
+        timestamp: 0,
+      })
+    );
+    const validSnapshot = createSkillSnapshotMessage({
+      id: "snapshot-valid",
+      skillName: "pull-requests",
+      historySequence: 201,
+    });
+    // Missing skillName: the schema must still reject it.
+    const malformedSnapshotMetadata: unknown = { scope: "project" };
+    const malformedSnapshot = createMuxMessage("snapshot-malformed", "user", "<agent-skill>", {
+      historySequence: 202,
+      timestamp: 0,
+      synthetic: true,
+      agentSkillSnapshot: malformedSnapshotMetadata as NonNullable<
+        MuxMessage["metadata"]
+      >["agentSkillSnapshot"],
+    });
+
+    const safeParseSpy = spyOn(AgentSkillSnapshotMetadataSchema, "safeParse");
+    try {
+      aggregator.loadHistoricalMessages([...plainRows, validSnapshot, malformedSnapshot]);
+
+      expect(safeParseSpy.mock.calls.map(([snapshot]) => snapshot)).toEqual([
+        validSnapshot.metadata?.agentSkillSnapshot,
+        malformedSnapshot.metadata?.agentSkillSnapshot,
+      ]);
+    } finally {
+      safeParseSpy.mockRestore();
+    }
+    expect(aggregator.getLoadedSkills()).toEqual([
+      {
+        name: "pull-requests",
+        description: "(loaded via /pull-requests)",
+        scope: "project",
+      },
+    ]);
+  });
+
   it("deduplicates skills by name", () => {
     const aggregator = createAggregator();
     startStream(aggregator);
@@ -282,7 +333,7 @@ describe("Loaded skills tracking", () => {
     const skillDefs = [
       { name: "tests", description: "Testing skill", scope: "project" as const },
       { name: "pull-requests", description: "PR guidelines", scope: "project" as const },
-      { name: "mux-docs", description: "Documentation", scope: "built-in" as const },
+      { name: "xum-docs", description: "Documentation", scope: "built-in" as const },
     ];
 
     for (const [index, skill] of skillDefs.entries()) {
@@ -297,9 +348,9 @@ describe("Loaded skills tracking", () => {
     const skills = aggregator.getLoadedSkills();
     expect(skills).toHaveLength(3);
     expect(skills.map((skill) => skill.name).sort()).toEqual([
-      "mux-docs",
       "pull-requests",
       "tests",
+      "xum-docs",
     ]);
   });
 
@@ -520,6 +571,216 @@ describe("Agent skill snapshot association", () => {
         body: "# Content",
       },
     });
+  });
+
+  it("attaches MCP prompt snapshots to slash and inline invocation surfaces", () => {
+    const aggregator = createAggregator();
+    const snapshot = createMuxMessage("prompt-snapshot", "user", "Expanded prompt body", {
+      historySequence: 1,
+      timestamp: 0,
+      synthetic: true,
+      mcpPromptSnapshot: {
+        serverName: "coder",
+        promptName: "review",
+        commandKey: "mcp__coder__review",
+        invokingMessageId: "prompt-slash",
+      },
+    });
+    const slash = createMuxMessage("prompt-slash", "user", "Using MCP prompt coder/review", {
+      historySequence: 2,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        rawCommand: "/mcp__coder__review",
+        commandPrefix: "/mcp__coder__review",
+        mcpPromptRefs: [
+          {
+            serverName: "coder",
+            promptName: "review",
+            commandKey: "mcp__coder__review",
+            source: "slash",
+          },
+        ],
+        agentSkillRefs: [{ skillName: "tdd", scope: "global", source: "inline" }],
+      },
+    });
+    const inlineSnapshot = createMuxMessage("prompt-snapshot-2", "user", "Expanded prompt body", {
+      historySequence: 3,
+      timestamp: 0,
+      synthetic: true,
+      mcpPromptSnapshot: {
+        serverName: "coder",
+        promptName: "review",
+        commandKey: "mcp__coder__review",
+        invokingMessageId: "prompt-inline",
+      },
+    });
+    const inline = createMuxMessage("prompt-inline", "user", "Use $mcp__coder__review", {
+      historySequence: 4,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        mcpPromptRefs: [
+          {
+            serverName: "coder",
+            promptName: "review",
+            commandKey: "mcp__coder__review",
+            source: "inline",
+          },
+        ],
+      },
+    });
+
+    aggregator.loadHistoricalMessages([snapshot, slash, inlineSnapshot, inline]);
+    const displayed = aggregator.getDisplayedMessages();
+    expect(displayed).toHaveLength(2);
+    const slashMessage = displayed[0];
+    const inlineMessage = displayed[1];
+    if (slashMessage?.type !== "user" || inlineMessage?.type !== "user") {
+      throw new Error("Expected displayed user messages");
+    }
+    expect(slashMessage.agentSkill?.snapshot?.body).toBe("Expanded prompt body");
+    expect(slashMessage.mcpPromptRefs).toEqual(slash.metadata?.muxMetadata?.mcpPromptRefs);
+    expect(slashMessage.agentSkillRefs).toEqual([
+      { skillName: "tdd", scope: "global", source: "inline" },
+    ]);
+    expect(inlineMessage.mcpPromptRefs).toEqual(inline.metadata?.muxMetadata?.mcpPromptRefs);
+    expect(inlineMessage.inlineSkillSnapshots?.mcp__coder__review?.snapshot.body).toBe(
+      "Expanded prompt body"
+    );
+  });
+
+  it("filters malformed persisted refs instead of crashing aggregation", () => {
+    const aggregator = createAggregator();
+    // Simulates corrupted chat.jsonl rows; muxMetadata persists untyped.
+    const corruptMcpRefs: unknown = [null, {}, { serverName: "coder" }, 42];
+    const corruptSkillRefs: unknown = [null, { skillName: "tdd" }];
+    const corrupted = createMuxMessage("prompt-corrupted", "user", "Corrupted refs", {
+      historySequence: 1,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        mcpPromptRefs: corruptMcpRefs as MCPPromptReference[],
+        agentSkillRefs: corruptSkillRefs as AgentSkillReference[],
+      },
+    });
+    const mixedRefs: unknown = [
+      null,
+      {
+        serverName: "coder",
+        promptName: "review",
+        commandKey: "mcp__coder__review",
+        source: "slash",
+      },
+    ];
+    const valid = createMuxMessage("prompt-valid", "user", "Using MCP prompt coder/review", {
+      historySequence: 2,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        mcpPromptRefs: mixedRefs as MCPPromptReference[],
+      },
+    });
+
+    aggregator.loadHistoricalMessages([corrupted, valid]);
+    const displayed = aggregator.getDisplayedMessages();
+    expect(displayed).toHaveLength(2);
+
+    const corruptedMessage = displayed[0];
+    const validMessage = displayed[1];
+    if (corruptedMessage?.type !== "user" || validMessage?.type !== "user") {
+      throw new Error("Expected displayed user messages");
+    }
+    expect(corruptedMessage.mcpPromptRefs).toBeUndefined();
+    expect(validMessage.mcpPromptRefs).toHaveLength(1);
+  });
+
+  it("does not attach an older turn's prompt snapshot when materialization failed", () => {
+    const aggregator = createAggregator();
+    const promptRef = {
+      serverName: "coder",
+      promptName: "review",
+      commandKey: "mcp__coder__review",
+      source: "slash" as const,
+    };
+    const snapshot = createMuxMessage("prompt-snapshot", "user", "Expanded prompt body", {
+      historySequence: 1,
+      timestamp: 0,
+      synthetic: true,
+      mcpPromptSnapshot: {
+        serverName: "coder",
+        promptName: "review",
+        commandKey: "mcp__coder__review",
+        invokingMessageId: "prompt-first",
+      },
+    });
+    const first = createMuxMessage("prompt-first", "user", "Using MCP prompt coder/review", {
+      historySequence: 2,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        rawCommand: "/mcp__coder__review",
+        commandPrefix: "/mcp__coder__review",
+        mcpPromptRefs: [promptRef],
+      },
+    });
+    const second = createMuxMessage("prompt-second", "user", "Using MCP prompt coder/review", {
+      historySequence: 3,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        rawCommand: "/mcp__coder__review",
+        commandPrefix: "/mcp__coder__review",
+        mcpPromptRefs: [promptRef],
+      },
+    });
+
+    aggregator.loadHistoricalMessages([snapshot, first, second]);
+    const displayed = aggregator.getDisplayedMessages();
+    const firstMessage = displayed[0];
+    const secondMessage = displayed[1];
+    if (firstMessage?.type !== "user" || secondMessage?.type !== "user") {
+      throw new Error("Expected displayed user messages");
+    }
+    expect(firstMessage.agentSkill?.snapshot?.body).toBe("Expanded prompt body");
+    expect(secondMessage.agentSkill?.snapshot).toBeUndefined();
+  });
+
+  it("does not attach a crash-orphaned snapshot to a later same-prompt turn", () => {
+    const aggregator = createAggregator();
+    const orphan = createMuxMessage("orphan-snapshot", "user", "Stale expansion", {
+      historySequence: 1,
+      timestamp: 0,
+      synthetic: true,
+      mcpPromptSnapshot: {
+        serverName: "coder",
+        promptName: "review",
+        commandKey: "mcp__coder__review",
+        invokingMessageId: "user-crashed",
+      },
+    });
+    const later = createMuxMessage("prompt-later", "user", "Use $mcp__coder__review", {
+      historySequence: 2,
+      timestamp: 0,
+      muxMetadata: {
+        type: "normal",
+        mcpPromptRefs: [
+          {
+            serverName: "coder",
+            promptName: "review",
+            commandKey: "mcp__coder__review",
+            source: "inline" as const,
+          },
+        ],
+      },
+    });
+
+    aggregator.loadHistoricalMessages([orphan, later]);
+    const displayed = aggregator.getDisplayedMessages();
+    const laterMessage = displayed[0];
+    if (laterMessage?.type !== "user") throw new Error("Expected displayed user message");
+    expect(laterMessage.inlineSkillSnapshots).toBeUndefined();
+    expect(laterMessage.agentSkill).toBeUndefined();
   });
 
   it("uses the latest snapshot available at each invocation turn", () => {

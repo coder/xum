@@ -8,9 +8,10 @@ import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 // Create test runtime

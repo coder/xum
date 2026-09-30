@@ -1,25 +1,45 @@
-import type { DisplayedMessage } from "@/common/types/message";
+import {
+  displayStagedAttachmentsToChatAttachments,
+  parseStagedAttachmentNotice,
+} from "@/browser/features/ChatInput/stagedAttachments";
+import type { StagedChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
+import type { DisplayedMessage, ReviewNoteDataForDisplay } from "@/common/types/message";
 import { formatReviewForModel } from "@/common/types/review";
 import type { BashOutputToolArgs } from "@/common/types/tools";
 
+export interface EditableUserMessageDraftContent {
+  text: string;
+  stagedAttachments: StagedChatAttachment[];
+}
+
 /**
- * Returns the text that should be placed into the ChatInput when editing a user message.
+ * Returns the text and staged attachments that should be placed into ChatInput when editing.
  */
-export function getEditableUserMessageText(
+export function getEditableUserMessageDraftContent(
   message: Extract<DisplayedMessage, { type: "user" }>
-): string {
-  const reviews = message.reviews;
+): EditableUserMessageDraftContent {
+  const parsed = parseStagedAttachmentNotice(message.content);
+  return {
+    text: stripRenderedReviews(parsed.text, message.reviews),
+    stagedAttachments: displayStagedAttachmentsToChatAttachments(
+      parsed.attachments,
+      `edited-${message.historyId}`
+    ),
+  };
+}
+
+function stripRenderedReviews(content: string, reviews?: ReviewNoteDataForDisplay[]): string {
   if (!reviews || reviews.length === 0) {
-    return message.content;
+    return content;
   }
 
   // Reviews are already stored in metadata; strip their rendered tags to avoid duplication on edit.
   const reviewText = reviews.map(formatReviewForModel).join("\n\n");
-  if (!message.content.startsWith(reviewText)) {
-    return message.content;
+  if (!content.startsWith(reviewText)) {
+    return content;
   }
 
-  const remainder = message.content.slice(reviewText.length);
+  const remainder = content.slice(reviewText.length);
   if (remainder.startsWith("\n\n")) {
     return remainder.slice(2);
   }

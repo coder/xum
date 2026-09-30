@@ -26,24 +26,44 @@ import type {
   SetSessionConfigOptionResponse,
   Usage,
 } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import {
   DEFAULT_COMPACTION_WORD_TARGET,
   WORDS_TO_TOKENS_RATIO,
   buildCompactionPrompt,
 } from "@/common/constants/ui";
+import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { CompactionRequestData } from "@/common/types/message";
 import { buildAgentSkillMetadata } from "@/common/types/message";
 import { isWorktreeRuntime, type RuntimeConfig, type RuntimeMode } from "@/common/types/runtime";
+import type { ProjectConfig } from "@/common/types/project";
+import {
+  deriveProjectHierarchy,
+  isPathDescendant,
+  resolveWorkspaceCreationScope,
+} from "@/common/utils/subProjects";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { negotiateCapabilities, type NegotiatedCapabilities } from "./capabilities";
-import { AGENT_MODE_CONFIG_ID, buildConfigOptions, handleSetConfigOption } from "./configOptions";
+import { buildConfigOptions, handleSetConfigOption } from "./configOptions";
 import { forkSessionFromWorkspace } from "./experimental/sessionFork";
-import { loadSessionFromWorkspace } from "./experimental/sessionResume";
+import {
+  canonicalizePathForWorkspaceMatch,
+  loadSessionFromWorkspace,
+} from "./experimental/sessionResume";
 import { convertToAcpUsage } from "./experimental/sessionUsage";
-import { resolveAgentAiSettings, type ResolvedAiSettings } from "./resolveAgentAiSettings";
+import {
+  resolveAcpAgentAiSettings,
+  resolveAgentAiSettings,
+  type ResolvedAiSettings,
+} from "./resolveAgentAiSettings";
+import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
+import { InvalidExplicitAiSettingError } from "@/common/utils/ai/resolveAgentAiSettings";
 import type { ServerConnection } from "./serverConnection";
 import { SessionManager } from "./sessionManager";
 import {
@@ -53,6 +73,7 @@ import {
   type ParsedAcpSlashCommand,
 } from "./slashCommands";
 import { StreamTranslator } from "./streamTranslator";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { ToolRouter } from "./toolRouter";
 
 const DEFAULT_AGENT_ID = "exec";
@@ -74,8 +95,8 @@ const ACP_DELEGATION_CANDIDATE_TOOLS = [
 ] as const;
 const DEFAULT_DISCONNECT_CLEANUP_MAX_WAIT_MS = 10_000;
 /**
- * ACP currently has no session/close RPC. Keep idle sessions bounded so long-lived
- * editor connections cannot leak subscriptions and per-session caches forever.
+ * Xum does not implement the session/close RPC yet. Keep idle sessions bounded so
+ * long-lived editor connections cannot leak subscriptions and per-session caches forever.
  */
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_TRACKED_SESSIONS = 24;
@@ -95,6 +116,11 @@ interface SessionState {
   runtimeMode: RuntimeMode;
   agentId: string;
   aiSettings: ResolvedAiSettings;
+}
+
+interface AcpWorkspaceCreationScope {
+  projectPath: string;
+  subProjectPath?: string;
 }
 
 interface NewSessionWorkspaceLifecycle {
@@ -118,6 +144,11 @@ interface TurnCompletion {
    * Used to avoid binding fallback stream-start events emitted before prompt dispatch.
    */
   dispatchedAtMs?: number;
+  /**
+   * Bind only a stream-start that carries this turn's correlation id. A /send-held turn passes
+   * its id through the resend (#5170), so an uncorrelated start is another entry's stream.
+   */
+  requiresExactCorrelation?: boolean;
   /** Inactivity timer so idle prompt turns cannot hang forever. */
   timeoutHandle: ReturnType<typeof setTimeout>;
   /** Set after stream-start; only this message id may resolve/reject the turn. */
@@ -139,8 +170,9 @@ type MetaRecord = Record<string, unknown>;
 type WorkspaceInfo = NonNullable<
   Awaited<ReturnType<ServerConnection["client"]["workspace"]["getInfo"]>>
 >;
-type WorkspaceActivityById = Awaited<
-  ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>
+// NonNullable: the null read-failure signal is normalized to {} at the call site.
+type WorkspaceActivityById = NonNullable<
+  Awaited<ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>>
 >;
 
 export class MuxAgent implements Agent {
@@ -173,6 +205,18 @@ export class MuxAgent implements Agent {
   private readonly chatSubscriptionReady = new Map<string, Promise<void>>();
   /** Mode used for the currently active/connecting onChat subscription per session. */
   private readonly chatSubscriptionModeBySessionId = new Map<string, OnChatMode>();
+  /**
+   * Sessions whose last observed replay reported `historyReplayStatus: "failed"`: their history
+   * is unreadable and unverified, so prompts are refused (as the browser and CLI refuse sends)
+   * until a later caught-up reports a complete replay.
+   */
+  private readonly historyReplayFailedSessionIds = new Set<string>();
+  /**
+   * Settles at the first caught-up of a session's active full-mode subscription (or when that
+   * subscription ends without one). A prompt awaits it before dispatching so a failed replay is
+   * observed and refused rather than raced by the send.
+   */
+  private readonly firstCaughtUpBySessionId = new Map<string, Promise<void>>();
   /** Async iterators for active onChat streams so we can cancel on mode switch/eviction. */
   private readonly chatIteratorsBySessionId = new Map<
     string,
@@ -245,7 +289,7 @@ export class MuxAgent implements Agent {
     this.connection.signal.addEventListener(
       "abort",
       () => {
-        const disconnectError = new Error("Mux ACP connection closed");
+        const disconnectError = new Error("Xum ACP connection closed");
         const activeTurnSessionIds = [...this.turnCompletions.keys()];
         for (const sessionId of activeTurnSessionIds) {
           this.rejectTurn(sessionId, disconnectError);
@@ -277,8 +321,8 @@ export class MuxAgent implements Agent {
     return Promise.resolve({
       protocolVersion: params.protocolVersion,
       agentInfo: {
-        name: "mux",
-        version: process.env.MUX_VERSION ?? "dev",
+        name: XUM_PRODUCT_SLUG,
+        version: resolveXumEnvironmentValue("VERSION", process.env) ?? "dev",
       },
       agentCapabilities: {
         loadSession: true,
@@ -297,24 +341,30 @@ export class MuxAgent implements Agent {
     this.inFlightNewSessionCount += 1;
     try {
       const meta = parseMuxMeta(params._meta);
-      const projectPath = meta.projectPath ?? params.cwd.trim();
-      assert(projectPath.length > 0, "newSession: projectPath/cwd must be non-empty");
+      const requestedProjectPath = await resolveAcpNewSessionProjectPath(
+        params.cwd,
+        meta.projectPath
+      );
+      const workspaceScope = await this.ensureAcpProjectTrusted(requestedProjectPath);
 
       // When the ACP client doesn't supply a trunk branch (typical — editors only
       // send `cwd`, not mux-specific `_meta`), derive it from the project's git
       // repo.  Worktree/SSH runtimes require a trunk branch for workspace creation.
       let trunkBranch = meta.trunkBranch;
       if (trunkBranch == null || trunkBranch.trim().length === 0) {
-        const branchInfo = await this.server.client.projects.listBranches({ projectPath });
+        const branchInfo = await this.server.client.projects.listBranches({
+          projectPath: workspaceScope.projectPath,
+        });
         trunkBranch = branchInfo.recommendedTrunk ?? DEFAULT_TRUNK_BRANCH;
       }
 
       const createResult = await this.server.client.workspace.create({
-        projectPath,
+        projectPath: workspaceScope.projectPath,
         branchName: meta.branchName ?? generateDefaultBranchName(),
         trunkBranch,
         title: meta.title,
         runtimeConfig: meta.runtimeConfig,
+        subProjectPath: workspaceScope.subProjectPath,
       });
 
       if (!createResult.success) {
@@ -341,7 +391,6 @@ export class MuxAgent implements Agent {
 
       const agentId = meta.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
       const aiSettings = await resolveAgentAiSettings(this.server.client, agentId, workspaceId);
-      await this.persistAiSettings(workspaceId, agentId, aiSettings);
 
       this.sessionStateById.set(sessionId, {
         workspaceId,
@@ -357,6 +406,7 @@ export class MuxAgent implements Agent {
         sessionId,
         configOptions: await buildConfigOptions(this.server.client, workspaceId, {
           activeAgentId: agentId,
+          aiSettings,
         }),
       };
 
@@ -375,16 +425,14 @@ export class MuxAgent implements Agent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     this.assertInitialized("loadSession");
 
-    // Pass any prior in-memory agent selection so mode switches survive
-    // reconnect/reload (agent mode set via set_config_option is only stored
-    // in ACP session state, not persisted as the workspace's active agent).
+    // Preserve unsent picker choices when reloading this adapter's active session.
     const existingState = this.sessionStateById.get(params.sessionId);
     const resumed = await loadSessionFromWorkspace(params, {
       server: this.server,
       sessionManager: this.sessionManager,
       negotiatedCapabilities: this.negotiatedCapabilities,
       defaultAgentId: DEFAULT_AGENT_ID,
-      existingSessionAgentId: existingState?.agentId,
+      existingSessionState: existingState,
     });
 
     this.sessionStateById.set(resumed.sessionId, {
@@ -404,18 +452,20 @@ export class MuxAgent implements Agent {
     return resumed.response;
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    this.assertInitialized("unstable_listSessions");
-    assert(params != null, "unstable_listSessions: params are required");
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    this.assertInitialized("listSessions");
+    assert(params != null, "listSessions: params are required");
 
     const normalizedCwd = normalizeOptionalPath(params.cwd);
     const offset = parseSessionListCursor(params.cursor);
 
-    const [activeWorkspaces, archivedWorkspaces, workspaceActivity] = await Promise.all([
+    const [activeWorkspaces, archivedWorkspaces, workspaceActivityList] = await Promise.all([
       this.server.client.workspace.list({ archived: false }),
       this.server.client.workspace.list({ archived: true }),
       this.server.client.workspace.activity.list(),
     ]);
+    // null = backend activity read failure; session ordering degrades to metadata-only.
+    const workspaceActivity = workspaceActivityList ?? {};
 
     const allWorkspaces = dedupeWorkspacesById([...activeWorkspaces, ...archivedWorkspaces]);
     const filteredWorkspaces =
@@ -433,8 +483,9 @@ export class MuxAgent implements Agent {
     return {
       sessions: page.map((workspace) => ({
         sessionId: workspace.id,
-        // Surface projectPath as cwd so session/list filtering matches editor cwd.
-        cwd: workspace.projectPath,
+        // Surface subProjectPath when present so ACP clients reconnecting from a
+        // package/sub-project cwd can list and resume the session they created.
+        cwd: workspace.subProjectPath ?? workspace.projectPath,
         title: workspace.title ?? workspace.name,
         updatedAt: toSessionUpdatedAt(workspace, workspaceActivity),
       })),
@@ -442,14 +493,14 @@ export class MuxAgent implements Agent {
     };
   }
 
-  async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-    this.assertInitialized("unstable_resumeSession");
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    this.assertInitialized("resumeSession");
 
     const sessionId = params.sessionId.trim();
-    assert(sessionId.length > 0, "unstable_resumeSession: sessionId must be non-empty");
+    assert(sessionId.length > 0, "resumeSession: sessionId must be non-empty");
 
     const cwd = params.cwd.trim();
-    assert(cwd.length > 0, "unstable_resumeSession: cwd must be non-empty");
+    assert(cwd.length > 0, "resumeSession: cwd must be non-empty");
 
     const existingState = this.sessionStateById.get(sessionId);
     const resumed = await loadSessionFromWorkspace(
@@ -464,7 +515,7 @@ export class MuxAgent implements Agent {
         sessionManager: this.sessionManager,
         negotiatedCapabilities: this.negotiatedCapabilities,
         defaultAgentId: DEFAULT_AGENT_ID,
-        existingSessionAgentId: existingState?.agentId,
+        existingSessionState: existingState,
       }
     );
 
@@ -492,6 +543,17 @@ export class MuxAgent implements Agent {
     this.assertInitialized("unstable_forkSession");
 
     const meta = parseMuxMeta(params._meta);
+    const sourceWorkspaceId = this.sessionManager.getWorkspaceId(params.sessionId);
+    const sourceWorkspace = await this.server.client.workspace.getInfo({
+      workspaceId: sourceWorkspaceId,
+    });
+    if (!sourceWorkspace) {
+      throw new Error(
+        `unstable_forkSession: source workspace '${sourceWorkspaceId}' was not found`
+      );
+    }
+    await this.ensureAcpProjectTrusted(sourceWorkspace.projectPath);
+
     // Pass the source session's active agent so forks inherit mode switches
     const sourceSessionState = this.sessionStateById.get(params.sessionId);
     const forked = await forkSessionFromWorkspace(
@@ -505,8 +567,6 @@ export class MuxAgent implements Agent {
       },
       meta.forkName
     );
-
-    await this.persistAiSettings(forked.workspaceId, forked.agentId, forked.aiSettings);
 
     this.sessionStateById.set(forked.sessionId, {
       workspaceId: forked.workspaceId,
@@ -536,6 +596,10 @@ export class MuxAgent implements Agent {
     const sessionState = await this.refreshSessionState(sessionId);
     const parsedPrompt = parsePromptBlocks(params.prompt);
 
+    // Slash commands mutate too (`/clear` truncates, `/compact` sends), so the transcript is
+    // verified before any of them, not only before an ordinary send. The gate sits directly
+    // before each mutation: slash-command discovery awaits skill lookup, and a subscription
+    // that dies during that wait must still refuse the destructive command.
     const slashCommandResponse = await this.tryHandleSlashCommand(
       sessionId,
       workspaceId,
@@ -546,6 +610,7 @@ export class MuxAgent implements Agent {
       return slashCommandResponse;
     }
 
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.sendWorkspaceMessageAndAwaitTurn({
       sessionId,
       workspaceId,
@@ -553,6 +618,8 @@ export class MuxAgent implements Agent {
       options: {
         model: sessionState.aiSettings.model,
         thinkingLevel: sessionState.aiSettings.thinkingLevel,
+        // The send path re-gates pro mode for the selected model and route.
+        reasoningMode: sessionState.aiSettings.reasoningMode,
         agentId: sessionState.agentId,
       },
       fileParts: parsedPrompt.fileParts,
@@ -567,20 +634,26 @@ export class MuxAgent implements Agent {
 
     this.touchSession(sessionId);
     const workspaceId = this.sessionManager.getWorkspaceId(sessionId);
-    const interruptResult = await this.server.client.workspace.interruptStream({ workspaceId });
-
-    if (!interruptResult.success) {
-      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
-    }
+    const interruptResult = await this.server.client.workspace.interruptStream({
+      workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
 
     // Resolve any pending prompt immediately after a successful interrupt request.
     // Backend abort events can be dropped or synthesized without a messageId when no
     // active stream exists; waiting exclusively for terminal chat events can leave
-    // ACP prompt requests hanging indefinitely.
-    this.resolveTurn(sessionId, {
-      stopReason: "cancelled",
-      usage: this.latestUsageBySessionId.get(sessionId),
-    });
+    // ACP prompt requests hanging indefinitely. STOP_UNRECORDED_MESSAGE reports a stream
+    // that did stop (only its durable Stop records failed), so the prompt settles as
+    // cancelled before that failure is reported below.
+    if (interruptResult.success || interruptResult.error === STOP_UNRECORDED_MESSAGE) {
+      this.resolveTurn(sessionId, {
+        stopReason: "cancelled",
+        usage: this.latestUsageBySessionId.get(sessionId),
+      });
+    }
+    if (!interruptResult.success) {
+      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
+    }
   }
 
   async setSessionConfigOption(
@@ -596,23 +669,31 @@ export class MuxAgent implements Agent {
     const trimmedConfigId = params.configId.trim();
     assert(trimmedConfigId.length > 0, "setSessionConfigOption: configId must be non-empty");
 
-    const activeAgentId = this.sessionStateById.get(sessionId)?.agentId;
+    // ACP supports boolean config options since schema 0.13, but mux only
+    // exposes select options; reject boolean values until one exists. Surface
+    // a spec-correct InvalidParams (-32602) error — matching what pre-0.25 SDK
+    // schemas returned for boolean values — instead of a generic internal error.
+    if (typeof params.value !== "string") {
+      throw RequestError.invalidParams(
+        { configId: trimmedConfigId },
+        `config option '${trimmedConfigId}' expects a select value`
+      );
+    }
+
+    const sessionState = this.sessionStateById.get(sessionId);
     const configOptions = await handleSetConfigOption(
       this.server.client,
       workspaceId,
       params.configId,
       params.value,
       {
-        activeAgentId,
+        activeAgentId: sessionState?.agentId,
+        aiSettings: sessionState?.aiSettings,
         onAgentModeChanged: (agentId, aiSettings) => {
           this.updateSessionAgentState(sessionId, agentId, aiSettings);
         },
       }
     );
-
-    if (trimmedConfigId !== AGENT_MODE_CONFIG_ID) {
-      await this.refreshSessionState(sessionId);
-    }
 
     return { configOptions };
   }
@@ -641,27 +722,7 @@ export class MuxAgent implements Agent {
     );
     assert(args.message.trim().length > 0, "sendWorkspaceMessageAndAwaitTurn: message required");
 
-    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
-
-    const promptCorrelationId = randomUUID();
-    const turnPromise = this.beginTurn(args.sessionId, promptCorrelationId);
-
-    // Attach a sink immediately so early stream failures cannot produce
-    // unhandled rejections before this method awaits turnPromise.
-    void turnPromise.catch(() => undefined);
-
-    try {
-      // Re-establish chat subscription if a prior one dropped (e.g., transient
-      // websocket interruption). Register the turn first so subscription
-      // failures can reject it instead of leaving prompt() hanging.
-      await this.ensureChatSubscription(
-        args.sessionId,
-        args.workspaceId,
-        this.getSessionOnChatMode(args.sessionId)
-      );
-
-      this.markTurnDispatched(args.sessionId, promptCorrelationId);
-
+    return this.dispatchAndAwaitTurn(args, async (promptCorrelationId) => {
       const delegatedToolNames = this.getDelegatedToolNames(args.sessionId);
       const optionsWithPromptCorrelation = this.attachPromptCorrelationToSendOptions(
         args.options,
@@ -684,6 +745,39 @@ export class MuxAgent implements Agent {
           `prompt: workspace.sendMessage failed: ${stringifyUnknown(sendResult.error)}`
         );
       }
+    });
+  }
+
+  /**
+   * Run one prompt turn: `dispatch` starts (or queues) the workspace message, and the returned
+   * response settles when that message's stream ends, aborts or fails.
+   */
+  private async dispatchAndAwaitTurn(
+    args: { sessionId: string; workspaceId: string; requiresExactCorrelation?: boolean },
+    dispatch: (promptCorrelationId: string) => Promise<void>
+  ): Promise<PromptResponse> {
+    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
+
+    const promptCorrelationId = randomUUID();
+    const turnPromise = this.beginTurn(
+      args.sessionId,
+      promptCorrelationId,
+      args.requiresExactCorrelation
+    );
+
+    // Attach a sink immediately so early stream failures cannot produce
+    // unhandled rejections before this method awaits turnPromise.
+    void turnPromise.catch(() => undefined);
+
+    try {
+      // Re-establish chat subscription if a prior one dropped (e.g., transient
+      // websocket interruption). Register the turn first so subscription
+      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
+      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
+      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
+
+      this.markTurnDispatched(args.sessionId, promptCorrelationId);
+      await dispatch(promptCorrelationId);
 
       const turn = await turnPromise;
       const usage = turn.usage ?? this.latestUsageBySessionId.get(args.sessionId);
@@ -699,6 +793,33 @@ export class MuxAgent implements Agent {
       this.takeTurnCompletion(args.sessionId);
       throw error;
     }
+  }
+
+  /**
+   * Ensure the session's transcript is verified before a mutation. A full-mode replay must
+   * be observed first: an unreadable history closes it with `historyReplayStatus: "failed"`
+   * (or the stream ends before reporting), and a mutation against that unverified transcript
+   * would persist a user row or truncate rows the client never saw. A failed subscription is
+   * torn down here because prompts reuse a ready subscription, so it would never replay
+   * again on its own; the next prompt re-subscribes and replays afresh.
+   */
+  private async assertTranscriptVerified(sessionId: string, workspaceId: string): Promise<void> {
+    // A session whose last replay failed must replay again to be verified, whatever mode a
+    // later resume chose: a live subscription reads no history and could never clear the flag.
+    const onChatMode = this.historyReplayFailedSessionIds.has(sessionId)
+      ? ON_CHAT_MODE_FULL
+      : this.getSessionOnChatMode(sessionId);
+    await this.ensureChatSubscription(sessionId, workspaceId, onChatMode);
+    await this.firstCaughtUpBySessionId.get(sessionId);
+    if (!this.historyReplayFailedSessionIds.has(sessionId)) {
+      return;
+    }
+
+    await this.stopChatSubscription(sessionId, "history replay failed");
+    this.firstCaughtUpBySessionId.delete(sessionId);
+    throw new Error(
+      `prompt: workspace ${workspaceId} history could not be read; refusing to mutate an unverified transcript`
+    );
   }
 
   private attachPromptCorrelationToSendOptions(
@@ -768,6 +889,8 @@ export class MuxAgent implements Agent {
       return null;
     }
 
+    // Verified after discovery (which awaits), immediately before the command mutates.
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.handleSlashCommand(
       sessionId,
       workspaceId,
@@ -788,6 +911,69 @@ export class MuxAgent implements Agent {
       case "invalid":
         return this.respondToCommand(sessionId, parsedCommand.message);
 
+      case "send-held": {
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
+        // the one it was queued with, so the turn binds only its own stream. A resend that is
+        // queued and then refused at dequeue is held again under this id and settles the turn
+        // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
+        // which says whether the input is still held (it may have been sent or discarded
+        // elsewhere since the notice).
+        let refusal: string | undefined;
+        const response = await this.dispatchAndAwaitTurn(
+          { sessionId, workspaceId, requiresExactCorrelation: true },
+          async (promptCorrelationId) => {
+            const delegatedToolNames = this.getDelegatedToolNames(sessionId);
+            const sendResult = await this.server.client.workspace.sendHeldInput({
+              workspaceId,
+              heldInputId: lookup.heldInput.id,
+              acpCorrelation: {
+                acpPromptId: promptCorrelationId,
+                delegatedToolNames: delegatedToolNames.length > 0 ? delegatedToolNames : undefined,
+              },
+            });
+            if (!sendResult.success) {
+              refusal = formatSendMessageError(sendResult.error).message;
+              throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
+            }
+          }
+        ).catch((error: unknown) => {
+          if (refusal == null) throw error;
+          return null;
+        });
+        if (response != null) {
+          return response;
+        }
+        assert(refusal != null, "send-held: a failed resend records its refusal");
+        return this.respondToCommand(
+          sessionId,
+          `Could not send unsent message ${lookup.number}: ${refusal}`
+        );
+      }
+
+      case "discard-held": {
+        // The ACP counterpart of the desktop banner's Discard (#4944). ACP cannot put text back
+        // into the client's prompt, so the held-input notice shows each message's full text;
+        // sending it is tracked in #5170.
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        const discardResult = await this.server.client.workspace.discardHeldInput({
+          workspaceId,
+          heldInputId: lookup.heldInput.id,
+        });
+        return this.respondToCommand(
+          sessionId,
+          discardResult.success
+            ? `Discarded unsent message ${lookup.number}.`
+            : `Could not discard unsent message ${lookup.number}: ${discardResult.error}`
+        );
+      }
+
       case "clear": {
         const clearResult = await this.server.client.workspace.truncateHistory({
           workspaceId,
@@ -804,11 +990,20 @@ export class MuxAgent implements Agent {
       }
 
       case "compact": {
-        const compactionPayload = this.buildCompactionPayload(
-          parsedCommand,
-          parsedPrompt,
-          sessionState
-        );
+        let compactionPayload: { message: string; options: SendMessageOptions };
+        try {
+          compactionPayload = await this.buildCompactionPayload(
+            parsedCommand,
+            parsedPrompt,
+            sessionState,
+            workspaceId
+          );
+        } catch (error) {
+          if (error instanceof InvalidExplicitAiSettingError) {
+            return this.respondToCommand(sessionId, error.message);
+          }
+          throw error;
+        }
 
         return this.sendWorkspaceMessageAndAwaitTurn({
           sessionId,
@@ -822,12 +1017,14 @@ export class MuxAgent implements Agent {
         const options: SendMessageOptions = {
           model: sessionState.aiSettings.model,
           thinkingLevel: sessionState.aiSettings.thinkingLevel,
+          reasoningMode: sessionState.aiSettings.reasoningMode,
           agentId: sessionState.agentId,
           muxMetadata: buildAgentSkillMetadata({
             rawCommand: parsedCommand.rawCommand,
             commandPrefix: parsedCommand.commandPrefix,
             skillName: parsedCommand.descriptor.name,
             scope: parsedCommand.descriptor.scope,
+            arguments: parsedCommand.argumentText,
           }),
         };
 
@@ -841,6 +1038,15 @@ export class MuxAgent implements Agent {
       }
 
       case "fork": {
+        const workspaceInfo = await this.server.client.workspace.getInfo({ workspaceId });
+        if (workspaceInfo == null) {
+          return this.respondToCommand(
+            sessionId,
+            "Failed to fork workspace: current workspace metadata is unavailable."
+          );
+        }
+        await this.ensureAcpProjectTrusted(workspaceInfo.projectPath);
+
         const forkResult = await this.server.client.workspace.fork({
           sourceWorkspaceId: workspaceId,
           pendingAutoTitle:
@@ -863,6 +1069,7 @@ export class MuxAgent implements Agent {
             options: {
               model: sessionState.aiSettings.model,
               thinkingLevel: sessionState.aiSettings.thinkingLevel,
+              reasoningMode: sessionState.aiSettings.reasoningMode,
               agentId: sessionState.agentId,
             },
           });
@@ -884,10 +1091,14 @@ export class MuxAgent implements Agent {
           );
         }
 
+        const workspaceScope = await this.ensureAcpProjectTrusted(
+          workspaceInfo.subProjectPath ?? workspaceInfo.projectPath
+        );
+
         // Resolve trunk from project defaults — /new no longer accepts overrides
         // (it now mirrors /fork's seamless flow).
         const branchInfo = await this.server.client.projects.listBranches({
-          projectPath: workspaceInfo.projectPath,
+          projectPath: workspaceScope.projectPath,
         });
         const trunkBranch = branchInfo.recommendedTrunk ?? DEFAULT_TRUNK_BRANCH;
 
@@ -895,12 +1106,13 @@ export class MuxAgent implements Agent {
           parsedCommand.startMessage != null && parsedCommand.startMessage.trim().length > 0;
 
         const createResult = await this.server.client.workspace.create({
-          projectPath: workspaceInfo.projectPath,
+          projectPath: workspaceScope.projectPath,
           // branchName intentionally omitted — backend auto-generates (like /fork).
           trunkBranch,
           // Mirror /fork: when a start message accompanies /new, defer the title
           // selection until the first message can drive LLM-based generation.
           pendingAutoTitle: hasStartMessage,
+          subProjectPath: workspaceScope.subProjectPath,
         });
 
         if (!createResult.success) {
@@ -921,6 +1133,7 @@ export class MuxAgent implements Agent {
             options: {
               model: sessionState.aiSettings.model,
               thinkingLevel: sessionState.aiSettings.thinkingLevel,
+              reasoningMode: sessionState.aiSettings.reasoningMode,
               agentId: sessionState.agentId,
             },
           });
@@ -938,11 +1151,12 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private buildCompactionPayload(
+  private async buildCompactionPayload(
     command: Extract<ParsedAcpSlashCommand, { kind: "compact" }>,
     parsedPrompt: ParsedPrompt,
-    sessionState: SessionState
-  ): { message: string; options: SendMessageOptions } {
+    sessionState: SessionState,
+    workspaceId: string
+  ): Promise<{ message: string; options: SendMessageOptions }> {
     const targetWords =
       command.maxOutputTokens != null
         ? Math.round(command.maxOutputTokens / WORDS_TO_TOKENS_RATIO)
@@ -964,10 +1178,29 @@ export class MuxAgent implements Agent {
           model: sessionState.aiSettings.model,
           agentId: sessionState.agentId,
           thinkingLevel: sessionState.aiSettings.thinkingLevel,
+          reasoningMode: sessionState.aiSettings.reasoningMode,
         }
       : undefined;
 
-    const compactionModel = command.model ?? sessionState.aiSettings.model;
+    // Unified resolution as agent "compact": the -m flag is an explicit
+    // override (invalid values throw instead of silently falling back), the
+    // workspace's compact bucket and configured compact defaults win over the
+    // live session settings (parent runtime), and a model override reclamps
+    // thinking against the compaction model.
+    const workspace = await this.server.client.workspace.getInfo({ workspaceId });
+    const compactBucket = workspace?.aiSettingsByAgent?.compact;
+    const resolved = await resolveAcpAgentAiSettings(this.server.client, "compact", workspaceId, {
+      explicit: { model: command.model ?? undefined },
+      targetWorkspaceSettings: compactBucket
+        ? targetWorkspaceBucketToLayer(compactBucket)
+        : undefined,
+      parentRuntime: {
+        model: sessionState.aiSettings.model,
+        thinkingLevel: sessionState.aiSettings.thinkingLevel,
+        reasoningMode: sessionState.aiSettings.reasoningMode,
+      },
+    });
+    const compactionModel = resolved.selected.model;
 
     const compactData: CompactionRequestData = {
       model: compactionModel,
@@ -984,7 +1217,8 @@ export class MuxAgent implements Agent {
 
     const options: SendMessageOptions = {
       model: compactionModel,
-      thinkingLevel: sessionState.aiSettings.thinkingLevel,
+      thinkingLevel: resolved.effective.thinkingLevel,
+      reasoningMode: resolved.selected.reasoningMode,
       agentId: "compact",
       maxOutputTokens: command.maxOutputTokens,
       skipAiSettingsPersistence: true,
@@ -1273,6 +1507,8 @@ export class MuxAgent implements Agent {
     this.sessionSkillsById.delete(sessionId);
     this.onChatModeBySessionId.delete(sessionId);
     this.chatSubscriptionModeBySessionId.delete(sessionId);
+    this.historyReplayFailedSessionIds.delete(sessionId);
+    this.firstCaughtUpBySessionId.delete(sessionId);
     this.latestUsageBySessionId.delete(sessionId);
     this.sessionLastTouchedAtById.delete(sessionId);
 
@@ -1317,6 +1553,11 @@ export class MuxAgent implements Agent {
         }
       }
     };
+
+    // Retire the token before unwinding so the subscription's own teardown observes an
+    // intentional stop: its drain loop must neither count the missing caught-up as a failed
+    // replay nor reject a turn that already moved to the replacement subscription.
+    this.chatSubscriptionTokenBySessionId.delete(sessionId);
 
     const iterator = this.chatIteratorsBySessionId.get(sessionId);
     if (iterator != null) {
@@ -1478,6 +1719,17 @@ export class MuxAgent implements Agent {
       workspaceId,
       mode: onChatMode,
     });
+    // Registered before the connected signal so a prompt released by it always finds the
+    // gate. Full mode reads history; live mode reads none and cannot report on it, so it
+    // neither sets nor clears the failed flag and needs no first-caught-up gate.
+    const firstCaughtUp = Promise.withResolvers<void>();
+    if (onChatMode.type === "full") {
+      this.firstCaughtUpBySessionId.set(sessionId, firstCaughtUp.promise);
+    } else {
+      // A replaced subscription's gate must not outlive it (its teardown can linger).
+      this.firstCaughtUpBySessionId.delete(sessionId);
+      firstCaughtUp.resolve();
+    }
     onConnected();
     this.touchSession(sessionId);
 
@@ -1518,8 +1770,10 @@ export class MuxAgent implements Agent {
         event.type === "usage-delta" ||
         event.type === "session-usage-delta" ||
         event.type === "advisor-output" ||
+        event.type === "advisor-reasoning-output" ||
         event.type === "bash-output" ||
         event.type === "init-output" ||
+        event.type === "init-progress" ||
         // Drop replay history messages under saturation, but keep live message
         // events so ACP clients do not miss real-time conversation updates.
         isReplayMessageEvent
@@ -1558,6 +1812,12 @@ export class MuxAgent implements Agent {
           this.handleStreamEvent(sessionId, event);
           if (event.type === "caught-up") {
             hasCaughtUp = true;
+            if (event.historyReplayStatus === "failed") {
+              this.historyReplayFailedSessionIds.add(sessionId);
+            } else if (event.replay !== "live") {
+              this.historyReplayFailedSessionIds.delete(sessionId);
+            }
+            firstCaughtUp.resolve();
           }
           // Skip heartbeats from the queue: they produce no sessionUpdate
           // output and are emitted periodically, so they would accumulate
@@ -1590,6 +1850,14 @@ export class MuxAgent implements Agent {
           }
         }
       } finally {
+        // A current full-mode subscription that ends before its caught-up verified nothing:
+        // treat it as a failed replay so the waiting prompt is refused (and re-subscribes
+        // next time) instead of sending into an unverified transcript. A replaced
+        // subscription breaking out of the loop says nothing about the session.
+        if (!hasCaughtUp && isCurrentSubscription()) {
+          this.historyReplayFailedSessionIds.add(sessionId);
+        }
+        firstCaughtUp.resolve();
         end();
       }
     })();
@@ -1651,6 +1919,11 @@ export class MuxAgent implements Agent {
 
     this.refreshTurnInactivityTimeoutFromEvent(sessionId, event);
 
+    if (event.type === "held-inputs-changed") {
+      this.settleTurnHeldBeforeStart(sessionId, event.heldInputs);
+      return;
+    }
+
     if (event.type === "usage-delta") {
       if (!this.isActiveTurnMessage(sessionId, event.messageId)) {
         return;
@@ -1671,6 +1944,7 @@ export class MuxAgent implements Agent {
       const hasMatchingCorrelation = event.acpPromptId === completion.promptCorrelationId;
       const canFallbackToUncorrelatedStart =
         completion.messageId == null &&
+        completion.requiresExactCorrelation !== true &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
         event.acpPromptId == null &&
@@ -1755,6 +2029,32 @@ export class MuxAgent implements Agent {
       }
       this.rejectTurn(sessionId, new Error(`prompt stream failed: ${event.error}`));
     }
+  }
+
+  /**
+   * A queued prompt that the backend refused at dequeue (or a Stop returned from the queue) is
+   * kept as held input and never starts a stream, so no terminal event would settle its turn
+   * (#5171). The held list names that prompt by its correlation id: settle the turn from it.
+   */
+  private settleTurnHeldBeforeStart(
+    sessionId: string,
+    heldInputs: Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }>["heldInputs"]
+  ): void {
+    const completion = this.turnCompletions.get(sessionId);
+    // A turn bound to its stream-start was dispatched: its input was sent, so it is not held.
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const held = heldInputs.find(
+      (heldInput) => heldInput.acpPromptId === completion.promptCorrelationId
+    );
+    if (held == null) {
+      return;
+    }
+    this.resolveTurn(sessionId, {
+      stopReason: held.reason === "interrupted" ? "cancelled" : "refusal",
+      usage: this.latestUsageBySessionId.get(sessionId),
+    });
   }
 
   private async maybeDelegateToolCallToEditor(
@@ -1871,7 +2171,11 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private beginTurn(sessionId: string, promptCorrelationId: string): Promise<TurnResult> {
+  private beginTurn(
+    sessionId: string,
+    promptCorrelationId: string,
+    requiresExactCorrelation?: boolean
+  ): Promise<TurnResult> {
     assert(
       !this.turnCompletions.has(sessionId),
       `prompt: session '${sessionId}' already has a running turn`
@@ -1898,6 +2202,7 @@ export class MuxAgent implements Agent {
         promptCorrelationId,
         startedAtMs,
         timeoutHandle,
+        requiresExactCorrelation,
       });
     });
   }
@@ -2035,7 +2340,9 @@ export class MuxAgent implements Agent {
     // selection lives in sessionStateById and must not be reverted by a
     // workspace.agentId value from the backend.
     const agentId = existing?.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
+    // Picker choices remain session-local until the next user message sends them.
     const aiSettings =
+      existing?.aiSettings ??
       workspace.aiSettingsByAgent?.[agentId] ??
       workspace.aiSettings ??
       (await resolveAgentAiSettings(this.server.client, agentId, workspaceId));
@@ -2051,43 +2358,184 @@ export class MuxAgent implements Agent {
     return nextState;
   }
 
-  private async persistAiSettings(
-    workspaceId: string,
-    agentId: string,
-    aiSettings: ResolvedAiSettings
-  ): Promise<void> {
-    if (agentId === "plan" || agentId === "exec") {
-      const updateModeResult = await this.server.client.workspace.updateModeAISettings({
-        workspaceId,
-        mode: agentId,
-        aiSettings,
-      });
-
-      if (!updateModeResult.success) {
-        throw new Error(`workspace.updateModeAISettings failed: ${updateModeResult.error}`);
-      }
-
-      return;
-    }
-
-    const updateAgentResult = await this.server.client.workspace.updateAgentAISettings({
-      workspaceId,
-      agentId,
-      aiSettings,
-    });
-
-    if (!updateAgentResult.success) {
-      throw new Error(`workspace.updateAgentAISettings failed: ${updateAgentResult.error}`);
-    }
-  }
-
   async waitForDisconnectCleanup(): Promise<void> {
     await this.disconnectCleanupPromise;
+  }
+
+  private async ensureAcpProjectTrusted(projectPath: string): Promise<AcpWorkspaceCreationScope> {
+    const workspaceScope = await this.resolveAcpWorkspaceCreationScope(projectPath);
+    const trustPaths =
+      workspaceScope.subProjectPath != null
+        ? [workspaceScope.subProjectPath, workspaceScope.projectPath]
+        : [workspaceScope.projectPath];
+
+    // Launching mux as an ACP adapter from an editor for a concrete cwd is an
+    // explicit trust signal, matching other CLI-style ACP adapters that work in
+    // the selected directory without a separate desktop approval step.  For
+    // sub-projects, trust both the requested child entry (so it exists) and the
+    // owning parent entry that workspace creation/fork gates on.
+    for (const trustedProjectPath of trustPaths) {
+      await this.server.client.projects.setTrust({
+        projectPath: trustedProjectPath,
+        trusted: true,
+      });
+    }
+
+    return workspaceScope;
+  }
+
+  private async resolveAcpWorkspaceCreationScope(
+    projectPath: string
+  ): Promise<AcpWorkspaceCreationScope> {
+    const normalizedProjectPath = normalizePathForWorkspaceMatch(projectPath);
+    const projectEntries = await this.server.client.projects.list();
+    const projects = deriveProjectHierarchy(new Map<string, ProjectConfig>(projectEntries));
+    const existingProjectPath = findProjectPathByNormalizedPath(normalizedProjectPath, projects);
+
+    if (existingProjectPath != null) {
+      const scope = resolveWorkspaceCreationScope(existingProjectPath, projects);
+      assert(
+        scope.projectPath.trim().length > 0,
+        "resolveAcpWorkspaceCreationScope: owning project path must be non-empty"
+      );
+
+      return {
+        projectPath: scope.projectPath,
+        subProjectPath: scope.subProjectPath ?? undefined,
+      };
+    }
+
+    const parentProjectPath = findContainingTopLevelProjectPath(normalizedProjectPath, projects);
+    if (
+      parentProjectPath != null &&
+      (await pathsShareGitTopLevel(parentProjectPath, normalizedProjectPath))
+    ) {
+      return await this.registerAcpSubProject(parentProjectPath, normalizedProjectPath);
+    }
+
+    const gitTopLevel = await readGitTopLevelForAcpScope(normalizedProjectPath);
+    if (gitTopLevel != null && gitTopLevel !== normalizedProjectPath) {
+      const existingGitRootProjectPath = findProjectPathByNormalizedPath(gitTopLevel, projects);
+      const owningProjectPath =
+        existingGitRootProjectPath ?? (await this.registerAcpTopLevelProject(gitTopLevel));
+      return await this.registerAcpSubProject(owningProjectPath, normalizedProjectPath);
+    }
+
+    return { projectPath: normalizedProjectPath };
+  }
+
+  private async registerAcpTopLevelProject(projectPath: string): Promise<string> {
+    const createProjectResult = await this.server.client.projects.create({ projectPath });
+    if (!createProjectResult.success) {
+      throw new Error(
+        `resolveAcpWorkspaceCreationScope: failed to register project '${projectPath}': ${createProjectResult.error}`
+      );
+    }
+
+    return createProjectResult.data.normalizedPath;
+  }
+
+  private async registerAcpSubProject(
+    parentProjectPath: string,
+    subProjectPath: string
+  ): Promise<AcpWorkspaceCreationScope> {
+    const createProjectResult = await this.server.client.projects.create({
+      projectPath: subProjectPath,
+    });
+    if (!createProjectResult.success) {
+      throw new Error(
+        `resolveAcpWorkspaceCreationScope: failed to register sub-project '${subProjectPath}': ${createProjectResult.error}`
+      );
+    }
+
+    return {
+      projectPath: parentProjectPath,
+      subProjectPath: createProjectResult.data.normalizedPath,
+    };
   }
 
   private assertInitialized(methodName: string): void {
     assert(this.initialized, `${methodName}: initialize must be called first`);
   }
+}
+
+async function pathsShareGitTopLevel(leftPath: string, rightPath: string): Promise<boolean> {
+  const [leftGitRoot, rightGitRoot] = await Promise.all([
+    readGitTopLevelForAcpScope(leftPath),
+    readGitTopLevelForAcpScope(rightPath),
+  ]);
+
+  return leftGitRoot != null && leftGitRoot === rightGitRoot;
+}
+
+async function readGitTopLevelForAcpScope(projectPath: string): Promise<string | null> {
+  try {
+    using proc = execFileAsync("git", ["-C", projectPath, "rev-parse", "--show-toplevel"]);
+    const { stdout } = await proc.result;
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? normalizePathForWorkspaceMatch(trimmed) : null;
+  } catch {
+    return null;
+  }
+}
+
+function findProjectPathByNormalizedPath(
+  normalizedProjectPath: string,
+  projects: ReadonlyMap<string, ProjectConfig>
+): string | undefined {
+  for (const projectPath of projects.keys()) {
+    if (normalizePathForWorkspaceMatch(projectPath) === normalizedProjectPath) {
+      return projectPath;
+    }
+  }
+
+  return undefined;
+}
+
+function findContainingTopLevelProjectPath(
+  projectPath: string,
+  projects: ReadonlyMap<string, ProjectConfig>
+): string | undefined {
+  let closestParentPath: string | undefined;
+
+  for (const [candidatePath, candidateConfig] of projects) {
+    if (candidateConfig.parentProjectPath != null) {
+      continue;
+    }
+
+    if (!isPathDescendant(candidatePath, projectPath)) {
+      continue;
+    }
+
+    if (closestParentPath == null || candidatePath.length > closestParentPath.length) {
+      closestParentPath = candidatePath;
+    }
+  }
+
+  return closestParentPath;
+}
+
+async function resolveAcpNewSessionProjectPath(
+  cwd: string,
+  metaProjectPath: string | undefined
+): Promise<string> {
+  const cwdProjectPath = cwd.trim();
+  assert(cwdProjectPath.length > 0, "newSession: cwd must be non-empty");
+
+  if (metaProjectPath == null) {
+    return cwdProjectPath;
+  }
+
+  const [canonicalCwd, canonicalMetaProjectPath] = await Promise.all([
+    canonicalizePathForWorkspaceMatch(cwdProjectPath),
+    canonicalizePathForWorkspaceMatch(metaProjectPath),
+  ]);
+  assert(
+    canonicalCwd === canonicalMetaProjectPath,
+    "newSession: _meta.projectPath must match cwd before ACP can auto-trust the project"
+  );
+
+  return metaProjectPath;
 }
 
 function normalizeOptionalPath(value: string | null | undefined): string | undefined {
@@ -2133,10 +2581,10 @@ function parseSessionListCursor(cursor: string | null | undefined): number {
     return 0;
   }
 
-  assert(/^\d+$/.test(trimmed), `unstable_listSessions: invalid cursor '${cursor}'`);
+  assert(/^\d+$/.test(trimmed), `listSessions: invalid cursor '${cursor}'`);
 
   const parsed = Number(trimmed);
-  assert(Number.isSafeInteger(parsed), `unstable_listSessions: invalid cursor '${cursor}'`);
+  assert(Number.isSafeInteger(parsed), `listSessions: invalid cursor '${cursor}'`);
   return parsed;
 }
 
@@ -2157,11 +2605,19 @@ function dedupeWorkspacesById(workspaces: WorkspaceInfo[]): WorkspaceInfo[] {
 }
 
 function workspaceMatchesCwd(workspace: WorkspaceInfo, cwd: string): boolean {
-  // Match both projectPath and concrete workspace path so clients can filter by
-  // either the original project root or the runtime-specific working directory.
+  // Match project, sub-project, and concrete workspace paths so clients can
+  // filter by either their editor cwd or the runtime-specific working directory.
   const normalizedProjectPath = normalizePathForWorkspaceMatch(workspace.projectPath);
+  const normalizedSubProjectPath =
+    workspace.subProjectPath != null
+      ? normalizePathForWorkspaceMatch(workspace.subProjectPath)
+      : null;
   const normalizedWorkspacePath = normalizePathForWorkspaceMatch(workspace.namedWorkspacePath);
-  return normalizedProjectPath === cwd || normalizedWorkspacePath === cwd;
+  return (
+    normalizedProjectPath === cwd ||
+    normalizedSubProjectPath === cwd ||
+    normalizedWorkspacePath === cwd
+  );
 }
 
 function compareSessionRecency(

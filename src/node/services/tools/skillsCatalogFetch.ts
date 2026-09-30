@@ -10,7 +10,8 @@ import { MAX_FILE_SIZE } from "./fileCommon";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
 
 const SEARCH_TIMEOUT_MS = 10_000;
-const SEARCH_USER_AGENT = "mux-desktop";
+// Display/product attribution for skills.sh; no server-side mux contract.
+const SEARCH_USER_AGENT = "xum-desktop";
 
 export const SKILLS_API_BASE = process.env.SKILLS_API_URL ?? "https://skills.sh";
 
@@ -62,12 +63,6 @@ export function tryParseSource(source: string): { owner: string; repo: string } 
   const [owner, repo, ...rest] = source.split("/");
   if (!owner || !repo || rest.length > 0) return null;
   return { owner, repo };
-}
-
-export function parseSource(source: string): { owner: string; repo: string } {
-  const parsed = tryParseSource(source);
-  if (!parsed) throw new Error(`Invalid source format '${source}'. Expected 'owner/repo'`);
-  return parsed;
 }
 
 async function assertGitAvailable(): Promise<void> {

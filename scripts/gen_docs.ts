@@ -369,6 +369,8 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   google: "Google",
   xai: "xAI",
   deepseek: "DeepSeek",
+  moonshotai: "Moonshot AI",
+  zai: "Z.ai",
   openrouter: "OpenRouter",
   bedrock: "Bedrock",
 };
@@ -474,11 +476,16 @@ function escapeMarkdownTableCodeCell(value: string): string {
 function escapeMarkdownTableTextCell(value: string): string {
   // docs/hooks/tools.mdx is MDX; raw `<...>` sequences can be parsed as JSX.
   // Escape them so tool descriptions like "(<5s)" render correctly.
+  // `_` and `*` must also be escaped: identifiers like `task_ids`/`wfr_...` can pair up
+  // into emphasis spans, which Prettier then normalizes into mid-word `*` delimiters,
+  // shipping mangled text (e.g. "task*ids") to the docs site and built-in skills.
   return value
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll("|", "\\|")
+    .replaceAll("_", "\\_")
+    .replaceAll("*", "\\*")
     .replaceAll("\\n", " ")
     .replaceAll("\n", " ")
     .trim();
@@ -587,7 +594,7 @@ function collectToolHookEnvVarsFromZodSchema(schema: unknown): ToolHookEnvVarDoc
     if (type === "array" || type === "tuple") {
       // Arrays also get a _COUNT env var.
       add({
-        envVar: toolHookEnvVarName("MUX_TOOL_INPUT", [...options.keyPath, "COUNT"], {
+        envVar: toolHookEnvVarName("XUM_TOOL_INPUT", [...options.keyPath, "COUNT"], {
           allowPlaceholders: true,
         }),
         jsonPath: options.jsonPath ? `${options.jsonPath}.length` : "length",
@@ -658,7 +665,7 @@ function collectToolHookEnvVarsFromZodSchema(schema: unknown): ToolHookEnvVarDoc
     if (options.keyPath.length === 0) return;
 
     add({
-      envVar: toolHookEnvVarName("MUX_TOOL_INPUT", options.keyPath, { allowPlaceholders: true }),
+      envVar: toolHookEnvVarName("XUM_TOOL_INPUT", options.keyPath, { allowPlaceholders: true }),
       jsonPath: options.jsonPath || "(root)",
       type,
       description: description ?? "",
@@ -737,7 +744,7 @@ async function syncAutoCleanupWorkflow(): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function generateDeepReviewSkillBlock(): string {
-  const skillPath = path.join(import.meta.dir, "..", ".mux", "skills", "deep-review", "SKILL.md");
+  const skillPath = path.join(import.meta.dir, "..", ".xum", "skills", "deep-review", "SKILL.md");
   const content = fs.readFileSync(skillPath, "utf-8");
   // Use 5 backticks to wrap the skill content since it may contain nested code blocks with 3 backticks.
   return "`````md\n" + content.trim() + "\n`````";
@@ -746,7 +753,7 @@ function generateDeepReviewSkillBlock(): string {
 async function syncDeepReviewSkill(): Promise<boolean> {
   return syncDoc({
     docsFile: "agents/agent-skills.mdx",
-    sourceLabel: ".mux/skills/deep-review/SKILL.md",
+    sourceLabel: ".xum/skills/deep-review/SKILL.md",
     markerName: "DEEP_REVIEW_SKILL",
     generateBlock: generateDeepReviewSkillBlock,
   });

@@ -1,6 +1,6 @@
 import assert from "@/common/utils/assert";
 import type React from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { z } from "zod";
 import type { APIClient } from "@/browser/contexts/API";
 import { useAPI } from "@/browser/contexts/API";
@@ -180,6 +180,7 @@ export function useAnalyticsSpendOverTime(params: {
   granularity: "hour" | "day" | "week";
   from?: Date | null;
   to?: Date | null;
+  timeZone?: string | null;
 }): AsyncState<SpendOverTimeItem[]> {
   assert(
     params.granularity === "hour" || params.granularity === "day" || params.granularity === "week",
@@ -205,9 +206,10 @@ export function useAnalyticsSpendOverTime(params: {
         granularity: params.granularity,
         from: fromDate,
         to: toDate,
+        timeZone: params.timeZone ?? null,
       })
     );
-  }, [api, params.projectPath, params.granularity, fromMs, toMs]);
+  }, [api, params.projectPath, params.granularity, params.timeZone, fromMs, toMs]);
 
   return state;
 }
@@ -422,6 +424,11 @@ export function useAnalyticsRawQuery() {
     loading: false,
     error: null,
   });
+  // Saved panels auto re-run when the dashboard date range changes, so rapid
+  // toggles can leave multiple raw queries in flight. Track a monotonic
+  // execution id and drop completions of superseded requests so a slower
+  // older query cannot overwrite the newest result.
+  const executionIdRef = useRef(0);
 
   const executeQuery = async (sql: string) => {
     if (!api) {
@@ -435,16 +442,24 @@ export function useAnalyticsRawQuery() {
       return;
     }
 
+    const executionId = ++executionIdRef.current;
     setState((prev) => ({ ...prev, loading: true, error: null }));
     try {
       const result = await namespace.executeRawQuery({ sql });
-      setState({ data: result, loading: false, error: null });
+      if (executionId === executionIdRef.current) {
+        setState({ data: result, loading: false, error: null });
+      }
     } catch (err) {
-      setState({ data: null, loading: false, error: getErrorMessage(err) });
+      if (executionId === executionIdRef.current) {
+        setState({ data: null, loading: false, error: getErrorMessage(err) });
+      }
     }
   };
 
   const clearResults = () => {
+    // Invalidate in-flight executions so a late completion cannot resurrect
+    // results the caller explicitly cleared.
+    executionIdRef.current += 1;
     setState({ data: null, loading: false, error: null });
   };
 

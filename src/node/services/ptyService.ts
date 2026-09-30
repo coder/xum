@@ -18,6 +18,7 @@ import type { PtyHandle } from "@/node/runtime/transports";
 import { spawnPtyProcess } from "@/node/runtime/ptySpawn";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { redactDevcontainerArgsForLog } from "@/node/runtime/devcontainerLogRedaction";
@@ -139,7 +140,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else if (runtime instanceof LocalBaseRuntime) {
       try {
@@ -168,7 +168,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: true,
         env: options?.env,
         logLocalEnv: true,
       });
@@ -186,16 +185,16 @@ export class PTYService {
         `cd ${shellQuotePath(workspacePath)} && exec /bin/sh`,
       ];
       runtimeLabel = "Docker";
-      log.info(`[PTY] Docker terminal for ${sessionId}: docker ${dockerArgs.join(" ")}`);
+      const containerCli = await resolveContainerCli();
+      log.info(`[PTY] Docker terminal for ${sessionId}: ${containerCli} ${dockerArgs.join(" ")}`);
 
       ptyProcess = spawnPtyProcess({
         runtimeLabel,
-        command: "docker",
+        command: containerCli,
         args: dockerArgs,
         cwd: process.cwd(),
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else {
       throw new Error(`Unsupported runtime type: ${runtime.constructor.name}`);
@@ -316,12 +315,5 @@ export class PTYService {
     const sessionIds = Array.from(this.sessions.keys());
     log.info(`Closing all ${sessionIds.length} terminal session(s)`);
     sessionIds.forEach((id) => this.closeSession(id));
-  }
-
-  /**
-   * Get all sessions for debugging
-   */
-  getSessions(): Map<string, SessionData> {
-    return this.sessions;
   }
 }

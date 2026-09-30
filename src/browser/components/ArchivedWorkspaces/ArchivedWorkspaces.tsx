@@ -3,12 +3,16 @@ import React from "react";
 import { cn } from "@/common/lib/utils";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
 import { isWorktreeRuntime } from "@/common/types/runtime";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  FrontendWorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { ChevronDown, ChevronRight, FolderX, Loader2, Search, Trash2 } from "lucide-react";
 import { ArchiveIcon, ArchiveRestoreIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -40,7 +44,9 @@ type SessionUsageFile = z.infer<typeof SessionUsageFileSchema>;
 interface ArchivedWorkspacesProps {
   projectPath: string;
   projectName: string;
-  workspaces: FrontendWorkspaceMetadata[];
+  workspaces: FrontendWorkspaceMetadata[] | undefined;
+  /** Message from a failed archived list request; shown while expanded above any cached rows */
+  loadError?: string;
   /** Called after a workspace is unarchived or deleted to refresh the list */
   onWorkspacesChanged?: () => void;
 }
@@ -51,10 +57,17 @@ interface BulkOperationState {
   completed: number;
   current: string | null;
   errors: string[];
+  /** What forced removals left behind (#5143); kept in the dialog so Done does not clear it. */
+  warnings?: string[];
 }
 
 function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
-  return isWorktreeRuntime(workspace.runtimeConfig) && workspace.transcriptOnly !== true;
+  return (
+    isWorktreeRuntime(workspace.runtimeConfig) &&
+    workspace.transcriptOnly !== true &&
+    // isolation:none tasks reuse an ancestor checkout, so they do not own local worktree state.
+    workspace.taskIsolation !== "none"
+  );
 }
 
 /** Group workspaces by time period for timeline display */
@@ -111,6 +124,47 @@ function flattenGrouped(
     result.push(...workspaces);
   }
   return result;
+}
+
+/**
+ * Preserve selection order among peers while ensuring descendants are deleted before parents.
+ * This keeps bulk deletion deterministic and prevents the backend's orphan guard from turning a
+ * single subtree deletion into a partial operation that needs a second attempt.
+ */
+function sortWorkspaceIdsDeepestFirst(
+  workspaceIds: readonly string[],
+  workspaces: readonly FrontendWorkspaceMetadata[]
+): string[] {
+  const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace] as const));
+  const depthById = new Map<string, number>();
+
+  const getDepth = (workspaceId: string, visiting: Set<string>): number => {
+    const cached = depthById.get(workspaceId);
+    if (cached != null) return cached;
+    if (visiting.has(workspaceId)) return 0;
+
+    const workspace = workspaceById.get(workspaceId);
+    const parentWorkspaceId = workspace?.parentWorkspaceId;
+    if (parentWorkspaceId == null || !workspaceById.has(parentWorkspaceId)) {
+      depthById.set(workspaceId, 0);
+      return 0;
+    }
+
+    visiting.add(workspaceId);
+    const depth = Math.min(getDepth(parentWorkspaceId, visiting) + 1, 32);
+    visiting.delete(workspaceId);
+    depthById.set(workspaceId, depth);
+    return depth;
+  };
+
+  return workspaceIds
+    .map((workspaceId, index) => ({
+      workspaceId,
+      index,
+      depth: getDepth(workspaceId, new Set()),
+    }))
+    .sort((left, right) => right.depth - left.depth || left.index - right.index)
+    .map(({ workspaceId }) => workspaceId);
 }
 
 /** Calculate total cost from a SessionUsageFile by summing all model usages */
@@ -234,6 +288,18 @@ const BulkProgressModal: React.FC<{
           </div>
         )}
 
+        {/* Leftovers of successful forced removals */}
+        {operation.warnings != null && operation.warnings.length > 0 && (
+          <div
+            role="status"
+            className="bg-warning-overlay text-warning-text max-h-32 overflow-y-auto rounded p-2 text-xs break-words whitespace-pre-wrap"
+          >
+            {operation.warnings.map((warning, i) => (
+              <div key={i}>{warning}</div>
+            ))}
+          </div>
+        )}
+
         {isComplete && (
           <DialogFooter className="justify-center">
             <Button variant="secondary" onClick={onClose} className="w-full">
@@ -253,13 +319,17 @@ const BulkProgressModal: React.FC<{
 export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   projectPath: _projectPath,
   projectName: _projectName,
-  workspaces,
+  workspaces: loadedWorkspaces,
+  loadError,
   onWorkspacesChanged,
 }) => {
   const [isExpanded, setIsExpanded] = usePersistedState(
     getArchivedWorkspacesExpandedKey(_projectPath),
-    false
+    false,
+    { listener: true }
   );
+  // Collapsed sections must not scan metadata or fetch costs, even with a warm cache.
+  const workspaces = isExpanded ? (loadedWorkspaces ?? []) : [];
   const archivedRegionId = React.useId();
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
@@ -270,9 +340,15 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const [forceDeleteModal, setForceDeleteModal] = React.useState<{
     workspaceId: string;
     error: string;
+    descendants?: WorkspaceRemovalDescendant[];
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
+  // What a forced removal left behind (e.g. a devcontainer that may still hold the plan, #5143),
+  // after Shift-click or the Force Delete dialog. It stays until dismissed: the row is gone, so
+  // the user could not reread it. Bulk delete shows it in its progress dialog instead: that modal
+  // would hide this popover from assistive technology.
+  const removeWarning = usePopoverError(null);
 
   // Bulk selection state
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
@@ -296,7 +372,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   // Cost data with optimistic caching - shows cached costs immediately, fetches fresh in background
-  const workspaceIds = React.useMemo(() => workspaces.map((w) => w.id), [workspaces]);
+  const workspaceIds = workspaces.map((w) => w.id);
 
   // Memoize fetchBatch so the hook doesn't refetch on every local state change.
   const fetchWorkspaceCosts = React.useCallback(
@@ -318,7 +394,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const { values: costsByWorkspace, status: costsStatus } = useOptimisticBatchLRU({
     keys: workspaceIds,
     cache: sessionCostCache,
-    skip: !api,
+    skip: !api || !isExpanded,
     fetchBatch: fetchWorkspaceCosts,
   });
   const costsLoading = costsStatus === "idle" || costsStatus === "loading";
@@ -333,23 +409,17 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       })
     : workspaces;
 
-  // Group filtered workspaces by time period
   const groupedWorkspaces = groupByTimePeriod(filteredWorkspaces);
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
   // Calculate total cost and per-period costs from cached/fetched values
-  const totalCost = React.useMemo(() => {
-    let sum = 0;
-    let hasCost = false;
-    for (const ws of workspaces) {
-      const cost = costsByWorkspace[ws.id];
-      if (cost !== undefined) {
-        sum += cost;
-        hasCost = true;
-      }
+  let totalCost: number | undefined;
+  for (const ws of workspaces) {
+    const cost = costsByWorkspace[ws.id];
+    if (cost !== undefined) {
+      totalCost = (totalCost ?? 0) + cost;
     }
-    return hasCost ? sum : undefined;
-  }, [workspaces, costsByWorkspace]);
+  }
 
   const periodCosts = React.useMemo(() => {
     const costs = new Map<string, number | undefined>();
@@ -367,11 +437,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     }
     return costs;
   }, [groupedWorkspaces, costsByWorkspace]);
-
-  // workspaces prop should already be filtered to archived only
-  if (workspaces.length === 0) {
-    return null;
-  }
 
   // Handle checkbox click with shift-click range selection
   const handleCheckboxClick = (workspaceId: string, event: React.MouseEvent) => {
@@ -424,13 +489,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return next;
       });
     } else {
-      // Select all filtered
       setSelectedIds((prev) => new Set([...prev, ...allFilteredIds]));
     }
     setBulkDeleteConfirm(false); // Clear confirmation when selection changes
   };
 
-  // Bulk restore
   const handleBulkRestore = async () => {
     const idsToRestore = Array.from(selectedIds);
     setBulkOperation({
@@ -477,7 +540,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   // Bulk delete (always force: true) - requires confirmation
   const handleBulkDelete = async () => {
     setBulkDeleteConfirm(false);
-    const idsToDelete = Array.from(selectedIds);
+    const idsToDelete = sortWorkspaceIdsDeepestFirst(Array.from(selectedIds), workspaces);
     setBulkOperation({
       type: "delete",
       total: idsToDelete.length,
@@ -493,6 +556,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
       try {
         const result = await removeWorkspace(id, { force: true });
+        if (result.success && result.warnings?.length) {
+          const line = `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`;
+          setBulkOperation((prev) =>
+            prev ? { ...prev, warnings: [...(prev.warnings ?? []), line] } : prev
+          );
+        }
         if (!result.success) {
           setBulkOperation((prev) =>
             prev
@@ -676,10 +745,25 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return;
       }
 
-      // Shift-click: skip force-delete confirmation, auto-force immediately.
+      // Shift-click: skip every confirmation, auto-force immediately. Shift stands in for the
+      // descendant acknowledgment the modal would otherwise collect, so pass the scope the
+      // backend just reported. The backend still rejects the retry if any descendant is active
+      // or the scope changed, and that failure falls through to the modal below.
       if (options?.bypassForceConfirm) {
-        const forced = await removeWorkspace(workspaceId, { force: true });
+        const forced = await removeWorkspace(workspaceId, {
+          force: true,
+          ...(result.descendants?.length
+            ? {
+                acknowledgedDescendantIds: result.descendants.map(
+                  (descendant) => descendant.workspaceId
+                ),
+              }
+            : {}),
+        });
         if (forced.success) {
+          if (forced.warnings?.length) {
+            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
+          }
           onWorkspacesChanged?.();
           return;
         }
@@ -688,6 +772,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         setForceDeleteModal({
           workspaceId,
           error: forced.error ?? result.error ?? "Failed to remove workspace",
+          descendants: forced.descendants,
         });
         return;
       }
@@ -695,6 +780,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setForceDeleteModal({
         workspaceId,
         error: result.error ?? "Failed to remove workspace",
+        descendants: result.descendants,
       });
     } finally {
       setProcessingIds((prev) => {
@@ -716,19 +802,32 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     <>
       {/* Bulk operation progress modal */}
 
-      <ForceDeleteModal
-        isOpen={forceDeleteModal !== null}
-        workspaceId={forceDeleteModal?.workspaceId ?? ""}
-        error={forceDeleteModal?.error ?? ""}
-        onClose={() => setForceDeleteModal(null)}
-        onForceDelete={async (workspaceId) => {
-          const result = await removeWorkspace(workspaceId, { force: true });
-          if (!result.success) {
-            throw new Error(result.error ?? "Force delete failed");
-          }
-          onWorkspacesChanged?.();
-        }}
-      />
+      {forceDeleteModal && (
+        <ForceDeleteModal
+          isOpen
+          workspaceId={forceDeleteModal.workspaceId}
+          error={forceDeleteModal.error}
+          descendants={forceDeleteModal.descendants}
+          onClose={() => setForceDeleteModal(null)}
+          onForceDelete={async (workspaceId, acknowledgedDescendantIds) => {
+            const result = await removeWorkspace(workspaceId, {
+              force: true,
+              acknowledgedDescendantIds,
+            });
+            if (result.success) {
+              // The dialog showed the non-forced error; the forced retry can leave more behind.
+              if (result.warnings?.length) {
+                removeWarning.showError(
+                  workspaceId,
+                  formatWorkspaceRemoveWarnings(result.warnings)
+                );
+              }
+              onWorkspacesChanged?.();
+            }
+            return result;
+          }}
+        />
+      )}
       <PopoverError
         error={unarchiveError.error}
         prefix="Failed to restore workspace"
@@ -738,6 +837,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         error={deleteWorktreeError.error}
         prefix="Failed to delete managed worktree"
         onDismiss={deleteWorktreeError.clearError}
+      />
+      <PopoverError
+        error={removeWarning.error}
+        prefix="Workspace deleted, but something was left behind"
+        onDismiss={removeWarning.clearError}
       />
       {bulkOperation && (
         <BulkProgressModal operation={bulkOperation} onClose={() => setBulkOperation(null)} />
@@ -762,9 +866,10 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           </button>
           <ArchiveIcon className="text-muted h-4 w-4" />
           <span className="text-foreground font-medium">
-            Archived Workspaces ({workspaces.length})
+            Archived Workspaces
+            {isExpanded && loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
           </span>
-          <CostBadge cost={totalCost} loading={costsLoading} size="lg" />
+          {isExpanded && <CostBadge cost={totalCost} loading={costsLoading} size="lg" />}
           <span className="flex-1" />
           {isExpanded && hasSelection && (
             <div className="flex items-center gap-2">
@@ -848,6 +953,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             aria-label="Archived workspaces"
             className="border-border border-t"
           >
+            {loadError !== undefined && (
+              <div className="text-error px-4 py-3 text-center text-sm">
+                Failed to load archived workspaces: {loadError}
+              </div>
+            )}
+
             {/* Search input with select all */}
             {workspaces.length > 1 && (
               <div className="border-border flex items-center gap-2 border-b px-4 py-2">
@@ -875,136 +986,143 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
             {/* Timeline grouped list */}
             <div>
-              {filteredWorkspaces.length === 0 ? (
-                <div className="text-muted px-4 py-6 text-center text-sm">
-                  No workspaces match {`"${searchQuery}"`}
-                </div>
-              ) : (
-                Array.from(groupedWorkspaces.entries()).map(([period, periodWorkspaces]) => (
-                  <div key={period}>
-                    {/* Period header */}
-                    <div className="bg-bg-dark text-muted flex items-center gap-2 px-4 py-1.5 text-xs font-medium">
-                      <span>{period}</span>
-                      <CostBadge cost={periodCosts.get(period)} loading={costsLoading} />
+              {filteredWorkspaces.length === 0
+                ? loadError === undefined && (
+                    <div className="text-muted px-4 py-6 text-center text-sm">
+                      {loadedWorkspaces === undefined
+                        ? "Loading archived workspaces…"
+                        : searchQuery.trim()
+                          ? `No workspaces match "${searchQuery}"`
+                          : "No archived workspaces"}
                     </div>
-                    {/* Workspaces in this period */}
-                    {periodWorkspaces.map((workspace) => {
-                      const isProcessing = processingIds.has(workspace.id) || workspace.isRemoving;
-                      const isSelected = selectedIds.has(workspace.id);
-                      const workspaceNameForTooltip =
-                        workspace.title && workspace.title !== workspace.name
-                          ? workspace.name
-                          : undefined;
-                      const displayTitle = workspace.title ?? workspace.name;
-                      const canDeleteWorktree = canDeleteManagedWorktree(workspace);
-                      const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
+                  )
+                : Array.from(groupedWorkspaces.entries()).map(([period, periodWorkspaces]) => (
+                    <div key={period}>
+                      {/* Period header */}
+                      <div className="bg-bg-dark text-muted flex items-center gap-2 px-4 py-1.5 text-xs font-medium">
+                        <span>{period}</span>
+                        <CostBadge cost={periodCosts.get(period)} loading={costsLoading} />
+                      </div>
+                      {/* Workspaces in this period */}
+                      {periodWorkspaces.map((workspace) => {
+                        const isProcessing =
+                          processingIds.has(workspace.id) || workspace.isRemoving;
+                        const isSelected = selectedIds.has(workspace.id);
+                        const workspaceNameForTooltip =
+                          workspace.title && workspace.title !== workspace.name
+                            ? workspace.name
+                            : undefined;
+                        const displayTitle = workspace.title ?? workspace.name;
+                        const canDeleteWorktree = canDeleteManagedWorktree(workspace);
+                        const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
 
-                      return (
-                        <div
-                          key={workspace.id}
-                          className={cn(
-                            "border-border flex items-center gap-3 border-b px-4 py-2.5 last:border-b-0",
-                            isProcessing && "opacity-50",
-                            isSelected && "bg-white/5"
-                          )}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onClick={(e) => handleCheckboxClick(workspace.id, e)}
-                            onChange={() => undefined} // Controlled by onClick for shift-click support
-                            className="h-4 w-4 rounded border-gray-600 bg-transparent"
-                            aria-label={`Select ${displayTitle}`}
-                          />
-                          <RuntimeBadge
-                            runtimeConfig={workspace.runtimeConfig}
-                            isWorking={false}
-                            workspacePath={workspace.namedWorkspacePath}
-                            workspaceName={workspaceNameForTooltip}
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="text-foreground truncate text-sm font-medium">
-                              {displayTitle}
+                        return (
+                          <div
+                            key={workspace.id}
+                            className={cn(
+                              "border-border flex items-center gap-3 border-b px-4 py-2.5 last:border-b-0",
+                              isProcessing && "opacity-50",
+                              isSelected && "bg-white/5"
+                            )}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onClick={(e) => handleCheckboxClick(workspace.id, e)}
+                              onChange={() => undefined} // Controlled by onClick for shift-click support
+                              className="h-4 w-4 rounded border-gray-600 bg-transparent"
+                              aria-label={`Select ${displayTitle}`}
+                            />
+                            <RuntimeBadge
+                              runtimeConfig={workspace.runtimeConfig}
+                              isWorking={false}
+                              workspacePath={workspace.namedWorkspacePath}
+                              workspaceName={workspaceNameForTooltip}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="text-foreground truncate text-sm font-medium">
+                                {displayTitle}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {workspace.archivedAt && (
+                                  <span className="text-muted text-xs">
+                                    {new Date(workspace.archivedAt).toLocaleString(undefined, {
+                                      month: "short",
+                                      day: "numeric",
+                                      hour: "numeric",
+                                      minute: "2-digit",
+                                    })}
+                                  </span>
+                                )}
+                                <CostBadge
+                                  cost={costsByWorkspace[workspace.id]}
+                                  loading={costsLoading}
+                                  size="sm"
+                                />
+                              </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                              {workspace.archivedAt && (
-                                <span className="text-muted text-xs">
-                                  {new Date(workspace.archivedAt).toLocaleString(undefined, {
-                                    month: "short",
-                                    day: "numeric",
-                                    hour: "numeric",
-                                    minute: "2-digit",
-                                  })}
-                                </span>
-                              )}
-                              <CostBadge
-                                cost={costsByWorkspace[workspace.id]}
-                                loading={costsLoading}
-                                size="sm"
-                              />
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) =>
-                                    void handleUnarchive(workspace.id, event.currentTarget)
-                                  }
-                                  disabled={isProcessing}
-                                  className="text-muted hover:text-foreground rounded p-1.5 transition-colors hover:bg-white/10 disabled:opacity-50"
-                                  aria-label={`Restore workspace ${displayTitle}`}
-                                >
-                                  <ArchiveRestoreIcon className="h-4 w-4" />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent>Restore to sidebar</TooltipContent>
-                            </Tooltip>
-                            {canDeleteWorktree && (
+                            <div className="flex items-center gap-1">
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
                                     onClick={(event) =>
-                                      void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                      void handleUnarchive(workspace.id, event.currentTarget)
                                     }
                                     disabled={isProcessing}
-                                    className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"
-                                    aria-label={`Remove local checkout for workspace ${displayTitle}`}
+                                    className="text-muted hover:text-foreground rounded p-1.5 transition-colors hover:bg-white/10 disabled:opacity-50"
+                                    aria-label={`Restore workspace ${displayTitle}`}
                                   >
-                                    {isDeletingWorktree ? (
-                                      <Loader2 className="h-4 w-4 animate-spin" />
-                                    ) : (
-                                      <FolderX className="h-4 w-4" />
-                                    )}
+                                    <ArchiveRestoreIcon className="h-4 w-4" />
                                   </button>
                                 </TooltipTrigger>
-                                <TooltipContent>Remove local checkout</TooltipContent>
+                                <TooltipContent>Restore to sidebar</TooltipContent>
                               </Tooltip>
-                            )}
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) =>
-                                    void handleDelete(workspace.id, {
-                                      bypassForceConfirm: event.shiftKey,
-                                    })
-                                  }
-                                  disabled={isProcessing}
-                                  className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-red-400 disabled:opacity-50"
-                                  aria-label={`Delete workspace ${displayTitle}`}
-                                >
-                                  <Trash2 className="h-4 w-4" />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent>Delete permanently (local branch too)</TooltipContent>
-                            </Tooltip>
+                              {canDeleteWorktree && (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <button
+                                      onClick={(event) =>
+                                        void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                      }
+                                      disabled={isProcessing}
+                                      className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"
+                                      aria-label={`Remove local checkout for workspace ${displayTitle}`}
+                                    >
+                                      {isDeletingWorktree ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <FolderX className="h-4 w-4" />
+                                      )}
+                                    </button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>Remove local checkout</TooltipContent>
+                                </Tooltip>
+                              )}
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    onClick={(event) =>
+                                      void handleDelete(workspace.id, {
+                                        bypassForceConfirm: event.shiftKey,
+                                      })
+                                    }
+                                    disabled={isProcessing}
+                                    className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-red-400 disabled:opacity-50"
+                                    aria-label={`Delete workspace ${displayTitle}`}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  Delete permanently (local branch too)
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))
-              )}
+                        );
+                      })}
+                    </div>
+                  ))}
             </div>
           </div>
         )}

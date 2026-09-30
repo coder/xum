@@ -1,4 +1,5 @@
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { usePersistedState } from "./usePersistedState";
@@ -9,10 +10,15 @@ import {
 import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
-import { useExperimentOverrideValue } from "./useExperiments";
+import { useExperimentOverrideValue, useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { getWorkspaceAiSettingsFromMetadata } from "@/browser/utils/workspaceAiSettingsSync";
+import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  getAutoRoutingKey,
+  setAutoRoutingChoice,
+  type AutoRoutingDimension,
+} from "@/browser/utils/modelChange";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
@@ -24,11 +30,30 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
 }
 
 /**
+ * Ignores persisted Auto while the experiment is disabled. In workspace scopes, user
+ * updates also record the active agent's routing choice.
+ */
+export function useAutoRoutingSelection(
+  workspaceId: string,
+  dimension: AutoRoutingDimension
+): [active: boolean, setActive: (active: boolean) => void] {
+  const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const [persisted] = usePersistedState<boolean>(getAutoRoutingKey(workspaceId, dimension), false, {
+    listener: true,
+  });
+  return [
+    experimentEnabled && persisted === true,
+    (active) => setAutoRoutingChoice(workspaceId, dimension, active),
+  ];
+}
+
+/**
  * Single source of truth for message send options (ChatInput, RetryBarrier, etc.).
  * Subscribes to persisted preferences so model/thinking/agent changes propagate automatically.
  */
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
+  const [reasoningMode] = useReasoningMode();
   const { agentId, disableWorkspaceAgents } = useAgent();
   const { workspaceMetadata } = useWorkspaceContext();
   const { options: providerOptions } = useProviderOptions();
@@ -50,40 +75,48 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   });
 
   // Subscribe to local override state so toggles apply immediately.
-  // If undefined, the backend will apply the PostHog assignment.
   const programmaticToolCalling = useExperimentOverrideValue(
     EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
   );
-  const programmaticToolCallingExclusive = useExperimentOverrideValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-  );
-  const execSubagentHardRestart = useExperimentOverrideValue(
-    EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART
-  );
-  const imageGenerationTool = useExperimentOverrideValue(EXPERIMENT_IDS.IMAGE_GENERATION_TOOL);
+  const rlm = useExperimentOverrideValue(EXPERIMENT_IDS.RLM);
+  const advisorTool = useExperimentOverrideValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+  const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
+  const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
+  const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
+  const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
+  const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+  const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
+  const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
+  const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
-  const metadataSettings = getWorkspaceAiSettingsFromMetadata(
-    workspaceMetadata.get(workspaceId),
-    agentId
-  );
-  const baseModel = normalizeModelPreference(
+  const baseModel = resolveEffectiveComposerModel(
     preferredModel,
-    metadataSettings.model ?? defaultModel
+    workspaceMetadata.get(workspaceId),
+    agentId,
+    defaultModel
   );
 
   const options = buildSendMessageOptions({
     agentId,
     thinkingLevel,
+    reasoningMode,
     model: baseModel,
     providerOptions,
     experiments: {
       programmaticToolCalling,
-      programmaticToolCallingExclusive,
-      execSubagentHardRestart,
-      imageGenerationTool,
+      rlm,
+      advisorTool,
+      dynamicWorkflows,
+      memory,
+      memoryIntuition,
+      toolSearch,
+      continuousCompaction,
+      tokenBudget,
     },
     disableWorkspaceAgents,
+    autoModelRouting,
+    autoThinkingLevel,
   });
 
   return {

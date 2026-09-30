@@ -1,36 +1,98 @@
 import { randomUUID } from "node:crypto";
 
-import { tool } from "ai";
+import { tool, type Tool } from "ai";
 import type { z } from "zod";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
   TaskToolResultSchema,
   TOOL_DEFINITIONS,
+  buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
 } from "@/common/utils/tools/toolDefinitions";
-import { RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
+import {
+  RUNTIME_MODE,
+  runtimeModeSupportsSharedTaskWorkspace,
+  type RuntimeMode,
+} from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
-import { buildTaskGroupLaunches, type TaskGroupKind } from "@/common/utils/tools/taskGroups";
-import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
+import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
+import {
+  emitChatEventBestEffort,
+  parseToolResult,
+  requireTaskService,
+  requireWorkspaceTurnManager,
+  requireWorkspaceId,
+} from "./toolUtils";
 import { getErrorMessage } from "@/common/utils/errors";
-import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceThinkingLevel,
+  parseThinkingInput,
+  type ParsedThinkingInput,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { coerceNonEmptyString } from "@/node/services/taskUtils";
+
+// Plan agent is read-only: only `explore` sub-agent tasks may be spawned. Shared by both the
+// workspace-turn guard and the per-launch agent-id guard so the message can't drift between them.
+const PLAN_AGENT_EXPLORE_ONLY_ERROR =
+  'In the plan agent you may only spawn agentId: "explore" tasks.';
+
+const BUILT_IN_TASK_TOOL_MARKER = Symbol("muxBuiltInTaskTool");
+
+export function markBuiltInTaskTool<TParameters, TResult>(
+  taskTool: Tool<TParameters, TResult>
+): Tool<TParameters, TResult> {
+  Object.defineProperty(taskTool, BUILT_IN_TASK_TOOL_MARKER, {
+    value: true,
+    // enumerable so object spread (wrapWithInitWait) and descriptor clones (withHooks,
+    // cloneToolPreservingDescriptors, cache control) carry the marker forward to every wrapper —
+    // that is what lets sibling explore task calls share the parallel reader lock downstream.
+    enumerable: true,
+    configurable: true,
+  });
+  return taskTool;
+}
+
+export function isBuiltInTaskTool(tool: Tool | undefined): boolean {
+  return Boolean(
+    (tool as (Tool & Record<symbol, unknown>) | undefined)?.[BUILT_IN_TASK_TOOL_MARKER] === true
+  );
+}
+
+/** Resolve the parent workspace's runtime mode from the injected MUX_RUNTIME env. */
+function resolveRuntimeMode(config: ToolConfiguration): RuntimeMode | undefined {
+  const runtimeValue = config.xumEnv?.MUX_RUNTIME;
+  return runtimeValue != null && Object.values(RUNTIME_MODE).includes(runtimeValue as RuntimeMode)
+    ? (runtimeValue as RuntimeMode)
+    : undefined;
+}
+
+/**
+ * Whether to offer `isolation: "none"`: only where TaskService honors it — runtimes that can share
+ * the parent checkout, in single-project workspaces. Multi-project workspaces run through a runtime
+ * that derives every checkout from the task's own name, so TaskService refuses it there (#4411).
+ */
+function supportsSharedIsolation(config: ToolConfiguration): boolean {
+  return (
+    runtimeModeSupportsSharedTaskWorkspace(resolveRuntimeMode(config)) &&
+    (config.projects?.length ?? 0) <= 1
+  );
+}
 
 /**
  * Build dynamic task tool description with runtime-specific workspace visibility
  * guidance and the currently available sub-agents.
  */
 function buildTaskDescription(config: ToolConfiguration): string {
-  const runtimeValue = config.muxEnv?.MUX_RUNTIME;
-  const runtimeMode =
-    runtimeValue != null && Object.values(RUNTIME_MODE).includes(runtimeValue as RuntimeMode)
-      ? (runtimeValue as RuntimeMode)
-      : undefined;
-  const baseDescription = buildTaskToolDescription(runtimeMode);
+  const runtimeMode = resolveRuntimeMode(config);
+  const baseDescription = buildTaskToolDescription(runtimeMode, {
+    sharedIsolation: supportsSharedIsolation(config),
+  });
   const subagents = config.availableSubagents?.filter((a) => a.subagentRunnable) ?? [];
 
   if (subagents.length === 0) {
@@ -48,8 +110,8 @@ function buildTaskDescription(config: ToolConfiguration): string {
 function buildParentRuntimeAiSettings(
   config: ToolConfiguration
 ): { modelString?: string; thinkingLevel?: ThinkingLevel } | undefined {
-  const modelString = coerceNonEmptyString(config.muxEnv?.MUX_MODEL_STRING);
-  const thinkingLevel = coerceThinkingLevel(config.muxEnv?.MUX_THINKING_LEVEL);
+  const modelString = coerceNonEmptyString(config.xumEnv?.MUX_MODEL_STRING);
+  const thinkingLevel = coerceThinkingLevel(config.xumEnv?.MUX_THINKING_LEVEL);
 
   if (modelString == null && thinkingLevel == null) {
     return undefined;
@@ -61,28 +123,72 @@ function buildParentRuntimeAiSettings(
   };
 }
 
+/**
+ * Parse the optional `model`/`thinking` overrides supplied on a task launch,
+ * reusing the exact parsing the UI uses (`normalizeModelInput` for model alias
+ * resolution; `parseThinkingInput` for named levels OR numeric indices). Numeric
+ * thinking indices stay deferred as a `ParsedThinkingInput` so they resolve
+ * against the sub-agent's chosen model in `resolveTaskAISettings`. Throws a
+ * descriptive error on invalid input so the model can correct the call.
+ *
+ * Exported so the models_list tests can prove every advertised model/alias/level
+ * is accepted by exactly this parser.
+ */
+export function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+  modelString?: string;
+  thinkingLevel?: ParsedThinkingInput;
+} {
+  const overrides: { modelString?: string; thinkingLevel?: ParsedThinkingInput } = {};
+
+  if (args.model != null) {
+    const normalized = normalizeModelInput(args.model);
+    if (normalized.model == null) {
+      throw new Error(
+        `task tool: invalid model "${args.model}". Provide a known alias or a "provider:model" string.`
+      );
+    }
+    overrides.modelString = normalized.model;
+  }
+
+  if (args.thinking != null) {
+    const parsed = parseThinkingInput(args.thinking);
+    if (parsed == null) {
+      throw new Error(
+        `task tool: invalid thinking "${args.thinking}". Use a level name (off, low, medium, high, xhigh, max) or a numeric index.`
+      );
+    }
+    overrides.thinkingLevel = parsed;
+  }
+
+  return overrides;
+}
+
 interface SpawnedTaskInfo {
   taskId: string;
-  status: "queued" | "running";
-  groupKind?: TaskGroupKind;
-  label?: string;
+  status: "queued" | "starting" | "running";
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 interface PendingTaskInfo {
   taskId: string;
-  status: "queued" | "running" | "completed" | "interrupted";
-  groupKind?: TaskGroupKind;
-  label?: string;
+  status: "queued" | "starting" | "running" | "completed" | "interrupted";
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 interface CompletedTaskInfo {
   taskId: string;
   reportMarkdown: string;
+  structuredOutput?: unknown;
   title?: string;
   agentId: string;
   agentType: string;
-  groupKind?: TaskGroupKind;
-  label?: string;
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 type ForegroundWaitOutcome =
@@ -107,30 +213,38 @@ function emitTaskCreatedEvent(params: {
     return;
   }
 
-  params.config.emitChatEvent({
-    type: "task-created",
-    workspaceId: params.workspaceId,
-    toolCallId: params.toolCallId,
-    taskId: params.taskId,
-    timestamp: Date.now(),
-  } satisfies TaskCreatedEvent);
+  emitChatEventBestEffort(
+    params.config,
+    {
+      type: "task-created",
+      workspaceId: params.workspaceId,
+      toolCallId: params.toolCallId,
+      taskId: params.taskId,
+      timestamp: Date.now(),
+    } satisfies TaskCreatedEvent,
+    "task"
+  );
 }
 
 function toAggregatePendingStatus(
   statuses: ReadonlyArray<PendingTaskInfo["status"]>
-): "queued" | "running" {
-  return statuses.every((status) => status === "queued") ? "queued" : "running";
+): "queued" | "starting" | "running" {
+  if (statuses.every((status) => status === "queued")) return "queued";
+  if (statuses.every((status) => status === "starting")) return "starting";
+  return "running";
 }
 
 function serializeCompletedReport(report: CompletedTaskInfo) {
   return {
     taskId: report.taskId,
     reportMarkdown: report.reportMarkdown,
+    structuredOutput: report.structuredOutput,
     title: report.title,
     agentId: report.agentId,
     agentType: report.agentType,
-    groupKind: report.groupKind,
-    label: report.label,
+    modelString: report.modelString,
+    thinkingLevel: report.thinkingLevel,
+    desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
   };
 }
 
@@ -182,6 +296,9 @@ function buildPendingTaskResult(params: {
     return {
       status,
       taskId: task.taskId,
+      modelString: task.modelString,
+      thinkingLevel: task.thinkingLevel,
+      desktopOwnerWorkspaceId: task.desktopOwnerWorkspaceId,
       note: params.note,
     };
   }
@@ -192,8 +309,9 @@ function buildPendingTaskResult(params: {
     tasks: params.tasks.map((task) => ({
       taskId: task.taskId,
       status: task.status,
-      groupKind: task.groupKind,
-      label: task.label,
+      modelString: task.modelString,
+      thinkingLevel: task.thinkingLevel,
+      desktopOwnerWorkspaceId: task.desktopOwnerWorkspaceId,
     })),
     note: params.note,
     ...(serializedReports ? { reports: serializedReports } : {}),
@@ -210,9 +328,13 @@ function buildCompletedTaskResult(params: {
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
+      structuredOutput: report.structuredOutput,
       title: report.title,
       agentId: report.agentId,
       agentType: report.agentType,
+      modelString: report.modelString,
+      thinkingLevel: report.thinkingLevel,
+      desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
     };
   }
 
@@ -228,14 +350,18 @@ function normalizePendingTaskStatuses(params: {
   createdTasks: readonly SpawnedTaskInfo[];
   completedReports?: readonly CompletedTaskInfo[];
 }): PendingTaskInfo[] {
-  const completedTaskIds = new Set((params.completedReports ?? []).map((report) => report.taskId));
+  const completedReportsByTaskId = new Map(
+    (params.completedReports ?? []).map((report) => [report.taskId, report])
+  );
   return params.createdTasks.map((createdTask) => {
-    if (completedTaskIds.has(createdTask.taskId)) {
+    const completedReport = completedReportsByTaskId.get(createdTask.taskId);
+    if (completedReport) {
       return {
         taskId: createdTask.taskId,
         status: "completed",
-        groupKind: createdTask.groupKind,
-        label: createdTask.label,
+        modelString: completedReport.modelString ?? createdTask.modelString,
+        thinkingLevel: completedReport.thinkingLevel ?? createdTask.thinkingLevel,
+        desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
       };
     }
 
@@ -246,19 +372,28 @@ function normalizePendingTaskStatuses(params: {
       status:
         currentStatus === "queued"
           ? "queued"
-          : currentStatus === "interrupted"
-            ? "interrupted"
-            : "running",
-      groupKind: createdTask.groupKind,
-      label: createdTask.label,
+          : currentStatus === "starting"
+            ? "starting"
+            : currentStatus === "interrupted"
+              ? "interrupted"
+              : "running",
+      modelString: createdTask.modelString,
+      thinkingLevel: createdTask.thinkingLevel,
+      desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
     };
   });
 }
 
 export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
-  return tool({
+  // Only advertise the `isolation` parameter where sharing the parent checkout is supported (see
+  // supportsSharedIsolation). Elsewhere the field is omitted from the schema entirely, so it never
+  // enters LLM context.
+  const inputSchema = buildTaskToolAgentArgsSchema({
+    includeIsolation: supportsSharedIsolation(config),
+  });
+  const taskTool = tool({
     description: buildTaskDescription(config),
-    inputSchema: TOOL_DEFINITIONS.task.schema,
+    inputSchema,
     execute: async (args, { abortSignal, toolCallId }): Promise<unknown> => {
       // Defensive: tool() should have already validated args via inputSchema,
       // but keep runtime validation here to preserve type-safety.
@@ -280,17 +415,154 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         throw new Error("Interrupted");
       }
 
-      const { agentId, subagent_type, prompt, title, run_in_background, n, variants } =
-        validatedArgs;
+      const {
+        kind,
+        agentId,
+        subagent_type,
+        prompt,
+        title,
+        run_in_background,
+        n,
+        model,
+        thinking,
+        isolation,
+        desktop,
+        workspace,
+      } = validatedArgs;
+
+      // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
+      // inherits the parent's live settings unless the caller requests an override.
+      const aiOverrides = parseTaskAiOverrides({ model, thinking });
+
+      const workspaceId = requireWorkspaceId(config, "task");
+      const taskService = requireTaskService(config, "task");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task");
+
+      const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
+
+      if (config.planFileOnly && kind === "workspace") {
+        throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
+      }
+
+      if (kind === "workspace") {
+        const created = await workspaceTurnManager.createWorkspaceTurn({
+          ownerWorkspaceId: workspaceId,
+          prompt,
+          title,
+          // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
+          ...(agentId != null ? { agentId } : {}),
+          experiments: config.experiments,
+          ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
+          ...(aiOverrides.thinkingLevel != null
+            ? { thinkingLevel: aiOverrides.thinkingLevel }
+            : {}),
+          ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+          // Background launches are non-blocking with terminal wake-up; foreground/default block.
+          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+          workspace: {
+            mode: workspace?.mode ?? "new",
+            ...(workspace?.workspaceId != null ? { workspaceId: workspace.workspaceId } : {}),
+            ...(workspace?.branchName != null ? { branchName: workspace.branchName } : {}),
+            ...(workspace?.trunkBranch != null ? { trunkBranch: workspace.trunkBranch } : {}),
+            ...(workspace?.queueDispatchMode != null
+              ? { queueDispatchMode: workspace.queueDispatchMode }
+              : {}),
+            ...(workspace?.disposable != null ? { disposable: workspace.disposable } : {}),
+          },
+        });
+        if (!created.success) {
+          throw new Error(created.error);
+        }
+
+        // Announce the probable quiet supersession at creation time so the
+        // owner is not surprised when its old handle settles interrupted
+        // without a separate wake. Pending (queued/running) results carry the
+        // forward-looking note; the foreground terminal result carries a
+        // past-tense equivalent because the old handle's suppressed wake means
+        // this result is the owner's only notification about that handle.
+        const supersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? ` Queued behind your active turn ${created.data.maySupersedeTaskId}; at the target's next tool boundary this follow-up may supersede it — if so, ${created.data.maySupersedeTaskId} settles as interrupted quietly (no separate wake) and this new handle carries the workspace's continuation.`
+            : "";
+        const completedSupersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? `This follow-up was queued behind your earlier turn ${created.data.maySupersedeTaskId}; if it cut that turn at a tool boundary, ${created.data.maySupersedeTaskId} settled as interrupted quietly (no separate wake) and this result carries the workspace's continuation.`
+            : undefined;
+        const pendingResult = {
+          status: created.data.status,
+          taskId: created.data.taskId,
+          workspaceId: created.data.workspaceId,
+          handleKind: "workspace_turn" as const,
+          note: buildBackgroundStartNote(1) + supersedeNote,
+        };
+        if (run_in_background) {
+          return parseToolResult(TaskToolResultSchema, pendingResult, "task");
+        }
+
+        try {
+          const report = await workspaceTurnManager.waitForWorkspaceTurn(created.data.taskId, {
+            abortSignal,
+            requestingWorkspaceId: workspaceId,
+            backgroundOnMessageQueued: true,
+          });
+          return parseToolResult(
+            TaskToolResultSchema,
+            {
+              status: "completed" as const,
+              taskId: created.data.taskId,
+              workspaceId: report.workspaceId ?? created.data.workspaceId,
+              handleKind: "workspace_turn" as const,
+              reportMarkdown: report.reportMarkdown,
+              title: report.title,
+              messageId: report.messageId,
+              finalMessageRef: report.finalMessageRef,
+              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
+            },
+            "task"
+          );
+        } catch (error: unknown) {
+          if (abortSignal?.aborted) {
+            throw new Error("Interrupted");
+          }
+          if (error instanceof ForegroundWaitBackgroundedError) {
+            return parseToolResult(
+              TaskToolResultSchema,
+              {
+                ...pendingResult,
+                note: buildForegroundContinuationNote(1, "backgrounded") + supersedeNote,
+              },
+              "task"
+            );
+          }
+          const errorMessage = getErrorMessage(error);
+          if (errorMessage === "Timed out waiting for workspace turn") {
+            // The foreground wait exceeded its budget but the workspace turn keeps running. Make it
+            // non-blocking so the owner's stream-end does not re-force a task_await; Xum wakes the
+            // owner with the terminal output instead.
+            await taskService.markBackgroundWorkNotifyOnTerminal?.(
+              created.data.taskId,
+              workspaceId
+            );
+            return parseToolResult(
+              TaskToolResultSchema,
+              {
+                ...pendingResult,
+                note: buildForegroundContinuationNote(1, "timed_out") + supersedeNote,
+              },
+              "task"
+            );
+          }
+          throw error;
+        }
+      }
+
       const requestedAgentId =
         typeof agentId === "string" && agentId.trim().length > 0 ? agentId : subagent_type;
       if (!requestedAgentId) {
         throw new Error("task tool input validation failed: expected agent task args");
       }
 
-      const workspaceId = requireWorkspaceId(config, "task");
-      const taskService = requireTaskService(config, "task");
-      const taskGroupLaunches = buildTaskGroupLaunches({ prompt, n, variants });
+      const taskGroupLaunches = buildTaskGroupLaunches({ prompt, n });
       const taskGroupCount = taskGroupLaunches.length;
       const taskGroupId =
         taskGroupCount > 1 ? buildTaskGroupId(workspaceId, toolCallId) : undefined;
@@ -300,13 +572,12 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Plan agent is explicitly non-executing. Allow only read-only exploration tasks.
       if (config.planFileOnly && requestedAgentId !== "explore") {
-        throw new Error('In the plan agent you may only spawn agentId: "explore" tasks.');
+        throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
 
       // Parent runtime model and thinking are forwarded as a low-priority fallback so
       // unconfigured delegated runs still inherit the parent's live model. Do not
       // restore the previous top-priority forwarding through explicit task args.
-      const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
       const createdTasks: SpawnedTaskInfo[] = [];
       for (const launch of taskGroupLaunches) {
         if (abortSignal?.aborted) {
@@ -322,15 +593,21 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           prompt: launch.prompt,
           title,
           experiments: config.experiments,
+          ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
+          ...(aiOverrides.thinkingLevel != null
+            ? { thinkingLevel: aiOverrides.thinkingLevel }
+            : {}),
+          ...(isolation != null ? { isolation } : {}),
+          ...(desktop != null ? { desktop } : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+          // Background launches are non-blocking with terminal wake-up; foreground/default block.
+          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
           bestOf:
             taskGroupId != null
               ? {
                   groupId: taskGroupId,
                   index: launch.index,
                   total: launch.total,
-                  kind: launch.kind,
-                  ...(launch.label ? { label: launch.label } : {}),
                 }
               : undefined,
         });
@@ -356,9 +633,9 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         const task = {
           taskId: created.data.taskId,
           status: created.data.status,
-          ...(taskGroupCount > 1 || launch.label
-            ? { groupKind: launch.kind, ...(launch.label ? { label: launch.label } : {}) }
-            : {}),
+          modelString: created.data.modelString,
+          thinkingLevel: created.data.thinkingLevel,
+          desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
         } satisfies SpawnedTaskInfo;
         createdTasks.push(task);
 
@@ -397,11 +674,15 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               report: {
                 taskId: createdTask.taskId,
                 reportMarkdown: report.reportMarkdown,
+                structuredOutput: report.structuredOutput,
                 title: report.title,
                 agentId: requestedAgentId,
                 agentType: requestedAgentId,
-                groupKind: createdTask.groupKind,
-                label: createdTask.label,
+                // Prefer the settings the report was produced with: a plan child that
+                // auto-handoffs to exec rewrites its task settings after launch.
+                modelString: report.model ?? createdTask.modelString,
+                thinkingLevel: report.thinkingLevel ?? createdTask.thinkingLevel,
+                desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
               } satisfies CompletedTaskInfo,
             };
           } catch (error: unknown) {
@@ -451,6 +732,17 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       const hadInterruptedTask = waitOutcomes.some(
         (outcome) => outcome.kind === "task_interrupted"
       );
+
+      // Foreground waits that exceeded their budget but whose tasks keep running become
+      // non-blocking: persist notify_on_terminal so the owner is not re-forced to await them.
+      await Promise.all(
+        waitOutcomes.flatMap((outcome, index) => {
+          const task = createdTasks[index];
+          return outcome.kind === "timed_out" && task != null
+            ? [taskService.markBackgroundWorkNotifyOnTerminal?.(task.taskId, workspaceId)]
+            : [];
+        })
+      );
       if (wasBackgrounded || didTimeOut || hadInterruptedTask) {
         return parseToolResult(
           TaskToolResultSchema,
@@ -476,4 +768,5 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       throw new Error("Task foreground wait ended without a terminal result");
     },
   });
+  return markBuiltInTaskTool(taskTool);
 };

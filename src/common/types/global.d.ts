@@ -1,6 +1,7 @@
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
-import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
+import type { DeepLinkPayload } from "@/common/types/deepLink";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 declare global {
   interface WindowApi {
@@ -10,15 +11,13 @@ declare global {
       chrome?: string;
       electron?: string;
     };
-    // Optional mux.md base URL override (passed through Electron preload).
-    muxMdUrlOverride?: string;
     // Debug flags (dev-only, passed through preload)
     debugLlmRequest?: boolean;
     // Allow maintainers to opt into telemetry while running the dev server.
     enableTelemetryInDev?: boolean;
     // E2E test mode flag - used to adjust UI behavior (e.g., longer toast durations)
     isE2E?: boolean;
-    // Enables in-app React.Profiler capture for automated perf tests.
+    // Enables in-app React render capture for dev profiling and automated perf tests.
     enableReactPerfProfile?: boolean;
     // Sandbox launchers default tutorials off unless explicitly re-enabled by env.
     enableTutorialsInSandbox?: boolean;
@@ -34,9 +33,11 @@ declare global {
     // Returns an unsubscribe function.
     onNotificationClicked?: (callback: (data: { workspaceId: string }) => void) => () => void;
     // Consume any mux:// deep links received before the renderer subscribed.
-    consumePendingDeepLinks?: () => MuxDeepLinkPayload[];
+    consumePendingDeepLinks?: () => DeepLinkPayload[];
     // Subscribe to mux:// deep links as they arrive. Returns an unsubscribe function.
-    onDeepLink?: (callback: (payload: MuxDeepLinkPayload) => void) => () => void;
+    onDeepLink?: (callback: (payload: DeepLinkPayload) => void) => () => void;
+    // Only the local desktop renderer can control remote windows.
+    remoteConnection?: RemoteConnectionApi;
     // Optional ORPC-backed API surfaces populated in tests/storybook mocks
     tokenizer?: unknown;
     providers?: unknown;
@@ -62,13 +63,6 @@ declare global {
     __MUX_PROXY_URI_TEMPLATE__?: string | null;
   }
 
-  /**
-   * Optional mux.md base URL override injected by Vite (`define`) in dev-server browser mode.
-   *
-   * This intentionally lives on `globalThis` so shared code (compiled for Node as CJS) doesn't need
-   * to rely on `import.meta.env`.
-   */
-  var __MUX_MD_URL_OVERRIDE__: string | undefined;
   /**
    * Optional tutorial sandbox override injected either by Vite (`define`) in browser-mode sandboxes
    * or by Electron preload. `null`/`undefined` means normal tutorial behavior.

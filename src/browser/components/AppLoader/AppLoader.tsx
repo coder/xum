@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, type ReactNode } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import App from "../../App";
 import { AuthTokenModal } from "../AuthTokenModal/AuthTokenModal";
@@ -10,15 +10,109 @@ import { useWorkspaceStoreRaw, workspaceStore } from "../../stores/WorkspaceStor
 import { useGitStatusStoreRaw } from "../../stores/GitStatusStore";
 import { useRuntimeStatusStoreRaw } from "../../stores/RuntimeStatusStore";
 import { useBackgroundBashStoreRaw } from "../../stores/BackgroundBashStore";
+import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
+import { getAppConfigStore } from "../../stores/AppConfigStore";
+import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
+import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
 import { PolicyProvider, usePolicy } from "@/browser/contexts/PolicyContext";
 import { PolicyBlockedScreen } from "@/browser/components/PolicyBlockedScreen/PolicyBlockedScreen";
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
-import { TelemetryEnabledProvider } from "../../contexts/TelemetryEnabledContext";
+import {
+  hydrateUserPreferencesLocalCache,
+  UserPreferencesProvider,
+} from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
+import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
+
+const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
+
+function UserPreferencesStartupGate(props: { children: ReactNode }) {
+  const apiState = useAPI();
+  const [ready, setReady] = useState(false);
+  const bootstrappedRef = useRef(false);
+
+  useEffect(() => {
+    if (bootstrappedRef.current || !apiState.api) {
+      return;
+    }
+
+    const abortController = new AbortController();
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timeoutId = setTimeout(resolve, USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS, "timeout");
+    });
+    const hydratePromise = hydrateUserPreferencesLocalCache({
+      configClient: apiState.api.config,
+      signal: abortController.signal,
+    }).catch((error) => {
+      console.warn("Failed to bootstrap user preferences:", error);
+      return undefined;
+    });
+
+    const startup = Promise.race([hydratePromise, timeoutPromise]);
+    // User preference hydration must happen before RouterProvider reads launch behavior, but
+    // startup still needs a hard fallback so a slow backend cannot trap users on the boot screen.
+    void startup
+      .then((result) => {
+        if (result === "timeout") {
+          abortController.abort();
+        }
+        if (abortController.signal.aborted && result !== "timeout") {
+          return;
+        }
+
+        bootstrappedRef.current = true;
+        setReady(true);
+      })
+      .finally(() => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      });
+
+    return () => {
+      abortController.abort();
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    };
+  }, [apiState.api]);
+
+  // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
+  // the ref during render would make React Compiler skip this component.
+  if (ready) {
+    return <>{props.children}</>;
+  }
+
+  if (apiState.status === "auth_required") {
+    return (
+      <AuthTokenModal
+        isOpen={true}
+        onSubmit={apiState.authenticate}
+        onSessionAuthenticated={apiState.retry}
+        error={apiState.error}
+      />
+    );
+  }
+
+  if (apiState.status === "error") {
+    return <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />;
+  }
+
+  return (
+    <LoadingScreen
+      statusText={
+        apiState.status === "reconnecting"
+          ? `Reconnecting to backend (attempt ${apiState.attempt})...`
+          : "Loading preferences"
+      }
+    />
+  );
+}
 
 interface AppLoaderProps {
   /** Optional pre-created ORPC api?. If provided, skips internal connection setup. */
@@ -41,15 +135,19 @@ export function AppLoader(props: AppLoaderProps) {
   return (
     <ThemeProvider>
       <APIProvider client={props.client}>
-        <PolicyProvider>
-          <RouterProvider>
-            <ProjectProvider>
-              <WorkspaceProvider>
-                <AppLoaderInner />
-              </WorkspaceProvider>
-            </ProjectProvider>
-          </RouterProvider>
-        </PolicyProvider>
+        <UserPreferencesStartupGate>
+          <PolicyProvider>
+            <RouterProvider>
+              <ProjectProvider>
+                <WorkspaceProvider>
+                  <UserPreferencesProvider>
+                    <AppLoaderInner />
+                  </UserPreferencesProvider>
+                </WorkspaceProvider>
+              </ProjectProvider>
+            </RouterProvider>
+          </PolicyProvider>
+        </UserPreferencesStartupGate>
       </APIProvider>
     </ThemeProvider>
   );
@@ -66,7 +164,6 @@ function AppLoaderInner() {
   const apiState = useAPI();
   const api = apiState.api;
 
-  // Get store instances
   const workspaceStoreInstance = useWorkspaceStoreRaw();
   const gitStatusStore = useGitStatusStoreRaw();
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
@@ -84,12 +181,25 @@ function AppLoaderInner() {
 
   // Sync stores when metadata finishes loading
   useEffect(() => {
+    // #4662: git/PR probes for a workspace wait for its chat replay to settle. Wire the gate
+    // before setClient/syncWorkspaces below, which can refresh synchronously.
+    const chatReplayGate = {
+      isReplayPending: workspaceStore.isWorkspaceChatReplayPending,
+      subscribeKey: workspaceStore.subscribeKey,
+    };
+    gitStatusStore.setChatReplayGate(chatReplayGate);
+    getPRStatusStoreInstance().setChatReplayGate(chatReplayGate);
+
     // Keep store clients in sync even during backend restarts (api can be null while reconnecting).
     workspaceStoreInstance.setClient(api ?? null);
     gitStatusStore.setClient(api ?? null);
     runtimeStatusStore.setClient(api ?? null);
     backgroundBashStore.setClient(api ?? null);
     getPRStatusStoreInstance().setClient(api ?? null);
+    getProvidersConfigStore().setClient(api ?? null);
+    getAppConfigStore().setClient(api ?? null);
+    getReviewStateStore().setClient(api ?? null);
+    getDraftStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {
       workspaceStoreInstance.syncWorkspaces(workspaceContext.workspaceMetadata);
@@ -116,15 +226,25 @@ function AppLoaderInner() {
     api,
   ]);
 
+  // Composers render the in-memory draft store; hold the app until it has the backend's drafts
+  // (and imported legacy localStorage drafts) so a composer never starts from an empty draft.
+  const draftsReady = useDraftStoreReady();
+
   useEffect(() => {
     if (initialLoadComplete) {
       return;
     }
 
-    if (!projectContext.loading && !workspaceContext.loading && storesSynced) {
+    if (!projectContext.loading && !workspaceContext.loading && storesSynced && draftsReady) {
       setInitialLoadComplete(true);
     }
-  }, [initialLoadComplete, projectContext.loading, storesSynced, workspaceContext.loading]);
+  }, [
+    initialLoadComplete,
+    projectContext.loading,
+    storesSynced,
+    workspaceContext.loading,
+    draftsReady,
+  ]);
 
   if (policyState.status.state === "blocked") {
     return <PolicyBlockedScreen reason={policyState.status.reason} />;
@@ -162,7 +282,7 @@ function AppLoaderInner() {
               statusText={
                 apiState.status === "reconnecting"
                   ? `Reconnecting to backend (attempt ${apiState.attempt})...`
-                  : "Loading Mux"
+                  : "Loading Xum"
               }
             />
           )}
@@ -175,11 +295,10 @@ function AppLoaderInner() {
           transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.3, ease: "easeOut" }}
           className="bg-surface-primary h-full"
         >
-          <TelemetryEnabledProvider>
-            <TerminalRouterProvider>
-              <App />
-            </TerminalRouterProvider>
-          </TelemetryEnabledProvider>
+          <TerminalRouterProvider>
+            <App />
+            <UpdateRestartOverlay />
+          </TerminalRouterProvider>
         </motion.div>
       )}
     </AnimatePresence>

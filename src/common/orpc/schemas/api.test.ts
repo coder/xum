@@ -4,8 +4,11 @@ import {
   ProviderConfigInfoSchema,
   ProvidersConfigMapSchema,
   config,
+  agentPlugins,
+  mcp,
   workspace,
 } from "./api";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
 /**
@@ -102,8 +105,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
     // This is the most comprehensive test - includes ALL possible fields
     const full: ProviderConfigInfo = {
       apiKeySet: true,
-      apiKeyIsOpRef: true,
-      apiKeyOpRef: "op://Personal/OpenAI/credential",
       isEnabled: true,
       isConfigured: true,
       baseUrl: "https://custom.endpoint.com",
@@ -138,8 +139,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
 
     // Explicit field-by-field verification for clarity
     expect(parsed.apiKeySet).toBe(full.apiKeySet);
-    expect(parsed.apiKeyIsOpRef).toBe(full.apiKeyIsOpRef);
-    expect(parsed.apiKeyOpRef).toBe(full.apiKeyOpRef);
     expect(parsed.isEnabled).toBe(full.isEnabled);
     expect(parsed.baseUrl).toBe(full.baseUrl);
     expect(parsed.apiKeySource).toBe(full.apiKeySource);
@@ -203,21 +202,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
 
     expect(parsed).toEqual(full);
     expect(Object.keys(parsed)).toEqual(Object.keys(full));
-  });
-});
-
-describe("config imageGeneration schema", () => {
-  it("preserves image upload consent across get and update payloads", () => {
-    const full = {
-      modelString: "openai:gpt-image-1.5",
-      maxImagesPerCall: 2,
-      allowImageUploadsForEditing: true,
-    };
-
-    expect(config.getConfig.output.shape.imageGeneration.parse(full)).toEqual(full);
-    expect(config.updateImageGenerationConfig.input.parse({ imageGeneration: full })).toEqual({
-      imageGeneration: full,
-    });
   });
 });
 
@@ -292,13 +276,13 @@ describe("workspace.createMultiProject schema", () => {
 });
 
 describe("config.saveConfig schema", () => {
-  it("rejects payload missing taskSettings", () => {
+  it("accepts payloads that omit taskSettings", () => {
     const result = config.saveConfig.input.safeParse({ agentAiDefaults: {} });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
   });
 
-  it("accepts payload with required taskSettings", () => {
+  it("accepts payload with taskSettings", () => {
     const result = config.saveConfig.input.safeParse({
       taskSettings: {
         maxParallelAgentTasks: 2,
@@ -307,5 +291,49 @@ describe("config.saveConfig schema", () => {
     });
 
     expect(result.success).toBe(true);
+  });
+});
+
+describe("mcp.icons schema", () => {
+  it("accepts a bounded list of well-formed refs and rejects oversized or malformed input", () => {
+    const ref = (n: number) => n.toString(16).padStart(32, "0");
+    const refs = (count: number) => Array.from({ length: count }, (_, i) => ref(i));
+    expect(mcp.icons.input.safeParse({ iconRefs: [] }).success).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries) }).success
+    ).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries + 1) }).success
+    ).toBe(false);
+    expect(mcp.icons.input.safeParse({ iconRefs: ["not-a-ref"] }).success).toBe(false);
+    // Output carries one answer per requested ref; unknown refs are null.
+    expect(
+      mcp.icons.output.safeParse({
+        [ref(1)]:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFOcAAAAASUVORK5CYII=",
+        [ref(2)]: null,
+      }).success
+    ).toBe(true);
+    expect(mcp.icons.output.safeParse({ [ref(1)]: "https://example.com/icon.png" }).success).toBe(
+      false
+    );
+  });
+});
+
+describe("agentPlugins.setComponents schema", () => {
+  it("requires a baseline and distinguishes legacy absence from an explicit empty selection", () => {
+    const request = {
+      name: "plugin",
+      expectedLockedSha: "sha",
+      expectedContentHash: "receipt",
+      importedComponents: { skills: [], mcpServers: [] },
+    };
+    expect(agentPlugins.setComponents.input.safeParse(request).success).toBe(false);
+    for (const expectedImportedComponents of [null, { skills: [], mcpServers: [] }]) {
+      expect(
+        agentPlugins.setComponents.input.parse({ ...request, expectedImportedComponents })
+          .expectedImportedComponents
+      ).toEqual(expectedImportedComponents);
+    }
   });
 });

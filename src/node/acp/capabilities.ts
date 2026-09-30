@@ -12,7 +12,7 @@ export function negotiateCapabilities(
   return {
     editorSupportsFsRead: clientCaps?.fs?.readTextFile ?? false,
     editorSupportsFsWrite: clientCaps?.fs?.writeTextFile ?? false,
-    // ACP SDK v0.14.x models terminal support as an optional boolean capability.
+    // The ACP SDK models terminal support as an optional boolean capability.
     editorSupportsTerminal: clientCaps?.terminal === true,
   };
 }

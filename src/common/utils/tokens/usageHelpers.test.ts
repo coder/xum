@@ -1,6 +1,93 @@
 import { describe, test, expect } from "bun:test";
-import { addUsage, accumulateProviderMetadata } from "./usageHelpers";
+import {
+  addUsage,
+  accumulateProviderMetadata,
+  accumulateStepsProviderMetadata,
+  normalizeUsage,
+  withCacheWriteMetadata,
+} from "./usageHelpers";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+
+describe("normalizeUsage", () => {
+  test("maps AI SDK 7 nested details to the flat persisted shape", () => {
+    expect(
+      normalizeUsage({
+        inputTokens: 1000,
+        outputTokens: 200,
+        totalTokens: 1200,
+        inputTokenDetails: { noCacheTokens: 100, cacheReadTokens: 700, cacheWriteTokens: 200 },
+        outputTokenDetails: { textTokens: 150, reasoningTokens: 50 },
+      })
+    ).toEqual({
+      inputTokens: 1000,
+      outputTokens: 200,
+      totalTokens: 1200,
+      reasoningTokens: 50,
+      cachedInputTokens: 700,
+    });
+  });
+
+  test("passes already-flat (persisted v6) usage through unchanged", () => {
+    expect(
+      normalizeUsage({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        reasoningTokens: 10,
+        cachedInputTokens: 20,
+      })
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+      reasoningTokens: 10,
+      cachedInputTokens: 20,
+    });
+  });
+
+  test("prefers nested details over stale flat fields", () => {
+    const normalized = normalizeUsage({
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+      reasoningTokens: 1,
+      cachedInputTokens: 2,
+      inputTokenDetails: { noCacheTokens: 60, cacheReadTokens: 40, cacheWriteTokens: 0 },
+      outputTokenDetails: { textTokens: 45, reasoningTokens: 5 },
+    });
+    expect(normalized.reasoningTokens).toBe(5);
+    expect(normalized.cachedInputTokens).toBe(40);
+  });
+
+  test("returns undefined for undefined usage", () => {
+    expect(normalizeUsage(undefined)).toBeUndefined();
+  });
+});
+
+describe("withCacheWriteMetadata", () => {
+  test("injects anthropic.cacheCreationInputTokens from v7 usage", () => {
+    expect(
+      withCacheWriteMetadata(
+        { anthropic: { usage: { foo: 1 } } },
+        { inputTokenDetails: { cacheWriteTokens: 321 } }
+      )
+    ).toEqual({
+      anthropic: { usage: { foo: 1 }, cacheCreationInputTokens: 321 },
+    });
+  });
+
+  test("creates metadata when none exists and cache writes are reported", () => {
+    expect(
+      withCacheWriteMetadata(undefined, { inputTokenDetails: { cacheWriteTokens: 5 } })
+    ).toEqual({ anthropic: { cacheCreationInputTokens: 5 } });
+  });
+
+  test("no-ops when the usage reports no cache writes", () => {
+    const metadata = { openai: { responseId: "resp_1" } };
+    expect(withCacheWriteMetadata(metadata, { inputTokens: 10 })).toBe(metadata);
+    expect(withCacheWriteMetadata(undefined, undefined)).toBeUndefined();
+  });
+});
 
 describe("addUsage", () => {
   test("sums all fields when both arguments have values", () => {
@@ -125,6 +212,23 @@ describe("accumulateProviderMetadata", () => {
     expect(accumulateProviderMetadata(existing, step)).toBe(step);
   });
 
+  test("keeps the costliest reported OpenAI service tier across steps (#4352)", () => {
+    // A ramp downgrade mid-turn: the aggregate must not price earlier Fast steps at Standard.
+    const downgraded = accumulateProviderMetadata(
+      { openai: { serviceTier: "priority", responseId: "resp_1" } },
+      { openai: { serviceTier: "default", responseId: "resp_2" } }
+    );
+    expect(downgraded).toEqual({ openai: { serviceTier: "priority", responseId: "resp_2" } });
+
+    const upgradedFromFlex = { openai: { serviceTier: "default", responseId: "resp_4" } };
+    expect(
+      accumulateProviderMetadata(
+        { openai: { serviceTier: "flex", responseId: "resp_3" } },
+        upgradedFromFlex
+      )
+    ).toBe(upgradedFromFlex);
+  });
+
   test("sums cache creation tokens when both have them", () => {
     const existing = { anthropic: { cacheCreationInputTokens: 100 } };
     const step = { anthropic: { cacheCreationInputTokens: 50 } };
@@ -162,6 +266,15 @@ describe("accumulateProviderMetadata", () => {
         cacheReadInputTokens: 200,
         modelId: "claude-sonnet-4-5",
       },
+    });
+  });
+
+  test("sums xAI exact cost ticks across model steps", () => {
+    const existing = { xai: { costInUsdTicks: 10_000_000 } };
+    const step = { xai: { costInUsdTicks: 25_000_000, requestId: "req_2" } };
+
+    expect(accumulateProviderMetadata(existing, step)).toEqual({
+      xai: { costInUsdTicks: 35_000_000, requestId: "req_2" },
     });
   });
 
@@ -241,5 +354,34 @@ describe("accumulateProviderMetadata", () => {
       someOtherProvider: { field: "value" },
       anthropic: { cacheCreationInputTokens: 100 },
     });
+  });
+});
+
+describe("accumulateStepsProviderMetadata", () => {
+  test("returns undefined for streams that never reported metadata", () => {
+    expect(accumulateStepsProviderMetadata([])).toBeUndefined();
+    expect(accumulateStepsProviderMetadata([{}, {}])).toBeUndefined();
+  });
+
+  test("sums cache-write tokens across steps (last-step metadata alone would drop them)", () => {
+    const result = accumulateStepsProviderMetadata([
+      { providerMetadata: { anthropic: { cacheCreationInputTokens: 1000 } } },
+      { providerMetadata: { anthropic: { cacheCreationInputTokens: 500 } } },
+      // Final step reads from cache only — its own metadata reports 0 writes.
+      { providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } } },
+    ]);
+    expect(
+      (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
+    ).toBe(1500);
+  });
+
+  test("keeps earlier metadata when a later step reports none", () => {
+    const result = accumulateStepsProviderMetadata([
+      { providerMetadata: { anthropic: { cacheCreationInputTokens: 300 } } },
+      {},
+    ]);
+    expect(
+      (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
+    ).toBe(300);
   });
 });

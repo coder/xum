@@ -10,9 +10,10 @@ import type { BashOutputToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 // Create test runtime
@@ -442,7 +443,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.terminate(spawnResult.processId);
+    await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();
   });
@@ -486,7 +487,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.terminate(spawnResult.processId);
+    await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();
   });
@@ -536,7 +537,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.terminate(spawnResult.processId);
+    await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();
   });
@@ -586,7 +587,7 @@ describe("bash_output tool", () => {
 
     // Cleanup
     manager.setMessageQueued("test-workspace", false);
-    await manager.terminate(spawnResult.processId);
+    await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();
   });

@@ -1,11 +1,16 @@
 import { z } from "zod";
+import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { isHttpsOrigin, isHttpsUrlWithoutUserinfo } from "@/common/utils/mcp/httpsUrl";
+import { enforceUtf8ByteBudget } from "@/common/utils/mcp/utf8ByteBudget";
 
 /**
  * Per-workspace MCP overrides.
  *
- * Stored per-workspace in <workspace>/.mux/mcp.local.jsonc (workspace-local, intended to be gitignored).
+ * Stored per-workspace in <workspace>/.xum/mcp.local.jsonc (workspace-local, intended to be gitignored).
  * Allows workspaces to disable servers or restrict tool allowlists
- * without modifying the project-level .mux/mcp.jsonc.
+ * without modifying the project-level .xum/mcp.jsonc.
  */
 export const WorkspaceMCPOverridesSchema = z.object({
   /** Server names to explicitly disable for this workspace. */
@@ -29,19 +34,39 @@ export const MCPTransportSchema = z.enum(["stdio", "http", "sse", "auto"]);
 export const MCPHeaderValueSchema = z.union([z.string(), z.object({ secret: z.string() })]);
 export const MCPHeadersSchema = z.record(z.string(), MCPHeaderValueSchema);
 
+/** UI-safe Agent Plugin provenance (agent-plugins experiment; read-only entries). */
+export const MCPServerPluginProvenanceSchema = z.object({
+  pluginName: z.string(),
+  serverName: z.string(),
+  sourceScope: z.enum(["project", "global"]),
+  /** Installation location discriminator, e.g. ".xum/plugins/demo" (same-name plugins can sit in sibling containers). */
+  sourceLocation: z.string(),
+  componentPolicy: z.object({ registryPath: z.string(), name: z.string() }).optional(),
+});
+
+const MCPConfigLayerSchema = z.enum(["global", "project"]);
+
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
     command: z.string(),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
+    cwd: z.string().optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("http"),
+    managed: z.literal("claude-design").optional(),
     url: z.string(),
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("sse"),
@@ -49,6 +74,8 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("auto"),
@@ -56,13 +83,43 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
+    plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
 ]);
+
+export const MCPPromptDescriptorSchema = z.object({
+  commandKey: z.string(),
+  /** Identity-derived alias (always hash-suffixed); stable across catalog changes. */
+  stableKey: z.string(),
+  serverName: z.string(),
+  promptName: z.string(),
+  description: z.string().optional(),
+  arguments: z
+    .array(
+      z.object({
+        name: z.string(),
+        description: z.string().optional(),
+        required: z.boolean().optional(),
+      })
+    )
+    .optional(),
+});
+
+export type MCPPromptDescriptor = z.infer<typeof MCPPromptDescriptorSchema>;
 
 export const MCPServerMapSchema = z.record(z.string(), MCPServerInfoSchema);
 
 export const MCPListParamsSchema = z.object({
   projectPath: z.string().optional(),
+  /**
+   * Workspace whose Agent Plugins MCP context should apply (agent-plugins
+   * experiment): plugin servers are discovered from that workspace's active
+   * checkout, and omitted entirely for off-host workspaces. Without a
+   * workspaceId, plugin discovery scans under projectPath (project-level
+   * flows like Settings).
+   */
+  workspaceId: z.string().optional(),
 });
 
 const MCPAddParamsBaseSchema = z.object({
@@ -153,6 +210,8 @@ const MCPTestParamsBaseSchema = z.object({
   command: z.string().optional(),
   url: z.string().optional(),
   headers: MCPHeadersSchema.optional(),
+  /** Workspace whose Agent Plugins MCP context should apply; see MCPListParamsSchema. */
+  workspaceId: z.string().optional(),
 });
 
 type MCPTestParamsLike = z.infer<typeof MCPTestParamsBaseSchema>;
@@ -196,8 +255,84 @@ export const BearerChallengeSchema = z.object({
   resourceMetadataUrl: z.url().optional(),
 });
 
+/** Credential-free `https:` URL suitable for display and for opening externally. */
+export const HttpsUrlSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.websiteUrlMaxChars)
+  .refine(isHttpsUrlWithoutUserinfo, { message: "must be an https URL without credentials" });
+
+/** Exactly serialized https origin (`https://host[:port]`), ASCII only. */
+export const HttpsOriginSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.originMaxBytes)
+  .refine(isHttpsOrigin, { message: "must be an https origin" });
+
+/**
+ * Server-reported identity (MCP `Implementation`), display-only and never a
+ * verified identity: it must not drive namespacing, enablement, trust, or
+ * OAuth decisions. Required fields fail the whole value; optional fields that
+ * are malformed or over budget are dropped individually via `.catch`.
+ * Empty optional strings are dropped too, so `title ?? name` is always a
+ * usable display name.
+ */
+export const MCPServerIdentitySchema = z.object({
+  name: z.string().min(1).max(MCP_IDENTITY_LIMITS.nameMaxChars),
+  version: z.string().min(1).max(MCP_IDENTITY_LIMITS.versionMaxChars),
+  title: z.string().min(1).max(MCP_IDENTITY_LIMITS.titleMaxChars).optional().catch(undefined),
+  description: z
+    .string()
+    .min(1)
+    .max(MCP_IDENTITY_LIMITS.descriptionMaxChars)
+    .optional()
+    .catch(undefined),
+  websiteUrl: HttpsUrlSchema.optional().catch(undefined),
+});
+
+/**
+ * The configured connection an identity was observed on. Deliberately carries
+ * no command, args, path, query, headers, or userinfo — those can hold
+ * credentials and this value is persisted into chat history.
+ */
+export const MCPConnectionRefSchema = z.object({
+  /** Server key from mcp.jsonc. */
+  key: z.string().min(1).max(MCP_IDENTITY_LIMITS.connectionKeyMaxChars),
+  /** Actual transport in use (`auto` is resolved before a snapshot is taken). */
+  transport: z.enum(["stdio", "http", "sse"]),
+  /** http/sse only: origin of the configured URL when it is https. */
+  origin: HttpsOriginSchema.optional().catch(undefined),
+});
+
+export const MCPIconRefSchema = z.string().regex(/^[a-f0-9]{32}$/);
+export const PngDataUrlSchema = z
+  .string()
+  .max(MCP_ICON_LIMITS.pngDataUrlMaxChars)
+  .refine(isPngDataUrl);
+
+/**
+ * Per-tool-call identity snapshot authored by the host and frozen on the
+ * tool part. `source` records whether the identity came from this result's
+ * `_meta` or from the connection handshake. One aggregate byte budget bounds
+ * what every MCP tool call persists.
+ */
+export const MCPToolCallDisplaySchema = z
+  .object({
+    connection: MCPConnectionRefSchema,
+    identity: MCPServerIdentitySchema,
+    source: z.enum(["response", "connection"]),
+    /** Immutable session-local ref, never an icon URL or persisted image bytes. */
+    iconRef: MCPIconRefSchema.optional().catch(undefined),
+  })
+  .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
+
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
-  z.object({ success: z.literal(true), tools: z.array(z.string()) }),
+  z.object({
+    success: z.literal(true),
+    tools: z.array(z.string()),
+    protocolVersion: z.string().optional(),
+    /** Handshake identity; optional so cached results from older builds still parse. */
+    serverInfo: MCPServerIdentitySchema.optional().catch(undefined),
+    icon: PngDataUrlSchema.optional().catch(undefined),
+  }),
   z.object({
     success: z.literal(false),
     error: z.string(),

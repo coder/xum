@@ -1,3 +1,8 @@
+import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
@@ -28,10 +33,20 @@ import { Switch } from "@/browser/components/Switch/Switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
-import type { CachedMCPTestResult, MCPServerInfo, MCPServerTransport } from "@/common/types/mcp";
+import type {
+  CachedMCPTestResult,
+  MCPServerIdentity,
+  MCPServerInfo,
+  MCPServerTransport,
+} from "@/common/types/mcp";
 import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeadersEditor";
+import {
+  MCPServerIdentityBadge,
+  describeConfiguredConnection,
+  stripBranding,
+} from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 import {
   mcpHeaderRowsToRecord,
   mcpHeadersRecordToRows,
@@ -40,6 +55,28 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+
+/** Expand/collapse header shared by the editable and read-only tool sections. */
+const ToolsDisclosureButton: React.FC<{
+  expanded: boolean;
+  onToggle: () => void;
+  summary: string;
+  testedAt: number;
+  saving?: boolean;
+}> = (props) => (
+  <button
+    type="button"
+    onClick={props.onToggle}
+    aria-expanded={props.expanded}
+    // Forced-colors mode drops box-shadow rings, so keep an outline fallback.
+    className="text-content-secondary hover:text-foreground focus-visible:ring-accent flex items-center gap-1 rounded-sm text-xs focus-visible:ring-1 forced-colors:focus-visible:outline"
+  >
+    {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+    <span>{props.summary}</span>
+    <span className="ml-1">({formatRelativeTime(props.testedAt)})</span>
+    {props.saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
+  </button>
+);
 
 /** Component for managing tool allowlist for a single MCP server */
 const ToolAllowlistSection: React.FC<{
@@ -144,17 +181,13 @@ const ToolAllowlistSection: React.FC<{
 
   return (
     <div>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
-      >
-        {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-        <span>
-          Tools: {localAllowlist.length}/{availableTools.length}
-        </span>
-        <span className="text-muted/60 ml-1">({formatRelativeTime(testedAt)})</span>
-        {saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
-      </button>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${localAllowlist.length}/${availableTools.length}`}
+        testedAt={testedAt}
+        saving={saving}
+      />
 
       {expanded && (
         <div className="mt-2">
@@ -172,7 +205,45 @@ const ToolAllowlistSection: React.FC<{
   );
 };
 
-type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
+/**
+ * Read-only discovered-tool list for plugin-provided servers. Plugin
+ * definitions cannot be edited from Settings (the backend rejects canonical
+ * plugin keys in setToolAllowlist) and their permissions are granted per
+ * workspace, so this only lets users inspect what a connection test found
+ * without offering allowlist controls.
+ */
+const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${props.tools.length}`}
+        testedAt={props.testedAt}
+      />
+      {expanded && (
+        <div className="mt-2">
+          <p className="text-content-secondary mb-2 text-xs">
+            Discovered by the connection test. Tool permissions for plugin servers are chosen per
+            workspace via Configure MCP servers.
+          </p>
+          {/* wrap-anywhere: repo-controlled tool names can be long unbroken
+              tokens; let them wrap instead of overflowing at ~375px. */}
+          <ul className="grid gap-x-3 gap-y-0.5 sm:grid-cols-2">
+            {props.tools.map((tool) => (
+              <li key={tool} className="min-w-0 font-mono text-xs wrap-anywhere">
+                {tool}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+};
+
+type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "completing" | "success" | "error";
 
 interface MCPOAuthAuthStatus {
   serverUrl?: string;
@@ -227,6 +298,7 @@ function getMCPOAuthAPI(api: ReturnType<typeof useAPI>["api"]): MCPOAuthAPI | nu
     return null;
   }
 
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   return maybeOauth as unknown as MCPOAuthAPI;
 }
 
@@ -272,7 +344,8 @@ function useMCPOAuthLogin(input: {
   const [loginStatus, setLoginStatus] = useState<MCPOAuthLoginStatus>("idle");
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const loginInProgress = loginStatus === "starting" || loginStatus === "waiting";
+  const loginInProgress =
+    loginStatus === "starting" || loginStatus === "waiting" || loginStatus === "completing";
 
   const cancelLogin = useCallback(() => {
     loginAttemptRef.current++;
@@ -305,7 +378,7 @@ function useMCPOAuthLogin(input: {
 
       if (!api) {
         setLoginStatus("error");
-        setLoginError("Mux API not connected.");
+        setLoginError("Xum API not connected.");
         return;
       }
 
@@ -387,8 +460,16 @@ function useMCPOAuthLogin(input: {
       }
 
       if (waitResult.success) {
-        setLoginStatus("success");
+        // The flow is finished on the backend, so there is nothing left to cancel.
+        setFlowId(null);
+        // Stay in progress until the success callback settles: callers lock UI on
+        // `loginInProgress`, and the callback may still be writing config.
+        setLoginStatus("completing");
         await onSuccess?.();
+        if (attempt !== loginAttemptRef.current) {
+          return;
+        }
+        setLoginStatus("success");
         return;
       }
 
@@ -414,22 +495,16 @@ function useMCPOAuthLogin(input: {
   };
 }
 
-const MCPOAuthRequiredCallout: React.FC<{
-  serverName: string;
-  pendingServer?: MCPOAuthPendingServerConfig;
+type MCPOAuthLoginController = ReturnType<typeof useMCPOAuthLogin>;
+
+const MCPOAuthRequiredCalloutView: React.FC<{
+  login: MCPOAuthLoginController;
   disabledReason?: string;
-  onLoginSuccess?: () => void | Promise<void>;
-}> = ({ serverName, pendingServer, disabledReason, onLoginSuccess }) => {
+}> = (props) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
-
-  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
-    isDesktop,
-    serverName,
-    pendingServer,
-    onSuccess: onLoginSuccess,
-  });
+  const disabledReason = props.disabledReason;
+  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = props.login;
 
   const mcpOauthApi = getMCPOAuthAPI(api);
   const loginFlowMode = getMCPOAuthLoginFlowMode({
@@ -440,7 +515,7 @@ const MCPOAuthRequiredCallout: React.FC<{
   const disabledTitle =
     disabledReason ??
     (!api
-      ? "Mux API not connected"
+      ? "Xum API not connected"
       : !mcpOauthApi
         ? "OAuth is not available in this environment."
         : !loginFlowMode
@@ -463,7 +538,7 @@ const MCPOAuthRequiredCallout: React.FC<{
       {loginInProgress ? (
         <>
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          Waiting for login...
+          {loginStatus === "completing" ? "Finishing…" : "Waiting for login..."}
         </>
       ) : (
         "Login via OAuth"
@@ -476,15 +551,15 @@ const MCPOAuthRequiredCallout: React.FC<{
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="font-medium">This server requires OAuth.</p>
-          {disabledReason && <p className="text-muted mt-0.5">{disabledReason}</p>}
+          {disabledReason && <p className="text-content-secondary mt-0.5">{disabledReason}</p>}
 
           {loginStatus === "waiting" && (
             <>
-              <p className="text-muted mt-0.5">
+              <p className="text-content-secondary mt-0.5">
                 Finish the login flow in your browser, then return here.
               </p>
               {!isDesktop && (
-                <p className="text-muted mt-0.5">
+                <p className="text-content-secondary mt-0.5">
                   If a new tab didn&apos;t open, your browser may have blocked the popup. Allow
                   popups and try again.
                 </p>
@@ -492,7 +567,9 @@ const MCPOAuthRequiredCallout: React.FC<{
             </>
           )}
 
-          {loginStatus === "success" && <p className="text-muted mt-0.5">Logged in.</p>}
+          {(loginStatus === "completing" || loginStatus === "success") && (
+            <p className="text-content-secondary mt-0.5">Logged in.</p>
+          )}
 
           {loginStatus === "error" && loginError && (
             <p className="text-destructive mt-0.5">OAuth error: {loginError}</p>
@@ -511,7 +588,9 @@ const MCPOAuthRequiredCallout: React.FC<{
             loginButton
           )}
 
-          {loginStatus === "waiting" && (
+          {/* Also offered while starting: OAuth discovery can stall, and callers lock their
+              form on loginInProgress, so the user needs a way out before the browser opens. */}
+          {(loginStatus === "starting" || loginStatus === "waiting") && (
             <Button variant="secondary" size="sm" onClick={cancelLogin}>
               Cancel
             </Button>
@@ -520,6 +599,24 @@ const MCPOAuthRequiredCallout: React.FC<{
       </div>
     </div>
   );
+};
+
+const MCPOAuthRequiredCallout: React.FC<{
+  serverName: string;
+  pendingServer?: MCPOAuthPendingServerConfig;
+  disabledReason?: string;
+  onLoginSuccess?: () => void | Promise<void>;
+}> = (props) => {
+  const { api } = useAPI();
+  const login = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName: props.serverName,
+    pendingServer: props.pendingServer,
+    onSuccess: props.onLoginSuccess,
+  });
+
+  return <MCPOAuthRequiredCalloutView login={login} disabledReason={props.disabledReason} />;
 };
 
 const RemoteMCPOAuthSection: React.FC<{
@@ -636,14 +733,14 @@ const RemoteMCPOAuthSection: React.FC<{
     <div className="mt-1 flex items-center justify-between gap-2">
       <div className="flex min-w-0 items-center gap-2 text-xs">
         <span className="text-foreground font-medium">OAuth</span>
-        <span className="text-muted truncate">
+        <span className="text-content-secondary truncate">
           {authStatusText}
           {updatedAtText}
         </span>
 
         {oauthDebugErrors.length > 0 && (
           <details className="group inline-block">
-            <summary className="text-muted hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+            <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
               Details
             </summary>
             <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
@@ -716,6 +813,9 @@ const RemoteMCPOAuthSection: React.FC<{
 };
 
 export const MCPSettingsSection: React.FC = () => {
+  const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+  const designRevision = useClaudeDesignRevision();
+  const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
   const policyState = usePolicy();
   const mcpAllowUserDefined =
@@ -735,6 +835,16 @@ export const MCPSettingsSection: React.FC = () => {
     clearResult: clearTestResult,
   } = useMCPTestCache("__global__");
   const [testingServer, setTestingServer] = useState<string | null>(null);
+  // Server-reported identity is display-only and lives in memory for one
+  // configuration load: refresh() starts a new generation and drops all
+  // branding, and a test that started under an older generation may cache its
+  // tools but never brands the row. Every entry in `branding` therefore belongs
+  // to the current load. Persisting it would need a backend-produced binding to
+  // the tested configuration (follow-up); users re-test to see it again.
+  const loadGeneration = useRef(0);
+  const [branding, setBranding] = useState<
+    Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
+  >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
 
   interface EditableServer {
@@ -796,15 +906,20 @@ export const MCPSettingsSection: React.FC = () => {
 
   const refresh = useCallback(async () => {
     if (!api) return;
+    const request = ++refreshRequest.current.id;
+    loadGeneration.current += 1;
+    setBranding({});
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
+      if (request !== refreshRequest.current.id) return;
       setServers(mcpResult ?? {});
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load MCP servers");
+      if (request === refreshRequest.current.id)
+        setError(err instanceof Error ? err.message : "Failed to load MCP servers");
     } finally {
-      setLoading(false);
+      if (request === refreshRequest.current.id) setLoading(false);
     }
   }, [api]);
 
@@ -834,8 +949,13 @@ export const MCPSettingsSection: React.FC = () => {
   }, [api]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    // A sibling can change reuse/server settings while the experiment stays enabled.
+    const requests = refreshRequest.current;
+    refresh().catch(() => undefined);
+    return () => {
+      requests.id++;
+    };
+  }, [refresh, designEnabled, designRevision]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {
@@ -899,10 +1019,21 @@ export const MCPSettingsSection: React.FC = () => {
   const handleTest = useCallback(
     async (name: string) => {
       if (!api) return;
+      const generation = loadGeneration.current;
       setTestingServer(name);
+      // The new result replaces the old test, even if it fails or has no identity.
+      setBranding((prev) => {
+        const { [name]: _previous, ...remaining } = prev;
+        return remaining;
+      });
       try {
         const result = await api.mcp.test({ name });
-        cacheTestResult(name, result);
+        cacheTestResult(name, stripBranding(result));
+        const serverInfo = result.success ? result.serverInfo : undefined;
+        if (serverInfo && generation === loadGeneration.current) {
+          const icon = result.success ? result.icon : undefined;
+          setBranding((prev) => ({ ...prev, [name]: { serverInfo, icon } }));
+        }
       } catch (err) {
         cacheTestResult(name, {
           success: false,
@@ -917,54 +1048,6 @@ export const MCPSettingsSection: React.FC = () => {
 
   const serverDisplayValue = (entry: MCPServerInfo): string =>
     entry.transport === "stdio" ? entry.command : entry.url;
-
-  const handleTestNewServer = useCallback(async () => {
-    if (!api || !newServer.value.trim()) return;
-    setTestingNew(true);
-    setNewTestResult(null);
-
-    try {
-      const { headers, validation } =
-        newServer.transport === "stdio"
-          ? { headers: undefined, validation: { errors: [], warnings: [] } }
-          : mcpHeaderRowsToRecord(newServer.headersRows, {
-              knownSecretKeys: new Set(globalSecretKeys),
-            });
-
-      if (validation.errors.length > 0) {
-        throw new Error(validation.errors[0]);
-      }
-
-      const pendingName = newServer.name.trim();
-
-      const result = await api.mcp.test({
-        ...(newServer.transport === "stdio"
-          ? { command: newServer.value.trim() }
-          : {
-              ...(pendingName ? { name: pendingName } : {}),
-              transport: newServer.transport,
-              url: newServer.value.trim(),
-              headers,
-            }),
-      });
-
-      setNewTestResult({ result, testedAt: Date.now() });
-    } catch (err) {
-      setNewTestResult({
-        result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
-        testedAt: Date.now(),
-      });
-    } finally {
-      setTestingNew(false);
-    }
-  }, [
-    api,
-    newServer.name,
-    newServer.transport,
-    newServer.value,
-    newServer.headersRows,
-    globalSecretKeys,
-  ]);
 
   const handleAddServer = useCallback(async () => {
     if (!api || !newServer.name.trim() || !newServer.value.trim()) return;
@@ -1020,26 +1103,13 @@ export const MCPSettingsSection: React.FC = () => {
 
       // For remote servers, always run a test immediately after adding so OAuth-required servers can
       // surface an OAuth callout without requiring a manual Test click.
-      setTestingServer(serverName);
-      try {
-        const testResult = await api.mcp.test({
-          name: serverName,
-        });
-        cacheTestResult(serverName, testResult);
-      } catch (err) {
-        cacheTestResult(serverName, {
-          success: false,
-          error: err instanceof Error ? err.message : "Test failed",
-        });
-      } finally {
-        setTestingServer(null);
-      }
+      await handleTest(serverName);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add MCP server");
     } finally {
       setAddingServer(false);
     }
-  }, [api, newServer, newTestResult, refresh, cacheTestResult, globalSecretKeys]);
+  }, [api, newServer, newTestResult, refresh, cacheTestResult, handleTest, globalSecretKeys]);
 
   const handleStartEdit = useCallback((name: string, entry: MCPServerInfo) => {
     setEditing({
@@ -1113,6 +1183,103 @@ export const MCPSettingsSection: React.FC = () => {
     newServer.value.trim().length > 0 &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
+  // OAuth login for the add-server draft lives here rather than in the callout so the form
+  // can lock while the browser round-trip is pending. The success callback closes over the
+  // draft it authorized; if the user could edit fields or click "Add" in the meantime, that
+  // stale draft would be written over the newer one.
+  const newServerName = newServer.name.trim();
+  const newServerUrl = newServer.value.trim();
+  // If the server already exists in config, prefer that config for OAuth.
+  const newServerOauthPendingServer: MCPOAuthPendingServerConfig | undefined =
+    newServerName && !servers[newServerName] && newServer.transport !== "stdio" && newServerUrl
+      ? { transport: newServer.transport, url: newServerUrl }
+      : undefined;
+  const newServerOauthDisabledReason = !newServerName
+    ? "Enter a server name to enable OAuth login."
+    : (servers[newServerName]?.transport ?? newServer.transport) === "stdio"
+      ? "OAuth login is only supported for remote (http/sse) MCP servers."
+      : undefined;
+  const newServerOauthLogin = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName: newServerName,
+    pendingServer: newServerOauthPendingServer,
+    onSuccess: async () => {
+      setMcpOauthRefreshNonce((prev) => prev + 1);
+      if (!api) return;
+      // Re-read config rather than trusting the `servers` snapshot: if another writer added
+      // this name during the browser round-trip, only refresh that row's test result so we
+      // never overwrite its config with the draft.
+      const current = (await api.mcp.list({})) ?? {};
+      if (current[newServerName]) {
+        // Install the fresh list so the row is visible before its test result lands.
+        await refresh();
+        await handleTest(newServerName);
+        return;
+      }
+      // The user already named the server and authorized it in the browser.
+      // Add it now so they don't have to remember to click "Add" afterwards.
+      await handleAddServer();
+    },
+  });
+  const newServerOauthPending = newServerOauthLogin.loginInProgress;
+  // With no flow in flight, cancelLogin() is a pure state reset.
+  const resetNewServerOauthLogin = newServerOauthLogin.cancelLogin;
+
+  const handleTestNewServer = useCallback(async () => {
+    if (!api || !newServer.value.trim()) return;
+    setTestingNew(true);
+    setNewTestResult(null);
+    // The login controller outlives the callout, so drop any status left over from a
+    // previous draft; the callout must describe the server being tested now.
+    resetNewServerOauthLogin();
+
+    try {
+      const { headers, validation } =
+        newServer.transport === "stdio"
+          ? { headers: undefined, validation: { errors: [], warnings: [] } }
+          : mcpHeaderRowsToRecord(newServer.headersRows, {
+              knownSecretKeys: new Set(globalSecretKeys),
+            });
+
+      if (validation.errors.length > 0) {
+        throw new Error(validation.errors[0]);
+      }
+
+      const pendingName = newServer.name.trim();
+
+      const result = await api.mcp.test({
+        ...(newServer.transport === "stdio"
+          ? { command: newServer.value.trim() }
+          : {
+              ...(pendingName ? { name: pendingName } : {}),
+              transport: newServer.transport,
+              url: newServer.value.trim(),
+              headers,
+            }),
+      });
+
+      // Adding reloads configuration, so only cacheable test data crosses that
+      // boundary. The saved row needs its own test before it can show branding.
+      setNewTestResult({ result: stripBranding(result), testedAt: Date.now() });
+    } catch (err) {
+      setNewTestResult({
+        result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
+        testedAt: Date.now(),
+      });
+    } finally {
+      setTestingNew(false);
+    }
+  }, [
+    api,
+    newServer.name,
+    newServer.transport,
+    newServer.value,
+    newServer.headersRows,
+    globalSecretKeys,
+    resetNewServerOauthLogin,
+  ]);
+
   const editHeadersValidation =
     editing && editing.transport !== "stdio"
       ? mcpHeaderRowsToRecord(editing.headersRows, {
@@ -1124,20 +1291,32 @@ export const MCPSettingsSection: React.FC = () => {
     <div className="space-y-6">
       {/* Intro */}
       <div>
-        <p className="text-muted mb-4 text-xs">
+        <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
-          <code className="text-accent">~/.mux/mcp.jsonc</code>, with optional repo overrides in{" "}
-          <code className="text-accent">./.mux/mcp.jsonc</code> and workspace overrides in{" "}
-          <code className="text-accent">.mux/mcp.local.jsonc</code>.
+          <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
+          <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
+          <code className="text-accent">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
+
+      {designEnabled && (
+        <ClaudeDesignCard
+          onChange={refresh}
+          remoteDisabled={mcpAllowUserDefined?.remote === false}
+          conflict={Boolean(
+            servers[CLAUDE_DESIGN_SERVER_NAME] &&
+            (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
+              !("managed" in servers[CLAUDE_DESIGN_SERVER_NAME]))
+          )}
+        />
+      )}
 
       {/* MCP Servers */}
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
 
         {mcpDisabledByPolicy ? (
-          <p className="text-muted py-2 text-sm">MCP servers are disabled by policy.</p>
+          <p className="text-content-secondary py-2 text-sm">MCP servers are disabled by policy.</p>
         ) : (
           <>
             {error && (
@@ -1150,12 +1329,14 @@ export const MCPSettingsSection: React.FC = () => {
             {/* Server list */}
             <div className="space-y-2">
               {loading ? (
-                <div className="text-muted flex items-center gap-2 py-4 text-sm">
+                <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Loading servers…
                 </div>
               ) : Object.keys(servers).length === 0 ? (
-                <p className="text-muted py-2 text-sm">No MCP servers configured yet.</p>
+                <p className="text-content-secondary py-2 text-sm">
+                  No MCP servers configured yet.
+                </p>
               ) : (
                 Object.entries(servers).map(([name, entry]) => {
                   const isTesting = testingServer === name;
@@ -1163,6 +1344,13 @@ export const MCPSettingsSection: React.FC = () => {
                   const isEditing = editing?.name === name;
                   const isEnabled = !entry.disabled;
                   const remoteEntry = entry.transport === "stdio" ? null : entry;
+                  // Plugin definitions remain read-only (no edit/remove/allowlist).
+                  // Global enablement persists only their keys in enabledPluginServers.
+                  const isPluginEntry = entry.plugin !== undefined;
+                  const isDesignEntry = remoteEntry?.managed === "claude-design";
+                  const displayName = entry.plugin
+                    ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
+                    : name;
                   return (
                     <div
                       key={name}
@@ -1177,7 +1365,7 @@ export const MCPSettingsSection: React.FC = () => {
                                 onCheckedChange={(checked) =>
                                   void handleToggleEnabled(name, checked)
                                 }
-                                aria-label={`Toggle ${name} enabled`}
+                                aria-label={`Toggle ${displayName} enabled`}
                               />
                             </div>
                           </TooltipTrigger>
@@ -1186,8 +1374,28 @@ export const MCPSettingsSection: React.FC = () => {
                           </TooltipContent>
                         </Tooltip>
                         <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
-                          <div className="flex items-center gap-2">
-                            <span className="text-foreground text-sm font-medium">{name}</span>
+                          {/* flex-wrap + wrap-anywhere: repo-controlled plugin names and
+                              install locations can be long unbroken tokens; wrap-anywhere
+                              shrinks their min-content so they cannot starve the actions
+                              column at ~375px. */}
+                          <div className="flex flex-wrap items-center gap-2">
+                            {branding[name] && !isEditing && (
+                              <MCPServerIdentityBadge
+                                connection={describeConfiguredConnection(name, entry)}
+                                identity={branding[name].serverInfo}
+                                icon={branding[name].icon}
+                              />
+                            )}
+                            <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
+                              {displayName}
+                            </span>
+                            {entry.plugin && (
+                              <span className="text-content-secondary bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
+                                {/* Include the install location: same-name plugins can
+                                    exist in sibling containers (.mux vs .agents). */}
+                                plugin · {entry.plugin.sourceLocation}
+                              </span>
+                            )}
                             {cached?.result.success && !isEditing && isEnabled && (
                               <Tooltip>
                                 <TooltipTrigger asChild>
@@ -1200,11 +1408,15 @@ export const MCPSettingsSection: React.FC = () => {
                                 </TooltipContent>
                               </Tooltip>
                             )}
-                            {!isEnabled && <span className="text-muted text-xs">disabled</span>}
+                            {!isEnabled && (
+                              <span className="text-content-secondary text-xs">disabled</span>
+                            )}
                           </div>
                           {isEditing ? (
                             <div className="mt-2 space-y-2">
-                              <p className="text-muted text-xs">transport: {editing.transport}</p>
+                              <p className="text-content-secondary text-xs">
+                                transport: {editing.transport}
+                              </p>
                               <input
                                 type="text"
                                 value={editing.value}
@@ -1219,7 +1431,7 @@ export const MCPSettingsSection: React.FC = () => {
                               />
                               {editing.transport !== "stdio" && (
                                 <div>
-                                  <div className="text-muted mb-1 text-[11px]">
+                                  <div className="text-content-secondary mb-1 text-[11px]">
                                     HTTP headers (optional)
                                   </div>
                                   <MCPHeadersEditor
@@ -1237,7 +1449,7 @@ export const MCPSettingsSection: React.FC = () => {
                               )}
                             </div>
                           ) : (
-                            <p className="text-muted mt-0.5 font-mono text-xs break-all">
+                            <p className="text-content-secondary mt-0.5 font-mono text-xs break-all">
                               {serverDisplayValue(entry)}
                             </p>
                           )}
@@ -1311,43 +1523,48 @@ export const MCPSettingsSection: React.FC = () => {
                                 </TooltipTrigger>
                                 <TooltipContent side="top">Test connection</TooltipContent>
                               </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => handleStartEdit(name, entry)}
-                                      className="text-muted hover:text-accent h-7 w-7"
-                                      aria-label="Edit server"
-                                    >
-                                      <Pencil className="h-4 w-4" />
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Edit server</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => void handleRemove(name)}
-                                      disabled={loading}
-                                      className="text-muted hover:text-error h-7 w-7"
-                                      aria-label="Remove server"
-                                    >
-                                      <Trash2 className="h-4 w-4" />
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Remove server</TooltipContent>
-                              </Tooltip>
+                              {/* Plugin entries are read-only: no edit/remove. */}
+                              {!isPluginEntry && !isDesignEntry && (
+                                <>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="inline-flex">
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          onClick={() => handleStartEdit(name, entry)}
+                                          className="text-muted hover:text-accent h-7 w-7"
+                                          aria-label="Edit server"
+                                        >
+                                          <Pencil className="h-4 w-4" />
+                                        </Button>
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top">Edit server</TooltipContent>
+                                  </Tooltip>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="inline-flex">
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          onClick={() => void handleRemove(name)}
+                                          disabled={loading}
+                                          className="text-muted hover:text-error h-7 w-7"
+                                          aria-label="Remove server"
+                                        >
+                                          <Trash2 className="h-4 w-4" />
+                                        </Button>
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top">Remove server</TooltipContent>
+                                  </Tooltip>
+                                </>
+                              )}
                             </>
                           )}
                         </div>
-                        {!isEditing && remoteEntry && (
+                        {!isEditing && remoteEntry && !isDesignEntry && (
                           <div
                             className={cn(
                               "col-start-2 col-span-2 min-w-0",
@@ -1370,7 +1587,7 @@ export const MCPSettingsSection: React.FC = () => {
                             <span>{cached.result.error}</span>
                           </div>
 
-                          {cached.result.oauthChallenge && (
+                          {cached.result.oauthChallenge && !isDesignEntry && (
                             <div className="mt-2">
                               <MCPOAuthRequiredCallout
                                 serverName={name}
@@ -1390,12 +1607,22 @@ export const MCPSettingsSection: React.FC = () => {
                       )}
                       {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
                         <div className="border-border-medium border-t px-3 py-2">
-                          <ToolAllowlistSection
-                            serverName={name}
-                            availableTools={cached.result.tools}
-                            currentAllowlist={entry.toolAllowlist}
-                            testedAt={cached.testedAt}
-                          />
+                          {isPluginEntry ? (
+                            // Plugin servers are read-only here (setToolAllowlist rejects
+                            // plugin keys); their allowlists live in Workspace MCP. Users
+                            // can still inspect what the connection test discovered.
+                            <PluginToolListSection
+                              tools={cached.result.tools}
+                              testedAt={cached.testedAt}
+                            />
+                          ) : (
+                            <ToolAllowlistSection
+                              serverName={name}
+                              availableTools={cached.result.tools}
+                              currentAllowlist={entry.toolAllowlist}
+                              testedAt={cached.testedAt}
+                            />
+                          )}
                         </div>
                       )}
                     </div>
@@ -1412,7 +1639,10 @@ export const MCPSettingsSection: React.FC = () => {
               </summary>
               <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
                 <div>
-                  <label htmlFor="server-name" className="text-muted mb-1 block text-xs">
+                  <label
+                    htmlFor="server-name"
+                    className="text-content-secondary mb-1 block text-xs"
+                  >
                     Name
                   </label>
                   <input
@@ -1421,14 +1651,16 @@ export const MCPSettingsSection: React.FC = () => {
                     placeholder="e.g., memory"
                     value={newServer.name}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
                   />
                 </div>
 
                 <div>
-                  <label className="text-muted mb-1 block text-xs">Transport</label>
+                  <label className="text-content-secondary mb-1 block text-xs">Transport</label>
                   <Select
                     value={newServer.transport}
+                    disabled={newServerOauthPending}
                     onValueChange={(value) =>
                       setNewServer((prev) => ({
                         ...prev,
@@ -1457,7 +1689,10 @@ export const MCPSettingsSection: React.FC = () => {
                 </div>
 
                 <div>
-                  <label htmlFor="server-value" className="text-muted mb-1 block text-xs">
+                  <label
+                    htmlFor="server-value"
+                    className="text-content-secondary mb-1 block text-xs"
+                  >
                     {newServer.transport === "stdio" ? "Command" : "URL"}
                   </label>
                   <input
@@ -1471,13 +1706,16 @@ export const MCPSettingsSection: React.FC = () => {
                     value={newServer.value}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
                     spellCheck={false}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
                   />
                 </div>
 
                 {newServer.transport !== "stdio" && (
                   <div>
-                    <label className="text-muted mb-1 block text-xs">HTTP headers (optional)</label>
+                    <label className="text-content-secondary mb-1 block text-xs">
+                      HTTP headers (optional)
+                    </label>
                     <MCPHeadersEditor
                       rows={newServer.headersRows}
                       onChange={(rows) =>
@@ -1487,7 +1725,7 @@ export const MCPSettingsSection: React.FC = () => {
                         }))
                       }
                       secretKeys={globalSecretKeys}
-                      disabled={addingServer || testingNew}
+                      disabled={addingServer || testingNew || newServerOauthPending}
                     />
                   </div>
                 )}
@@ -1529,50 +1767,9 @@ export const MCPSettingsSection: React.FC = () => {
                   !newTestResult.result.success &&
                   newTestResult.result.oauthChallenge && (
                     <div className="mt-2">
-                      <MCPOAuthRequiredCallout
-                        serverName={newServer.name.trim()}
-                        pendingServer={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return undefined;
-                          }
-
-                          // If the server already exists in config, prefer that config for OAuth.
-                          const existing = servers[pendingName];
-                          if (existing) {
-                            return undefined;
-                          }
-
-                          if (newServer.transport === "stdio") {
-                            return undefined;
-                          }
-
-                          const url = newServer.value.trim();
-                          if (!url) {
-                            return undefined;
-                          }
-
-                          return { transport: newServer.transport, url };
-                        })()}
-                        disabledReason={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return "Enter a server name to enable OAuth login.";
-                          }
-
-                          const existing = servers[pendingName];
-
-                          const transport = existing?.transport ?? newServer.transport;
-                          if (transport === "stdio") {
-                            return "OAuth login is only supported for remote (http/sse) MCP servers.";
-                          }
-
-                          return undefined;
-                        })()}
-                        onLoginSuccess={async () => {
-                          setMcpOauthRefreshNonce((prev) => prev + 1);
-                          await handleTestNewServer();
-                        }}
+                      <MCPOAuthRequiredCalloutView
+                        login={newServerOauthLogin}
+                        disabledReason={newServerOauthDisabledReason}
                       />
                     </div>
                   )}
@@ -1581,7 +1778,7 @@ export const MCPSettingsSection: React.FC = () => {
                     variant="outline"
                     size="sm"
                     onClick={() => void handleTestNewServer()}
-                    disabled={!canTest || testingNew}
+                    disabled={!canTest || testingNew || newServerOauthPending}
                   >
                     {testingNew ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1593,7 +1790,7 @@ export const MCPSettingsSection: React.FC = () => {
                   <Button
                     size="sm"
                     onClick={() => void handleAddServer()}
-                    disabled={!canAdd || addingServer}
+                    disabled={!canAdd || addingServer || newServerOauthPending}
                   >
                     {addingServer ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />

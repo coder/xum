@@ -1,11 +1,27 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 
-import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
+import type { ORPCContext } from "@/node/orpc/context";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { isAgentEffectivelyDisabled } from "./agentEnablement";
+import { resolveAgentVisibility } from "./agentVisibility";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalMuxHome";
+import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import {
+  execBuffered,
+  readFileString,
+  throwIfTransportFailure,
+} from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 
 import {
@@ -21,13 +37,23 @@ import type {
   AgentId,
 } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
-import { validateFileSize } from "@/node/services/tools/fileCommon";
+import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
+
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  discoverAgentPlugins,
+  readPluginFileWithinRootCapped,
+  UNIVERSAL_AGENT_PLUGINS_CONTAINER,
+  type AgentPluginContainer,
+} from "@/node/services/agentPlugins/discovery";
+import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
 import {
   AgentDefinitionParseError,
   parseAgentDefinitionMarkdown,
 } from "./parseAgentDefinitionMarkdown";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 
 export const MAX_INHERITANCE_DEPTH = 10;
 
@@ -79,83 +105,44 @@ export function computeBaseSkipScope(
   return getSkipScopesAboveForKnownScope(currentScope);
 }
 
-const GLOBAL_AGENTS_ROOT = "~/.mux/agents";
-
-interface AgentDefinitionUiFlags {
-  hidden?: boolean;
-  selectable?: boolean;
-  disabled?: boolean;
-  routable?: boolean;
-}
-
-// TODO: The visibility/routability resolution logic (hidden → selectable, routable)
-// is duplicated across agentDefinitionsService.ts, agentSession.ts,
-// streamContextBuilder.ts, and orpc/router.ts. Consider extracting a single
-// resolveAgentVisibility(ui) → { selectable, routable, disabled } helper.
-function resolveUiSelectable(ui: AgentDefinitionUiFlags | undefined): boolean {
-  if (!ui) {
-    return true;
-  }
-
-  if (typeof ui.hidden === "boolean") {
-    return !ui.hidden;
-  }
-
-  if (typeof ui.selectable === "boolean") {
-    return ui.selectable;
-  }
-
-  return true;
-}
-
-/**
- * Resolve whether an agent can be targeted by switch_agent.
- *
- * Defaults to the same value as uiSelectable: visible agents are routable by
- * default (a human-pickable agent should also be agent-pickable). This differs
- * from subagentRunnable which defaults to false, because routing via
- * switch_agent has lower impact than spawning a task sub-agent.
- *
- * Hidden agents must explicitly set `ui.routable: true` to be switch targets.
- */
-function resolveUiRoutable(ui: AgentDefinitionUiFlags | undefined): boolean {
-  if (typeof ui?.routable === "boolean") {
-    return ui.routable;
-  }
-
-  return resolveUiSelectable(ui);
-}
-
-function resolveUiDisabled(ui: AgentDefinitionUiFlags | undefined): boolean {
-  return ui?.disabled === true;
-}
-
-/**
- * Internal type for tracking agent definitions during discovery.
- * Includes a legacy `disabled` flag (from ui.disabled) for debugging/logging only.
- * Filtering is applied at higher layers so Settings can surface opt-in agents.
- */
-interface AgentDiscoveryEntry {
-  descriptor: AgentDefinitionDescriptor;
-  disabled: boolean;
-}
+const GLOBAL_AGENTS_ROOT = "~/.xum/agents";
 
 export interface AgentDefinitionsRoots {
-  projectRoot: string;
+  projectRoots: string[];
   globalRoot: string;
+  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (agent-plugins experiment; read-only). */
+  projectPluginRoots?: string[];
+  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (agent-plugins experiment; read-only). */
+  globalPluginRoots?: string[];
 }
 
 export function getDefaultAgentDefinitionsRoots(
   runtime: Runtime,
-  workspacePath: string
+  workspacePath: string,
+  options?: { includeAgentPlugins?: boolean }
 ): AgentDefinitionsRoots {
   if (!workspacePath) {
     throw new Error("getDefaultAgentDefinitionsRoots: workspacePath is required");
   }
 
   return {
-    projectRoot: runtime.normalizePath(".mux/agents", workspacePath),
+    projectRoots: listProjectMetadataRelativePaths("agents").map((relativePath) =>
+      runtime.normalizePath(relativePath, workspacePath)
+    ),
     globalRoot: GLOBAL_AGENTS_ROOT,
+    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
+    // never get plugin containers (mirrors agentSkillsService).
+    ...(options?.includeAgentPlugins && !(runtime instanceof RemoteRuntime)
+      ? {
+          projectPluginRoots: [
+            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+              runtime.normalizePath(relativePath, workspacePath)
+            ),
+            runtime.normalizePath(".agents/plugins", workspacePath),
+          ],
+          globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
+        }
+      : {}),
   };
 }
 
@@ -163,36 +150,130 @@ interface AgentDefinitionScanCandidate {
   scope: Exclude<AgentDefinitionScope, "built-in">;
   root: string;
   runtime: Runtime;
+  /** Agent Plugins only: canonical plugin root anchoring per-file realpath containment. */
+  pluginRoot?: string;
+  /** Agent Plugins only: contributing plugin name for descriptor attribution. */
+  pluginName?: string;
 }
 
-function buildDiscoveryScans(
+/**
+ * Agent Plugins: expand plugin container dirs into per-plugin `agents/` scan
+ * candidates (host-local filesystem only, mirroring plugin skill discovery).
+ */
+async function buildPluginAgentScanCandidates(args: {
+  containers: string[];
+  scope: Exclude<AgentDefinitionScope, "built-in">;
+  workspacePath: string;
+  /** Project scope: plugin roots must stay inside the checkout (repo-symlink posture). */
+  projectContainmentRoot?: string;
+}): Promise<AgentDefinitionScanCandidate[]> {
+  if (args.containers.length === 0) {
+    return [];
+  }
+
+  const localRuntime = new LocalRuntime(args.workspacePath);
+  const resolvedContainers: AgentPluginContainer[] = [];
+  for (const container of args.containers) {
+    try {
+      // Container paths may be tilde-form (e.g. ~/.agents/plugins).
+      resolvedContainers.push({
+        path: await localRuntime.resolvePath(container),
+        scope: args.scope,
+      });
+    } catch (err) {
+      log.warn(`Failed to resolve plugin container ${container}: ${getErrorMessage(err)}`);
+    }
+  }
+
+  const { plugins } = await discoverAgentPlugins(resolvedContainers);
+
+  const candidates: AgentDefinitionScanCandidate[] = [];
+  for (const plugin of plugins) {
+    if (plugin.agentsDir == null) {
+      continue;
+    }
+
+    if (args.projectContainmentRoot != null) {
+      try {
+        await ensurePathContained(args.projectContainmentRoot, plugin.rootPath);
+      } catch (error) {
+        log.warn(
+          `Skipping project plugin '${plugin.name}' at '${plugin.rootPath}': plugin root escapes the project containment root: ${getErrorMessage(error)}`
+        );
+        continue;
+      }
+    }
+
+    candidates.push({
+      scope: args.scope,
+      root: plugin.agentsDir,
+      runtime: localRuntime,
+      pluginRoot: plugin.rootPath,
+      pluginName: plugin.name,
+    });
+  }
+
+  return candidates;
+}
+
+/**
+ * Scan/read candidates in precedence order (earlier wins): project agents,
+ * project plugin agents, global agents, global plugin agents. Built-ins are
+ * handled separately as the lowest layer.
+ */
+async function buildScanCandidates(
   runtime: Runtime,
   workspacePath: string,
   roots: AgentDefinitionsRoots
-): AgentDefinitionScanCandidate[] {
+): Promise<AgentDefinitionScanCandidate[]> {
+  const projectPluginCandidates = await buildPluginAgentScanCandidates({
+    containers: roots.projectPluginRoots ?? [],
+    scope: "project",
+    workspacePath,
+    projectContainmentRoot: workspacePath,
+  });
+  const globalPluginCandidates = await buildPluginAgentScanCandidates({
+    containers: roots.globalPluginRoots ?? [],
+    scope: "global",
+    workspacePath,
+  });
+
   return [
+    ...roots.projectRoots.map((root) => ({
+      scope: "project" as const,
+      root,
+      runtime,
+    })),
+    ...projectPluginCandidates,
     {
       scope: "global",
       root: roots.globalRoot,
       runtime: resolveGlobalRuntime(runtime, workspacePath),
     },
-    { scope: "project", root: roots.projectRoot, runtime },
+    ...globalPluginCandidates,
   ];
 }
 
-function buildReadCandidates(
-  runtime: Runtime,
-  workspacePath: string,
-  roots: AgentDefinitionsRoots
-): AgentDefinitionScanCandidate[] {
-  return [
-    { scope: "project", root: roots.projectRoot, runtime },
-    {
-      scope: "global",
-      root: roots.globalRoot,
-      runtime: resolveGlobalRuntime(runtime, workspacePath),
-    },
-  ];
+/**
+ * Agent Plugins: per-file realpath containment anchored at the canonical
+ * plugin root, so a symlinked agents/<id>.md cannot escape the plugin.
+ */
+async function isPluginAgentContained(args: {
+  pluginRoot: string;
+  filePath: string;
+  agentId: AgentId;
+}): Promise<boolean> {
+  try {
+    await ensurePathContained(args.pluginRoot, args.filePath);
+    return true;
+  } catch (error) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      log.warn(
+        `Plugin agent '${args.agentId}' at '${args.filePath}' escapes the plugin root: ${getErrorMessage(error)}`
+      );
+    }
+    return false;
+  }
 }
 
 async function listAgentFilesFromLocalFs(root: string): Promise<string[]> {
@@ -222,6 +303,7 @@ async function listAgentFilesFromRuntime(
     `fi`;
 
   const result = await execBuffered(runtime, command, { cwd: options.cwd, timeout: 10 });
+  throwIfTransportFailure(runtime, result, `Failed to read agents directory ${root}`);
   if (result.exitCode !== 0) {
     log.warn(`Failed to read agents directory ${root}: ${result.stderr || result.stdout}`);
     return [];
@@ -248,58 +330,85 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
   return idParsed.data;
 }
 
-async function readAgentDescriptorFromFileWithDisabled(
+async function readAgentDescriptorFromFile(
   runtime: Runtime,
   filePath: string,
   agentId: AgentId,
-  scope: Exclude<AgentDefinitionScope, "built-in">
-): Promise<AgentDiscoveryEntry | null> {
-  let stat;
-  try {
-    stat = await runtime.stat(filePath);
-  } catch {
-    return null;
-  }
-
-  if (stat.isDirectory) {
-    return null;
-  }
-
-  const sizeValidation = validateFileSize(stat);
-  if (sizeValidation) {
-    log.warn(`Skipping agent '${agentId}' (${scope}): ${sizeValidation.error}`);
-    return null;
-  }
-
+  scope: Exclude<AgentDefinitionScope, "built-in">,
+  pluginName?: string,
+  /**
+   * Plugin agents (host-local by construction): the consuming read must
+   * revalidate containment + file identity through a bounded post-open
+   * handle. isPluginAgentContained ran BEFORE this call, and a managed
+   * update promoted in between can replace agents/<id>.md (or an ancestor)
+   * with an absolute symlink to an outside definition — staged validation
+   * reads that as a capability removal, and the outside frontmatter would
+   * otherwise control agent policy (runnable/base/tools).
+   */
+  pluginRoot?: string
+): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
-  try {
-    content = await readFileString(runtime, filePath);
-  } catch (err) {
-    log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
-    return null;
+  let byteSize: number;
+  if (pluginRoot != null) {
+    try {
+      const result = await readPluginFileWithinRootCapped({
+        filePath,
+        pluginRoot,
+        maxBytes: MAX_FILE_SIZE,
+        label: `plugin agent '${agentId}'`,
+      });
+      content = result.content;
+      byteSize = result.byteSize;
+    } catch (err) {
+      log.warn(`Failed to read plugin agent definition ${filePath}: ${getErrorMessage(err)}`);
+      return null;
+    }
+  } else {
+    let stat;
+    try {
+      stat = await runtime.stat(filePath);
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
+      return null;
+    }
+
+    if (stat.isDirectory) {
+      return null;
+    }
+
+    const sizeValidation = validateFileSize(stat);
+    if (sizeValidation) {
+      log.warn(`Skipping agent '${agentId}' (${scope}): ${sizeValidation.error}`);
+      return null;
+    }
+
+    try {
+      content = await readFileString(runtime, filePath);
+    } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
+      log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
+      return null;
+    }
+    byteSize = stat.size;
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize: stat.size });
+    const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
 
-    const uiSelectable = resolveUiSelectable(parsed.frontmatter.ui);
-    const uiRoutable = resolveUiRoutable(parsed.frontmatter.ui);
-    const uiColor = parsed.frontmatter.ui?.color;
-    const subagentRunnable = parsed.frontmatter.subagent?.runnable ?? false;
-    const disabled = resolveUiDisabled(parsed.frontmatter.ui);
+    const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
     const descriptor: AgentDefinitionDescriptor = {
       id: agentId,
       scope,
       name: parsed.frontmatter.name,
       description: parsed.frontmatter.description,
-      uiSelectable,
-      uiRoutable,
-      uiColor,
-      subagentRunnable,
+      uiSelectable: selectable,
+      uiColor: parsed.frontmatter.ui?.color,
+      subagentRunnable: parsed.frontmatter.subagent?.runnable ?? false,
       base: parsed.frontmatter.base,
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
+      ...(pluginName !== undefined ? { pluginName } : {}),
     };
 
     const validated = AgentDefinitionDescriptorSchema.safeParse(descriptor);
@@ -308,7 +417,7 @@ async function readAgentDescriptorFromFileWithDisabled(
       return null;
     }
 
-    return { descriptor: validated.data, disabled };
+    return validated.data;
   } catch (err) {
     const message = err instanceof AgentDefinitionParseError ? err.message : getErrorMessage(err);
     log.warn(`Skipping invalid agent definition '${agentId}' (${scope}): ${message}`);
@@ -316,52 +425,61 @@ async function readAgentDescriptorFromFileWithDisabled(
   }
 }
 
+function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
+  const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
+
+  return {
+    id: pkg.id,
+    scope: pkg.scope,
+    name: pkg.frontmatter.name,
+    description: pkg.frontmatter.description,
+    uiSelectable: selectable,
+    uiColor: pkg.frontmatter.ui?.color,
+    subagentRunnable: pkg.frontmatter.subagent?.runnable ?? false,
+    base: pkg.frontmatter.base,
+    aiDefaults: pkg.frontmatter.ai,
+    tools: pkg.frontmatter.tools,
+  };
+}
+
 export async function discoverAgentDefinitions(
   runtime: Runtime,
   workspacePath: string,
-  options?: { roots?: AgentDefinitionsRoots }
+  options?: {
+    roots?: AgentDefinitionsRoots;
+    /** agent-plugins experiment: also scan Agent Plugins agents (used only when `roots` is absent). */
+    includeAgentPlugins?: boolean;
+    /**
+     * When false, return every discovered descriptor in precedence order
+     * (shadowed ids included) instead of only the effective one per id.
+     * Used by the plugin composition inspector to report shadowing.
+     */
+    dedupeById?: boolean;
+  }
 ): Promise<AgentDefinitionDescriptor[]> {
   if (!workspacePath) {
     throw new Error("discoverAgentDefinitions: workspacePath is required");
   }
 
-  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
-
-  const byId = new Map<AgentId, AgentDiscoveryEntry>();
-
-  // Seed built-ins (lowest precedence).
-  for (const pkg of getBuiltInAgentDefinitions()) {
-    const uiSelectable = resolveUiSelectable(pkg.frontmatter.ui);
-    const uiRoutable = resolveUiRoutable(pkg.frontmatter.ui);
-    const uiColor = pkg.frontmatter.ui?.color;
-    const subagentRunnable = pkg.frontmatter.subagent?.runnable ?? false;
-    const disabled = resolveUiDisabled(pkg.frontmatter.ui);
-
-    byId.set(pkg.id, {
-      descriptor: {
-        id: pkg.id,
-        scope: "built-in",
-        name: pkg.frontmatter.name,
-        description: pkg.frontmatter.description,
-        uiSelectable,
-        uiRoutable,
-        uiColor,
-        subagentRunnable,
-        base: pkg.frontmatter.base,
-        aiDefaults: pkg.frontmatter.ai,
-        tools: pkg.frontmatter.tools,
-      },
-      disabled,
+  const roots =
+    options?.roots ??
+    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
+      includeAgentPlugins: options?.includeAgentPlugins,
     });
-  }
+  const dedupeById = options?.dedupeById ?? true;
 
-  const scans = buildDiscoveryScans(runtime, workspacePath, roots);
+  const byId = new Map<AgentId, AgentDefinitionDescriptor>();
+  const discovered: AgentDefinitionDescriptor[] = [];
+
+  // Scan order encodes precedence: earlier roots win when ids collide.
+  const scans = await buildScanCandidates(runtime, workspacePath, roots);
 
   for (const scan of scans) {
     let resolvedRoot: string;
     try {
       resolvedRoot = await scan.runtime.resolvePath(scan.root);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to resolve agents root ${scan.root}: ${getErrorMessage(err)}`);
       continue;
     }
@@ -378,34 +496,149 @@ export async function discoverAgentDefinitions(
         continue;
       }
 
+      if (dedupeById && byId.has(agentId)) {
+        continue;
+      }
+
       const filePath = scan.runtime.normalizePath(filename, resolvedRoot);
-      const result = await readAgentDescriptorFromFileWithDisabled(
+
+      if (scan.pluginRoot != null) {
+        const contained = await isPluginAgentContained({
+          pluginRoot: scan.pluginRoot,
+          filePath,
+          agentId,
+        });
+        if (!contained) continue;
+      }
+
+      const descriptor = await readAgentDescriptorFromFile(
         scan.runtime,
         filePath,
         agentId,
-        scan.scope
+        scan.scope,
+        scan.pluginName,
+        scan.pluginRoot
       );
-      if (!result) continue;
+      if (!descriptor) continue;
 
-      byId.set(agentId, result);
+      if (dedupeById) {
+        // First discovered descriptor wins because duplicates are skipped above.
+        byId.set(agentId, descriptor);
+      } else {
+        discovered.push(descriptor);
+      }
     }
+  }
+
+  // Built-ins are lowest precedence and are omitted when overridden.
+  for (const pkg of getBuiltInAgentDefinitions()) {
+    if (dedupeById) {
+      if (!byId.has(pkg.id)) {
+        byId.set(pkg.id, buildAgentDescriptor(pkg));
+      }
+      continue;
+    }
+
+    discovered.push(buildAgentDescriptor(pkg));
   }
 
   // Return all discovered agents (including those disabled by front-matter).
   // Filtering is applied at higher layers (e.g., agents.list) so Settings can still surface opt-in agents.
-  return Array.from(byId.values())
-    .map((entry) => entry.descriptor)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const agents = dedupeById ? Array.from(byId.values()) : discovered;
+  // Sort same-ID duplicates as one group keyed by the WINNING (first
+  // discovered, highest precedence) definition's display name: sorting on each
+  // row's own name could reorder rows within an ID group, and composition
+  // consumers treat the first row per ID as the effective definition.
+  const groupNameById = new Map<string, string>();
+  for (const agent of agents) {
+    if (!groupNameById.has(agent.id)) {
+      groupNameById.set(agent.id, agent.name);
+    }
+  }
+  return agents.sort((a, b) => {
+    const byGroupName = (groupNameById.get(a.id) ?? a.name).localeCompare(
+      groupNameById.get(b.id) ?? b.name
+    );
+    if (byGroupName !== 0) {
+      return byGroupName;
+    }
+    // Same group name, different IDs: keep the order deterministic. Same ID:
+    // 0 lets the stable sort preserve discovery (precedence) order.
+    return a.id.localeCompare(b.id);
+  });
+}
+
+/**
+ * Request-scoped memo for `readAgentDefinition`.
+ *
+ * One stream request resolves the same definitions several times (agent
+ * resolution, disablement checks, inheritance, prompt body, frontmatter, and
+ * sub-agent discovery); on SSH runtimes every probe is a remote round-trip.
+ * Create one cache per request and drop it with the request. Nothing is shared
+ * across requests, so edits between turns are always picked up.
+ *
+ * The key covers every input that can change the winning definition (runtime
+ * identity, workspace path, agent id, roots identity, plugin inclusion, and
+ * skipped scopes), so precedence and base resolution are exactly as uncached.
+ * Promises are memoized so concurrent lookups in one request share one read.
+ */
+export class AgentDefinitionRequestCache {
+  private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
+  /** Identity keys: distinct runtime or roots objects never share entries. */
+  private readonly objectIds = new WeakMap<Runtime | AgentDefinitionsRoots, number>();
+  private nextObjectId = 1;
+
+  private objectId(value: Runtime | AgentDefinitionsRoots): number {
+    let id = this.objectIds.get(value);
+    if (id == null) {
+      id = this.nextObjectId++;
+      this.objectIds.set(value, id);
+    }
+    return id;
+  }
+
+  read(
+    runtime: Runtime,
+    workspacePath: string,
+    agentId: AgentId,
+    options: ReadAgentDefinitionOptions | undefined,
+    load: () => Promise<AgentDefinitionPackage>
+  ): Promise<AgentDefinitionPackage> {
+    const key = JSON.stringify([
+      this.objectId(runtime),
+      workspacePath,
+      agentId,
+      options?.roots != null ? this.objectId(options.roots) : null,
+      // getDefaultAgentDefinitionsRoots treats undefined like false.
+      options?.includeAgentPlugins === true,
+      options?.skipScopesAbove ?? null,
+    ]);
+    let definition = this.definitions.get(key);
+    if (definition == null) {
+      definition = load();
+      this.definitions.set(key, definition);
+    }
+    return definition;
+  }
 }
 
 export interface ReadAgentDefinitionOptions {
   roots?: AgentDefinitionsRoots;
+  /** agent-plugins experiment: also probe Agent Plugins agents (used only when `roots` is absent). */
+  includeAgentPlugins?: boolean;
+  /** Per-request reuse of resolved definitions; the caller owns its lifetime. */
+  cache?: AgentDefinitionRequestCache;
   /**
    * Skip scopes at or above this level when resolving.
    * Used for base resolution: when a project-scope agent has `base: exec`,
    * we skip project scope to find the global/built-in exec, avoiding self-reference.
    */
   skipScopesAbove?: AgentDefinitionScope;
+  /**
+   * Cancels the underlying runtime stat/read work (e.g. SSH commands) and stops
+   * probing further candidates; readAgentDefinition then rejects with the abort reason.
+   */
+  abortSignal?: AbortSignal;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -419,8 +652,26 @@ export async function readAgentDefinition(
   if (!workspacePath) {
     throw new Error("readAgentDefinition: workspacePath is required");
   }
+  const cache = options?.cache;
+  if (cache != null) {
+    return cache.read(runtime, workspacePath, agentId, options, () =>
+      loadAgentDefinition(runtime, workspacePath, agentId, options)
+    );
+  }
+  return loadAgentDefinition(runtime, workspacePath, agentId, options);
+}
 
-  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
+async function loadAgentDefinition(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
+  const roots =
+    options?.roots ??
+    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
+      includeAgentPlugins: options?.includeAgentPlugins,
+    });
   const skipScopesAbove = options?.skipScopesAbove;
 
   // Determine which scopes to skip based on skipScopesAbove
@@ -435,10 +686,13 @@ export async function readAgentDefinition(
     }
   }
 
-  // Precedence: project overrides global overrides built-in.
-  const candidates = buildReadCandidates(runtime, workspacePath, roots);
+  // Precedence: project overrides plugin(project) overrides global overrides
+  // plugin(global) overrides built-in.
+  const candidates = await buildScanCandidates(runtime, workspacePath, roots);
 
+  const abortSignal = options?.abortSignal;
   for (const candidate of candidates) {
+    abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
       continue;
     }
@@ -446,31 +700,65 @@ export async function readAgentDefinition(
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch {
+    } catch (error) {
+      // An unreachable host is not a missing root: never fall through to a
+      // lower scope or the built-in agent on a transport failure (#4438).
+      if (isRuntimeTransportError(error)) throw error;
       continue;
     }
 
     const filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
 
+    if (candidate.pluginRoot != null) {
+      const contained = await isPluginAgentContained({
+        pluginRoot: candidate.pluginRoot,
+        filePath,
+        agentId,
+      });
+      if (!contained) continue;
+    }
+
     try {
-      const stat = await candidate.runtime.stat(filePath);
-      if (stat.isDirectory) {
-        continue;
-      }
+      let content: string;
+      let byteSize: number;
+      if (candidate.pluginRoot != null) {
+        // Plugin agents: bounded post-open revalidation (containment + file
+        // identity) — see the pluginRoot doc on readAgentDescriptorFromFile.
+        // This frontmatter controls agent policy (runnable/base/tools), so a
+        // replacement symlink promoted after isPluginAgentContained must not
+        // have its outside target read here.
+        const result = await readPluginFileWithinRootCapped({
+          filePath,
+          pluginRoot: candidate.pluginRoot,
+          maxBytes: MAX_FILE_SIZE,
+          label: `plugin agent '${agentId}'`,
+        });
+        content = result.content;
+        byteSize = result.byteSize;
+      } else {
+        const stat = await candidate.runtime.stat(filePath, abortSignal);
+        if (stat.isDirectory) {
+          continue;
+        }
 
-      const sizeValidation = validateFileSize(stat);
-      if (sizeValidation) {
-        throw new Error(sizeValidation.error);
-      }
+        const sizeValidation = validateFileSize(stat);
+        if (sizeValidation) {
+          throw new Error(sizeValidation.error);
+        }
 
-      const content = await readFileString(candidate.runtime, filePath);
-      const parsed = parseAgentDefinitionMarkdown({ content, byteSize: stat.size });
+        content = await readFileString(candidate.runtime, filePath, abortSignal);
+        byteSize = stat.size;
+      }
+      const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,
         scope: candidate.scope,
         frontmatter: parsed.frontmatter,
         body: parsed.body,
+        // Exact provenance for strict-send pinning; per-plugin candidate roots are
+        // unique per plugin, so root identity distinguishes file vs plugin sources.
+        source: candidate.root,
       };
 
       const validated = AgentDefinitionPackageSchema.safeParse(pkg);
@@ -481,7 +769,11 @@ export async function readAgentDefinition(
       }
 
       return validated.data;
-    } catch {
+    } catch (error) {
+      // An aborted or failed read (transport, permission) is not a missing
+      // candidate: stop probing instead of falling through to a lower scope
+      // (#4438, #4827). Parse and validation errors still skip the candidate.
+      if (abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
       continue;
     }
   }
@@ -489,7 +781,7 @@ export async function readAgentDefinition(
   if (!skipScopes.has("built-in")) {
     const builtIn = getBuiltInAgentDefinitions().find((pkg) => pkg.id === agentId);
     if (builtIn) {
-      const validated = AgentDefinitionPackageSchema.safeParse(builtIn);
+      const validated = AgentDefinitionPackageSchema.safeParse({ ...builtIn, source: "built-in" });
       if (!validated.success) {
         throw new Error(
           `Invalid built-in agent definition '${agentId}': ${validated.error.message}`
@@ -516,7 +808,12 @@ export async function resolveAgentBody(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: { roots?: AgentDefinitionsRoots; skipScopesAbove?: AgentDefinitionScope }
+  options?: {
+    roots?: AgentDefinitionsRoots;
+    includeAgentPlugins?: boolean;
+    skipScopesAbove?: AgentDefinitionScope;
+    cache?: AgentDefinitionRequestCache;
+  }
 ): Promise<string> {
   const visited = new Set<string>();
 
@@ -555,7 +852,9 @@ export async function resolveAgentBody(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
+      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -645,18 +944,16 @@ function deepMergeAgentFrontmatter(
 }
 
 /**
- * Resolve an agent's effective frontmatter by overlaying its base chain (base first, then child).
- *
- * Unlike prompt body inheritance, frontmatter inheritance is always applied when `base` is set.
- * This prevents same-name overrides (e.g. project exec.md with base: exec) from accidentally
- * dropping important base config like subagent.runnable or subagent.append_prompt.
+ * Resolve prompt and frontmatter in one base-chain walk so callers authorize
+ * and execute the same definition snapshot. Frontmatter always inherits when
+ * `base` is set, even when the child replaces the base prompt.
  */
-export async function resolveAgentFrontmatter(
+export async function resolveAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: { roots?: AgentDefinitionsRoots; skipScopesAbove?: AgentDefinitionScope }
-): Promise<AgentDefinitionPackage["frontmatter"]> {
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -690,7 +987,7 @@ export async function resolveAgentFrontmatter(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<AgentDefinitionPackage["frontmatter"]> {
+  ): Promise<AgentDefinitionPackage> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -699,7 +996,9 @@ export async function resolveAgentFrontmatter(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
+      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -710,16 +1009,16 @@ export async function resolveAgentFrontmatter(
 
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return pkg.frontmatter;
+      return pkg;
     }
 
-    const baseFrontmatter = await resolve(
+    const base = await resolve(
       baseId,
       depth + 1,
       mergeSkipScopesAbove(skipScopesAbove, computeBaseSkipScope(baseId, id, pkg.scope))
     );
 
-    const mergedRaw = deepMergeAgentFrontmatter(baseFrontmatter, pkg.frontmatter, []);
+    const mergedRaw = deepMergeAgentFrontmatter(base.frontmatter, pkg.frontmatter, []);
     const merged = AgentDefinitionFrontmatterSchema.safeParse(mergedRaw);
     if (!merged.success) {
       throw new Error(
@@ -727,8 +1026,173 @@ export async function resolveAgentFrontmatter(
       );
     }
 
-    return merged.data;
+    const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
+    return {
+      ...pkg,
+      frontmatter: merged.data,
+      body:
+        pkg.frontmatter.prompt?.append === false ? pkg.body : `${base.body}${separator}${pkg.body}`,
+    };
   }
 
   return resolve(agentId, 0, options?.skipScopesAbove);
+}
+
+export async function resolveAgentFrontmatter(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage["frontmatter"]> {
+  return (await resolveAgentDefinition(runtime, workspacePath, agentId, options)).frontmatter;
+}
+
+/**
+ * Resolve a headless agent definition: a user override at <muxRoot>/agents/<agentId>.md
+ * (global agent scope) shadows the built-in definition, like any other agent.
+ * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
+ * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
+ * Host-side read only — headless runs are runtime-independent, so project-scope
+ * agent overrides (which need a live checkout) are intentionally not resolved.
+ * Shared with the debug CLI.
+ */
+export async function resolveHeadlessAgentDefinition(
+  muxRoot: string,
+  agentId: string
+): Promise<AgentDefinitionPackage | null> {
+  assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
+  try {
+    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
+      // Headless tools have no live checkout: never consult repo overrides or plugins.
+      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
+    });
+    const body = definition.body.trim();
+    // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
+    const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
+    return { ...definition, body: body || (fallbackBody ?? "") };
+  } catch (error) {
+    // Invalid inheritance must not silently send memory using another definition/model.
+    log.warn("[HeadlessAgent] failed to resolve definition", {
+      agentId,
+      error: getErrorMessage(error),
+    });
+    return null;
+  }
+}
+
+export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
+  aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
+  experimentsService: Pick<ORPCContext["experimentsService"], "isExperimentEnabled">;
+  initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
+};
+
+export async function resolveAgentDiscoveryContext(
+  context: AgentDefinitionsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+): Promise<{ runtime: Runtime; discoveryPath: string; metadata?: WorkspaceMetadata }> {
+  if (!input.projectPath && !input.workspaceId)
+    throw new Error("Either projectPath or workspaceId must be provided");
+  if (input.workspaceId) {
+    const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
+    if (!metadataResult.success) throw new Error(metadataResult.error);
+    const metadata = metadataResult.data;
+    const runtime = createRuntimeForWorkspace(metadata);
+    return {
+      runtime,
+      discoveryPath: input.disableWorkspaceAgents
+        ? metadata.projectPath
+        : runtime.getWorkspacePath(metadata.projectPath, metadata.name),
+      metadata,
+    };
+  }
+  const projectPath = input.projectPath!;
+  return {
+    runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),
+    discoveryPath: projectPath,
+  };
+}
+
+export async function listAgentDefinitions(
+  context: AgentDefinitionsContext,
+  input: {
+    projectPath?: string;
+    workspaceId?: string;
+    disableWorkspaceAgents?: boolean;
+    includeDisabled?: boolean;
+  }
+) {
+  if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
+  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.AGENT_PLUGINS
+  );
+  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
+    includeAgentPlugins,
+  });
+  const cfg = context.config.loadConfigOrDefault();
+  const resolved = await Promise.all(
+    descriptors.map(async (listedDescriptor) => {
+      let descriptor = listedDescriptor;
+      try {
+        // Settings must show the same host-only Intuition definition used for paid recall,
+        // regardless of a selected workspace's project or plugin overrides.
+        const headless =
+          descriptor.id === "intuition"
+            ? await resolveHeadlessAgentDefinition(context.config.rootDir, descriptor.id)
+            : undefined;
+        if (headless === null) return null;
+        if (headless) descriptor = buildAgentDescriptor(headless);
+        const resolvedFrontmatter =
+          headless?.frontmatter ??
+          (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
+            includeAgentPlugins,
+            skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+          }));
+        if (
+          isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
+          input.includeDisabled !== true
+        )
+          return null;
+        return { descriptor, resolvedFrontmatter };
+      } catch {
+        return { descriptor };
+      }
+    })
+  );
+  return resolved.flatMap((entry) => {
+    if (entry == null) return [];
+    if (entry.resolvedFrontmatter == null) return [entry.descriptor];
+    const frontmatter = entry.resolvedFrontmatter;
+    return [
+      {
+        ...entry.descriptor,
+        name: frontmatter.name,
+        description: frontmatter.description,
+        uiSelectable: resolveAgentVisibility(frontmatter.ui).selectable,
+        uiColor: frontmatter.ui?.color,
+        subagentRunnable: frontmatter.subagent?.runnable ?? false,
+        base: frontmatter.base,
+        aiDefaults: frontmatter.ai,
+        tools: frontmatter.tools,
+      },
+    ];
+  });
+}
+
+export async function getAgentDefinition(
+  context: AgentDefinitionsContext,
+  input: {
+    projectPath?: string;
+    workspaceId?: string;
+    disableWorkspaceAgents?: boolean;
+    agentId: AgentId;
+  }
+) {
+  if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
+  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+  return readAgentDefinition(runtime, discoveryPath, input.agentId, {
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+  });
 }

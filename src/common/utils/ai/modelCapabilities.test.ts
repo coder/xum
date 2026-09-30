@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getModelCapabilities, getSupportedInputMediaTypes } from "./modelCapabilities";
+import { extractModelCapabilities, getModelCapabilities } from "./modelCapabilities";
 
 describe("getModelCapabilities", () => {
   it("returns capabilities for known models", () => {
@@ -33,6 +33,24 @@ describe("getModelCapabilities", () => {
     expect(caps).not.toBeNull();
   });
 
+  it("reports image support for Kimi K3 via direct and gateway ids", () => {
+    for (const model of ["moonshotai:kimi-k3", "openrouter:moonshotai/kimi-k3"]) {
+      const caps = getModelCapabilities(model);
+      expect(caps).not.toBeNull();
+      expect(caps?.supportsVision).toBe(true);
+      expect(caps?.supportsPdfInput).toBe(false);
+    }
+  });
+
+  it("reports image-only multimodal input for GLM 5.3 Flash", () => {
+    const caps = getModelCapabilities("zai:glm-5.3-flash");
+
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsVision).toBe(true);
+    expect(caps?.supportsPdfInput).toBe(false);
+    expect(caps?.supportsVideoInput).toBe(false);
+  });
+
   it("infers PDF support for OpenAI vision models when models-extra omits the flag", () => {
     const caps = getModelCapabilities("openai:gpt-5.5");
     expect(caps).not.toBeNull();
@@ -40,11 +58,12 @@ describe("getModelCapabilities", () => {
     expect(caps?.supportsVision).toBe(true);
   });
 
-  it("returns maxPdfSizeMb when present in model metadata", () => {
-    const caps = getModelCapabilities("google:gemini-1.5-flash");
-    expect(caps).not.toBeNull();
-    expect(caps?.supportsPdfInput).toBe(true);
-    expect(caps?.maxPdfSizeMb).toBeGreaterThan(0);
+  it("returns maxPdfSizeMb and infers PDF support when metadata carries the field", () => {
+    // Injected metadata: upstream LiteLLM dropped max_pdf_size_mb, but
+    // models-extra overrides can still supply it.
+    const caps = extractModelCapabilities({ max_pdf_size_mb: 30 });
+    expect(caps.supportsPdfInput).toBe(true);
+    expect(caps.maxPdfSizeMb).toBe(30);
   });
 
   it("returns multimodal capabilities for Gemini 3.5 Flash", () => {
@@ -58,19 +77,5 @@ describe("getModelCapabilities", () => {
 
   it("returns null for unknown models", () => {
     expect(getModelCapabilities("anthropic:this-model-does-not-exist")).toBeNull();
-  });
-});
-
-describe("getSupportedInputMediaTypes", () => {
-  it("includes pdf when model supports_pdf_input is true", () => {
-    const supported = getSupportedInputMediaTypes("anthropic:claude-sonnet-4-5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
-  });
-
-  it("includes pdf for OpenAI vision models that rely on the fallback", () => {
-    const supported = getSupportedInputMediaTypes("openai:gpt-5.5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
   });
 });

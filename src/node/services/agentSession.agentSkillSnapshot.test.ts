@@ -1,11 +1,17 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import type { AIService } from "@/node/services/aiService";
+
+import { RuntimeError } from "@/node/runtime/Runtime";
+import * as agentSkillsService from "@/node/services/agentSkills/agentSkillsService";
 
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
@@ -47,6 +53,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     workspacePath: string;
     workspaceId?: string;
     runtimeConfig?: FrontendWorkspaceMetadata["runtimeConfig"];
+    aiServiceOverrides?: Partial<AIService>;
   }) {
     const workspaceId = args.workspaceId ?? "ws-test";
     const workspaceMeta: FrontendWorkspaceMetadata = {
@@ -61,20 +68,22 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       workspaceId,
       aiServiceOverrides: {
         getWorkspaceMetadata: mock((_workspaceId: string) => Promise.resolve(Ok(workspaceMeta))),
+        ...args.aiServiceOverrides,
       },
     });
     historyCleanup = cleanup;
 
     const messages: MuxMessage[] = [];
-    const realAppend = historyService.appendToHistory.bind(historyService);
-    const appendToHistory = spyOn(historyService, "appendToHistory").mockImplementation(
-      async (wId: string, message: MuxMessage) => {
-        messages.push(message);
-        return realAppend(wId, message);
-      }
-    );
+    const send = session.sendMessage.bind(session);
+    spyOn(session, "sendMessage").mockImplementation(async (...args) => {
+      const result = await send(...args);
+      const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!persisted.success) throw new Error(persisted.error);
+      messages.splice(0, messages.length, ...persisted.data);
+      return result;
+    });
 
-    return { session, appendToHistory, messages, historyService };
+    return { session, messages, historyService };
   }
 
   it("persists a synthetic agent skill snapshot before the user message", async () => {
@@ -85,7 +94,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody: "Follow this skill.",
     });
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -103,7 +112,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(result.success).toBe(true);
 
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     const [snapshotMessage, userMessage] = messages;
 
     expect(snapshotMessage.role).toBe("user");
@@ -125,25 +134,6 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(userText).toBe("do X");
   });
 
-  it("skips built-in imagegen snapshots when image generation is disabled", async () => {
-    const { workspacePath } = await createTestWorkspaceWithSkills({ skills: [] });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
-
-    const result = await session.sendMessage("retry image generation", {
-      model: "anthropic:claude-3-5-sonnet-latest",
-      agentId: "exec",
-      experiments: { imageGenerationTool: false },
-      muxMetadata: {
-        agentSkillRefs: [{ skillName: "imagegen", scope: "built-in", source: "inline" }],
-      },
-    });
-
-    expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(1);
-    expect(messages[0]?.metadata?.agentSkillSnapshot).toBeUndefined();
-    expect(getMessageText(messages[0])).toBe("retry image generation");
-  });
-
   it("honors disableWorkspaceAgents when resolving skill snapshots", async () => {
     const workspaceId = "ws-test";
 
@@ -155,7 +145,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath: projectPath,
       runtimeConfig: { type: "worktree", srcBaseDir },
@@ -175,11 +165,78 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(result.success).toBe(true);
 
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     const [snapshotMessage] = messages;
 
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
     expect(snapshotText).toContain("Project override for init skill.");
+  });
+
+  it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
+    const workspaceId = "ws-test";
+
+    // agent-plugins experiment: the workspace executes in a subdirectory of the
+    // checkout, while the plugin container lives at the checkout level.
+    const checkout = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-checkout-"));
+    const subprojectPath = path.join(checkout, "packages", "app");
+    await fs.mkdir(subprojectPath, { recursive: true });
+    const xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-muxhome-"));
+
+    const pluginDir = path.join(checkout, ".mux", "plugins", "demo-plugin");
+    const skillDir = path.join(pluginDir, "skills", "plugin-skill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "demo-plugin",
+        version: "1.0.0",
+        description: "demo",
+      }),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: plugin-skill\ndescription: Plugin skill\n---\n\nFollow the plugin skill.\n",
+      "utf-8"
+    );
+
+    const { session, messages } = await createSessionHarness({
+      workspaceId,
+      workspacePath: subprojectPath,
+      aiServiceOverrides: {
+        isAgentPluginsEnabled: () => true,
+        // Mirrors AIService: checkout root anchors plugin containers even though
+        // the execution path is the subproject directory.
+        resolveXumToolScopeForWorkspace: () => ({
+          type: "project",
+          xumHome,
+          projectRoot: subprojectPath,
+          projectStorageAuthority: "host-local",
+          checkoutRoot: checkout,
+        }),
+      },
+    });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/plugin-skill do X",
+        skillName: "plugin-skill",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+
+    expect(messages).toHaveLength(2);
+    const [snapshotMessage] = messages;
+
+    expect(snapshotMessage.metadata?.agentSkillSnapshot?.skillName).toBe("plugin-skill");
+    const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
+    expect(snapshotText).toContain("Follow the plugin skill.");
   });
 
   it("dedupes identical skill snapshots when recently inserted", async () => {
@@ -190,7 +247,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody: "Follow this skill.",
     });
 
-    const { session, appendToHistory } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -208,7 +265,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const first = await session.sendMessage("do X", baseOptions);
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("do Y", {
       ...baseOptions,
@@ -220,9 +277,9 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(second.success).toBe(true);
     // First send: snapshot + user. Second send: user only.
-    expect(appendToHistory.mock.calls).toHaveLength(3);
+    expect(messages).toHaveLength(3);
 
-    const appendedIds = appendToHistory.mock.calls.map((call) => call[1].id);
+    const appendedIds = messages.map((message) => message.id);
     const secondSendAppendedIds = appendedIds.slice(2);
     expect(secondSendAppendedIds).toHaveLength(1);
     expect(secondSendAppendedIds[0]).toStartWith("user-");
@@ -239,7 +296,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody,
     });
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -257,7 +314,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const first = await session.sendMessage("do X", baseOptions);
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const firstSnapshot = messages[0];
     expect(firstSnapshot.id).toStartWith("agent-skill-snapshot-");
@@ -284,7 +341,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(second.success).toBe(true);
 
     // Second send should persist a new snapshot (frontmatter differs) + user message.
-    expect(appendToHistory.mock.calls).toHaveLength(4);
+    expect(messages).toHaveLength(4);
 
     const secondSnapshot = messages[2];
     expect(secondSnapshot.id).toStartWith("agent-skill-snapshot-");
@@ -307,7 +364,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         { skillName: "beta-skill", skillBody: "Follow beta." },
       ],
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -322,7 +379,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(3);
+    expect(messages).toHaveLength(3);
 
     const [alphaSnapshot, betaSnapshot, userMessage] = messages;
     expect(alphaSnapshot.metadata?.synthetic).toBe(true);
@@ -342,7 +399,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "test-skill",
       skillBody: "Follow slash skill.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -357,7 +414,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const [snapshotMessage, userMessage] = messages;
     expect(snapshotMessage.metadata?.synthetic).toBe(true);
@@ -372,7 +429,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "valid-skill",
       skillBody: "Follow valid skill.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -387,7 +444,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     expect(messages[0].metadata?.agentSkillSnapshot?.skillName).toBe("valid-skill");
     expect(getMessageText(messages[0])).toContain("Follow valid skill.");
     expect(getMessageText(messages[1])).toBe("do X");
@@ -398,7 +455,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "alpha-skill",
       skillBody: "Follow alpha.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -413,15 +470,41 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     expect(messages[0].metadata?.agentSkillSnapshot?.skillName).toBe("alpha-skill");
     expect(getMessageText(messages[0])).toContain("Follow alpha.");
     expect(getMessageText(messages[1])).toBe("do X");
   });
 
+  it("refuses the send when an inline skill fails in transport", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "alpha-skill",
+      skillBody: "Follow alpha.",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+    // #4438: an unreachable host is not an unknown skill, so it must not be skipped.
+    const read = spyOn(agentSkillsService, "readAgentSkill").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+
+    const result = await session
+      .sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "normal",
+          agentSkillRefs: [{ skillName: "alpha-skill", scope: "project", source: "inline" }],
+        },
+      })
+      .finally(() => read.mockRestore());
+
+    expect(result.success).toBe(false);
+    expect(messages).toHaveLength(0);
+  });
+
   it("still throws when a slash skill name is invalid", async () => {
     const { workspacePath } = await createTestWorkspaceWithSkills({ skills: [] });
-    const { session, appendToHistory } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -443,12 +526,12 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       throw new Error("Expected invalid slash skill failure to use unknown error shape");
     }
     expect(result.error.raw).toContain("Invalid agent skill name");
-    expect(appendToHistory.mock.calls).toHaveLength(0);
+    expect(messages).toHaveLength(0);
   });
 
   it("still throws when a slash skill is missing", async () => {
     const { workspacePath } = await createTestWorkspaceWithSkills({ skills: [] });
-    const { session, appendToHistory } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -462,7 +545,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(appendToHistory.mock.calls).toHaveLength(0);
+    expect(messages).toHaveLength(0);
   });
 
   it("dedupes against recent history per-skill", async () => {
@@ -472,7 +555,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         { skillName: "beta-skill", skillBody: "Follow beta." },
       ],
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const first = await session.sendMessage("first", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -483,7 +566,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("second", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -498,10 +581,345 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(second.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(4);
+    expect(messages).toHaveLength(4);
     expect(messages[2].metadata?.agentSkillSnapshot?.skillName).toBe("beta-skill");
     expect(getMessageText(messages[2])).toContain("Follow beta.");
     expect(getMessageText(messages[3])).toBe("second");
+  });
+
+  it("substitutes $ARGUMENTS/$N placeholders in slash-invoked snapshot bodies", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "fix-issue",
+      skillBody: "Fix issue $1 with priority $2.\nSummary: $ARGUMENTS",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("Using skill fix-issue: 123 high", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/fix-issue 123 high",
+        skillName: "fix-issue",
+        scope: "project",
+        arguments: "123 high",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(2);
+
+    const [snapshotMessage, userMessage] = messages;
+    expect(getMessageText(snapshotMessage)).toContain(
+      "Fix issue 123 with priority high.\nSummary: 123 high"
+    );
+    // The user message still shows what the user typed; only the snapshot body changes.
+    expect(getMessageText(userMessage)).toBe("Using skill fix-issue: 123 high");
+  });
+
+  it("materializes distinct snapshots for the same skill with different arguments", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "fix-issue",
+      skillBody: "Fix issue $ARGUMENTS.",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const baseOptions = {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+    };
+
+    const first = await session.sendMessage("Using skill fix-issue: 123", {
+      ...baseOptions,
+      muxMetadata: {
+        type: "agent-skill" as const,
+        rawCommand: "/fix-issue 123",
+        skillName: "fix-issue",
+        scope: "project" as const,
+        arguments: "123",
+      },
+    });
+    expect(first.success).toBe(true);
+    expect(messages).toHaveLength(2);
+
+    const second = await session.sendMessage("Using skill fix-issue: 456", {
+      ...baseOptions,
+      muxMetadata: {
+        type: "agent-skill" as const,
+        rawCommand: "/fix-issue 456",
+        skillName: "fix-issue",
+        scope: "project" as const,
+        arguments: "456",
+      },
+    });
+    expect(second.success).toBe(true);
+
+    // Different arguments produce different substituted bodies, so the sha256 dedupe
+    // must NOT collapse the second snapshot: snapshot + user, snapshot + user.
+    expect(messages).toHaveLength(4);
+
+    const firstSnapshot = messages[0];
+    const secondSnapshot = messages[2];
+    expect(getMessageText(firstSnapshot)).toContain("Fix issue 123.");
+    expect(getMessageText(secondSnapshot)).toContain("Fix issue 456.");
+    expect(firstSnapshot.metadata?.agentSkillSnapshot?.sha256).not.toBe(
+      secondSnapshot.metadata?.agentSkillSnapshot?.sha256
+    );
+  });
+
+  it("still dedupes repeated invocations with identical arguments", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "fix-issue",
+      skillBody: "Fix issue $ARGUMENTS.",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const options = {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill" as const,
+        rawCommand: "/fix-issue 123",
+        skillName: "fix-issue",
+        scope: "project" as const,
+        arguments: "123",
+      },
+    };
+
+    const first = await session.sendMessage("Using skill fix-issue: 123", options);
+    expect(first.success).toBe(true);
+    expect(messages).toHaveLength(2);
+
+    const second = await session.sendMessage("Using skill fix-issue: 123", options);
+    expect(second.success).toBe(true);
+    // Identical substituted body → snapshot deduped; only the user message is appended.
+    expect(messages).toHaveLength(3);
+  });
+
+  it("leaves placeholders in inline-referenced skill bodies untouched", async () => {
+    const skillBody = "Fix issue $1 with $ARGUMENTS.";
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "fix-issue",
+      skillBody,
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("Please follow $fix-issue for 123", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [{ skillName: "fix-issue", scope: "project", source: "inline" }],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(2);
+    // Inline refs carry no argument concept: the body must stay byte-identical.
+    expect(getMessageText(messages[0])).toContain(skillBody);
+  });
+
+  it("keeps bodies without placeholders byte-identical when arguments are provided", async () => {
+    // Note: $0 and $ARG are not placeholders; $100 would be ($1 + literal "00").
+    const skillBody = "Follow this skill. Cost is $0 and $ARG stays.";
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "no-placeholders",
+      skillBody,
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("Using skill no-placeholders: 123 high", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/no-placeholders 123 high",
+        skillName: "no-placeholders",
+        scope: "project",
+        arguments: "123 high",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(2);
+    // Fallback: no placeholders → body untouched; the arguments stay visible in the
+    // user message only.
+    expect(getMessageText(messages[0])).toContain(skillBody);
+  });
+
+  it("substitutes placeholders with empty strings when a slash invocation has no arguments", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "fix-issue",
+      skillBody: "Fix issue [$1] with [$ARGUMENTS].",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("Use skill fix-issue", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/fix-issue",
+        skillName: "fix-issue",
+        scope: "project",
+        arguments: "",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(2);
+    expect(getMessageText(messages[0])).toContain("Fix issue [] with [].");
+  });
+
+  it("leaves dynamic context directives literal and executes nothing when the experiment is off", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      // The directive has an observable side effect so we can prove it never ran.
+      skillBody: "Context:\n!`touch dynamic-context-ran.marker`\nDone.",
+    });
+    const isExperimentEnabled = mock(() => false);
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: { isExperimentEnabled },
+    });
+
+    const result = await session.sendMessage("use dyn", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/dyn",
+        skillName: "dyn",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(isExperimentEnabled).toHaveBeenCalledWith(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT);
+    // Body unchanged: the directive stays literal text...
+    expect(getMessageText(messages[0])).toContain("!`touch dynamic-context-ran.marker`");
+    // ...and no command executed (the side-effect marker must not exist).
+    expect(existsSync(path.join(workspacePath, "dynamic-context-ran.marker"))).toBe(false);
+  });
+
+  it("replaces whole-line directives with command output when the experiment is on", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      skillBody: "Context:\n!`echo dynamic-ok`\n!`exit 7`\nDone.",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use dyn", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/dyn",
+        skillName: "dyn",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const text = getMessageText(messages[0]);
+    expect(text).toContain("```text (output of: echo dynamic-ok)\ndynamic-ok\n```");
+    expect(text).not.toContain("!`echo dynamic-ok`");
+    // Real runtime exit-code plumbing: non-zero exit still injects, annotated.
+    expect(text).toContain("[exit code 7]");
+  });
+
+  it("bounds directive output while reading and still appends the truncation marker", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      // ~64KB of output, well over the 16KB cap. The capped reader must bound
+      // accumulation during the read (not just post-hoc) and hand the module an
+      // over-cap payload so its truncation marker still fires.
+      skillBody: "!`head -c 65536 /dev/zero | tr '\\\\0' x`",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use dyn", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/dyn",
+        skillName: "dyn",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const text = getMessageText(messages[0]);
+    expect(text).toContain("[output truncated at 16KB]");
+    // The materialized snapshot must carry at most the cap (+ formatting), not 64KB.
+    expect(text.length).toBeLessThan(32 * 1024);
+  });
+
+  it("composes dynamic context with $ARGUMENTS substitution (arguments first)", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      skillBody: "!`echo $1`",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use dyn hi", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/dyn hi",
+        skillName: "dyn",
+        scope: "project",
+        arguments: "hi",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    // $1 → "hi" happens before execution, so the command itself sees the argument.
+    expect(getMessageText(messages[0])).toContain("```text (output of: echo hi)\nhi\n```");
+  });
+
+  it("injects dynamic context for inline skill refs (also user-initiated)", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      skillBody: "!`echo inline-ok`",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("Please follow $dyn", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [{ skillName: "dyn", scope: "project", source: "inline" }],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(getMessageText(messages[0])).toContain(
+      "```text (output of: echo inline-ok)\ninline-ok\n```"
+    );
   });
 
   it("truncates edits starting from preceding skill/file snapshots", async () => {

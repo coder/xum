@@ -4,13 +4,15 @@ import { TokenMeter } from "@/browser/features/RightSidebar/TokenMeter";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "../Dialog/Dialog";
 import {
   HorizontalThresholdSlider,
+  getAutoCompactionLabel,
+  getEffectiveThreshold,
   type AutoCompactionConfig,
 } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { Switch } from "../Switch/Switch";
 import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { cn } from "@/common/lib/utils";
 import { Toggle1MContext } from "../Toggle1MContext/Toggle1MContext";
-import { Tooltip, TooltipContent, TooltipTrigger } from "../Tooltip/Tooltip";
+import { COMPOSER_COMPACT_HIDE_CLASS, COMPOSER_CONTROL_HEIGHT_CLASS } from "@/constants/layout";
 
 /** Compact threshold tick mark for the button view */
 const CompactThresholdIndicator: React.FC<{ threshold: number }> = ({ threshold }) => {
@@ -112,8 +114,10 @@ const AutoCompactSettings: React.FC<{
           </span>
         </div>
         {showUsageSlider && (
-          <div className="text-muted mt-1 text-[10px]">
-            Drag blue slider to adjust usage-based auto-compaction
+          <div className="text-muted counter-nums mt-1 text-[10px]">
+            {usageConfig?.rolloverEnabled
+              ? `${getAutoCompactionLabel(usageConfig)} · Drag blue slider to adjust`
+              : "Drag blue slider to adjust usage-based auto-compaction"}
           </div>
         )}
       </div>
@@ -206,85 +210,62 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
     ? `${Math.round(data.totalPercentage)}%`
     : formatTokens(data.totalTokens);
 
-  const hoverUsageSummary = data.maxTokens
-    ? `Context ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`
-    : `Context ${formatTokens(data.totalTokens)} (unknown limit)`;
-  const hoverAutoSummary = autoCompaction
-    ? autoCompaction.threshold < 100
-      ? `Auto ${autoCompaction.threshold}%`
-      : "Auto off"
-    : null;
-  const hoverIdleSummary = idleCompaction
-    ? isIdleCompactionEnabled
-      ? `Idle ${idleHours}h`
-      : "Idle off"
-    : null;
-  const hoverSummary = [hoverUsageSummary, hoverAutoSummary, hoverIdleSummary]
-    .filter((part): part is string => part !== null)
-    .join(" · ");
-
   return (
     <Dialog>
-      {/*
-        Keep a hover-only one-line summary so users can quickly see compaction stats
-        without reopening the full click-based settings dialog.
-      */}
-      <Tooltip delayDuration={200} disableHoverableContent>
-        <TooltipTrigger asChild>
-          <DialogTrigger asChild>
-            <button
-              aria-label={ariaLabel}
-              aria-haspopup="dialog"
-              className="hover:bg-sidebar-hover flex cursor-pointer items-center rounded py-0.5"
-              type="button"
+      <DialogTrigger asChild>
+        <button
+          aria-label={ariaLabel}
+          aria-haspopup="dialog"
+          className={cn(
+            "border-border-light hover:bg-hover focus-visible:ring-accent flex cursor-pointer items-center gap-1.5 rounded-md border px-1.5 focus-visible:ring-1",
+            COMPOSER_CONTROL_HEIGHT_CLASS
+          )}
+          type="button"
+        >
+          {/* Keep this control scannable: usage is already conveyed by the meter + percentage, and
+            click opens the detailed compaction settings without a competing hover interaction. */}
+          {isIdleCompactionEnabled && (
+            <span className={COMPOSER_COMPACT_HIDE_CLASS}>
+              <Hourglass className="text-muted h-3 w-3" />
+            </span>
+          )}
+
+          {/* Narrow composers keep the percentage only: a 56px meter reads as an empty bar at
+            low usage while starving the model and agent labels next to it. */}
+          {data.totalTokens > 0 ? (
+            <div
+              data-context-usage-meter
+              className={cn("relative h-3 w-14", COMPOSER_COMPACT_HIDE_CLASS)}
             >
-              {/* Idle compaction indicator */}
-              {isIdleCompactionEnabled && (
-                <span
-                  title={`Auto-compact after ${idleHours}h idle`}
-                  className="mr-1.5 [@container(max-width:420px)]:hidden"
-                >
-                  <Hourglass className="text-muted h-3 w-3" />
-                </span>
+              <TokenMeter
+                segments={data.segments}
+                orientation="horizontal"
+                className="h-3"
+                trackClassName="bg-surface-quaternary"
+              />
+              {isAutoCompactionEnabled && (
+                <CompactThresholdIndicator threshold={getEffectiveThreshold(autoCompaction)} />
               )}
-
-              {/* Full meter when there's room; fall back to a compact percentage label on narrow layouts. */}
-              {data.totalTokens > 0 ? (
-                <div
-                  data-context-usage-meter
-                  className="relative h-3 w-14 [@container(max-width:420px)]:hidden"
-                >
-                  <TokenMeter
-                    segments={data.segments}
-                    orientation="horizontal"
-                    className="h-3"
-                    trackClassName="bg-dark"
-                  />
-                  {isAutoCompactionEnabled && (
-                    <CompactThresholdIndicator threshold={autoCompaction.threshold} />
-                  )}
-                </div>
-              ) : (
-                /* Empty meter placeholder - allows access to settings with no usage */
-                <div
-                  data-context-usage-meter
-                  className="bg-dark relative h-3 w-14 rounded-full [@container(max-width:420px)]:hidden"
-                />
+            </div>
+          ) : (
+            /* Empty meter placeholder - allows access to settings with no usage */
+            <div
+              data-context-usage-meter
+              className={cn(
+                "bg-surface-quaternary relative h-3 w-14 rounded-full",
+                COMPOSER_COMPACT_HIDE_CLASS
               )}
+            />
+          )}
 
-              <span
-                data-context-usage-percent
-                className="text-muted hidden text-[10px] font-medium tabular-nums [@container(max-width:420px)]:block"
-              >
-                {compactLabel}
-              </span>
-            </button>
-          </DialogTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="top" showArrow={false} className="whitespace-nowrap">
-          {hoverSummary}
-        </TooltipContent>
-      </Tooltip>
+          <span
+            data-context-usage-percent
+            className="text-muted counter-nums text-[10px] font-medium"
+          >
+            {compactLabel}
+          </span>
+        </button>
+      </DialogTrigger>
 
       {/*
         Keep compaction controls in a dialog so auto + idle settings stay open

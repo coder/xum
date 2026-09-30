@@ -12,13 +12,13 @@ Systematically explore a web application, find issues, and produce a report with
 
 Only the **Target URL** is required. Everything else has sensible defaults -- use them unless the user explicitly provides an override.
 
-| Parameter | Default | Example override |
-|-----------|---------|-----------------|
-| **Target URL** | _(required)_ | `vercel.com`, `http://localhost:3000` |
-| **Session name** | Slugified domain (e.g., `vercel.com` -> `vercel-com`) | `--session my-session` |
-| **Output directory** | `./dogfood-output/` | `Output directory: /tmp/qa` |
-| **Scope** | Full app | `Focus on the billing page` |
-| **Authentication** | None | `Sign in to user@example.com` |
+| Parameter            | Default                                               | Example override                      |
+| -------------------- | ----------------------------------------------------- | ------------------------------------- |
+| **Target URL**       | _(required)_                                          | `vercel.com`, `http://localhost:3000` |
+| **Session name**     | Slugified domain (e.g., `vercel.com` -> `vercel-com`) | `--session my-session`                |
+| **Output directory** | `./dogfood-output/`                                   | `Output directory: /tmp/qa`           |
+| **Scope**            | Full app                                              | `Focus on the billing page`           |
+| **Authentication**   | None                                                  | `Sign in to user@example.com`         |
 
 If the user says something like "dogfood vercel.com", start immediately with defaults. Do not ask clarifying questions unless authentication is mentioned but credentials are missing.
 
@@ -34,6 +34,10 @@ Always use `agent-browser` directly -- never `npx agent-browser`. The direct bin
 5. Document      Screenshot + record each issue as found
 6. Wrap up       Update summary counts, close session
 ```
+
+### Local target startup
+
+If the target is a local app that is not already running, start it before the browser loop using the repo's dev-server skill. For one long-running server command, prefer `bash({ run_in_background: true, monitor: ... })` with a readiness/error regex (for example `ready|localhost|ERROR|EADDRINUSE|failed`) so Xum wakes the workspace when the app is ready or broken. Do not repeatedly poll server logs from the parent; use `task_await` once only if the wake line lacks enough context.
 
 ### 1. Initialize
 
@@ -209,12 +213,12 @@ agent-browser --session {SESSION} close
 
 ## References
 
-| Reference | When to Read |
-|-----------|--------------|
+| Reference                                                    | When to Read                                                                           |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
 | [references/issue-taxonomy.md](references/issue-taxonomy.md) | Start of session -- calibrate what to look for, severity levels, exploration checklist |
 
 ## Templates
 
-| Template | Purpose |
-|----------|---------|
+| Template                                                                     | Purpose                                       |
+| ---------------------------------------------------------------------------- | --------------------------------------------- |
 | [templates/dogfood-report-template.md](templates/dogfood-report-template.md) | Copy into output directory as the report file |

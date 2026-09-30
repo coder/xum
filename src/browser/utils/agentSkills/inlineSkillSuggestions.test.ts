@@ -3,7 +3,6 @@ import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import {
   getInlineSkillInsertionTrailingText,
   getInlineSkillSuggestions,
-  shouldRefreshInlineSkillSuggestions,
 } from "./inlineSkillSuggestions";
 
 function descriptor(name: string, description = `${name} description`): AgentSkillDescriptor {
@@ -35,6 +34,40 @@ describe("getInlineSkillSuggestions", () => {
         replacement: "$deep-review",
       },
     ]);
+  });
+
+  test("suggests only MCP prompts without required arguments", () => {
+    expect(
+      getInlineSkillSuggestions({
+        partial: "mcp__coder",
+        descriptors: [],
+        mcpPrompts: [
+          {
+            commandKey: "mcp__coder__review",
+            stableKey: "mcp__coder__review_11111111",
+            serverName: "coder",
+            promptName: "review",
+            arguments: [],
+          },
+          {
+            commandKey: "mcp__coder__required",
+            stableKey: "mcp__coder__required_22222222",
+            serverName: "coder",
+            promptName: "required",
+            arguments: [{ name: "path", required: true }],
+          },
+        ],
+      }).map((suggestion) => suggestion.display)
+    ).toEqual(["$mcp__coder__review"]);
+  });
+
+  test("hides user-invocable: false skills from suggestions", () => {
+    expect(
+      getInlineSkillSuggestions({
+        partial: "",
+        descriptors: [descriptor("tdd"), { ...descriptor("model-only"), userInvocable: false }],
+      }).map((suggestion) => suggestion.display)
+    ).toEqual(["$tdd"]);
   });
 
   test("returns only descriptors whose names start with the partial", () => {
@@ -114,37 +147,6 @@ describe("getInlineSkillSuggestions", () => {
         descriptors: [descriptor("deep-review"), descriptor("tdd"), descriptor("clear")],
       }).map((suggestion) => suggestion.display)
     ).toEqual(["$deep-review", "$tdd", "$clear"]);
-  });
-});
-
-describe("shouldRefreshInlineSkillSuggestions", () => {
-  test("refreshes when descriptor discovery updates an unchanged partial", () => {
-    const previousDescriptors: AgentSkillDescriptor[] = [];
-    const descriptors = [descriptor("deep-review")];
-
-    expect(
-      shouldRefreshInlineSkillSuggestions({
-        inputChanged: false,
-        previousPartial: "dee",
-        partial: "dee",
-        previousDescriptors,
-        descriptors,
-      })
-    ).toBe(true);
-  });
-
-  test("skips only when input, partial, and descriptor list identity are unchanged", () => {
-    const descriptors = [descriptor("deep-review")];
-
-    expect(
-      shouldRefreshInlineSkillSuggestions({
-        inputChanged: false,
-        previousPartial: "dee",
-        partial: "dee",
-        previousDescriptors: descriptors,
-        descriptors,
-      })
-    ).toBe(false);
   });
 });
 

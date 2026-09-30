@@ -1,9 +1,20 @@
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
+import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 
 // Test helper: create aggregator with default createdAt for tests
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -135,8 +146,10 @@ function endToolCall(
     toolCallId: string;
     toolName: string;
     result: unknown;
+    mcpServer?: MCPToolCallDisplay;
     timestamp?: number;
     parentToolCallId?: string;
+    replay?: boolean;
   }
 ): void {
   aggregator.handleToolCallEnd({
@@ -146,8 +159,10 @@ function endToolCall(
     toolCallId: options.toolCallId,
     toolName: options.toolName,
     result: options.result,
+    mcpServer: options.mcpServer,
     timestamp: options.timestamp ?? Date.now(),
     parentToolCallId: options.parentToolCallId,
+    replay: options.replay,
   });
 }
 
@@ -226,6 +241,7 @@ function historicalToolMessage(
     output?: unknown;
     historySequence?: number;
     partial?: boolean;
+    workflowRun?: { runId: string; timestamp: number };
   } = {}
 ) {
   const message = createMuxMessage(id, "assistant", "", {
@@ -240,6 +256,7 @@ function historicalToolMessage(
     toolName,
     state: "output-available",
     input,
+    ...(options.workflowRun != null ? { workflowRun: options.workflowRun } : {}),
     output: options.output ?? { success: true },
   });
   return message;
@@ -253,286 +270,89 @@ function historicalTodoMessage(
   return historicalToolMessage(id, "todo_write", { todos }, options);
 }
 
-function imageGenerateOutput(prompt: string, path: string, extra: Record<string, unknown> = {}) {
-  return {
-    success: true,
-    model: "openai:gpt-image-1.5",
-    prompt,
-    requestedCount: 1,
-    images: [{ path, filename: "image-1.png", mediaType: "image/png" }],
-    ...extra,
-  };
-}
-
-function imageEditOutput(prompt: string, path: string, extra: Record<string, unknown> = {}) {
-  return {
-    ...imageGenerateOutput(prompt, path),
-    source: {
-      path: "/tmp/source.png",
-      resolvedPath: "/tmp/source.png",
-      sizeBytes: 100,
-      dimensions: { width: 16, height: 16 },
-    },
-    images: [
-      {
-        path,
-        filename: "image-1.png",
-        mediaType: "image/png",
-        outputDimensions: { width: 16, height: 16 },
-      },
-    ],
-    ...extra,
-  };
-}
-
-function displayedFromTool(
-  toolName: string,
-  input: Record<string, unknown>,
-  output: unknown,
-  options: { id?: string; toolCallId?: string; partial?: boolean } = {}
-): DisplayedMessage[] {
-  const aggregator = createTestAggregator();
-  aggregator.loadHistoricalMessages([
-    historicalToolMessage(options.id ?? "assistant-tool", toolName, input, {
-      toolCallId: options.toolCallId,
-      output,
-      partial: options.partial,
-    }),
-  ]);
-  return aggregator.getDisplayedMessages();
-}
-
 describe("StreamingMessageAggregator", () => {
-  describe("image generation display messages", () => {
-    test("renders successful image_generate tool output as a generated-image row", () => {
-      const displayed = displayedFromTool(
-        "image_generate",
-        { prompt: "A small blue square" },
-        imageGenerateOutput("A small blue square", "/tmp/mux/imagegen/image-tool-1/image-1.png"),
-        { id: "assistant-image", toolCallId: "image-tool-1" }
-      );
-
-      expect(displayed).toHaveLength(1);
-      expect(displayed[0]?.type).toBe("generated-image");
-      if (displayed[0]?.type !== "generated-image") {
-        throw new Error("Expected generated-image display row");
-      }
-      expect(displayed[0].toolCallId).toBe("image-tool-1");
-      expect(displayed[0].model).toBe("openai:gpt-image-1.5");
-      expect(displayed[0].images[0]?.path).toBe("/tmp/mux/imagegen/image-tool-1/image-1.png");
-    });
-
-    test("keeps image_generate output with hook output as a normal tool row", () => {
-      const displayed = displayedFromTool(
-        "image_generate",
-        { prompt: "A small blue square" },
-        imageGenerateOutput("A small blue square", "/tmp/mux/imagegen/image-tool-1/image-1.png", {
-          hook_output: "post-processing hook ran",
-        }),
-        { id: "assistant-image-hook", toolCallId: "image-tool-hook" }
-      );
-
-      expect(displayed).toHaveLength(1);
-      expect(displayed[0]?.type).toBe("tool");
-      if (displayed[0]?.type !== "tool") {
-        throw new Error("Expected hooked image generation to remain a tool row");
-      }
-      expect(displayed[0].toolName).toBe("image_generate");
-      expect(displayed[0].result).toMatchObject({ hook_output: "post-processing hook ran" });
-    });
-
-    test("renders nested PTC image_generate output as a generated-image row", () => {
-      const imageOutput = imageGenerateOutput(
-        "A nested blue square",
-        "/tmp/mux/generated_images/ptc-image/image-1.png"
-      );
-      const displayed = displayedFromTool(
-        "code_execution",
-        { code: "await mux.image_generate(...)" },
-        {
-          success: true,
-          result: "done",
-          toolCalls: [
-            {
-              toolName: "image_generate",
-              args: { prompt: "A nested blue square" },
-              result: imageOutput,
-              duration_ms: 12,
-            },
-          ],
-        },
-        { id: "assistant-ptc-image", toolCallId: "code-tool-1" }
-      );
-
-      expect(displayed).toHaveLength(2);
-      expect(displayed[0]?.type).toBe("tool");
-      expect(displayed[1]?.type).toBe("generated-image");
-      if (displayed[0]?.type !== "tool" || displayed[1]?.type !== "generated-image") {
-        throw new Error("Expected code_execution tool row followed by generated image row");
-      }
-      expect(displayed[0].toolName).toBe("code_execution");
-      expect(displayed[0].nestedCalls).toEqual([]);
-      expect(displayed[0].isLastPartOfMessage).toBe(false);
-      expect(displayed[1].toolCallId).toBe("code-tool-1-nested-0");
-      expect(displayed[1].prompt).toBe("A nested blue square");
-      expect(displayed[1].images[0]?.path).toBe("/tmp/mux/generated_images/ptc-image/image-1.png");
-      expect(displayed[1].isLastPartOfMessage).toBe(true);
-    });
-
-    test("renders successful image_edit tool output as an edited-image row", () => {
-      const displayed = displayedFromTool(
-        "image_edit",
-        { sourcePath: "/tmp/source.png", prompt: "Make the square blue" },
-        imageEditOutput(
-          "Make the square blue",
-          "/tmp/mux/edited_images/image-edit-tool-1/image-1.png"
-        ),
-        { id: "assistant-edit-image", toolCallId: "image-edit-tool-1" }
-      );
-
-      expect(displayed).toHaveLength(1);
-      expect(displayed[0]?.type).toBe("edited-image");
-      if (displayed[0]?.type !== "edited-image") {
-        throw new Error("Expected edited-image display row");
-      }
-      expect(displayed[0].toolCallId).toBe("image-edit-tool-1");
-      expect(displayed[0].source.path).toBe("/tmp/source.png");
-      expect(displayed[0].images[0]?.outputDimensions).toEqual({ width: 16, height: 16 });
-    });
-
-    test("renders nested PTC image_edit output as an edited-image row", () => {
-      const imageOutput = imageEditOutput(
-        "Make a nested square blue",
-        "/tmp/mux/edited_images/ptc-edit/image-1.png"
-      );
-      const displayed = displayedFromTool(
-        "code_execution",
-        { code: "await mux.image_edit(...)" },
-        {
-          success: true,
-          result: "done",
-          toolCalls: [
-            {
-              toolName: "image_edit",
-              args: { sourcePath: "/tmp/source.png", prompt: "Make a nested square blue" },
-              result: imageOutput,
-              duration_ms: 12,
-            },
-          ],
-        },
-        { id: "assistant-ptc-edit-image", toolCallId: "code-tool-edit-1" }
-      );
-
-      expect(displayed).toHaveLength(2);
-      expect(displayed[0]?.type).toBe("tool");
-      expect(displayed[1]?.type).toBe("edited-image");
-      if (displayed[0]?.type !== "tool" || displayed[1]?.type !== "edited-image") {
-        throw new Error("Expected code_execution tool row followed by edited image row");
-      }
-      expect(displayed[0].toolName).toBe("code_execution");
-      expect(displayed[0].nestedCalls).toEqual([]);
-      expect(displayed[0].isLastPartOfMessage).toBe(false);
-      expect(displayed[1].toolCallId).toBe("code-tool-edit-1-nested-0");
-      expect(displayed[1].prompt).toBe("Make a nested square blue");
-      expect(displayed[1].images[0]?.path).toBe("/tmp/mux/edited_images/ptc-edit/image-1.png");
-      expect(displayed[1].isLastPartOfMessage).toBe(true);
-    });
-
-    const toolRowScenarios = [
-      {
-        name: "keeps malformed successful image_edit output as a normal tool row",
-        toolName: "image_edit",
-        toolCallId: "image-edit-tool-malformed",
-        input: { sourcePath: "/tmp/source.png", prompt: "Make the square blue" },
-        output: imageEditOutput(
-          "Make the square blue",
-          "/tmp/mux/edited_images/image-edit-tool-1/image-1.png",
-          {
-            images: [
-              {
-                path: "/tmp/mux/edited_images/image-edit-tool-1/image-1.png",
-                filename: "image-1.png",
-                mediaType: "image/png",
-              },
-            ],
-          }
-        ),
-        error: "Expected malformed image edit to remain a tool row",
-      },
-      {
-        name: "keeps malformed successful image_generate output as a normal tool row",
-        toolName: "image_generate",
-        toolCallId: "image-tool-malformed",
-        input: { prompt: "A small blue square" },
-        output: imageGenerateOutput("A small blue square", "", { images: [null] }),
-        expectedStatus: "completed",
-        error: "Expected malformed image generation to remain a tool row",
-      },
-      {
-        name: "keeps non-string image_generate warnings as a normal tool row",
-        toolName: "image_generate",
-        toolCallId: "image-tool-bad-warnings",
-        input: { prompt: "A small blue square" },
-        output: imageGenerateOutput(
-          "A small blue square",
-          "/tmp/mux/generated_images/image-tool-1/image-1.png",
-          {
-            warnings: "thumbnail warning",
-          }
-        ),
-        error: "Expected bad image warnings to remain a tool row",
-      },
-      {
-        name: "keeps successful image_generate output as a normal tool row when the message is partial",
-        toolName: "image_generate",
-        toolCallId: "image-tool-partial",
-        input: { prompt: "A small blue square" },
-        output: imageGenerateOutput(
-          "A small blue square",
-          "/tmp/mux/generated_images/image-tool-1/image-1.png"
-        ),
-        partial: true,
-        expectedStatus: "completed",
-        error: "Expected partial image generation to remain a tool row",
-      },
-      {
-        name: "keeps failed image_edit output as a normal tool row",
-        toolName: "image_edit",
-        toolCallId: "image-edit-tool-failed",
-        input: { sourcePath: "/tmp/source.png", prompt: "Make the square blue" },
-        output: { success: false, error: "Image editing requires upload consent." },
-        expectedStatus: "failed",
-        error: "Expected failed image edit to remain a tool row",
-      },
-      {
-        name: "keeps failed image_generate output as a normal tool row",
-        toolName: "image_generate",
-        toolCallId: "image-tool-failed",
-        input: { prompt: "A small blue square" },
-        output: { success: false, error: "Image generation requires an OpenAI API key." },
-        expectedStatus: "failed",
-        error: "Expected failed image generation to remain a tool row",
-      },
-    ] as const;
-
-    for (const scenario of toolRowScenarios) {
-      test(scenario.name, () => {
-        const displayed = displayedFromTool(scenario.toolName, scenario.input, scenario.output, {
-          toolCallId: scenario.toolCallId,
-          partial: "partial" in scenario ? scenario.partial : undefined,
-        });
-
-        expect(displayed).toHaveLength(1);
-        expect(displayed[0]?.type).toBe("tool");
-        if (displayed[0]?.type !== "tool") {
-          throw new Error(scenario.error);
-        }
-        expect(displayed[0].toolName).toBe(scenario.toolName);
-        if ("expectedStatus" in scenario) {
-          expect(displayed[0].status).toBe(scenario.expectedStatus);
-        }
+  describe("history edit evidence", () => {
+    const row = (id: string, seq: number, text: string) =>
+      createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", text, {
+        historySequence: seq,
+        timestamp: seq + 1,
       });
-    }
+
+    test("a projection over a persisted row keeps the persisted version as evidence", () => {
+      const aggregator = new StreamingMessageAggregator(new Date().toISOString());
+      const persistedCard = row("workflow-run-1", 1, "workflow running");
+      aggregator.loadHistoricalMessages([row("u0", 0, "hi"), persistedCard, row("u2", 2, "next")]);
+      const before = aggregator.getHistoryEvidenceMessages();
+
+      // The projection (same id, live status) is displayed; the backend still holds the card.
+      aggregator.addEphemeralMessage(row("workflow-run-1", 1, "workflow completed"));
+      expect(aggregator.getAllMessages().find((m) => m.id === "workflow-run-1")?.parts).toEqual(
+        row("workflow-run-1", 1, "workflow completed").parts
+      );
+      expect(aggregator.getHistoryEvidenceMessages()).toEqual(before);
+
+      // A newer persisted version from the backend becomes the evidence, projection or not.
+      const republished = row("workflow-run-1", 1, "workflow finished (persisted)");
+      aggregator.addMessage(republished);
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(republished.parts);
+
+      // Every active stream's row is fenced by identity only (two can overlap briefly).
+      startTestStream(aggregator, { messageId: "s3", historySequence: 3 });
+      startTestStream(aggregator, { messageId: "s4", historySequence: 4 });
+      expect(
+        aggregator
+          .getHistoryEvidenceMessages()
+          .filter((m) => m.id === "s3" || m.id === "s4")
+          .map((m) => m.metadata?.partial)
+      ).toEqual([true, true]);
+
+      // A since replay that rewrites the row (the backend updated the persisted card) refreshes
+      // the evidence too — that path bypasses addMessage and loadHistoricalMessages.
+      const rewritten = row("workflow-run-1", 1, "workflow finished (since replay)");
+      aggregator.reconcileSinceReplay({
+        messages: [rewritten],
+        requestedAnchorSequence: 0,
+        hasActiveStream: false,
+      });
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(rewritten.parts);
+
+      // A frontend-only row with no persisted counterpart is not evidence at all.
+      aggregator.addEphemeralMessage(
+        row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
+      );
+      expect(
+        aggregator.getHistoryEvidenceMessages().some((m) => m.id === "plan-display-preview")
+      ).toBe(false);
+    });
+  });
+
+  describe("workflow run attachments", () => {
+    test("preserves persisted workflow run attachments on displayed tool rows", () => {
+      const aggregator = createTestAggregator();
+      const workflowRun = { runId: "wfr_partial", timestamp: 101 };
+      const message = historicalToolMessage(
+        "partial-workflow",
+        "workflow_run",
+        { name: "simplify", args: {} },
+        {
+          toolCallId: "workflow-call-1",
+          historySequence: 7,
+          partial: true,
+          workflowRun,
+        }
+      );
+
+      aggregator.loadHistoricalMessages([message], false);
+
+      const toolRow = aggregator
+        .getDisplayedMessages()
+        .find((row) => row.type === "tool" && row.toolCallId === "workflow-call-1");
+      expect(toolRow).toMatchObject({ workflowRun });
+    });
   });
 
   describe("init state reference stability", () => {
@@ -682,6 +502,36 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("display flags", () => {
+    test("propagates modelFallback metadata to displayed assistant rows", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      const fallback = createMuxMessage("a1", "assistant", "answer", {
+        timestamp: 1,
+        historySequence: 1,
+        model: "anthropic:claude-opus-4-8",
+        modelFallback: {
+          requestedModel: "openai:gpt-5.5",
+          refusedModels: ["openai:gpt-5.5"],
+        },
+      });
+      const plain = createMuxMessage("a2", "assistant", "no fallback", {
+        timestamp: 2,
+        historySequence: 2,
+        model: "anthropic:claude-opus-4-8",
+      });
+
+      aggregator.loadHistoricalMessages([fallback, plain], false);
+
+      const assistantRows = aggregator.getDisplayedMessages().filter((m) => m.type === "assistant");
+
+      expect(assistantRows).toHaveLength(2);
+      expect(assistantRows[0]?.modelFallback).toEqual({
+        requestedModel: "openai:gpt-5.5",
+        refusedModels: ["openai:gpt-5.5"],
+      });
+      expect(assistantRows[1]?.modelFallback).toBeUndefined();
+    });
+
     test("should hide synthetic messages by default", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
@@ -727,6 +577,939 @@ describe("StreamingMessageAggregator", () => {
       expect(userMessages[0]?.isSynthetic).toBe(true);
       expect(userMessages[1]?.content).toBe("hello");
       expect(userMessages[1]?.isSynthetic).toBeUndefined();
+    });
+
+    test("renders unknown persisted muxMetadata as an ordinary row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const legacyMessage = MuxMessageSchema.parse({
+        id: "legacy-1",
+        role: "user",
+        parts: [{ type: "text", text: "ordinary persisted content" }],
+        metadata: {
+          timestamp: 1,
+          historySequence: 1,
+          muxMetadata: {
+            type: "removed-feature",
+            rawCommand: "/removed decorated content",
+          },
+        },
+      });
+
+      aggregator.loadHistoricalMessages([legacyMessage], false);
+
+      expect(aggregator.getDisplayedMessages()).toMatchObject([
+        {
+          type: "user",
+          historyId: "legacy-1",
+          content: "ordinary persisted content",
+          commandPrefix: undefined,
+        },
+      ]);
+    });
+
+    test("does not start a parent response for a visible completed subagent report", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("assistant-1", "assistant", "I incorporated the progress update.", {
+            timestamp: 1,
+            historySequence: 1,
+          }),
+        ],
+        false
+      );
+
+      aggregator.handleMessage({
+        ...createMuxMessage(
+          "report-1",
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: "task-1",
+            agentType: "explore",
+            status: "completed",
+            title: "Investigation complete",
+            reportMarkdown: "The child finished successfully.",
+          }),
+          {
+            timestamp: 2,
+            historySequence: 2,
+            synthetic: true,
+            uiVisible: true,
+          }
+        ),
+        type: "message",
+      });
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      const displayedMessages = aggregator.getDisplayedMessages();
+      expect(
+        displayedMessages
+          .filter((message) => message.type === "user" || message.type === "assistant")
+          .map((message) => `${message.type}:${message.historyId}`)
+      ).toEqual(["user:report-1", "assistant:assistant-1"]);
+      expect(getInterruptionContext(displayedMessages).hasInterruptedStream).toBe(false);
+    });
+
+    test("keeps an anchored completed report between reasoning emitted before and after it", () => {
+      const report = createMuxMessage(
+        "report-1",
+        "user",
+        formatSubagentReportEnvelope({
+          taskId: "task-1",
+          agentType: "explore",
+          status: "completed",
+          title: "Investigation complete",
+          reportMarkdown: "The child finished successfully.",
+        }),
+        {
+          timestamp: 2,
+          historySequence: 2,
+          synthetic: true,
+          uiVisible: true,
+          transcriptAnchor: {
+            messageId: "assistant-1",
+            historySequence: 1,
+            textLength: 0,
+            reasoningLength: 11,
+            partIndex: 1,
+          },
+        }
+      );
+
+      const live = new StreamingMessageAggregator(TEST_CREATED_AT);
+      live.handleStreamStart({
+        type: "stream-start",
+        workspaceId: "workspace-1",
+        messageId: "assistant-1",
+        historySequence: 1,
+        model: "openai:gpt-5",
+        startTime: 1,
+      });
+      live.handleReasoningDelta({
+        type: "reasoning-delta",
+        workspaceId: "workspace-1",
+        messageId: "assistant-1",
+        delta: "reasoning A",
+        tokens: 1,
+        timestamp: 1,
+      });
+      live.handleMessage({ ...report, type: "message" });
+      live.handleReasoningDelta({
+        type: "reasoning-delta",
+        workspaceId: "workspace-1",
+        messageId: "assistant-1",
+        delta: "reasoning B",
+        tokens: 1,
+        timestamp: 3,
+      });
+
+      const readOrder = (aggregator: StreamingMessageAggregator) =>
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "reasoning" || row.type === "user")
+          .map((row) =>
+            row.type === "reasoning" ? `reasoning:${row.content}` : `user:${row.historyId}`
+          );
+
+      expect(readOrder(live)).toEqual([
+        "reasoning:reasoning A",
+        "user:report-1",
+        "reasoning:reasoning B",
+      ]);
+
+      const liveRows = live.getDisplayedMessages();
+      const liveReasoningRows = liveRows.filter((row) => row.type === "reasoning");
+      expect(liveReasoningRows.map((row) => row.isLastPartOfMessage)).toEqual([false, true]);
+
+      const reloaded = new StreamingMessageAggregator(TEST_CREATED_AT);
+      reloaded.loadHistoricalMessages(
+        [
+          {
+            ...createMuxMessage("assistant-1", "assistant", "", {
+              timestamp: 1,
+              historySequence: 1,
+              model: "openai:gpt-5",
+            }),
+            parts: [
+              { type: "reasoning", text: "reasoning A" },
+              { type: "reasoning", text: "reasoning B" },
+            ],
+          },
+          report,
+        ],
+        false
+      );
+
+      expect(readOrder(reloaded)).toEqual([
+        "reasoning:reasoning A",
+        "user:report-1",
+        "reasoning:reasoning B",
+      ]);
+      const reloadedReasoningRows = reloaded
+        .getDisplayedMessages()
+        .filter((row) => row.type === "reasoning");
+      expect(reloadedReasoningRows.map((row) => row.isLastPartOfMessage)).toEqual([false, true]);
+      expect(readOrder(reloaded).at(-1)).not.toBe("user:report-1");
+    });
+
+    test("prefers a valid later-stream anchor over the earlier progress response", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage(
+            "progress-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "in_progress",
+              title: "Progress",
+              reportMarkdown: "Still investigating.",
+            }),
+            { timestamp: 1, historySequence: 1, synthetic: true }
+          ),
+          createMuxMessage("assistant-progress", "assistant", "I incorporated the update.", {
+            timestamp: 2,
+            historySequence: 2,
+          }),
+          createMuxMessage("manual-user", "user", "Continue with other work", {
+            timestamp: 3,
+            historySequence: 3,
+          }),
+          {
+            ...createMuxMessage("assistant-current", "assistant", "", {
+              timestamp: 4,
+              historySequence: 4,
+            }),
+            parts: [
+              { type: "reasoning", text: "reasoning A" },
+              { type: "reasoning", text: "reasoning B" },
+            ],
+          },
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 5,
+              historySequence: 5,
+              synthetic: true,
+              uiVisible: true,
+              transcriptAnchor: {
+                messageId: "assistant-current",
+                historySequence: 4,
+                textLength: 0,
+                reasoningLength: "reasoning A".length,
+                partIndex: 1,
+              },
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter(
+            (row) => row.type === "assistant" || row.type === "reasoning" || row.type === "user"
+          )
+          .map((row) =>
+            row.type === "reasoning" ? `reasoning:${row.content}` : `${row.type}:${row.historyId}`
+          )
+      ).toEqual([
+        "assistant:assistant-progress",
+        "user:manual-user",
+        "reasoning:reasoning A",
+        "user:report-1",
+        "reasoning:reasoning B",
+      ]);
+    });
+
+    test("places an unanchored completed report before the assistant response to its progress update", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage(
+            "progress-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "in_progress",
+              title: "Progress",
+              reportMarkdown: "Still investigating.",
+            }),
+            { timestamp: 1, historySequence: 1, synthetic: true }
+          ),
+          createMuxMessage("assistant-1", "assistant", "Final answer", {
+            timestamp: 2,
+            historySequence: 2,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 3,
+              historySequence: 3,
+              synthetic: true,
+              uiVisible: true,
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["user:report-1", "assistant:assistant-1"]);
+    });
+
+    test("skips another completed report while locating the progress response", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage(
+            "progress-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "in_progress",
+              title: "Progress",
+              reportMarkdown: "Still investigating.",
+            }),
+            { timestamp: 1, historySequence: 1, synthetic: true }
+          ),
+          createMuxMessage(
+            "report-2",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-2",
+              agentType: "explore",
+              status: "completed",
+              title: "Other investigation complete",
+              reportMarkdown: "Another child finished first.",
+            }),
+            { timestamp: 2, historySequence: 2, synthetic: true, uiVisible: true }
+          ),
+          createMuxMessage("assistant-1", "assistant", "Final answer", {
+            timestamp: 3,
+            historySequence: 3,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The first child finished successfully.",
+            }),
+            { timestamp: 4, historySequence: 4, synthetic: true, uiVisible: true }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["user:report-2", "user:report-1", "assistant:assistant-1"]);
+    });
+
+    test.each([
+      {
+        label: "reasoning",
+        parts: [{ type: "reasoning" as const, text: "Finished reasoning" }],
+        expectedType: "reasoning",
+      },
+      {
+        label: "tool",
+        parts: [
+          {
+            type: "dynamic-tool" as const,
+            toolCallId: "tool-1",
+            toolName: "file_read",
+            input: { path: "README.md" },
+            state: "output-available" as const,
+            output: { success: true },
+          },
+        ],
+        expectedType: "tool",
+      },
+    ])("repairs a trailing report before a $label-only assistant", ({ parts, expectedType }) => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistant = createMuxMessage(
+        "assistant-1",
+        "assistant",
+        "",
+        { timestamp: 1, historySequence: 1 },
+        [...parts]
+      );
+      const report = createMuxMessage(
+        "report-1",
+        "user",
+        formatSubagentReportEnvelope({
+          taskId: "task-1",
+          agentType: "explore",
+          status: "completed",
+          title: "Investigation complete",
+          reportMarkdown: "The child finished successfully.",
+        }),
+        { timestamp: 2, historySequence: 2, synthetic: true, uiVisible: true }
+      );
+
+      aggregator.loadHistoricalMessages([assistant, report], false);
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "user" || row.type === "reasoning" || row.type === "tool")
+          .map((row) => (row.type === "user" ? `user:${row.historyId}` : row.type))
+      ).toEqual(["user:report-1", expectedType]);
+    });
+
+    test("pairs an old unanchored report with the first response to its progress turn", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage(
+            "progress-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "in_progress",
+              title: "Progress",
+              reportMarkdown: "Still investigating.",
+            }),
+            { timestamp: 1, historySequence: 1, synthetic: true }
+          ),
+          createMuxMessage("assistant-progress", "assistant", "I incorporated the update.", {
+            timestamp: 2,
+            historySequence: 2,
+          }),
+          createMuxMessage("manual-user", "user", "One more question", {
+            timestamp: 3,
+            historySequence: 3,
+          }),
+          createMuxMessage("assistant-manual", "assistant", "Answering the later question.", {
+            timestamp: 4,
+            historySequence: 4,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 5,
+              historySequence: 5,
+              synthetic: true,
+              uiVisible: true,
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual([
+        "user:report-1",
+        "assistant:assistant-progress",
+        "user:manual-user",
+        "assistant:assistant-manual",
+      ]);
+    });
+
+    test("does not repair a trailing report across a context boundary", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("assistant-1", "assistant", "Old answer", {
+            timestamp: 1,
+            historySequence: 1,
+          }),
+          createMuxMessage("reset-1", "assistant", "", {
+            timestamp: 2,
+            historySequence: 2,
+            contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            { timestamp: 3, historySequence: 3, synthetic: true, uiVisible: true }
+          ),
+        ],
+        false
+      );
+
+      expect(aggregator.getDisplayedMessages().at(-1)).toMatchObject({
+        type: "user",
+        historyId: "report-1",
+      });
+    });
+
+    test("keeps a cross-epoch completion after an unrelated new turn", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("reset-1", "assistant", "", {
+            timestamp: 1,
+            historySequence: 1,
+            contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+          }),
+          createMuxMessage("new-user", "user", "New epoch question", {
+            timestamp: 2,
+            historySequence: 2,
+          }),
+          createMuxMessage("new-assistant", "assistant", "New epoch answer", {
+            timestamp: 3,
+            historySequence: 3,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "old-task",
+              agentType: "explore",
+              status: "completed",
+              title: "Old task complete",
+              reportMarkdown: "The old task finished after the reset.",
+            }),
+            { timestamp: 4, historySequence: 4, synthetic: true, uiVisible: true }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["user:new-user", "assistant:new-assistant", "user:report-1"]);
+    });
+
+    test("keeps no-progress historical repair stable after later turns", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("assistant-1", "assistant", "Original answer", {
+            timestamp: 1,
+            historySequence: 1,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            { timestamp: 2, historySequence: 2, synthetic: true, uiVisible: true }
+          ),
+          createMuxMessage("manual-user", "user", "A later question", {
+            timestamp: 3,
+            historySequence: 3,
+          }),
+          createMuxMessage("assistant-2", "assistant", "A later answer", {
+            timestamp: 4,
+            historySequence: 4,
+          }),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual([
+        "user:report-1",
+        "assistant:assistant-1",
+        "user:manual-user",
+        "assistant:assistant-2",
+      ]);
+    });
+
+    test("repairs a completed report whose persisted anchor target is missing", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage(
+            "progress-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "in_progress",
+              title: "Progress",
+              reportMarkdown: "Still investigating.",
+            }),
+            { timestamp: 1, historySequence: 1, synthetic: true }
+          ),
+          createMuxMessage("assistant-1", "assistant", "Final answer", {
+            timestamp: 2,
+            historySequence: 2,
+          }),
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 3,
+              historySequence: 3,
+              synthetic: true,
+              uiVisible: true,
+              transcriptAnchor: {
+                messageId: "deleted-assistant",
+                historySequence: 2,
+                textLength: 0,
+                reasoningLength: 0,
+                partIndex: 0,
+              },
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["user:report-1", "assistant:assistant-1"]);
+    });
+
+    test("keeps a tail-anchored report at the active stream position", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        Array.from({ length: 70 }, (_, index) =>
+          createMuxMessage(`older-${index}`, "assistant", `older response ${index}`, {
+            historySequence: index + 1,
+            timestamp: index + 1,
+          })
+        ),
+        false
+      );
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: "workspace-1",
+        messageId: "assistant-1",
+        historySequence: 71,
+        model: "openai:gpt-5",
+        startTime: 71,
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: "workspace-1",
+        messageId: "assistant-1",
+        delta: "current answer",
+        tokens: 1,
+        timestamp: 71,
+      });
+      aggregator.handleMessage({
+        ...createMuxMessage(
+          "report-1",
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: "task-1",
+            agentType: "explore",
+            status: "completed",
+            title: "Investigation complete",
+            reportMarkdown: "The child finished successfully.",
+          }),
+          {
+            timestamp: 72,
+            historySequence: 72,
+            synthetic: true,
+            uiVisible: true,
+            transcriptAnchor: {
+              messageId: "assistant-1",
+              historySequence: 71,
+              textLength: "current answer".length,
+              reasoningLength: 0,
+              partIndex: 1,
+            },
+          }
+        ),
+        type: "message",
+      });
+
+      const assistantRows = aggregator
+        .getDisplayedMessages()
+        .filter(
+          (row): row is Extract<DisplayedMessage, { type: "assistant" }> =>
+            row.type === "assistant" && row.historyId === "assistant-1"
+        );
+      expect(aggregator.getDisplayedMessages().some((row) => row.type === "history-hidden")).toBe(
+        true
+      );
+      expect(assistantRows).toHaveLength(1);
+      expect(assistantRows[0]?.isLastPartOfMessage).toBe(false);
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter(
+            (row): row is Extract<DisplayedMessage, { type: "assistant" | "user" }> =>
+              (row.type === "assistant" && row.historyId === "assistant-1") ||
+              (row.type === "user" && row.historyId === "report-1")
+          )
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["assistant:assistant-1", "user:report-1"]);
+    });
+
+    test("places a tail-anchored report before final assistant text while keeping terminal chrome", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          {
+            ...createMuxMessage("assistant-1", "assistant", "", {
+              timestamp: 1,
+              historySequence: 1,
+              model: "openai:gpt-5",
+            }),
+            parts: [{ type: "text", text: "final answer" }],
+          },
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 2,
+              historySequence: 2,
+              synthetic: true,
+              uiVisible: true,
+              transcriptAnchor: {
+                messageId: "assistant-1",
+                historySequence: 1,
+                textLength: "final answer".length,
+                reasoningLength: 0,
+                partIndex: 1,
+              },
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .filter((row) => row.type === "assistant" || row.type === "user")
+          .map((row) => `${row.type}:${row.historyId}`)
+      ).toEqual(["user:report-1", "assistant:assistant-1"]);
+
+      const assistantRows = aggregator
+        .getDisplayedMessages()
+        .filter((row) => row.type === "assistant");
+      expect(assistantRows).toHaveLength(1);
+      expect(assistantRows[0]?.isLastPartOfMessage).toBe(true);
+    });
+
+    test("renders terminal stream errors once when a report splits an assistant", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          {
+            ...createMuxMessage("assistant-1", "assistant", "", {
+              timestamp: 1,
+              historySequence: 1,
+              error: "Provider failed",
+              errorType: "api",
+            }),
+            parts: [{ type: "text", text: "before after" }],
+          },
+          createMuxMessage(
+            "report-1",
+            "user",
+            formatSubagentReportEnvelope({
+              taskId: "task-1",
+              agentType: "explore",
+              status: "completed",
+              title: "Investigation complete",
+              reportMarkdown: "The child finished successfully.",
+            }),
+            {
+              timestamp: 2,
+              historySequence: 2,
+              synthetic: true,
+              uiVisible: true,
+              transcriptAnchor: {
+                messageId: "assistant-1",
+                historySequence: 1,
+                textLength: "before".length,
+                reasoningLength: 0,
+                partIndex: 1,
+              },
+            }
+          ),
+        ],
+        false
+      );
+
+      expect(
+        aggregator.getDisplayedMessages().filter((row) => row.type === "stream-error")
+      ).toHaveLength(1);
+    });
+
+    test("keeps hidden completed subagent reports in the retry lifecycle", () => {
+      withDebugLlmRequestEnabled(() => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        aggregator.loadHistoricalMessages(
+          [
+            createMuxMessage(
+              "report-1",
+              "user",
+              formatSubagentReportEnvelope({
+                taskId: "task-1",
+                agentType: "explore",
+                status: "completed",
+                title: "Investigation complete",
+                reportMarkdown: "The child finished successfully.",
+              }),
+              {
+                timestamp: 1,
+                historySequence: 1,
+                synthetic: true,
+              }
+            ),
+          ],
+          false
+        );
+
+        const displayedMessages = aggregator.getDisplayedMessages();
+        expect(displayedMessages.at(-1)).toMatchObject({
+          type: "user",
+          id: "report-1",
+          isSynthetic: true,
+          isUiVisible: undefined,
+        });
+        expect(getInterruptionContext(displayedMessages).hasInterruptedStream).toBe(true);
+      });
+    });
+
+    test("renders persisted workflow slash invocation before workflow card", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const command = createMuxMessage("workflow-command", "user", "/deep-research mux", {
+        timestamp: 1,
+        historySequence: 1,
+        muxMetadata: {
+          type: "workflow-trigger-display",
+          rawCommand: "/deep-research mux",
+          commandPrefix: "/deep-research",
+          runId: "wfr_123",
+        },
+      });
+      const card = buildWorkflowRunCardMessage(
+        { scriptPath: "skill://deep-research/workflow.js", args: { input: "mux" } },
+        { runId: "wfr_123", status: "running", result: null },
+        2
+      );
+      card.metadata = {
+        timestamp: 2,
+        historySequence: 2,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: { type: "workflow-run-card-display", runId: "wfr_123" },
+      };
+      const hiddenWorkflowResult = createMuxMessage(
+        "workflow-result",
+        "user",
+        '/deep-research mux\n\n<mux_workflow_result>{"reportMarkdown":"hidden"}</mux_workflow_result>',
+        {
+          timestamp: 3,
+          historySequence: 3,
+          muxMetadata: {
+            type: "workflow-result",
+            rawCommand: "/deep-research mux",
+            commandPrefix: "/deep-research",
+            runId: "wfr_123",
+          },
+        }
+      );
+      const assistant = createMuxMessage("assistant-1", "assistant", "Done", {
+        timestamp: 4,
+        historySequence: 4,
+      });
+
+      aggregator.loadHistoricalMessages([command, card, hiddenWorkflowResult, assistant], false);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.map((message) => message.type)).toEqual(["user", "tool", "assistant"]);
+      expect(displayed[0]).toMatchObject({
+        type: "user",
+        content: "/deep-research mux",
+        commandPrefix: "/deep-research",
+      });
+      if (displayed[0]?.type !== "user") {
+        throw new Error("Expected workflow command to render as a user message");
+      }
+      expect(displayed[0].content).not.toContain("mux_workflow_result");
+      expect(displayed.some((message) => message.id === "workflow-result")).toBe(false);
+      expect(displayed[1]).toMatchObject({
+        type: "tool",
+        toolName: "workflow_run",
+        args: {
+          script_path: "skill://deep-research/workflow.js",
+          args: { input: "mux" },
+          run_in_background: true,
+        },
+        result: { status: "running", runId: "wfr_123", result: null },
+      });
     });
 
     test("should strip legacy goal-cleared label from displayed summaries", () => {
@@ -802,6 +1585,70 @@ describe("StreamingMessageAggregator", () => {
         expect(userMessages[1].content).toBe("hello");
         expect(userMessages[1].isSynthetic).toBeUndefined();
       });
+    });
+
+    test("hides plan-review record rows even when debugLlmRequest is enabled", () => {
+      // Debug mode shows what the model sees; record rows are never sent, so they stay hidden.
+      // Feedback rows are real user messages and remain visible either way.
+      const load = () => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        const snapshot = createMuxMessage("plan-snapshot", "user", "<mux_plan_review>…", {
+          timestamp: 1,
+          historySequence: 1,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "snapshot",
+            recordId: "rec1",
+            snapshotId: "s1",
+          },
+        });
+        const feedbackRecord: PlanReviewRecord = {
+          v: 1,
+          kind: "feedback",
+          recordId: "rec2",
+          feedbackId: "f1",
+          snapshotId: "s1",
+          contentHash: "a".repeat(64),
+          comments: [
+            { threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" },
+          ],
+          replies: [],
+        };
+        const feedback = createMuxMessage(
+          "plan-feedback",
+          "user",
+          formatPlanReviewEnvelope(feedbackRecord),
+          { timestamp: 2, historySequence: 2, muxMetadata: buildPlanReviewMetadata(feedbackRecord) }
+        );
+        const resolve = createMuxMessage("plan-resolve", "user", "<mux_plan_review>…", {
+          timestamp: 3,
+          historySequence: 3,
+          synthetic: true,
+          muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
+        });
+        // A hidden record whose metadata kind was corrupted to "feedback" stays hidden: only an
+        // authentic feedback envelope is a visible user message.
+        const corruptedKind = createMuxMessage("plan-corrupted", "user", "<mux_plan_review>…", {
+          timestamp: 4,
+          historySequence: 4,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "feedback",
+            recordId: "rec4",
+            snapshotId: "s2",
+          },
+        });
+        aggregator.loadHistoricalMessages([snapshot, feedback, resolve, corruptedKind], false);
+        return aggregator
+          .getDisplayedMessages()
+          .filter((m) => m.type === "user")
+          .map((m) => m.id);
+      };
+
+      expect(load()).toEqual(["plan-feedback"]);
+      expect(withDebugLlmRequestEnabled(load)).toEqual(["plan-feedback"]);
     });
 
     test("should disable displayed message cap when showAllMessages is enabled", () => {
@@ -884,6 +1731,15 @@ describe("StreamingMessageAggregator", () => {
       expect(userMessages).toHaveLength(100);
       expect(assistantMessages.length).toBeLessThan(100);
       expect(assistantMessages.length).toBeGreaterThan(0);
+
+      // A Timeline reveal may pin one old row, but must not disable the transcript cap.
+      aggregator.setTranscriptRevealTarget({ messageId: "a0" });
+      const withRevealTarget = aggregator.getDisplayedMessages();
+      expect(
+        withRevealTarget.some((message) => "historyId" in message && message.historyId === "a0")
+      ).toBe(true);
+      expect(withRevealTarget.some((message) => message.type === "history-hidden")).toBe(true);
+      expect(withRevealTarget.length).toBeLessThan(400);
 
       // Enable showAllMessages to see full history
       aggregator.setShowAllMessages(true);
@@ -1340,7 +2196,7 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("live compaction boundary pruning", () => {
-    // handleMessage expects ChatMuxMessage (type: "message"), matching how the
+    // handleMessage expects ChatXumMessage (type: "message"), matching how the
     // backend emits events via emitChatEvent({ ...message, type: "message" }).
     const asChatMessage = (msg: ReturnType<typeof createMuxMessage>) => ({
       ...msg,
@@ -1439,7 +2295,7 @@ describe("StreamingMessageAggregator", () => {
       expect(remaining.map((m) => m.id)).toEqual(["boundary-2"]);
     });
 
-    test("updates reconnect cursor floor when a live compaction boundary arrives", () => {
+    test("keeps returning the stored server cursor when a live compaction boundary arrives", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
       // Simulate initial replay window starting at historySequence 40.
@@ -1458,8 +2314,16 @@ describe("StreamingMessageAggregator", () => {
         { mode: "replace" }
       );
 
+      const serverCursor = {
+        messageId: "history-41",
+        historySequence: 41,
+        oldestHistorySequence: 40,
+        priorHistoryFingerprint: "cafe1234",
+      };
+      aggregator.setServerHistoryCursor(serverCursor);
+
       const beforeCompactionCursor = aggregator.getOnChatCursor();
-      expect(beforeCompactionCursor?.history?.oldestHistorySequence).toBe(40);
+      expect(beforeCompactionCursor?.history).toEqual(serverCursor);
 
       const boundary = asChatMessage(
         createMuxMessage("boundary-60", "assistant", "Summary epoch 60", {
@@ -1472,8 +2336,11 @@ describe("StreamingMessageAggregator", () => {
       );
       aggregator.handleMessage(boundary);
 
+      // The cursor is reused verbatim: a live compaction makes it stale, and the
+      // server-side anchor validation downgrades the next reconnect to a (small)
+      // full replay of the fresh epoch instead of the client guessing a new cursor.
       const afterCompactionCursor = aggregator.getOnChatCursor();
-      expect(afterCompactionCursor?.history?.oldestHistorySequence).toBe(60);
+      expect(afterCompactionCursor?.history).toEqual(serverCursor);
     });
 
     test("keeps visible history when a live reset boundary arrives", () => {
@@ -1542,6 +2409,65 @@ describe("StreamingMessageAggregator", () => {
       aggregator.handleMessage(msg2);
 
       expect(aggregator.getAllMessages()).toHaveLength(2);
+    });
+  });
+
+  describe("stream metadata", () => {
+    test("keeps derived agentId on the live assistant message when legacy mode is omitted", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "explore-msg",
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: Date.now(),
+        agentId: "explore",
+      });
+
+      const streamingMessage = aggregator
+        .getAllMessages()
+        .find((message) => message.id === "explore-msg");
+      expect(streamingMessage?.metadata?.agentId).toBe("explore");
+      expect(streamingMessage?.metadata?.mode).toBeUndefined();
+    });
+
+    test("preserves derived agentId when replay stream-start omits it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "explore-replay-msg",
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: Date.now(),
+        agentId: "explore",
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "explore-replay-msg",
+        delta: "hello",
+        tokens: 1,
+        timestamp: Date.now(),
+      });
+
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "explore-replay-msg",
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: Date.now(),
+        replay: true,
+      });
+
+      const streamingMessage = aggregator
+        .getAllMessages()
+        .find((message) => message.id === "explore-replay-msg");
+      expect(streamingMessage?.metadata?.agentId).toBe("explore");
     });
   });
 
@@ -1644,7 +2570,7 @@ describe("StreamingMessageAggregator", () => {
       expect(callbackCompletedAt).toBeGreaterThanOrEqual(beforeEnd);
     });
 
-    test("marks idle compaction completions as non-notifying", () => {
+    test("marks compaction completions as non-notifying", () => {
       const workspaceId = "test-workspace-recency-idle-compaction";
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
       let completion: Parameters<typeof shouldNotifyOnResponseComplete>[0];
@@ -1688,11 +2614,7 @@ describe("StreamingMessageAggregator", () => {
         parts: [],
       });
 
-      expect(completion).toEqual({
-        kind: "compaction",
-        hasAutoFollowUp: false,
-        isIdle: true,
-      });
+      expect(completion).toEqual({ kind: "compaction" });
       expect(shouldNotifyOnResponseComplete(completion)).toBe(false);
     });
 
@@ -2001,6 +2923,201 @@ describe("StreamingMessageAggregator", () => {
     });
   });
 
+  test("tool-call-execution-start stamps executionStartedAt onto the displayed tool row", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+    startTestStream(aggregator, { messageId: "msg-1" });
+    startToolCall(aggregator, {
+      toolCallId: "tool-queued",
+      toolName: "bash",
+      args: { command: "echo hi" },
+      timestamp: 1_000,
+    });
+
+    // Queued behind a sibling: no execution start yet.
+    const queuedRow = aggregator
+      .getDisplayedMessages()
+      .find((m) => m.type === "tool" && m.toolCallId === "tool-queued");
+    expect(queuedRow?.type).toBe("tool");
+    expect(queuedRow?.type === "tool" ? queuedRow.executionStartedAt : null).toBeUndefined();
+
+    aggregator.handleToolCallExecutionStart({
+      type: "tool-call-execution-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-queued",
+      timestamp: 5_000,
+    });
+
+    const executingRow = aggregator
+      .getDisplayedMessages()
+      .find((m) => m.type === "tool" && m.toolCallId === "tool-queued");
+    expect(executingRow?.type === "tool" ? executingRow.executionStartedAt : undefined).toBe(5_000);
+  });
+
+  test("tool execution stats measure from execution start, not queue entry", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+    startTestStream(aggregator, { messageId: "msg-1" });
+    // Two parallel tool calls emitted back-to-back; they execute sequentially.
+    startToolCall(aggregator, {
+      toolCallId: "tool-a",
+      toolName: "bash",
+      args: {},
+      timestamp: 1_000,
+    });
+    startToolCall(aggregator, {
+      toolCallId: "tool-b",
+      toolName: "bash",
+      args: {},
+      timestamp: 1_001,
+    });
+
+    aggregator.handleToolCallExecutionStart({
+      type: "tool-call-execution-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-a",
+      timestamp: 1_002,
+    });
+    endToolCall(aggregator, {
+      toolCallId: "tool-a",
+      toolName: "bash",
+      result: {},
+      timestamp: 5_000,
+    });
+    aggregator.handleToolCallExecutionStart({
+      type: "tool-call-execution-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-b",
+      timestamp: 5_001,
+    });
+    endToolCall(aggregator, {
+      toolCallId: "tool-b",
+      toolName: "bash",
+      result: {},
+      timestamp: 9_000,
+    });
+
+    const stats = aggregator.getActiveStreamTimingStats();
+    // A: 5000-1002, B: 9000-5001. Without execution-start re-anchoring, B would
+    // count from emission (9000-1001) and double-count A's run time.
+    expect(stats?.toolExecutionMs).toBe(3_998 + 3_999);
+  });
+
+  test("replayed tool-call-start merges executionStartedAt into an existing tool part", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+    startTestStream(aggregator, { messageId: "msg-1" });
+    // Client saw the queued tool-call-start live (no execution start yet)...
+    startToolCall(aggregator, {
+      toolCallId: "tool-reconnect",
+      toolName: "bash",
+      args: { command: "echo hi" },
+      timestamp: 1_000,
+    });
+
+    // ...disconnected, execute() began, and the `since` replay re-sends the enriched start.
+    aggregator.handleToolCallStart({
+      type: "tool-call-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-reconnect",
+      toolName: "bash",
+      args: { command: "echo hi" },
+      tokens: 0,
+      timestamp: 1_000,
+      executionStartedAt: 6_000,
+      replay: true,
+    });
+
+    const row = aggregator
+      .getDisplayedMessages()
+      .find((m) => m.type === "tool" && m.toolCallId === "tool-reconnect");
+    expect(row?.type === "tool" ? row.executionStartedAt : undefined).toBe(6_000);
+
+    // The merge must also re-anchor timing stats: the tool's duration counts from
+    // execution start (6000), not the pre-disconnect emission seed (1000).
+    endToolCall(aggregator, {
+      toolCallId: "tool-reconnect",
+      toolName: "bash",
+      result: {},
+      timestamp: 9_000,
+    });
+    expect(aggregator.getActiveStreamTimingStats()?.toolExecutionMs).toBe(3_000);
+  });
+
+  test("stashes execution starts that arrive before their tool part exists", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+    startTestStream(aggregator, { messageId: "msg-1" });
+    // Reconnect replay in progress: the live execution-start (not replay-buffered)
+    // arrives before the replayed tool-call-start creates the part.
+    aggregator.handleToolCallExecutionStart({
+      type: "tool-call-execution-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-race",
+      timestamp: 6_000,
+    });
+
+    // Replayed start without executionStartedAt (snapshot predates execute()).
+    aggregator.handleToolCallStart({
+      type: "tool-call-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-race",
+      toolName: "bash",
+      args: { command: "echo hi" },
+      tokens: 0,
+      timestamp: 1_000,
+      replay: true,
+    });
+
+    const row = aggregator
+      .getDisplayedMessages()
+      .find((m) => m.type === "tool" && m.toolCallId === "tool-race");
+    expect(row?.type === "tool" ? row.executionStartedAt : undefined).toBe(6_000);
+
+    // Timing stats must also anchor at execution start, not the replayed emission time.
+    endToolCall(aggregator, {
+      toolCallId: "tool-race",
+      toolName: "bash",
+      result: {},
+      timestamp: 9_000,
+    });
+    expect(aggregator.getActiveStreamTimingStats()?.toolExecutionMs).toBe(3_000);
+  });
+
+  test("fresh replayed tool-call-start seeds timing stats from executionStartedAt", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+    startTestStream(aggregator, { messageId: "msg-1" });
+    // Full replay after reconnect: the client never saw the live start, and the
+    // replayed event already carries the true execution start.
+    aggregator.handleToolCallStart({
+      type: "tool-call-start",
+      workspaceId: TEST_WORKSPACE_ID,
+      messageId: "msg-1",
+      toolCallId: "tool-fresh-replay",
+      toolName: "bash",
+      args: { command: "echo hi" },
+      tokens: 0,
+      timestamp: 1_000,
+      executionStartedAt: 6_000,
+      replay: true,
+    });
+    endToolCall(aggregator, {
+      toolCallId: "tool-fresh-replay",
+      toolName: "bash",
+      result: {},
+      timestamp: 9_000,
+    });
+
+    expect(aggregator.getActiveStreamTimingStats()?.toolExecutionMs).toBe(3_000);
+  });
+
   test("keeps richer in-memory parts when append replay sends a stale duplicate", () => {
     const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
@@ -2153,6 +3270,64 @@ describe("StreamingMessageAggregator", () => {
       });
 
       expect(aggregator.isCompacting()).toBe(true);
+    });
+
+    test("reconnect recovery looks past hidden plan-review records to the compaction request, not past user rows", () => {
+      const compactionRequest = {
+        id: "compact-req",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "/compact" }],
+        metadata: {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-request" as const,
+            rawCommand: "/compact",
+            parsed: { model: "anthropic:claude-3-5-haiku-20241022" },
+          },
+        },
+      };
+      const resolveRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "resolve",
+        recordId: "rec_res",
+        threadId: "thr_1",
+      };
+      const hiddenRecord = createMuxMessage(
+        "plan-review-resolve",
+        "user",
+        formatPlanReviewEnvelope(resolveRecord),
+        {
+          historySequence: 2,
+          timestamp: Date.now(),
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(resolveRecord),
+        }
+      );
+      const ordinaryUser = createMuxMessage("user-2", "user", "hello", {
+        historySequence: 2,
+        timestamp: Date.now(),
+      });
+      // Replayed stream-start without agentId, as older/legacy streams report it.
+      const streamStart = {
+        type: "stream-start" as const,
+        workspaceId: "test-workspace",
+        messageId: "active-stream",
+        historySequence: 3,
+        model: "anthropic:claude-3-5-haiku-20241022",
+        startTime: Date.now(),
+        mode: "exec" as const,
+      };
+
+      const behindHidden = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindHidden.loadHistoricalMessages([compactionRequest, hiddenRecord], true);
+      behindHidden.handleStreamStart(streamStart);
+      expect(behindHidden.isCompacting()).toBe(true);
+
+      const behindUser = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindUser.loadHistoricalMessages([compactionRequest, ordinaryUser], true);
+      behindUser.handleStreamStart(streamStart);
+      expect(behindUser.isCompacting()).toBe(false);
     });
 
     test("treats mode=compact as authoritative", () => {
@@ -2448,6 +3623,124 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("pending stream lifecycle", () => {
+    const hiddenResolve = (sequence: number) =>
+      createMuxMessage(`plan-resolve-${sequence}`, "user", "<mux_plan_review>…", {
+        historySequence: sequence,
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: {
+          type: "plan-review",
+          kind: "resolve",
+          recordId: `rec-${sequence}`,
+          threadId: "t1",
+        },
+      });
+
+    test("a live hidden plan-review record does not start a pending turn while idle", () => {
+      // Resolving a review thread while idle emits the hidden row live; no stream follows.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Done", {
+            historySequence: 2,
+            timestamp: 2,
+          }),
+        ],
+        false
+      );
+      const lifecycleBefore = aggregator.getStreamLifecycle();
+      aggregator.handleMessage({ ...hiddenResolve(3), type: "message" });
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(aggregator.getStreamLifecycle()).toEqual(lifecycleBefore);
+      // The row is retained for review-state replay.
+      expect(aggregator.getAllMessages().map((m) => m.id)).toContain("plan-resolve-3");
+    });
+
+    test("an authentic plan-review feedback row still starts a pending turn", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      aggregator.handleMessage({
+        ...createMuxMessage("plan-feedback", "user", formatPlanReviewEnvelope(feedbackRecord), {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+        }),
+        type: "message",
+      });
+
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+    });
+
+    test("marks only authentic feedback as not generically editable, live and on reload", () => {
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      const envelope = formatPlanReviewEnvelope(feedbackRecord);
+      const feedback = createMuxMessage("plan-feedback", "user", envelope, {
+        historySequence: 1,
+        timestamp: 1,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      });
+      // The same text without authentic metadata is an ordinary (neutralized) user message.
+      const lookalike = createMuxMessage("pasted-lookalike", "user", envelope, {
+        historySequence: 2,
+        timestamp: 2,
+      });
+      const editability = (aggregator: StreamingMessageAggregator) =>
+        aggregator
+          .getDisplayedMessages()
+          .filter((message) => message.type === "user")
+          .map((message) => [message.historyId, canEditDisplayedUserMessage(message)]);
+
+      const live = new StreamingMessageAggregator(TEST_CREATED_AT);
+      live.handleMessage({ ...feedback, type: "message" });
+      live.handleMessage({ ...lookalike, type: "message" });
+      const reloaded = new StreamingMessageAggregator(TEST_CREATED_AT);
+      reloaded.loadHistoricalMessages([feedback, lookalike], false);
+
+      for (const aggregator of [live, reloaded]) {
+        expect(editability(aggregator)).toEqual([
+          ["plan-feedback", false],
+          ["pasted-lookalike", true],
+        ]);
+      }
+    });
+
+    test("replay settles a pending turn when a hidden record trails the assistant response", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      seedPendingStreamState(aggregator);
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Hi", { historySequence: 2, timestamp: 2 }),
+          hiddenResolve(3),
+        ],
+        false
+      );
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+    });
+
     test("clears pending state when stream-end arrives without prior stream-start", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       seedPendingStreamState(aggregator);
@@ -2506,6 +3799,294 @@ describe("StreamingMessageAggregator", () => {
 
       expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
       expect(aggregator.getPendingStreamModel()).toBe("openai:gpt-4o-mini");
+    });
+
+    const pendingFirstMessage = { content: "Build the thing", timestamp: 1_700_000_000_000 };
+    const displayedTypes = (aggregator: StreamingMessageAggregator) =>
+      aggregator.getDisplayedMessages().map((message) => message.type);
+    const displayedUserRows = (aggregator: StreamingMessageAggregator) =>
+      aggregator
+        .getDisplayedMessages()
+        .filter((message): message is Extract<DisplayedMessage, { type: "user" }> => {
+          return message.type === "user";
+        });
+
+    test("shows the pending first message as a user row ahead of the creation card", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0]).toMatchObject({
+        content: "Build the thing",
+        isPendingSend: true,
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      // The row is presentation only: history bookkeeping never sees it.
+      expect(aggregator.getAllMessages()).toHaveLength(0);
+      expect(aggregator.hasMessages()).toBe(false);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+    });
+
+    test("replaces the pending row with the durable first message and never resurrects it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      const [durableRow] = displayedUserRows(aggregator);
+      expect(durableRow.historyId).toBe("user-1");
+      expect(durableRow.isPendingSend).toBeUndefined();
+
+      // Truncating history back to empty must not bring the presentation row back.
+      aggregator.loadHistoricalMessages([], false);
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+    });
+
+    test("keeps the pending row through hidden snapshot rows until the visible first message", () => {
+      // Skill, MCP prompt, and @file sends persist synthetic snapshot rows ahead of the user
+      // row; they never render, so they cannot stand in for the durable first message.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage(
+          "skill-snapshot-1",
+          "user",
+          '<agent-skill name="x">\nbody\n</agent-skill>',
+          {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }
+        ),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0].isPendingSend).toBe(true);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 2,
+          timestamp: Date.now(),
+        }),
+      });
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
+    test("drops the pending row when the durable first message arrives via bulk history", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("user-1", "user", "Build the thing", { historySequence: 1 })],
+        true
+      );
+      expect(displayedUserRows(aggregator)).toHaveLength(1);
+      aggregator.loadHistoricalMessages([], true);
+      expect(displayedUserRows(aggregator)).toHaveLength(0);
+    });
+
+    test("keeps the pending row when bulk history holds only hidden snapshot rows", () => {
+      // Catching up between the persisted snapshot rows and the durable user row must not
+      // leave the transcript without a prompt.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      const skillSnapshot = createMuxMessage(
+        "skill-snapshot-1",
+        "user",
+        '<agent-skill name="x">\nbody\n</agent-skill>',
+        {
+          historySequence: 1,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+        }
+      );
+      aggregator.loadHistoricalMessages([skillSnapshot], true);
+      const pendingRows = displayedUserRows(aggregator);
+      expect(pendingRows).toHaveLength(1);
+      expect(pendingRows[0].isPendingSend).toBe(true);
+
+      aggregator.loadHistoricalMessages(
+        [
+          skillSnapshot,
+          createMuxMessage("user-1", "user", "Build the thing", { historySequence: 2 }),
+        ],
+        true
+      );
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
+    test("shows a stand-in creation card until the backend init replaces it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: "dark-mode",
+        nameGenerated: false,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      const initRow = () =>
+        aggregator
+          .getDisplayedMessages()
+          .find(
+            (message): message is Extract<DisplayedMessage, { type: "workspace-init" }> =>
+              message.type === "workspace-init"
+          );
+
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      // A typed name was never generated, so the card only lists the creation step.
+      expect(initRow()).toMatchObject({
+        status: "running",
+        lines: [{ line: "Creating workspace dark-mode", step: true }],
+      });
+
+      // The durable first message does not disturb the stand-in card.
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+      });
+      aggregator.handleMessage({
+        type: "init-output",
+        line: "Preparing checkout",
+        step: true,
+        timestamp: 6,
+        replay: true,
+      });
+      aggregator.flushPendingInitOutput();
+      expect(initRow()).toMatchObject({
+        hookPath: "/project/.xum/init",
+        lines: [{ line: "Preparing checkout", step: true }],
+      });
+    });
+
+    test("a failed first send removes the pending row but keeps the stand-in card until init-start", () => {
+      // Init keeps running no matter how the send fared, so the card is the workspace's only
+      // provisioning status until the real init-start (live or replayed) takes over.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: null,
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.clearPendingStreamStart();
+      expect(aggregator.clearPendingInitialUserMessage()).toBe(true);
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+      expect(aggregator.clearPendingInitialUserMessage()).toBe(false);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+        completed: { exitCode: 0, endTime: 9 },
+      });
+      const initRows = aggregator
+        .getDisplayedMessages()
+        .filter((message) => message.type === "workspace-init");
+      expect(initRows).toHaveLength(1);
+      expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
+    });
+
+    test("carries a stand-in creation card without a pending stream until init-start", () => {
+      // Initial /goal sends create no user turn, so no pending stream is marked.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markPendingCreationInit({
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: Date.now(),
+      });
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      // The subscription's replay reset must not drop the card before init-start arrives.
+      aggregator.resetForReplay();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+        completed: { exitCode: 0, endTime: 9 },
+      });
+      const initRows = aggregator
+        .getDisplayedMessages()
+        .filter((message) => message.type === "workspace-init");
+      expect(initRows).toHaveLength(1);
+      expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
+    });
+
+    test("the stale startup barrier clears on repeated idle catch-ups but the pending row stays", () => {
+      // The first send can wait minutes on init (deferred runtimes, file staging). Two idle
+      // caught-up cycles across reconnects retire the optimistic barrier, which must not take
+      // the only visible prompt with it; the durable first message is what replaces the row.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.resetForReplay();
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+
+      aggregator.resetForReplay();
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0]).toMatchObject({ isPendingSend: true });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", pendingFirstMessage.content, {
+          historySequence: 1,
+          timestamp: pendingFirstMessage.timestamp + 5,
+        }),
+      });
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0].historyId).toBe("user-1");
     });
 
     test("clears stale pending state when authoritative history now ends with assistant", () => {
@@ -2810,6 +4391,83 @@ describe("StreamingMessageAggregator", () => {
       }
     });
 
+    test("drops nested starts whose parent part has not streamed in (no ghost top-level row)", () => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+      // No parent tool part exists yet; streamManager re-emits the nested
+      // events after the parent lands, so the early event must be dropped.
+      startToolCall(aggregator, {
+        toolCallId: "nested-early-1",
+        toolName: "workflow_run",
+        args: {},
+        timestamp: 1100,
+        parentToolCallId: "parent-tool-1",
+      });
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .some((m) => m.type === "tool" && m.toolCallId === "nested-early-1")
+      ).toBe(false);
+    });
+
+    test("skips duplicate nested starts (reconnect replays re-emit them with the parent part)", () => {
+      const aggregator = createTestAggregator();
+      startParentTool(aggregator);
+      for (let i = 0; i < 2; i++) {
+        startToolCall(aggregator, {
+          toolCallId: "nested-tool-1",
+          toolName: "workflow_run",
+          args: { script_path: "wf.js" },
+          timestamp: 1100,
+          parentToolCallId: "parent-tool-1",
+        });
+      }
+
+      const toolMsg = parentToolMessage(aggregator);
+      if (toolMsg?.type !== "tool") {
+        throw new Error("Expected parent tool message");
+      }
+      expect(toolMsg.nestedCalls).toHaveLength(1);
+    });
+
+    test.each([undefined, "parent-tool-1"])(
+      "retains host-authored MCP display metadata from live completion (parent: %s)",
+      (parentToolCallId) => {
+        const aggregator = createTestAggregator();
+        startParentTool(aggregator);
+        const mcpServer = {
+          connection: { key: "configured", transport: "stdio" as const },
+          identity: { name: "display-server", version: "1" },
+          source: "response" as const,
+        };
+        startToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          args: {},
+          timestamp: 1100,
+          parentToolCallId,
+        });
+        endToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          result: { content: [{ type: "text", text: "answer" }] },
+          timestamp: 1200,
+          parentToolCallId,
+          mcpServer,
+        });
+        const parts = aggregator.getAllMessages().flatMap((message) => message.parts);
+        const parent = parts.find(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "parent-tool-1"
+        );
+        const call =
+          parentToolCallId && parent?.type === "dynamic-tool"
+            ? parent.nestedCalls?.find((nested) => nested.toolCallId === "mcp-call")
+            : parts.find((part) => part.type === "dynamic-tool" && part.toolCallId === "mcp-call");
+        expect(call).toMatchObject({ mcpServer });
+      }
+    );
+
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();
       startParentTool(aggregator);
@@ -2885,23 +4543,6 @@ describe("StreamingMessageAggregator", () => {
         expect(toolMsg.nestedCalls![1].toolName).toBe("bash");
         expect(toolMsg.nestedCalls![1].state).toBe("output-available");
       }
-    });
-
-    test("falls through to create regular tool if parent not found", () => {
-      // Defensive behavior: out-of-order nested calls should become regular tool parts.
-      const aggregator = createTestAggregator();
-      startTestStream(aggregator, { messageId: "msg-1" });
-      startToolCall(aggregator, {
-        toolCallId: "nested-orphan",
-        toolName: "file_read",
-        args: { filePath: "test.txt" },
-        timestamp: 1000,
-        parentToolCallId: "non-existent-parent",
-      });
-
-      const toolParts = aggregator.getDisplayedMessages().filter((m) => m.type === "tool");
-      expect(toolParts).toHaveLength(1);
-      expect(toolParts[0].toolCallId).toBe("nested-orphan");
     });
 
     test("nested call end is ignored if nested call not found in parent", () => {
@@ -3157,6 +4798,547 @@ describe("StreamingMessageAggregator", () => {
       const errorRows = displayed.filter((m) => m.type === "stream-error");
       expect(errorRows).toHaveLength(1);
       expect(errorRows[0]?.type === "stream-error" && errorRows[0].errorType).toBe("network");
+    });
+  });
+
+  describe("refusal finish reasons", () => {
+    test("synthesizes a visible refusal row for legacy content-filter completions", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-refused",
+        role: "assistant",
+        parts: [{ type: "text" as const, text: "I checked the security report." }],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-fable-5",
+          finishReason: "content-filter",
+          providerMetadata: {
+            anthropic: {
+              stopDetails: {
+                explanation: "This request triggered restrictions on cyber content.",
+              },
+            },
+          },
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      const errorRow = displayed.find((message) => message.type === "stream-error");
+      expect(errorRow).toBeDefined();
+      if (errorRow?.type === "stream-error") {
+        expect(errorRow.errorType).toBe("model_refusal");
+        expect(errorRow.error).toContain("finishReason: content-filter");
+        expect(errorRow.error).toContain("triggered restrictions");
+      }
+    });
+
+    test("does not render a red refusal row for successful fallback completions", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-fallback-success",
+        role: "assistant",
+        parts: [{ type: "text" as const, text: "Fallback finished the response." }],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "openai:gpt-5.5",
+          finishReason: "stop",
+          modelFallback: {
+            requestedModel: "anthropic:claude-fable-5",
+            refusedModels: ["anthropic:claude-fable-5"],
+          },
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.find((message) => message.type === "stream-error")).toBeUndefined();
+    });
+  });
+});
+
+/**
+ * Tests for `review_pane_update` -> assistedReviewHunks bookkeeping.
+ *
+ * Cover the metadata bits the aggregator tracks for the assisted-review UI:
+ *   - addedAt: set on first sight of each pin's path[:range] key during a
+ *     live update, used to drive the transient "new" badge. Replay
+ *     intentionally skips this so historical pins don't flash as "new" on
+ *     initial load.
+ *   - Carryover: re-flagging an existing key with `operation: "add"`
+ *     preserves the original `addedAt` so a refined comment does not make
+ *     the pin look brand-new.
+ *   - Dedup: a fresh `replace` snapshot drops keys that aren't reincluded.
+ *
+ * Lives in this file (rather than its own test file) so test ordering stays
+ * stable — adding a new `*.test.ts` shifts the alphabetical order across the
+ * suite, which has historically exposed latent pollution in unrelated tests.
+ */
+function historicalReviewPaneUpdateMessage(
+  id: string,
+  hunks: Array<{ path: string; comment?: string | null }>,
+  operation: "add" | "replace" = "replace",
+  options: { historySequence?: number; toolCallId?: string } = {}
+) {
+  const message = createMuxMessage(id, "assistant", "", {
+    historySequence: options.historySequence ?? 1,
+    timestamp: Date.now(),
+    muxMetadata: { type: "normal", requestedModel: TEST_MODEL },
+  });
+  message.parts.push({
+    type: "dynamic-tool",
+    toolCallId: options.toolCallId ?? `tc-${id}`,
+    toolName: "review_pane_update",
+    state: "output-available",
+    input: { operation, hunks: hunks.map((h) => ({ path: h.path })) },
+    output: { success: true, operation, hunks },
+  });
+  return message;
+}
+
+describe("review_pane_update -> assistedReviewHunks", () => {
+  test("replay parses pins without lighting up the addedAt badge", () => {
+    // Initial-load case: we never want replayed history to flash the
+    // transient "new" badge. The aggregator deliberately omits the
+    // timestamp on replay, so addedAt stays undefined for every pin.
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    aggregator.loadHistoricalMessages([
+      historicalReviewPaneUpdateMessage("assistant-1", [
+        { path: "src/foo.ts:10-12", comment: "double-check" },
+        { path: "src/bar.ts", comment: null },
+      ]),
+    ]);
+
+    const pins = aggregator.getAssistedReviewHunks();
+    expect(pins).toHaveLength(2);
+    expect(pins[0].path).toBe("src/foo.ts");
+    expect(pins[0].range).toEqual({ start: 10, end: 12 });
+    expect(pins[0].addedAt).toBeUndefined();
+
+    expect(pins[1].path).toBe("src/bar.ts");
+    expect(pins[1].addedAt).toBeUndefined();
+  });
+
+  test("`add` re-flagging an existing path:range refines the comment in place", () => {
+    // `add` semantics: dedup the existing key, but let the latest comment
+    // win so an agent can revise its rationale without producing a second
+    // pin for the same range.
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    aggregator.loadHistoricalMessages([
+      historicalReviewPaneUpdateMessage(
+        "assistant-1",
+        [{ path: "src/foo.ts:10-12", comment: "look at parser" }],
+        "replace",
+        { historySequence: 1 }
+      ),
+      historicalReviewPaneUpdateMessage(
+        "assistant-2",
+        [{ path: "src/foo.ts:10-12", comment: "look at parser (revised)" }],
+        "add",
+        { historySequence: 2, toolCallId: "tc-2" }
+      ),
+    ]);
+
+    const refreshed = aggregator.getAssistedReviewHunks();
+    expect(refreshed).toHaveLength(1);
+    // Last-writer-wins on the comment for duplicate keys under `add`.
+    expect(refreshed[0].comment).toBe("look at parser (revised)");
+  });
+
+  test("a `replace` drops keys that the new snapshot does not reinclude", () => {
+    // Sanity check: when the agent replaces the set, dropped keys vanish.
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    aggregator.loadHistoricalMessages([
+      historicalReviewPaneUpdateMessage(
+        "assistant-1",
+        [{ path: "src/foo.ts", comment: null }],
+        "replace",
+        { historySequence: 1 }
+      ),
+      historicalReviewPaneUpdateMessage(
+        "assistant-2",
+        [{ path: "src/bar.ts", comment: null }],
+        "replace",
+        { historySequence: 2, toolCallId: "tc-2" }
+      ),
+    ]);
+
+    const pins = aggregator.getAssistedReviewHunks();
+    expect(pins).toHaveLength(1);
+    expect(pins[0].path).toBe("src/bar.ts");
+  });
+});
+
+/**
+ * Tests for notify tool results -> Web Notifications routing.
+ *
+ * The notify tool persists its routing metadata (`notifiedVia: "browser"`) in
+ * history, so the aggregator must fire Web Notifications only for live tool
+ * results. History hydration and reconnect replay re-process the same outputs
+ * on every workspace switch/reload and must stay silent (#2547).
+ */
+class FakeNotification {
+  static permission = "granted";
+  static created: Array<{ title: string; body?: string }> = [];
+  onclick: (() => void) | null = null;
+
+  constructor(title: string, options?: { body?: string }) {
+    FakeNotification.created.push({ title, body: options?.body });
+  }
+
+  static requestPermission(): Promise<string> {
+    return Promise.resolve("granted");
+  }
+}
+
+function withFakeNotificationWindow<T>(fn: () => T): T {
+  const globalWithWindow = globalThis as unknown as { window?: unknown };
+  const previousWindow = globalWithWindow.window;
+  FakeNotification.created = [];
+  globalWithWindow.window = { Notification: FakeNotification, focus: () => undefined };
+  try {
+    return fn();
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalWithWindow.window;
+    } else {
+      globalWithWindow.window = previousWindow;
+    }
+  }
+}
+
+function browserNotifyOutput(title: string, message?: string) {
+  return {
+    success: true,
+    title,
+    message,
+    ui_only: { notify: { notifiedVia: "browser", workspaceId: TEST_WORKSPACE_ID } },
+  };
+}
+
+function runNotifyTool(
+  aggregator: StreamingMessageAggregator,
+  options: { messageId?: string; toolCallId?: string; replay?: boolean } = {}
+): void {
+  const messageId = options.messageId ?? "msg-1";
+  const toolCallId = options.toolCallId ?? "tc-notify";
+  startToolCall(aggregator, {
+    messageId,
+    toolCallId,
+    toolName: "notify",
+    args: { title: "Task done" },
+  });
+  endToolCall(aggregator, {
+    messageId,
+    toolCallId,
+    toolName: "notify",
+    result: browserNotifyOutput("Task done", "All checks passed"),
+    replay: options.replay,
+  });
+}
+
+describe("notify tool -> browser notifications", () => {
+  test("live notify results fire a browser notification", () => {
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+
+      runNotifyTool(aggregator);
+
+      expect(FakeNotification.created).toEqual([{ title: "Task done", body: "All checks passed" }]);
+    });
+  });
+
+  test("replayed tool-call-end does not re-fire the notification", () => {
+    // Reconnect replay re-emits tool-call-end (replay: true) for already-completed
+    // calls of an active stream; the user was already notified when it ran live.
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+
+      runNotifyTool(aggregator, { replay: true });
+
+      expect(FakeNotification.created).toEqual([]);
+    });
+  });
+
+  test("history hydration does not re-fire notifications; later live ones still do", () => {
+    // Workspace switches and reloads hydrate the full transcript through
+    // loadHistoricalMessages; historical notify results must stay silent.
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      const message = createMuxMessage("msg-1", "assistant", "", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        muxMetadata: { type: "normal", requestedModel: TEST_MODEL },
+      });
+      message.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "tc-notify",
+        toolName: "notify",
+        state: "output-available",
+        input: { title: "Task done" },
+        output: browserNotifyOutput("Task done", "All checks passed"),
+      });
+
+      aggregator.loadHistoricalMessages([message]);
+      expect(FakeNotification.created).toEqual([]);
+
+      // A genuinely new notify after hydration still notifies.
+      startTestStream(aggregator, { messageId: "msg-2", historySequence: 2 });
+      runNotifyTool(aggregator, { messageId: "msg-2", toolCallId: "tc-notify-2" });
+      expect(FakeNotification.created).toEqual([{ title: "Task done", body: "All checks passed" }]);
+    });
+  });
+
+  describe("server-issued reconnect cursor", () => {
+    test("returns undefined before any server cursor is stored", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("history-1", "user", "hello", { historySequence: 1, timestamp: 1 })],
+        false,
+        { mode: "replace" }
+      );
+
+      // Local rows alone are not enough: only the server can issue a valid cursor.
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("returns the stored server cursor verbatim and clears on null", () => {
+      const aggregator = createTestAggregator();
+      const serverCursor = {
+        messageId: "history-2",
+        historySequence: 2,
+        oldestHistorySequence: 1,
+        priorHistoryFingerprint: "deadbeef",
+      };
+
+      aggregator.setServerHistoryCursor(serverCursor);
+      expect(aggregator.getOnChatCursor()?.history).toEqual(serverCursor);
+
+      aggregator.setServerHistoryCursor(null);
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("clear() drops the stored server cursor", () => {
+      const aggregator = createTestAggregator();
+      aggregator.setServerHistoryCursor({ messageId: "history-1", historySequence: 1 });
+      aggregator.clear();
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+  });
+
+  describe("since-replay suffix reconciliation", () => {
+    const persistedRow = (
+      id: string,
+      historySequence: number,
+      texts: string[],
+      role: "user" | "assistant" = "assistant"
+    ) => {
+      // createMuxMessage rejects empty user messages, so build with placeholder
+      // content and overwrite parts with the exact persisted-form layout.
+      const message = createMuxMessage(id, role, "placeholder", {
+        historySequence,
+        timestamp: historySequence * 100,
+      });
+      message.parts = texts.map((text) => ({ type: "text" as const, text }));
+      return message;
+    };
+
+    test("removes local suffix rows the server did not re-send", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["kept"]),
+          persistedRow("assistant-3", 3, ["deleted server-side while away"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["kept"])],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual([
+        "user-1",
+        "assistant-2",
+      ]);
+    });
+
+    test("replaces rewritten rows even when the persisted form has fewer parts", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["a", "b", "c"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["rewritten"])],
+        hasActiveStream: false,
+      });
+
+      const rewritten = aggregator.getAllMessages().find((message) => message.id === "assistant-2");
+      expect(rewritten?.parts).toEqual([{ type: "text", text: "rewritten" }]);
+    });
+
+    test("keeps optimistic rows without a historySequence and does not duplicate the boundary row", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("assistant-1", 1, ["turn one"])], false, {
+        mode: "replace",
+      });
+      // Optimistic send awaiting ack: no historySequence yet.
+      aggregator.addMessage(createMuxMessage("optimistic-1", "user", "queued send"));
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("assistant-1", 1, ["turn one"])],
+        hasActiveStream: false,
+      });
+
+      const ids = aggregator.getAllMessages().map((message) => message.id);
+      expect(ids.filter((id) => id === "assistant-1")).toHaveLength(1);
+      expect(ids).toContain("optimistic-1");
+    });
+
+    test("drops derived state sourced from a removed suffix row", () => {
+      const aggregator = createTestAggregator();
+      const todos = [{ content: "task", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          historicalTodoMessage("todo-row", todos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(todos);
+
+      // The todo-bearing row was deleted server-side while the client was away.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual(["user-1"]);
+      expect(aggregator.getCurrentTodos()).toEqual([]);
+    });
+
+    test("rebuilds derived state from surviving rows when a suffix source is removed", () => {
+      const aggregator = createTestAggregator();
+      const keptTodos = [{ content: "kept", status: "in_progress" as const }];
+      const staleTodos = [{ content: "stale", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          historicalTodoMessage("todo-kept", keptTodos, { historySequence: 1 }),
+          historicalTodoMessage("todo-stale", staleTodos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(staleTodos);
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      // Derived state falls back to the surviving todo_write below the anchor.
+      expect(aggregator.getCurrentTodos()).toEqual(keptTodos);
+    });
+
+    test("preserves the locally assembled active-stream row when the carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      startTestStream(aggregator, { messageId: "msg-live", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "Hello ",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "world",
+        tokens: 1,
+        timestamp: 1_002,
+      });
+
+      // The persisted placeholder for an in-flight stream has empty parts.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("user-1", 1, ["hello"], "user"), persistedRow("msg-live", 2, [])],
+        preservedActiveStreamMessageId: "msg-live",
+        hasActiveStream: true,
+      });
+
+      const liveRow = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(liveRow?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBe("msg-live");
+
+      // Stream ending right after caught-up still finalizes the preserved message.
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        metadata: { model: TEST_MODEL, historySequence: 2, timestamp: 1_003 },
+        parts: [],
+      });
+      const finalized = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(finalized?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
+    });
+
+    test("rebuilds the stream row from persisted form when no carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      // Local stream context went stale (e.g. stream A ended while away); the store
+      // clears mismatched stream contexts before reconciling, so no carve-out applies
+      // and the persisted (finalized) form wins over the richer local assembly.
+      startTestStream(aggregator, { messageId: "msg-old", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-old",
+        delta: "locally assembled much longer content",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.clearActiveStreams();
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("msg-old", 2, ["final"]),
+        ],
+        hasActiveStream: false,
+      });
+
+      const rebuilt = aggregator.getAllMessages().find((message) => message.id === "msg-old");
+      expect(rebuilt?.parts).toEqual([{ type: "text", text: "final" }]);
     });
   });
 });

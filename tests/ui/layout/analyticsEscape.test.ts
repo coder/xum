@@ -21,9 +21,7 @@ describe("Analytics Escape", () => {
 
     try {
       // Open analytics via the TitleBar button.
-      const analyticsButton = app.view.container.querySelector(
-        '[data-testid="analytics-button"]'
-      ) as HTMLButtonElement;
+      const analyticsButton = app.view.container.querySelector('[data-testid="analytics-button"]')!;
       expect(analyticsButton).not.toBeNull();
       fireEvent.click(analyticsButton);
 
@@ -39,7 +37,7 @@ describe("Analytics Escape", () => {
             throw new Error("Workspace chat should be replaced by analytics");
           }
         },
-        { timeout: 10_000 }
+        { timeout: 30_000 }
       );
 
       // Press Escape to close analytics.
@@ -53,10 +51,13 @@ describe("Analytics Escape", () => {
             throw new Error("Workspace chat did not reappear after Escape");
           }
         },
-        { timeout: 10_000 }
+        { timeout: 30_000 }
       );
     } finally {
       await app.dispose();
     }
-  }, 60_000);
+    // 120s total (like focus/undo): CI runners under merge-queue load inflate wall
+    // clock enough that the 60s budget covering harness setup + interactions was
+    // exceeded at 66s (merge-queue run 32719185534) on a PR that never touched this area.
+  }, 120_000);
 });

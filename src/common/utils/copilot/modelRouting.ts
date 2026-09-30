@@ -3,14 +3,18 @@ export type CopilotApiMode = "responses" | "chatCompletions";
 // Keep this in sync with the Copilot model filtering used after OAuth login.
 export const COPILOT_MODEL_PREFIXES = ["gpt-5", "claude-", "gemini-3", "grok-code"] as const;
 
-export function isCopilotRoutableModel(_modelId: string): boolean {
-  return true;
-}
+// Copilot's catalog marks these models as Responses-only, and chat completions rejects them
+// with unsupported_api_for_model. Use explicit membership because routing has no catalog credentials.
+const COPILOT_RESPONSES_ONLY_MODELS = new Set(["gpt-5.4", "gpt-5.4-mini"]);
 
 export function selectCopilotApiMode(modelId: string): CopilotApiMode {
+  const unprefixedId = modelId.includes(":") ? modelId.slice(modelId.indexOf(":") + 1) : modelId;
+
   // Copilot Codex-family models are proven to work through the custom Responses path.
   // Keep the broader Copilot catalog on chat completions until the upstream parser is reliable.
-  return modelId.includes("-codex") ? "responses" : "chatCompletions";
+  return COPILOT_RESPONSES_ONLY_MODELS.has(unprefixedId) || unprefixedId.includes("-codex")
+    ? "responses"
+    : "chatCompletions";
 }
 
 export function normalizeCopilotModelId(id: string): string {

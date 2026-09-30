@@ -1,8 +1,7 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import type { ComponentType } from "react";
+import { expect, waitFor, within } from "@storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
-import { replaceInputValue } from "@/browser/stories/storyPlayHelpers.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { DEFAULT_IMAGE_GENERATION_MODEL } from "@/common/types/imageGeneration";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ExperimentsSection } from "./ExperimentsSection.js";
@@ -19,10 +18,51 @@ type Story = StoryObj<typeof meta>;
 
 export const Experiments: Story = {
   render: () => (
-    <SettingsSectionStory setup={() => setupSettingsStory({})}>
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          // Seed the parent off explicitly so the "sub-experiments hidden"
+          // assertion does not rely on the experiment's default value.
+          experiments: { [EXPERIMENT_IDS.MEMORY]: false },
+        })
+      }
+    >
       <ExperimentsSection />
     </SettingsSectionStory>
   ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // Memory sub-experiments are nested under Agent Memory, so with the parent
+    // off they must not appear anywhere in the list.
+    await canvas.findByLabelText("Toggle Agent Memory");
+    await expect(canvas.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    await expect(canvas.queryByLabelText("Toggle Memory Hot Set")).toBeNull();
+    await expect(canvas.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
+  },
+};
+
+export const MemorySettingsEnabled: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          experiments: { [EXPERIMENT_IDS.MEMORY]: true },
+        })
+      }
+    >
+      <ExperimentsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // With Agent Memory enabled, the sub-experiment toggles render in the
+    // nested panel under the parent row.
+    await canvas.findByLabelText("Toggle Memory Intuition");
+    await canvas.findByLabelText("Toggle Memory Hot Set");
+    await canvas.findByLabelText("Toggle Memory Consolidation");
+  },
 };
 
 export const ExperimentsToggleOn: Story = {
@@ -37,49 +77,12 @@ export const ExperimentsToggleOn: Story = {
       <ExperimentsSection />
     </SettingsSectionStory>
   ),
-};
-
-export const ImageGenerationEnabled: Story = {
-  render: () => (
-    <SettingsSectionStory
-      setup={() =>
-        setupSettingsStory({
-          experiments: { [EXPERIMENT_IDS.IMAGE_GENERATION_TOOL]: true },
-          imageGeneration: {
-            modelString: DEFAULT_IMAGE_GENERATION_MODEL,
-            maxImagesPerCall: 4,
-            allowImageUploadsForEditing: true,
-          },
-        })
-      }
-    >
-      <ExperimentsSection />
-    </SettingsSectionStory>
-  ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(canvas.findByText("Image Tools")).resolves.toBeInTheDocument();
-    await expect(
-      canvas.findByDisplayValue(DEFAULT_IMAGE_GENERATION_MODEL)
-    ).resolves.toBeInTheDocument();
 
-    const uploadConsentSwitch = await canvas.findByLabelText("Allow image uploads for editing");
-    await waitFor(() => expect(uploadConsentSwitch).toHaveAttribute("aria-checked", "true"));
-    await userEvent.click(uploadConsentSwitch);
-    await waitFor(() => expect(uploadConsentSwitch).toHaveAttribute("aria-checked", "false"));
-
-    const maxImagesInput = await canvas.findByDisplayValue("4");
-    // Use replaceInputValue (focus + select-all + type) instead of clear+type.
-    // The max-images input has an onBlur that normalizes invalid drafts back
-    // to the default; raw clear+type can interleave a spurious blur that
-    // resets the value and produces flaky assertions. See replaceInputValue
-    // for details.
-    await replaceInputValue(maxImagesInput, "11");
-    await expect(
-      canvas.findByText("Enter a whole number from 1 to 10.")
-    ).resolves.toBeInTheDocument();
-
-    await replaceInputValue(maxImagesInput, "2");
+    // With PTC enabled, the RLM Mode sub-experiment renders in the nested
+    // panel under the parent row.
+    await canvas.findByLabelText("Toggle RLM Mode");
   },
 };
 
@@ -127,12 +130,16 @@ export const HeartbeatSettingsEnabled: Story = {
   },
 };
 
-export const ExperimentsToggleOff: Story = {
+export const AutoModelRoutingEnabled: Story = {
   render: () => (
     <SettingsSectionStory
       setup={() =>
         setupSettingsStory({
-          experiments: { [EXPERIMENT_IDS.IMAGE_GENERATION_TOOL]: false },
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+          providersConfig: {
+            anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
         })
       }
     >
@@ -141,11 +148,57 @@ export const ExperimentsToggleOff: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(canvas.findByText("Image Tools")).resolves.toBeInTheDocument();
-    const imageToolsToggle = await canvas.findByLabelText("Toggle Image Tools");
-    await waitFor(() => expect(imageToolsToggle).toHaveAttribute("aria-checked", "false"));
-    await expect(canvas.queryByText("Image model")).toBeNull();
-    await expect(canvas.queryByText("Max images per call")).toBeNull();
-    await expect(canvas.queryByText("Allow image uploads for editing")).toBeNull();
+
+    // The nested panel renders the evaluation model field, the default tier rows, and the
+    // preview control.
+    await canvas.findByLabelText("Evaluation model");
+    await canvas.findByLabelText("Tier 4 description");
+    await canvas.findByRole("button", { name: "Add tier" });
+  },
+};
+
+// Pixel's named phone viewport width. The test-runner ignores viewport globals and plays at
+// desktop size, so the decorator forces this width; the clamp keeps the narrower local
+// `mobile1` viewport from clipping the frame.
+const PHONE_VIEWPORT_WIDTH = 390;
+
+function PhoneWidthDecorator(Story: ComponentType) {
+  return (
+    <div
+      data-phone-frame
+      style={{ width: `min(100vw, ${PHONE_VIEWPORT_WIDTH}px)`, overflow: "hidden" }}
+    >
+      <Story />
+    </div>
+  );
+}
+
+export const AutoModelRoutingEnabledPhone: Story = {
+  ...AutoModelRoutingEnabled,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  decorators: [PhoneWidthDecorator],
+  play: async ({ canvasElement, parameters, globals }) => {
+    await expect(parameters).toMatchObject({ pixel: { matrix: { viewports: ["phone"] } } });
+    await expect(globals).toMatchObject({ viewport: { value: "mobile1" } });
+
+    const canvas = within(canvasElement);
+    await canvas.findByLabelText("Tier 4 description");
+    await canvas.findByRole("button", { name: "Add tier" });
+
+    const frame = canvasElement.querySelector("[data-phone-frame]");
+    const section = canvasElement.querySelector("[data-auto-model-routing-config]");
+    if (!(frame instanceof HTMLElement) || !(section instanceof HTMLElement)) {
+      throw new Error("Phone frame or routing section did not render");
+    }
+    const frameRight = frame.getBoundingClientRect().right;
+    // Nothing in the routing panel may extend past the phone frame: inputs, selectors, and
+    // the per-tier controls must all fit inside the narrow column.
+    await waitFor(async () => {
+      await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+      for (const element of section.querySelectorAll<HTMLElement>("input, button, textarea")) {
+        await expect(element.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
+      }
+    });
   },
 };

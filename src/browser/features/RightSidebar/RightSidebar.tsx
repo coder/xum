@@ -3,9 +3,11 @@ import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   getReviewImmersiveKey,
+  TERMINAL_TITLES_MAX_CHARS,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
+import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -29,6 +31,7 @@ import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/re
 import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 
 // Per-tab panel components are no longer imported here directly — the
@@ -45,18 +48,23 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import { TerminalTab } from "@/browser/features/RightSidebar/TerminalTab";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import {
-  RIGHT_SIDEBAR_TABS,
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceActivityAuthoritative,
+} from "@/browser/stores/WorkspaceStore";
+import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
+import {
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
+  getTerminalTabFallbackName,
   makeTerminalTabType,
   type TabType,
 } from "@/browser/types/rightSidebar";
@@ -112,9 +120,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
-
-// Re-export for consumers
-export type { ReviewStats };
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -195,9 +200,6 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   );
 };
 
-export { RIGHT_SIDEBAR_TABS, isTabType };
-export type { TabType };
-
 function getGoalSetErrorMessage(error: GoalSetError): string {
   if (error.type === "goal_conflict") {
     return "Goal changed in another window. Please try again.";
@@ -245,6 +247,21 @@ const DragAwarePanelResizeHandle: React.FC<{
   return <PanelResizeHandle className={className} />;
 };
 
+/** Longest title kept per terminal in the persisted map (deep working directories get long). */
+const PERSISTED_TERMINAL_TITLE_MAX_CHARS = 96;
+
+/**
+ * Persist a bounded copy of the terminal titles: they come from the shell, so cap each title and
+ * keep the newest ones that fit the key budget (a refused write would stop persisting any title).
+ * The in-memory titles stay complete.
+ */
+function persistTerminalTitles(key: string, titles: Map<TabType, string>): void {
+  const capped = Object.fromEntries(
+    Array.from(titles, ([tab, title]) => [tab, title.slice(0, PERSISTED_TERMINAL_TITLE_MAX_CHARS)])
+  );
+  updatePersistedState(key, trimRecordToChars(capped, TERMINAL_TITLES_MAX_CHARS));
+}
+
 function hasMountedReviewPanel(node: RightSidebarLayoutNode): boolean {
   if (node.type === "tabset") {
     return node.activeTab === "review";
@@ -285,6 +302,8 @@ interface RightSidebarTabsetNodeProps {
   onTerminalExit: (tab: TabType) => void;
   /** Map of terminal tab types to their current titles (from OSC sequences) */
   terminalTitles: Map<TabType, string>;
+  /** Workspace-wide 0-based ordering of terminal tabs across all splits */
+  terminalTabOrder: Map<TabType, number>;
   /** Handler to update a terminal's title */
   onTerminalTitleChange: (tab: TabType, title: string) => void;
   /** Map of tab → global position index (0-based) for keybind tooltips */
@@ -321,7 +340,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
 
   // Content container class comes from tab registry - each tab defines its own padding/overflow
   const tabsetContentClassName = cn(
-    "relative flex-1 min-h-0",
+    "relative flex-1 min-h-0 min-w-0",
     getTabContentClassName(props.node.activeTab)
   );
 
@@ -410,7 +429,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       const Label = TAB_REGISTRY[tab].Label;
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
-      const terminalIndex = terminalTabs.indexOf(tab);
+      const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
       label = (
         <TerminalTabLabel
           dynamicTitle={props.terminalTitles.get(tab)}
@@ -554,6 +573,9 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           // Check if this terminal should be auto-focused (was just opened via keybind)
           const terminalSessionId = getTerminalSessionId(terminalTab);
           const shouldAutoFocus = isActive && terminalSessionId === props.autoFocusTerminalSession;
+          const terminalIndex = props.terminalTabOrder.get(terminalTab) ?? 0;
+          const tabName =
+            props.terminalTitles.get(terminalTab) ?? getTerminalTabFallbackName(terminalIndex);
 
           return (
             <div
@@ -568,6 +590,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
                 workspaceId={props.workspaceId}
                 tabType={terminalTab}
                 visible={isActive}
+                tabName={tabName}
+                tabIndex={terminalIndex}
                 onTitleChange={(title) => props.onTerminalTitleChange(terminalTab, title)}
                 autoFocus={shouldAutoFocus}
                 onAutoFocusConsumed={shouldAutoFocus ? props.onAutoFocusConsumed : undefined}
@@ -673,12 +697,16 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const api = apiState.api;
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
+  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const workflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
+  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   // Child task workspaces can't run goal actions — backend rejects them
   // via `WorkspaceGoalService.assertParentWorkspace`. We use this flag
   // both to hide the Goal tab below and to gate any inline goal UX.
   const workspaceMetadataContext = useWorkspaceMetadata();
   const currentWorkspaceMetadata =
     workspaceMetadataContext.workspaceMetadata.get(workspaceId) ?? null;
+  const canReviewDiffs = hasWorkspaceRepository(currentWorkspaceMetadata);
   const isChildWorkspaceForGoal = currentWorkspaceMetadata?.parentWorkspaceId != null;
   // Safe variant: storybook stories may render before addWorkspace() runs; the
   // optional hook returns null instead of throwing assertGet on the unregistered
@@ -841,8 +869,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Read last-used focused tab for better defaults when initializing a new layout.
   const initialActiveTab = React.useMemo<TabType>(() => {
     const raw = readPersistedState<string>(RIGHT_SIDEBAR_TAB_KEY, "costs");
+    if (!canReviewDiffs && raw === "review") return "costs";
     return isTabType(raw) ? raw : "costs";
-  }, []);
+  }, [canReviewDiffs]);
 
   const defaultLayout = React.useMemo(
     () => getDefaultRightSidebarLayoutState(initialActiveTab),
@@ -865,9 +894,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [layoutDraft, setLayoutDraft] = React.useState<RightSidebarLayoutState | null>(null);
   const layoutDraftRef = React.useRef<RightSidebarLayoutState | null>(null);
 
-  // Ref to access latest layoutRaw without causing callback recreation
+  // Ref to access latest layoutRaw without causing callback recreation. Synced in a
+  // layout effect (same task as the commit) because React Compiler rejects render-time ref writes.
   const layoutRawRef = React.useRef(layoutRaw);
-  layoutRawRef.current = layoutRaw;
+  React.useLayoutEffect(() => {
+    layoutRawRef.current = layoutRaw;
+  });
 
   const isSidebarTabDragInProgressRef = React.useRef(false);
 
@@ -888,9 +920,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setLayoutDraft(null);
   }, [setLayoutRaw]);
 
-  const layout = React.useMemo(
+  const parsedLayout = React.useMemo(
     () => parseRightSidebarLayoutState(layoutDraft ?? layoutRaw, initialActiveTab),
     [layoutDraft, layoutRaw, initialActiveTab]
+  );
+  const layout = React.useMemo(
+    () => (canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review")),
+    [canReviewDiffs, parsedLayout]
   );
 
   const hasReviewPanelMounted = React.useMemo(
@@ -961,6 +997,61 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     });
   }, [browserAvailable, initialActiveTab, setLayoutRaw]);
 
+  // Memory tab follows the experiment value (same shape as the browser tab).
+  React.useEffect(() => {
+    setLayoutRaw((prevRaw) => {
+      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
+      const hasMemory = collectAllTabs(prev.root).includes("memory");
+
+      if (memoryExperimentEnabled && !hasMemory) {
+        return addTabToFocusedTabset(prev, "memory", false);
+      }
+
+      if (!memoryExperimentEnabled && hasMemory) {
+        return removeTabEverywhere(prev, "memory");
+      }
+
+      return prev;
+    });
+  }, [memoryExperimentEnabled, initialActiveTab, setLayoutRaw]);
+
+  // Workflows tab follows the dynamic-workflows experiment (same shape as the memory tab):
+  // experimental tabs are added/removed from the persisted layout here, not via tabConfig's
+  // featureFlag (which only filters the Add-Tool picker / command palette).
+  React.useEffect(() => {
+    setLayoutRaw((prevRaw) => {
+      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
+      const hasWorkflows = collectAllTabs(prev.root).includes("workflows");
+
+      if (workflowsExperimentEnabled && !hasWorkflows) {
+        return addTabToFocusedTabset(prev, "workflows", false);
+      }
+
+      if (!workflowsExperimentEnabled && hasWorkflows) {
+        return removeTabEverywhere(prev, "workflows");
+      }
+
+      return prev;
+    });
+  }, [workflowsExperimentEnabled, initialActiveTab, setLayoutRaw]);
+
+  React.useEffect(() => {
+    setLayoutRaw((prevRaw) => {
+      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
+      const hasTimeline = collectAllTabs(prev.root).includes("timeline");
+
+      if (timelineExperimentEnabled && !hasTimeline) {
+        return addTabToFocusedTabset(prev, "timeline", false);
+      }
+
+      if (!timelineExperimentEnabled && hasTimeline) {
+        return removeTabEverywhere(prev, "timeline");
+      }
+
+      return prev;
+    });
+  }, [timelineExperimentEnabled, initialActiveTab, setLayoutRaw]);
+
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
@@ -989,7 +1080,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
 
-    if (apiState.status !== "connected" || !api) {
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    if (!api) {
       setDesktopAvailable(null);
       return;
     }
@@ -1012,7 +1104,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [api, apiState.status, desktopExperimentEnabled, workspaceId]);
+  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {
@@ -1043,10 +1135,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     if (layoutDraft !== null) {
       return;
     }
-    if (layoutRaw !== layout) {
-      setLayoutRaw(layout);
+    if (layoutRaw !== parsedLayout) {
+      setLayoutRaw(parsedLayout);
     }
-  }, [layout, layoutDraft, layoutRaw, setLayoutRaw]);
+  }, [layoutDraft, layoutRaw, parsedLayout, setLayoutRaw]);
 
   const getBaseLayout = React.useCallback(() => {
     return (
@@ -1087,9 +1179,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   const selectOrOpenReviewTab = React.useCallback(() => {
+    if (!canReviewDiffs) return;
     setLayout((prev) => selectOrAddTab(prev, "review"));
     _setFocusTrigger((prev) => prev + 1);
-  }, [setLayout]);
+  }, [canReviewDiffs, setLayout]);
 
   React.useEffect(() => {
     const handleOpenGoalTab = (event: Event) => {
@@ -1109,9 +1202,41 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
+  // Auto-surface the Workflows tab when a run starts: the tab is the primary
+  // run-detail surface (the chat card stays collapsed while it exists), but a
+  // background-added tab with a small badge is easy to miss. Only a mounted
+  // 0 → >0 transition activates — opening a workspace mid-run keeps the user's
+  // persisted tab, and switching away afterwards is respected. Does not
+  // un-collapse a collapsed sidebar.
+  const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
+  const activityAuthoritative = useWorkspaceActivityAuthoritative();
+  const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
+    // workspace — both pre-hydration and after a failure-path self-heal (which marks
+    // hydrated with an empty map). Recording that 0 as the baseline would misread the
+    // eventual real snapshot of a pre-existing active run as a fresh 0 → >0 start and
+    // steal the persisted tab. Keep the baseline unknown until authoritative data; the
+    // first authoritative observation counts as "first observation" and never activates.
+    if (!activityAuthoritative) {
+      return;
+    }
+    const previous = previousActiveWorkflowRunCountRef.current;
+    previousActiveWorkflowRunCountRef.current = activeWorkflowRunCount;
+    if (
+      !workflowsExperimentEnabled ||
+      !shouldAutoActivateWorkflowsTab(previous, activeWorkflowRunCount)
+    ) {
+      return;
+    }
+    setLayout((prev) => selectOrAddTab(prev, "workflows"));
+  }, [activityAuthoritative, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
+
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (!canReviewDiffs) return;
+
       if (detail?.workspaceId !== workspaceId) {
         return;
       }
@@ -1131,11 +1256,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE,
         handleOpenTouchReviewImmersive
       );
-  }, [selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
+  }, [canReviewDiffs, selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
 
   React.useEffect(() => {
     const handleOpenReviewImmersive = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (!canReviewDiffs) return;
+
       if (detail?.workspaceId !== workspaceId) {
         return;
       }
@@ -1149,7 +1276,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE, handleOpenReviewImmersive);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE, handleOpenReviewImmersive);
-  }, [selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
+  }, [canReviewDiffs, selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
 
   // Keyboard shortcuts for tab switching by position (Cmd/Ctrl+1-9)
   // Auto-expands sidebar if collapsed
@@ -1171,10 +1298,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         if (matchesKeybind(e, tabKeybinds[i])) {
           e.preventDefault();
 
-          const currentLayout = parseRightSidebarLayoutState(
-            layoutRawRef.current,
-            initialActiveTab
-          );
+          const parsedLayout = parseRightSidebarLayoutState(layoutRawRef.current, initialActiveTab);
+          const currentLayout = canReviewDiffs
+            ? parsedLayout
+            : removeTabEverywhere(parsedLayout, "review");
           const allTabs = collectAllTabsWithTabset(currentLayout.root);
           const target = allTabs[i];
           if (target && isTerminalTab(target.tab)) {
@@ -1188,7 +1315,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             _setFocusTrigger((prev) => prev + 1);
           }
 
-          setLayout((prev) => selectTabByIndex(prev, i));
+          // A per-iteration copy: React Compiler can't lower `i++` on a variable a closure captures.
+          const tabIndex = i;
+          setLayout((prev) =>
+            selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
+          );
           setCollapsed(false);
           return;
         }
@@ -1197,13 +1328,22 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [initialActiveTab, setAutoFocusTerminalSession, setCollapsed, setLayout, _setFocusTrigger]);
+  }, [
+    canReviewDiffs,
+    initialActiveTab,
+    setAutoFocusTerminalSession,
+    setCollapsed,
+    setLayout,
+    _setFocusTrigger,
+  ]);
 
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE)) {
         return;
       }
+
+      if (!canReviewDiffs) return;
 
       if (isEditableElement(e.target)) {
         return;
@@ -1223,7 +1363,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive]);
+  }, [canReviewDiffs, selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive]);
 
   const baseId = `right-sidebar-${workspaceId}`;
 
@@ -1236,6 +1376,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     });
     return positions;
   }, [layout.root]);
+
+  // Workspace-wide terminal ordering. Numbering per tabset would restart at
+  // "Terminal"/#1 in every split, defeating the badge's per-tab identity.
+  const terminalTabOrder = new Map<TabType, number>();
+  collectAllTabs(layout.root)
+    .filter(isTerminalTab)
+    .forEach((tab, index) => terminalTabOrder.set(tab, index));
 
   // @dnd-kit state for tracking active drag
   const [activeDragData, setActiveDragData] = React.useState<TabDragData | null>(null);
@@ -1258,7 +1405,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.delete(tab);
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
@@ -1268,6 +1415,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
@@ -1302,10 +1450,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Sync terminal tabs with backend sessions on workspace mount.
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
   // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
+  // Runs only on workspace change, not layout change (layout.root as a dependency would
+  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
+  // backend list with that snapshot (not the latest layout) keeps terminals created or
+  // closed while the request is in flight from being removed or re-added.
+  const layoutForSessionSyncRef = React.useRef(layout);
+  React.useLayoutEffect(() => {
+    layoutForSessionSyncRef.current = layout;
+  });
   React.useEffect(() => {
     if (!api) return;
 
     let cancelled = false;
+    const layoutAtRequestStart = layoutForSessionSyncRef.current;
 
     void api.terminal.listSessions({ workspaceId }).then((backendSessionIds) => {
       if (cancelled) return;
@@ -1313,7 +1470,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const backendSessionSet = new Set(backendSessionIds);
 
       // Get current terminal tabs in layout
-      const currentTabs = collectAllTabs(layout.root);
+      const currentTabs = collectAllTabs(layoutAtRequestStart.root);
       const currentTerminalTabs = currentTabs.filter(isTerminalTab);
       const currentTerminalSessionIds = new Set(
         currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
@@ -1352,7 +1509,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only run on workspace change, not layout change. layout.root would cause infinite loop.
   }, [api, workspaceId, setLayout]);
 
   // Handler to update a terminal's title (from OSC sequences)
@@ -1362,8 +1518,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.set(tab, title);
-        // Persist to localStorage
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
@@ -1444,10 +1599,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // an unhandled promise rejection. We surface it via the same PopoverError used by
       // handleAddTerminal — the user already paid the cost of removing the tab below, so
       // they need to know if the pop-out itself failed.
-      void openTerminalPopout(api, workspaceId, sessionId).catch((err: unknown) => {
-        console.error("[RightSidebar] Failed to open terminal pop-out:", err);
-        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
-      });
+      // Carry the known OSC title into the pop-out; it is deleted from the
+      // sidebar map below and the new window only sees future title changes.
+      void openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab)).catch(
+        (err: unknown) => {
+          console.error("[RightSidebar] Failed to open terminal pop-out:", err);
+          terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+        }
+      );
 
       // Remove the tab from the sidebar (terminal now lives in its own window)
       // Don't close the session - the pop-out window takes over
@@ -1457,11 +1616,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setTerminalTitles((prev) => {
         const next = new Map(prev);
         next.delete(tab);
-        updatePersistedState(terminalTitlesKey, Object.fromEntries(next));
+        persistTerminalTitles(terminalTitlesKey, next);
         return next;
       });
     },
-    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError]
+    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError, terminalTitles]
   );
 
   // Configure sensors with distance threshold for click vs drag disambiguation
@@ -1614,6 +1773,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onCloseTerminal={handleCloseTerminal}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}
+        terminalTabOrder={terminalTabOrder}
         onTerminalTitleChange={handleTerminalTitleChange}
         tabPositions={tabPositions}
         onRequestTerminalFocus={setAutoFocusTerminalSession}
@@ -1658,6 +1818,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
                   "w-0.5 flex-shrink-0 z-10 transition-[background] duration-150 cursor-col-resize",
                   isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
                 )}
+                // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
                 onMouseDown={(e) => onStartResize(e as unknown as React.MouseEvent)}
               />
             )}

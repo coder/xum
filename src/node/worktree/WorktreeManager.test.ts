@@ -2,7 +2,8 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
 import * as submoduleSync from "@/node/runtime/submoduleSync";
@@ -32,6 +33,7 @@ async function createWorktreeManagerFixture(options?: {
   existingBranchName?: string;
   currentBranchName?: string;
   tempDirPrefix?: string;
+  fetchTimeoutMs?: number;
 }) {
   const rootDir = await fsPromises.realpath(
     await fsPromises.mkdtemp(
@@ -56,10 +58,80 @@ async function createWorktreeManagerFixture(options?: {
   return {
     rootDir,
     projectPath,
-    manager: new WorktreeManager(srcBaseDir),
+    manager: new WorktreeManager(
+      srcBaseDir,
+      options?.fetchTimeoutMs === undefined ? undefined : { fetchTimeoutMs: options.fetchTimeoutMs }
+    ),
     initLogger: createNullInitLogger(),
     cleanup: () => fsPromises.rm(rootDir, { recursive: true, force: true }),
   };
+}
+
+/**
+ * Point origin at an upload-pack shim that never answers and leaves a background child holding
+ * the inherited stdio pipes, like a credential helper blocked on external authentication.
+ */
+async function installStalledOriginFetch(fixture: { rootDir: string; projectPath: string }) {
+  const pidFile = path.join(fixture.rootDir, "stall-pids");
+  const shim = path.join(fixture.rootDir, "stalled-upload-pack.sh");
+  await fsPromises.writeFile(
+    shim,
+    `#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' "$$" "$!" > "${pidFile}"\nwait\n`,
+    "utf-8"
+  );
+  await fsPromises.chmod(shim, 0o755);
+  execFileSync("git", ["remote", "add", "origin", "."], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "remote.origin.uploadpack", shim], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+
+  return {
+    async waitForPids(): Promise<number[]> {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const lines = await fsPromises.readFile(pidFile, "utf-8").then(
+          (content) => content.trim().split("\n"),
+          () => []
+        );
+        if (lines.length === 2) return lines.map(Number);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error("stalled upload-pack shim did not start");
+    },
+  };
+}
+
+async function isProcessGone(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  // A killed orphan that PID 1 has not reaped yet still answers signal 0.
+  return fsPromises.readFile(`/proc/${pid}/stat`, "utf-8").then(
+    (stat) => stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z"),
+    () => false
+  );
+}
+
+async function waitForProcessesToExit(pids: number[]): Promise<boolean> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const gone = await Promise.all(pids.map(isProcessGone));
+    if (gone.every(Boolean)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+function gitRevParseHead(cwd: string): string {
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd, stdio: ["ignore", "pipe", "ignore"] })
+    .toString()
+    .trim();
 }
 
 describe("WorktreeManager constructor", () => {
@@ -90,6 +162,179 @@ describe("WorktreeManager constructor", () => {
 });
 
 describe("WorktreeManager.createWorkspace", () => {
+  for (const existing of [false, true]) {
+    it(`populates a clean ${existing ? "existing-branch" : "new-branch"} worktree and streams checkout output`, async () => {
+      const branchName = "feature-progress";
+      const fixture = await createWorktreeManagerFixture({
+        existingBranchName: existing ? branchName : undefined,
+      });
+      const realExecFile = disposableExec.execFileAsync;
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const progress: Array<[string, number]> = [];
+      const initLogger = {
+        ...fixture.initLogger,
+        logStdout: (line: string) => stdout.push(line),
+        logStderr: (line: string) => stderr.push(line),
+        logProgress: (label: string, percent: number) => progress.push([label, percent]),
+      };
+      const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+      const hookMarker = path.join(fixture.rootDir, "checkout-hook-ran");
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      let checkoutStarted = false;
+      const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+        (file, args, options) => {
+          if (file === "git" && args.includes("checkout") && !checkoutStarted) {
+            checkoutStarted = true;
+            expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
+          }
+          const proc = realExecFile(file, args, options);
+          if (file === "git" && args[2] === "worktree" && args[3] === "add") {
+            // Inject stdout so forwarding coverage does not depend on Git's output.
+            const result = proc.result;
+            Object.defineProperty(proc, "result", {
+              value: result.then((output) => ({
+                ...output,
+                stdout: "worktree metadata ready\r\n",
+              })),
+            });
+          }
+          return proc;
+        }
+      );
+      try {
+        let expectedContent = "hello\n";
+        if (existing) {
+          execFileSync("git", ["checkout", branchName], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+          expectedContent = "existing branch contents\n";
+          await fsPromises.writeFile(path.join(fixture.projectPath, "README.md"), expectedContent);
+          execFileSync("git", ["commit", "-am", "branch contents"], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["checkout", "main"], { cwd: fixture.projectPath, stdio: "ignore" });
+        }
+        await fsPromises.writeFile(hook, '#!/bin/sh\nprintf ran > "' + hookMarker + '"\n');
+        await fsPromises.chmod(hook, 0o755);
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: false,
+          initLogger,
+        });
+        expect(result).toEqual({ success: true, workspacePath, createdBranch: !existing });
+        expect(checkoutStarted).toBe(true);
+        expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
+          expectedContent
+        );
+        expect(
+          execFileSync("git", ["status", "--porcelain"], { cwd: workspacePath }).toString()
+        ).toBe("");
+        expect(
+          execFileSync("git", ["branch", "--show-current"], { cwd: workspacePath })
+            .toString()
+            .trim()
+        ).toBe(branchName);
+        expect(existsSync(hookMarker)).toBe(false);
+        expect(stdout).toContain("worktree metadata ready");
+        expect(stdout.some((line) => line.includes("Preparing worktree"))).toBe(true);
+        // Real git progress: a one-file checkout only reports progress because the
+        // checkout disables git's 2s progress delay.
+        expect(stdout.some((line) => /^Updating files: 100% \(1\/1\), done\.$/.test(line))).toBe(
+          true
+        );
+        expect(stdout.some((line) => line.includes(branchName))).toBe(true);
+        // git's routine stderr chatter must not render as error output.
+        expect(stderr).toEqual([]);
+        expect(progress).toEqual([["Updating files", 100]]);
+      } finally {
+        execSpy.mockRestore();
+        await fixture.cleanup();
+      }
+    }, 20_000);
+
+    it(`removes a failed ${existing ? "existing-branch" : "new-branch"} worktree checkout`, async () => {
+      const branchName = "feature-checkout-failure";
+      const fixture = await createWorktreeManagerFixture({
+        existingBranchName: existing ? branchName : undefined,
+      });
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      try {
+        // Several files so git reports checkout progress before the filter fails.
+        for (const name of ["a", "b", "c", "d"]) {
+          await fsPromises.writeFile(path.join(fixture.projectPath, `${name}.txt`), name);
+        }
+        await fsPromises.writeFile(
+          path.join(fixture.projectPath, ".gitattributes"),
+          "README.md filter=fail\n"
+        );
+        execFileSync("git", ["add", "-A"], {
+          cwd: fixture.projectPath,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["commit", "-m", "require checkout filter"], {
+          cwd: fixture.projectPath,
+          stdio: "ignore",
+        });
+        if (existing) {
+          execFileSync("git", ["branch", "-f", branchName, "main"], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+        }
+        execFileSync("git", ["config", "filter.fail.smudge", "exit 1"], {
+          cwd: fixture.projectPath,
+        });
+        execFileSync("git", ["config", "filter.fail.required", "true"], {
+          cwd: fixture.projectPath,
+        });
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: {
+            ...fixture.initLogger,
+            logStdout: (line) => stdout.push(line),
+            logStderr: (line) => stderr.push(line),
+          },
+        });
+        expect(result.success).toBe(false);
+        if (result.success) throw new Error("Expected checkout to fail");
+        expect(result.error).toContain("smudge filter fail failed");
+        // Git's diagnostics are classified once by the exit status: as error output, not
+        // streamed as output first and repeated as error afterwards.
+        const diagnostic = (line: string) => line.includes("external filter");
+        expect(stderr.filter(diagnostic)).toHaveLength(2);
+        expect(stdout.filter(diagnostic)).toEqual([]);
+        expect(stderr.filter((line) => line.includes("smudge filter fail failed"))).toHaveLength(1);
+        // Progress separators never leak into a logged line.
+        expect([...stdout, ...stderr].some((line) => line.includes("\r"))).toBe(false);
+        const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+        expect(existsSync(workspacePath)).toBe(false);
+        expect(
+          execFileSync("git", ["worktree", "list", "--porcelain"], {
+            cwd: fixture.projectPath,
+          }).toString()
+        ).not.toContain(workspacePath);
+        expect(
+          execFileSync("git", ["branch", "--list", branchName], { cwd: fixture.projectPath })
+            .toString()
+            .trim()
+        ).toBe(existing ? branchName : "");
+      } finally {
+        await fixture.cleanup();
+      }
+    }, 20_000);
+  }
+
   const rollbackCases = [
     {
       name: "rolls back failed new worktrees when submodule materialization fails",
@@ -162,10 +407,1074 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
-  it("uses directoryName for the workspace path while checking out the requested branch", async () => {
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
     const fixture = await createWorktreeManagerFixture();
-    const branchName = "feature-branch";
-    const directoryName = "review-slot";
+
+    try {
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-missing-repo",
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: false,
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected createWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("reserves the worktree and populates it later when materialization is deferred", async () => {
+    const branchName = "feature-deferred";
+    const fixture = await createWorktreeManagerFixture({ existingBranchName: branchName });
+    const steps: string[] = [];
+    const progress: Array<[string, number]> = [];
+    const initLogger = {
+      ...fixture.initLogger,
+      logStep: (message: string) => steps.push(message),
+      logProgress: (label: string, percent: number) => progress.push([label, percent]),
+    };
+    const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+    const hookLog = path.join(fixture.rootDir, "post-checkout-args");
+    try {
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        '#!/bin/sh\nprintf "%s %s %s" "$1" "$2" "$3" >> "' + hookLog + '"\n'
+      );
+      await fsPromises.chmod(hook, 0o755);
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger,
+        deferMaterialization: true,
+      });
+      expect(result).toEqual({
+        success: true,
+        workspacePath,
+        pendingMaterialization: { fastForwardFromOrigin: false },
+        createdBranch: false,
+      });
+      // Reserved but empty: registered with git, no files, no checkout activity yet.
+      expect(
+        execFileSync("git", ["worktree", "list", "--porcelain"], {
+          cwd: fixture.projectPath,
+        }).toString()
+      ).toContain(workspacePath);
+      expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
+      expect(existsSync(hookLog)).toBe(false);
+      expect(steps).not.toContain("Checking out files...");
+      expect(progress).toEqual([]);
+
+      await fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: workspacePath }).toString()
+      ).toBe("");
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: workspacePath }).toString().trim()
+      ).toBe(branchName);
+      expect(progress).toEqual([["Updating files", 100]]);
+      expect(steps).toContain("Checking out files...");
+      // The deferred checkout still reports itself to hooks as a fresh worktree add.
+      const tip = execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+        .toString()
+        .trim();
+      expect(await fsPromises.readFile(hookLog, "utf8")).toBe(`${"0".repeat(40)} ${tip} 1`);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps the branch reserved between the deferred reservation and its checkout", async () => {
+    const branchName = "feature-reserved";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      // Another checkout of the branch must be refused while materialization is pending.
+      const rival = path.join(fixture.rootDir, "rival");
+      expect(() =>
+        execFileSync("git", ["worktree", "add", rival, branchName], {
+          cwd: fixture.projectPath,
+          stdio: "pipe",
+        })
+      ).toThrow(/already (checked out|used by worktree)/);
+
+      await fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath: result.workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps the branch reserved while the checkout streams", async () => {
+    const branchName = "feature-reserved-while-streaming";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      // A smudge filter that waits to be released holds the checkout open mid-stream.
+      const started = path.join(fixture.rootDir, "smudge-started");
+      const release = path.join(fixture.rootDir, "smudge-release");
+      const shim = path.join(fixture.rootDir, "gated-smudge.sh");
+      await fsPromises.writeFile(
+        shim,
+        `#!/bin/sh\n: > "${started}"\nwhile [ ! -e "${release}" ]; do sleep 0.05; done\ncat\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(shim, 0o755);
+      await fsPromises.writeFile(
+        path.join(fixture.projectPath, ".gitattributes"),
+        "README.md filter=gate\n"
+      );
+      execFileSync("git", ["add", ".gitattributes"], { cwd: fixture.projectPath, stdio: "ignore" });
+      execFileSync("git", ["commit", "-qm", "gate the checkout"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "filter.gate.smudge", shim], { cwd: fixture.projectPath });
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const materialize = fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath: result.workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !existsSync(started)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(existsSync(started)).toBe(true);
+      // The files are still landing: another worktree must not be able to claim the branch.
+      const rival = path.join(fixture.rootDir, "rival");
+      let rivalError: unknown;
+      try {
+        execFileSync("git", ["worktree", "add", "--no-checkout", rival, branchName], {
+          cwd: fixture.projectPath,
+          stdio: "pipe",
+        });
+      } catch (error) {
+        rivalError = error;
+      }
+      await fsPromises.writeFile(release, "");
+      expect(rivalError).toBeInstanceOf(Error);
+      expect((rivalError as Error).message).toMatch(/already (checked out|used by worktree)/);
+
+      await materialize;
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(branchName);
+      expect(await fsPromises.readFile(path.join(result.workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("forks at the hook boundary without exposing an unborn source branch", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const branchName = "source-hook-boundary";
+    const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+    const realExec = disposableExec.execFileAsync;
+    let forkResult: Awaited<ReturnType<WorktreeManager["forkWorkspace"]>> | undefined;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        // Both implementations reach this boundary after populating files, before creation
+        // settles. The old symbolic-ref path exposes an invalid branch to this same fork.
+        if (
+          file === "git" &&
+          args[1] === workspacePath &&
+          ((args.includes("symbolic-ref") &&
+            args.some((a) => a.startsWith("refs/heads/xum-unborn-"))) ||
+            (args.includes("hook") && args.includes("run")))
+        ) {
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then(async (output) => {
+              forkResult = await fixture.manager.forkWorkspace({
+                projectPath: fixture.projectPath,
+                sourceWorkspaceName: branchName,
+                newWorkspaceName: "fork-at-hook",
+                trusted: true,
+                initLogger: fixture.initLogger,
+              });
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath || !result.pendingMaterialization)
+        throw new Error("Expected reservation");
+      await fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        },
+        result.pendingMaterialization
+      );
+      expect(forkResult).toMatchObject({ success: true, sourceBranch: branchName });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  // The portable hook-boundary regression above also runs on Windows.
+  it.skipIf(process.platform === "win32")(
+    "keeps the source branch claimed and forkable while its trusted checkout hook is running",
+    async () => {
+      const fixture = await createWorktreeManagerFixture();
+      const branchName = "source-held-hook";
+      const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+      const fifo = path.join(fixture.rootDir, "release-hook");
+      execFileSync("mkfifo", [fifo]);
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        `#!/bin/sh\nif [ "$PWD" = "${workspacePath}" ]; then\nprintf 'source-hook-entered\\n' >&2\nread release < "${fifo}"\nfi\n`
+      );
+      await fsPromises.chmod(hook, 0o755);
+      const entered = Promise.withResolvers<void>();
+      const realExec = disposableExec.execFileAsync;
+      const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+        (file, args, options) =>
+          realExec(file, args, {
+            ...options,
+            onStderrData: (chunk) => {
+              options?.onStderrData?.(chunk);
+              if (args[1] === workspacePath && chunk.includes("source-hook-entered"))
+                entered.resolve();
+            },
+          })
+      );
+      let materialize: Promise<void> | undefined;
+      const controller = new AbortController();
+      try {
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        if (!result.success || !result.pendingMaterialization)
+          throw new Error("Expected reservation");
+        materialize = fixture.manager.materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            abortSignal: controller.signal,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization
+        );
+        await Promise.race([
+          entered.promise,
+          materialize.then(() => {
+            throw new Error("Hook settled without entering its gate");
+          }),
+        ]);
+        expect(() =>
+          execFileSync(
+            "git",
+            ["worktree", "add", "--no-checkout", path.join(fixture.rootDir, "rival"), branchName],
+            { cwd: fixture.projectPath, stdio: "pipe" }
+          )
+        ).toThrow(/already (checked out|used by worktree)/);
+        const fork = await fixture.manager.forkWorkspace({
+          projectPath: fixture.projectPath,
+          sourceWorkspaceName: branchName,
+          newWorkspaceName: "fork-with-hook-running",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        });
+        expect(fork).toMatchObject({ success: true, sourceBranch: branchName });
+        await fsPromises.writeFile(fifo, "release\n");
+        await materialize;
+      } finally {
+        controller.abort();
+        await materialize?.catch(() => undefined);
+        execSpy.mockRestore();
+        await fixture.cleanup();
+      }
+    },
+    20_000
+  );
+
+  it.each([
+    ["git version 2.35.7", true, false],
+    ["unrecognized git version", true, false],
+    [null, true, false],
+    ["git version 2.35.7", false, true],
+  ] as const)(
+    "keeps deferred creation safe with version %s and trusted=%s",
+    async (version, trusted, deferred) => {
+      const fixture = await createWorktreeManagerFixture();
+      const realExec = disposableExec.execFileAsync;
+      const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+        (file, args, options) => {
+          const proc = realExec(file, args, options);
+          if (file === "git" && args[0] === "--version") {
+            Object.defineProperty(proc, "result", {
+              value: proc.result.then((output) => {
+                if (version === null) throw new Error("version probe failed");
+                return { ...output, stdout: version + "\n" };
+              }),
+            });
+          }
+          return proc;
+        }
+      );
+      try {
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "compat-source",
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        expect(result.success).toBe(true);
+        if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+        expect(result.pendingMaterialization !== undefined).toBe(deferred);
+        expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(!deferred);
+        const fork = await fixture.manager.forkWorkspace({
+          projectPath: fixture.projectPath,
+          sourceWorkspaceName: "compat-source",
+          newWorkspaceName: "compat-fork",
+          trusted,
+          initLogger: fixture.initLogger,
+        });
+        expect(fork).toMatchObject({ success: true, sourceBranch: "compat-source" });
+      } finally {
+        execSpy.mockRestore();
+        await fixture.cleanup();
+      }
+    }
+  );
+
+  it("honors cancellation during capability detection instead of starting legacy checkout", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const controller = new AbortController();
+    const realExec = disposableExec.execFileAsync;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") {
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then((output) => {
+              controller.abort();
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "cancelled-capability",
+        trunkBranch: "main",
+        trusted: true,
+        skipRemoteSync: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+        abortSignal: controller.signal,
+      });
+      expect(result.success).toBe(false);
+      expect(
+        existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-capability"))
+      ).toBe(false);
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
+  it("preserves configured checkout-hook arguments and environment in a SHA-256 repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      await fsPromises.rm(path.join(fixture.projectPath, ".git"), { recursive: true, force: true });
+      const git = (...args: string[]) =>
+        execFileSync("git", args, { cwd: fixture.projectPath, stdio: "pipe" }).toString().trim();
+      git("init", "-b", "main", "--object-format=sha256");
+      git("config", "user.name", "test");
+      git("config", "user.email", "test@example.com");
+      git("config", "commit.gpgsign", "false");
+      git("add", "README.md");
+      git("commit", "-qm", "init");
+      const hooks = path.join(fixture.rootDir, "configured hooks");
+      await fsPromises.mkdir(hooks);
+      const log = path.join(fixture.rootDir, "hook-contract");
+      const hook = path.join(hooks, "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        `#!/bin/sh\nprintf '%s\\n' "$1" "$2" "$3" "$PWD" "$GIT_DIR" > "${log}"\n`
+      );
+      await fsPromises.chmod(hook, 0o755);
+      git("config", "core.hooksPath", hooks);
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "sha256-source",
+        trunkBranch: "main",
+        trusted: true,
+        skipRemoteSync: true,
+        initLogger: fixture.initLogger,
+      });
+      if (!result.success || !result.workspacePath) throw new Error(JSON.stringify(result));
+      const tip = git("rev-parse", "sha256-source");
+      const gitDir = execFileSync("git", [
+        "-C",
+        result.workspacePath,
+        "rev-parse",
+        "--absolute-git-dir",
+      ])
+        .toString()
+        .trim();
+      expect((await fsPromises.readFile(log, "utf8")).trim().split("\n")).toEqual([
+        "0".repeat(tip.length),
+        tip,
+        "1",
+        result.workspacePath,
+        gitDir,
+      ]);
+      expect(tip.length).toBe(64);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("restores the reserved branch when a trusted hook changes HEAD and fails", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const branchName = "source-failed-hook";
+    const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+    try {
+      execFileSync("git", ["branch", "hook-moved-head"], { cwd: fixture.projectPath });
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        '#!/bin/sh\ngit -c core.hooksPath=/dev/null checkout hook-moved-head\nprintf "deliberate hook failure\\n" >&2\nexit 1\n'
+      );
+      await fsPromises.chmod(hook, 0o755);
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      if (!result.success || !result.pendingMaterialization)
+        throw new Error("Expected reservation");
+      const failure = await fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain("deliberate hook failure");
+      expect(
+        execFileSync("git", ["-C", workspacePath, "branch", "--show-current"]).toString().trim()
+      ).toBe(branchName);
+      expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("detaches instead of re-attaching when the branch is claimed during the hook switch", async () => {
+    const branchName = "feature-claimed-in-gap";
+    const fixture = await createWorktreeManagerFixture();
+    const rival = path.join(fixture.rootDir, "rival");
+    const realExecFile = disposableExec.execFileAsync;
+    // Claim the branch from another worktree in the instant HEAD sits on the placeholder.
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExecFile(file, args, options);
+        if (
+          file === "git" &&
+          args.includes("symbolic-ref") &&
+          args.some((arg) => arg.startsWith("refs/heads/xum-unborn-"))
+        ) {
+          const result = proc.result;
+          Object.defineProperty(proc, "result", {
+            value: result.then((output) => {
+              execFileSync("git", ["worktree", "add", "--no-checkout", rival, branchName], {
+                cwd: fixture.projectPath,
+                stdio: "ignore",
+              });
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: false,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      // Reserve without hooks, then exercise legacy hook recovery directly.
+      const failure = await fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization!,
+          { legacyHookCheckout: true }
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/already (checked out|used by worktree)/);
+      // The rival keeps the branch alone; this worktree stays usable, detached at the tip.
+      const holders = execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: fixture.projectPath,
+      })
+        .toString()
+        .split("\n\n")
+        .filter((block) => block.includes(`branch refs/heads/${branchName}`))
+        .map((block) => block.split("\n")[0]);
+      expect(holders).toEqual([`worktree ${rival}`]);
+      expect(
+        execFileSync("git", ["rev-parse", "HEAD"], { cwd: result.workspacePath }).toString().trim()
+      ).toBe(
+        execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+          .toString()
+          .trim()
+      );
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath }).toString()
+      ).toBe("");
+      expect(await fsPromises.readFile(path.join(result.workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("refuses to overwrite files written into the reserved worktree and returns to the branch", async () => {
+    const branchName = "feature-stray-file";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      // The workspace is already announced, so a terminal or editor can write here first.
+      const strayFile = path.join(result.workspacePath, "README.md");
+      await fsPromises.writeFile(strayFile, "user data\n");
+
+      const failure = await fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization!
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain("README.md");
+      expect(await fsPromises.readFile(strayFile, "utf8")).toBe("user data\n");
+      // The retained workspace stays on its branch rather than the checkout placeholder, with
+      // an index that matches it: the stray file reads as a modification, not as every tracked
+      // file staged for deletion.
+      expect(
+        execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(`refs/heads/${branchName}`);
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath })
+          .toString()
+          .trimEnd()
+      ).toBe(" M README.md");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("cancelling a deferred checkout also stops the helpers it spawned", async () => {
+    const branchName = "feature-stalled-smudge";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const pidFile = path.join(fixture.rootDir, "smudge-pids");
+      const shim = path.join(fixture.rootDir, "stalled-smudge.sh");
+      await fsPromises.writeFile(
+        shim,
+        `#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' "$$" "$!" > "${pidFile}"\nwait\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(shim, 0o755);
+      await fsPromises.writeFile(
+        path.join(fixture.projectPath, ".gitattributes"),
+        "README.md filter=stall\n"
+      );
+      execFileSync("git", ["add", ".gitattributes"], { cwd: fixture.projectPath, stdio: "ignore" });
+      execFileSync("git", ["commit", "-qm", "stall the checkout"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "filter.stall.smudge", shim], { cwd: fixture.projectPath });
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const controller = new AbortController();
+      const materialize = fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+            abortSignal: controller.signal,
+          },
+          result.pendingMaterialization!
+        )
+        .then(
+          () => "resolved",
+          () => "rejected"
+        );
+      const deadline = Date.now() + 5_000;
+      let pids: number[] = [];
+      while (Date.now() < deadline && pids.length !== 2) {
+        pids = await fsPromises.readFile(pidFile, "utf-8").then(
+          (content) => content.trim().split("\n").map(Number),
+          () => []
+        );
+        if (pids.length !== 2) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(pids).toHaveLength(2);
+      controller.abort();
+      expect(await materialize).toBe("rejected");
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("deletes a reserved worktree that was never materialized", async () => {
+    const branchName = "feature-deferred-cancelled";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      // Cancelling creation removes with force: git reports a reserved worktree's missing
+      // files as deletions, so a plain `worktree remove` would refuse it.
+      const deleteResult = await fixture.manager.deleteWorkspace(
+        fixture.projectPath,
+        branchName,
+        true,
+        true
+      );
+      expect(deleteResult.success).toBe(true);
+      const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+      expect(existsSync(workspacePath)).toBe(false);
+      expect(
+        execFileSync("git", ["branch", "--list", branchName], { cwd: fixture.projectPath })
+          .toString()
+          .trim()
+      ).toBe("");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("runs post-checkout with the new-worktree arguments of a plain worktree add", async () => {
+    const branchName = "feature-hook-contract";
+    const fixture = await createWorktreeManagerFixture();
+    const hookLog = path.join(fixture.rootDir, "post-checkout-args");
+    try {
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        '#!/bin/sh\nprintf "%s %s %s" "$1" "$2" "$3" >> "' + hookLog + '"\n'
+      );
+      await fsPromises.chmod(hook, 0o755);
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+      });
+      expect(result.success).toBe(true);
+      const tip = execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+        .toString()
+        .trim();
+      expect(await fsPromises.readFile(hookLog, "utf8")).toBe(`${"0".repeat(40)} ${tip} 1`);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("checks out a linked worktree when submodule.recurse is enabled", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const submodulePath = path.join(fixture.rootDir, "sub");
+      await fsPromises.mkdir(submodulePath);
+      initGitRepo(submodulePath);
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", submodulePath, "sub"],
+        { cwd: fixture.projectPath, stdio: "ignore" }
+      );
+      execFileSync("git", ["commit", "-qm", "add submodule"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "submodule.recurse", "true"], { cwd: fixture.projectPath });
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-submodules",
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        // The later submodule sync clones from a local path; git only honors this
+        // permission from command-line scope, never from repository config.
+        env: {
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "protocol.file.allow",
+          GIT_CONFIG_VALUE_0: "always",
+        },
+      });
+      expect(result).toEqual({
+        success: true,
+        workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, "feature-submodules"),
+        createdBranch: true,
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("skips repo-configured upload-pack commands when project automation is disabled", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const marker = path.join(fixture.rootDir, "upload-pack-ran");
+    const uploadPack = path.join(fixture.rootDir, "upload-pack.sh");
+    const previous = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+
+    try {
+      await fsPromises.writeFile(
+        uploadPack,
+        `#!/bin/sh\nprintf ran > "${marker}"\nexit 1\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(uploadPack, 0o755);
+      execFileSync("git", ["remote", "add", "origin", "."], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "remote.origin.uploadpack", uploadPack], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      const steps: string[] = [];
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-no-upload-pack",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStep: (message) => steps.push(message),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(steps).toContain(
+        "Skipping origin fetch while project automation is disabled; using local state."
+      );
+      const uploadPackRan = await fsPromises.access(marker).then(
+        () => true,
+        () => false
+      );
+      expect(uploadPackRan).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      } else {
+        process.env.XUM_DISABLE_PROJECT_AUTOMATION = previous;
+      }
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("bounds a stalled origin fetch, kills its process tree, and falls back to the local trunk", async () => {
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 1_000 });
+
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const stderrLines: string[] = [];
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-stalled-fetch",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStderr: (line) => stderrLines.push(line),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) {
+        throw new Error("Expected createWorkspace to fall back to the local trunk");
+      }
+      expect(stderrLines.some((line) => line.includes("did not finish within"))).toBe(true);
+      expect(gitRevParseHead(result.workspacePath)).toBe(gitRevParseHead(fixture.projectPath));
+
+      const pids = await stall.waitForPids();
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps caller cancellation a cancellation while the origin fetch stalls", async () => {
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 30_000 });
+
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const controller = new AbortController();
+      const stderrLines: string[] = [];
+      const workspacePath = fixture.manager.getWorkspacePath(
+        fixture.projectPath,
+        "feature-cancelled-fetch"
+      );
+
+      const pending = fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-cancelled-fetch",
+        trunkBranch: "main",
+        trusted: true,
+        abortSignal: controller.signal,
+        initLogger: {
+          ...fixture.initLogger,
+          logStderr: (line) => stderrLines.push(line),
+        },
+      });
+      const pids = await stall.waitForPids();
+      controller.abort();
+      const result = await pending;
+
+      expect(result.success).toBe(false);
+      expect(stderrLines).toEqual([]);
+      const workspaceExists = await fsPromises.access(workspacePath).then(
+        () => true,
+        () => false
+      );
+      expect(workspaceExists).toBe(false);
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("bases new branches on the freshly fetched origin trunk", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      const remotePath = path.join(fixture.rootDir, "remote");
+      execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], {
+        stdio: "ignore",
+      });
+      execSync(
+        'git config user.email "test@example.com" && git config user.name "test" && ' +
+          'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
+        { cwd: remotePath, stdio: "ignore" }
+      );
+      execFileSync("git", ["remote", "add", "origin", remotePath], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      const remoteHead = gitRevParseHead(remotePath);
+      expect(remoteHead).not.toBe(gitRevParseHead(fixture.projectPath));
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-fresh-origin",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: fixture.initLogger,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) {
+        throw new Error("Expected createWorkspace to return a workspace path");
+      }
+      expect(gitRevParseHead(result.workspacePath)).toBe(remoteHead);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("uses a sanitized directory for slash branch names and persists the mapping", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const branchName = "feature/foo";
+    const directoryName = "feature-foo";
 
     try {
       const result = await fixture.manager.createWorkspace({
@@ -185,6 +1494,14 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result.workspacePath).toBe(
         fixture.manager.getWorkspacePath(fixture.projectPath, directoryName)
       );
+      const nestedBranchDirectoryExists = await fsPromises
+        .access(fixture.manager.getWorkspacePath(fixture.projectPath, "feature"))
+        .then(
+          () => true,
+          () => false
+        );
+      expect(nestedBranchDirectoryExists).toBe(false);
+
       const checkedOutBranch = execSync("git branch --show-current", {
         cwd: result.workspacePath,
         stdio: ["ignore", "pipe", "ignore"],
@@ -192,6 +1509,13 @@ describe("WorktreeManager.createWorkspace", () => {
         .toString()
         .trim();
       expect(checkedOutBranch).toBe(branchName);
+
+      const branchMapPath = path.join(fixture.projectPath, ".git", "mux-workspace-branches.json");
+      const branchMap = JSON.parse(await fsPromises.readFile(branchMapPath, "utf8")) as Record<
+        string,
+        string
+      >;
+      expect(branchMap[directoryName]).toBe(branchName);
     } finally {
       await fixture.cleanup();
     }
@@ -250,9 +1574,128 @@ describe("WorktreeManager.renameWorkspace", () => {
       await fixture.cleanup();
     }
   }, 20_000);
+
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      const oldName = "rename-preflight-old";
+      const createResult = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: oldName,
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+
+      const result = await fixture.manager.renameWorkspace(
+        fixture.projectPath,
+        oldName,
+        "rename-preflight-new",
+        false
+      );
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected renameWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+});
+
+describe("WorktreeManager.renameWorkspace undo (#4779)", () => {
+  const branchOf = (cwd: string) =>
+    execFileSync("git", ["branch", "--show-current"], { cwd, encoding: "utf8" }).trim();
+
+  it.each([
+    // Diverged: directory "foo" tracks branch "bar", renamed to "bar". The forward move leaves the
+    // branch alone, and deriving the undo from names alone would rename "bar" to "foo".
+    { label: "diverged", branchName: "bar", expectedRenamed: false },
+    { label: "name-tracking", branchName: "foo", expectedRenamed: true },
+  ])("$label: undo restores the branch the rename found", async (c) => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { manager, projectPath, initLogger } = fixture;
+      const created = await manager.createWorkspace({
+        projectPath,
+        branchName: c.branchName,
+        directoryName: "foo",
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger,
+      });
+      expect(created.success).toBe(true);
+
+      const forward = await manager.renameWorkspace(projectPath, "foo", "bar", true);
+      if (!forward.success) throw new Error(forward.error);
+      expect(forward.branchRenamed).toBe(c.expectedRenamed);
+
+      const undo = await manager.renameWorkspace(projectPath, "bar", "foo", true, {
+        renameBranch: forward.branchRenamed,
+      });
+      if (!undo.success) throw new Error(undo.error);
+      expect(undo.newPath).toBe(forward.oldPath);
+      expect(branchOf(forward.oldPath)).toBe(c.branchName);
+      // The mapping follows too: a later ordinary rename still sees the original branch.
+      const later = await manager.renameWorkspace(projectPath, "foo", "baz", true);
+      if (!later.success) throw new Error(later.error);
+      expect(branchOf(later.newPath)).toBe(c.expectedRenamed ? "baz" : c.branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {
+  it("keeps returning declared results and force-deletes when the main checkout is gone", async () => {
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
+
+    try {
+      const { projectPath, manager, initLogger } = fixture;
+      const branchName = "feature-stale-cleanup";
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName,
+        trunkBranch: "main",
+        initLogger,
+      });
+      expect(createResult.success).toBe(true);
+      if (!createResult.success) return;
+      if (!createResult.workspacePath) {
+        throw new Error("Expected workspacePath from createWorkspace");
+      }
+      const workspacePath = createResult.workspacePath;
+
+      // Simulate a deleted main checkout with a stale managed workspace left
+      // behind: repo-aware filter discovery fails closed for it.
+      await fsPromises.rm(projectPath, { recursive: true, force: true });
+
+      const preflight = await manager.canDeleteWorkspaceWithoutForce(projectPath, branchName);
+      expect(preflight.success).toBe(false);
+
+      const nonForce = await manager.deleteWorkspace(projectPath, branchName, false);
+      expect(nonForce.success).toBe(false);
+
+      const forced = await manager.deleteWorkspace(projectPath, branchName, true);
+      expect(forced.success).toBe(true);
+      const workspaceRemains = await fsPromises.access(workspacePath).then(
+        () => true,
+        () => false
+      );
+      expect(workspaceRemains).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("deletes non-agent branches when removing worktrees (force)", async () => {
     const fixture = await createWorktreeManagerFixture({
       tempDirPrefix: "worktree-manager-delete-",

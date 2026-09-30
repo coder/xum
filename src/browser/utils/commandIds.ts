@@ -21,13 +21,19 @@ export const CommandIds = {
   workspaceSwitch: (workspaceId: string) =>
     `${COMMAND_ID_PREFIXES.WS_SWITCH}${workspaceId}` as const,
   workspaceNew: () => "ws:new" as const,
+  workspaceNewScratch: () => "ws:new-scratch" as const,
   workspaceNewInProject: () => "ws:new-in-project" as const,
   workspaceNewMultiProject: () => "ws:new-multi-project" as const,
   workspaceRemove: () => "ws:remove" as const,
+  workspaceRemoveSubagent: () => "ws:remove-subagent" as const,
+  workspaceKeepInterruptedDelegated: () => "ws:keep-interrupted-delegated" as const,
   workspaceRemoveAny: () => "ws:remove-any" as const,
   workspaceEditTitle: () => "ws:edit-title" as const,
   workspaceEditTitleAny: () => "ws:edit-title-any" as const,
   workspaceGenerateTitle: () => "ws:generate-title" as const,
+  workspaceTogglePinned: () => "ws:toggle-pinned" as const,
+  workspaceMovePinnedUp: () => "ws:move-pinned-up" as const,
+  workspaceMovePinnedDown: () => "ws:move-pinned-down" as const,
   workspaceOpenTerminal: () => "ws:open-terminal" as const,
   workspaceOpenTerminalCurrent: () => "ws:open-terminal-current" as const,
   workspaceArchiveMergedInProject: () => "ws:archive-merged-in-project" as const,
@@ -36,6 +42,9 @@ export const CommandIds = {
   navNext: () => "nav:next" as const,
   navPrev: () => "nav:prev" as const,
   navToggleSidebar: () => "nav:toggleSidebar" as const,
+  navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
+  navToggleFlatChatList: () => "nav:toggle-flat-chat-list" as const,
+  navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,
@@ -60,12 +69,17 @@ export const CommandIds = {
   chatInterrupt: () => "chat:interrupt" as const,
   chatJumpBottom: () => "chat:jumpBottom" as const,
   chatVoiceInput: () => "chat:voiceInput" as const,
+  chatRunLatestPlanAction: () => "chat:runLatestPlanAction" as const,
   chatClearTimingStats: () => "chat:clearTimingStats" as const,
 
   // Mode commands
   modeToggle: () => "mode:toggle" as const,
   modelChange: () => "model:change" as const,
   thinkingSetLevel: () => "thinking:set-level" as const,
+  toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
+  toggleFastMode: () => "thinking:toggle-fast-mode" as const,
+  toggleAutoRouting: (dimension: "model" | "thinkingLevel") =>
+    `auto-routing:toggle:${dimension}` as const,
 
   // Project commands
   projectAdd: () => "project:add" as const,
@@ -85,9 +99,27 @@ export const CommandIds = {
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
+  settingsToggleKeepScreenAwake: () => "settings:toggle-keep-screen-awake" as const,
+  openServerWindow: () => "remote-connection:open-server-window" as const,
+  coderDisconnect: () => "providers:coder:disconnect" as const,
+  coderRefreshModels: () => "providers:coder:refresh-models" as const,
+
+  // Agent Plugin commands (agent-plugins experiment)
+  pluginsInstall: () => "plugins:install" as const,
+  pluginsManageComponents: () => "plugins:manage-components" as const,
+  pluginsUninstall: () => "plugins:uninstall" as const,
+  pluginsCheckUpdates: () => "plugins:check-updates" as const,
+  pluginsUpdateAll: () => "plugins:update-all" as const,
+  pluginsUpdateOne: () => "plugins:update-one" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,
+  aboutOpen: () => "about:open" as const,
+  updateCheck: () => "update:check" as const,
+  updateDownload: () => "update:download" as const,
+  updateInstall: () => "update:install" as const,
+  updateInstallForce: () => "update:install-force" as const,
+  updateChannel: (channel: string) => `update:channel:${channel}` as const,
 } as const;
 
 /**

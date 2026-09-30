@@ -1,5 +1,7 @@
+import { Duration, Effect, Exit, Schedule, Scope, type Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import type { MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { WorkspaceActivitySnapshot, WorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -7,16 +9,21 @@ import {
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  isValidHeartbeatScheduleUpdatedAt,
+  resolveHeartbeatSchedulePolicy,
+  type HeartbeatTrigger,
 } from "@/constants/heartbeat";
 import type { Config } from "@/node/config";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { IdleDispatcher, type IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import type { TaskService } from "./taskService";
+import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import type { WorkspaceService } from "./workspaceService";
 
-const STARTUP_DELAY_MS = 60 * 1000; // 60s - let startup settle
-const CHECK_INTERVAL_MS = 30 * 1000; // 30s tick
+export const STARTUP_DELAY_MS = 60 * 1000; // 60s - let startup settle
+export const CHECK_INTERVAL_MS = 30 * 1000; // 30s tick
 const MAX_CONCURRENT_HEARTBEATS = 1;
 const HEARTBEAT_IDLE_CONSUMER_NAME = "heartbeat";
 const HEARTBEAT_IDLE_CONSUMER_PRIORITY = 50;
@@ -26,19 +33,64 @@ interface HeartbeatEligibilityResult {
   reason?: string;
 }
 
+/**
+ * Next deadline for a fixed-interval (trigger: "interval") heartbeat after a firing.
+ *
+ * Anchors at `firedAt` (not dispatch end) so dispatch duration never drifts the cadence:
+ * nextDeadline = firedAt + k*intervalMs for the smallest k >= 1 with nextDeadline > now.
+ * k > 1 only when the attempt ran longer than an interval — missed slots are never
+ * burst-fired; the anchor simply advances so subsequent deadlines stay aligned.
+ */
+export function advanceAnchoredDeadline(firedAt: number, intervalMs: number, now: number): number {
+  assert(
+    Number.isFinite(firedAt) && Number.isFinite(now) && now >= firedAt,
+    "advanceAnchoredDeadline requires finite timestamps with now >= firedAt"
+  );
+  assert(
+    Number.isFinite(intervalMs) && intervalMs > 0,
+    "advanceAnchoredDeadline requires a positive interval"
+  );
+
+  const intervalsElapsed = Math.floor((now - firedAt) / intervalMs);
+  return firedAt + (intervalsElapsed + 1) * intervalMs;
+}
+
 export class HeartbeatService {
   private readonly config: Config;
   private readonly extensionMetadata: ExtensionMetadataService;
   private readonly workspaceService: WorkspaceService;
   private readonly taskService: TaskService;
   private readonly idleDispatcher: IdleDispatcher;
+  /**
+   * Runs the lifecycle effects below (scope acquisition, scheduler fork, scope
+   * close). Context-bound in the app (so the scheduler fiber reads the
+   * runtime's `Clock` — a `TestClock` in tests); the global runtime by default.
+   */
+  private readonly runner: EffectRunner;
 
-  private startupTimeout: ReturnType<typeof setTimeout> | null = null;
-  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
+
+  // The scheduler runs as a single Effect fiber forked into `lifecycleScope`:
+  // sleep(STARTUP_DELAY_MS), then tick immediately and every CHECK_INTERVAL_MS.
+  // The legacy two-field shape is preserved because it is the observable
+  // lifecycle contract (tests pin the null/non-null progression):
+  // `startupTimeout` holds the fiber while the startup delay is pending and
+  // `checkInterval` holds it once the periodic ticker is live.
+  private startupTimeout: Fiber.Fiber<void> | null = null;
+  private checkInterval: Fiber.Fiber<void> | null = null;
+  /**
+   * Owns every resource start() acquires — idle-consumer registration,
+   * workspace event listeners, and the scheduler fiber. Closing it releases
+   * them in reverse acquisition order (fiber interrupt, listeners off,
+   * consumer dispose — the same order the hand-rolled stop() used) and is
+   * guaranteed to run them even when a later startup step throws.
+   */
+  private lifecycleScope: Scope.Closeable | null = null;
   private stopped = true;
 
   private readonly nextEligibleAtByWorkspaceId = new Map<string, number>();
   private readonly trackedIntervalMsByWorkspaceId = new Map<string, number>();
+  private readonly trackedTriggerByWorkspaceId = new Map<string, HeartbeatTrigger>();
   private readonly activeWorkspaceIds = new Set<string>();
   private readonly queuedWorkspaceIds = new Set<string>();
   private isProcessingQueue = false;
@@ -60,16 +112,22 @@ export class HeartbeatService {
     extensionMetadata: ExtensionMetadataService,
     workspaceService: WorkspaceService,
     taskService: TaskService,
-    idleDispatcher?: IdleDispatcher
+    idleDispatcher?: IdleDispatcher,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.config = config;
     this.extensionMetadata = extensionMetadata;
     this.workspaceService = workspaceService;
     this.taskService = taskService;
     this.idleDispatcher = idleDispatcher ?? new IdleDispatcher();
+    this.runner = runner;
 
     this.onActivity = (event) => this.handleActivityEvent(event);
     this.onMetadata = (event) => this.handleMetadataEvent(event);
+  }
+
+  setTimelineRecorder(recorder: TimelineRecorder): void {
+    this.timelineRecorder = recorder;
   }
 
   start(): void {
@@ -81,25 +139,90 @@ export class HeartbeatService {
     this.stopped = false;
     this.lifecycleVersion += 1;
 
-    this.heartbeatConsumerDisposer = this.idleDispatcher.registerConsumer({
-      name: HEARTBEAT_IDLE_CONSUMER_NAME,
-      priority: HEARTBEAT_IDLE_CONSUMER_PRIORITY,
-      buildPayload: (workspaceId) => this.buildHeartbeatDispatchPayload(workspaceId),
-    });
-    this.workspaceService.on("activity", this.onActivity);
-    this.workspaceService.on("metadata", this.onMetadata);
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    const scope = Scope.makeUnsafe();
+    this.lifecycleScope = scope;
 
-    this.startupTimeout = setTimeout(() => {
-      if (this.stopped) {
+    const scheduler = Effect.gen(function* () {
+      yield* Effect.sleep(Duration.millis(STARTUP_DELAY_MS));
+      // Defensive parity with the legacy setTimeout callback: interruption via
+      // stop() already prevents this resumption, so a stopped service must
+      // never transition into the ticking phase even if a wake-up raced it.
+      if (self.stopped) {
         return;
       }
 
+      // Startup delay elapsed: the same fiber now becomes the periodic ticker.
+      self.checkInterval = self.startupTimeout;
+      self.startupTimeout = null;
+      // Effect.repeat runs the first tick immediately (matching the legacy
+      // direct tick() call when the startup timer fired), then Schedule.fixed
+      // reproduces setInterval cadence: wall-clock anchored, no burst catch-up.
+      // tick() is synchronous fire-and-forget, so the body never delays a slot.
+      yield* Effect.sync(() => self.tick()).pipe(
+        Effect.repeat(Schedule.fixed(Duration.millis(CHECK_INTERVAL_MS)))
+      );
+    });
+
+    const acquireResources = Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.heartbeatConsumerDisposer = self.idleDispatcher.registerConsumer({
+            name: HEARTBEAT_IDLE_CONSUMER_NAME,
+            priority: HEARTBEAT_IDLE_CONSUMER_PRIORITY,
+            buildPayload: (workspaceId) => self.buildHeartbeatDispatchPayload(workspaceId),
+          });
+        }),
+        () =>
+          Effect.sync(() => {
+            self.heartbeatConsumerDisposer?.();
+            self.heartbeatConsumerDisposer = null;
+          })
+      );
+      // One acquireRelease per listener: a combined acquisition would install
+      // its finalizer only after BOTH .on() calls succeed, so a throw from the
+      // second registration (e.g. a `newListener` hook) would leak the first
+      // listener across start() retries (Codex P2 on #4031).
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.workspaceService.on("activity", self.onActivity);
+        }),
+        () =>
+          Effect.sync(() => {
+            self.workspaceService.off("activity", self.onActivity);
+          })
+      );
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.workspaceService.on("metadata", self.onMetadata);
+        }),
+        () =>
+          Effect.sync(() => {
+            self.workspaceService.off("metadata", self.onMetadata);
+          })
+      );
+      self.startupTimeout = yield* Effect.forkIn(scheduler, scope);
+    });
+
+    try {
+      // Runs synchronously: acquisitions are Effect.sync and forkIn executes
+      // the scheduler up to its first sleep before returning, so the startup
+      // timer is registered before start() returns (same observable ordering
+      // as the previous setTimeout call).
+      this.runner.runSync(Scope.provide(scope)(acquireResources));
+    } catch (error) {
+      // Guaranteed cleanup on partial startup failure: close the scope so the
+      // finalizers registered before the failing step run (the hand-rolled
+      // version leaked earlier acquisitions here), restore the stopped state
+      // so a later start() retry is possible, then surface the error.
+      this.lifecycleScope = null;
       this.startupTimeout = null;
-      this.tick();
-      this.checkInterval = setInterval(() => {
-        this.tick();
-      }, CHECK_INTERVAL_MS);
-    }, STARTUP_DELAY_MS);
+      this.checkInterval = null;
+      this.stopped = true;
+      this.runner.runSync(Scope.close(scope, Exit.void));
+      throw error;
+    }
 
     log.info("HeartbeatService started", {
       startupDelayMs: STARTUP_DELAY_MS,
@@ -111,28 +234,35 @@ export class HeartbeatService {
     this.stopped = true;
     this.lifecycleVersion += 1;
 
-    if (this.startupTimeout) {
-      clearTimeout(this.startupTimeout);
-      this.startupTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
-    }
+    // Captured before teardown for the shutdown log below.
+    const schedulerPhase =
+      this.checkInterval != null
+        ? "ticking"
+        : this.startupTimeout != null
+          ? "startup_delay"
+          : "not_started";
 
-    this.workspaceService.off("activity", this.onActivity);
-    this.workspaceService.off("metadata", this.onMetadata);
-    this.heartbeatConsumerDisposer?.();
-    this.heartbeatConsumerDisposer = null;
+    if (this.lifecycleScope) {
+      const scope = this.lifecycleScope;
+      this.lifecycleScope = null;
+      // Releases everything start() acquired, in reverse acquisition order:
+      // scheduler fiber interrupt (synchronously clearing its pending timer),
+      // listeners off, consumer disposer — completing synchronously because
+      // the fiber only ever suspends on its clock timer.
+      this.runner.runSync(Scope.close(scope, Exit.void));
+    }
+    this.startupTimeout = null;
+    this.checkInterval = null;
 
     this.nextEligibleAtByWorkspaceId.clear();
     this.trackedIntervalMsByWorkspaceId.clear();
+    this.trackedTriggerByWorkspaceId.clear();
     this.activeWorkspaceIds.clear();
     this.queuedWorkspaceIds.clear();
     this.isProcessingQueue = false;
     this.tickInFlight = false;
 
-    log.info("HeartbeatService stopped");
+    log.info("HeartbeatService stopped", { schedulerPhase });
   }
 
   private tick(): void {
@@ -195,15 +325,29 @@ export class HeartbeatService {
         configuredWorkspaceIds.add(workspaceId);
         const trackingIntervalMs = this.getTrackingIntervalMsForWorkspace(workspace, config);
         if (trackingIntervalMs != null) {
+          const trigger = resolveHeartbeatSchedulePolicy(workspace.heartbeat).trigger;
           const nextEligibleAt = this.nextEligibleAtByWorkspaceId.has(workspaceId)
             ? now + trackingIntervalMs
-            : this.deriveInitialNextEligibleAt(
-                now,
-                workspaceId,
-                trackingIntervalMs,
-                activitySnapshots.get(workspaceId)
-              );
-          this.ensureTrackedWorkspace(workspaceId, nextEligibleAt, trackingIntervalMs);
+            : trigger === "interval"
+              ? await this.deriveInitialIntervalNextEligibleAt(
+                  now,
+                  workspaceId,
+                  trackingIntervalMs,
+                  activitySnapshots.get(workspaceId),
+                  workspace.heartbeat?.scheduleUpdatedAt
+                )
+              : this.deriveInitialNextEligibleAt(
+                  now,
+                  workspaceId,
+                  trackingIntervalMs,
+                  activitySnapshots.get(workspaceId)
+                );
+          // Re-check after the potential await above: a stop()/restart mid-derivation
+          // must not re-track a stale entry.
+          if (this.lifecycleVersion !== lifecycleVersion) {
+            return;
+          }
+          this.ensureTrackedWorkspace(workspaceId, nextEligibleAt, trackingIntervalMs, trigger);
           continue;
         }
 
@@ -219,6 +363,83 @@ export class HeartbeatService {
         this.purgeWorkspace(workspaceId, "config_resync_missing");
       }
     }
+  }
+
+  /**
+   * Initial deadline for fixed-interval schedules after a restart/resync-add.
+   *
+   * Fixed schedules are activity-independent, so re-anchoring them to activity recency
+   * would let a user interaction just before a restart push the next firing out (an edit
+   * at 10:25 must not move a 10:30 firing to 10:55). The last firing is already persisted
+   * as the heartbeat-request user message in chat history — anchor there: in-window
+   * schedules keep their cadence and overdue ones fire once immediately (max with now,
+   * never a burst). A firing that predates the last cadence-affecting settings edit
+   * (scheduleUpdatedAt) loses to the edit: the live path re-anchored the fixed cadence at
+   * the edit, so an idle-era or old-interval firing must not pull the restart deadline
+   * earlier. Workspaces with no recorded firing (never fired, or the record was compacted
+   * away) fall back to the activity-recency approximation used by idle triggers, which is
+   * never earlier than the edit anchor because setHeartbeatSettings persists that recency.
+   */
+  private async deriveInitialIntervalNextEligibleAt(
+    now: number,
+    workspaceId: string,
+    trackingIntervalMs: number,
+    activity: WorkspaceActivitySnapshot | undefined,
+    scheduleUpdatedAt: number | null | undefined
+  ): Promise<number> {
+    assert(
+      Number.isFinite(now),
+      "HeartbeatService.deriveInitialIntervalNextEligibleAt requires a finite timestamp"
+    );
+
+    // Future timestamps (clock skew) are ignored the same way skewed firing records are.
+    const editAnchor =
+      isValidHeartbeatScheduleUpdatedAt(scheduleUpdatedAt) && scheduleUpdatedAt <= now
+        ? scheduleUpdatedAt
+        : undefined;
+
+    try {
+      const history = await this.workspaceService.getChatHistory(workspaceId);
+      for (let i = history.length - 1; i >= 0; i -= 1) {
+        const message = history[i];
+        if (message?.role !== "user") {
+          continue;
+        }
+        const metadata = message.metadata;
+        const muxMetadata = metadata?.muxMetadata;
+        if (metadata == null || muxMetadata?.type !== "heartbeat-request") {
+          continue;
+        }
+
+        // Queue-mode busy deliveries write the history row only after the running turn
+        // finishes, so the row timestamp can be minutes after the slot fired — anchoring
+        // there would drift the fixed cadence across restarts. Prefer the persisted fire
+        // time (matching the live advanceAnchoredDeadline anchor); rows without it
+        // (pre-firedAt records) fall back to the row timestamp.
+        const persistedFiredAt = muxMetadata.firedAt;
+        const firedAt =
+          typeof persistedFiredAt === "number" &&
+          Number.isFinite(persistedFiredAt) &&
+          persistedFiredAt <= now
+            ? persistedFiredAt
+            : metadata.timestamp;
+        // Newest firing record wins; an unusable timestamp (missing/overflowed/future
+        // clock skew) falls through to the recency fallback rather than scanning older,
+        // even staler records.
+        if (typeof firedAt !== "number" || !Number.isFinite(firedAt) || firedAt > now) {
+          break;
+        }
+        const anchor = editAnchor != null ? Math.max(firedAt, editAnchor) : firedAt;
+        return Math.max(anchor + trackingIntervalMs, now);
+      }
+    } catch (error) {
+      log.warn("HeartbeatService: failed to derive interval anchor from history", {
+        workspaceId,
+        error,
+      });
+    }
+
+    return this.deriveInitialNextEligibleAt(now, workspaceId, trackingIntervalMs, activity);
   }
 
   private deriveInitialNextEligibleAt(
@@ -272,7 +493,8 @@ export class HeartbeatService {
   private ensureTrackedWorkspace(
     workspaceId: string,
     nextEligibleAt: number,
-    trackingIntervalMs: number
+    trackingIntervalMs: number,
+    trigger: HeartbeatTrigger
   ): void {
     assert(
       workspaceId.trim().length > 0,
@@ -289,12 +511,22 @@ export class HeartbeatService {
 
     const previousNextEligibleAt = this.nextEligibleAtByWorkspaceId.get(workspaceId);
     const previousIntervalMs = this.trackedIntervalMsByWorkspaceId.get(workspaceId);
-    if (previousNextEligibleAt != null && previousIntervalMs === trackingIntervalMs) {
+    const previousTrigger = this.trackedTriggerByWorkspaceId.get(workspaceId);
+    // A trigger change must refresh the deadline even when intervalMs is unchanged:
+    // an idle→interval edit re-anchors the fixed cadence at the edit (instead of
+    // inheriting the stale idle countdown), and interval→idle starts a fresh
+    // time-since-activity countdown.
+    if (
+      previousNextEligibleAt != null &&
+      previousIntervalMs === trackingIntervalMs &&
+      previousTrigger === trigger
+    ) {
       return;
     }
 
     this.nextEligibleAtByWorkspaceId.set(workspaceId, nextEligibleAt);
     this.trackedIntervalMsByWorkspaceId.set(workspaceId, trackingIntervalMs);
+    this.trackedTriggerByWorkspaceId.set(workspaceId, trigger);
     log.debug(
       previousNextEligibleAt == null
         ? "HeartbeatService: tracking workspace"
@@ -303,8 +535,10 @@ export class HeartbeatService {
         workspaceId,
         previousNextEligibleAt,
         previousIntervalMs,
+        previousTrigger,
         nextEligibleAt,
         trackingIntervalMs,
+        trigger,
       }
     );
   }
@@ -315,6 +549,7 @@ export class HeartbeatService {
 
     const removedDeadline = this.nextEligibleAtByWorkspaceId.delete(workspaceId);
     const removedInterval = this.trackedIntervalMsByWorkspaceId.delete(workspaceId);
+    this.trackedTriggerByWorkspaceId.delete(workspaceId);
     const removedActive = this.activeWorkspaceIds.delete(workspaceId);
     const removedQueued = this.queuedWorkspaceIds.delete(workspaceId);
     if (!removedDeadline && !removedInterval && !removedActive && !removedQueued) {
@@ -348,14 +583,31 @@ export class HeartbeatService {
     }
 
     const config = this.config.loadConfigOrDefault();
-    const intervalMs = this.getHeartbeatIntervalMs(workspaceId, config);
+    const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
+    const intervalMs =
+      workspace?.heartbeat?.enabled === true
+        ? this.getSanitizedTrackingIntervalMs(
+            workspaceId,
+            workspace.heartbeat.intervalMs,
+            config,
+            "heartbeat_lookup"
+          )
+        : null;
     if (intervalMs == null) {
       this.purgeWorkspace(workspaceId, "activity_event_ineligible");
       return;
     }
 
+    // Fixed-interval heartbeats measure wall-clock cadence, not time-since-activity:
+    // activity must not push back the deadline.
+    const trigger = resolveHeartbeatSchedulePolicy(workspace?.heartbeat).trigger;
+    if (trigger === "interval") {
+      return;
+    }
+
     this.nextEligibleAtByWorkspaceId.set(workspaceId, Date.now() + intervalMs);
     this.trackedIntervalMsByWorkspaceId.set(workspaceId, intervalMs);
+    this.trackedTriggerByWorkspaceId.set(workspaceId, trigger);
     log.debug("HeartbeatService: activity event reset countdown", { workspaceId, intervalMs });
   }
 
@@ -394,25 +646,16 @@ export class HeartbeatService {
         return;
       }
 
-      this.ensureTrackedWorkspace(workspaceId, Date.now() + intervalMs, intervalMs);
+      this.ensureTrackedWorkspace(
+        workspaceId,
+        Date.now() + intervalMs,
+        intervalMs,
+        resolveHeartbeatSchedulePolicy(metadata.heartbeat).trigger
+      );
       return;
     }
 
     this.purgeWorkspace(workspaceId, "heartbeat_disabled");
-  }
-
-  private getHeartbeatIntervalMs(workspaceId: string, config: ProjectsConfig): number | null {
-    const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
-    if (workspace?.heartbeat?.enabled !== true) {
-      return null;
-    }
-
-    return this.getSanitizedTrackingIntervalMs(
-      workspaceId,
-      workspace.heartbeat.intervalMs,
-      config,
-      "heartbeat_lookup"
-    );
   }
 
   private checkAllWorkspaces(now: number): void {
@@ -478,6 +721,9 @@ export class HeartbeatService {
         this.queuedWorkspaceIds.delete(workspaceId);
         this.activeWorkspaceIds.add(workspaceId);
 
+        // Capture the fire time before dispatching so fixed-interval cadences exclude
+        // dispatch duration (see advanceAnchoredDeadline).
+        const firedAt = Date.now();
         try {
           await this.idleDispatcher.requestDispatch(workspaceId, HEARTBEAT_IDLE_CONSUMER_NAME);
         } catch (error) {
@@ -486,10 +732,22 @@ export class HeartbeatService {
           this.activeWorkspaceIds.delete(workspaceId);
           if (!this.stopped) {
             const config = this.config.loadConfigOrDefault();
-            const trackingIntervalMs = this.getTrackingIntervalMs(workspaceId, config);
+            const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
+            const trackingIntervalMs = workspace
+              ? this.getTrackingIntervalMsForWorkspace(workspace, config)
+              : null;
             if (trackingIntervalMs != null) {
-              this.nextEligibleAtByWorkspaceId.set(workspaceId, Date.now() + trackingIntervalMs);
+              // Every attempt (success, eligibility skip, or error) consumes its slot.
+              // Fixed-interval triggers stay anchored to the fire time; idle triggers
+              // keep today's fresh countdown from dispatch end.
+              const trigger = resolveHeartbeatSchedulePolicy(workspace?.heartbeat).trigger;
+              const nextEligibleAt =
+                trigger === "interval"
+                  ? advanceAnchoredDeadline(firedAt, trackingIntervalMs, Date.now())
+                  : Date.now() + trackingIntervalMs;
+              this.nextEligibleAtByWorkspaceId.set(workspaceId, nextEligibleAt);
               this.trackedIntervalMsByWorkspaceId.set(workspaceId, trackingIntervalMs);
+              this.trackedTriggerByWorkspaceId.set(workspaceId, trigger);
             } else {
               this.purgeWorkspace(workspaceId, "post_dispatch_ineligible");
             }
@@ -513,12 +771,23 @@ export class HeartbeatService {
         workspaceId,
         reason: eligibility.reason,
       });
+      this.timelineRecorder.record(workspaceId, {
+        kind: "heartbeat.skipped",
+        source: { system: "heartbeat" },
+        status: "skipped",
+        data: { reason: eligibility.reason },
+      });
       return null;
     }
 
     return {
       dispatch: async () => {
         log.info("HeartbeatService: executing heartbeat", { workspaceId });
+        this.timelineRecorder.record(workspaceId, {
+          kind: "heartbeat.dispatched",
+          source: { system: "heartbeat" },
+          status: "started",
+        });
         await this.workspaceService.executeHeartbeat(workspaceId);
       },
     };
@@ -546,23 +815,51 @@ export class HeartbeatService {
       return { eligible: false, reason: "child_workspace" };
     }
 
+    // Busy-related gates depend on the whenBusy policy: "skip" (the idle-trigger default)
+    // misses the slot exactly as before, while queue modes pass through so executeHeartbeat
+    // can deliver — enqueued at the requested boundary while streaming, or dispatched
+    // immediately when only descendant tasks are active (the session itself is idle then).
+    const deliverWhenBusy = resolveHeartbeatSchedulePolicy(workspace.heartbeat).whenBusy !== "skip";
+
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
-    if (activity?.streaming === true) {
+    const isStreaming = activity?.streaming === true;
+    if (isStreaming && !deliverWhenBusy) {
       return { eligible: false, reason: "currently_streaming" };
     }
-    if (this.taskService.hasActiveDescendantAgentTasksForWorkspace(workspaceId)) {
+    if (
+      this.taskService.hasActiveDescendantAgentTasksForWorkspace(workspaceId) &&
+      !deliverWhenBusy
+    ) {
       return { eligible: false, reason: "active_descendant_tasks" };
     }
 
     const history = await this.workspaceService.getChatHistory(workspaceId);
+    // Defensive even under queue modes: a fresh workspace that never completed a turn
+    // should not receive scheduled maintenance messages.
     if (history.length === 0 || !history.some((message) => message.role === "assistant")) {
       return { eligible: false, reason: "no_completed_turn" };
     }
 
-    const lastMessage = history[history.length - 1];
-    if (lastMessage?.role === "user") {
+    // Judge the tail by the last row the model would see: hidden plan-review records
+    // (resolve/reopen or an on-demand snapshot appended while idle) are user-role rows but never
+    // a prompt awaiting a response, and must not disable scheduled heartbeats.
+    const lastMessage = history.findLast((message) => !isPlanReviewRecordMessage(message));
+    // An idle unanswered user message stays a hard gate for every whenBusy policy: injecting a
+    // scheduled message into that abnormal state risks clobbering a failed/interrupted user
+    // turn. During an active stream, however, the in-progress assistant output lives only in
+    // partial.json (committed history still ends with the user message being answered), so
+    // queue modes must carve out the streaming case or they could never deliver while busy.
+    // The live session busy state counts too: between user-message acceptance and
+    // stream-start (turn preparation) the activity snapshot's streaming flag is still false,
+    // yet the trailing user message is actively being answered — queue modes must queue that
+    // slot, not consume it as awaiting_response. Skip mode keeps the pre-existing gate.
+    const activelyAnswering =
+      isStreaming || (deliverWhenBusy && this.workspaceService.isBusyForMessage(workspaceId));
+    if (lastMessage?.role === "user" && !activelyAnswering) {
       return { eligible: false, reason: "awaiting_response" };
     }
+    // Inert while streaming (committed history cannot end with an assistant message then), so
+    // this only guards the idle waiting-for-input state — keep it hard for every policy.
     if (lastMessage?.role === "assistant" && this.hasInteractiveToolInput(lastMessage)) {
       return { eligible: false, reason: "awaiting_interactive_input" };
     }
@@ -578,11 +875,6 @@ export class HeartbeatService {
         ...this.queuedWorkspaceIds,
       ])
     );
-  }
-
-  private getTrackingIntervalMs(workspaceId: string, config: ProjectsConfig): number | null {
-    const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
-    return workspace ? this.getTrackingIntervalMsForWorkspace(workspace, config) : null;
   }
 
   private getTrackingIntervalMsForWorkspace(

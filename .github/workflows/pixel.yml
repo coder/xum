@@ -1,0 +1,66 @@
+name: Pixel
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  pixel:
+    name: Visual Regression Testing
+    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-8' || 'ubuntu-latest' }}
+    # Skip for forked PRs since they don't have access to secrets
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    env:
+      PIXEL_KEY: ${{ secrets.PIXEL_KEY }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-xum
+
+      - uses: ./.github/actions/setup-playwright
+
+      - name: Generate version file
+        run: ./scripts/generate-version.sh
+
+      - name: Mock version for stable visual testing
+        run: cp src/browser/stories/mocks/version.ts src/version.ts
+
+      - name: Snapshot
+        if: env.PIXEL_KEY != ''
+        run: bun x pixel-storybook
+        env:
+          # On pull_request events GITHUB_SHA is the merge commit; report the
+          # head SHA so the Pixel commit status lands on the PR.
+          PIXEL_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          # Auto-approve main builds so they become baselines without review.
+          PIXEL_AUTO_REVIEW: ${{ github.event_name == 'push' && 'true' || 'false' }}
+
+      # A story whose final frame depends on timing shows up as a spurious "changed"
+      # snapshot on unrelated PRs. Replay Pixel's capture pipeline over every story and
+      # fail on any variant that renders differently across runs. Deliberately no
+      # changed-file filtering: Storybook consumes app code, styles, the harness, and
+      # build inputs such as index.html, and every allowlist attempt missed some of them.
+      # A full check takes ~6 minutes, in parallel with the much longer PR workflow, and
+      # reuses the storybook-static/ build above.
+      - name: Check stories for nondeterministic snapshots
+        if: github.event_name == 'pull_request' && env.PIXEL_KEY != ''
+        run: node scripts/storybook-flake-check.mjs --runs 3
+
+      - name: Upload nondeterministic renders
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: storybook-flakes
+          path: storybook-flakes/
+          if-no-files-found: ignore
+
+      - name: Notice when Pixel is not configured
+        if: env.PIXEL_KEY == ''
+        run: echo "PIXEL_KEY secret not configured; skipping Pixel snapshot upload."

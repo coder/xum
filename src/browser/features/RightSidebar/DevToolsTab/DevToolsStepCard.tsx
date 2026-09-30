@@ -24,7 +24,7 @@ import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { truncateToFirstLine } from "./devToolsStepCardHelpers";
 
 const PRE_CLASS_NAME =
-  "whitespace-pre-wrap break-all text-[10px] text-muted bg-background-primary rounded border border-border-light p-2 mt-1 max-h-[220px] overflow-auto";
+  "whitespace-pre-wrap break-words text-[10px] text-muted bg-background-primary rounded border border-border-light p-2 mt-1 max-h-[220px] overflow-auto min-w-0";
 const ROLE_COLORS: Record<string, string> = {
   system: "bg-neutral-500/20 text-neutral-400",
   user: "bg-blue-500/20 text-blue-400",
@@ -65,17 +65,17 @@ export function DevToolsStepCard(props: DevToolsStepCardProps) {
   };
 
   return (
-    <div className="border-border-light bg-background rounded border">
+    <div className="border-border-light bg-background min-w-0 rounded border">
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}
-        className="hover:bg-hover flex w-full items-center gap-1.5 px-2 py-1 text-left"
+        className="hover:bg-hover flex w-full min-w-0 items-center gap-1.5 px-2 py-1 text-left"
       >
         <ChevronRight
           className={cn("h-3 w-3 shrink-0 transition-transform", expanded && "rotate-90")}
         />
         <span className="text-foreground text-xs font-medium">Step {props.step.stepNumber}</span>
-        <span className="text-muted text-[10px]">{props.step.modelId}</span>
+        <span className="text-muted min-w-0 truncate text-[10px]">{props.step.modelId}</span>
         {props.step.durationMs != null && (
           <span className="text-muted text-[10px]">
             {formatDuration(props.step.durationMs, "precise")}
@@ -86,7 +86,7 @@ export function DevToolsStepCard(props: DevToolsStepCardProps) {
       </button>
 
       {expanded && (
-        <div className="border-border-light border-t px-2 py-1.5">
+        <div className="border-border-light min-w-0 border-t px-2 py-1.5">
           <MetadataBar
             step={props.step}
             tools={tools}
@@ -104,13 +104,13 @@ export function DevToolsStepCard(props: DevToolsStepCardProps) {
             />
           )}
 
-          <div className="border-border-light mt-2 grid grid-cols-2 gap-2 border-t pt-2">
-            <div className="border-border-light border-r pr-2">
+          <div className="border-border-light mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 border-t pt-2">
+            <div className="border-border-light min-w-0 border-r pr-2">
               <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">Input</p>
               <StepInputPanel step={props.step} />
             </div>
 
-            <div className="pl-0.5">
+            <div className="min-w-0 pl-0.5">
               <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">Output</p>
               <StepOutputPanel step={props.step} />
             </div>
@@ -147,14 +147,16 @@ function MetadataBar(props: {
   const hasPills = props.tools.length > 0 || hasProviderOptions || hasUsage || hasToolPolicy;
 
   return (
-    <div className="border-border-light bg-background-primary flex flex-wrap items-center gap-1 rounded border px-2 py-1">
+    <div className="border-border-light bg-background-primary flex min-w-0 flex-wrap items-center gap-1 rounded border px-2 py-1">
       {props.step.provider != null && props.step.provider.length > 0 && (
-        <span className="rounded bg-blue-500/20 px-1.5 py-0.5 text-[10px] font-medium text-blue-400">
+        <span className="min-w-0 rounded bg-blue-500/20 px-1.5 py-0.5 text-[10px] font-medium break-all text-blue-400">
           {props.step.provider}
         </span>
       )}
 
-      <span className="font-monospace text-muted text-[10px]">{props.step.modelId}</span>
+      <span className="font-monospace text-muted min-w-0 text-[10px] break-all">
+        {props.step.modelId}
+      </span>
 
       {details.map((detail, index) => (
         <span key={`${detail}-${index}`} className="flex items-center gap-1">
@@ -164,7 +166,7 @@ function MetadataBar(props: {
       ))}
 
       {hasPills && (
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1">
           {props.tools.length > 0 && (
             <MetadataPill
               icon={Wrench}
@@ -219,14 +221,14 @@ function MetadataPill(props: {
       type="button"
       onClick={props.onClick}
       className={cn(
-        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]",
+        "inline-flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px]",
         props.active
           ? "bg-hover text-foreground"
           : "text-muted hover:bg-hover/70 hover:text-foreground"
       )}
     >
-      <Icon className="h-3 w-3" />
-      <span>{props.label}</span>
+      <Icon className="h-3 w-3 shrink-0" />
+      <span className="min-w-0 break-words">{props.label}</span>
     </button>
   );
 }
@@ -265,15 +267,17 @@ function AvailableToolsSection(props: { tools: ParsedTool[] }) {
   }
 
   return (
-    <div className="mt-1 flex flex-col gap-1">
+    <div className="mt-1 flex min-w-0 flex-col gap-1">
       {props.tools.map((tool, index) => (
         <div
           key={`${tool.name}-${index}`}
-          className="border-border-light bg-background-primary rounded border p-2"
+          className="border-border-light bg-background-primary min-w-0 rounded border p-2"
         >
-          <div className="flex items-center gap-1">
-            <Wrench className="h-3 w-3 text-violet-500" />
-            <span className="text-foreground text-[10px] font-semibold">{tool.name}</span>
+          <div className="flex min-w-0 items-center gap-1">
+            <Wrench className="h-3 w-3 shrink-0 text-violet-500" />
+            <span className="text-foreground min-w-0 text-[10px] font-semibold break-all">
+              {tool.name}
+            </span>
           </div>
 
           {tool.description != null && tool.description.length > 0 && (
@@ -296,16 +300,18 @@ function AvailableToolsSection(props: { tools: ParsedTool[] }) {
 
 function ToolPolicySection(props: { policy: ToolPolicy }) {
   return (
-    <div className="mt-1 flex flex-col gap-1">
+    <div className="mt-1 flex min-w-0 flex-col gap-1">
       {props.policy.map((filter, index) => (
         <div
           key={`${filter.regex_match}-${index}`}
-          className="border-border-light bg-background-primary flex items-center gap-2 rounded border px-2 py-1"
+          className="border-border-light bg-background-primary flex min-w-0 items-center gap-2 rounded border px-2 py-1"
         >
-          <code className="text-foreground font-monospace text-[10px]">{filter.regex_match}</code>
+          <code className="text-foreground font-monospace min-w-0 flex-1 text-[10px] break-all">
+            {filter.regex_match}
+          </code>
           <span
             className={cn(
-              "ml-auto rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase",
+              "ml-auto shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase",
               POLICY_ACTION_STYLES[filter.action]
             )}
           >
@@ -449,7 +455,7 @@ function StepInputPanel(props: { step: DevToolsStep }) {
   const visibleMessages = showAllMessages ? prompt : prompt.slice(Math.max(0, prompt.length - 2));
 
   return (
-    <div className="mt-1 flex flex-col gap-1">
+    <div className="mt-1 flex min-w-0 flex-col gap-1">
       {prompt.length > 2 && (
         <button
           type="button"
@@ -486,7 +492,7 @@ function StepOutputPanel(props: { step: DevToolsStep }) {
   }
 
   return (
-    <div className="mt-1 flex flex-col gap-1.5">
+    <div className="mt-1 flex min-w-0 flex-col gap-1.5">
       {reasoningParts.map((reasoningPart) => (
         <ReasoningBlock key={reasoningPart.id} text={reasoningPart.text} />
       ))}
@@ -542,11 +548,11 @@ function RequestResponseSection(props: { step: DevToolsStep }) {
         : props.step.rawResponse;
 
   return (
-    <div className="border-border-light mt-2 border-t pt-1.5">
+    <div className="border-border-light mt-2 min-w-0 border-t pt-1.5">
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}
-        className="hover:bg-hover flex w-full items-center gap-1 rounded px-1 py-0.5 text-left"
+        className="hover:bg-hover flex w-full min-w-0 items-center gap-1 rounded px-1 py-0.5 text-left"
       >
         <ChevronRight
           className={cn(
@@ -558,7 +564,7 @@ function RequestResponseSection(props: { step: DevToolsStep }) {
       </button>
 
       {expanded && (
-        <div className="mt-1">
+        <div className="mt-1 min-w-0">
           <div className="flex items-center gap-1 px-1 pb-1">
             <ToggleButton
               active={viewMode === "ai-sdk"}
@@ -572,12 +578,12 @@ function RequestResponseSection(props: { step: DevToolsStep }) {
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <div>
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2">
+            <div className="min-w-0">
               <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">Request</p>
               <JsonBlock data={requestData} emptyMessage="No request captured" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">
                 {formatRawResponseLabel(viewMode, props.step)}
               </p>
@@ -588,7 +594,7 @@ function RequestResponseSection(props: { step: DevToolsStep }) {
           {viewMode === "provider" &&
             props.step.requestHeaders != null &&
             Object.keys(props.step.requestHeaders).length > 0 && (
-              <div className="mt-2">
+              <div className="mt-2 min-w-0">
                 <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">
                   Request Headers
                 </p>
@@ -599,7 +605,7 @@ function RequestResponseSection(props: { step: DevToolsStep }) {
           {viewMode === "provider" &&
             props.step.responseHeaders != null &&
             Object.keys(props.step.responseHeaders).length > 0 && (
-              <div className="mt-2">
+              <div className="mt-2 min-w-0">
                 <p className="text-muted text-[9px] font-semibold tracking-wide uppercase">
                   Response Headers
                 </p>
@@ -636,7 +642,7 @@ function JsonBlock(props: { data: unknown; emptyMessage?: string; maxHeight?: st
       : (props.emptyMessage ?? "No data captured");
 
   return (
-    <div className="group relative mt-1">
+    <div className="group relative mt-1 min-w-0">
       <pre
         className={PRE_CLASS_NAME}
         style={props.maxHeight != null ? { maxHeight: props.maxHeight } : {}}
@@ -666,19 +672,19 @@ function CollapsibleCard(props: {
   return (
     <div
       className={cn(
-        "bg-background-primary rounded border border-l-2 px-2 py-1",
+        "bg-background-primary min-w-0 rounded border border-l-2 px-2 py-1",
         props.borderColorClass
       )}
     >
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}
-        className="hover:bg-hover/50 flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left"
+        className="hover:bg-hover/50 flex w-full min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-left"
       >
         {props.icon}
         {props.label}
         {!expanded && props.preview.length > 0 && (
-          <span className="text-muted truncate text-[10px]">{props.preview}</span>
+          <span className="text-muted min-w-0 flex-1 truncate text-[10px]">{props.preview}</span>
         )}
         <ChevronRight
           className={cn(
@@ -688,7 +694,7 @@ function CollapsibleCard(props: {
         />
       </button>
 
-      {expanded && <div className="mt-1">{props.children}</div>}
+      {expanded && <div className="mt-1 min-w-0">{props.children}</div>}
     </div>
   );
 }
@@ -704,7 +710,11 @@ function ToolCallCard(props: { toolCall: unknown }) {
   return (
     <CollapsibleCard
       icon={<Wrench className="h-3 w-3 shrink-0 text-violet-500" />}
-      label={<span className="text-foreground text-[10px] font-semibold">{toolName}</span>}
+      label={
+        <span className="text-foreground min-w-0 flex-1 truncate text-[10px] font-semibold">
+          {toolName}
+        </span>
+      }
       preview={formatArgsPreview(args)}
       borderColorClass="border-violet-500/30"
     >
@@ -723,7 +733,7 @@ function MessagePreview(props: { message: unknown }) {
       preview={truncateToFirstLine(content, 80)}
       borderColorClass="border-border-light"
     >
-      <pre className="text-muted max-h-[220px] overflow-auto text-[10px] break-words whitespace-pre-wrap">
+      <pre className="text-muted max-h-[220px] min-w-0 overflow-auto text-[10px] break-words whitespace-pre-wrap">
         {content}
       </pre>
     </CollapsibleCard>
@@ -745,11 +755,11 @@ function ReasoningBlock(props: { text: string }) {
   return (
     <CollapsibleCard
       icon={<Brain className="h-3 w-3 shrink-0 text-amber-500" />}
-      label={<span className="text-foreground text-[10px] font-medium">Thinking</span>}
+      label={<span className="text-foreground min-w-0 text-[10px] font-medium">Thinking</span>}
       preview={truncateToFirstLine(props.text, 80)}
       borderColorClass="border-amber-500/30"
     >
-      <pre className="text-muted max-h-[220px] overflow-auto text-[10px] break-words whitespace-pre-wrap">
+      <pre className="text-muted max-h-[220px] min-w-0 overflow-auto text-[10px] break-words whitespace-pre-wrap">
         {props.text}
       </pre>
     </CollapsibleCard>

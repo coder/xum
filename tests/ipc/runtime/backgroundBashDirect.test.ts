@@ -41,7 +41,46 @@ function getBackgroundProcessManager(env: TestEnvironment): BackgroundProcessMan
 }
 
 // Foreground bash startup can be slower on Windows CI (Git Bash init + IO flush).
-const FOREGROUND_MIGRATION_READY_MS = process.platform === "win32" ? 900 : 300;
+const FOREGROUND_OUTPUT_READY_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 5_000;
+
+interface BashOutputCollector {
+  readonly chunks: string[];
+  emitChatEvent: (event: { type: string; toolCallId?: string; text?: string }) => void;
+}
+
+function createBashOutputCollector(toolCallId: string): BashOutputCollector {
+  const chunks: string[] = [];
+  return {
+    chunks,
+    emitChatEvent: (event) => {
+      if (event.type === "bash-output" && event.toolCallId === toolCallId && event.text) {
+        // Foreground migration tests must wait for real stdout readiness rather than
+        // assuming Git Bash has flushed within a fixed CI-dependent delay.
+        chunks.push(event.text);
+      }
+    },
+  };
+}
+
+async function waitForBashOutput(
+  chunks: readonly string[],
+  expectedText: string,
+  timeoutMs: number
+): Promise<void> {
+  if (expectedText.length === 0) {
+    throw new Error("waitForBashOutput requires non-empty expected text");
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (chunks.some((chunk) => chunk.includes(expectedText))) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  throw new Error(`Timed out waiting for bash output: ${expectedText}`);
+}
 
 interface ToolExecuteResult {
   success: boolean;
@@ -96,7 +135,7 @@ describe("Background Bash Direct Integration", () => {
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -111,7 +150,7 @@ describe("Background Bash Direct Integration", () => {
         display_name: `spawn_${Date.now()}`,
         timeout_secs: 30,
       },
-      { toolCallId: "spawn", messages: [] }
+      { toolCallId: "spawn", messages: [], context: undefined }
     )) as ToolExecuteResult;
 
     expect(spawnResult.success).toBe(true);
@@ -123,7 +162,7 @@ describe("Background Bash Direct Integration", () => {
     const bashOutput2 = createBashOutputTool(toolConfig);
     const outputResult = (await bashOutput2.execute!(
       { process_id: processId, timeout_secs: 0 },
-      { toolCallId: "read", messages: [] }
+      { toolCallId: "read", messages: [], context: undefined }
     )) as ToolExecuteResult;
 
     expect(outputResult.success).toBe(true);
@@ -412,27 +451,28 @@ describe("Foreground to Background Migration", () => {
 
     const manager = getBackgroundProcessManager(env);
     const runtime = new LocalRuntime(workspacePath);
+    const testId = `fg_to_bg_${Date.now()}`;
+    const marker1 = `BEFORE_BG_${testId}`;
+    const marker2 = `AFTER_BG_${testId}`;
+    const toolCallId = `tool_${testId}`;
+    const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
+      emitChatEvent: outputCollector.emitChatEvent,
     };
-
-    const testId = `fg_to_bg_${Date.now()}`;
-    const marker1 = `BEFORE_BG_${testId}`;
-    const marker2 = `AFTER_BG_${testId}`;
 
     // Create tools for "message 1"
     const bash1 = createBashTool(toolConfig);
 
     // Start foreground bash that runs for ~3 seconds
     // Script: output marker1, sleep, output marker2
-    const toolCallId = `tool_${testId}`;
     const bashPromise = bash1.execute!(
       {
         script: `echo "${marker1}"; sleep 2; echo "${marker2}"`,
@@ -440,11 +480,11 @@ describe("Foreground to Background Migration", () => {
         display_name: testId,
         timeout_secs: 30,
       },
-      { toolCallId, messages: [] }
+      { toolCallId, messages: [], context: undefined }
     ) as Promise<ToolExecuteResult>;
 
     // Wait for foreground process to register and output first marker
-    await new Promise((resolve) => setTimeout(resolve, FOREGROUND_MIGRATION_READY_MS));
+    await waitForBashOutput(outputCollector.chunks, marker1, FOREGROUND_OUTPUT_READY_TIMEOUT_MS);
 
     // Verify foreground process is registered
     const fgToolCallIds = manager.getForegroundToolCallIds(workspaceId);
@@ -485,7 +525,7 @@ describe("Foreground to Background Migration", () => {
     // Get output via bash_output tool (new tool instance)
     const outputResult = (await bashOutput2.execute!(
       { process_id: testId, timeout_secs: 0 },
-      { toolCallId: "output_read", messages: [] }
+      { toolCallId: "output_read", messages: [], context: undefined }
     )) as ToolExecuteResult;
 
     expect(outputResult.success).toBe(true);
@@ -502,24 +542,25 @@ describe("Foreground to Background Migration", () => {
 
     const manager = getBackgroundProcessManager(env);
     const runtime = new LocalRuntime(workspacePath);
+    const testId = `preserve_output_${Date.now()}`;
+    const marker1 = `EARLY_${testId}`;
+    const marker2 = `LATE_${testId}`;
+    const toolCallId = `tool_${testId}`;
+    const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
+      emitChatEvent: outputCollector.emitChatEvent,
     };
-
-    const testId = `preserve_output_${Date.now()}`;
-    const marker1 = `EARLY_${testId}`;
-    const marker2 = `LATE_${testId}`;
 
     const bash1 = createBashTool(toolConfig);
 
-    const toolCallId = `tool_${testId}`;
     // Script outputs marker1, sleeps, then outputs marker2
     const script = `echo "${marker1}"; sleep 2; echo "${marker2}"`;
 
@@ -530,11 +571,11 @@ describe("Foreground to Background Migration", () => {
         display_name: testId,
         timeout_secs: 30,
       },
-      { toolCallId, messages: [] }
+      { toolCallId, messages: [], context: undefined }
     ) as Promise<ToolExecuteResult>;
 
     // Wait for marker1 to output
-    await new Promise((resolve) => setTimeout(resolve, FOREGROUND_MIGRATION_READY_MS));
+    await waitForBashOutput(outputCollector.chunks, marker1, FOREGROUND_OUTPUT_READY_TIMEOUT_MS);
 
     // Send to background mid-execution
     manager.sendToBackground(toolCallId);
@@ -569,7 +610,7 @@ describe("Foreground to Background Migration", () => {
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -590,7 +631,7 @@ describe("Foreground to Background Migration", () => {
         display_name: testId,
         timeout_secs: 30,
       },
-      { toolCallId, messages: [] }
+      { toolCallId, messages: [], context: undefined }
     ) as Promise<ToolExecuteResult>;
 
     // Small delay then try to background (might already be done)
@@ -645,27 +686,27 @@ describe("Foreground to Background Migration", () => {
 
     const manager = getBackgroundProcessManager(env);
     const runtime = new LocalRuntime(workspacePath);
+    const testId = `abort_after_bg_${Date.now()}`;
+    const marker1 = `BEFORE_${testId}`;
+    const marker2 = `AFTER_${testId}`;
+    const toolCallId = `tool_${testId}`;
+    const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
+      emitChatEvent: outputCollector.emitChatEvent,
     };
-
-    const testId = `abort_after_bg_${Date.now()}`;
-    const marker1 = `BEFORE_${testId}`;
-    const marker2 = `AFTER_${testId}`;
 
     // Create an AbortController to simulate stream abort
     const abortController = new AbortController();
 
     const bash = createBashTool(toolConfig);
-
-    const toolCallId = `tool_${testId}`;
 
     // Start a foreground bash with the abort signal
     const bashPromise = bash.execute!(
@@ -675,11 +716,11 @@ describe("Foreground to Background Migration", () => {
         display_name: testId,
         timeout_secs: 30,
       },
-      { toolCallId, messages: [], abortSignal: abortController.signal }
+      { toolCallId, messages: [], context: undefined, abortSignal: abortController.signal }
     ) as Promise<ToolExecuteResult>;
 
     // Wait for first marker
-    await new Promise((resolve) => setTimeout(resolve, FOREGROUND_MIGRATION_READY_MS));
+    await waitForBashOutput(outputCollector.chunks, marker1, FOREGROUND_OUTPUT_READY_TIMEOUT_MS);
 
     // Send to background
     manager.sendToBackground(toolCallId);

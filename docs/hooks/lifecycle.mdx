@@ -1,0 +1,67 @@
+---
+title: Archive and Delete Hooks
+description: Run project cleanup before archiving or deleting a workspace
+---
+
+Add executable scripts to the workspace checkout:
+
+- `.xum/archive` runs before Xum archives the workspace.
+- `.xum/delete` runs before Xum deletes the workspace.
+
+Use these hooks to stop project services or remove temporary resources.
+Deletion does not also run the archive hook.
+Archive policies that remove the checkout run only the archive hook.
+
+## Example
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker compose down
+```
+
+For archive cleanup, save the script as `.xum/archive` and make it executable:
+
+```bash
+chmod +x .xum/archive
+```
+
+Use `.xum/delete` instead for deletion cleanup.
+
+## Execution
+
+The hook runs in the workspace checkout through its runtime, before runtime shutdown or checkout deletion.
+Xum waits for each hook, with a 60-second timeout.
+Hook failures do not block archive or deletion. Xum records failures in its backend logs.
+
+Hooks receive project secrets and these environment variables:
+
+- `XUM_PROJECT_PATH`
+- `XUM_RUNTIME`
+- `XUM_WORKSPACE_NAME`
+- `XUM_WORKSPACE_ID`
+
+Matching `MUX_*` aliases remain available. See [environment variables](/hooks/environment-variables).
+For multi-project workspaces, Xum runs each project's hook with that project's secrets and checkout directory.
+All projects must be trusted.
+
+If the `.xum` script is absent or not executable, Xum checks the corresponding `.mux` script.
+The legacy script must also be executable.
+Only one script runs for each project and operation.
+
+## Limits
+
+Xum skips these hooks for:
+
+- Untrusted projects or `XUM_DISABLE_PROJECT_AUTOMATION=1`.
+- Shared-checkout sub-agents and scratch workspaces.
+- Coder workspaces that the control plane does not report as running.
+- Missing checkouts or unavailable runtimes. Xum does not restore checkouts or start containers to run cleanup.
+
+Archiving an already archived workspace does not rerun its archive hook.
+Unarchive permits the hook to run on the next archive.
+
+A later lifecycle check can still reject the operation after the hook runs.
+For example, deletion can fail because a checkout has uncommitted changes.
+Make cleanup scripts idempotent so that retries remain safe.

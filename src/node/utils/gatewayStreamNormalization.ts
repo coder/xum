@@ -33,16 +33,42 @@ export function isV3Usage(usage: unknown): usage is V3Usage {
   return typeof u.inputTokens === "object" && u.inputTokens != null;
 }
 
+/** Options for converting flat gateway usage to v3 nested format. */
+export interface FlatUsageOptions {
+  /**
+   * The gateway forwards each upstream provider's flat usage semantics as-is.
+   * OpenAI-style flat usage reports outputTokens INCLUSIVE of reasoning, but
+   * Google forwards candidatesTokenCount, which EXCLUDES thoughts. Set this for
+   * google/* gateway models so text/total are derived correctly.
+   */
+  outputExcludesReasoning?: boolean;
+}
+
+// Non-finite counts (NaN/Infinity from a malformed gateway payload) must not
+// leak into SDK usage/cost arithmetic; treat them the same as missing.
+function finiteTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 /**
  * Convert flat (v2-style) usage to v3 nested format.
  */
-export function flatUsageToV3(usage: Record<string, unknown>): V3Usage {
-  const inputTokens = typeof usage.inputTokens === "number" ? usage.inputTokens : undefined;
-  const outputTokens = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
-  const cachedInputTokens =
-    typeof usage.cachedInputTokens === "number" ? usage.cachedInputTokens : undefined;
-  const reasoningTokens =
-    typeof usage.reasoningTokens === "number" ? usage.reasoningTokens : undefined;
+export function flatUsageToV3(usage: Record<string, unknown>, options?: FlatUsageOptions): V3Usage {
+  const inputTokens = finiteTokenCount(usage.inputTokens);
+  const outputTokens = finiteTokenCount(usage.outputTokens);
+  const cachedInputTokens = finiteTokenCount(usage.cachedInputTokens);
+  const reasoningTokens = finiteTokenCount(usage.reasoningTokens);
+
+  const outputExcludesReasoning = options?.outputExcludesReasoning === true;
+  const outputTotal =
+    outputExcludesReasoning && outputTokens != null
+      ? outputTokens + (reasoningTokens ?? 0)
+      : outputTokens;
+  const outputText = outputExcludesReasoning
+    ? outputTokens
+    : outputTokens != null && reasoningTokens != null
+      ? outputTokens - reasoningTokens
+      : undefined;
 
   return {
     inputTokens: {
@@ -55,11 +81,8 @@ export function flatUsageToV3(usage: Record<string, unknown>): V3Usage {
       cacheWrite: undefined,
     },
     outputTokens: {
-      total: outputTokens,
-      text:
-        outputTokens != null && reasoningTokens != null
-          ? outputTokens - reasoningTokens
-          : undefined,
+      total: outputTotal,
+      text: outputText,
       reasoning: reasoningTokens,
     },
     raw: usage,
@@ -80,15 +103,50 @@ export function normalizeFinishReason(fr: unknown): { unified: string; raw: unkn
   return { unified: str === "unknown" ? "other" : str, raw: str };
 }
 
+function normalizeGatewayUsage(
+  usage: unknown,
+  providerMetadata: unknown,
+  options?: FlatUsageOptions
+): V3Usage | null | undefined {
+  if (usage == null) return usage;
+  const normalized = isV3Usage(usage)
+    ? usage
+    : flatUsageToV3(usage as Record<string, unknown>, options);
+
+  // Gateway OpenAI responses can report cache writes only in provider metadata.
+  // Recover them before SDK aggregation so writes do not appear as uncached input.
+  // Explicit SDK counts take precedence, including zero, to prevent double counting.
+  if (normalized.inputTokens.cacheWrite != null) return normalized;
+  const metadata = providerMetadata as
+    | { openai?: { usage?: { cacheWriteTokens?: unknown } } }
+    | undefined;
+  const cacheWrite = finiteTokenCount(metadata?.openai?.usage?.cacheWriteTokens);
+  if (cacheWrite == null || cacheWrite < 0) return normalized;
+
+  const total = finiteTokenCount(normalized.inputTokens.total);
+  const cacheRead = finiteTokenCount(normalized.inputTokens.cacheRead);
+  return {
+    ...normalized,
+    inputTokens: {
+      ...normalized.inputTokens,
+      cacheWrite,
+      noCache: total != null ? Math.max(0, total - (cacheRead ?? 0) - cacheWrite) : undefined,
+    },
+  };
+}
+
 /**
  * Normalize a doGenerate result from the gateway.
  * Converts flat usage and plain-string finishReason to v3 nested format.
  */
-export function normalizeGatewayGenerateResult<T extends Record<string, unknown>>(result: T): T {
+export function normalizeGatewayGenerateResult<T extends Record<string, unknown>>(
+  result: T,
+  options?: FlatUsageOptions
+): T {
   const normalized: Record<string, unknown> = { ...result };
 
-  if (result.usage != null && !isV3Usage(result.usage)) {
-    normalized.usage = flatUsageToV3(result.usage as Record<string, unknown>);
+  if (result.usage != null) {
+    normalized.usage = normalizeGatewayUsage(result.usage, result.providerMetadata, options);
   }
 
   if (result.finishReason != null) {
@@ -104,7 +162,7 @@ export function normalizeGatewayGenerateResult<T extends Record<string, unknown>
  *
  * Only transforms "finish" events; all other chunks pass through unchanged.
  */
-export function normalizeGatewayStreamUsage(): TransformStream {
+export function normalizeGatewayStreamUsage(options?: FlatUsageOptions): TransformStream {
   return new TransformStream({
     transform(chunk: unknown, controller: TransformStreamDefaultController) {
       if (typeof chunk !== "object" || chunk == null) {
@@ -118,11 +176,7 @@ export function normalizeGatewayStreamUsage(): TransformStream {
         return;
       }
 
-      // Normalize usage: convert flat → v3 nested if needed
-      let usage = c.usage;
-      if (usage != null && !isV3Usage(usage)) {
-        usage = flatUsageToV3(usage as Record<string, unknown>);
-      }
+      const usage = normalizeGatewayUsage(c.usage, c.providerMetadata, options);
 
       // Normalize finishReason: convert string → { unified, raw } if needed
       const finishReason = normalizeFinishReason(c.finishReason);

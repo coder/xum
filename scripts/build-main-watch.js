@@ -9,15 +9,23 @@ const fs = require("fs");
 const path = require("path");
 
 const rootDir = path.join(__dirname, "..");
-const tsgoPath = path.join(rootDir, "node_modules/@typescript/native-preview/bin/tsgo.js");
 const tscAliasPath = path.join(rootDir, "node_modules/tsc-alias/dist/bin/index.js");
 const buildCompleteStampPath = path.join(rootDir, "dist/.main-build-complete");
 
 try {
   console.log("Building main process...");
 
-  // Run tsgo
-  execSync(`node "${tsgoPath}" -p tsconfig.main.json`, {
+  // Re-embed JavaScript-authored workflow runtime sources first so edits hot-reload.
+  for (const command of ["bun scripts/gen_workflow_runtime_sources.ts"]) {
+    execSync(command, {
+      cwd: rootDir,
+      stdio: "inherit",
+      env: { ...process.env, NODE_ENV: "development" },
+    });
+  }
+
+  // Use the package binary so native-preview can change its internal wrapper safely.
+  execSync("bun run tsgo -p tsconfig.main.json", {
     cwd: rootDir,
     stdio: "inherit",
     env: { ...process.env, NODE_ENV: "development" },

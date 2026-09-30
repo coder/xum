@@ -1,76 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
-import { LayoutStackLane } from "./LayoutStackLane";
-import type { LayoutStackItem } from "./layoutStack";
+import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
+import {
+  createChatInputDecorationStackItem,
+  createTranscriptTailStackItem,
+  selectVisibleChatInputDecorations,
+} from "./layoutStack";
 
 let cleanupDom: (() => void) | null = null;
-let originalResizeObserver: typeof ResizeObserver | undefined;
-const resizeCallbacks = new Map<Element, ResizeObserverCallback[]>();
-
-class ResizeObserverMock implements ResizeObserver {
-  public readonly callback: ResizeObserverCallback;
-
-  constructor(callback: ResizeObserverCallback) {
-    this.callback = callback;
-  }
-
-  observe(target: Element) {
-    resizeCallbacks.set(target, [...(resizeCallbacks.get(target) ?? []), this.callback]);
-  }
-
-  unobserve(target: Element) {
-    const callbacks = (resizeCallbacks.get(target) ?? []).filter(
-      (callback) => callback !== this.callback
-    );
-    if (callbacks.length === 0) {
-      resizeCallbacks.delete(target);
-      return;
-    }
-    resizeCallbacks.set(target, callbacks);
-  }
-
-  disconnect() {
-    for (const [target, callbacks] of resizeCallbacks.entries()) {
-      const remainingCallbacks = callbacks.filter((callback) => callback !== this.callback);
-      if (remainingCallbacks.length === 0) {
-        resizeCallbacks.delete(target);
-        continue;
-      }
-      resizeCallbacks.set(target, remainingCallbacks);
-    }
-  }
-
-  takeRecords(): ResizeObserverEntry[] {
-    return [];
-  }
-}
-
-function emitResize(target: Element, height: number) {
-  const callbacks = resizeCallbacks.get(target) ?? [];
-  const contentRect: DOMRectReadOnly = {
-    x: 0,
-    y: 0,
-    width: 0,
-    height,
-    top: 0,
-    right: 0,
-    bottom: height,
-    left: 0,
-    toJSON: () => ({}),
-  };
-  const entry: ResizeObserverEntry = {
-    target,
-    contentRect,
-    borderBoxSize: [],
-    contentBoxSize: [],
-    devicePixelContentBoxSize: [],
-  };
-  for (const callback of callbacks) {
-    callback([entry], {} as ResizeObserver);
-  }
-}
+const COMPOSER_STACK_COMPONENT = "ChatInputDecorationStack";
+const TRANSCRIPT_TAIL_STACK_COMPONENT = "TranscriptTailStack";
 
 function getRenderedStack(container: HTMLElement, dataComponent: string): HTMLDivElement {
   const stack = container.querySelector(`[data-component="${dataComponent}"]`);
@@ -81,293 +22,78 @@ function getRenderedStack(container: HTMLElement, dataComponent: string): HTMLDi
   return stack as HTMLDivElement;
 }
 
-function getStackContent(container: HTMLElement, dataComponent: string): HTMLDivElement {
-  const content = getRenderedStack(container, dataComponent).firstElementChild;
-  expect(content).toBeTruthy();
-  if (content?.tagName !== "DIV") {
-    throw new Error("Expected stack content to exist");
-  }
-  return content as HTMLDivElement;
-}
-
-async function waitForResizeObservation(target: Element): Promise<void> {
-  await waitFor(() => {
-    const callbacks = resizeCallbacks.get(target);
-    if (!callbacks || callbacks.length === 0) {
-      throw new Error("Resize observer is not attached yet");
-    }
-  });
-}
-
-function createTextItem(key: string, text: string): LayoutStackItem {
-  return { key, node: <div>{text}</div> };
-}
-
-function createHiddenItem(key = "idle-decoration"): LayoutStackItem {
-  return { key, node: <span hidden /> };
-}
-
 describe("LayoutStackLane", () => {
   beforeEach(() => {
     cleanupDom = installDom();
-    originalResizeObserver = globalThis.ResizeObserver;
-    resizeCallbacks.clear();
-    (globalThis as typeof globalThis & { ResizeObserver: typeof ResizeObserver }).ResizeObserver =
-      ResizeObserverMock as unknown as typeof ResizeObserver;
   });
 
   afterEach(() => {
     cleanup();
-    resizeCallbacks.clear();
-    if (originalResizeObserver === undefined) {
-      delete (globalThis as Partial<typeof globalThis>).ResizeObserver;
-    } else {
-      (globalThis as typeof globalThis & { ResizeObserver: typeof ResizeObserver }).ResizeObserver =
-        originalResizeObserver;
-    }
     cleanupDom?.();
     cleanupDom = null;
-    originalResizeObserver = undefined;
   });
 
-  // --- Height reservation (shared between tail + decoration use) ---
-
-  it("holds the last measured height while switching to a hydrating workspace", async () => {
-    const view = render(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createTextItem("workspace-a", "workspace A")]}
-      />
+  it("renders nothing when a lane has no items", () => {
+    const view = render(<ChatInputDecorationStackLane items={[]} />);
+    expect(view.container.querySelector(`[data-component="${COMPOSER_STACK_COMPONENT}"]`)).toBe(
+      null
     );
-
-    const content = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(content);
-    emitResize(content, 184);
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("184px");
-    });
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createTextItem("workspace-b", "workspace B")]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("");
-    });
   });
 
-  it("ignores zero-height observations from non-rendering items during hydration", async () => {
+  it("renders decoration items in declared order", () => {
     const view = render(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createTextItem("workspace-a", "workspace A")]}
+      <ChatInputDecorationStackLane
+        items={[
+          createChatInputDecorationStackItem({ key: "first", node: <div>first banner</div> }),
+          createChatInputDecorationStackItem({ key: "second", node: <div>second banner</div> }),
+        ]}
       />
     );
 
-    const initialContent = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(initialContent);
-    emitResize(initialContent, 184);
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    const hydratingContent = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(hydratingContent);
-    emitResize(hydratingContent, 0);
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("184px");
-    });
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("");
-    });
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-c"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("");
-    });
+    const stack = getRenderedStack(view.container, COMPOSER_STACK_COMPONENT);
+    expect(stack.textContent).toBe("first bannersecond banner");
   });
 
-  it("attaches ResizeObserver when items mount after an empty null lane", async () => {
-    const view = render(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[]}
-      />
-    );
-
-    expect(view.container.querySelector('[data-component="stable-stack"]')).toBeNull();
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createTextItem("workspace-a", "workspace A")]}
-      />
-    );
-
-    const mountedContent = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(mountedContent);
-    emitResize(mountedContent, 123);
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("123px");
+  it("keeps immediate queued-message chrome visible while deferred decorations are gated", () => {
+    const queuedMessage = createChatInputDecorationStackItem({
+      key: "queued-message",
+      node: <div>queued follow-up</div>,
+      revealBeforeReady: true,
     });
+    const backgroundProcesses = createChatInputDecorationStackItem({
+      key: "background-processes",
+      node: <div>background processes</div>,
+    });
+
+    expect(selectVisibleChatInputDecorations([queuedMessage, backgroundProcesses], false)).toEqual([
+      queuedMessage,
+    ]);
+    expect(selectVisibleChatInputDecorations([queuedMessage, backgroundProcesses], true)).toEqual([
+      queuedMessage,
+      backgroundProcesses,
+    ]);
   });
 
-  it("clears settled empty-lane measurements from both the workspace cache and fallback", async () => {
+  it("opts the transcript tail out of scroll anchoring but not the composer decorations", () => {
+    // The tail lane renders inside the scrollport above the bottom sentinel, so it
+    // must never be an anchor candidate while the transcript is locked; composer
+    // decorations live in the sticky dock, which opts out as a whole in ChatPane.
     const view = render(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createTextItem("workspace-a", "workspace A")]}
-      />
-    );
-
-    const initialContent = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(initialContent);
-    emitResize(initialContent, 184);
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    const settledEmptyContent = getStackContent(view.container, "stable-stack");
-    await waitForResizeObservation(settledEmptyContent);
-    emitResize(settledEmptyContent, 0);
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("");
-    });
-
-    view.rerender(
-      <LayoutStackLane
-        workspaceId="workspace-b"
-        isHydrating={true}
-        align="end"
-        dataComponent="stable-stack"
-        items={[createHiddenItem()]}
-      />
-    );
-
-    await waitFor(() => {
-      expect(getRenderedStack(view.container, "stable-stack").style.minHeight).toBe("");
-    });
-  });
-
-  it("renders alignment and overflow-anchor modifiers correctly", () => {
-    const view = render(
-      <div>
-        <LayoutStackLane
-          workspaceId="workspace-a"
-          isHydrating={false}
-          align="end"
-          dataComponent="decoration-lane"
-          items={[createTextItem("workspace-a", "workspace A")]}
+      <>
+        <TranscriptTailStackLane
+          items={[createTranscriptTailStackItem({ key: "barrier", node: <div>barrier</div> })]}
         />
-        <div data-component="ChatInputSection">Input</div>
-      </div>
+        <ChatInputDecorationStackLane
+          items={[createChatInputDecorationStackItem({ key: "banner", node: <div>banner</div> })]}
+        />
+      </>
     );
 
-    const decoration = getRenderedStack(view.container, "decoration-lane");
-    expect(decoration.className).toContain("justify-end");
-    expect(decoration.style.overflowAnchor).toBe("");
-
-    const tail = render(
-      <LayoutStackLane
-        workspaceId="workspace-a"
-        isHydrating={false}
-        align="start"
-        overflowAnchor="none"
-        dataComponent="tail-lane"
-        items={[createTextItem("workspace-a", "workspace A")]}
-      />
+    expect(
+      getRenderedStack(view.container, TRANSCRIPT_TAIL_STACK_COMPONENT).style.overflowAnchor
+    ).toBe("none");
+    expect(getRenderedStack(view.container, COMPOSER_STACK_COMPONENT).style.overflowAnchor).toBe(
+      ""
     );
-    const tailStack = getRenderedStack(tail.container, "tail-lane");
-    expect(tailStack.className).toContain("justify-start");
-    expect(tailStack.style.overflowAnchor).toBe("none");
   });
 });

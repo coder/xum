@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "..",
+    "paths": {
+      "@novnc/novnc/lib/rfb": [".design-sync/stubs/novnc-rfb.ts"],
+      "@novnc/novnc": [".design-sync/stubs/novnc-rfb.ts"],
+      "katex/dist/katex.min.css": [".design-sync/stubs/empty.css"]
+    }
+  }
+}

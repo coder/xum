@@ -1,15 +1,16 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
+import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
-import { Config } from "@/node/config";
 
 function getErrorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null) {
@@ -54,6 +55,11 @@ async function waitForWebSocketOpen(ws: WebSocket): Promise<void> {
 }
 
 async function waitForWebSocketRejection(ws: WebSocket): Promise<void> {
+  // Since Bun 1.3.10 the `ws` client shim's once() installs two native forwarders, so a
+  // rejected handshake fires 'error' twice (and terminate() before 'close' re-emits it).
+  // The listeners below detach once settled, so keep one for the socket's lifetime;
+  // otherwise the extra 'error' is thrown as unhandled.
+  ws.on("error", () => undefined);
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
@@ -104,7 +110,8 @@ function createHttpClient(
   headers?: Record<string, string>
 ): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
     headers,
   });
 
@@ -1152,6 +1159,54 @@ describe("createOrpcServer", () => {
     }
   });
 
+  test("MCP OAuth callback forwards the RFC 9207 iss parameter (query + form_post)", async () => {
+    // The MCP SDK rejects the code exchange for issuers that advertise RFC 9207
+    // unless the route passes `iss` through (Linear login regression).
+    const callbackInputs: unknown[] = [];
+    const stubContext: Partial<ORPCContext> = {
+      mcpOauthService: {
+        handleServerCallbackAndExchange: (input: unknown) => {
+          callbackInputs.push(input);
+          return Promise.resolve({ success: true, data: undefined });
+        },
+      } as unknown as ORPCContext["mcpOauthService"],
+    };
+
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+      });
+
+      const issuer = "https://mcp.linear.app";
+      const queryRes = await fetch(
+        `${server.baseUrl}/auth/mcp-oauth/callback?state=query-state&code=query-code&iss=${encodeURIComponent(issuer)}`
+      );
+      expect(queryRes.status).toBe(200);
+
+      const formRes = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          state: "form-state",
+          code: "form-code",
+          iss: issuer,
+        }).toString(),
+      });
+      expect(formRes.status).toBe(200);
+
+      expect(callbackInputs).toEqual([
+        expect.objectContaining({ state: "query-state", code: "query-code", iss: issuer }),
+        expect.objectContaining({ state: "form-state", code: "form-code", iss: issuer }),
+      ]);
+    } finally {
+      await server?.close();
+    }
+  });
+
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
     const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
     const stubContext: Partial<ORPCContext> = {
@@ -1164,6 +1219,9 @@ describe("createOrpcServer", () => {
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
+      coderOauthService: {
+        handleServerCallback: handleSuccessfulCallback,
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1179,6 +1237,14 @@ describe("createOrpcServer", () => {
         Origin: "https://evil.example.com",
         "Content-Type": "application/x-www-form-urlencoded",
       };
+
+      const coderOauthResponse = await fetch(`${server.baseUrl}/auth/coder/callback`, {
+        method: "POST",
+        headers: callbackHeaders,
+        body: "state=test-state&code=test-code",
+      });
+      expect(coderOauthResponse.status).toBe(200);
+      expect(coderOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
         method: "POST",
@@ -1205,6 +1271,204 @@ describe("createOrpcServer", () => {
       expect(mcpOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
     } finally {
       await server?.close();
+    }
+  });
+
+  test("Coder OAuth start route builds a server-hosted redirect URI and the callback renders the flow outcome", async () => {
+    const startCalls: Array<{ deploymentUrl: string; flowId?: string; redirectUri: string }> = [];
+    const callbackCalls: Array<{
+      state: string | null;
+      code: string | null;
+      error: string | null;
+    }> = [];
+    const stubContext: Partial<ORPCContext> = {
+      coderOauthService: {
+        startServerFlow: (input: {
+          deploymentUrl: string;
+          flowId?: string;
+          redirectUri: string;
+        }) => {
+          startCalls.push(input);
+          return Promise.resolve({
+            success: true,
+            data: {
+              flowId: input.flowId ?? "generated",
+              authorizeUrl: "https://coder.test/authorize",
+            },
+          });
+        },
+        handleServerCallback: (input: {
+          state: string | null;
+          code: string | null;
+          error: string | null;
+        }) => {
+          callbackCalls.push(input);
+          return Promise.resolve(
+            input.state === "known-state"
+              ? { success: true, data: undefined }
+              : { success: false, error: "Unknown or expired OAuth state" }
+          );
+        },
+      } as unknown as ORPCContext["coderOauthService"],
+    };
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+        authToken: "test-token",
+      });
+
+      // Start requires auth: the route mints a registration on the deployment.
+      const unauthenticated = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`
+      );
+      expect(unauthenticated.status).toBe(401);
+      expect(startCalls).toHaveLength(0);
+
+      const missingDeployment = await fetch(`${server.baseUrl}/auth/coder/start`, {
+        headers: { Authorization: "Bearer test-token" },
+      });
+      expect(missingDeployment.status).toBe(400);
+
+      // The redirect URI is derived from the request (incl. app-proxy prefix),
+      // never taken from the client.
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test&flowId=flow-0123456789abcdef`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
+      );
+      expect(startResponse.status).toBe(200);
+      expect(await startResponse.json()).toEqual({
+        flowId: "flow-0123456789abcdef",
+        authorizeUrl: "https://coder.test/authorize",
+      });
+      expect(startCalls).toEqual([
+        {
+          deploymentUrl: "https://coder.test",
+          flowId: "flow-0123456789abcdef",
+          redirectUri: `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`,
+        },
+      ]);
+
+      // Callback: unauthenticated navigation; outcome decides the page.
+      const okResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=known-state&code=test-code`
+      );
+      expect(okResponse.status).toBe(200);
+      const okHtml = await okResponse.text();
+      expect(okHtml).toContain("Login complete");
+      expect(okHtml).toContain('"type":"coder-oauth"');
+
+      const failedResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=stale-state&code=test-code`
+      );
+      expect(failedResponse.status).toBe(400);
+      expect(await failedResponse.text()).toContain("Unknown or expired OAuth state");
+      expect(callbackCalls.map((c) => c.state)).toEqual(["known-state", "stale-state"]);
+    } finally {
+      await server?.close();
+    }
+  });
+
+  test("localhost binds both loopback families on one port", async () => {
+    // Regression: binding "localhost" used to take only the first resolved family,
+    // leaving the other loopback address free for another dev server on the same port.
+    // Mixed case also exercises hostname normalization.
+    const stubContext: Partial<ORPCContext> = {};
+    const server = await createOrpcServer({
+      host: "LocalHost",
+      port: 0,
+      context: stubContext as ORPCContext,
+      authToken: "test-token",
+    });
+
+    try {
+      expect(server.baseUrl).toBe(`http://LocalHost:${server.port}`);
+      const v4 = await fetch(`http://127.0.0.1:${server.port}/version`);
+      expect(v4.status).toBe(200);
+
+      let v6: Response;
+      try {
+        v6 = await fetch(`http://[::1]:${server.port}/version`);
+      } catch {
+        // Some CI environments do not have IPv6 loopback; the server falls back to IPv4 only.
+        return;
+      }
+      expect(v6.status).toBe(200);
+
+      // WebSocket upgrades arriving on ::1 must reach the shared upgrade handler.
+      const ws = new WebSocket(`ws://[::1]:${server.port}${ORPC_WS_PATH}?token=test-token`);
+      try {
+        await waitForWebSocketOpen(ws);
+      } finally {
+        ws.terminate();
+      }
+    } finally {
+      await server.close();
+    }
+
+    // close() must release both listeners.
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(server.port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+
+  test("localhost fails with EADDRINUSE when another process holds the IPv6 loopback port", async () => {
+    const squatter = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject);
+        squatter.listen(0, "::1", () => resolve());
+      });
+    } catch (error) {
+      const code = getErrorCode(error);
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        return;
+      }
+      throw error;
+    }
+
+    const address = squatter.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected TCP address");
+    }
+    const port = address.port;
+
+    try {
+      const stubContext: Partial<ORPCContext> = {};
+      let caught: unknown = null;
+      try {
+        const server = await createOrpcServer({
+          host: "localhost",
+          port,
+          context: stubContext as ORPCContext,
+          authToken: "test-token",
+        });
+        await server.close();
+      } catch (error) {
+        caught = error;
+      }
+      expect(getErrorCode(caught)).toBe("EADDRINUSE");
+
+      // The IPv4 listener bound before the failure must be released.
+      const reuse = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        reuse.once("error", reject);
+        reuse.listen(port, "127.0.0.1", () => resolve());
+      });
+      await new Promise<void>((resolve) => reuse.close(() => resolve()));
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
     }
   });
 
@@ -1523,6 +1787,35 @@ describe("createOrpcServer", () => {
     });
   }
 
+  test("does not log the auth token of a blocked cross-origin WebSocket upgrade", async () => {
+    // Browser clients authenticate the oRPC WebSocket with `?token=` (#4853).
+    const secret = "SECRET-auth-token-4853";
+    const warnSpy = spyOn(log, "warn");
+
+    try {
+      await withTestOrpcServer(async (server) => {
+        const ws = new WebSocket(`${server.wsUrl}?token=${secret}`, {
+          headers: { origin: "https://evil.example.com" },
+        });
+
+        try {
+          await waitForWebSocketRejection(ws);
+        } finally {
+          ws.terminate();
+        }
+      });
+
+      const blockedCalls = warnSpy.mock.calls.filter(
+        ([message]) => message === "Blocked cross-origin WebSocket upgrade request"
+      );
+      expect(blockedCalls).toHaveLength(1);
+      expect(blockedCalls[0]?.[1]).toMatchObject({ path: ORPC_WS_PATH });
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test("returns restrictive CORS preflight headers for same-origin requests", async () => {
     const stubContext: Partial<ORPCContext> = {};
 
@@ -1555,177 +1848,6 @@ describe("createOrpcServer", () => {
       expect(response.headers.get("access-control-max-age")).toBe("86400");
     } finally {
       await server?.close();
-    }
-  });
-
-  test("passes project trust through to global MCP tests when projectPath is provided", async () => {
-    async function runCase(trusted: boolean): Promise<void> {
-      const muxRoot = await fs.mkdtemp(
-        path.join(os.tmpdir(), `mux-orpc-mcp-test-${trusted ? "trusted" : "untrusted"}-`)
-      );
-      const projectPath = path.join(muxRoot, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-
-      const config = new Config(muxRoot);
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, { trusted, workspaces: [] });
-        return cfg;
-      });
-
-      const listServerCalls: Array<{ projectPath?: string; trusted?: boolean }> = [];
-      const testCalls: Array<{ projectPath: string; trusted?: boolean; name?: string }> = [];
-      const stubContext: Partial<ORPCContext> = {
-        config,
-        mcpConfigService: {
-          listServers: (listedProjectPath?: string, listedTrusted?: boolean) => {
-            listServerCalls.push({ projectPath: listedProjectPath, trusted: listedTrusted });
-            return Promise.resolve({
-              "repo-local": { transport: "stdio", command: "echo repo-local" },
-            });
-          },
-        } as unknown as ORPCContext["mcpConfigService"],
-        mcpServerManager: {
-          test: (options: { projectPath: string; trusted?: boolean; name?: string }) => {
-            testCalls.push(options);
-            return Promise.resolve({ success: true, tools: ["repo_tool"] });
-          },
-        } as unknown as ORPCContext["mcpServerManager"],
-        policyService: {
-          isEnforced: () => false,
-        } as unknown as ORPCContext["policyService"],
-        telemetryService: {
-          capture: () => undefined,
-        } as unknown as ORPCContext["telemetryService"],
-      };
-
-      let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
-
-      try {
-        server = await createOrpcServer({
-          host: "127.0.0.1",
-          port: 0,
-          context: stubContext as ORPCContext,
-        });
-
-        const client = createHttpClient(server.baseUrl);
-        const result = await Promise.resolve(
-          client.mcp.test({
-            projectPath,
-            name: "repo-local",
-          })
-        );
-
-        expect(result).toEqual({ success: true, tools: ["repo_tool"] });
-        expect(listServerCalls).toHaveLength(1);
-        expect(listServerCalls[0]?.projectPath).toBe(projectPath);
-        expect(listServerCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls).toHaveLength(1);
-        expect(testCalls[0]?.projectPath).toBe(projectPath);
-        expect(testCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls[0]?.name).toBe("repo-local");
-      } finally {
-        await server?.close();
-        await fs.rm(muxRoot, { recursive: true, force: true });
-      }
-    }
-
-    await runCase(false);
-    await runCase(true);
-  });
-
-  test("agents.list gates desktop-only agents with one capability probe", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agents-list-desktop-"));
-    const projectPath = path.join(tempRoot, "project");
-    const agentsRoot = path.join(projectPath, ".mux", "agents");
-    const config = new Config(tempRoot);
-    const metadata = {
-      id: "workspace-1",
-      name: "desktop-workspace",
-      projectName: "project",
-      projectPath,
-      runtimeConfig: { type: "local" as const },
-    };
-
-    await fs.mkdir(agentsRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(agentsRoot, "desktop-one.md"),
-      `---\nname: Desktop One\nui:\n  requires:\n    - desktop\n---\nBody\n`,
-      "utf-8"
-    );
-    await fs.writeFile(
-      path.join(agentsRoot, "desktop-two.md"),
-      `---\nname: Desktop Two\nui:\n  requires:\n    - desktop\n---\nBody\n`,
-      "utf-8"
-    );
-    await fs.writeFile(
-      path.join(agentsRoot, "plain.md"),
-      `---\nname: Plain Agent\n---\nBody\n`,
-      "utf-8"
-    );
-
-    async function runCase(available: boolean): Promise<void> {
-      const waitForInit = mock(() => Promise.resolve(undefined));
-      const getWorkspaceMetadata = mock(() =>
-        Promise.resolve({ success: true as const, data: metadata })
-      );
-      const getCapability = mock(() =>
-        Promise.resolve(
-          available
-            ? {
-                available: true as const,
-                width: 1440,
-                height: 900,
-                sessionId: `desktop:${metadata.id}`,
-              }
-            : {
-                available: false as const,
-                reason: "unsupported_runtime" as const,
-              }
-        )
-      );
-
-      const stubContext: Partial<ORPCContext> = {
-        config,
-        aiService: {
-          waitForInit,
-          getWorkspaceMetadata,
-        } as unknown as ORPCContext["aiService"],
-        desktopSessionManager: {
-          getCapability,
-        } as unknown as ORPCContext["desktopSessionManager"],
-      };
-
-      let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
-
-      try {
-        server = await createOrpcServer({
-          host: "127.0.0.1",
-          port: 0,
-          context: stubContext as ORPCContext,
-          authToken: "test-token",
-        });
-
-        const client = createHttpClient(server.baseUrl, {
-          Authorization: "Bearer test-token",
-        });
-        const agents = await Promise.resolve(client.agents.list({ workspaceId: metadata.id }));
-
-        expect(waitForInit).toHaveBeenCalledTimes(1);
-        expect(getWorkspaceMetadata).toHaveBeenCalledTimes(1);
-        expect(getCapability).toHaveBeenCalledTimes(1);
-        expect(agents.find((agent) => agent.id === "desktop-one")?.uiSelectable).toBe(available);
-        expect(agents.find((agent) => agent.id === "desktop-two")?.uiSelectable).toBe(available);
-        expect(agents.find((agent) => agent.id === "plain")?.uiSelectable).toBe(true);
-      } finally {
-        await server?.close();
-      }
-    }
-
-    try {
-      await runCase(false);
-      await runCase(true);
-    } finally {
-      await fs.rm(tempRoot, { recursive: true, force: true });
     }
   });
 

@@ -71,6 +71,47 @@ export function subscribeAdditionalSystemContext(
   };
 }
 
+const hydrationInFlight = new Set<string>();
+
+/**
+ * Fetch the persisted scratchpad once per workspace per app session.
+ *
+ * Historically the store was only hydrated by the Instructions-tab editor, so
+ * the chat-input decoration for saved instructions stayed hidden until that
+ * tab was opened — and then popped in. The chat view's first-paint barrier
+ * (useChatViewDataReady) calls this at workspace open so the decoration's
+ * state is known before the transcript reveals. Idempotent and re-entrant
+ * safe; never rejects (a failed fetch marks the store hydrated-empty so first
+ * paint is never blocked — self-healing over a stuck skeleton).
+ */
+export function ensureAdditionalSystemContextHydrated(api: APIClient, workspaceId: string): void {
+  if (isAdditionalSystemContextHydrated(workspaceId) || hydrationInFlight.has(workspaceId)) {
+    return;
+  }
+  hydrationInFlight.add(workspaceId);
+
+  api.workspace
+    .getAdditionalSystemContext({ workspaceId })
+    .then((result) => {
+      // A concurrent hydration (e.g. the Instructions editor) or a local edit
+      // may have landed first — never clobber it with this fetch.
+      if (!isAdditionalSystemContextHydrated(workspaceId)) {
+        updateAdditionalSystemContextSnapshot(workspaceId, {
+          content: result.content,
+          enabled: result.enabled,
+        });
+      }
+    })
+    .catch(() => {
+      if (!isAdditionalSystemContextHydrated(workspaceId)) {
+        updateAdditionalSystemContextSnapshot(workspaceId, DEFAULT_SNAPSHOT);
+      }
+    })
+    .finally(() => {
+      hydrationInFlight.delete(workspaceId);
+    });
+}
+
 interface SaveCallbacks {
   onError?: (error: unknown) => void;
   onIdle?: () => void;
@@ -167,7 +208,7 @@ export function queueAdditionalSystemContextSave(
  * soon as it mounts, and the focus request remains visible because we replay
  * it with a small generation counter.
  */
-let pendingFocusGeneration = new Map<string, number>();
+const pendingFocusGeneration = new Map<string, number>();
 
 export function requestAdditionalSystemContextFocus(workspaceId: string): void {
   const next = (pendingFocusGeneration.get(workspaceId) ?? 0) + 1;
@@ -198,11 +239,6 @@ export function subscribeAdditionalSystemContextFocus(
 
 export function getAdditionalSystemContextFocusGeneration(workspaceId: string): number {
   return pendingFocusGeneration.get(workspaceId) ?? 0;
-}
-
-/** Test-only: reset focus generation counters between scenarios. */
-export function __resetAdditionalSystemContextFocusForTests(): void {
-  pendingFocusGeneration = new Map();
 }
 
 export function useAdditionalSystemContextHydrated(workspaceId: string): boolean {

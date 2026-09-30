@@ -1,9 +1,19 @@
 import type { DisplayedMessage } from "@/common/types/message";
+import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 
 export interface LinkedTaskReport {
   taskId: string;
   reportMarkdown: string;
   title?: string;
+  // Report-time AI settings: fresher than the spawn result when a plan child
+  // handed off to exec after launch.
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+export interface BashTaskSpawnInfo {
+  script: string;
+  modelIntent?: string;
 }
 
 export interface TaskReportLinking {
@@ -28,6 +38,18 @@ export interface TaskReportLinking {
    * (e.g. older agent_report payloads).
    */
   spawnTitleByTaskId: Map<string, string>;
+
+  /**
+   * Agent types from the original `task` tool call input (`args.agentId` / `args.subagent_type`),
+   * indexed by taskId.
+   */
+  spawnAgentTypeByTaskId: Map<string, string>;
+
+  /**
+   * Spawn args of background `bash` tool calls, indexed by taskId. Lets task_await rows
+   * surface the spawning command's model_intent, which task_await results do not carry.
+   */
+  bashSpawnByTaskId: Map<string, BashTaskSpawnInfo>;
 }
 
 function getTaskIdsFromToolResult(result: unknown): string[] {
@@ -71,6 +93,48 @@ function getTitleFromTaskToolArgs(args: unknown): string | null {
   return typeof title === "string" && title.trim().length > 0 ? title.trim() : null;
 }
 
+function getAgentTypeFromTaskToolArgs(args: unknown): string | null {
+  if (typeof args !== "object" || args === null) return null;
+
+  const candidates = [
+    (args as { agentId?: unknown }).agentId,
+    (args as { subagent_type?: unknown }).subagent_type,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+// Only background bash spawn results carry a taskId, so its presence identifies them.
+function getBashSpawnTaskId(result: unknown): string | null {
+  if (typeof result !== "object" || result === null) return null;
+
+  const taskId = (result as { taskId?: unknown }).taskId;
+  return typeof taskId === "string" && taskId.trim().length > 0 ? taskId.trim() : null;
+}
+
+function getBashSpawnInfoFromArgs(args: unknown): BashTaskSpawnInfo | null {
+  if (typeof args !== "object" || args === null) return null;
+
+  const { script, model_intent } = args as {
+    script?: unknown;
+    model_intent?: unknown;
+  };
+  const modelIntent =
+    typeof model_intent === "string" && model_intent.trim().length > 0
+      ? model_intent.trim()
+      : undefined;
+  if (modelIntent === undefined) return null;
+
+  return {
+    script: typeof script === "string" ? script : "",
+    modelIntent,
+  };
+}
+
 /**
  * Render-time helper that links completed task reports (from `task_await`) back to the
  * original `task` tool call that spawned the background work.
@@ -82,17 +146,34 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
   // First pass: record which taskIds have a visible `task` tool call (and capture spawn titles).
   const taskToolCallTaskIds = new Set<string>();
   const spawnTitleByTaskId = new Map<string, string>();
+  const spawnAgentTypeByTaskId = new Map<string, string>();
+  const bashSpawnByTaskId = new Map<string, BashTaskSpawnInfo>();
   for (const msg of messages) {
-    if (msg.type !== "tool" || msg.toolName !== "task") continue;
+    if (msg.type !== "tool") continue;
+
+    if (msg.toolName === "bash") {
+      const taskId = getBashSpawnTaskId(msg.result);
+      const spawnInfo = taskId ? getBashSpawnInfoFromArgs(msg.args) : null;
+      if (taskId && spawnInfo) {
+        bashSpawnByTaskId.set(taskId, spawnInfo);
+      }
+      continue;
+    }
+
+    if (msg.toolName !== "task") continue;
 
     const taskIds = getTaskIdsFromToolResult(msg.result);
     if (taskIds.length === 0) continue;
 
     const title = getTitleFromTaskToolArgs(msg.args);
+    const agentType = getAgentTypeFromTaskToolArgs(msg.args);
     for (const taskId of taskIds) {
       taskToolCallTaskIds.add(taskId);
       if (title) {
         spawnTitleByTaskId.set(taskId, title);
+      }
+      if (agentType) {
+        spawnAgentTypeByTaskId.set(taskId, agentType);
       }
     }
   }
@@ -122,12 +203,23 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
       if (typeof reportMarkdown !== "string") continue;
 
       const title = (r as { title?: unknown }).title;
+      const modelString = (r as { modelString?: unknown }).modelString;
+      const thinkingLevel = (r as { thinkingLevel?: unknown }).thinkingLevel;
 
       // Last-wins (history order)
       reportByTaskId.set(taskId, {
         taskId,
         reportMarkdown,
         title: typeof title === "string" ? title : undefined,
+        modelString:
+          typeof modelString === "string" && modelString.trim().length > 0
+            ? modelString
+            : undefined,
+        thinkingLevel:
+          typeof thinkingLevel === "string" &&
+          (THINKING_LEVELS as readonly string[]).includes(thinkingLevel)
+            ? (thinkingLevel as ThinkingLevel)
+            : undefined,
       });
     }
   }
@@ -142,5 +234,11 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
     suppressReportInAwaitTaskIds.add(taskId);
   }
 
-  return { reportByTaskId, suppressReportInAwaitTaskIds, spawnTitleByTaskId };
+  return {
+    reportByTaskId,
+    suppressReportInAwaitTaskIds,
+    spawnTitleByTaskId,
+    spawnAgentTypeByTaskId,
+    bashSpawnByTaskId,
+  };
 }

@@ -2,9 +2,14 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider } from "@/browser/contexts/API";
-import { CHROMATIC_SMOKE_MODES } from "@/browser/stories/meta";
+import { PIXEL_DUAL_THEME } from "@/browser/stories/meta";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import type { GoalBoardEntry, GoalBoardSnapshot, GoalRecordV1 } from "@/common/types/goal";
+import type {
+  GoalBoardEntry,
+  GoalBoardSnapshot,
+  GoalRecordV1,
+  GoalSnapshot,
+} from "@/common/types/goal";
 
 import { GoalTab } from "./GoalTab";
 
@@ -17,28 +22,40 @@ const meta: Meta<typeof GoalTab> = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const EmptyWithCreateForm: Story = {
-  // Empty-state surface that wires the in-tab create form. Mirrors the
-  // slash-command `goal-set` shape (objective + optional budget + turn
-  // cap). The `onCreate` mock keeps the form interactive in Storybook
-  // without hitting a backend.
-  args: {
+// ─────────────────────────────────────────────────────────────────────────
+// States — composite gallery of the non-interactive GoalTab permutations.
+// Each section is the same component fed a different `goal` arg (empty
+// states, active, paused, budget-limited, complete, accounting/budget
+// variants). Stacking them in one story keeps every visual permutation
+// under review while collapsing eight near-duplicate snapshots into one.
+// Interaction coverage continues to live in `GoalTab.test.tsx`; this
+// gallery is intentionally `play`-free.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface GalleryVariant {
+  label: string;
+  goal: GoalSnapshot | null;
+  onCreate?: () => void;
+}
+
+const STATE_VARIANTS: GalleryVariant[] = [
+  {
+    // Empty-state surface that wires the in-tab create form. Mirrors the
+    // slash-command `goal-set` shape (objective + optional budget + turn
+    // cap). The `onCreate` mock keeps the form interactive in Storybook
+    // without hitting a backend.
+    label: "Empty · with create form",
     goal: null,
     onCreate: () => undefined,
   },
-};
-
-export const EmptyReadOnly: Story = {
-  // Read-only fallback when no create callback is wired (e.g., storybook
-  // stories that exercise the legacy placeholder). Asserts the empty-state
-  // gracefully degrades instead of crashing.
-  args: {
+  {
+    // Read-only fallback when no create callback is wired. Asserts the
+    // empty-state gracefully degrades instead of crashing.
+    label: "Empty · read-only",
     goal: null,
   },
-};
-
-export const Active: Story = {
-  args: {
+  {
+    label: "Active",
     goal: {
       goalId: "11111111-1111-4111-8111-111111111111",
       status: "active",
@@ -50,10 +67,8 @@ export const Active: Story = {
       startedAtMs: Date.now(),
     },
   },
-};
-
-export const ActiveWithAccounting: Story = {
-  args: {
+  {
+    label: "Active · with accounting",
     goal: {
       goalId: "44444444-4444-4444-8444-444444444444",
       status: "active",
@@ -65,10 +80,8 @@ export const ActiveWithAccounting: Story = {
       startedAtMs: Date.now() - 90_000,
     },
   },
-};
-
-export const Paused: Story = {
-  args: {
+  {
+    label: "Paused",
     goal: {
       goalId: "22222222-2222-4222-8222-222222222222",
       status: "paused",
@@ -80,10 +93,8 @@ export const Paused: Story = {
       startedAtMs: Date.now(),
     },
   },
-};
-
-export const BudgetLimited: Story = {
-  args: {
+  {
+    label: "Budget limited",
     goal: {
       goalId: "55555555-5555-4555-8555-555555555555",
       status: "budget_limited",
@@ -95,10 +106,8 @@ export const BudgetLimited: Story = {
       startedAtMs: Date.now() - 120_000,
     },
   },
-};
-
-export const Complete: Story = {
-  args: {
+  {
+    label: "Complete",
     goal: {
       goalId: "33333333-3333-4333-8333-333333333333",
       status: "complete",
@@ -111,10 +120,8 @@ export const Complete: Story = {
       startedAtMs: Date.now(),
     },
   },
-};
-
-export const ActiveWithBudget: Story = {
-  args: {
+  {
+    label: "Active · with budget",
     goal: {
       goalId: "66666666-6666-4666-8666-666666666666",
       status: "active",
@@ -126,6 +133,21 @@ export const ActiveWithBudget: Story = {
       startedAtMs: Date.now() - 30_000,
     },
   },
+];
+
+export const States: Story = {
+  render: () => (
+    <div className="flex flex-col gap-6 p-3">
+      {STATE_VARIANTS.map((variant) => (
+        <section key={variant.label} className="flex flex-col gap-2">
+          <div className="text-xs font-medium tracking-wide uppercase opacity-60">
+            {variant.label}
+          </div>
+          <GoalTab goal={variant.goal} onCreate={variant.onCreate} />
+        </section>
+      ))}
+    </div>
+  ),
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -237,7 +259,7 @@ export const CompleteWithBoard: Story = {
   // Dual-theme smoke coverage: the row-action button restyle should not
   // regress in either light or dark mode.
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   decorators: [
     (Story) => (

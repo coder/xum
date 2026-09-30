@@ -20,12 +20,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { Blocks, Cog, GitBranch, Loader2, Wand2 } from "lucide-react";
-import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { useSettings } from "@/browser/contexts/SettingsContext";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { GitBranch, Loader2, Wand2 } from "lucide-react";
+import type { ProjectConfig } from "@/common/types/project";
+import { CreationProjectSelect } from "./CreationProjectSelect";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
+import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
@@ -54,7 +53,9 @@ import {
  * Fixed width ensures Select (with chevron) and text inputs render identically.
  */
 const INLINE_CONTROL_CLASSES =
-  "h-7 w-[140px] rounded border border-border-medium bg-separator px-2 text-xs text-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+  "h-7 w-[140px] rounded border border-border-light bg-transparent px-2 text-xs text-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+
+const SENTENCE_CLAUSE_CLASSES = "flex w-full min-w-0 items-center gap-2 md:w-auto";
 
 /** Credential sharing checkbox - used by Docker and Devcontainer runtimes */
 function CredentialSharingCheckbox(props: {
@@ -78,12 +79,7 @@ function CredentialSharingCheckbox(props: {
   );
 }
 
-function NameErrorDisplay(props: { error: WorkspaceNameUIError }) {
-  // Validation and transport errors are already human-readable plain text.
-  if (props.error.kind === "validation" || props.error.kind === "transport") {
-    return <span className="text-xs text-red-500">{props.error.message}</span>;
-  }
-
+function NameErrorDisplay(props: { error: Extract<WorkspaceNameUIError, { kind: "generation" }> }) {
   const formatted = formatNameGenerationError(props.error.error);
   return (
     <div className="text-primary rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs">
@@ -126,6 +122,9 @@ interface CreationControlsProps {
    * {@link projectPath} when omitted.
    */
   selectedProjectPath?: string;
+  /** Stable project data passed by ChatInput so typing does not subscribe this form to broad contexts. */
+  userProjects: Map<string, ProjectConfig>;
+  onSelectedProjectPathChange: (path: string) => void;
   /** Project name to display as header */
   projectName: string;
   /** Workspace name/title generation state and actions */
@@ -520,10 +519,8 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
  * Prominent controls shown above the input during workspace creation.
  * Displays project name as header, workspace name with magic wand, and runtime/branch selectors.
  */
-export function CreationControls(props: CreationControlsProps) {
-  const { userProjects } = useProjectContext();
-  const settings = useSettings();
-  const { beginWorkspaceCreation } = useWorkspaceContext();
+function CreationControlsContent(props: CreationControlsProps) {
+  usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
 
   // Extract mode from discriminated union for convenience
@@ -726,9 +723,13 @@ export function CreationControls(props: CreationControlsProps) {
     nameState.setAutoGenerate(!nameState.autoGenerate);
   }, [nameState]);
 
+  const nameTooltipError =
+    nameState.error?.kind === "validation" || nameState.error?.kind === "transport"
+      ? nameState.error
+      : null;
+
   return (
     <div className="mb-3 flex flex-col gap-4">
-      {/* Project name / workspace name header row - wraps on narrow viewports */}
       <div
         className={cn("flex gap-y-2", nameState.error ? "items-start" : "items-center")}
         data-component="WorkspaceNameGroup"
@@ -739,46 +740,12 @@ export function CreationControls(props: CreationControlsProps) {
           // selecting "gbot/bbot" would show "gbot" because props.projectPath
           // is normalized to the owning parent for runtime/config scoping.
           const selected = props.selectedProjectPath ?? props.projectPath;
-          const selectedLabel = formatProjectHierarchyLabel(selected, userProjects);
-          return userProjects.size > 1 ? (
-            <RadixSelect
-              value={selected}
-              onValueChange={(path: string) => beginWorkspaceCreation(path)}
-            >
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <SelectTrigger
-                    aria-label="Select project"
-                    data-testid="project-selector"
-                    className="text-foreground hover:bg-toggle-bg/70 h-7 w-auto max-w-[280px] shrink-0 border-transparent bg-transparent px-0 text-lg font-semibold shadow-none"
-                  >
-                    {/*
-                     * Render the hierarchy label as the explicit child instead of
-                     * relying on Radix's <SelectValue/> mirror of the matched
-                     * <SelectItem/> text. This keeps the trigger label in sync
-                     * with the SelectItem labels (which also use the hierarchy
-                     * label) and avoids fallbacks to bare basenames.
-                     */}
-                    <SelectValue placeholder={selectedLabel}>{selectedLabel}</SelectValue>
-                  </SelectTrigger>
-                </TooltipTrigger>
-                <TooltipContent align="start">{selected}</TooltipContent>
-              </Tooltip>
-              <SelectContent>
-                {Array.from(userProjects.keys()).map((path) => (
-                  <SelectItem key={path} value={path}>
-                    {formatProjectHierarchyLabel(path, userProjects)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </RadixSelect>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <h2 className="text-foreground shrink-0 text-lg font-semibold">{selectedLabel}</h2>
-              </TooltipTrigger>
-              <TooltipContent align="start">{selected}</TooltipContent>
-            </Tooltip>
+          return (
+            <CreationProjectSelect
+              selected={selected}
+              userProjects={props.userProjects}
+              onChange={props.onSelectedProjectPathChange}
+            />
           );
         })()}
         <span className="text-muted-foreground mx-2 text-lg">/</span>
@@ -787,7 +754,7 @@ export function CreationControls(props: CreationControlsProps) {
         <div className="flex min-w-0 flex-col gap-1" data-component="WorkspaceNameInputBlock">
           {/* Name input with magic wand */}
           <div className="flex items-center gap-1">
-            <Tooltip>
+            <Tooltip open={nameTooltipError ? true : undefined}>
               <TooltipTrigger asChild>
                 <input
                   id="workspace-name"
@@ -797,19 +764,31 @@ export function CreationControls(props: CreationControlsProps) {
                   onFocus={handleInputFocus}
                   placeholder={nameState.isGenerating ? "Generating..." : "workspace-name"}
                   disabled={props.disabled}
+                  aria-invalid={nameState.error ? true : undefined}
                   className={cn(
                     `border-border-medium focus:border-accent h-7 rounded-md
                      border border-transparent bg-transparent text-lg font-semibold 
                      field-sizing-content focus:border focus:bg-bg-dark focus:outline-none 
                      disabled:opacity-50 max-w-[50vw] sm:max-w-[40vw] lg:max-w-[30vw]`,
                     nameState.autoGenerate ? "text-muted" : "text-foreground",
-                    nameState.error && "border-red-500"
+                    // focus:border-red-500 keeps the error border visible while typing;
+                    // focus:border-accent would otherwise override it.
+                    nameState.error && "border-red-500 focus:border-red-500"
                   )}
                 />
               </TooltipTrigger>
-              <TooltipContent align="start" className="max-w-64">
-                A stable identifier used for git branches, worktree folders, and session
-                directories.
+              <TooltipContent
+                align="start"
+                className={cn("max-w-64", nameTooltipError && "border-red-500/40 text-red-500")}
+              >
+                {nameTooltipError ? (
+                  nameTooltipError.message
+                ) : (
+                  <>
+                    Use lowercase letters, numbers, hyphens, underscores, and the <code>/</code>
+                    separator. Slashes in git branches map to hyphens in folder and workspace names.
+                  </>
+                )}
               </TooltipContent>
             </Tooltip>
             {/* Magic wand / loading indicator */}
@@ -843,46 +822,19 @@ export function CreationControls(props: CreationControlsProps) {
               </Tooltip>
             )}
           </div>
-          {nameState.error && <NameErrorDisplay error={nameState.error} />}
+          {nameState.error?.kind === "generation" && <NameErrorDisplay error={nameState.error} />}
         </div>
       </div>
 
-      {/* Runtime and source branch controls */}
       <div className="flex flex-col gap-1.5" data-component="RuntimeTypeGroup">
-        <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-2 text-sm">
+          <span className="text-muted-foreground shrink-0">This workspace will use</span>
           {/* Workspace Type + Source Branch share a row on mobile */}
-          <div className="flex w-full items-end gap-3 md:contents md:w-auto">
-            <div className="flex min-w-0 flex-1 flex-col gap-1.5 md:flex-initial">
-              <div className="flex items-center gap-1.5">
-                <label className="text-muted-foreground flex items-center gap-1 text-xs font-medium">
-                  <Blocks className="h-3.5 w-3.5" />
-                  Workspace Type
-                </label>
-                {/* Keep this compact while preserving quick access to project runtime defaults. */}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        settings.open("runtimes", { runtimesProjectPath: props.projectPath })
-                      }
-                      className={cn(
-                        "text-muted-foreground hover:text-foreground inline-flex h-3.5 w-3.5 items-center justify-center rounded-sm transition-colors",
-                        runtimeChoice !== props.defaultRuntimeMode &&
-                          "text-warning hover:text-warning"
-                      )}
-                      aria-label="Configure runtimes"
-                    >
-                      <Cog className="h-3 w-3" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent align="center">
-                    {runtimeChoice !== props.defaultRuntimeMode
-                      ? "Set project runtime defaults"
-                      : "Configure runtimes"}
-                  </TooltipContent>
-                </Tooltip>
-              </div>
+          <div className="flex w-full items-center gap-2 md:contents md:w-auto">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 md:flex-initial">
+              <label className="sr-only" htmlFor="workspace-type-group">
+                Workspace Type
+              </label>
               <RuntimeButtonGroup
                 value={runtimeChoice}
                 onChange={(mode) => {
@@ -958,15 +910,17 @@ export function CreationControls(props: CreationControlsProps) {
               />
             </div>
 
+            <span className="text-muted-foreground shrink-0">from</span>
+
             <div
-              className="flex min-w-0 flex-1 flex-col gap-1.5 md:flex-initial"
+              className="flex min-w-0 flex-1 items-center gap-1.5 md:flex-initial"
               data-component="BranchSelector"
               data-tutorial="trunk-branch"
             >
-              <label className="text-muted-foreground flex items-center gap-1 text-xs font-medium">
-                <GitBranch className="h-3.5 w-3.5" />
+              <label className="sr-only" htmlFor="source-branch-select">
                 Source Branch
               </label>
+              <GitBranch className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
               {props.branchesLoaded ? (
                 <RadixSelect
                   value={props.trunkBranch}
@@ -994,44 +948,50 @@ export function CreationControls(props: CreationControlsProps) {
           </div>
           {/* end mobile row wrapper */}
 
-          {/* SSH Host Input - shown in the same row when SSH (non-Coder) is selected */}
           {selectedRuntime.mode === "ssh" &&
             !isCoderSelected &&
             (props.allowSshHost ?? true) &&
             !props.coderProps?.enabled &&
             // Also hide when Coder is still checking but has saved config (will enable after check)
             !(props.coderProps?.coderInfo === null && props.coderProps?.coderConfig) && (
-              <RuntimeConfigInput
-                id="ssh-host"
-                fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
-                value={selectedRuntime.host}
-                onChange={(value) => onSelectedRuntimeChange({ mode: "ssh", host: value })}
-                disabled={props.disabled}
-                hasError={props.runtimeFieldError === "ssh"}
-                inputClassName={INLINE_CONTROL_CLASSES}
-                stacked
-              />
+              <div className={SENTENCE_CLAUSE_CLASSES}>
+                <span className="text-muted-foreground shrink-0">on host</span>
+                <RuntimeConfigInput
+                  id="ssh-host"
+                  fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
+                  value={selectedRuntime.host}
+                  onChange={(value) => onSelectedRuntimeChange({ mode: "ssh", host: value })}
+                  disabled={props.disabled}
+                  hasError={props.runtimeFieldError === "ssh"}
+                  className="min-w-0 flex-1 md:flex-initial"
+                  labelClassName="sr-only"
+                  inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[160px]")}
+                />
+              </div>
             )}
 
-          {/* Docker Image Input - shown in the same row when Docker is selected */}
           {selectedRuntime.mode === "docker" && (
-            <RuntimeConfigInput
-              fieldSpec={RUNTIME_OPTION_FIELDS.docker}
-              value={selectedRuntime.image}
-              onChange={(value) =>
-                onSelectedRuntimeChange({
-                  mode: "docker",
-                  image: value,
-                  shareCredentials: selectedRuntime.shareCredentials,
-                })
-              }
-              disabled={props.disabled}
-              hasError={props.runtimeFieldError === "docker"}
-              id="docker-image"
-              ariaLabel="Docker image"
-              inputClassName={INLINE_CONTROL_CLASSES}
-              stacked
-            />
+            <div className={SENTENCE_CLAUSE_CLASSES}>
+              <span className="text-muted-foreground shrink-0">with image</span>
+              <RuntimeConfigInput
+                fieldSpec={RUNTIME_OPTION_FIELDS.docker}
+                value={selectedRuntime.image}
+                onChange={(value) =>
+                  onSelectedRuntimeChange({
+                    mode: "docker",
+                    image: value,
+                    shareCredentials: selectedRuntime.shareCredentials,
+                  })
+                }
+                disabled={props.disabled}
+                hasError={props.runtimeFieldError === "docker"}
+                id="docker-image"
+                ariaLabel="Docker image"
+                className="min-w-0 flex-1 md:flex-initial"
+                labelClassName="sr-only"
+                inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[160px]")}
+              />
+            </div>
           )}
         </div>
 
@@ -1160,5 +1120,101 @@ export function CreationControls(props: CreationControlsProps) {
         )}
       </div>
     </div>
+  );
+}
+
+// ChatInput is not currently compiler-eligible because of its async control flow,
+// so keep this small wrapper compiler-friendly and pass every dependency explicitly.
+// React Compiler then retains the expensive control tree while draft text changes.
+export function CreationControls(props: CreationControlsProps) {
+  const coderEnabled = props.coderProps?.enabled;
+  const coderOnEnabledChange = props.coderProps?.onEnabledChange;
+  const coderInfo = props.coderProps?.coderInfo;
+  const coderConfig = props.coderProps?.coderConfig;
+  const coderOnConfigChange = props.coderProps?.onCoderConfigChange;
+  const coderTemplates = props.coderProps?.templates;
+  const coderTemplatesError = props.coderProps?.templatesError;
+  const coderPresets = props.coderProps?.presets;
+  const coderPresetsError = props.coderProps?.presetsError;
+  const coderExistingWorkspaces = props.coderProps?.existingWorkspaces;
+  const coderWorkspacesError = props.coderProps?.workspacesError;
+  const coderLoadingTemplates = props.coderProps?.loadingTemplates;
+  const coderLoadingPresets = props.coderProps?.loadingPresets;
+  const coderLoadingWorkspaces = props.coderProps?.loadingWorkspaces;
+  const hasCoderProps = props.coderProps != null;
+  const coderProps = !hasCoderProps
+    ? undefined
+    : {
+        enabled: coderEnabled ?? false,
+        onEnabledChange: coderOnEnabledChange!,
+        coderInfo: coderInfo ?? null,
+        coderConfig: coderConfig ?? null,
+        onCoderConfigChange: coderOnConfigChange!,
+        templates: coderTemplates ?? [],
+        templatesError: coderTemplatesError ?? null,
+        presets: coderPresets ?? [],
+        presetsError: coderPresetsError ?? null,
+        existingWorkspaces: coderExistingWorkspaces ?? [],
+        workspacesError: coderWorkspacesError ?? null,
+        loadingTemplates: coderLoadingTemplates ?? false,
+        loadingPresets: coderLoadingPresets ?? false,
+        loadingWorkspaces: coderLoadingWorkspaces ?? false,
+      };
+  const runtimeLocal = props.runtimeEnablement?.local;
+  const runtimeWorktree = props.runtimeEnablement?.worktree;
+  const runtimeSsh = props.runtimeEnablement?.ssh;
+  const runtimeCoder = props.runtimeEnablement?.coder;
+  const runtimeDocker = props.runtimeEnablement?.docker;
+  const runtimeDevcontainer = props.runtimeEnablement?.devcontainer;
+  const hasRuntimeEnablement = props.runtimeEnablement != null;
+  const runtimeEnablement = !hasRuntimeEnablement
+    ? undefined
+    : {
+        local: runtimeLocal ?? true,
+        worktree: runtimeWorktree ?? true,
+        ssh: runtimeSsh ?? true,
+        coder: runtimeCoder ?? true,
+        docker: runtimeDocker ?? true,
+        devcontainer: runtimeDevcontainer ?? true,
+      };
+  const nameState = {
+    name: props.nameState.name,
+    title: props.nameState.title,
+    isGenerating: props.nameState.isGenerating,
+    autoGenerate: props.nameState.autoGenerate,
+    error: props.nameState.error,
+    setAutoGenerate: props.nameState.setAutoGenerate,
+    setName: props.nameState.setName,
+  };
+
+  return (
+    <CreationControlsContent
+      branches={props.branches}
+      branchesLoaded={props.branchesLoaded}
+      trunkBranch={props.trunkBranch}
+      onTrunkBranchChange={props.onTrunkBranchChange}
+      selectedRuntime={props.selectedRuntime}
+      coderConfigFallback={props.coderConfigFallback}
+      sshHostFallback={props.sshHostFallback}
+      defaultRuntimeMode={props.defaultRuntimeMode}
+      onSelectedRuntimeChange={props.onSelectedRuntimeChange}
+      onSetDefaultRuntime={props.onSetDefaultRuntime}
+      disabled={props.disabled}
+      projectPath={props.projectPath}
+      selectedProjectPath={props.selectedProjectPath}
+      userProjects={props.userProjects}
+      onSelectedProjectPathChange={props.onSelectedProjectPathChange}
+      projectName={props.projectName}
+      nameState={nameState}
+      runtimeAvailabilityState={props.runtimeAvailabilityState}
+      runtimeEnablement={runtimeEnablement}
+      runtimeFieldError={props.runtimeFieldError}
+      allowedRuntimeModes={props.allowedRuntimeModes}
+      allowSshHost={props.allowSshHost}
+      allowSshCoder={props.allowSshCoder}
+      runtimePolicyError={props.runtimePolicyError}
+      coderInfo={props.coderInfo}
+      coderProps={coderProps}
+    />
   );
 }

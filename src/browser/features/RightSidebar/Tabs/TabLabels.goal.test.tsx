@@ -4,11 +4,16 @@ import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { GoalSnapshot } from "@/common/types/goal";
 import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 // The label subscribes to the workspace sidebar store to surface the
 // "active goal" accent. Mocking the hook keeps these tests focused on the
 // label's CSS behavior without spinning up a real workspace store.
 let mockedSidebarState: WorkspaceSidebarState | null = null;
+// The partial store stub below drops every other export; restore the real module after this
+// suite so later files see the full WorkspaceStore.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }]]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useOptionalWorkspaceSidebarState: () => mockedSidebarState,
   useWorkspaceUsage: () => ({

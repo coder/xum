@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const BOTTOM_LOCK_EPSILON_PX = 1;
 const USER_BOTTOM_RELOCK_THRESHOLD_PX = 8;
 const USER_SCROLL_INTENT_WINDOW_MS = 750;
-const BOTTOM_LOCK_SETTLE_FRAME_LIMIT = 60;
 const TRANSCRIPT_SCROLL_KEYS = new Set([
   "ArrowDown",
   "ArrowUp",
@@ -45,6 +44,24 @@ function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   );
 }
 
+// Space activates buttons/summaries instead of scrolling the scrollport, so
+// pressing it on a transcript control (e.g. keyboard-expanding the last tool card)
+// is not scroll intent. Treating it as intent let the resulting layout-growth
+// scroll event release the bottom lock; Pixel caught this as a flaky
+// "Jump to bottom" state in App/AgentCommunication/Long Message.
+// Links are deliberately excluded: they activate on Enter, and Space on a focused
+// link still scrolls the transcript.
+const ACTIVATION_SCROLL_KEYS = new Set([" ", "Spacebar"]);
+const SPACE_ACTIVATED_CONTROL_SELECTOR = 'button, summary, [role="button"]';
+
+function isActivationKeyOnControl(key: string, target: EventTarget | null): boolean {
+  return (
+    ACTIVATION_SCROLL_KEYS.has(key) &&
+    target instanceof Element &&
+    target.closest(SPACE_ACTIVATED_CONTROL_SELECTOR) !== null
+  );
+}
+
 function isMouseDownExemptFromScrollIntent(
   target: EventTarget | null,
   currentTarget: HTMLElement
@@ -56,18 +73,36 @@ function isMouseDownExemptFromScrollIntent(
 }
 
 /**
- * Bottom-lock invariant: while `autoScroll` is true the transcript `scrollTop`
- * equals `scrollHeight - clientHeight`. Layout signals such as ResizeObserver,
- * open-chat, send, and geometric relock arm a short requestAnimationFrame settle
- * window instead of polling forever. The rAF tick lands just before paint, so
- * sub-pixel CSS transitions, async font/image settling, and scroll-anchor races
- * inside expanding tool panes converge without adding continuous idle work.
- * User input releases the lock; an explicit action (open chat, send,
- * jump-to-bottom) or geometric return-to-bottom reacquires it.
+ * Bottom-stick architecture: the browser owns bottom anchoring; JS only sets the
+ * initial bottom on discrete events.
+ *
+ * The scroll content ends with a 0-height sentinel (`sentinelRef`). While
+ * `autoScroll` is true the consumer marks the sentinel as the *only* element with
+ * `overflow-anchor: auto` (every transcript row opts out via `overflow-anchor:
+ * none`). Native CSS scroll anchoring then keeps that sentinel pinned to the
+ * bottom as rows, tokens, and the streaming barrier append above it — no per-frame
+ * `scrollTop` chase. This replaced an earlier 60-frame requestAnimationFrame settle
+ * loop that re-pinned every frame and visibly fought sub-pixel transitions, font
+ * swaps, and composer-driven viewport resizes (the recurring "send flash").
+ *
+ * `stickToBottom` is therefore only invoked on discrete ownership transfers
+ * (open-chat, send, jump-to-bottom, geometric relock) and once per scrollport
+ * resize as a safety net; anchoring holds the bottom in between. User input
+ * releases the lock; an explicit action or a geometric return-to-bottom reacquires
+ * it, at which point the sentinel comes back onscreen and anchoring re-engages.
+ *
+ * NOTE: anchoring only sticks to the bottom while the sentinel is onscreen (i.e.
+ * we are at the bottom). Once the user scrolls up, `autoScroll` flips false, rows
+ * regain `overflow-anchor: auto`, and the browser preserves the user's reading
+ * position when off-screen content above the fold settles.
  */
 export function useAutoScroll() {
   const [autoScroll, setAutoScroll] = useState(true);
   const contentRef = useRef<HTMLDivElement>(null);
+  // 0-height marker rendered between the transcript content and the in-flow
+  // composer dock. See the hook doc comment: while locked it is the sole
+  // `overflow-anchor: auto` element so native anchoring pins the bottom.
+  const sentinelRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const programmaticDisableRef = useRef(false);
   const userScrollIntentUntilRef = useRef(0);
@@ -106,47 +141,6 @@ export function useAutoScroll() {
     }
   }, []);
 
-  const frameLoopRef = useRef<{ id: number | null; framesRemaining: number }>({
-    id: null,
-    framesRemaining: 0,
-  });
-
-  const stopBottomLockFrameLoop = useCallback(() => {
-    const frameId = frameLoopRef.current.id;
-    if (frameId !== null && typeof window !== "undefined") {
-      const cancelFrame = window.cancelAnimationFrame?.bind(window);
-      cancelFrame?.(frameId);
-    }
-    frameLoopRef.current.id = null;
-    frameLoopRef.current.framesRemaining = 0;
-  }, []);
-
-  const startBottomLockFrameLoop = useCallback(() => {
-    if (!autoScrollRef.current) return;
-    const win = typeof window !== "undefined" ? window : undefined;
-    const raf = win?.requestAnimationFrame?.bind(win);
-    if (!raf) return;
-
-    frameLoopRef.current.framesRemaining = BOTTOM_LOCK_SETTLE_FRAME_LIMIT;
-    if (frameLoopRef.current.id !== null) return;
-
-    const tick = () => {
-      frameLoopRef.current.id = null;
-      if (!autoScrollRef.current || frameLoopRef.current.framesRemaining <= 0) {
-        frameLoopRef.current.framesRemaining = 0;
-        return;
-      }
-
-      stickToBottom();
-      frameLoopRef.current.framesRemaining -= 1;
-      if (frameLoopRef.current.framesRemaining > 0) {
-        frameLoopRef.current.id = raf(tick);
-      }
-    };
-
-    frameLoopRef.current.id = raf(tick);
-  }, [stickToBottom]);
-
   const jumpToBottom = useCallback(() => {
     // Opening/sending is an explicit transfer of scroll ownership back to the
     // transcript tail. Clear stale wheel/touch/key intent before the browser emits
@@ -154,12 +148,13 @@ export function useAutoScroll() {
     userScrollIntentUntilRef.current = 0;
     programmaticDisableRef.current = false;
     setAutoScrollEnabled(true);
+    // Establish the bottom once. The sentinel is now onscreen, so native scroll
+    // anchoring holds it as later rows/tokens append — no settle loop required.
     stickToBottom();
     // stickToBottom skips the write when scrollTop is already max, so we may
     // not get a follow-up scroll event to refresh lastScrollTopRef.
     seedScrollDirectionBaseline();
-    startBottomLockFrameLoop();
-  }, [seedScrollDirectionBaseline, setAutoScrollEnabled, startBottomLockFrameLoop, stickToBottom]);
+  }, [seedScrollDirectionBaseline, setAutoScrollEnabled, stickToBottom]);
 
   const disableAutoScroll = useCallback(() => {
     userScrollIntentUntilRef.current = 0;
@@ -169,8 +164,7 @@ export function useAutoScroll() {
     // baseline now to keep the next user-driven scroll event's direction
     // check honest.
     seedScrollDirectionBaseline();
-    stopBottomLockFrameLoop();
-  }, [seedScrollDirectionBaseline, setAutoScrollEnabled, stopBottomLockFrameLoop]);
+  }, [seedScrollDirectionBaseline, setAutoScrollEnabled]);
 
   const markUserScrollIntent = useCallback(() => {
     programmaticDisableRef.current = false;
@@ -245,6 +239,7 @@ export function useAutoScroll() {
       // buttons or links. Editable controls keep those keys local for caret/text
       // navigation, so they must not open a transcript scroll-intent window.
       if (!TRANSCRIPT_SCROLL_KEYS.has(event.key) || isEditableKeyboardTarget(event.target)) return;
+      if (isActivationKeyOnControl(event.key, event.target)) return;
 
       markUserScrollIntent();
     },
@@ -264,7 +259,6 @@ export function useAutoScroll() {
           !isWithinBottomThreshold(scrollContainer, BOTTOM_LOCK_EPSILON_PX)
         ) {
           stickToBottom();
-          startBottomLockFrameLoop();
           return;
         }
 
@@ -274,7 +268,9 @@ export function useAutoScroll() {
           isWithinBottomThreshold(scrollContainer, USER_BOTTOM_RELOCK_THRESHOLD_PX)
         ) {
           setAutoScrollEnabled(true);
-          startBottomLockFrameLoop();
+          // Snap the sentinel fully onscreen so anchoring re-engages from the exact
+          // bottom (relock fires within USER_BOTTOM_RELOCK_THRESHOLD_PX of it).
+          stickToBottom();
         }
         return;
       }
@@ -310,28 +306,21 @@ export function useAutoScroll() {
         isWithinBottomThreshold(scrollContainer, USER_BOTTOM_RELOCK_THRESHOLD_PX)
       ) {
         setAutoScrollEnabled(true);
-        startBottomLockFrameLoop();
+        stickToBottom();
       }
     },
-    [setAutoScrollEnabled, startBottomLockFrameLoop, stickToBottom]
+    [setAutoScrollEnabled, stickToBottom]
   );
 
-  // Frame-aligned bottom-lock enforcer.
-  //
-  // The rAF work is bounded: open-chat/send/relock/resize signals arm a short
-  // settle window, and the loop stops once that budget is exhausted or the user
-  // releases the lock. That keeps the paint-aligned correction without continuous
-  // idle polling in long-lived chats.
-  useEffect(() => {
-    if (autoScroll) {
-      startBottomLockFrameLoop();
-      return stopBottomLockFrameLoop;
-    }
-
-    stopBottomLockFrameLoop();
-    return undefined;
-  }, [autoScroll, startBottomLockFrameLoop, stopBottomLockFrameLoop]);
-
+  // Safety net behind native scroll anchoring. Anchoring (the sentinel) keeps us
+  // pinned as content appends, but two layout changes are not an "append above
+  // the anchor": a resize of the scrollport itself (window, sidebars, onscreen
+  // keyboard) and growth of the in-flow composer dock, which sits BELOW the
+  // sentinel so anchoring cannot compensate. Observing the scrollport plus every
+  // direct child (transcript content, sentinel, composer dock) covers both:
+  // ResizeObserver delivers before paint, so this is a single synchronous
+  // pre-paint write per resize — NOT a per-frame loop — and cannot fight CSS
+  // transitions or font swaps the way the old settle loop did.
   useEffect(() => {
     if (!autoScroll) return;
     const scrollContainer = contentRef.current;
@@ -341,19 +330,18 @@ export function useAutoScroll() {
     const observer = new ResizeObserverCtor(() => {
       if (!autoScrollRef.current) return;
       stickToBottom();
-      startBottomLockFrameLoop();
     });
     observer.observe(scrollContainer);
-    const content = scrollContainer.firstElementChild;
-    if (content) {
-      observer.observe(content);
+    for (const child of Array.from(scrollContainer.children)) {
+      observer.observe(child);
     }
 
     return () => observer.disconnect();
-  }, [autoScroll, startBottomLockFrameLoop, stickToBottom]);
+  }, [autoScroll, stickToBottom]);
 
   return {
     contentRef,
+    sentinelRef,
     autoScroll,
     disableAutoScroll,
     jumpToBottom,

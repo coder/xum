@@ -1,9 +1,9 @@
 ---
 title: Keyboard Shortcuts
-description: Complete keyboard shortcut reference for Mux
+description: Complete keyboard shortcut reference for Xum
 ---
 
-Mux is designed to be keyboard-driven for maximum efficiency. All major actions have keyboard shortcuts.
+Xum is designed to be keyboard-driven for maximum efficiency. All major actions have keyboard shortcuts.
 
 <Info>
   This document should be kept in sync with `src/browser/utils/ui/keybinds.ts`, which is the source
@@ -28,16 +28,17 @@ When documentation shows `Ctrl`, it means:
 
 ## Chat & Messages
 
-| Action                 | Shortcut              |
-| ---------------------- | --------------------- |
-| Focus chat input       | `a`, `i`, or `Ctrl+I` |
-| Send message           | `Enter`               |
-| Send after turn        | `Ctrl+Enter`          |
-| New line in message    | `Shift+Enter`         |
-| Cancel editing message | `Esc`                 |
-| Jump to bottom of chat | `Shift+G`             |
-| Cycle model            | `Ctrl+/`              |
-| Toggle thinking level  | `Ctrl+Shift+T`        |
+| Action                  | Shortcut              |
+| ----------------------- | --------------------- |
+| Focus chat input        | `a`, `i`, or `Ctrl+I` |
+| Send message            | `Enter`               |
+| Send after turn         | `Ctrl+Enter`          |
+| New line in message     | `Shift+Enter`         |
+| Cancel editing message  | `Esc`                 |
+| Jump to bottom of chat  | `Shift+G`             |
+| Cycle model             | `Ctrl+/`              |
+| Increase thinking level | `Ctrl+Shift+]`        |
+| Decrease thinking level | `Ctrl+Shift+[`        |
 
 ## Workspaces
 
@@ -78,5 +79,5 @@ This separation keeps the switcher clean and fast while making all other command
 - **Consistent modifiers**: Most workspace/project operations use `Ctrl` as the modifier
 - **Natural expectations**: We try to use shortcuts users would naturally expect (e.g., `Ctrl+N` for new)
 - **Focus anywhere**: Use `Ctrl+I` to quickly jump to the chat input from anywhere in the application
-- **Per-model thinking**: `Ctrl+Shift+T` toggles thinking on/off and remembers your last preference for each model
+- **Per-model thinking**: `Ctrl+Shift+]` / `Ctrl+Shift+[` step thinking effort up/down (clamped at the model's range) and remember your last preference for each model
 - **Terminal access**: `Ctrl+T` opens the current workspace in your system terminal

@@ -4,26 +4,28 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import { createTestHistoryService } from "./testHistoryService";
+import { waitForCondition } from "./testDispatchHelpers";
 
-async function waitForCondition(
-  condition: () => boolean,
-  options?: { timeoutMs?: number; intervalMs?: number }
-): Promise<void> {
-  const timeoutMs = options?.timeoutMs ?? 1_000;
-  const intervalMs = options?.intervalMs ?? 10;
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (condition()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
+/** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
+function planReviewRecordRow(id: string, timestamp: number) {
+  const record = {
+    v: 1 as const,
+    kind: "resolve" as const,
+    recordId: `rec_${id}`,
+    threadId: "thr_1",
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+    timestamp,
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(record),
+  });
 }
 
 describe("IdleCompactionService", () => {
@@ -32,6 +34,7 @@ describe("IdleCompactionService", () => {
   let historyService: HistoryService;
   let mockExtensionMetadata: ExtensionMetadataService;
   let executeIdleCompactionMock: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
+  let loadConfigMock: ReturnType<typeof mock<() => ProjectsConfig>>;
   let service: IdleCompactionService;
   let cleanup: () => Promise<void>;
 
@@ -43,8 +46,8 @@ describe("IdleCompactionService", () => {
 
   beforeEach(async () => {
     // Create mock config
-    mockConfig = {
-      loadConfigOrDefault: mock(() => ({
+    loadConfigMock = mock(
+      (): ProjectsConfig => ({
         projects: new Map<string, ProjectConfig>([
           [
             testProjectPath,
@@ -54,8 +57,9 @@ describe("IdleCompactionService", () => {
             },
           ],
         ]),
-      })),
-    } as unknown as Config;
+      })
+    );
+    mockConfig = { loadConfigOrDefault: loadConfigMock } as unknown as Config;
 
     // Create real history service and seed default idle messages (25 hours ago)
     ({ historyService, cleanup } = await createTestHistoryService());
@@ -98,8 +102,54 @@ describe("IdleCompactionService", () => {
     await cleanup();
   });
 
+  describe("start/stop on the default runner", () => {
+    // Default-runner smoke (cadence itself is covered on virtual time in
+    // idleCompactionService.testClock.test.ts): with no runner injected the
+    // checker sleeps on Effect's default clock, so nothing may run this early
+    // in INITIAL_CHECK_DELAY_MS, and stop() must close the scope synchronously.
+    test("start() arms the checker on the real clock without an early sweep", async () => {
+      service.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(loadConfigMock).not.toHaveBeenCalled();
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+      service.stop();
+    });
+  });
+
   describe("checkEligibility", () => {
     const threshold24h = 24 * oneHourMs;
+
+    test.each([
+      { archivedAt: "2026-01-02T00:00:00.000Z", unarchivedAt: undefined, archived: true },
+      {
+        archivedAt: "2026-01-02T00:00:00.000Z",
+        unarchivedAt: "2026-01-01T00:00:00.000Z",
+        archived: true,
+      },
+      {
+        archivedAt: "2026-01-02T00:00:00.000Z",
+        unarchivedAt: "2026-01-03T00:00:00.000Z",
+        archived: false,
+      },
+    ])(
+      "checks archive state before reading history: %j",
+      async ({ archivedAt, unarchivedAt, archived }) => {
+        const config = loadConfigMock();
+        const workspace = config.projects.get(testProjectPath)?.workspaces[0];
+        if (!workspace) throw new Error("Missing fixture workspace");
+        workspace.archivedAt = archivedAt;
+        workspace.unarchivedAt = unarchivedAt;
+        loadConfigMock.mockReturnValue(config);
+        const historySpy = spyOn(historyService, "getLastMessages");
+
+        const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+
+        expect(result.eligible).toBe(!archived);
+        expect(historySpy).toHaveBeenCalledTimes(archived ? 0 : 1);
+      }
+    );
 
     test("returns eligible for idle workspace with messages", async () => {
       const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
@@ -175,6 +225,63 @@ describe("IdleCompactionService", () => {
       expect(result.reason).toBe("awaiting_response");
     });
 
+    /** Persist rows on top of the answered turn the suite seeds in beforeEach. */
+    async function appendRows(rows: MuxMessage[]): Promise<void> {
+      for (const row of rows) {
+        const result = await historyService.appendToHistory(testWorkspaceId, row);
+        expect(result.success).toBe(true);
+      }
+    }
+
+    test("ignores hidden plan-review record rows when judging an unanswered tail", async () => {
+      // A resolve/reopen appended while idle sits after the assistant's answer; it is not a
+      // prompt awaiting a response, so background compaction must stay eligible.
+      const idleTimestamp = now - 25 * oneHourMs;
+      await appendRows([
+        planReviewRecordRow("3", idleTimestamp),
+        planReviewRecordRow("4", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+
+      // A real unanswered prompt followed by hidden rows keeps its protection.
+      await appendRows([
+        createMuxMessage("5", "user", "Another question?", { timestamp: idleTimestamp }),
+        planReviewRecordRow("6", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+    });
+
+    test("looks past a tail window made only of hidden record rows", async () => {
+      // More hidden rows than the bounded tail read: the window alone cannot tell whether the
+      // last real row is an answered turn or a pending prompt, so the check must consult the
+      // history since the latest boundary rather than guess either way.
+      const idleTimestamp = now - 25 * oneHourMs;
+      const fullSpy = spyOn(historyService, "getHistoryFromLatestBoundary");
+      const hiddenWindow = (prefix: string) =>
+        Array.from({ length: 50 }, (_, i) => planReviewRecordRow(`${prefix}${i}`, idleTimestamp));
+
+      await appendRows(hiddenWindow("h"));
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(1);
+
+      await appendRows([
+        createMuxMessage("pending", "user", "Pending", { timestamp: idleTimestamp }),
+        ...hiddenWindow("p"),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(2);
+    });
+
     test("returns ineligible when messages have no timestamps", async () => {
       // Messages without timestamps - can't determine recency
       spyOn(historyService, "getLastMessages").mockResolvedValueOnce(
@@ -188,6 +295,22 @@ describe("IdleCompactionService", () => {
   });
 
   describe("checkAllWorkspaces", () => {
+    test("does not check archived workspaces during the periodic sweep", async () => {
+      const config = loadConfigMock();
+      const workspace = config.projects.get(testProjectPath)?.workspaces[0];
+      if (!workspace) throw new Error("Missing fixture workspace");
+      workspace.archivedAt = "2026-01-02T00:00:00.000Z";
+      loadConfigMock.mockReturnValue(config);
+      const eligibilitySpy = spyOn(service, "checkEligibility");
+      const historySpy = spyOn(historyService, "getLastMessages");
+
+      await service.checkAllWorkspaces();
+
+      expect(eligibilitySpy).not.toHaveBeenCalled();
+      expect(historySpy).not.toHaveBeenCalled();
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+    });
+
     test("skips projects without idleCompactionHours set", async () => {
       (mockConfig.loadConfigOrDefault as ReturnType<typeof mock>).mockReturnValueOnce({
         projects: new Map([
@@ -317,23 +440,57 @@ describe("IdleCompactionService", () => {
     });
 
     test("deduplicates queued idle compaction for same workspace", async () => {
+      const sentinelWorkspaceId = "sentinel-workspace";
+      const idleTimestamp = now - 25 * oneHourMs;
+      loadConfigMock.mockImplementation(() => ({
+        projects: new Map([
+          [
+            testProjectPath,
+            {
+              workspaces: [
+                { id: testWorkspaceId, path: "/test/path", name: "test" },
+                { id: sentinelWorkspaceId, path: "/sentinel/path", name: "sentinel" },
+              ],
+              idleCompactionHours: 24,
+            },
+          ],
+        ]),
+      }));
+
       let releaseCompaction: (() => void) | undefined;
       const gate = new Promise<void>((resolve) => {
         releaseCompaction = resolve;
       });
-
-      executeIdleCompactionMock.mockImplementation(async () => {
-        await gate;
+      const executed: string[] = [];
+      executeIdleCompactionMock.mockImplementation(async (workspaceId: string) => {
+        executed.push(workspaceId);
+        if (workspaceId === testWorkspaceId) {
+          await gate;
+        }
       });
 
+      // The sentinel has no history yet, so only the first workspace is eligible.
       await service.checkAllWorkspaces();
+      await waitForCondition(() => executed.length === 1);
+      // Duplicate sweep while the first compaction is still running.
       await service.checkAllWorkspaces();
 
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      // Queue the sentinel behind any duplicate. The queue is FIFO, so once the
+      // sentinel has run, a duplicate entry would already have executed.
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s1", "user", "Hello", { timestamp: idleTimestamp })
+      );
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s2", "assistant", "Hi!", { timestamp: idleTimestamp })
+      );
+      await service.checkAllWorkspaces();
+
       releaseCompaction?.();
+      await waitForCondition(() => executed.includes(sentinelWorkspaceId));
 
-      // Ensure the queue drains without running a duplicate.
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      expect(executed).toEqual([testWorkspaceId, sentinelWorkspaceId]);
     });
   });
 
@@ -384,6 +541,68 @@ describe("IdleCompactionService", () => {
 
       await service.checkAllWorkspaces();
 
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("recordOutcome (failure suppression)", () => {
+    const threshold24h = 24 * oneHourMs;
+
+    test("stops the loop after two consecutive failures", async () => {
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+
+      // One failure is not enough to suppress.
+      const afterOne = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+      expect(afterOne.eligible).toBe(true);
+
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+
+      const afterTwo = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+      expect(afterTwo.eligible).toBe(false);
+      expect(afterTwo.reason).toBe("suppressed_after_failures");
+    });
+
+    test("stops the loop immediately on a model_not_found failure", async () => {
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: true });
+
+      const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+      expect(result.eligible).toBe(false);
+      expect(result.reason).toBe("suppressed_after_failures");
+    });
+
+    test("a success between failures resets the consecutive failure streak", async () => {
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+      service.recordOutcome(testWorkspaceId, { success: true });
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+
+      // Only one failure since the last success, so the workspace is still eligible.
+      const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+      expect(result.eligible).toBe(true);
+    });
+
+    test("a later success lifts suppression (self-healing)", async () => {
+      // Two failures suppress the workspace.
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: false });
+      expect((await service.checkEligibility(testWorkspaceId, threshold24h, now)).eligible).toBe(
+        false
+      );
+
+      // An in-flight retry that actually persists a compaction clears suppression.
+      service.recordOutcome(testWorkspaceId, { success: true });
+
+      const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
+      expect(result.eligible).toBe(true);
+    });
+
+    test("checkAllWorkspaces no longer queues a suppressed workspace", async () => {
+      // A non-recoverable failure suppresses the workspace immediately.
+      service.recordOutcome(testWorkspaceId, { success: false, modelNotFound: true });
+
+      await service.checkAllWorkspaces();
+
+      // Give the (fire-and-forget) queue a chance to run; it must not execute.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       expect(executeIdleCompactionMock).not.toHaveBeenCalled();
     });
   });

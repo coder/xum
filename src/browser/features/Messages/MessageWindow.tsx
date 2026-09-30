@@ -72,10 +72,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
         // space only changes at the same (settled) moment as the meta row appearing,
         // avoiding a second separate tear step.
         showAssistantMetaRow && "mb-4",
-        // Caller-supplied class — used by side-question rendering to apply
-        // the "side branch" left-accent treatment. Previously declared but
-        // never spread onto the outer container, so callers couldn't theme
-        // a message block at all.
+        // Caller-supplied classes apply to the outer message block.
         className
       )}
       data-message-block

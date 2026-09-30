@@ -6,9 +6,11 @@ import React from "react";
 import { extractNewPath, type FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FileChangeType } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { trimRecordToChars, withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   getFileTreeExpandStateKey,
   REVIEW_FILE_TREE_VIEW_MODE_KEY,
+  FILE_TREE_EXPAND_STATE_MAX_CHARS,
 } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
@@ -141,10 +143,11 @@ const TreeNodeContent: React.FC<{
   const isOpen = hasManualState ? expandStateMap[node.path] : depth < 2; // Default: auto-expand first 2 levels
 
   const setIsOpen = (open: boolean) => {
-    setExpandStateMap((prev) => ({
-      ...prev,
-      [node.path]: open,
-    }));
+    // Store only overrides of the default expansion, newest last, so FileTree can persist the
+    // newest ones that fit the key budget. The live map itself is not trimmed.
+    setExpandStateMap((prev) =>
+      withRecordEntry(prev, node.path, open === depth < 2 ? undefined : open, Infinity)
+    );
   };
 
   const handleClick = (e: React.MouseEvent) => {
@@ -380,12 +383,34 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   getFileReadStatus,
   workspaceId,
 }) => {
-  // Use persisted state for expand/collapse per workspace (lifted to parent to avoid O(n) re-renders)
-  const [expandStateMap, setExpandStateMap] = usePersistedState<Record<string, boolean>>(
-    getFileTreeExpandStateKey(workspaceId),
-    {},
-    { listener: true }
-  );
+  // Use persisted state for expand/collapse per workspace (lifted to parent to avoid O(n) re-renders).
+  // The live map keeps every toggle of this session; the persisted copy keeps the newest overrides
+  // that fit the key budget, so a large tree never collapses directories on its own while in use,
+  // and a reload restores the most recent ones.
+  const expandStateKey = getFileTreeExpandStateKey(workspaceId);
+  const [persistedExpandStateMap, setPersistedExpandStateMap] = usePersistedState<
+    Record<string, boolean>
+  >(expandStateKey, {}, { listener: true });
+  // `persisted` is the trimmed copy this window wrote; once the stored value differs (another
+  // window changed it), the stored value wins again so cross-window updates are not masked.
+  const [liveExpandState, setLiveExpandState] = React.useState<{
+    key: string;
+    value: Record<string, boolean>;
+    persisted: string;
+  } | null>(null);
+  const expandStateMap =
+    liveExpandState?.key === expandStateKey &&
+    liveExpandState.persisted === JSON.stringify(persistedExpandStateMap)
+      ? liveExpandState.value
+      : persistedExpandStateMap;
+  const setExpandStateMap = (
+    value: Record<string, boolean> | ((prev: Record<string, boolean>) => Record<string, boolean>)
+  ) => {
+    const next = typeof value === "function" ? value(expandStateMap) : value;
+    const persisted = trimRecordToChars(next, FILE_TREE_EXPAND_STATE_MAX_CHARS);
+    setLiveExpandState({ key: expandStateKey, value: next, persisted: JSON.stringify(persisted) });
+    setPersistedExpandStateMap(persisted);
+  };
 
   const [viewMode, setViewMode] = usePersistedState<FileTreeViewMode>(
     REVIEW_FILE_TREE_VIEW_MODE_KEY,

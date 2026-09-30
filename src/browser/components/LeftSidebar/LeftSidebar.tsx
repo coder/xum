@@ -26,15 +26,15 @@ export function LeftSidebar(props: LeftSidebarProps) {
     ...projectSidebarProps
   } = props;
   const isDesktop = isDesktopMode();
-  // Match the CSS gate for the mobile "overlay" sidebar; we don't show a drag handle in that mode.
-  const isMobileTouch =
-    typeof window !== "undefined" &&
-    window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+  // Match the CSS gate for the mobile "overlay" sidebar (width-only, any pointer
+  // type); we don't show a drag handle in that mode since CSS pins the width.
+  const isMobileOverlay =
+    typeof window !== "undefined" && window.matchMedia("(max-width: 768px)").matches;
 
   const handleBeforeOpenSettings = () => {
-    // Keep settings navigation escapable on touch devices by dismissing the
+    // Keep settings navigation escapable on narrow viewports by dismissing the
     // off-canvas sidebar as soon as the user opens settings from this sidebar.
-    if (!collapsed && isMobileTouch) {
+    if (!collapsed && isMobileOverlay) {
       onToggleCollapsed();
     }
   };
@@ -45,14 +45,17 @@ export function LeftSidebar(props: LeftSidebarProps) {
 
   return (
     <>
-      {/* Overlay backdrop - only visible on mobile when sidebar is open */}
-      <div
-        className={cn(
-          "hidden mobile-overlay fixed inset-0 bg-black/50 z-40 backdrop-blur-sm",
-          collapsed && "!hidden"
-        )}
-        onClick={onToggleCollapsed}
-      />
+      {/* Overlay backdrop - only visible on mobile when sidebar is open. Unmounted (not
+          hidden via opacity/!hidden) when collapsed, and the dim+blur is painted on a
+          pseudo-element: iOS/iPadOS 26 WebKit samples background-color/backdrop-filter on
+          any mounted fixed element (hidden or visible) to synthesize a Liquid Glass blur
+          over the status bar, but ignores pseudo-elements/absolute children. */}
+      {!collapsed && (
+        <div
+          className="mobile-overlay fixed inset-0 z-40 hidden before:absolute before:inset-0 before:bg-black/50 before:backdrop-blur-sm"
+          onClick={onToggleCollapsed}
+        />
+      )}
 
       {/* Sidebar */}
       <div
@@ -77,7 +80,7 @@ export function LeftSidebar(props: LeftSidebarProps) {
           onToggleCollapsed={onToggleCollapsed}
         />
 
-        {!collapsed && !isMobileTouch && onStartResize && (
+        {!collapsed && !isMobileOverlay && onStartResize && (
           <div
             data-testid="left-sidebar-resize-handle"
             className={cn(

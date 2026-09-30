@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import {
   addTabToFocusedTabset,
   addToolToFocusedTabset,
-  closeSplit,
   dockTabToEdge,
   getDefaultRightSidebarLayoutState,
   moveTabToTabset,
   parseRightSidebarLayoutState,
+  removeTabEverywhere,
   reorderTabInTabset,
   selectTabInFocusedTabset,
   splitFocusedTabset,
@@ -21,6 +21,13 @@ test("default layout includes Instructions alongside Stats and Review", () => {
   expect(state.root.tabs).toContain("costs");
   expect(state.root.tabs).toContain("review");
   expect(state.root.tabs).toContain("instructions");
+});
+
+test("removeTabEverywhere preserves identity when the tab is absent", () => {
+  const state = getDefaultRightSidebarLayoutState("costs");
+  const withoutBrowser = removeTabEverywhere(state, "browser");
+
+  expect(withoutBrowser).toBe(state);
 });
 
 test("selectTabInFocusedTabset adds missing tool and makes it active", () => {
@@ -243,38 +250,6 @@ test("dockTabToEdge removes an empty source tabset when docking into another tab
 
   expect(left.tabs).toEqual(["costs"]);
   expect(right.tabs).toEqual(["review"]);
-});
-
-test("closeSplit keeps the specified child", () => {
-  const s: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 3,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "split",
-      id: "split-1",
-      direction: "horizontal",
-      sizes: [50, 50],
-      children: [
-        { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-        { type: "tabset", id: "tabset-2", tabs: ["review"], activeTab: "review" },
-      ],
-    },
-  };
-
-  // Close split, keeping the first child (left)
-  const s1 = closeSplit(s, "split-1", 0);
-  expect(s1.root.type).toBe("tabset");
-  if (s1.root.type !== "tabset") throw new Error("expected tabset");
-  expect(s1.root.id).toBe("tabset-1");
-  expect(s1.root.tabs).toEqual(["costs"]);
-
-  // Close split, keeping the second child (right)
-  const s2 = closeSplit(s, "split-1", 1);
-  expect(s2.root.type).toBe("tabset");
-  if (s2.root.type !== "tabset") throw new Error("expected tabset");
-  expect(s2.root.id).toBe("tabset-2");
-  expect(s2.root.tabs).toEqual(["review"]);
 });
 
 test("parseRightSidebarLayoutState strips removed static tabs from persisted layouts", () => {

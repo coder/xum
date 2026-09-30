@@ -10,6 +10,11 @@ export interface BrowserViewportMetadata {
   scrollOffsetY: number;
 }
 
+export interface BrowserFrameImageSize {
+  width: number;
+  height: number;
+}
+
 export type BrowserDiscoveredSessionStatus = "attachable" | "missing_stream";
 
 export interface BrowserDiscoveredSession {
@@ -21,11 +26,11 @@ export interface BrowserDiscoveredOtherSession extends BrowserDiscoveredSession 
   cwd: string;
 }
 
+export type { BrowserPageTab } from "@/common/orpc/schemas/api";
+
 export interface BrowserSessionAttachOptions {
   allowOtherWorkspaceSession?: boolean;
 }
-
-export type PageStateSource = "bootstrap" | "command" | "poll";
 
 export interface BrowserSession {
   id: string;

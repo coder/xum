@@ -7,6 +7,7 @@ import type { Page } from "@playwright/test";
 import { _electron as electron, type ElectronApplication } from "playwright";
 import { prepareDemoProject, type DemoProjectConfig } from "./utils/demoProject";
 import { createWorkspaceUI, type WorkspaceUI } from "./utils/ui";
+import { getXumE2EEnv, setXumE2EEnv } from "./env";
 
 interface WorkspaceHarness {
   configRoot: string;
@@ -22,8 +23,8 @@ interface ElectronFixtures {
 
 const appRoot = path.resolve(__dirname, "..", "..");
 const defaultTestRoot = path.join(appRoot, "tests", "e2e", "tmp", "mux-root");
-const BASE_DEV_SERVER_PORT = Number(process.env.MUX_E2E_DEVSERVER_PORT_BASE ?? "5173");
-const shouldLoadDist = process.env.MUX_E2E_LOAD_DIST === "1";
+const BASE_DEV_SERVER_PORT = Number(getXumE2EEnv("E2E_DEVSERVER_PORT_BASE") ?? "5173");
+const shouldLoadDist = getXumE2EEnv("E2E_LOAD_DIST") === "1";
 
 const REQUIRED_DIST_FILES = [
   path.join(appRoot, "dist", "index.html"),
@@ -53,7 +54,7 @@ async function waitForServerReady(url: string, timeoutMs = 20_000): Promise<void
       if (response.ok || response.status === 404) {
         return;
       }
-    } catch (error) {
+    } catch {
       // Server not ready yet
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -70,7 +71,7 @@ function sanitizeForPath(value: string): string {
 }
 
 function shouldSkipBuild(): boolean {
-  return process.env.MUX_E2E_SKIP_BUILD === "1";
+  return getXumE2EEnv("E2E_SKIP_BUILD") === "1";
 }
 
 export function parseEnvVarFromPsCommand(command: string, name: string): string | undefined {
@@ -153,24 +154,26 @@ function buildTarget(target: string): void {
 }
 
 export const electronTest = base.extend<ElectronFixtures>({
+  // eslint-disable-next-line no-empty-pattern -- Playwright fixtures must destructure their first argument
   workspace: async ({}, use, testInfo) => {
+    const originalXumRoot = process.env.XUM_ROOT;
     const originalMuxRoot = process.env.MUX_ROOT;
-    const envRoot = originalMuxRoot ?? "";
+    const envRoot = getXumE2EEnv("ROOT") ?? "";
     const baseRoot = envRoot || defaultTestRoot;
     const uniqueTestId = testInfo.testId || testInfo.title || `test-${Date.now()}`;
 
     // Always isolate each test run under its own root directory.
     //
-    // Even when MUX_ROOT is set (often for debugging), Playwright runs tests in parallel.
+    // Even when XUM_ROOT is set (often for debugging), Playwright runs tests in parallel.
     // A shared root would cause cross-test interference when we reset the filesystem.
     const testRoot = path.join(baseRoot, sanitizeForPath(uniqueTestId));
 
     const shouldCleanup = !envRoot;
 
-    // Ensure the Electron process sees our per-test MUX_ROOT even if Playwright's electron.launch({ env }) is ignored.
+    // Ensure the Electron process sees our per-test XUM_ROOT even if Playwright's electron.launch({ env }) is ignored.
     //
     // This is especially important when running Playwright under Bun.
-    process.env.MUX_ROOT = testRoot;
+    setXumE2EEnv(process.env, "ROOT", testRoot);
 
     try {
       await fsPromises.mkdir(path.dirname(testRoot), { recursive: true });
@@ -190,6 +193,11 @@ export const electronTest = base.extend<ElectronFixtures>({
         await fsPromises.rm(testRoot, { recursive: true, force: true });
       }
     } finally {
+      if (originalXumRoot === undefined) {
+        delete process.env.XUM_ROOT;
+      } else {
+        process.env.XUM_ROOT = originalXumRoot;
+      }
       if (originalMuxRoot === undefined) {
         delete process.env.MUX_ROOT;
       } else {
@@ -221,6 +229,7 @@ export const electronTest = base.extend<ElectronFixtures>({
           ...process.env,
           NODE_ENV: "development",
           VITE_DISABLE_MERMAID: "1",
+          XUM_VITE_PORT: String(devServerPort),
           MUX_VITE_PORT: String(devServerPort),
         },
       });
@@ -261,7 +270,7 @@ export const electronTest = base.extend<ElectronFixtures>({
     try {
       let devHost = "127.0.0.1";
       if (shouldStartDevServer) {
-        devHost = process.env.MUX_DEVSERVER_HOST ?? "127.0.0.1";
+        devHost = getXumE2EEnv("DEVSERVER_HOST") ?? "127.0.0.1";
         await waitForServerReady(`http://${devHost}:${devServerPort}`);
         const exitCode = devServer?.exitCode;
         if (exitCode !== null && exitCode !== undefined) {
@@ -273,7 +282,7 @@ export const electronTest = base.extend<ElectronFixtures>({
       fs.mkdirSync(recordVideoDir, { recursive: true });
 
       const isPerfScenario = /[\\/]scenarios[\\/]perf\./.test(testInfo.file);
-      const shouldCaptureReactProfile = process.env.MUX_PROFILE_REACT === "1" || isPerfScenario;
+      const shouldCaptureReactProfile = getXumE2EEnv("PROFILE_REACT") === "1" || isPerfScenario;
       const electronEnv: Record<string, string> = {};
       for (const [key, value] of Object.entries(process.env)) {
         if (typeof value === "string") {
@@ -281,16 +290,16 @@ export const electronTest = base.extend<ElectronFixtures>({
         }
       }
       electronEnv.ELECTRON_DISABLE_SECURITY_WARNINGS = "true";
-      electronEnv.MUX_MOCK_AI = electronEnv.MUX_MOCK_AI ?? "1";
-      electronEnv.MUX_ROOT = configRoot;
-      electronEnv.MUX_E2E = "1";
-      electronEnv.MUX_PROFILE_REACT = shouldCaptureReactProfile ? "1" : "0";
-      electronEnv.MUX_E2E_LOAD_DIST = shouldLoadDist ? "1" : "0";
+      setXumE2EEnv(electronEnv, "MOCK_AI", getXumE2EEnv("MOCK_AI", electronEnv) ?? "1");
+      setXumE2EEnv(electronEnv, "ROOT", configRoot);
+      setXumE2EEnv(electronEnv, "E2E", "1");
+      setXumE2EEnv(electronEnv, "PROFILE_REACT", shouldCaptureReactProfile ? "1" : "0");
+      setXumE2EEnv(electronEnv, "E2E_LOAD_DIST", shouldLoadDist ? "1" : "0");
       electronEnv.VITE_DISABLE_MERMAID = "1";
 
       if (shouldStartDevServer) {
-        electronEnv.MUX_DEVSERVER_PORT = String(devServerPort);
-        electronEnv.MUX_DEVSERVER_HOST = devHost;
+        setXumE2EEnv(electronEnv, "DEVSERVER_PORT", String(devServerPort));
+        setXumE2EEnv(electronEnv, "DEVSERVER_HOST", devHost);
         electronEnv.NODE_ENV = electronEnv.NODE_ENV ?? "development";
       } else {
         electronEnv.NODE_ENV = electronEnv.NODE_ENV ?? "production";
@@ -319,10 +328,11 @@ export const electronTest = base.extend<ElectronFixtures>({
       if (!pid) {
         throw new Error("Electron launch returned no pid");
       }
-      const electronMuxRoot = readEnvVarFromProcess(pid, "MUX_ROOT");
+      const electronMuxRoot =
+        readEnvVarFromProcess(pid, "XUM_ROOT") ?? readEnvVarFromProcess(pid, "MUX_ROOT");
       if (electronMuxRoot !== configRoot) {
         throw new Error(
-          `E2E harness bug: Electron process MUX_ROOT mismatch. Expected ${configRoot}, got ${electronMuxRoot ?? "<unset>"}`
+          `E2E harness bug: Electron process XUM_ROOT mismatch. Expected ${configRoot}, got ${electronMuxRoot ?? "<unset>"}`
         );
       }
 
@@ -350,13 +360,13 @@ export const electronTest = base.extend<ElectronFixtures>({
                 const destination = path.join(videosDir, `${baseName}${suffix}${ext}`);
                 await fsPromises.rm(destination, { force: true });
                 await fsPromises.rename(path.join(recordVideoDir, file), destination);
-                console.log(`[video] saved to ${destination}`); // eslint-disable-line no-console
+                console.log(`[video] saved to ${destination}`);
               }
             } else if (electronApp) {
-              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`); // eslint-disable-line no-console
+              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`);
             }
           } catch (error) {
-            console.error(`[video] failed to process video for "${displayName}":`, error); // eslint-disable-line no-console
+            console.error(`[video] failed to process video for "${displayName}":`, error);
           } finally {
             await fsPromises.rm(recordVideoDir, { recursive: true, force: true });
           }
@@ -373,12 +383,13 @@ export const electronTest = base.extend<ElectronFixtures>({
     await window.waitForLoadState("domcontentloaded");
     await window.setViewportSize({ width: 1600, height: 900 });
 
-    // Disable tutorials for e2e tests by marking them as completed
-    // Must set before React reads the state, so we set and reload
+    // Disable tutorials for e2e tests before React reads the state, then reload.
+    // Otherwise delayed tutorial backdrops can race with Playwright clicks and make
+    // unrelated UI scenarios flaky when a new tutorial sequence is added.
     await window.evaluate(() => {
       const tutorialState = {
-        disabled: false,
-        completed: { settings: true, creation: true, workspace: true },
+        disabled: true,
+        completed: { creation: true, workspace: true, review: true },
       };
       localStorage.setItem("tutorialState", JSON.stringify(tutorialState));
     });
@@ -387,7 +398,6 @@ export const electronTest = base.extend<ElectronFixtures>({
     await window.waitForLoadState("domcontentloaded");
 
     window.on("console", (msg) => {
-      // eslint-disable-next-line no-console
       console.log(`[renderer:${msg.type()}]`, msg.text());
     });
     window.on("pageerror", (error) => {

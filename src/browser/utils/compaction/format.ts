@@ -1,3 +1,4 @@
+import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { CompactionRequestData } from "@/common/types/message";
 import { isDefaultSourceContent } from "@/common/types/message";
 
@@ -23,12 +24,18 @@ export function formatCompactionCommandLine(options: {
  * Hides the default resume sentinel ("Continue") and empty text.
  */
 export function getFollowUpContentText(
-  followUpContent?: CompactionRequestData["followUpContent"]
+  followUpContent?: CompactionRequestData["followUpContent"],
+  options?: { stripStagedAttachmentNotice?: boolean }
 ): string | null {
   if (!followUpContent) return null;
   if (isDefaultSourceContent(followUpContent)) return null;
-  const text = followUpContent.text;
-  if (typeof text !== "string" || text.trim().length === 0) {
+  const rawText = followUpContent.text;
+  if (typeof rawText !== "string") {
+    return null;
+  }
+  const text =
+    options?.stripStagedAttachmentNotice === true ? stripStagedAttachmentNotice(rawText) : rawText;
+  if (text.trim().length === 0) {
     return null;
   }
   return text;

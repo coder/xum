@@ -23,6 +23,12 @@ interface ParsedRoutingInput {
 
 type GatewayModelAccessibility = (gateway: string, modelId: string) => boolean;
 
+/**
+ * Route priority used when config.json has none persisted. Shared by the browser
+ * (useRouting) and the backend (models_list) so both resolve the same routes.
+ */
+export const DEFAULT_ROUTE_PRIORITY: string[] = ["direct"];
+
 function getProviderDefinition(provider: string): RoutingProviderDefinition | undefined {
   if (!(provider in PROVIDER_DEFINITIONS)) {
     return undefined;

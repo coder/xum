@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { DisposableProcess } from "@/node/utils/disposableExec";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import { getAgentBrowserSocketDir } from "./agentBrowserSocketPaths";
 
 const CLI_TIMEOUT_MS = 30_000;
 const PROCESS_CWD_TIMEOUT_MS = 5_000;
@@ -182,8 +182,6 @@ if ($null -ne $result) {
 }
 `;
 
-export type AgentBrowserDiscoveredSessionStatus = "attachable" | "missing_stream";
-
 interface AgentBrowserDiscoveredSessionBase {
   sessionName: string;
   pid: number;
@@ -231,26 +229,6 @@ interface AgentBrowserSessionDiscoveryServiceOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function getAgentBrowserSocketDir(env: NodeJS.ProcessEnv): string {
-  const override = env.AGENT_BROWSER_SOCKET_DIR?.trim();
-  if (override) {
-    return override;
-  }
-
-  const xdgRuntimeDir = env.XDG_RUNTIME_DIR?.trim();
-  if (xdgRuntimeDir) {
-    return path.join(xdgRuntimeDir, "agent-browser");
-  }
-
-  const homeDir = env.HOME?.trim();
-  if (homeDir) {
-    return path.join(homeDir, ".agent-browser");
-  }
-
-  const tmpDir = env.TMPDIR?.trim();
-  return path.join(tmpDir ?? os.tmpdir(), "agent-browser");
 }
 
 function extractSessionNames(payload: unknown): string[] {

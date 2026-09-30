@@ -50,7 +50,7 @@ export const WorkspaceDragLayer: React.FC = () => {
         <div
           className={cn(
             "flex max-w-56 items-center gap-1.5 rounded-sm px-2 py-1.5",
-            "bg-sidebar border-border border shadow-lg"
+            "bg-dark border-border border shadow-lg"
           )}
         >
           <RuntimeBadge runtimeConfig={workspaceItem.runtimeConfig} isWorking={false} />

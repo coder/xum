@@ -17,23 +17,24 @@ function cfgWithOverrides(overrides: Record<string, { enabled?: boolean }>): Pro
 }
 
 describe("agentEnablement", () => {
-  test("disabled field takes precedence over ui.disabled", () => {
+  test("disabled: true reports the agent as disabled", () => {
     const frontmatter: AgentDefinitionFrontmatter = {
       name: "Test",
-      disabled: false,
-      ui: { disabled: true },
-    };
-
-    expect(isAgentDisabledByFrontmatter(frontmatter)).toBe(false);
-  });
-
-  test("falls back to ui.disabled when disabled is unset", () => {
-    const frontmatter: AgentDefinitionFrontmatter = {
-      name: "Test",
-      ui: { disabled: true },
+      disabled: true,
     };
 
     expect(isAgentDisabledByFrontmatter(frontmatter)).toBe(true);
+  });
+
+  test("disabled: false (or unset) reports the agent as enabled", () => {
+    const enabledExplicit: AgentDefinitionFrontmatter = {
+      name: "Test",
+      disabled: false,
+    };
+    const enabledImplicit: AgentDefinitionFrontmatter = { name: "Test" };
+
+    expect(isAgentDisabledByFrontmatter(enabledExplicit)).toBe(false);
+    expect(isAgentDisabledByFrontmatter(enabledImplicit)).toBe(false);
   });
 
   test("user override enabled:true re-enables a disabled agent", () => {

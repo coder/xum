@@ -10,9 +10,10 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createAgentSkillReadTool } from "./agent_skill_read";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 async function writeProjectSkill(
@@ -131,7 +132,7 @@ describe("agent_skill_read", () => {
     const tool = createAgentSkillReadTool(baseConfig);
 
     const raw: unknown = await Promise.resolve(
-      tool.execute!({ name: "mux-docs" }, mockToolCallOptions)
+      tool.execute!({ name: "xum-docs" }, mockToolCallOptions)
     );
 
     const parsed = AgentSkillReadToolResultSchema.safeParse(raw);
@@ -144,31 +145,7 @@ describe("agent_skill_read", () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.skill.scope).toBe("built-in");
-      expect(result.skill.frontmatter.name).toBe("mux-docs");
-    }
-  });
-
-  it("blocks the built-in imagegen skill when the image generation tool is unavailable", async () => {
-    using tempDir = new TestTempDir("test-agent-skill-read-imagegen-disabled");
-    const baseConfig = createTestToolConfig(tempDir.path, {
-      workspaceId: GLOBAL_WORKSPACE_ID,
-    });
-
-    const tool = createAgentSkillReadTool(baseConfig);
-
-    const raw: unknown = await Promise.resolve(
-      tool.execute!({ name: "imagegen" }, mockToolCallOptions)
-    );
-
-    const parsed = AgentSkillReadToolResultSchema.safeParse(raw);
-    expect(parsed.success).toBe(true);
-    if (!parsed.success) {
-      throw new Error(parsed.error.message);
-    }
-
-    expect(parsed.data.success).toBe(false);
-    if (!parsed.data.success) {
-      expect(parsed.data.error).toContain("Image Tools experiment");
+      expect(result.skill.frontmatter.name).toBe("xum-docs");
     }
   });
 
@@ -248,9 +225,9 @@ describe("agent_skill_read", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot: tempDir.path,
         projectStorageAuthority: "host-local",
       },
@@ -299,9 +276,9 @@ describe("agent_skill_read", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       },
@@ -324,7 +301,7 @@ describe("agent_skill_read", () => {
     }
   });
 
-  it("reads project skill via muxScope when cwd differs (remote-like split root)", async () => {
+  it("reads project skill via xumScope when cwd differs (remote-like split root)", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-project-split-root");
     const hostProjectRoot = tempDir.path;
     const remoteStyleCwd = "/remote/workspace/path";
@@ -333,9 +310,9 @@ describe("agent_skill_read", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot: hostProjectRoot,
         projectStorageAuthority: "host-local",
       },
@@ -382,9 +359,9 @@ describe("agent_skill_read", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       runtime: remoteRuntime,
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: path.join(tempDir.path, "mux-home"),
+        xumHome: path.join(tempDir.path, "mux-home"),
         projectRoot: hostProjectRoot,
         projectStorageAuthority: "runtime",
       },
@@ -408,5 +385,38 @@ describe("agent_skill_read", () => {
     if (result.success) {
       expect(result.skill.body).toContain("Remote body");
     }
+  });
+
+  it("appends whenToUse guidance only for skills that carry it in the description index", () => {
+    using tempDir = new TestTempDir("test-agent-skill-read-when-to-use");
+    const baseConfig = createTestToolConfig(tempDir.path);
+
+    const tool = createAgentSkillReadTool({
+      ...baseConfig,
+      availableSkills: [
+        {
+          name: "with-guidance",
+          description: "Skill carrying extra guidance",
+          scope: "global",
+          whenToUse: "only when triaging incoming issues",
+        },
+        {
+          name: "without-guidance",
+          description: "Skill without extra guidance",
+          scope: "global",
+        },
+      ],
+    });
+
+    // The ai SDK types `description` as string | dynamic-function; the factory always
+    // builds a static string.
+    const description = typeof tool.description === "string" ? tool.description : "";
+    const lines = description.split("\n");
+    const withLine = lines.find((line) => line.startsWith("- with-guidance:"));
+    const withoutLine = lines.find((line) => line.startsWith("- without-guidance:"));
+
+    expect(withLine).toContain("only when triaging incoming issues");
+    expect(withoutLine).toBeDefined();
+    expect(withoutLine).not.toContain("When to use:");
   });
 });

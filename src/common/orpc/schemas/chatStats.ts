@@ -33,6 +33,8 @@ export const ChatUsageDisplaySchema = z.object({
   reasoning: ChatUsageComponentSchema,
   model: z.string().optional(),
   costsIncluded: z.boolean().optional(),
+  // Without it, the schema would strip the tier and repricing would drop the premium (#4787).
+  serviceTier: z.enum(["flex", "fast", "ultrafast", "unknown", "mixed"]).optional(),
 });
 
 export const ChatStatsSchema = z.object({
@@ -97,7 +99,7 @@ export type RolledUpChildEntry = z.infer<typeof RolledUpChildEntrySchema>;
 
 /**
  * Cumulative session usage file format.
- * Stored in ~/.mux/sessions/{workspaceId}/session-usage.json
+ * Stored in ~/.xum/sessions/{workspaceId}/session-usage.json
  */
 export const SessionUsageFileSchema = z.object({
   byModel: z.record(z.string(), ChatUsageDisplaySchema),

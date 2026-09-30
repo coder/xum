@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Installing dependencies with bun..."
+# Some contributors use direnv-managed toolchains; only opt in when direnv exists.
+if command -v direnv >/dev/null 2>&1; then
+  direnv allow
+fi
+
+# Keep tool bootstrap read-only for lockfiles so opening a workspace never dirties bun.lock.
+bun install --frozen-lockfile
+echo "Dependencies installed successfully!"

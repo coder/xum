@@ -22,46 +22,36 @@ if [ -n "$PNG_FILES" ]; then
   exit 1
 fi
 
-ESLINT_PATTERN='src/**/*.{ts,tsx}'
-
-get_cpu_count() {
-  local cpu_count=""
-
-  if command -v getconf >/dev/null 2>&1; then
-    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-  fi
-
-  if [ -z "$cpu_count" ] && command -v nproc >/dev/null 2>&1; then
-    cpu_count="$(nproc 2>/dev/null || true)"
-  fi
-
-  if [ -z "$cpu_count" ] && command -v sysctl >/dev/null 2>&1; then
-    cpu_count="$(sysctl -n hw.ncpu 2>/dev/null || true)"
-  fi
-
-  if [[ "$cpu_count" =~ ^[0-9]+$ ]] && [ "$cpu_count" -gt 0 ]; then
-    echo "$cpu_count"
-  else
-    echo 2
-  fi
-}
+# Workflow runtime and packaged skill workflow sources are executable JS embedded
+# into the app; lint them alongside the TS sources (they get dedicated
+# non-type-aware config blocks).
+ESLINT_PATTERNS=(
+  'src/**/*.{ts,tsx}'
+  'tests/**/*.{ts,tsx}'
+  'src/node/builtinSkills/**/*.js'
+  'src/node/workflowRuntime/*.js'
+  'scripts/lib/*.js'
+)
 
 get_default_eslint_concurrency() {
-  local cpu_count
-  local concurrency
-
-  cpu_count="$(get_cpu_count)"
-  concurrency=$(((cpu_count + 1) / 2))
-
-  # User rationale: local static-check should scale up on agent/desktop machines
-  # without letting ESLint's auto concurrency spawn one worker per core.
-  if [ "$concurrency" -lt 2 ]; then
-    concurrency=2
-  elif [ "$concurrency" -gt 8 ]; then
-    concurrency=8
+  # Most local `make static-check` runs are warm-cache validation after a small
+  # edit. ESLint's worker startup/merge overhead dominates that path, so keep it
+  # single-process once the cache exists; cold caches still scale up for CI-like
+  # first runs.
+  if [ -f .eslintcache ]; then
+    echo 1
+    return
   fi
 
-  echo "$concurrency"
+  # Cold type-aware runs scale memory with concurrency, so use cgroup headroom instead of visible
+  # core count. Keep stderr attached for diagnostics, and fall back only if the helper fails.
+  local concurrency
+  if concurrency="$(node "$SCRIPT_DIR/lib/worker_budget.js" eslint)" \
+    && [[ "$concurrency" =~ ^[0-9]+$ ]] && [ "$concurrency" -gt 0 ]; then
+    echo "$concurrency"
+  else
+    echo 1
+  fi
 }
 
 ESLINT_CONCURRENCY="${MUX_ESLINT_CONCURRENCY:-$(get_default_eslint_concurrency)}"
@@ -74,9 +64,9 @@ ESLINT_ARGS=(
 
 if [ "${1:-}" = "--fix" ]; then
   echo "Running bun x eslint with --fix (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "$ESLINT_PATTERN" --fix
+  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}" --fix
 else
   echo "Running eslint (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "$ESLINT_PATTERN"
+  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}"
   echo "ESLint checks passed!"
 fi

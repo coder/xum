@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -100,6 +100,69 @@ class CommandCaptureSSHRuntime extends SSHRuntime {
   }
 }
 
+class LocalUnpackSSHRuntime extends SSHRuntime {
+  readonly commands: string[] = [];
+
+  constructor(private readonly baseRepoPath: string) {
+    const config: SSHRuntimeConfig = {
+      host: "example.test",
+      srcBaseDir: "/remote/src",
+    };
+    super(config, createMockTransport(config));
+  }
+
+  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+    this.commands.push(command);
+    if (!command.includes("unpack-objects -r")) {
+      const result = spawnSync("sh", ["-c", command], {
+        cwd: options.cwd,
+        encoding: "utf8",
+      });
+      return Promise.resolve(
+        createExecStream(result.stdout || "", result.stderr || "", result.status ?? 1)
+      );
+    }
+
+    const chunks: Buffer[] = [];
+    let resolveExitCode: (exitCode: number) => void = noop;
+    const exitCode = new Promise<number>((resolve) => {
+      resolveExitCode = resolve;
+    });
+    let unpackRan = false;
+    const runUnpack = () => {
+      if (unpackRan) {
+        return;
+      }
+      unpackRan = true;
+      const result = spawnSync("git", ["-C", this.baseRepoPath, "unpack-objects", "-r"], {
+        input: Buffer.concat(chunks),
+      });
+      resolveExitCode(result.status ?? 1);
+    };
+
+    return Promise.resolve({
+      stdout: createTextStream(""),
+      stderr: createTextStream(""),
+      stdin: new WritableStream<Uint8Array>({
+        write(chunk) {
+          chunks.push(Buffer.from(chunk));
+          return Promise.resolve();
+        },
+        close() {
+          runUnpack();
+          return Promise.resolve();
+        },
+        abort() {
+          resolveExitCode(1);
+          return Promise.resolve();
+        },
+      }),
+      exitCode,
+      duration: exitCode.then(() => 0),
+    });
+  }
+}
+
 interface GitPushPrivateApi {
   syncProjectSnapshotViaGitPush(
     projectPath: string,
@@ -150,6 +213,19 @@ interface FreshWorkspaceSourcePrivateApi {
     abortSignal?: AbortSignal,
     nhp?: string
   ): Promise<boolean>;
+}
+
+interface MissingObjectRepairPrivateApi {
+  checkBaseRepoBundleConnectivity(
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ healthy: true } | { healthy: false; detail: string }>;
+  repairBaseRepoMissingObjectsFromLocal(
+    projectPath: string,
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void>;
 }
 
 function createLayout(): RemoteProjectLayout {
@@ -386,6 +462,42 @@ describe("SSHRuntime authoritative sync contract", () => {
     expect(runtime.commands).toContain(
       "git fetch origin '+refs/heads/main:refs/remotes/origin/main'"
     );
+  });
+
+  it("repairs missing objects in reusable base repos with a full local pack", async () => {
+    const repoPath = await createTempGitRepo();
+    const baseParent = await mkdtemp(path.join(os.tmpdir(), "mux-ssh-missing-objects-base-"));
+    tempDirs.push(baseParent);
+    const baseRepoPath = path.join(baseParent, "base.git");
+    const worktreePath = path.join(baseParent, "repaired-worktree");
+
+    execSync(`git clone --bare "${repoPath}" "${baseRepoPath}"`, { stdio: "pipe" });
+    execSync(`git -C "${baseRepoPath}" update-ref refs/mux-bundle/main refs/heads/main`, {
+      stdio: "pipe",
+    });
+
+    execSync(`find "${path.join(baseRepoPath, "objects")}" -type f -delete`, { stdio: "pipe" });
+
+    const runtime = new LocalUnpackSSHRuntime(baseRepoPath);
+    const privateApi = runtime as unknown as MissingObjectRepairPrivateApi;
+
+    const beforeRepair = await privateApi.checkBaseRepoBundleConnectivity(baseRepoPath);
+    expect(beforeRepair.healthy).toBe(false);
+
+    await privateApi.repairBaseRepoMissingObjectsFromLocal(repoPath, baseRepoPath, noopInitLogger);
+
+    const afterRepair = await privateApi.checkBaseRepoBundleConnectivity(baseRepoPath);
+    expect(afterRepair.healthy).toBe(true);
+    expect(runtime.commands).toContain(`git -C ${baseRepoPath} unpack-objects -r`);
+
+    execSync(
+      `git -C "${baseRepoPath}" worktree add "${worktreePath}" -B repaired refs/mux-bundle/main`,
+      { stdio: "pipe" }
+    );
+    const repairedContent = execSync(`cat "${path.join(worktreePath, "file.txt")}"`, {
+      encoding: "utf8",
+    });
+    expect(repairedContent).toBe("initial");
   });
 
   it("fetches pruneable bundle branches separately from shared tags", async () => {

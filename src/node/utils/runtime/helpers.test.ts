@@ -1,29 +1,42 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { execFileSync } from "node:child_process";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/Runtime";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { shellQuote } from "@/common/utils/shell";
 import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
+import { drainFifoReaders } from "../../../../tests/ipc/fifoRelease";
 
 interface MockRuntimeState {
-  muxHome: string;
+  xumHome: string;
   files: Map<string, string>;
   readAttempts: string[];
   writes: Array<{ path: string; content: string }>;
   execCalls: Array<{ command: string; options: ExecOptions }>;
   resolvedPaths: Map<string, string>;
+  /** Reads/stats of these paths fail in transport (an unreachable SSH host). */
+  transportFailPaths: Set<string>;
+  /** Exit code every exec reports; 255 is the OpenSSH transport-failure exit. */
+  execExitCode: number;
 }
 
 function createRuntimeState(
-  muxHome: string,
+  xumHome: string,
   initialFiles: Record<string, string> = {}
 ): MockRuntimeState {
   return {
-    muxHome,
+    xumHome,
     files: new Map(Object.entries(initialFiles)),
     readAttempts: [],
     writes: [],
     execCalls: [],
     resolvedPaths: new Map(),
+    transportFailPaths: new Set(),
+    execExitCode: 0,
   };
 }
 
@@ -63,9 +76,12 @@ function toFileStat(content: string): FileStat {
 
 function createMockRuntime(state: MockRuntimeState): Runtime {
   return {
-    getMuxHome: () => state.muxHome,
+    getXumHome: () => state.xumHome,
     readFile: (path: string) => {
       state.readAttempts.push(path);
+      if (state.transportFailPaths.has(path)) {
+        throw new RuntimeError(`ssh: connect to host failed (${path})`, "network");
+      }
       const content = state.files.get(path);
       if (content === undefined) {
         throw new Error(`ENOENT: ${path}`);
@@ -89,9 +105,12 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
     },
     exec: (command: string, options: ExecOptions) => {
       state.execCalls.push({ command, options });
-      return Promise.resolve(createExecStream());
+      return Promise.resolve(createExecStream("", "", state.execExitCode));
     },
     stat: (path: string) => {
+      if (state.transportFailPaths.has(path)) {
+        return Promise.reject(new RuntimeError(`ssh: connect to host failed (${path})`, "network"));
+      }
       const content = state.files.get(path);
       if (content === undefined) {
         return Promise.reject(new Error(`ENOENT: ${path}`));
@@ -105,6 +124,7 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
       }
       return Promise.resolve(path);
     },
+    isTransportFailureExit: (exitCode: number) => exitCode === 255,
   } as unknown as Runtime;
 }
 
@@ -114,12 +134,12 @@ describe("copyPlanFileAcrossRuntimes", () => {
   const targetWorkspaceName = "target-workspace";
   const projectName = "demo-project";
   const sourceMuxHome = "/source-mux";
-  const targetMuxHome = "/target-mux";
+  const targetXumHome = "/target-mux";
 
   it("reads from source runtime and writes to target runtime", async () => {
     const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId);
-    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetMuxHome);
+    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
+    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
     const sourceContent = "# source plan\n";
 
     const sourceState = createRuntimeState(sourceMuxHome, {
@@ -127,7 +147,7 @@ describe("copyPlanFileAcrossRuntimes", () => {
       // If this is read instead of sourcePath, this assertion would fail.
       [legacyPath]: "# legacy plan\n",
     });
-    const targetState = createRuntimeState(targetMuxHome);
+    const targetState = createRuntimeState(targetXumHome);
 
     await copyPlanFileAcrossRuntimes(
       createMockRuntime(sourceState),
@@ -147,14 +167,14 @@ describe("copyPlanFileAcrossRuntimes", () => {
 
   it("falls back to legacy source path when the new source path is missing", async () => {
     const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId);
-    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetMuxHome);
+    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
+    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
     const legacyContent = "# legacy plan\n";
 
     const sourceState = createRuntimeState(sourceMuxHome, {
       [legacyPath]: legacyContent,
     });
-    const targetState = createRuntimeState(targetMuxHome);
+    const targetState = createRuntimeState(targetXumHome);
 
     await copyPlanFileAcrossRuntimes(
       createMockRuntime(sourceState),
@@ -172,11 +192,11 @@ describe("copyPlanFileAcrossRuntimes", () => {
 
   it("silently no-ops when source plan is missing at both new and legacy paths", async () => {
     const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId);
-    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetMuxHome);
+    const legacyPath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
+    const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
 
     const sourceState = createRuntimeState(sourceMuxHome);
-    const targetState = createRuntimeState(targetMuxHome);
+    const targetState = createRuntimeState(targetXumHome);
 
     await copyPlanFileAcrossRuntimes(
       createMockRuntime(sourceState),
@@ -193,29 +213,151 @@ describe("copyPlanFileAcrossRuntimes", () => {
   });
 });
 
+async function settleWithin<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Real filesystem: a fork copies the source plan, and the plan path is user/agent-writable, so a
+ * writer-less FIFO there must not park a libuv worker per fork. Every FIFO is drained in afterEach
+ * so a RED run never strands a reader.
+ */
+(process.platform !== "win32" ? describe : describe.skip)(
+  "copyPlanFileAcrossRuntimes on non-regular source plan paths",
+  () => {
+    const sourceWorkspaceName = "source-workspace";
+    const sourceWorkspaceId = "source-workspace-id";
+    const targetWorkspaceName = "target-workspace";
+    const projectName = "demo-project";
+
+    class HomeRuntime extends LocalRuntime {
+      constructor(private readonly xumHome: string) {
+        super(xumHome);
+      }
+
+      override getXumHome(): string {
+        return this.xumHome;
+      }
+    }
+
+    let dir: string;
+    let canonical: string;
+    let legacy: string;
+    let target: string;
+    let fifos: string[];
+    let attempts: Array<Promise<unknown>>;
+
+    beforeEach(async () => {
+      dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-copy-plan-"));
+      canonical = getPlanFilePath(sourceWorkspaceName, projectName, path.join(dir, "source"));
+      legacy = getLegacyPlanFilePath(sourceWorkspaceId, path.join(dir, "source"));
+      target = getPlanFilePath(targetWorkspaceName, projectName, path.join(dir, "target"));
+      await fs.mkdir(path.dirname(canonical), { recursive: true });
+      fifos = [];
+      attempts = [];
+    });
+
+    afterEach(async () => {
+      // Drain every FIFO concurrently: a reader released from the canonical FIFO falls through to
+      // the legacy one.
+      const drains = await Promise.all(
+        fifos.map((fifo) => drainFifoReaders(fifo, attempts, 10_000))
+      );
+      await fs.rm(dir, { recursive: true, force: true });
+      expect(drains.every((drain) => drain.settled)).toBe(true);
+    });
+
+    function mkfifo(p: string): void {
+      execFileSync("mkfifo", [p]);
+      fifos.push(p);
+    }
+
+    function copy(): Promise<string | undefined> {
+      const attempt = copyPlanFileAcrossRuntimes(
+        new HomeRuntime(path.join(dir, "source")),
+        new HomeRuntime(path.join(dir, "target")),
+        sourceWorkspaceName,
+        sourceWorkspaceId,
+        targetWorkspaceName,
+        projectName
+      );
+      attempts.push(attempt);
+      return settleWithin(attempt, 2000, "copyPlanFileAcrossRuntimes");
+    }
+
+    // A nonblocking write-open succeeds iff some reader holds or awaits the FIFO.
+    function writeOpenError(fifo: string): string | undefined {
+      try {
+        fsSync.closeSync(
+          fsSync.openSync(fifo, fsSync.constants.O_WRONLY | fsSync.constants.O_NONBLOCK)
+        );
+        return undefined;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code;
+      }
+    }
+
+    it("skips a writer-less canonical FIFO promptly and falls back to the regular legacy plan", async () => {
+      mkfifo(canonical);
+      await fs.writeFile(legacy, "# legacy plan\n");
+      await copy();
+      expect(await fs.readFile(target, "utf8")).toBe("# legacy plan\n");
+      expect(writeOpenError(canonical)).toBe("ENXIO");
+    });
+
+    it("treats writer-less FIFOs at both candidate paths as no plan", async () => {
+      mkfifo(canonical);
+      mkfifo(legacy);
+      await copy();
+      expect(fsSync.existsSync(target)).toBe(false);
+      expect(writeOpenError(canonical)).toBe("ENXIO");
+      expect(writeOpenError(legacy)).toBe("ENXIO");
+    });
+
+    it.each([
+      { label: "regular file", mode: 0o644, viaSymlink: false },
+      { label: "read-only regular file", mode: 0o444, viaSymlink: false },
+      { label: "symlink to a regular file", mode: 0o644, viaSymlink: true },
+    ])("copies a canonical $label unchanged", async ({ mode, viaSymlink }) => {
+      const content = "# canonical plan\n\n" + "step\n".repeat(5000);
+      const file = viaSymlink ? path.join(dir, "elsewhere.md") : canonical;
+      await fs.writeFile(file, content, { mode });
+      await fs.chmod(file, mode);
+      if (viaSymlink) await fs.symlink(file, canonical);
+      await fs.writeFile(legacy, "# legacy plan\n");
+      await copy();
+      expect(await fs.readFile(target, "utf8")).toBe(content);
+    });
+  }
+);
+
 describe("readPlanFile", () => {
-  it("resolves paths before building the quoted migration command", async () => {
+  it("passes unresolved migration paths through pathEnv", async () => {
     const workspaceName = "workspace-a1b2";
     const projectName = "demo-project";
     const workspaceId = "legacy-workspace-id";
-    const muxHome = "~/.mux";
+    const xumHome = "~/.mux";
     const legacyContent = "# legacy plan\n";
 
-    const planPath = getPlanFilePath(workspaceName, projectName, muxHome);
-    const legacyPath = getLegacyPlanFilePath(workspaceId);
+    const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
+    const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
     const planDir = planPath.substring(0, planPath.lastIndexOf("/"));
 
     const resolvedPlanPath = "/home/dev/.mux/plans/demo-project/workspace-a1b2.md";
-    const resolvedPlanDir = "/home/dev/.mux/plans/demo-project";
-    const resolvedLegacyPath = "/home/dev/.mux/plans/legacy-workspace-id.md";
 
-    const state = createRuntimeState(muxHome, {
+    const state = createRuntimeState(xumHome, {
       [legacyPath]: legacyContent,
     });
 
     state.resolvedPaths.set(planPath, resolvedPlanPath);
-    state.resolvedPaths.set(planDir, resolvedPlanDir);
-    state.resolvedPaths.set(legacyPath, resolvedLegacyPath);
 
     const result = await readPlanFile(
       createMockRuntime(state),
@@ -231,39 +373,211 @@ describe("readPlanFile", () => {
     });
     expect(state.readAttempts).toEqual([planPath, legacyPath]);
     expect(state.execCalls).toHaveLength(1);
-    expect(state.execCalls[0]?.command).toBe(
-      `mkdir -p ${shellQuote(resolvedPlanDir)} && mv ${shellQuote(resolvedLegacyPath)} ${shellQuote(resolvedPlanPath)}`
-    );
-    expect(state.execCalls[0]?.options).toMatchObject({ cwd: "/tmp", timeout: 5 });
-    expect(state.execCalls[0]?.command.includes("'~")).toBe(false);
+    expect(state.execCalls[0]).toEqual({
+      command: 'mkdir -p "$XUM_PLAN_DIR" && mv "$XUM_LEGACY_PLAN" "$XUM_PLAN"',
+      options: {
+        cwd: "/tmp",
+        pathEnv: {
+          XUM_PLAN_DIR: planDir,
+          XUM_LEGACY_PLAN: legacyPath,
+          XUM_PLAN: planPath,
+        },
+        timeout: 5,
+      },
+    });
   });
+
+  it.each([
+    { label: "local canonical", xumHome: "~/.xum" },
+    { label: "SSH legacy", xumHome: "~/.mux" },
+    { label: "Docker", xumHome: "/var/mux" },
+  ])(
+    "falls back to $label runtime-home legacy path, not a hardcoded ~/.xum root",
+    async ({ xumHome }) => {
+      const workspaceName = "workspace-a1b2";
+      const projectName = "demo-project";
+      const workspaceId = "legacy-workspace-id";
+      const localCanonicalLegacyPath = getLegacyPlanFilePath(workspaceId, "~/.xum");
+      const runtimeLegacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
+      const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
+      const legacyContent = "# runtime-home legacy plan\n";
+
+      const state = createRuntimeState(xumHome, {
+        [localCanonicalLegacyPath]: "# local-canonical leftover\n",
+        [runtimeLegacyPath]: legacyContent,
+      });
+      state.resolvedPaths.set(planPath, planPath);
+      state.resolvedPaths.set(runtimeLegacyPath, runtimeLegacyPath);
+
+      const result = await readPlanFile(
+        createMockRuntime(state),
+        workspaceName,
+        projectName,
+        workspaceId
+      );
+
+      expect(result.content).toBe(legacyContent);
+      expect(state.readAttempts).toEqual([planPath, runtimeLegacyPath]);
+      if (xumHome !== "~/.xum") {
+        expect(state.readAttempts).not.toContain(localCanonicalLegacyPath);
+      }
+    }
+  );
 });
 
 describe("movePlanFile", () => {
-  it("uses resolved absolute paths when constructing the mv command", async () => {
+  it("passes unresolved plan paths through pathEnv", async () => {
     const oldWorkspaceName = "old-workspace";
     const newWorkspaceName = "new-workspace";
     const projectName = "demo-project";
-    const muxHome = "~/.mux";
+    const xumHome = "~/.mux";
 
-    const oldPath = getPlanFilePath(oldWorkspaceName, projectName, muxHome);
-    const newPath = getPlanFilePath(newWorkspaceName, projectName, muxHome);
-    const resolvedOldPath = "/home/dev/.mux/plans/demo-project/old-workspace.md";
-    const resolvedNewPath = "/home/dev/.mux/plans/demo-project/new-workspace.md";
+    const oldPath = getPlanFilePath(oldWorkspaceName, projectName, xumHome);
+    const newPath = getPlanFilePath(newWorkspaceName, projectName, xumHome);
 
-    const state = createRuntimeState(muxHome, {
+    const state = createRuntimeState(xumHome, {
       [oldPath]: "# old plan\n",
     });
-
-    state.resolvedPaths.set(oldPath, resolvedOldPath);
-    state.resolvedPaths.set(newPath, resolvedNewPath);
 
     await movePlanFile(createMockRuntime(state), oldWorkspaceName, newWorkspaceName, projectName);
 
     expect(state.execCalls).toHaveLength(1);
-    expect(state.execCalls[0]?.command).toBe(
-      `mv ${shellQuote(resolvedOldPath)} ${shellQuote(resolvedNewPath)}`
+    expect(state.execCalls[0]).toEqual({
+      command: 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"',
+      options: {
+        cwd: "/tmp",
+        pathEnv: {
+          XUM_OLD_PLAN: oldPath,
+          XUM_NEW_PLAN: newPath,
+        },
+        timeout: 5,
+      },
+    });
+  });
+});
+
+// #4826: an unreachable runtime is not a missing plan. Each helper must fail
+// loudly instead of reading as "no plan file", and a move/copy must never
+// report success (or touch the target) when the source could not be read.
+describe("plan-file helpers on transport failures", () => {
+  const workspaceName = "workspace-a1b2";
+  const projectName = "demo-project";
+  const workspaceId = "legacy-workspace-id";
+  const xumHome = "~/.mux";
+  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
+  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
+
+  it("readPlanFile rethrows a transport failure on the canonical path", async () => {
+    const state = createRuntimeState(xumHome, { [legacyPath]: "# stale legacy plan\n" });
+    state.transportFailPaths.add(planPath);
+
+    const attempt = readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(attempt).rejects.toThrow("ssh: connect to host failed");
+    // Neither the legacy fallback nor its migration may run past the failure.
+    expect(state.readAttempts).toEqual([planPath]);
+    expect(state.execCalls).toHaveLength(0);
+  });
+
+  it("readPlanFile rethrows a transport failure on the legacy path", async () => {
+    const state = createRuntimeState(xumHome);
+    state.transportFailPaths.add(legacyPath);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId)
+    ).rejects.toThrow("ssh: connect to host failed");
+  });
+
+  it("readPlanFile still reports a truly missing plan as absent", async () => {
+    const state = createRuntimeState(xumHome);
+
+    const result = await readPlanFile(
+      createMockRuntime(state),
+      workspaceName,
+      projectName,
+      workspaceId
     );
-    expect(state.execCalls[0]?.options).toMatchObject({ cwd: "/tmp", timeout: 5 });
+
+    expect(result).toEqual({ content: "", exists: false, path: planPath });
+  });
+
+  describe("movePlanFile", () => {
+    const newPlanPath = getPlanFilePath("renamed-workspace", projectName, xumHome);
+
+    it("rethrows a transport failure on the source probe without moving", async () => {
+      const state = createRuntimeState(xumHome);
+      state.transportFailPaths.add(planPath);
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+      ).rejects.toThrow("ssh: connect to host failed");
+      expect(state.execCalls).toHaveLength(0);
+    });
+
+    it("fails when the move itself fails in transport", async () => {
+      const state = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
+      state.execExitCode = 255;
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+      ).rejects.toThrow("Failed to move plan file");
+    });
+
+    it("still succeeds as a no-op when there is no plan", async () => {
+      const state = createRuntimeState(xumHome);
+
+      await movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName);
+
+      expect(state.execCalls).toHaveLength(0);
+      expect(state.files.has(newPlanPath)).toBe(false);
+    });
+  });
+
+  describe("copyPlanFileAcrossRuntimes", () => {
+    const targetXumHome = "~/.xum";
+    const targetPlanPath = getPlanFilePath("fork-workspace", projectName, targetXumHome);
+
+    it("rethrows a source transport failure without writing the target", async () => {
+      const sourceState = createRuntimeState(xumHome, { [legacyPath]: "# stale legacy plan\n" });
+      sourceState.transportFailPaths.add(planPath);
+      const targetState = createRuntimeState(targetXumHome);
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        copyPlanFileAcrossRuntimes(
+          createMockRuntime(sourceState),
+          createMockRuntime(targetState),
+          workspaceName,
+          workspaceId,
+          "fork-workspace",
+          projectName
+        )
+      ).rejects.toThrow("ssh: connect to host failed");
+      // The stale legacy plan must not be copied in place of the unreadable one.
+      expect(sourceState.readAttempts).toEqual([planPath]);
+      expect(targetState.writes).toEqual([]);
+    });
+
+    it("still succeeds without writing when no source plan exists", async () => {
+      const sourceState = createRuntimeState(xumHome);
+      const targetState = createRuntimeState(targetXumHome);
+
+      await copyPlanFileAcrossRuntimes(
+        createMockRuntime(sourceState),
+        createMockRuntime(targetState),
+        workspaceName,
+        workspaceId,
+        "fork-workspace",
+        projectName
+      );
+
+      expect(sourceState.readAttempts).toEqual([planPath, legacyPath]);
+      expect(targetState.writes).toEqual([]);
+      expect(targetState.files.has(targetPlanPath)).toBe(false);
+    });
   });
 });

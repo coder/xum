@@ -7,6 +7,13 @@ export function isWorkspaceTrustedForSharedExecution(
   metadata: WorkspaceMetadata,
   projectsConfig: ProjectsConfig["projects"]
 ): boolean {
+  // Scratch chats are app-owned and created trusted under the _scratch system
+  // bucket; their metadata.projectPath is the per-chat workdir, which is never
+  // a config key, so the path lookup below would wrongly report untrusted.
+  if (metadata.kind === "scratch") {
+    return true;
+  }
+
   if (!isMultiProject(metadata)) {
     return projectsConfig.get(stripTrailingSlashes(metadata.projectPath))?.trusted ?? false;
   }

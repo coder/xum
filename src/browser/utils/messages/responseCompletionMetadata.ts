@@ -13,8 +13,8 @@ export type ResponseCompleteMetadata =
     } & ResponseNotificationPolicy)
   | ({
       kind: "compaction";
-      hasAutoFollowUp: boolean;
-      isIdle?: boolean;
+      // Only used to carry synthetic follow-up suppression across background
+      // generation handoffs; compaction itself is never notify-eligible.
     } & ResponseNotificationPolicy);
 
 export interface ResponseCompleteEvent {
@@ -30,31 +30,28 @@ export type ResponseCompleteHandler = (event: ResponseCompleteEvent) => void;
 
 export interface ResponseCompletionState {
   isCompacting: boolean;
-  hasCompactionContinue: boolean;
   hasQueuedFollowUp: boolean;
   /** This stream is a synthetic implementation-detail turn and should not alert. */
   suppressNotification?: boolean;
-  // Idle compaction is maintenance work, so downstream notification policy must
-  // be able to suppress the final completion even when the workspace is selected.
-  isIdleCompaction?: boolean;
 }
 
 export function buildResponseCompleteMetadata(
   state: ResponseCompletionState
 ): ResponseCompleteMetadata | undefined {
-  const hasAutoFollowUp = state.hasCompactionContinue || state.hasQueuedFollowUp;
   const suppressNotification = state.suppressNotification === true;
-  if (!state.isCompacting && !hasAutoFollowUp && !suppressNotification) {
-    return undefined;
-  }
-
   if (state.isCompacting) {
+    // Compaction is context-management, not an assistant response. Treat every
+    // compaction boundary as non-notifiable so notification correctness never
+    // depends on racing follow-up/queue metadata.
     return {
       kind: "compaction",
-      hasAutoFollowUp,
-      ...(state.isIdleCompaction ? { isIdle: true } : {}),
       ...(suppressNotification ? { suppressNotification: true } : {}),
     };
+  }
+
+  const hasAutoFollowUp = state.hasQueuedFollowUp;
+  if (!hasAutoFollowUp && !suppressNotification) {
+    return undefined;
   }
 
   return {
@@ -68,48 +65,42 @@ export function buildAggregateResponseCompleteMetadata(
   states: Iterable<ResponseCompletionState>
 ): ResponseCompleteMetadata | undefined {
   let isCompacting = false;
-  let hasCompactionContinue = false;
   let hasQueuedFollowUp = false;
   let suppressNotification = false;
-  let isIdleCompaction = false;
 
   for (const state of states) {
     isCompacting ||= state.isCompacting;
-    hasCompactionContinue ||= state.hasCompactionContinue;
     hasQueuedFollowUp ||= state.hasQueuedFollowUp;
     suppressNotification ||= state.suppressNotification === true;
-    isIdleCompaction ||= state.isIdleCompaction === true;
   }
 
   return buildResponseCompleteMetadata({
     isCompacting,
-    hasCompactionContinue,
     hasQueuedFollowUp,
     suppressNotification,
-    isIdleCompaction,
   });
 }
 
-export function createIdleCompactionCompletion(hasAutoFollowUp: boolean): ResponseCompleteMetadata {
-  return {
-    kind: "compaction",
-    hasAutoFollowUp,
-    isIdle: true,
-  };
+export function createCompactionCompletion(): ResponseCompleteMetadata {
+  return { kind: "compaction" };
 }
 
 export function shouldNotifyOnResponseComplete(
   completion: ResponseCompleteMetadata | undefined
 ): boolean {
-  if (completion?.suppressNotification === true) {
+  if (completion === undefined) {
+    return true;
+  }
+
+  if (completion.kind === "compaction") {
     return false;
   }
 
-  if (completion?.kind === "compaction" && completion.isIdle) {
+  if (completion.suppressNotification === true) {
     return false;
   }
 
-  return completion?.hasAutoFollowUp !== true;
+  return !completion.hasAutoFollowUp;
 }
 
 export function getResponseCompleteNotificationBody(

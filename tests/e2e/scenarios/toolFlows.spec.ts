@@ -182,6 +182,15 @@ test.describe("tool and reasoning flows", () => {
       .first();
     await expect(reasoningPreview).toBeVisible();
 
+    // Thinking blocks are quiet by default (collapsed): the summary line shows with a
+    // trailing ellipsis and the multi-line body stays hidden until the user expands.
+    await expect(transcript.getByTestId("reasoning-ellipsis")).toHaveCount(1);
+    await expect(
+      transcript.getByText("Plan: explain pivot selection, partitioning, recursion, base case.")
+    ).toHaveCount(0);
+
+    // Expanding reveals the full reasoning body (and the choice sticks for future blocks).
+    await reasoningPreview.click();
     await expect(transcript.getByTestId("reasoning-ellipsis")).toHaveCount(0);
     await expect(
       transcript.getByText("Plan: explain pivot selection, partitioning, recursion, base case.")

@@ -5,7 +5,13 @@ import { GlobalWindow } from "happy-dom";
 
 import { POWER_MODE_ENABLED_KEY } from "@/common/constants/storage";
 import { PowerModeEngine } from "@/browser/utils/powerMode/PowerModeEngine";
+import * as RealPowerModeOverlayModule from "@/browser/features/PowerMode/PowerModeOverlay";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
+// Restore the real overlay after this suite so the stub cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/features/PowerMode/PowerModeOverlay", { ...RealPowerModeOverlayModule }],
+]);
 void mock.module("@/browser/features/PowerMode/PowerModeOverlay", () => ({
   // Overlay rendering is unrelated to caret alignment; keep tests focused on context behavior.
   PowerModeOverlay: () => null,

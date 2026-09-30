@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Wait for a PR to become merge-ready by enforcing the Codex + optional coder-agents-review + CI loop.
+# Wait for a PR to become merge-ready by enforcing the Codex + optional coder-agents-review + non-visual-review CI loop.
 # Usage: ./scripts/wait_pr_ready.sh <pr_number>
 #
 # This script orchestrates Codex + optional coder-agents-review + checks in one polling loop:
@@ -13,7 +13,8 @@ set -euo pipefail
 #   6) check_codex_comments.sh (only when all active gates pass)
 #
 # It exits immediately on the first terminal failure and succeeds only when
-# all required and active optional gates report success.
+# all required and active optional gates report success. Pixel review
+# statuses are intentionally ignored by wait_pr_checks.sh.
 
 if [ $# -ne 1 ]; then
   echo "Usage: $0 <pr_number>" >&2
@@ -146,7 +147,7 @@ trap cleanup EXIT
 export MUX_PR_DATA_FILE="$PR_DATA_FILE"
 export MUX_REACTIONS_SCAN_CACHE_FILE="$REACTIONS_SCAN_CACHE_FILE"
 
-echo "🚦 Waiting for PR #$PR_NUMBER to become ready (Codex + optional coder-agents-review + CI, fail-fast)..."
+echo "🚦 Waiting for PR #$PR_NUMBER to become ready (Codex + optional coder-agents-review + non-visual-review CI, fail-fast)..."
 echo ""
 
 while true; do
@@ -329,7 +330,7 @@ while true; do
     if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
       echo ""
       echo ""
-      echo "🎉 PR #$PR_NUMBER is ready: Codex approved, ${CODER_AGENTS_READY_SUMMARY}, required checks passed, and no unresolved Codex comments remain."
+      echo "🎉 PR #$PR_NUMBER is ready: Codex approved, ${CODER_AGENTS_READY_SUMMARY}, non-visual-review checks passed, and no unresolved Codex comments remain."
       exit 0
     fi
 

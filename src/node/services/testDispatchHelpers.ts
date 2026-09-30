@@ -36,7 +36,7 @@ export async function drainPendingDispatches(): Promise<void> {
  * `workspaceGoalService.test.ts` and `idleDispatcher.test.ts`.
  */
 export async function waitForCondition(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   options?: { timeoutMs?: number; intervalMs?: number }
 ): Promise<void> {
   const timeoutMs = options?.timeoutMs ?? 1_000;
@@ -44,7 +44,7 @@ export async function waitForCondition(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    if (condition()) {
+    if (await condition()) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));

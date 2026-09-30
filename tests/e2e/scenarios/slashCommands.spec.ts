@@ -76,22 +76,22 @@ test.describe("slash command flows", () => {
     await ui.projects.openFirstWorkspace();
 
     const modeToggles = page.locator('[data-component="ChatModeToggles"]');
-    // Default model is Opus 4.7 - displayed as formatted name
-    await expect(modeToggles.getByText("Opus 4.7", { exact: true })).toBeVisible();
+    // Default model is Opus 5.5 - displayed as formatted name
+    await expect(modeToggles.getByText("Opus 5.5", { exact: true })).toBeVisible();
 
     await ui.chat.sendMessage("/model sonnet");
-    await ui.chat.expectStatusMessageContains("Model changed to anthropic:claude-sonnet-4-6");
+    await ui.chat.expectStatusMessageContains("Model changed to anthropic:claude-sonnet-5-5");
     // Model is displayed as formatted name
-    await expect(modeToggles.getByText("Sonnet 4.6", { exact: true })).toBeVisible();
+    await expect(modeToggles.getByText("Sonnet 5.5", { exact: true })).toBeVisible();
 
     const timeline = await ui.chat.captureStreamTimeline(async () => {
       await ui.chat.sendMessage(MOCK_SLASH_COMMAND_PROMPTS.MODEL_STATUS);
     });
 
     const streamStart = timeline.events.find((event) => event.type === "stream-start");
-    expect(streamStart?.model).toBe("anthropic:claude-sonnet-4-6");
+    expect(streamStart?.model).toBe("anthropic:claude-sonnet-5-5");
     await ui.chat.expectTranscriptContains(
-      "Claude Sonnet 4.6 is now responding with standard reasoning capacity."
+      "Claude Sonnet 5.5 is now responding with standard reasoning capacity."
     );
   });
 });

@@ -45,6 +45,23 @@ export function applyToolPolicyToNames(toolNames: string[], policy?: ToolPolicy)
 }
 
 /**
+ * Build anchored regexes for the policy's `require` rules.
+ *
+ * Strips existing anchors to avoid double-anchoring recovery policies
+ * (e.g. "^agent_report$" would otherwise become "^^agent_report$$").
+ * Shared by StreamManager's stop-when condition and the tool-search catalog
+ * classifier (required tools must never be deferred).
+ */
+export function buildRequiredToolPatterns(policy?: ToolPolicy): RegExp[] {
+  return (policy ?? [])
+    .filter((filter) => filter.action === "require")
+    .map((filter) => {
+      const rawPattern = filter.regex_match.replace(/^\^/, "").replace(/\$$/, "");
+      return new RegExp(`^${rawPattern}$`);
+    });
+}
+
+/**
  * Apply tool policy to filter available tools
  * @param tools All available tools
  * @param policy Optional policy to apply (default: allow all)
@@ -55,8 +72,18 @@ export function applyToolPolicy(
   policy?: ToolPolicy
 ): Record<string, Tool> {
   const enabledToolNames = new Set(applyToolPolicyToNames(Object.keys(tools), policy));
+  // new_context only makes sense when the agent can save its checkpoint (memory) and read the
+  // sealed window back (session_history): without either, a fresh window could not recover.
+  if (!enabledToolNames.has("session_history") || !enabledToolNames.has("memory")) {
+    enabledToolNames.delete("new_context");
+  }
 
   return Object.fromEntries(
     Object.entries(tools).filter(([toolName]) => enabledToolNames.has(toolName))
   );
+}
+
+/** Rollover must honor the same last-match regex policy as tool assembly. */
+export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
+  return applyToolPolicyToNames(["session_history"], policy).length === 0;
 }

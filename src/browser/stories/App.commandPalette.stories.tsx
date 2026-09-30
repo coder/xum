@@ -12,8 +12,8 @@
  * - ManyWorkspaces: 14 workspaces across 5 projects to stress-test scrolling/grouping
  */
 
-import { expect, userEvent, within } from "@storybook/test";
-import { CHROMATIC_SMOKE_MODES, appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -107,10 +107,12 @@ function setupStory(workspaces: FrontendWorkspaceMetadata[]) {
   return createMockORPCClient({ projects, workspaces });
 }
 
-/** Helper: wait for the app to render then open the command palette */
 async function openPalette(canvasElement: HTMLElement, waitForText: string) {
   const canvas = within(canvasElement);
-  await expect(canvas.findByText(waitForText, {}, { timeout: 5000 })).resolves.toBeTruthy();
+  // Workspace titles appear in both the sidebar and header.
+  await expect(canvas.findAllByText(waitForText, {}, { timeout: 5000 })).resolves.not.toHaveLength(
+    0
+  );
   await userEvent.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
 }
 
@@ -128,7 +130,7 @@ async function openPalette(canvasElement: HTMLElement, waitForText: string) {
  */
 export const WithTitles: AppStory = {
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   render: () => <AppWithMocks setup={() => setupStory(createRichWorkspaces())} />,
   play: async ({ canvasElement }) => {
@@ -276,5 +278,87 @@ export const ManyWorkspaces: AppStory = {
   ),
   play: async ({ canvasElement }) => {
     await openPalette(canvasElement, "Fix login button styling issue");
+  },
+};
+
+const REMOVE_REFUSAL =
+  "Workspace ws-myapp-fix-login is in use by another Xum process: a terminal in pid 4242; " +
+  "try again when it finishes (holder alive).";
+
+/**
+ * "Remove Current Workspace…" when the backend refuses (e.g. the cross-backend
+ * structural-mutation gate): the refusal must reach the user instead of only the log.
+ */
+export const RemoveCurrentWorkspaceRefused: AppStory = {
+  // Behavior contract only: the popover auto-dismisses, and the snapshot budget is full.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupStory(createRichWorkspaces());
+        client.workspace.remove = () => Promise.resolve({ success: false, error: REMOVE_REFUSAL });
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await openPalette(canvasElement, "Fix login button styling issue");
+    await userEvent.keyboard(">Remove Current Workspace");
+    const body = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await body.findByText("Remove Current Workspace…"));
+    const confirm = await body.findByRole("button", { name: "Remove" });
+    // The confirm dialog mounts while the closing palette dialog still holds
+    // `pointer-events: none` on the page; clicking before it lifts fails under load.
+    await waitFor(() => expect(getComputedStyle(confirm).pointerEvents).not.toBe("none"));
+    await userEvent.click(confirm);
+    const alert = await body.findByRole("alert", {}, { timeout: 5000 });
+    await expect(alert).toHaveTextContent("Failed to remove workspace");
+    await expect(alert).toHaveTextContent(REMOVE_REFUSAL);
+  },
+};
+
+/**
+ * #5106: "Remove Current Sub-agent…" on a sub-agent that holds unpreserved work (the kind a
+ * model's task_remove refuses). The confirmation lists what removal would permanently delete.
+ */
+export const RemoveCurrentSubagentConfirmation: AppStory = {
+  // Behavior contract only: the snapshot budget is full.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const subagent = createWorkspace({
+          id: "ws-myapp-subagent",
+          name: "agent_exec_auth",
+          projectName: "my-app",
+          title: "Refactor auth helpers",
+          parentWorkspaceId: "ws-myapp-fix-login",
+        });
+        const client = setupStory([subagent, ...createRichWorkspaces()]);
+        return Object.assign(client, {
+          tasks: {
+            ...client.tasks,
+            previewRemoval: () =>
+              Promise.resolve({
+                success: true as const,
+                data: {
+                  summary:
+                    "Removing this sub-agent would permanently delete the uncommitted or untracked files listed below and 2 commit(s) not captured by a ready patch artifact.",
+                  paths: ["src/auth/session.ts", "src/auth/tokenStore.test.ts", "notes/todo.md"],
+                },
+              }),
+          },
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await openPalette(canvasElement, "Refactor auth helpers");
+    await userEvent.keyboard(">Remove Current Sub-agent");
+    const body = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await body.findByText("Remove Current Sub-agent…"));
+    const files = await body.findByRole("region", { name: "Uncommitted or untracked files" });
+    await expect(files).toHaveTextContent("src/auth/session.ts");
+    await expect(body.findByRole("button", { name: /Remove sub-agent/ })).resolves.toBeTruthy();
   },
 };

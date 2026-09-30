@@ -5,12 +5,7 @@
 import { within, userEvent, waitFor, expect } from "@storybook/test";
 
 import { expandProjects } from "@/browser/stories/helpers/uiState";
-import {
-  CHROMATIC_SMOKE_MODES,
-  appMeta,
-  AppWithMocks,
-  type AppStory,
-} from "@/browser/stories/meta.js";
+import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { createArchivedWorkspace, NOW } from "@/browser/stories/mocks/workspaces";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -80,7 +75,7 @@ function projectWithNoWorkspaces(path: string): [string, ProjectConfig] {
  */
 export const CreateWorkspace: AppStory = {
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   render: () => (
     <AppWithMocks
@@ -102,13 +97,8 @@ export const CreateWorkspace: AppStory = {
 /** Creation view with multiple projects - shows sidebar with projects */
 export const CreateWorkspaceMultipleProjects: AppStory = {
   parameters: {
-    chromatic: {
-      modes: {
-        dark: { theme: "dark" },
-        light: { theme: "light" },
-        "dark-mobile": { theme: "dark", viewport: "mobile1", hasTouch: true },
-        "light-mobile": { theme: "light", viewport: "mobile1", hasTouch: true },
-      },
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["laptop", "phone"] },
     },
   },
   render: () => (
@@ -136,19 +126,14 @@ export const CreateWorkspaceMultipleProjects: AppStory = {
  * Creation view with sub-projects configured.
  * Sub-projects are shown in the sidebar rather than in a creation-time section selector.
  *
- * Includes mobile chromatic modes: the sidebar starts expanded via
+ * Includes mobile snapshot variants: the sidebar starts expanded via
  * localStorage so the play function can click the project row, then
  * collapses it so the creation form is the main visible content.
  */
 export const CreateWorkspaceWithSections: AppStory = {
   parameters: {
-    chromatic: {
-      modes: {
-        dark: { theme: "dark" },
-        light: { theme: "light" },
-        "dark-mobile": { theme: "dark", viewport: "mobile1", hasTouch: true },
-        "light-mobile": { theme: "light", viewport: "mobile1", hasTouch: true },
-      },
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["laptop", "phone"] },
     },
   },
   render: () => (
@@ -204,7 +189,7 @@ export const CreateWorkspaceWithSections: AppStory = {
 
       // On mobile, handleAddWorkspace auto-collapses the sidebar after the
       // project click. On desktop it stays open — collapse it so the creation
-      // form dominates the Chromatic screenshot.
+      // form dominates the snapshot.
       const sidebar = storyRoot.querySelector<HTMLElement>("[data-testid='left-sidebar']");
       const sidebarIsExpanded = sidebar && sidebar.getBoundingClientRect().width > 40;
       if (sidebarIsExpanded) {

@@ -4,12 +4,34 @@ import { openai } from "@ai-sdk/openai";
 import type { ModelMessage, Tool } from "ai";
 import { tool } from "ai";
 import { z } from "zod";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   supportsAnthropicCache,
   applyCacheControl,
+  getAnthropicCacheTtl,
   createCachedSystemMessage,
+  createOpenAICachedSystemMessage,
+  openaiExplicitPromptCachingAvailable,
   applyCacheControlToTools,
 } from "./cacheStrategy";
+import { markBuiltInTaskTool, isBuiltInTaskTool } from "@/node/services/tools/task";
+
+/** Direct-OpenAI providers config with API-key auth and no base URL override. */
+function openaiProvidersConfig(
+  overrides?: Partial<ProvidersConfigMap[string]>,
+  extraProviders?: ProvidersConfigMap
+): ProvidersConfigMap {
+  return {
+    openai: {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySource: "config",
+      ...overrides,
+    },
+    ...extraProviders,
+  };
+}
 
 describe("cacheStrategy", () => {
   describe("supportsAnthropicCache", () => {
@@ -29,6 +51,82 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("google:gemini-2.0")).toBe(false);
       expect(supportsAnthropicCache("openrouter:meta-llama/llama-3.1")).toBe(false);
       expect(supportsAnthropicCache("mux-gateway:openai/gpt-5.2")).toBe(false);
+    });
+
+    // Coder gateway instances: the wire comes from instance metadata, not the
+    // instance name. Custom-named Anthropic instances must get cache markers;
+    // cross-typed canonical names must not.
+    it("resolves Coder gateway instances through their metadata type", () => {
+      const config = {
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [
+            { name: "prod-anthropic", type: "anthropic" },
+            { name: "anthropic", type: "openai-compat" },
+          ],
+        },
+      };
+      expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("coder:anthropic/gpt-5", config)).toBe(false);
+      // Without metadata, the name === type default applies.
+      expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5")).toBe(true);
+      expect(supportsAnthropicCache("coder:unknown-instance/model", config)).toBe(false);
+    });
+
+    it("classifies custom providers by their API format", () => {
+      const config = {
+        zen: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "anthropic-messages" as const,
+        },
+        zap: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-responses" as const,
+        },
+        zim: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-compatible" as const,
+        },
+      };
+
+      expect(supportsAnthropicCache("zen:claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("zap:gpt-5", config)).toBe(false);
+      expect(supportsAnthropicCache("zim:claude-opus-4-5", config)).toBe(false);
+    });
+
+    // ZDR: disableBetaFeatures must reject cache eligibility itself — the
+    // provider fetch wrapper only skips injecting markers, it never strips
+    // ones these helpers already serialized.
+    it("rejects all Anthropic-wire routes when disableBetaFeatures is set", () => {
+      const config = {
+        anthropic: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          disableBetaFeatures: true,
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-anthropic", type: "anthropic" }],
+        },
+      };
+      expect(supportsAnthropicCache("anthropic:claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5", config)).toBe(false);
     });
   });
 
@@ -231,6 +329,206 @@ describe("cacheStrategy", () => {
     });
   });
 
+  describe("openaiExplicitPromptCachingAvailable", () => {
+    const config = openaiProvidersConfig();
+
+    it("accepts every GPT-5.6 tier on the direct official OpenAI route", () => {
+      for (const model of [
+        "openai:gpt-5.6",
+        "openai:gpt-5.6-sol",
+        "openai:gpt-5.6-terra",
+        "openai:gpt-5.6-luna",
+        "openai:gpt-5.6-sol-2026-07-09",
+      ]) {
+        expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(true);
+      }
+    });
+
+    it("accepts openai: aliases mapped to GPT-5.6 targets", () => {
+      const aliasConfig = openaiProvidersConfig({
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+      });
+      expect(openaiExplicitPromptCachingAvailable("openai:team-sol", "openai", aliasConfig)).toBe(
+        true
+      );
+    });
+
+    it("rejects aliases whose resolved target is not OpenAI GPT-5.6", () => {
+      const aliasConfig = openaiProvidersConfig({
+        models: [
+          { id: "team-old", mappedToModel: "openai:gpt-5.2" },
+          { id: "team-claude", mappedToModel: "anthropic:claude-opus-4-6" },
+          { id: "team-bare", mappedToModel: "gpt-5.6-sol" },
+        ],
+      });
+      for (const alias of ["openai:team-old", "openai:team-claude", "openai:team-bare"]) {
+        expect(openaiExplicitPromptCachingAvailable(alias, "openai", aliasConfig)).toBe(false);
+      }
+    });
+
+    it("rejects raw unprefixed and non-OpenAI-origin model strings", () => {
+      for (const model of [
+        "gpt-5.6-sol", // raw unprefixed: never infer a provider
+        "anthropic:claude-opus-4-6",
+        "openrouter:openai/gpt-5.6-sol",
+        "github-copilot:gpt-5.6-sol",
+      ]) {
+        expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
+      }
+    });
+
+    it("rejects older OpenAI models and near-miss ids", () => {
+      for (const model of ["openai:gpt-5.2", "openai:gpt-5.5", "openai:gpt-5.61"]) {
+        expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
+      }
+    });
+
+    it("rejects missing, unknown, and gateway routes", () => {
+      for (const route of [undefined, "unknown", "mux-gateway", "openrouter", "github-copilot"]) {
+        expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", route, config)).toBe(
+          false
+        );
+      }
+    });
+
+    it("rejects when Codex OAuth wins the auth path", () => {
+      // OAuth tokens without an API key: OAuth wins.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ apiKeySet: false, apiKeySource: undefined, codexOauthSet: true })
+        )
+      ).toBe(false);
+      // OAuth tokens + API key with default precedence: OAuth still wins.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true })
+        )
+      ).toBe(false);
+      // Explicit apiKey precedence restores API-key routing.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true, codexOauthDefaultAuth: "apiKey" })
+        )
+      ).toBe(true);
+    });
+
+    it("accepts a request-level Chat Completions wire format that falls back to the API key", () => {
+      // Stored config prefers OAuth and leaves wireFormat unset; the request selects
+      // Chat Completions, which Codex OAuth cannot serve, so the API key is used.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(true);
+      // The stored wire format wins over the request-level value.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true, wireFormat: "responses" }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(false);
+    });
+
+    it("rejects when the providers config view is unavailable", () => {
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", null)).toBe(
+        false
+      );
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", {})).toBe(false);
+    });
+
+    it("accepts official explicit and env-resolved base URLs", () => {
+      for (const overrides of [
+        { baseUrl: "https://api.openai.com/v1" },
+        { baseUrl: "https://api.openai.com/v1/" },
+        { baseUrl: "https://api.openai.com" },
+        { baseUrlResolved: "https://api.openai.com/v1" },
+      ]) {
+        expect(
+          openaiExplicitPromptCachingAvailable(
+            "openai:gpt-5.6-sol",
+            "openai",
+            openaiProvidersConfig(overrides)
+          )
+        ).toBe(true);
+      }
+    });
+
+    it("rejects custom, malformed, and non-HTTPS base URLs", () => {
+      for (const overrides of [
+        { baseUrl: "https://proxy.example.com/v1" },
+        { baseUrl: "http://api.openai.com/v1" },
+        { baseUrl: "https://api.openai.com:8443/v1" },
+        { baseUrl: "https://user:pass@api.openai.com/v1" },
+        { baseUrl: "https://api.openai.com/v1?beta=1" },
+        { baseUrl: "https://api.openai.com/v2" },
+        { baseUrl: "not a url" },
+        // Config-set baseUrl wins over an official env-resolved value.
+        { baseUrl: "https://proxy.example.com/v1", baseUrlResolved: "https://api.openai.com/v1" },
+        { baseUrlResolved: "http://localhost:11434/v1" },
+      ]) {
+        expect(
+          openaiExplicitPromptCachingAvailable(
+            "openai:gpt-5.6-sol",
+            "openai",
+            openaiProvidersConfig(overrides)
+          )
+        ).toBe(false);
+      }
+    });
+  });
+
+  describe("createOpenAICachedSystemMessage", () => {
+    const config = openaiProvidersConfig();
+
+    it("returns the exact typed system-message shape for eligible requests", () => {
+      const result = createOpenAICachedSystemMessage(
+        "You are a helpful assistant",
+        "openai:gpt-5.6-luna",
+        "openai",
+        config
+      );
+
+      expect(result).toEqual({
+        role: "system",
+        content: "You are a helpful assistant",
+        providerOptions: {
+          openai: {
+            promptCacheBreakpoint: { mode: "explicit" },
+          },
+        },
+      });
+    });
+
+    it("returns null for empty system content", () => {
+      expect(createOpenAICachedSystemMessage("", "openai:gpt-5.6-luna", "openai", config)).toBe(
+        null
+      );
+    });
+
+    it("returns null for ineligible models and routes", () => {
+      expect(
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.2", "openai", config)
+      ).toBeNull();
+      expect(
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", "mux-gateway", config)
+      ).toBeNull();
+      expect(
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", undefined, config)
+      ).toBeNull();
+    });
+  });
+
   describe("applyCacheControlToTools", () => {
     const mockTools: Record<string, Tool> = {
       readFile: tool({
@@ -385,5 +683,44 @@ describe("cacheStrategy", () => {
       });
       expect(result.readFile).toEqual(toolsWithDynamicTool.readFile);
     });
+
+    it("preserves the built-in task marker when recreating the last function tool", () => {
+      // Cache control recreates the last function tool via createTool(). Built-in explore-task
+      // parallelism depends on a symbol marker surviving that recreation; if it were dropped the
+      // task tool would silently fall back to serialized execution.
+      const taskTool = markBuiltInTaskTool(
+        tool({
+          description: "task",
+          inputSchema: z.object({ prompt: z.string() }),
+          execute: () => Promise.resolve("ok"),
+        })
+      );
+      const tools: Record<string, Tool> = {
+        readFile: mockTools.readFile,
+        task: taskTool,
+      };
+
+      const result = applyCacheControlToTools(tools, "anthropic:claude-3-5-sonnet");
+
+      expect(isBuiltInTaskTool(result.task)).toBe(true);
+      // A recreated tool is a different object; sanity-check the marker rode along on the copy.
+      expect(result.task).not.toBe(taskTool);
+    });
+  });
+});
+
+describe("getAnthropicCacheTtl", () => {
+  it("recovers a valid ttl from merged provider options", () => {
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "1h" } } })).toBe("1h");
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "5m" } } })).toBe("5m");
+  });
+
+  it("returns undefined for missing or malformed shapes", () => {
+    expect(getAnthropicCacheTtl(undefined)).toBeUndefined();
+    expect(getAnthropicCacheTtl({})).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: "1h" })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: "1h" } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "2h" } } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: 300 } } })).toBeUndefined();
   });
 });

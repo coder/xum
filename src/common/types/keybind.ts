@@ -27,6 +27,12 @@ export interface Keybind {
    * - "control": require the Control key specifically
    */
   macCtrlBehavior?: "either" | "command" | "control";
+  /**
+   * Marks a keybind as deprecated. Deprecated keybinds still function (kept for
+   * muscle memory / backwards-compat) but are hidden from generated keybind
+   * references (e.g. Settings → Keybinds) so they aren't advertised to users.
+   */
+  deprecated?: boolean;
 }
 
 export function hasModifierKeybind(keybind: Keybind): boolean {

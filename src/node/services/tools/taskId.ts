@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 
 const BASH_TASK_ID_PREFIX = "bash:";
+// Canonical workflow-run task ID prefix. WorkflowService.generateWorkflowRunId() builds run IDs
+// from this exact constant, so there is a single source of truth instead of duplicated literals.
+export const WORKFLOW_RUN_TASK_ID_PREFIX = "wfr_";
+
+/**
+ * Workflow run IDs are accepted by the task tools (task_await/task_list/task_stop)
+ * alongside agent-task and bash task IDs; the prefix is the discriminator.
+ *
+ * The predicate narrows to the template-literal type (not plain `string`) so negated uses on
+ * string inputs keep their type instead of collapsing to `never`.
+ */
+export function isWorkflowRunTaskId(value: unknown): value is `wfr_${string}` {
+  return typeof value === "string" && value.startsWith(WORKFLOW_RUN_TASK_ID_PREFIX);
+}
 
 export function toBashTaskId(processId: string): string {
   assert(typeof processId === "string", "toBashTaskId: processId must be a string");

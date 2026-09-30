@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
@@ -26,6 +26,10 @@ export interface SubagentReportArtifactIndexEntry {
   title?: string;
   /** Full ancestor chain (parent first). Used for descendant scope checks after cleanup. */
   ancestorWorkspaceIds: string[];
+  /** Ancestors for which this child is owned by a workflow step. */
+  workflowOwnedAncestorWorkspaceIds?: string[];
+  structuredOutput?: unknown;
+  planFilePath?: string;
   /** Estimated token count of delivered report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
 }
@@ -112,18 +116,41 @@ export async function readSubagentReportArtifactIndexEntry(
   return file.artifactsByChildTaskId[childTaskId] ?? null;
 }
 
+/**
+ * Strict read outcome: `absent` is POSITIVE evidence (the report body was never written — it is
+ * the first file publication writes), while `unreadable` covers I/O failures other than ENOENT and
+ * corrupt/incomplete bodies. Attempt disposition must never treat `unreadable` as "no report".
+ */
+export type SubagentReportArtifactReadResult =
+  | { kind: "found"; artifact: SubagentReportArtifact }
+  | { kind: "absent" }
+  | { kind: "unreadable"; error: string };
+
+/** Lenient reader: self-heals every non-found outcome to null (existing callers). */
 export async function readSubagentReportArtifact(
   workspaceSessionDir: string,
   childTaskId: string
 ): Promise<SubagentReportArtifact | null> {
+  const result = await readSubagentReportArtifactStrict(workspaceSessionDir, childTaskId);
+  return result.kind === "found" ? result.artifact : null;
+}
+
+export async function readSubagentReportArtifactStrict(
+  workspaceSessionDir: string,
+  childTaskId: string
+): Promise<SubagentReportArtifactReadResult> {
   const meta = await readSubagentReportArtifactIndexEntry(workspaceSessionDir, childTaskId);
+  const unreadable = (error: string): SubagentReportArtifactReadResult => ({
+    kind: "unreadable",
+    error,
+  });
 
   const reportPath = getSubagentReportArtifactPath(workspaceSessionDir, childTaskId);
   try {
     const raw = await fsPromises.readFile(reportPath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object") {
-      return null;
+      return unreadable("report body is not an object");
     }
 
     const obj = parsed as {
@@ -135,31 +162,48 @@ export async function readSubagentReportArtifact(
       thinkingLevel?: unknown;
       title?: unknown;
       ancestorWorkspaceIds?: unknown;
+      workflowOwnedAncestorWorkspaceIds?: unknown;
+      structuredOutput?: unknown;
+      planFilePath?: unknown;
       reportMarkdown?: unknown;
     };
 
     const reportMarkdown = typeof obj.reportMarkdown === "string" ? obj.reportMarkdown : null;
     if (!reportMarkdown || reportMarkdown.length === 0) {
-      return null;
+      return unreadable("report body has no reportMarkdown");
     }
 
     const title = typeof obj.title === "string" ? obj.title : undefined;
+
+    const planFilePath =
+      typeof obj.planFilePath === "string" && obj.planFilePath.trim().length > 0
+        ? obj.planFilePath.trim()
+        : undefined;
 
     const model =
       typeof obj.model === "string" && obj.model.trim().length > 0 ? obj.model.trim() : undefined;
     const thinkingLevel = coerceThinkingLevel(obj.thinkingLevel);
 
+    const workflowOwnedAncestorWorkspaceIds = isStringArray(obj.workflowOwnedAncestorWorkspaceIds)
+      ? obj.workflowOwnedAncestorWorkspaceIds
+      : undefined;
+
     if (meta) {
       // Trust the index file for metadata (versioned), but allow per-task file to override title.
       return {
-        ...meta,
-        model:
-          typeof meta.model === "string" && meta.model.trim().length > 0
-            ? meta.model.trim()
-            : undefined,
-        thinkingLevel: coerceThinkingLevel(meta.thinkingLevel),
-        title: title ?? meta.title,
-        reportMarkdown,
+        kind: "found",
+        artifact: {
+          ...meta,
+          model:
+            typeof meta.model === "string" && meta.model.trim().length > 0
+              ? meta.model.trim()
+              : undefined,
+          thinkingLevel: coerceThinkingLevel(meta.thinkingLevel),
+          title: title ?? meta.title,
+          structuredOutput: obj.structuredOutput,
+          planFilePath: planFilePath ?? meta.planFilePath,
+          reportMarkdown,
+        },
       };
     }
 
@@ -173,27 +217,33 @@ export async function readSubagentReportArtifact(
       : null;
 
     if (!parentWorkspaceId || !createdAtMs || !updatedAtMs || !ancestorWorkspaceIds) {
-      return null;
+      return unreadable("report body is missing index metadata and self-describing fields");
     }
 
     return {
-      childTaskId,
-      parentWorkspaceId,
-      createdAtMs,
-      updatedAtMs,
-      model,
-      thinkingLevel,
-      title,
-      ancestorWorkspaceIds,
-      reportMarkdown,
+      kind: "found",
+      artifact: {
+        childTaskId,
+        parentWorkspaceId,
+        createdAtMs,
+        updatedAtMs,
+        model,
+        thinkingLevel,
+        title,
+        ancestorWorkspaceIds,
+        workflowOwnedAncestorWorkspaceIds,
+        structuredOutput: obj.structuredOutput,
+        planFilePath,
+        reportMarkdown,
+      },
     };
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return null;
+      return { kind: "absent" };
     }
 
     log.error("Failed to read subagent report artifact", { childTaskId, error });
-    return null;
+    return unreadable(error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -230,6 +280,9 @@ export async function upsertSubagentReportArtifact(params: {
   model?: string;
   /** Task-level thinking/reasoning level used when running the sub-agent (optional for legacy entries). */
   thinkingLevel?: ThinkingLevel;
+  workflowOwnedAncestorWorkspaceIds?: string[];
+  planFilePath?: string;
+  structuredOutput?: unknown;
   title?: string;
   nowMs?: number;
 }): Promise<SubagentReportArtifactIndexEntry> {
@@ -243,6 +296,11 @@ export async function upsertSubagentReportArtifact(params: {
         ? params.model.trim()
         : undefined;
     const thinkingLevel = coerceThinkingLevel(params.thinkingLevel);
+
+    const planFilePath =
+      typeof params.planFilePath === "string" && params.planFilePath.trim().length > 0
+        ? params.planFilePath.trim()
+        : undefined;
 
     const file = await readSubagentReportArtifactsFile(params.workspaceSessionDir);
     const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
@@ -267,6 +325,9 @@ export async function upsertSubagentReportArtifact(params: {
             thinkingLevel,
             title: params.title,
             ancestorWorkspaceIds: params.ancestorWorkspaceIds,
+            workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
+            planFilePath,
+            structuredOutput: params.structuredOutput,
             reportMarkdown: params.reportMarkdown,
           },
           null,
@@ -290,6 +351,9 @@ export async function upsertSubagentReportArtifact(params: {
       model,
       thinkingLevel,
       title: params.title,
+      workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
+      planFilePath,
+      structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
     };
     updated.reportTokenEstimate = Math.ceil(

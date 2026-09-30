@@ -1,19 +1,13 @@
 import type { WorkspaceConsumersState } from "./WorkspaceStore";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { ChatStats } from "@/common/types/chatStats";
-import type { MuxMessage } from "@/common/types/message";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 
 const TOKENIZER_CANCELLED_MESSAGE = "Cancelled by newer request";
 
 let globalTokenStatsRequestId = 0;
 const latestRequestByWorkspace = new Map<string, number>();
 
-async function calculateTokenStatsLatest(
-  workspaceId: string,
-  messages: MuxMessage[],
-  model: string
-): Promise<ChatStats> {
+async function calculateTokenStatsLatest(workspaceId: string, model: string): Promise<ChatStats> {
   const orpcClient = window.__ORPC_CLIENT__;
   if (!orpcClient) {
     throw new Error("ORPC client not initialized");
@@ -23,11 +17,10 @@ async function calculateTokenStatsLatest(
   latestRequestByWorkspace.set(workspaceId, requestId);
 
   try {
-    const stats = await orpcClient.tokenizer.calculateStats({
-      workspaceId,
-      messages,
-      model,
-    });
+    // Only identifiers cross the wire. The backend owns the same history (chat.jsonl +
+    // partial.json) and slices it to the active context itself; uploading the renderer's copy
+    // on every tool-call-end during a stream was ~36 KB/s of redundant WebSocket traffic.
+    const stats = await orpcClient.tokenizer.calculateStats({ workspaceId, model });
     const latestRequestId = latestRequestByWorkspace.get(workspaceId);
     if (latestRequestId !== requestId) {
       throw new Error(TOKENIZER_CANCELLED_MESSAGE);
@@ -41,8 +34,8 @@ async function calculateTokenStatsLatest(
   }
 }
 
-// Timeout for Web Worker calculations (60 seconds - generous but responsive)
-const CALCULATION_TIMEOUT_MS = 60_000;
+// Log a warning when a calculation runs longer than this. It is not a timeout (#4815).
+const SLOW_CALCULATION_WARNING_MS = 60_000;
 
 /**
  * Manages consumer token calculations for workspaces.
@@ -69,8 +62,10 @@ export class WorkspaceConsumerManager {
   // Track scheduled calculations (in debounce window, not yet executing)
   private scheduledCalcs = new Set<string>();
 
-  // Track executing calculations (Web Worker running)
-  private pendingCalcs = new Set<string>();
+  // Track executing calculations (Web Worker running). The value identifies the owning run:
+  // a slow request can outlive removeWorkspace()/dispose(), and a newer run for the same
+  // workspace id must not have its cache entry or pending flag clobbered by the old one.
+  private pendingCalcs = new Map<string, object>();
 
   // Track workspaces that need recalculation after current one completes
   private needsRecalc = new Map<string, StreamingMessageAggregator>();
@@ -201,19 +196,17 @@ export class WorkspaceConsumerManager {
       return;
     }
 
-    this.pendingCalcs.add(workspaceId);
+    const runToken = {};
+    this.pendingCalcs.set(workspaceId, runToken);
+    // False once removeWorkspace()/dispose() dropped this run or a newer run replaced it.
+    const isCurrentRun = () => this.pendingCalcs.get(workspaceId) === runToken;
 
     // Mark as calculating and notify store
     this.notifyStoreAsync(workspaceId);
 
     // Run in next tick to avoid blocking caller
-    void (async () => {
+    (async () => {
       try {
-        // Only count tokens for the current active context; pre-boundary
-        // transcript rows carry stale context and inflate the consumer breakdown.
-        const messages = sliceMessagesForProviderFromLatestContextBoundary(
-          aggregator.getAllMessages()
-        );
         const model = aggregator.getCurrentModel() ?? "unknown";
 
         const providersConfigFingerprint = this.getProvidersConfigVersion();
@@ -238,21 +231,23 @@ export class WorkspaceConsumerManager {
           return;
         }
 
-        // Calculate in piscina pool with timeout protection.
-        // Store the timer ID so we can clear it on early exit to prevent
-        // unhandled promise rejections from orphaned timeout callbacks.
-        let timeoutId: ReturnType<typeof setTimeout> | undefined;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(
-            () => reject(new Error("Calculation timeout")),
-            CALCULATION_TIMEOUT_MS
+        // Never abandon a slow request: backend calculations do not join and only the newest
+        // one persists, so giving up would leave the Stats tab empty while the result lands on
+        // disk unseen (#4815). A retry would supersede the running request, so only warn.
+        const slowWarningTimer = setTimeout(() => {
+          console.warn(
+            `[WorkspaceConsumerManager] Calculation for ${workspaceId} is still running after ${SLOW_CALCULATION_WARNING_MS}ms; still waiting for it.`
           );
-        });
+        }, SLOW_CALCULATION_WARNING_MS);
 
-        const fullStats = await Promise.race([
-          calculateTokenStatsLatest(workspaceId, messages, model),
-          timeoutPromise,
-        ]).finally(() => clearTimeout(timeoutId));
+        const fullStats = await calculateTokenStatsLatest(workspaceId, model).finally(() =>
+          clearTimeout(slowWarningTimer)
+        );
+
+        // The workspace was removed or disposed (and possibly recalculated) meanwhile.
+        if (!isCurrentRun()) {
+          return;
+        }
 
         // Provider mappings may change while tokenization is in flight.
         // Drop outdated results instead of repopulating cache with stale tokenizer metadata.
@@ -279,8 +274,11 @@ export class WorkspaceConsumerManager {
           return;
         }
 
-        // Real errors (including timeout): log and cache empty result
+        // Real errors: log and cache empty result so the spinner does not stay stuck
         console.error(`[WorkspaceConsumerManager] Calculation failed for ${workspaceId}:`, error);
+        if (!isCurrentRun()) {
+          return;
+        }
         this.cache.set(workspaceId, {
           consumers: [],
           tokenizerName: "",
@@ -289,16 +287,21 @@ export class WorkspaceConsumerManager {
         });
         this.notifyStoreAsync(workspaceId);
       } finally {
-        this.pendingCalcs.delete(workspaceId);
+        // A stale run must not clear a newer run's pending flag or steal its recalc request.
+        if (isCurrentRun()) {
+          this.pendingCalcs.delete(workspaceId);
 
-        // If recalculation was requested while we were running, schedule it now
-        const needsRecalcAggregator = this.needsRecalc.get(workspaceId);
-        if (needsRecalcAggregator) {
-          this.needsRecalc.delete(workspaceId);
-          this.scheduleCalculation(workspaceId, needsRecalcAggregator);
+          // If recalculation was requested while we were running, schedule it now
+          const needsRecalcAggregator = this.needsRecalc.get(workspaceId);
+          if (needsRecalcAggregator) {
+            this.needsRecalc.delete(workspaceId);
+            this.scheduleCalculation(workspaceId, needsRecalcAggregator);
+          }
         }
       }
-    })();
+    })().catch((error: unknown) => {
+      console.error(`[WorkspaceConsumerManager] Calculation crashed for ${workspaceId}:`, error);
+    });
   }
 
   private notifyStoreAsync(workspaceId: string): void {

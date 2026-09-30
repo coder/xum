@@ -1,7 +1,12 @@
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
+import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -10,11 +15,13 @@ import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { MCPSettingsSection } from "./MCPSettingsSection";
 
 const MOCK_TOOLS = [
@@ -148,9 +155,6 @@ const meta: Meta<typeof MCPSettingsSection> = {
   component: MCPSettingsSection,
   parameters: {
     layout: "fullscreen",
-    chromatic: {
-      delay: 500,
-    },
   },
 };
 
@@ -172,7 +176,90 @@ export const ProjectSettingsEmpty: Story = {
   },
 };
 
+const PLUGIN_SERVER_KEY = "plugin:0123456789abcdef:echo";
+const setPluginEnabled = fn<APIClient["mcp"]["setEnabled"]>();
+
+export const AgentPluginServer: Story = {
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => {
+        const client = setupMCPSettingsSectionStory({
+          servers: {
+            [PLUGIN_SERVER_KEY]: {
+              transport: "stdio",
+              command: "bun echo-mcp.ts",
+              disabled: true,
+              plugin: {
+                pluginName: "hello-plugin",
+                serverName: "echo",
+                sourceScope: "global",
+                sourceLocation: ".xum/plugins/hello-plugin",
+              },
+            },
+          },
+        });
+        setPluginEnabled.mockReset().mockImplementation(client.mcp.setEnabled);
+        client.mcp.setEnabled = setPluginEnabled;
+        return client;
+      }}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    await expect(toggle).toBeEnabled();
+    await expect(toggle).not.toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    await expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenLastCalledWith({
+      name: PLUGIN_SERVER_KEY,
+      enabled: false,
+    });
+    await expect(toggle).not.toBeChecked();
+  },
+};
+
+export const AgentPluginServerEnableError: Story = {
+  ...AgentPluginServer,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    const error = "Unable to save global MCP settings";
+    let failToggle: () => void = () => {
+      throw new Error("The toggle request has not started");
+    };
+    setPluginEnabled.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          failToggle = () => resolve({ success: false, error });
+        })
+    );
+
+    await expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    // Hold the backend response to prove both the optimistic state and its rollback.
+    await expect(toggle).toBeChecked();
+    failToggle();
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    await expect(canvas.findByText(error)).resolves.toBeVisible();
+  },
+};
+
 export const ProjectSettingsAddRemoteServerHeaders: Story = {
+  parameters: {
+    pixel: {
+      // Chromium alternates the rounded form border's corner antialiasing by one shade. The full
+      // interaction sequence remains covered by Storybook tests.
+      exclude: true,
+    },
+  },
   render: () => (
     <MCPSettingsSectionStoryShell
       setup={() =>
@@ -338,6 +425,46 @@ export const ProjectSettingsWithToolAllowlist: Story = {
   },
 };
 
+// #4300: small help text must meet WCAG AA (4.5:1) in both themes, and the
+// Tools disclosure must show a focus ring on keyboard focus (global CSS
+// removes the browser's default outline).
+const helpTextAccessibilityPlay: Story["play"] = async ({ canvasElement }) => {
+  const canvas = within(canvasElement);
+  const disclosure = await canvas.findByRole("button", { name: /Tools: 3\/8/ });
+  const helpTexts = [
+    await canvas.findByText(/Configure global MCP servers/),
+    within(disclosure).getByText(/Tools: 3\/8/),
+    within(disclosure).getByText(/^\(.+\)$/),
+  ];
+  for (const helpText of helpTexts) {
+    await expect(textContrast(helpText)).toBeGreaterThanOrEqual(4.5);
+  }
+
+  disclosure.focus();
+  // Precondition: the runner reports script focus as keyboard-visible focus.
+  await expect(disclosure.matches(":focus-visible")).toBe(true);
+  const shadow = getComputedStyle(disclosure).boxShadow;
+  await expect(shadow.replaceAll("rgba(0, 0, 0, 0)", "")).toMatch(/rgb|oklch|oklab|color\(/);
+};
+
+export const HelpTextAccessibilityLight: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "light" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
+};
+
+export const HelpTextAccessibilityDark: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "dark" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
+};
+
 export const ProjectSettingsOAuthNotLoggedIn: Story = {
   decorators: withDesktopWindowApi,
   render: () => (
@@ -420,5 +547,201 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
     await userEvent.click(moreActionsButton);
     await body.findByRole("button", { name: /Re-login/i });
     await body.findByRole("button", { name: /^Logout$/i });
+  },
+};
+
+function setupDesignStory(
+  enabled = true,
+  reuseEnabled = false,
+  sibling?: { disconnect: () => void }
+): APIClient {
+  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  let revision = 0;
+  updates.push({ enabled, revision });
+  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
+  const client = setupMCPSettingsSectionStory({
+    servers: enabled
+      ? {
+          claude_design: {
+            transport: "http",
+            url: CLAUDE_DESIGN_URL,
+            managed: "claude-design",
+            disabled: true,
+          },
+        }
+      : {},
+  });
+  let status: ClaudeDesignStatus = {
+    state: reuseEnabled ? "connected" : "disabled",
+    backendHost: "remote-backend.example.test",
+    platform: "linux",
+    settings: {
+      source: { type: "file", path: "/home/example/.claude/.credentials.json" },
+      reuseEnabled,
+      serverEnabled: sibling !== undefined,
+    },
+  };
+  client.experiments = {
+    onDesignChange: (_input, { signal } = {}) => {
+      signal?.addEventListener("abort", updates.end, { once: true });
+      return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+    },
+    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
+    setOverride: () => Promise.resolve(),
+  };
+  client.mcp.designStatus = () => Promise.resolve(status);
+  client.mcp.configureDesign = (settings) => {
+    status = {
+      ...status,
+      settings: { ...status.settings, ...settings },
+      state: settings.reuseEnabled ? "not_configured" : "disabled",
+    };
+    updates.push({ enabled, revision: ++revision });
+    return Promise.resolve(status);
+  };
+  if (sibling) {
+    client.mcp.list = () =>
+      Promise.resolve({
+        claude_design: {
+          transport: "http",
+          url: CLAUDE_DESIGN_URL,
+          managed: "claude-design",
+          disabled: !status.settings.serverEnabled,
+        },
+      });
+    sibling.disconnect = () => {
+      status = {
+        ...status,
+        state: "disabled",
+        settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
+      };
+      updates.push({ enabled, revision: ++revision });
+    };
+  }
+  client.mcp.test = () => {
+    status = { ...status, state: "consent_required" };
+    return Promise.resolve({ success: false, error: "Claude Design: consent_required" });
+  };
+  return client;
+}
+
+export const ClaudeDesignOptIn: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const connect = await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Login" })).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Edit server" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await userEvent.click(connect);
+    await canvas.findByText(/Design requires consent/);
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPhone: Story = {
+  ...ClaudeDesignOptIn,
+  tags: ["claude-design"],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  // The test-runner ignores viewport globals; the wrapper enforces the contract there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async (context) => {
+    await ClaudeDesignOptIn.play?.(context);
+    const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
+    await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
+    await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+export const ClaudeDesignDisabled: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(false)}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("No MCP servers configured yet.");
+    await expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull();
+  },
+};
+
+export const ClaudeDesignConflictDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict remoteDisabled={false} onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    await userEvent.click(disconnect);
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPolicyDisconnect: Story = {
+  ...ClaudeDesignConflictDisconnect,
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict={false} remoteDisabled onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    disconnect.focus();
+    await userEvent.keyboard("{Control>}{Shift>}d{/Shift}{/Control}");
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignSiblingDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => {
+    const sibling: { disconnect: () => void } = { disconnect: () => undefined };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true, sibling)}>
+        <button onClick={() => sibling.disconnect()}>Disconnect in sibling window</button>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Retry connection" });
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect in sibling window" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Retry connection" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).not.toBeChecked();
   },
 };

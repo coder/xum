@@ -1,20 +1,22 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
-import type { APIClient } from "@/browser/contexts/API";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { DEFAULT_MODEL_KEY } from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { migrateLocalModelPrefsToBackend } from "./WorkspaceContext";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function createApiMock() {
   const updateModelPreferences = mock(() => Promise.resolve(undefined));
 
   return {
-    api: {
+    api: createTestApiClient({
       config: {
         updateModelPreferences,
       },
-    } as unknown as APIClient,
+    }),
     updateModelPreferences,
   };
 }
@@ -36,6 +38,7 @@ function getNonDefaultModel(): string {
 
 describe("migrateLocalModelPrefsToBackend", () => {
   beforeEach(() => {
+    saveDomGlobals();
     const happyWindow = new GlobalWindow();
     globalThis.window = happyWindow as unknown as Window & typeof globalThis;
     globalThis.document = happyWindow.document as unknown as Document;
@@ -45,9 +48,7 @@ describe("migrateLocalModelPrefsToBackend", () => {
 
   afterEach(() => {
     globalThis.window.localStorage.clear();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("migrates an explicit local default when it matches the built-in default", () => {
@@ -110,4 +111,43 @@ describe("migrateLocalModelPrefsToBackend", () => {
       defaultModel: "openrouter:openai/gpt-5",
     });
   });
+
+  test("merges legacy hides with seeded defaults before hydration", () => {
+    const legacyHidden = "openrouter:openai/gpt-5";
+    const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+    updatePersistedState(HIDDEN_MODELS_KEY, [legacyHidden]);
+    const { api, updateModelPreferences } = createApiMock();
+
+    const prefs = migrateLocalModelPrefsToBackend(api, {
+      hiddenModels: seeded,
+      hiddenModelsInitialized: false,
+    });
+    expect(prefs.hiddenModels).toEqual([...seeded, legacyHidden]);
+    expect(updateModelPreferences).toHaveBeenCalledWith({ hiddenModels: prefs.hiddenModels });
+  });
+
+  test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:gpt-5"] }])(
+    "restores local hides when migrated backend data is lost: %j",
+    ({ hiddenModels }) => {
+      updatePersistedState(HIDDEN_MODELS_KEY, hiddenModels);
+      const { api, updateModelPreferences } = createApiMock();
+      const prefs = migrateLocalModelPrefsToBackend(api, { hiddenModelsInitialized: false });
+      expect(prefs.hiddenModels).toEqual([...hiddenModels]);
+      expect(updateModelPreferences).toHaveBeenCalledWith({ hiddenModels });
+    }
+  );
+
+  test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:daybreak-red-latest"] }])(
+    "keeps initialized backend choices authoritative over stale local hides: %j",
+    ({ hiddenModels }) => {
+      updatePersistedState(HIDDEN_MODELS_KEY, ["openai:daybreak-blue-latest"]);
+      const { api, updateModelPreferences } = createApiMock();
+      const prefs = migrateLocalModelPrefsToBackend(api, {
+        hiddenModels: [...hiddenModels],
+        hiddenModelsInitialized: true,
+      });
+      expect(prefs.hiddenModels).toEqual([...hiddenModels]);
+      expect(updateModelPreferences).not.toHaveBeenCalled();
+    }
+  );
 });

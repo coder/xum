@@ -7,13 +7,20 @@ import type {
 } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { APIClient } from "@/browser/contexts/API";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
-import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import {
+  createMockORPCClient,
+  type MockORPCClientOptions,
+  type MockSessionUsage,
+} from "@/browser/stories/mocks/orpc";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -31,7 +38,9 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
     }
     // Default: emit caught-up immediately. Modern backends include hasOlderHistory
     // on full replays; default to false in stories to avoid phantom pagination UI.
-    queueMicrotask(() => emit({ type: "caught-up", hasOlderHistory: false }));
+    queueMicrotask(() =>
+      emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false })
+    );
     return undefined;
   };
 }
@@ -39,22 +48,18 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
 // SIMPLE CHAT STORY SETUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export interface BackgroundProcessFixture {
-  id: string;
-  pid: number;
-  script: string;
-  displayName?: string;
-  startTime: number;
-  status: "running" | "exited" | "killed" | "failed";
-  exitCode?: number;
-}
+export type BackgroundProcessFixture = BackgroundProcessInfo;
 
 export interface SimpleChatSetupOptions {
+  /** Session icon registry for mcp.icon (iconRef -> PNG data URL). */
+  mcpIcons?: Map<string, string>;
   workspaceId?: string;
   workspaceName?: string;
   projectName?: string;
   projectPath?: string;
   messages: ChatMuxMessage[];
+  /** Additional child workspaces that should appear alongside the selected chat workspace. */
+  additionalWorkspaces?: FrontendWorkspaceMetadata[];
   gitStatus?: GitStatusFixture;
   /** Git diff output for Review tab */
   gitDiff?: GitDiffFixture;
@@ -77,12 +82,6 @@ export interface SimpleChatSetupOptions {
   routePriority?: string[];
   /** Per-model route overrides for routing-aware stories */
   routeOverrides?: Record<string, string>;
-  /** Override signing capabilities (for testing warning states) */
-  signingCapabilities?: {
-    publicKey: string | null;
-    githubUser: string | null;
-    error: { message: string; hasEncryptedKey: boolean } | null;
-  };
   /** Custom executeBash mock (for file viewer stories) */
   executeBash?: (
     workspaceId: string,
@@ -101,6 +100,14 @@ export interface SimpleChatSetupOptions {
   }>;
   /** Mock clearLogs result */
   clearLogsResult?: { success: boolean; error?: string | null };
+  /** Full-width transcript preference returned by the mock config API. */
+  chatTranscriptFullWidth?: boolean;
+  /** Timeline events served by the mock workspace.timeline endpoints. */
+  timelineEvents?: TimelineEvent[];
+  /** Admin policy served by policy.get (defaults to no policy). */
+  policyResponse?: MockORPCClientOptions["policyResponse"];
+  /** Render the chat workspace as transcript-only (worktree gone; no composer). */
+  transcriptOnly?: boolean;
 }
 
 /**
@@ -117,7 +124,9 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       name: opts.workspaceName ?? "feature",
       projectName,
       projectPath,
+      transcriptOnly: opts.transcriptOnly,
     }),
+    ...(opts.additionalWorkspaces ?? []),
   ];
 
   const chatHandlers = new Map([[workspaceId, createStaticChatHandler(opts.messages)]]);
@@ -186,11 +195,14 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     sessionUsage: sessionUsageMap,
     subagentTranscripts: opts.subagentTranscripts,
     idleCompactionHours,
-    signingCapabilities: opts.signingCapabilities,
     agentSkills: opts.agentSkills,
     invalidAgentSkills: opts.invalidAgentSkills,
     logEntries: opts.logEntries,
     clearLogsResult: opts.clearLogsResult,
+    chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
+    timelineEvents: opts.timelineEvents,
+    mcpIcons: opts.mcpIcons,
+    policyResponse: opts.policyResponse,
   });
 }
 

@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import type {
   SubagentGitPatchArtifact,
@@ -58,6 +58,25 @@ export function matchesProjectArtifactProjectPathForUpdate(
   projectPath: string
 ): boolean {
   return artifact.projectPath === projectPath || isLegacySingleProjectArtifact(artifact);
+}
+
+export function isSafeSubagentGitPatchPathComponent(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value === value.trim() &&
+    value !== "." &&
+    value !== ".." &&
+    !path.isAbsolute(value) &&
+    !value.includes(path.sep) &&
+    !value.includes(path.posix.sep) &&
+    !value.includes("\\")
+  );
+}
+
+function assertSafeSubagentGitPatchPathComponent(value: string, label: string): void {
+  if (!isSafeSubagentGitPatchPathComponent(value)) {
+    throw new Error(`${label} must be a safe path component`);
+  }
 }
 
 function createEmptyArtifactsFile(): SubagentGitPatchArtifactsFile {
@@ -139,11 +158,15 @@ function summarizeProjectArtifacts(
 function normalizeProjectArtifacts(
   projectArtifacts: SubagentGitProjectPatchArtifact[]
 ): SubagentGitProjectPatchArtifact[] {
-  const normalizedProjectArtifacts = projectArtifacts.map((artifact) => ({
-    ...artifact,
-    projectName: artifact.projectName.trim(),
-    storageKey: (artifact.storageKey || artifact.projectName).trim(),
-  }));
+  const normalizedProjectArtifacts = projectArtifacts.map((artifact) => {
+    const storageKey = (artifact.storageKey || artifact.projectName).trim();
+    assertSafeSubagentGitPatchPathComponent(storageKey, "storageKey");
+    return {
+      ...artifact,
+      projectName: artifact.projectName.trim(),
+      storageKey,
+    };
+  });
 
   const storageKeys = normalizedProjectArtifacts.map((artifact) => artifact.storageKey);
   if (new Set(storageKeys).size !== storageKeys.length) {
@@ -186,6 +209,7 @@ function normalizeLegacyArtifact(
 export function normalizeSubagentGitPatchArtifact(
   artifact: SubagentGitPatchArtifact
 ): SubagentGitPatchArtifact {
+  assertSafeSubagentGitPatchPathComponent(artifact.childTaskId, "childTaskId");
   const normalizedProjectArtifacts = normalizeProjectArtifacts(artifact.projectArtifacts);
   const summary = summarizeProjectArtifacts(normalizedProjectArtifacts);
 

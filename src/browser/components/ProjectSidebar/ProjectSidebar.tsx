@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { cn } from "@/common/lib/utils";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import MuxLogoDark from "@/browser/assets/logos/mux-logo-dark.svg?react";
-import MuxLogoLight from "@/browser/assets/logos/mux-logo-light.svg?react";
+import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
@@ -16,11 +16,16 @@ import { useWorkspaceStoreRaw, type WorkspaceStore } from "@/browser/stores/Work
 import {
   EXPANDED_PROJECTS_KEY,
   MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY,
+  SIDEBAR_AGE_GROUPING_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
+  EXPANDED_SECTIONS_KEY,
+  EXPANDED_COMPLETED_SUB_AGENTS_KEY,
+  EXPANDED_TASK_GROUPS_KEY,
 } from "@/common/constants/storage";
 import { getDisplayTitleFromPersistedState } from "@/browser/hooks/useWorkspaceName";
 import { DndProvider } from "react-dnd";
@@ -31,6 +36,8 @@ import {
   reorderProjects,
   normalizeOrder,
 } from "@/common/utils/projectOrdering";
+import { PROJECT_ORDER_KEY, SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   matchesKeybind,
   formatKeybind,
@@ -46,33 +53,59 @@ import {
 import { PlatformPaths } from "@/common/utils/paths";
 import {
   partitionWorkspacesByAge,
+  buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
   computeWorkspaceDepthMap,
+  computeDelegatedActivityByWorkspaceId,
+  computeSubAgentsSummaryByWorkspaceId,
+  excludeSubAgentRows,
   filterVisibleAgentRows,
+  type WorkspaceSubAgentsSummary,
   computeAgentRowRenderMeta,
   findNextNonEmptyTier,
   getTierKey,
   getSectionExpandedKey,
   getSectionTierKey,
+  orderMultiProjectSectionRows,
   resolveEffectiveSectionId,
+  isSidebarSubAgentRunning,
+  isWorkspaceSidebarStateWorking,
+  computeRowMetaForVisibleNodes,
   type AgentRowRenderMeta,
+  type SidebarVisibleRowNode,
 } from "@/browser/utils/ui/workspaceFiltering";
+import {
+  computePinnedDropOrder,
+  computePinnedMoveOrderForWorkspace,
+  locatePinnedBlock,
+  type PinnedDropEdge,
+  type PinnedMoveDirection,
+} from "@/browser/utils/ui/pinnedReorder";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { normalizeTaskSettings } from "@/common/types/tasks";
 
 import { AgentListItem, type WorkspaceSelection } from "../AgentListItem/AgentListItem";
-import { getTaskGroupMemberDepth } from "../sidebarItemLayout";
+import { SubAgentListItem } from "../AgentListItem/SubAgentListItem";
+import {
+  getAncestorRailX,
+  getSubAgentChildStatusCenterX,
+  getSubAgentParentRailX,
+  getTaskGroupMemberDepth,
+} from "../sidebarItemLayout";
 import { TaskGroupListItem } from "./TaskGroupListItem";
+import {
+  collectActiveWorkflowGroupKeys,
+  computeSidebarTaskGroups,
+  computeTaskGroupMemberRowMeta,
+  type SidebarTaskGroupModel,
+} from "./sidebarTaskGroups";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -90,12 +123,14 @@ import {
   KeyRound,
   Palette,
   Pencil,
+  ScrollText,
   Trash,
   Plus,
 } from "lucide-react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
@@ -106,10 +141,13 @@ import { ScrollArea } from "../ScrollArea/ScrollArea";
 import { getProjectDisplayName, getSubProjectsForParent } from "@/common/utils/subProjects";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
-import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
-import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
-import { getTaskGroupKindFromMetadata } from "@/common/utils/tools/taskGroups";
-import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import { getDraftStore, useDraft } from "@/browser/stores/DraftStore";
+import {
+  MULTI_PROJECT_CONFIG_KEY,
+  MULTI_PROJECT_SIDEBAR_SECTION_ID,
+} from "@/common/constants/multiProject";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HexColorPicker } from "react-colorful";
@@ -120,6 +158,32 @@ interface SectionConfig {
   name: string;
   color?: string;
 }
+
+/**
+ * Pinned rows drag-reorder only within their visual block. Regular rows group
+ * by project + section (NUL separator: cannot appear in paths); multi-project
+ * rows share one flat section, so they get a single sentinel group regardless
+ * of each row's primary projectPath.
+ */
+function getPinnedReorderGroup(projectPath: string, sectionId: string | undefined): string {
+  return `${projectPath}\u0000${sectionId ?? ""}`;
+}
+const SCRATCH_PINNED_REORDER_GROUP = "\u0000scratch";
+const MULTI_PROJECT_PINNED_REORDER_GROUP = "\u0000multi-project";
+const FLAT_PINNED_REORDER_GROUP = "\u0000flat";
+
+// Stable reference so hide-mode rows without descendants don't get a fresh
+// object per render.
+const EMPTY_HIDDEN_SUBAGENTS_SUMMARY: WorkspaceSubAgentsSummary = {
+  subAgentCount: 0,
+  runningSubAgentCount: 0,
+  queuedSubAgentCount: 0,
+  runningWorkflowRunCount: 0,
+  queuedWorkflowRunCount: 0,
+  runningWorkflowAgentCount: 0,
+  queuedWorkflowAgentCount: 0,
+  workflowRunIds: new Set<string>(),
+};
 
 // Re-export WorkspaceSelection for backwards compatibility
 export type { WorkspaceSelection } from "../AgentListItem/AgentListItem";
@@ -138,8 +202,10 @@ export type { WorkspaceSelection } from "../AgentListItem/AgentListItem";
  */
 interface WorkspaceAttentionSignal {
   isWorking: boolean;
+  hasActiveBashMonitor: boolean;
   awaitingUserQuestion: boolean;
   hasSystemError: boolean;
+  activeWorkflowRunIdsKey: string;
 }
 
 function getWorkspaceAttentionSignal(
@@ -148,11 +214,11 @@ function getWorkspaceAttentionSignal(
 ): WorkspaceAttentionSignal | null {
   try {
     const sidebarState = workspaceStore.getWorkspaceSidebarState(workspaceId);
-    const isWorking =
-      (sidebarState.canInterrupt || sidebarState.isStarting) && !sidebarState.awaitingUserQuestion;
     return {
-      isWorking,
+      isWorking: isWorkspaceSidebarStateWorking(sidebarState),
+      hasActiveBashMonitor: sidebarState.activeBashMonitorCount > 0,
       awaitingUserQuestion: sidebarState.awaitingUserQuestion,
+      activeWorkflowRunIdsKey: (sidebarState.activeWorkflowRunIds ?? []).join("\u0000"),
       hasSystemError: sidebarState.lastAbortReason?.reason === "system",
     };
   } catch {
@@ -169,7 +235,9 @@ function didWorkspaceAttentionSignalChange(
     return true;
   }
   return (
+    prev.activeWorkflowRunIdsKey !== next.activeWorkflowRunIdsKey ||
     prev.isWorking !== next.isWorking ||
+    prev.hasActiveBashMonitor !== next.hasActiveBashMonitor ||
     prev.awaitingUserQuestion !== next.awaitingUserQuestion ||
     prev.hasSystemError !== next.hasSystemError
   );
@@ -369,8 +437,35 @@ interface DraftAgentListItemWrapperProps {
   isSelected: boolean;
   sectionId?: string;
   onVisibilityChange?: (isVisible: boolean) => void;
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
   onOpen: () => void;
   onDelete: () => void;
+}
+
+/** Per-row options the coalesced list pipeline passes to a list's row renderer. */
+interface CoalescedRowRenderOptions {
+  sectionId?: string;
+  /** undefined = fall back to the list's base meta; null = render without meta. */
+  rowRenderMeta?: AgentRowRenderMeta | null;
+  depthOverride?: number;
+  keyOverride?: string;
+  subAgentConnectorLayout?: "default" | "task-group-member";
+  taskGroupHeaderTitle?: string;
+}
+
+/** List-specific inputs for the shared coalesced workspace list pipeline. */
+interface CoalescedWorkspaceListContext {
+  sectionId?: string;
+  tierKeyPrefix: string;
+  /** Grouped lists indent age-tier toggles to align with folder content. */
+  tierButtonClassName?: string;
+  depthByWorkspaceId: Record<string, number>;
+  baseRowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+  renderRow: (
+    metadata: FrontendWorkspaceMetadata,
+    opts?: CoalescedRowRenderOptions
+  ) => React.ReactNode;
 }
 
 // Debounce delay for sidebar preview updates during typing.
@@ -383,19 +478,20 @@ function isDraftVisible(
   values?: {
     draftPrompt?: string;
     workspaceNameState?: unknown;
-    draftAttachments?: unknown[];
+    draftAttachmentCount?: number;
   }
 ): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
-  const draftPrompt = values?.draftPrompt ?? readPersistedState<string>(getInputKey(scopeId), "");
+  // Text and attachments come from the backend-backed draft store.
+  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
+  const draftPrompt = values?.draftPrompt ?? draft.text;
   const workspaceNameState =
     values?.workspaceNameState ??
     readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  const draftAttachments =
-    values?.draftAttachments ?? readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
+  const draftAttachmentCount = values?.draftAttachmentCount ?? draft.attachmentCount;
 
   const hasTextContent = typeof draftPrompt === "string" && draftPrompt.trim().length > 0;
-  const hasAttachments = Array.isArray(draftAttachments) && draftAttachments.length > 0;
+  const hasAttachments = draftAttachmentCount > 0;
   const hasNameState = workspaceNameState !== null;
   return hasTextContent || hasAttachments || hasNameState;
 }
@@ -404,14 +500,14 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const scopeId = getDraftScopeId(props.projectPath, props.draftId);
   const onVisibilityChange = props.onVisibilityChange;
 
-  const [draftPrompt] = usePersistedState<string>(getInputKey(scopeId), "", {
-    listener: true,
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
   });
+  const draftPrompt = draft.text;
 
   const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
-    listener: true,
-  });
-  const [draftAttachments] = usePersistedState<unknown[]>(getInputAttachmentsKey(scopeId), [], {
     listener: true,
   });
 
@@ -428,7 +524,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const isVisible = isDraftVisible(props.projectPath, props.draftId, {
     draftPrompt,
     workspaceNameState,
-    draftAttachments: Array.isArray(draftAttachments) ? draftAttachments : [],
+    draftAttachmentCount: draft.attachmentCount,
   });
 
   useEffect(() => {
@@ -453,6 +549,8 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
       projectPath={props.projectPath}
       isSelected={props.isSelected}
       sectionId={props.sectionId}
+      projectBadgeName={props.projectBadgeName}
+      projectBadgeColor={props.projectBadgeColor}
       draft={{
         draftId: props.draftId,
         draftNumber: props.draftNumber,
@@ -600,78 +698,6 @@ interface ProjectSidebarProps {
   workspaceRecency: Record<string, number>;
 }
 
-function didUntrackedPathSetChange(
-  acknowledgedUntrackedPaths: string[],
-  latestUntrackedPaths: string[]
-): boolean {
-  if (acknowledgedUntrackedPaths.length !== latestUntrackedPaths.length) {
-    return true;
-  }
-
-  const acknowledgedSet = new Set(acknowledgedUntrackedPaths);
-  return latestUntrackedPaths.some((path) => !acknowledgedSet.has(path));
-}
-
-function usePreserveSubagentsUntilArchiveSetting(api: ReturnType<typeof useAPI>["api"]): boolean {
-  const [preserveSubagentsUntilArchive, setPreserveSubagentsUntilArchive] = useState(false);
-
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    const abortController = new AbortController();
-    const { signal } = abortController;
-    let iterator: AsyncIterator<unknown> | null = null;
-    let refreshVersion = 0;
-
-    const refresh = async () => {
-      const version = (refreshVersion += 1);
-      try {
-        const cfg = await api.config.getConfig();
-        if (signal.aborted || version !== refreshVersion) {
-          return;
-        }
-        setPreserveSubagentsUntilArchive(
-          normalizeTaskSettings(cfg.taskSettings).preserveSubagentsUntilArchive === true
-        );
-      } catch {
-        // Best-effort: keep the last known setting instead of hiding preserved rows on a
-        // transient config fetch failure.
-      }
-    };
-
-    void refresh();
-
-    void (async () => {
-      try {
-        const subscribedIterator = await api.config.onConfigChanged(undefined, { signal });
-        if (signal.aborted) {
-          void subscribedIterator.return?.();
-          return;
-        }
-
-        iterator = subscribedIterator;
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) {
-            break;
-          }
-          void refresh();
-        }
-      } catch {
-        // Subscription cancellation is expected during unmount/API reconnects.
-      }
-    })();
-
-    return () => {
-      abortController.abort();
-      void iterator?.return?.();
-    };
-  }, [api]);
-
-  return preserveSubagentsUntilArchive;
-}
-
 const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   collapsed,
   onToggleCollapsed,
@@ -686,8 +712,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     setSelectedWorkspace: onSelectWorkspace,
     preflightArchiveWorkspace,
     archiveWorkspace: onArchiveWorkspace,
+    archivingWorkspaceIds,
     removeWorkspace,
     updateWorkspaceTitle: onUpdateTitle,
+    setWorkspacePinned,
+    reorderPinnedWorkspaces,
     refreshWorkspaceMetadata,
     pendingNewWorkspaceProject,
     pendingNewWorkspaceDraftId,
@@ -702,15 +731,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { navigateToProject } = useRouter();
   const { api } = useAPI();
-  const preserveSubagentsUntilArchive = usePreserveSubagentsUntilArchiveSetting(api);
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
+  // The settings modal covers the chat without changing the route's workspace; treat the
+  // covered workspace as unselected so its unread state stays visible until settings closes.
+  const visibleSelectedWorkspaceId = settings.isOpen ? undefined : selectedWorkspace?.workspaceId;
 
   // Get project state and operations from context
   const {
     userProjects,
     openProjectCreateModal: onAddProject,
     removeProject: onRemoveProject,
+    getRemovalBlockers,
     updateDisplayName,
     updateColor: updateProjectColor,
     assignWorkspaceToSubProject,
@@ -718,7 +750,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   // Theme for logo variant
   const { theme } = useTheme();
-  const MuxLogo = theme === "dark" || theme.endsWith("-dark") ? MuxLogoDark : MuxLogoLight;
+  const XumLogo = theme === "dark" || theme.endsWith("-dark") ? XumLogoDark : XumLogoLight;
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
 
   // Mobile breakpoint for auto-closing sidebar
@@ -839,52 +871,83 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
   const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
     Record<string, boolean>
-  >("expandedOldWorkspaces", {});
+  >(EXPANDED_OLD_WORKSPACES_KEY, {});
+
+  // Whether workspaces are grouped under collapsible "Older than X days" tiers.
+  // Toggled from Settings → General; listener keeps the sidebar live-updated.
+  const [ageGroupingEnabled] = usePersistedState<boolean>(SIDEBAR_AGE_GROUPING_KEY, true, {
+    listener: true,
+  });
+
+  const [flatSidebarEnabled] = usePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, false, {
+    listener: true,
+  });
+
+  // Opt-in: hide sub-agent rows and summarize them on parent rows instead.
+  const [hideSubAgentRows] = usePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, false, {
+    listener: true,
+  });
 
   // Track which sections are expanded
   const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    "expandedSections",
+    EXPANDED_SECTIONS_KEY,
     {}
   );
 
   // Track parent workspaces whose reported child tasks are expanded.
   const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
     Record<string, boolean>
-  >("expandedCompletedSubAgents", {});
+  >(EXPANDED_COMPLETED_SUB_AGENTS_KEY, {});
   const toggleCompletedChildrenExpansion = useCallback(
     (workspaceId: string) => {
-      setExpandedCompletedSubAgents((prev) => {
-        const current = prev[workspaceId] ?? preserveSubagentsUntilArchive;
-        const next = !current;
-        const updated = { ...prev };
-        if (next === preserveSubagentsUntilArchive) {
-          delete updated[workspaceId];
-        } else {
-          updated[workspaceId] = next;
-        }
-        return updated;
-      });
+      setExpandedCompletedSubAgents((prev) =>
+        withRecordEntry(
+          prev,
+          workspaceId,
+          !(prev[workspaceId] ?? false),
+          SIDEBAR_EXPANSION_MAP_MAX_CHARS
+        )
+      );
     },
-    [preserveSubagentsUntilArchive, setExpandedCompletedSubAgents]
+    [setExpandedCompletedSubAgents]
   );
   const expandedCompletedParentIds = new Set<string>();
   for (const workspaces of sortedWorkspacesByProject.values()) {
     for (const workspace of workspaces) {
-      if (expandedCompletedSubAgents[workspace.id] ?? preserveSubagentsUntilArchive) {
+      // Persistence and presentation are intentionally independent: durable inactive tasks stay
+      // collapsed until the user asks to inspect them, so history never crowds the active list.
+      if (expandedCompletedSubAgents[workspace.id] === true) {
         expandedCompletedParentIds.add(workspace.id);
       }
     }
   }
 
-  const [expandedTaskGroups, setExpandedTaskGroups] = useState<Record<string, boolean>>({});
-  const toggleTaskGroupExpansion = (groupId: string) => {
-    setExpandedTaskGroups((prev) => ({
-      ...prev,
-      [groupId]: !prev[groupId],
-    }));
+  // Task-group expansion survives reloads (D7). Keys are namespaced per group
+  // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
+  const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
+    EXPANDED_TASK_GROUPS_KEY,
+    {}
+  );
+  // D6: a workflow group that is (or was, this session) active defaults to
+  // expanded and must not auto-collapse when its members finish mid-session.
+  // The render-time ref keeps that default sticky; an explicit toggle wins.
+  const sessionActiveTaskGroupKeysRef = useRef<Set<string>>(new Set());
+  // Workflow-owned worker workspaces are transient. Cache the run-level group model separately so
+  // an active workflow keeps a stable sidebar header between sequential steps after its worker row
+  // has been deleted; inactive child rows themselves remain absent.
+  const retainedWorkflowTaskGroupsRef = useRef<Map<string, SidebarTaskGroupModel>>(new Map());
+  // Same transience problem for the hidden-sub-agents summary: retain each
+  // run's workflow name past its workers so runs between sequential steps stay
+  // labeled; entries are pruned once the owning workspace drops the run.
+  const workflowRunNamesRef = useRef<Map<string, { ownerWorkspaceId: string; name: string }>>(
+    new Map()
+  );
+  const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
+    setExpandedTaskGroups((prev) =>
+      withRecordEntry(prev, storageKey, !isCurrentlyExpanded, SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
-  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<Set<string>>(new Set());
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
   const [draftVisibilityByProject, setDraftVisibilityByProject] = useState<
     Record<string, Record<string, boolean>>
@@ -893,15 +956,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
-  const [archiveConfirmation, setArchiveConfirmation] = useState<{
-    workspaceId: string;
-    displayTitle: string;
-    buttonElement?: HTMLElement;
-    /** When set, the confirmation warns about permanent deletion of untracked files. */
-    untrackedPaths?: string[];
-    /** Whether the workspace has an active stream that will be interrupted. */
-    isStreaming?: boolean;
-  } | null>(null);
+  // Stays until dismissed: the cancelled row is gone, so the user could not reread it (#5143).
+  const workspaceRemoveWarning = usePopoverError(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;
@@ -961,12 +1017,50 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [setExpandedProjectsArray]
   );
 
+  const handleAddScratchWorkspace = useCallback(() => {
+    setExpandedProjectsArray((prev) => {
+      const expanded = Array.isArray(prev) ? prev : [];
+      return expanded.includes(SCRATCH_SIDEBAR_SECTION_ID)
+        ? expanded
+        : [...expanded, SCRATCH_SIDEBAR_SECTION_ID];
+    });
+    handleAddWorkspace(SCRATCH_PROJECT_CONFIG_KEY);
+  }, [handleAddWorkspace, setExpandedProjectsArray]);
+
+  // Open a sibling draft in the same project and section as `meta`. Shared by
+  // Ctrl+N and the flat-mode "New chat" button.
+  // Resolve the effective section ID exactly the way the renderer does:
+  // honor the workspace's own subProjectPath when it still exists, otherwise
+  // inherit from the parent workspace. This keeps the draft in lockstep with
+  // the visible section and avoids forwarding deleted sub-project paths that
+  // workspace.create would reject.
+  // Scratch chats are bucketed under the scratch config key while their
+  // projectPath is the app-managed workdir, so the bucket lookup below misses
+  // them; check kind first.
+  // useCallback is required here, not for memoization: the keydown useEffect
+  // lists this handler as a dependency and react-hooks/exhaustive-deps rejects
+  // a plain function there.
+  const handleAddSiblingWorkspace = useCallback(
+    (meta: FrontendWorkspaceMetadata) => {
+      if (meta.kind === "scratch") {
+        handleAddScratchWorkspace();
+        return;
+      }
+      const projectWorkspaces = sortedWorkspacesByProject.get(meta.projectPath) ?? [];
+      const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
+      const validSectionIds = new Set(
+        getSubProjectsForParent(meta.projectPath, userProjects).map(([subPath]) => subPath)
+      );
+      handleAddWorkspace(meta.projectPath, resolveEffectiveSectionId(meta, byId, validSectionIds));
+    },
+    [handleAddScratchWorkspace, handleAddWorkspace, sortedWorkspacesByProject, userProjects]
+  );
+
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setExpandedSections((prev) =>
+      withRecordEntry(prev, key, !prev[key], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const handleForkWorkspace = useCallback(
@@ -1040,92 +1134,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [api, runtimeStatusStore, workspaceStopRuntimeError]
   );
 
-  const performArchiveWorkspace = useCallback(
-    async (
-      workspaceId: string,
-      buttonElement?: HTMLElement,
-      acknowledgedUntrackedPaths?: string[]
-    ) => {
-      // Mark workspace as being archived for UI feedback
-      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
-
-      try {
-        const result = await onArchiveWorkspace(
-          workspaceId,
-          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-        );
-        if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
-          const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-          const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-          const aggregator = workspaceStore.getAggregator(workspaceId);
-          const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-          const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
-          const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
-          const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-          const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-          setArchiveConfirmation({
-            workspaceId,
-            displayTitle,
-            buttonElement,
-            untrackedPaths: result.data.paths,
-            // The retry path already handled any earlier streaming warning. Only surface the
-            // interruption warning again when the archive attempt has not yet been confirmed.
-            isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
-          });
-          return;
-        }
-        if (!result.success) {
-          if (acknowledgedUntrackedPaths != null) {
-            // Archive may fail if new untracked files appear between confirmation and capture.
-            // Re-run preflight so we can reopen the modal with the latest paths.
-            const preflight = await preflightArchiveWorkspace(workspaceId);
-            if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
-              const pathsChanged = didUntrackedPathSetChange(
-                acknowledgedUntrackedPaths,
-                preflight.data.paths
-              );
-              if (pathsChanged) {
-                const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-                const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-                setArchiveConfirmation({
-                  workspaceId,
-                  displayTitle,
-                  buttonElement,
-                  untrackedPaths: preflight.data.paths,
-                  isStreaming: (() => {
-                    const aggregator = workspaceStore.getAggregator(workspaceId);
-                    if (!aggregator) return false;
-                    const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-                    const isStarting =
-                      aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-                    const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-                    return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-                  })(),
-                });
-                return;
-              }
-            }
-          }
-
-          const error = result.error ?? "Failed to archive chat";
-          // Archive failures can be long-lived workflow errors (for example, untracked-file safety
-          // checks) that users should notice near the active workspace content, not pinned beside a
-          // left-sidebar row that may be far from their current focus. Use the shared toast fallback
-          // position so archive errors match other top-right UI error surfaces.
-          workspaceArchiveError.showError(workspaceId, error);
-        }
-      } finally {
-        // Clear archiving state
-        setArchivingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
-      }
-    },
-    [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
-  );
-
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
       const aggregator = workspaceStore.getAggregator(workspaceId);
@@ -1141,16 +1149,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceHasAttention = useCallback(
     (workspace: FrontendWorkspaceMetadata) => {
       const workspaceId = workspace.id;
-      const aggregator = workspaceStore.getAggregator(workspaceId);
-      const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-      const isStarting = aggregator?.getPendingStreamStartTime() != null && !hasActiveStreams;
-      const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-      const isWorking = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-      const hasError = aggregator?.getLastAbortReason()?.reason === "system";
+      const attentionSignal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
+      const isWorking = attentionSignal?.isWorking === true;
+      const awaitingUserQuestion = attentionSignal?.awaitingUserQuestion === true;
+      const hasError = attentionSignal?.hasSystemError === true;
       const isRemoving = workspace.isRemoving === true;
       const isArchiving = archivingWorkspaceIds.has(workspaceId);
       const isInitializing = workspace.isInitializing === true;
-      const isSelected = selectedWorkspace?.workspaceId === workspaceId;
+      const isSelected = visibleSelectedWorkspaceId === workspaceId;
       const recencyTimestamp = workspaceRecency[workspaceId] ?? null;
       const lastReadTimestamp = readPersistedState<number | null>(
         getWorkspaceLastReadKey(workspaceId),
@@ -1172,68 +1178,25 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         isUnread
       );
     },
-    [archivingWorkspaceIds, selectedWorkspace?.workspaceId, workspaceRecency, workspaceStore]
+    [archivingWorkspaceIds, visibleSelectedWorkspaceId, workspaceRecency, workspaceStore]
   );
 
-  const handleArchiveWorkspace = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace: onArchiveWorkspace,
+    isArchiving: (workspaceId) => archivingWorkspaceIds.has(workspaceId),
+    isStreaming: hasActiveStream,
+    getDisplayTitle: (workspaceId) => {
       const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-      const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-      const isStreaming = hasActiveStream(workspaceId);
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        workspaceArchiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness"
-        );
-        return;
-      }
-
-      const untrackedPaths =
-        preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
-
-      if (isStreaming || untrackedPaths) {
-        // Show a single combined confirmation dialog for streaming + untracked-file warnings.
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths,
-          isStreaming,
-        });
-        return;
-      }
-
-      await performArchiveWorkspace(workspaceId, buttonElement);
+      return metadata?.title ?? metadata?.name ?? workspaceId;
     },
-    [
-      hasActiveStream,
-      performArchiveWorkspace,
-      preflightArchiveWorkspace,
-      workspaceArchiveError,
-      workspaceStore,
-    ]
-  );
-
-  const handleArchiveWorkspaceConfirm = useCallback(async () => {
-    if (!archiveConfirmation) {
-      return;
-    }
-
-    const confirmation = archiveConfirmation;
-    setArchiveConfirmation(null);
-    await performArchiveWorkspace(
-      confirmation.workspaceId,
-      confirmation.buttonElement,
-      confirmation.untrackedPaths
-    );
-  }, [archiveConfirmation, performArchiveWorkspace]);
-
-  const handleArchiveWorkspaceCancel = useCallback(() => {
-    setArchiveConfirmation(null);
-  }, []);
+    // Archive failures can be long-lived workflow errors (for example, untracked-file safety
+    // checks) that users should notice near the active workspace content, not pinned beside a
+    // left-sidebar row that may be far from their current focus. Use the shared toast fallback
+    // position so archive errors match other top-right UI error surfaces.
+    showError: (workspaceId, error) => workspaceArchiveError.showError(workspaceId, error),
+  });
+  const handleArchiveWorkspace = archiveFlow.requestArchive;
 
   const showProjectRemoveError = useCallback(
     (
@@ -1244,7 +1207,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         activeCount?: number;
         archivedCount?: number;
       },
-      buttonElement?: HTMLElement
+      // Callers pass precomputed coordinates because the triggering button may
+      // already be unmounted by the time an awaited removal/preflight settles.
+      anchor?: { top: number; left: number }
     ) => {
       let message: string;
       if (error.type === "workspace_blockers") {
@@ -1265,25 +1230,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         message = error.message ?? "Failed to remove project";
       }
 
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
       projectRemoveError.showError(projectPath, message, anchor);
     },
     [projectRemoveError]
   );
 
   const removeProjectWithFeedback = useCallback(
-    async (projectPath: string, options?: { force?: boolean }, buttonElement?: HTMLElement) => {
+    async (
+      projectPath: string,
+      options?: { force?: boolean },
+      anchor?: { top: number; left: number }
+    ) => {
       const result = await onRemoveProject(projectPath, options);
       if (!result.success) {
-        showProjectRemoveError(projectPath, result.error, buttonElement);
+        showProjectRemoveError(projectPath, result.error, anchor);
       }
       return result;
     },
@@ -1318,6 +1278,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             workspaceId,
             result.error ?? "Failed to cancel workspace creation"
           );
+        } else if (result.warnings?.length) {
+          // This forced removal skips the Force Delete dialog, so show what it left behind
+          // (#5143), e.g. a devcontainer that may still hold the plan.
+          workspaceRemoveWarning.showError(
+            workspaceId,
+            formatWorkspaceRemoveWarnings(result.warnings)
+          );
         }
       } finally {
         setRemovingWorkspaceIds((prev) => {
@@ -1327,7 +1294,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError]
+    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (
@@ -1349,6 +1316,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         : undefined;
 
     // Removing a sub-project unregisters it and clears the cwd pointer from its workspaces.
+    // projects.list excludes archived workspaces, so this count covers live ones only;
+    // that matches the sidebar view this dialog describes, and the action itself is
+    // non-destructive (workspaces just move back to the parent project).
     const workspacesInSection = (userProjects.get(projectPath)?.workspaces ?? []).filter(
       (workspace) => workspace.subProjectPath === subProjectPath
     );
@@ -1374,14 +1344,27 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleOpenSecrets = useCallback(
     (projectPath: string) => {
-      // Collapse the off-canvas sidebar on mobile before navigating so the
-      // settings page is immediately accessible without a backdrop blocking it.
+      // Collapse the off-canvas sidebar on mobile before opening settings so its
+      // backdrop is not left blocking the page when settings closes.
       if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
         persistMobileSidebarScrollTop(mobileScrollTopRef.current);
         onToggleCollapsed();
       }
       // Navigate to Settings → Secrets with the project pre-selected.
       settings.open("secrets", { secretsProjectPath: projectPath });
+    },
+    [MOBILE_BREAKPOINT, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop, settings]
+  );
+
+  const handleOpenInstructions = useCallback(
+    (projectPath: string) => {
+      // Same mobile collapse behavior as handleOpenSecrets.
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+      // Navigate to Settings → Instructions with the project pre-selected.
+      settings.open("instructions", { instructionsProjectPath: projectPath });
     },
     [MOBILE_BREAKPOINT, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop, settings]
   );
@@ -1425,17 +1408,52 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [projectContextMenu]
   );
 
+  // Monotonic token so a slower earlier removal preflight can never overwrite
+  // the confirmation dialog (or trigger removal) for a project the user
+  // selected afterwards.
+  const removalPreflightSeq = useRef(0);
+
   const handleRequestProjectRemoval = useCallback(
-    (projectPath: string, buttonElement?: HTMLElement) => {
+    async (projectPath: string, buttonElement?: HTMLElement) => {
       const projectConfig = userProjects.get(projectPath);
       if (!projectConfig) {
         return;
       }
 
       const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
-      const counts = getProjectWorkspaceCounts(projectConfig.workspaces);
-      const total = counts.activeCount + counts.archivedCount;
-      if (total > 0) {
+      // Capture the anchor up front: the context menu closes (unmounting the
+      // button) while the preflight below is awaited, and a disconnected
+      // element would resolve to zero coordinates.
+      const anchor =
+        buttonElement != null
+          ? (() => {
+              const rect = buttonElement.getBoundingClientRect();
+              return { top: rect.top + window.scrollY, left: rect.right + 10 };
+            })()
+          : undefined;
+      // projects.list excludes archived workspaces (read-side projection), so
+      // blocker counts come from a read-only backend preflight instead of the
+      // embedded workspace arrays. remove() is deliberately NOT used as the
+      // probe: it prunes stale workspace entries and deletes the project when
+      // nothing remains, which must not happen before the user confirms.
+      const seq = ++removalPreflightSeq.current;
+      let counts: { activeCount: number; archivedCount: number };
+      try {
+        counts = await getRemovalBlockers(projectPath);
+      } catch (error) {
+        if (seq === removalPreflightSeq.current) {
+          showProjectRemoveError(
+            projectPath,
+            { type: "unknown", message: getErrorMessage(error) },
+            anchor
+          );
+        }
+        return;
+      }
+      if (seq !== removalPreflightSeq.current) {
+        return;
+      }
+      if (counts.activeCount + counts.archivedCount > 0) {
         setDeleteConfirmation({
           projectPath,
           projectName,
@@ -1445,9 +1463,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         return;
       }
 
-      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
+      void removeProjectWithFeedback(projectPath, undefined, anchor);
     },
-    [removeProjectWithFeedback, userProjects]
+    [getRemovalBlockers, removeProjectWithFeedback, showProjectRemoveError, userProjects]
   );
 
   const cancelProjectDisplayNameEditing = useCallback(() => {
@@ -1504,13 +1522,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     closeProjectContextMenu();
   }, [closeProjectContextMenu, handleOpenSecrets, projectMenuTargetPath]);
 
+  const handleProjectMenuInstructions = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
+    }
+
+    handleOpenInstructions(projectMenuTargetPath);
+    closeProjectContextMenu();
+  }, [closeProjectContextMenu, handleOpenInstructions, projectMenuTargetPath]);
+
   const handleProjectMenuDelete = useCallback(
     (buttonElement?: HTMLElement) => {
       if (!projectMenuTargetPath) {
         return;
       }
 
-      handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
+      void handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
       closeProjectContextMenu();
     },
     [closeProjectContextMenu, handleRequestProjectRemoval, projectMenuTargetPath]
@@ -1579,7 +1606,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   ]);
 
   // UI preference: project order persists in localStorage
-  const [projectOrder, setProjectOrder] = usePersistedState<string[]>("mux:projectOrder", []);
+  const [projectOrder, setProjectOrder] = usePersistedState<string[]>(PROJECT_ORDER_KEY, []);
 
   // Build a stable signature of the project keys so effects don't fire on Map identity churn
   const projectPathsSignature = React.useMemo(() => {
@@ -1619,14 +1646,160 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [projectPathsSignature, projectOrder]
   );
 
+  const isWorkspaceLiveActive = (workspaceId: string): boolean => {
+    const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
+    return signal?.isWorking === true;
+  };
+  const hasActiveBashMonitor = (workspaceId: string): boolean =>
+    getWorkspaceAttentionSignal(workspaceStore, workspaceId)?.hasActiveBashMonitor === true;
+  const getActiveWorkflowRunIds = (workspaceId: string): readonly string[] => {
+    try {
+      return workspaceStore.getWorkspaceSidebarState(workspaceId).activeWorkflowRunIds ?? [];
+    } catch {
+      return [];
+    }
+  };
+  const isWorkflowRunActive = (workspaceId: string, runId: string): boolean =>
+    getActiveWorkflowRunIds(workspaceId).includes(runId);
+  const allSidebarWorkspaces = Array.from(sortedWorkspacesByProject.values()).flat();
+  // Mirror the grouped collection's experiment gate: multi-project chats stay
+  // hidden in flat mode too while the experiment is off.
+  const flatWorkspaces = flatSidebarEnabled
+    ? buildSortedWorkspacesFlat(
+        multiProjectWorkspacesEnabled
+          ? allSidebarWorkspaces
+          : allSidebarWorkspaces.filter((workspace) => !isMultiProject(workspace)),
+        workspaceRecency
+      )
+    : [];
+  // Draft-to-workspace promotions: like grouped mode, the just-created
+  // workspace renders in its draft's position, so it must be suppressed from
+  // the normal rows or the same chat appears twice during creation.
+  // Drafts follow the same experiment gate as flatWorkspaces: _multi drafts
+  // (and their promotions) stay hidden in flat mode while the experiment is off.
+  const isGatedFlatDraftBucket = (projectPath: string): boolean =>
+    !multiProjectWorkspacesEnabled && projectPath === MULTI_PROJECT_CONFIG_KEY;
+  const flatDraftPromotionsByDraftId = new Map<string, FrontendWorkspaceMetadata>();
+  if (flatSidebarEnabled) {
+    for (const [projectPath, drafts] of Object.entries(workspaceDraftsByProject)) {
+      if (isGatedFlatDraftBucket(projectPath)) continue;
+      const promotions = workspaceDraftPromotionsByProject[projectPath] ?? {};
+      for (const draft of drafts) {
+        const promoted = promotions[draft.draftId];
+        if (promoted) {
+          flatDraftPromotionsByDraftId.set(draft.draftId, promoted);
+        }
+      }
+    }
+  }
+  const flatPromotedWorkspaceIds = new Set(
+    [...flatDraftPromotionsByDraftId.values()].map((metadata) => metadata.id)
+  );
+  const flatRowsBeforePromotionFilter = hideSubAgentRows
+    ? excludeSubAgentRows(flatWorkspaces)
+    : flatWorkspaces;
+  const flatRowsForDisplay =
+    flatPromotedWorkspaceIds.size > 0
+      ? flatRowsBeforePromotionFilter.filter(
+          (workspace) => !flatPromotedWorkspaceIds.has(workspace.id)
+        )
+      : flatRowsBeforePromotionFilter;
+  const flatDepthByWorkspaceId = computeWorkspaceDepthMap(flatRowsForDisplay);
+  const visibleFlatWorkspaces = filterVisibleAgentRows(
+    flatRowsForDisplay,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
+  );
+  const flatRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+    flatRowsForDisplay,
+    flatDepthByWorkspaceId,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
+  );
+  // Pinned-at-the-top invariant vs drafts: pinned roots (their subtrees stay
+  // adjacent and never age out) render as their own segment above the draft
+  // rows, so adding a draft never displaces the user's pinned chats.
+  const flatPinnedRowIds = new Set<string>();
+  if (flatSidebarEnabled) {
+    let inPinnedSubtree = false;
+    for (const row of flatRowsForDisplay) {
+      if ((flatDepthByWorkspaceId[row.id] ?? 0) === 0) {
+        inPinnedSubtree = isWorkspacePinned(row);
+      }
+      if (inPinnedSubtree) flatPinnedRowIds.add(row.id);
+    }
+  }
+  const visiblePinnedFlatWorkspaces = visibleFlatWorkspaces.filter((row) =>
+    flatPinnedRowIds.has(row.id)
+  );
+  const visibleUnpinnedFlatWorkspaces = visibleFlatWorkspaces.filter(
+    (row) => !flatPinnedRowIds.has(row.id)
+  );
+  if (flatSidebarEnabled) {
+    // Track runs that are (or were, this session) active so their groups stay
+    // mounted across step gaps (mirrors the grouped per-project seeding).
+    for (const key of collectActiveWorkflowGroupKeys(flatRowsForDisplay, {
+      isWorkspaceLiveActive,
+      hasActiveBashMonitor,
+    })) {
+      sessionActiveTaskGroupKeysRef.current.add(key);
+    }
+  }
+  // Learn run names while a worker row still carries them (workers are deleted
+  // after reporting), then drop names whose run is no longer active.
+  for (const workspace of allSidebarWorkspaces) {
+    const workflowTask = workspace.workflowTask;
+    if (workflowTask?.workflowName != null && workspace.parentWorkspaceId != null) {
+      workflowRunNamesRef.current.set(workflowTask.runId, {
+        ownerWorkspaceId: workspace.parentWorkspaceId,
+        name: workflowTask.workflowName,
+      });
+    }
+  }
+  for (const [runId, entry] of workflowRunNamesRef.current) {
+    if (!isWorkflowRunActive(entry.ownerWorkspaceId, runId)) {
+      workflowRunNamesRef.current.delete(runId);
+    }
+  }
+  const getWorkflowRunName = (runId: string): string | undefined =>
+    workflowRunNamesRef.current.get(runId)?.name;
+  const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
+    allSidebarWorkspaces,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
+  );
+  const subAgentsSummaryByWorkspaceId = hideSubAgentRows
+    ? computeSubAgentsSummaryByWorkspaceId(allSidebarWorkspaces, {
+        isWorkspaceLiveActive,
+        hasActiveBashMonitor,
+        getActiveWorkflowRunIds,
+        getWorkflowRunName,
+      })
+    : null;
+  // In hide mode every row gets at least the empty summary: rows without
+  // counted descendants still show a workflow line for their own active runs
+  // (step gaps between transient workers leave no countable descendants).
+  const getHiddenSubAgentsSummary = (workspaceId: string): WorkspaceSubAgentsSummary | undefined =>
+    subAgentsSummaryByWorkspaceId
+      ? (subAgentsSummaryByWorkspaceId.get(workspaceId) ?? EMPTY_HIDDEN_SUBAGENTS_SUMMARY)
+      : undefined;
+
   const singleProjectWorkspacesByProject = new Map<string, FrontendWorkspaceMetadata[]>();
+  const scratchWorkspacesById = new Map<string, FrontendWorkspaceMetadata>();
   const multiProjectWorkspacesById = new Map<string, FrontendWorkspaceMetadata>();
   const workspaceAttentionById = new Map<string, boolean>();
 
   for (const [projectPath, workspaces] of sortedWorkspacesByProject) {
     const singleProjectWorkspaces: FrontendWorkspaceMetadata[] = [];
     for (const workspace of workspaces) {
-      workspaceAttentionById.set(workspace.id, workspaceHasAttention(workspace));
+      workspaceAttentionById.set(
+        workspace.id,
+        workspaceHasAttention(workspace) ||
+          (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
+      );
+      if (workspace.kind === "scratch") {
+        scratchWorkspacesById.set(workspace.id, workspace);
+        continue;
+      }
       if (isMultiProject(workspace)) {
         if (multiProjectWorkspacesEnabled) {
           multiProjectWorkspacesById.set(workspace.id, workspace);
@@ -1639,22 +1812,114 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     singleProjectWorkspacesByProject.set(projectPath, singleProjectWorkspaces);
   }
 
-  const multiProjectWorkspaces = Array.from(multiProjectWorkspacesById.values());
-  // Multi-project rows should share the same completed-subagent chevron behavior as
-  // regular workspace rows, so reuse the same visibility + metadata calculations.
-  const multiProjectDepthByWorkspaceId = computeWorkspaceDepthMap(multiProjectWorkspaces);
+  const scratchWorkspaces = orderMultiProjectSectionRows(
+    Array.from(scratchWorkspacesById.values())
+  );
+  // Sub-agent rows render nested under their parent, so section counts skip
+  // them (orphans and malformed-cycle rows still count, matching display).
+  const topLevelScratchWorkspaces = excludeSubAgentRows(scratchWorkspaces);
+  const scratchRowsForDisplay = hideSubAgentRows ? topLevelScratchWorkspaces : scratchWorkspaces;
+  const scratchDepthByWorkspaceId = computeWorkspaceDepthMap(scratchRowsForDisplay);
+  const visibleScratchWorkspaces = filterVisibleAgentRows(
+    scratchRowsForDisplay,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
+  );
+  const scratchRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+    scratchRowsForDisplay,
+    scratchDepthByWorkspaceId,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
+  );
+  const isScratchSectionExpanded = expandedProjectsList.includes(SCRATCH_SIDEBAR_SECTION_ID);
+  const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt);
+
+  // Re-sort across primary-project buckets so pinned rows form one correctly
+  // ordered block (cross-primary pinned reorders would otherwise snap back).
+  const multiProjectWorkspaces = orderMultiProjectSectionRows(
+    Array.from(multiProjectWorkspacesById.values())
+  );
+  const topLevelMultiProjectWorkspaces = excludeSubAgentRows(multiProjectWorkspaces);
+  const multiProjectRowsForDisplay = hideSubAgentRows
+    ? topLevelMultiProjectWorkspaces
+    : multiProjectWorkspaces;
+  const multiProjectDepthByWorkspaceId = computeWorkspaceDepthMap(multiProjectRowsForDisplay);
   const visibleMultiProjectWorkspaces = filterVisibleAgentRows(
-    multiProjectWorkspaces,
-    expandedCompletedParentIds
+    multiProjectRowsForDisplay,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const multiProjectRowMetaByWorkspaceId = computeAgentRowRenderMeta(
-    multiProjectWorkspaces,
+    multiProjectRowsForDisplay,
     multiProjectDepthByWorkspaceId,
-    expandedCompletedParentIds
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const isMultiProjectSectionExpanded = expandedProjectsList.includes(
     MULTI_PROJECT_SIDEBAR_SECTION_ID
   );
+
+  const flatDrafts = Object.entries(workspaceDraftsByProject)
+    .filter(([projectPath]) => !isGatedFlatDraftBucket(projectPath))
+    .flatMap(([projectPath, drafts]) => drafts.map((draft) => ({ projectPath, draft })))
+    .sort((a, b) => b.draft.createdAt - a.draft.createdAt);
+  // Project headers render in both modes: grouped mode nests each project's
+  // chats under its header, while flat mode appends the headers below the
+  // flat chat list as a compact management section (per-project new chat,
+  // rename, color, delete) so core project operations stay reachable via
+  // mouse/touch without leaving flat mode.
+  const projectHeaderPaths = sortedProjectPaths;
+  const getProjectBadge = (projectPath: string): { name: string; color: string } => {
+    const config = userProjects.get(projectPath);
+    return {
+      name: config?.displayName ?? getProjectFallbackLabel(projectPath),
+      color: resolveSectionColor(config?.color),
+    };
+  };
+  // Flat mode drops the section headers that used to convey sub-project
+  // scope, so rows scoped to a valid sub-project badge with a hierarchical
+  // "Parent / Sub" label: sub-project names are only unique within their
+  // parent, so the bare sub name (badge text and aria-label both derive from
+  // it) could collide across projects. Stale references (deleted sections)
+  // fall back to the parent badge, mirroring getDraftSectionId's validation.
+  const resolveSubProjectBadge = (
+    parentProjectPath: string,
+    subProjectPath: string | null | undefined
+  ): { name: string; color: string } | undefined => {
+    if (typeof subProjectPath !== "string") return undefined;
+    const config = userProjects.get(subProjectPath);
+    if (config?.parentProjectPath !== parentProjectPath) return undefined;
+    return {
+      name: `${getProjectBadge(parentProjectPath).name} / ${getProjectDisplayName(subProjectPath, config)}`,
+      color: resolveSectionColor(config.color),
+    };
+  };
+  // The _multi bucket is a system key excluded from userProjects, so both
+  // chats and drafts label it explicitly instead of leaking the internal key.
+  const multiProjectBadge = { name: "Multi-project", color: resolveSectionColor(undefined) };
+  const getFlatProjectBadge = (
+    workspace: FrontendWorkspaceMetadata
+  ): { name: string; color: string } | undefined => {
+    if (workspace.parentWorkspaceId != null || workspace.kind === "scratch") return undefined;
+    if (isMultiProject(workspace)) {
+      return multiProjectBadge;
+    }
+    return (
+      resolveSubProjectBadge(workspace.projectPath, workspace.subProjectPath) ??
+      getProjectBadge(workspace.projectPath)
+    );
+  };
+  const getFlatDraftBadge = (
+    projectPath: string,
+    subProjectPath: string | null | undefined
+  ): { name: string; color: string } | undefined =>
+    projectPath === SCRATCH_PROJECT_CONFIG_KEY
+      ? undefined
+      : projectPath === MULTI_PROJECT_CONFIG_KEY
+        ? multiProjectBadge
+        : (resolveSubProjectBadge(projectPath, subProjectPath) ?? getProjectBadge(projectPath));
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
@@ -1662,6 +1927,65 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       setProjectOrder(next);
     },
     [projectOrder, userProjects, setProjectOrder]
+  );
+
+  // Pinned-chat reordering, shared by row drag-drop and the move keybinds.
+  // locatePinnedBlock mirrors renderer partitioning (sections, multi-project
+  // list), so moves stay within the row's visual pinned block while the
+  // request carries the bucket's full pinned order.
+  const handlePinnedReorderDrop = useCallback(
+    (draggedId: string, targetId: string, edge: PinnedDropEdge) => {
+      const targetMeta = workspaceStore.getWorkspaceMetadata(targetId);
+      if (!targetMeta) return;
+      const block = locatePinnedBlock(
+        targetMeta,
+        sortedWorkspacesByProject,
+        userProjects,
+        flatSidebarEnabled ? { multiProjectEnabled: multiProjectWorkspacesEnabled } : false
+      );
+      if (!block) return;
+      const order = computePinnedDropOrder(block, draggedId, targetId, edge);
+      if (order) void reorderPinnedWorkspaces(order);
+    },
+    [
+      workspaceStore,
+      sortedWorkspacesByProject,
+      userProjects,
+      flatSidebarEnabled,
+      multiProjectWorkspacesEnabled,
+      reorderPinnedWorkspaces,
+    ]
+  );
+
+  /**
+   * Move the selected pinned chat within its visual block. Returns whether the
+   * shortcut applies to this workspace: true for pinned rows (even edge
+   * no-ops, so the key is still consumed deterministically), false for
+   * unpinned/sub-agent selections so the keydown handler leaves the event
+   * untouched for other handlers instead of swallowing it globally.
+   */
+  const movePinnedWorkspace = useCallback(
+    (workspaceId: string, direction: PinnedMoveDirection): boolean => {
+      const meta = workspaceStore.getWorkspaceMetadata(workspaceId);
+      if (!meta || !isWorkspacePinned(meta)) return false;
+      const order = computePinnedMoveOrderForWorkspace(
+        meta,
+        direction,
+        sortedWorkspacesByProject,
+        userProjects,
+        flatSidebarEnabled ? { multiProjectEnabled: multiProjectWorkspacesEnabled } : false
+      );
+      if (order) void reorderPinnedWorkspaces(order);
+      return true;
+    },
+    [
+      workspaceStore,
+      sortedWorkspacesByProject,
+      userProjects,
+      flatSidebarEnabled,
+      multiProjectWorkspacesEnabled,
+      reorderPinnedWorkspaces,
+    ]
   );
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
@@ -1673,39 +1997,554 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // target from the live sidebar metadata before opening a sibling draft.
       if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
-        // Resolve the effective section ID exactly the way the renderer does:
-        // honor the workspace's own subProjectPath when it still exists,
-        // otherwise inherit from the parent workspace. This keeps Ctrl+N in
-        // lockstep with the visible section and avoids forwarding deleted
-        // sub-project paths that workspace.create would reject.
-        const projectWorkspaces =
-          sortedWorkspacesByProject.get(selectedWorkspace.projectPath) ?? [];
-        const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
-        const meta = byId.get(selectedWorkspace.workspaceId);
-        const validSectionIds = new Set(
-          getSubProjectsForParent(selectedWorkspace.projectPath, userProjects).map(
-            ([subPath]) => subPath
-          )
-        );
-        const subProjectPath = meta
-          ? resolveEffectiveSectionId(meta, byId, validSectionIds)
-          : undefined;
-        handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
+        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
+        if (meta) {
+          handleAddSiblingWorkspace(meta);
+        } else {
+          handleAddWorkspace(selectedWorkspace.projectPath);
+        }
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
+      } else if (matchesKeybind(e, KEYBINDS.PIN_WORKSPACE) && selectedWorkspace) {
+        e.preventDefault();
+        // Only root chats are pinnable; a selected sub-agent row is a no-op.
+        // Look up by id in the store rather than indexing sortedWorkspacesByProject
+        // by projectPath: multi-project workspaces are bucketed under the internal
+        // multi-project config key, not their primary project path.
+        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
+        if (meta && isWorkspacePinnable(meta)) {
+          void setWorkspacePinned(selectedWorkspace.workspaceId, !isWorkspacePinned(meta));
+        }
+      } else if (matchesKeybind(e, KEYBINDS.MOVE_PINNED_UP) && selectedWorkspace) {
+        // Consume the shortcut only when it applies (selected row is pinned);
+        // otherwise let the event fall through to other handlers.
+        if (movePinnedWorkspace(selectedWorkspace.workspaceId, "up")) {
+          e.preventDefault();
+        }
+      } else if (matchesKeybind(e, KEYBINDS.MOVE_PINNED_DOWN) && selectedWorkspace) {
+        if (movePinnedWorkspace(selectedWorkspace.workspaceId, "down")) {
+          e.preventDefault();
+        }
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
+    closeProjectContextMenu,
     selectedWorkspace,
+    handleAddSiblingWorkspace,
     handleAddWorkspace,
     handleArchiveWorkspace,
-    sortedWorkspacesByProject,
-    userProjects,
+    setWorkspacePinned,
+    movePinnedWorkspace,
+    workspaceStore,
   ]);
+
+  // ── Shared coalesced list pipeline ──────────────────────────────────────
+  // One rendering pipeline for every workspace list (grouped project sections
+  // and the flat chat list): age tiers, task-group coalescing (best-of and
+  // workflow runs), retained workflow headers, and connector geometry. Only
+  // row presentation differs per list, injected via ctx.renderRow.
+  const renderCoalescedWorkspaceList = (
+    workspaces: FrontendWorkspaceMetadata[],
+    allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[],
+    ctx: CoalescedWorkspaceListContext
+  ): React.ReactNode => {
+    // With age grouping disabled, keep every workspace in the recent path
+    // (flat recency-sorted list); full-length empty buckets preserve
+    // tier-index assumptions below.
+    const { recent: topVisibleRows, buckets } = ageGroupingEnabled
+      ? partitionWorkspacesByAge(workspaces, workspaceRecency)
+      : {
+          recent: workspaces,
+          buckets: AGE_THRESHOLDS_DAYS.map((): FrontendWorkspaceMetadata[] => []),
+        };
+
+    const expandedTierVisibleIds = new Set<string>();
+    const markExpandedTierRowsVisible = (tierIndex: number): void => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets
+        .slice(tierIndex)
+        .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
+      if (remainingCount === 0) {
+        return;
+      }
+
+      const tierKey = `${ctx.tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      if (!isTierExpanded) {
+        return;
+      }
+
+      for (const workspace of bucket) {
+        expandedTierVisibleIds.add(workspace.id);
+      }
+
+      const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+      if (nextTier !== -1) {
+        markExpandedTierRowsVisible(nextTier);
+      }
+    };
+
+    const firstTier = findNextNonEmptyTier(buckets, 0);
+    if (firstTier !== -1) {
+      markExpandedTierRowsVisible(firstTier);
+    }
+
+    // Connector geometry should match the rows users can currently see,
+    // not hidden siblings parked behind collapsed age tiers.
+    const visibleRowIds = new Set<string>([
+      ...topVisibleRows.map((workspace) => workspace.id),
+      ...expandedTierVisibleIds,
+    ]);
+    const visibleRows = workspaces.filter((workspace) => visibleRowIds.has(workspace.id));
+    // Coalesce grouped task rows (best-of + workflow runs)
+    // before deriving connector geometry: headers join the row model
+    // as synthetic nodes so trunks/elbows stay continuous (D5).
+    const taskGroups = computeSidebarTaskGroups({
+      rows: visibleRows,
+      allRows: allRowsForTaskGroupCoalescing,
+      selectedWorkspaceId: selectedWorkspace?.workspaceId,
+      isWorkspaceLiveActive,
+      hasActiveBashMonitor,
+    });
+
+    for (const group of taskGroups.groupsByStorageKey.values()) {
+      if (
+        group.kind === "workflow" &&
+        (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey))
+      ) {
+        retainedWorkflowTaskGroupsRef.current.set(group.storageKey, group);
+      }
+    }
+
+    const retainedWorkflowGroupsByParentId = new Map<string, SidebarTaskGroupModel[]>();
+    for (const [storageKey, retainedGroup] of retainedWorkflowTaskGroupsRef.current) {
+      if (taskGroups.groupsByStorageKey.has(storageKey)) {
+        continue;
+      }
+      if (!isWorkflowRunActive(retainedGroup.parentWorkspaceId, retainedGroup.id)) {
+        retainedWorkflowTaskGroupsRef.current.delete(storageKey);
+        sessionActiveTaskGroupKeysRef.current.delete(storageKey);
+        continue;
+      }
+      // The parent's hidden-sub-agents summary replaces retained
+      // workflow headers while sub-agent rows are hidden.
+      if (hideSubAgentRows) {
+        continue;
+      }
+      if (!visibleRowIds.has(retainedGroup.parentWorkspaceId)) {
+        continue;
+      }
+
+      const groups = retainedWorkflowGroupsByParentId.get(retainedGroup.parentWorkspaceId) ?? [];
+      groups.push({
+        ...retainedGroup,
+        displayMembers: [],
+        // The workflow run itself remains active between transient worker
+        // steps, without inventing a running member-task count.
+        runningCount: 0,
+        queuedCount: 0,
+        runActiveWithoutMembers: true,
+        hasActiveMember: true,
+      });
+      retainedWorkflowGroupsByParentId.set(retainedGroup.parentWorkspaceId, groups);
+    }
+
+    const rowNodes: SidebarVisibleRowNode[] = [];
+    const seenGroupKeys = new Set<string>();
+    for (const workspace of visibleRows) {
+      const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+      const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+      if (group != null) {
+        if (seenGroupKeys.has(group.storageKey)) {
+          continue;
+        }
+        seenGroupKeys.add(group.storageKey);
+        const anchorMeta = ctx.baseRowMetaByWorkspaceId.get(workspace.id);
+        const headerDepth = anchorMeta?.depth ?? ctx.depthByWorkspaceId[workspace.id] ?? 0;
+        rowNodes.push({
+          id: group.storageKey,
+          parentId: anchorMeta?.visibleParentWorkspaceId ?? group.parentWorkspaceId,
+          depth: headerDepth,
+          isRunning: group.runningCount > 0,
+          baseMeta: {
+            depth: headerDepth,
+            rowKind: "subagent",
+            connectorPosition: "single",
+            connectorStartsAtParent: false,
+            sharedTrunkActiveThroughRow: false,
+            sharedTrunkActiveBelowRow: false,
+            ancestorTrunks: [],
+            hasHiddenCompletedChildren: false,
+            visibleCompletedChildrenCount: 0,
+          },
+        });
+        continue;
+      }
+
+      const baseRowMeta = ctx.baseRowMetaByWorkspaceId.get(workspace.id);
+      if (!baseRowMeta) {
+        continue;
+      }
+      rowNodes.push({
+        id: workspace.id,
+        parentId: baseRowMeta.visibleParentWorkspaceId ?? workspace.parentWorkspaceId,
+        depth: baseRowMeta.depth,
+        isRunning: isSidebarSubAgentRunning(workspace, {
+          isWorkspaceLiveActive,
+          hasActiveBashMonitor,
+        }),
+        baseMeta: baseRowMeta,
+      });
+      for (const retainedGroup of retainedWorkflowGroupsByParentId.get(workspace.id) ?? []) {
+        const headerDepth = baseRowMeta.depth + 1;
+        rowNodes.push({
+          id: retainedGroup.storageKey,
+          parentId: workspace.id,
+          depth: headerDepth,
+          isRunning: true,
+          baseMeta: {
+            depth: headerDepth,
+            rowKind: "subagent",
+            connectorPosition: "single",
+            connectorStartsAtParent: false,
+            sharedTrunkActiveThroughRow: false,
+            sharedTrunkActiveBelowRow: false,
+            ancestorTrunks: [],
+            hasHiddenCompletedChildren: false,
+            visibleCompletedChildrenCount: 0,
+          },
+        });
+      }
+    }
+    const rowMetaByVisibleWorkspaceId = computeRowMetaForVisibleNodes(rowNodes);
+
+    // Expanded members hang off their header row, so their connector
+    // meta derives from the header's computed geometry.
+    const memberMetaByWorkspaceId = new Map<string, AgentRowRenderMeta>();
+    for (const group of taskGroups.groupsByStorageKey.values()) {
+      const headerMeta = rowMetaByVisibleWorkspaceId.get(group.storageKey);
+      if (headerMeta == null) {
+        continue;
+      }
+      for (const [memberId, memberMeta] of computeTaskGroupMemberRowMeta({
+        group,
+        headerMeta,
+        headerDepth: headerMeta.depth,
+        isWorkspaceLiveActive,
+        hasActiveBashMonitor,
+      })) {
+        memberMetaByWorkspaceId.set(memberId, memberMeta);
+      }
+    }
+
+    const renderTaskGroupRows = (group: SidebarTaskGroupModel): React.ReactNode[] => {
+      const headerMeta = rowMetaByVisibleWorkspaceId.get(group.storageKey);
+      const headerDepth =
+        headerMeta?.depth ??
+        ctx.depthByWorkspaceId[group.anchorId] ??
+        (ctx.depthByWorkspaceId[group.parentWorkspaceId] ?? -1) + 1;
+
+      if (group.kind === "workflow" && group.hasActiveMember) {
+        sessionActiveTaskGroupKeysRef.current.add(group.storageKey);
+      }
+      const defaultExpanded =
+        group.kind === "workflow" &&
+        (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
+      const isExpanded = expandedTaskGroups[group.storageKey] ?? defaultExpanded;
+      const isGroupSelected = group.allMembers.some(
+        (member) => member.id === visibleSelectedWorkspaceId
+      );
+
+      const headerRow = (
+        <TaskGroupListItem
+          groupId={group.id}
+          title={group.title}
+          kind={group.kind}
+          sectionId={ctx.sectionId}
+          depth={headerDepth}
+          totalCount={group.totalCount}
+          visibleCount={group.displayMembers.length}
+          completedCount={group.completedCount}
+          isRunActive={group.runActiveWithoutMembers === true}
+          runningCount={group.runningCount}
+          queuedCount={group.queuedCount}
+          interruptedCount={group.interruptedCount}
+          isExpanded={isExpanded}
+          isSelected={isGroupSelected}
+          onToggle={() => {
+            toggleTaskGroupExpansion(group.storageKey, isExpanded);
+          }}
+        />
+      );
+      const renderedRows: React.ReactNode[] = [
+        headerMeta != null ? (
+          <SubAgentListItem
+            key={`task-group:${group.storageKey}`}
+            connectorPosition={headerMeta.connectorPosition}
+            connectorStartsAtParent={headerMeta.connectorStartsAtParent}
+            sharedTrunkActiveThroughRow={headerMeta.sharedTrunkActiveThroughRow}
+            sharedTrunkActiveBelowRow={headerMeta.sharedTrunkActiveBelowRow}
+            ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
+              left: getAncestorRailX(trunk.depth, "default"),
+              active: trunk.active,
+            }))}
+            connectorRailX={getSubAgentParentRailX(headerDepth, "default")}
+            childStatusCenterX={getSubAgentChildStatusCenterX(headerDepth)}
+            isSelected={isGroupSelected}
+            isElbowActive={group.runActiveWithoutMembers === true || group.runningCount > 0}
+          >
+            {headerRow}
+          </SubAgentListItem>
+        ) : (
+          <React.Fragment key={`task-group:${group.storageKey}`}>{headerRow}</React.Fragment>
+        ),
+      ];
+
+      if (isExpanded) {
+        for (const member of group.displayMembers) {
+          renderedRows.push(
+            ctx.renderRow(member, {
+              sectionId: ctx.sectionId,
+              rowRenderMeta: memberMetaByWorkspaceId.get(member.id) ?? null,
+              depthOverride: getTaskGroupMemberDepth(headerDepth),
+              keyOverride: `task-group-member:${group.storageKey}:${member.id}`,
+              subAgentConnectorLayout: "task-group-member",
+              taskGroupHeaderTitle: group.title,
+            })
+          );
+        }
+      }
+      return renderedRows;
+    };
+
+    const renderWorkspaceRows = (rows: FrontendWorkspaceMetadata[]): React.ReactNode[] => {
+      const renderedRows: React.ReactNode[] = [];
+
+      for (const workspace of rows) {
+        const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+        const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+        if (group == null) {
+          renderedRows.push(
+            ctx.renderRow(workspace, {
+              sectionId: ctx.sectionId,
+              rowRenderMeta: rowMetaByVisibleWorkspaceId.get(workspace.id),
+            })
+          );
+          for (const retainedGroup of retainedWorkflowGroupsByParentId.get(workspace.id) ?? []) {
+            renderedRows.push(...renderTaskGroupRows(retainedGroup));
+          }
+          continue;
+        }
+
+        if (group.anchorId !== workspace.id) {
+          // Non-anchor members render under the group header at the
+          // anchor's position (D5), so suppress them here.
+          continue;
+        }
+
+        renderedRows.push(...renderTaskGroupRows(group));
+      }
+
+      return renderedRows;
+    };
+
+    const renderTier = (tierIndex: number): React.ReactNode => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets.slice(tierIndex).reduce((sum, b) => sum + b.length, 0);
+
+      if (remainingCount === 0) return null;
+
+      const tierKey = `${ctx.tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
+      const thresholdLabel = formatDaysThreshold(thresholdDays);
+      const displayCount = isTierExpanded ? bucket.length : remainingCount;
+
+      return (
+        <React.Fragment key={tierKey}>
+          <button
+            onClick={() => {
+              setExpandedOldWorkspaces((prev) =>
+                withRecordEntry(prev, tierKey, !prev[tierKey], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+              );
+            }}
+            aria-label={
+              isTierExpanded
+                ? `Collapse workspaces older than ${thresholdLabel}`
+                : `Expand workspaces older than ${thresholdLabel}`
+            }
+            aria-expanded={isTierExpanded}
+            className={cn(
+              "text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 text-xs font-medium transition-all duration-150 hover:bg-white/3",
+              ctx.tierButtonClassName
+            )}
+          >
+            <span
+              className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
+              style={{
+                transform: isTierExpanded ? "rotate(90deg)" : "rotate(0deg)",
+              }}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span>Older than {thresholdLabel}</span>
+              <span className="text-dim font-normal">({displayCount})</span>
+            </div>
+          </button>
+          {isTierExpanded && (
+            <>
+              {renderWorkspaceRows(bucket)}
+              {(() => {
+                const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+                return nextTier !== -1 ? renderTier(nextTier) : null;
+              })()}
+            </>
+          )}
+        </React.Fragment>
+      );
+    };
+
+    return (
+      <>
+        {renderWorkspaceRows(topVisibleRows)}
+        {firstTier !== -1 && renderTier(firstTier)}
+      </>
+    );
+  };
+
+  const renderFlatRow = (
+    metadata: FrontendWorkspaceMetadata,
+    opts?: CoalescedRowRenderOptions
+  ): React.ReactNode => {
+    const rowRenderMeta =
+      opts?.rowRenderMeta === undefined
+        ? flatRowMetaByWorkspaceId.get(metadata.id)
+        : (opts.rowRenderMeta ?? undefined);
+    const badge = getFlatProjectBadge(metadata);
+    return (
+      <AgentListItem
+        key={opts?.keyOverride ?? metadata.id}
+        metadata={metadata}
+        projectPath={metadata.projectPath}
+        projectName={metadata.projectName}
+        projectBadgeName={badge?.name}
+        projectBadgeColor={badge?.color}
+        isSelected={visibleSelectedWorkspaceId === metadata.id}
+        isArchiving={archivingWorkspaceIds.has(metadata.id)}
+        isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
+        onSelectWorkspace={handleSelectWorkspace}
+        onForkWorkspace={handleForkWorkspace}
+        onStopRuntime={handleStopRuntime}
+        onArchiveWorkspace={handleArchiveWorkspace}
+        onCancelCreation={handleCancelWorkspaceCreation}
+        depth={
+          opts?.depthOverride ?? rowRenderMeta?.depth ?? flatDepthByWorkspaceId[metadata.id] ?? 0
+        }
+        pinnedReorderGroup={FLAT_PINNED_REORDER_GROUP}
+        onPinnedReorderDrop={handlePinnedReorderDrop}
+        rowRenderMeta={rowRenderMeta}
+        subAgentConnectorLayout={opts?.subAgentConnectorLayout}
+        taskGroupHeaderTitle={opts?.taskGroupHeaderTitle}
+        isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+        delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+        hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+        getWorkflowRunName={getWorkflowRunName}
+        completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
+        onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+      />
+    );
+  };
+
+  // Default the flat-mode "New chat" to the project of the chat the user
+  // created most recently; fall back to Scratch only when that chat is a
+  // scratch chat or there are no chats. The target is defined by creation
+  // time alone, not by what currently renders: unsent drafts and sub-agent
+  // children are not user-created chats, and render-time filters (hidden
+  // sub-agents, collapsed age tiers, draft promotion) do not change the answer.
+  const handleAddFlatWorkspace = () => {
+    const recentWorkspace = findMostRecentlyCreatedWorkspace(
+      excludeSubAgentRows(flatWorkspaces),
+      workspaceRecency
+    );
+    if (recentWorkspace) {
+      handleAddSiblingWorkspace(recentWorkspace);
+    } else {
+      handleAddScratchWorkspace();
+    }
+  };
+
+  const flatSidebarContent = (
+    <div className="py-1">
+      <button
+        onClick={handleAddFlatWorkspace}
+        className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
+      >
+        <Plus className="h-3.5 w-3.5" />
+        New chat
+      </button>
+      {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
+        tierKeyPrefix: "flat",
+        depthByWorkspaceId: flatDepthByWorkspaceId,
+        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+        renderRow: renderFlatRow,
+      })}
+      {flatDrafts.map(({ projectPath, draft }, index) => {
+        const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
+        if (promotedMetadata) {
+          // The just-created workspace renders in the draft's position while
+          // the draft entry is still present (grouped mode does the same).
+          const liveMetadata =
+            flatWorkspaces.find((workspace) => workspace.id === promotedMetadata.id) ??
+            promotedMetadata;
+          return <React.Fragment key={draft.draftId}>{renderFlatRow(liveMetadata)}</React.Fragment>;
+        }
+        const isSelected =
+          pendingNewWorkspaceProject === projectPath &&
+          pendingNewWorkspaceDraftId === draft.draftId;
+        const draftBadge = getFlatDraftBadge(projectPath, draft.subProjectPath);
+        return (
+          <DraftAgentListItemWrapper
+            key={draft.draftId}
+            projectPath={projectPath}
+            draftId={draft.draftId}
+            draftNumber={index + 1}
+            isSelected={isSelected}
+            projectBadgeName={draftBadge?.name}
+            projectBadgeColor={draftBadge?.color}
+            onVisibilityChange={(isVisible) => {
+              handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
+            }}
+            onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
+            onDelete={() => {
+              if (isSelected) {
+                // Mirror grouped-mode deletion: hand selection to an adjacent
+                // remaining draft, falling back to the project route only when
+                // this was the last one.
+                const fallback = flatDrafts[index + 1] ?? flatDrafts[index - 1];
+                if (fallback) {
+                  openWorkspaceDraft(fallback.projectPath, fallback.draft.draftId);
+                } else {
+                  navigateToProject(projectPath);
+                }
+              }
+              deleteWorkspaceDraft(projectPath, draft.draftId);
+            }}
+          />
+        );
+      })}
+      {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
+        tierKeyPrefix: "flat",
+        depthByWorkspaceId: flatDepthByWorkspaceId,
+        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+        renderRow: renderFlatRow,
+      })}
+    </div>
+  );
 
   return (
     <TitleEditProvider onUpdateTitle={onUpdateTitle}>
@@ -1737,7 +2576,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     className="shrink-0 cursor-pointer border-none bg-transparent p-0"
                     aria-label="Home"
                   >
-                    <MuxLogo className="h-5 w-[44px]" aria-hidden="true" />
+                    <XumLogo className="h-5 w-auto" aria-hidden="true" />
                   </button>
                 </div>
                 <button
@@ -1755,7 +2594,127 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 onViewportScroll={handleProjectListScroll}
                 viewportClassName="overflow-x-hidden"
               >
-                {multiProjectWorkspaces.length > 0 && (
+                {flatSidebarEnabled && flatSidebarContent}
+                {!flatSidebarEnabled && (
+                  <div>
+                    <div className={PROJECT_ITEM_BASE_CLASS}>
+                      <button
+                        onClick={() => toggleProject(SCRATCH_SIDEBAR_SECTION_ID)}
+                        aria-label={`${isScratchSectionExpanded ? "Collapse" : "Expand"} scratch chats`}
+                        className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                      >
+                        <ChevronRight
+                          className="h-4 w-4 transition-transform duration-200"
+                          style={{
+                            transform: isScratchSectionExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                          }}
+                        />
+                      </button>
+                      <div className="flex min-w-0 flex-1 items-center pr-1">
+                        <span className="text-foreground truncate text-sm font-medium">Chats</span>
+                        {(scratchWorkspaces.length > 0 || scratchDrafts.length > 0) && (
+                          <span className="text-muted ml-2 text-xs">
+                            ({topLevelScratchWorkspaces.length + scratchDrafts.length})
+                          </span>
+                        )}
+                      </div>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleAddScratchWorkspace();
+                            }}
+                            aria-label="New scratch chat"
+                            className="text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>New scratch chat</TooltipContent>
+                      </Tooltip>
+                    </div>
+                    {isScratchSectionExpanded && (
+                      <div className="pt-1 pb-1">
+                        {scratchDrafts.map((draft, index) => {
+                          const isSelected =
+                            pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY &&
+                            pendingNewWorkspaceDraftId === draft.draftId;
+                          return (
+                            <DraftAgentListItemWrapper
+                              key={draft.draftId}
+                              projectPath={SCRATCH_PROJECT_CONFIG_KEY}
+                              draftId={draft.draftId}
+                              draftNumber={index + 1}
+                              isSelected={isSelected}
+                              onVisibilityChange={(isVisible) => {
+                                handleDraftVisibilityChange(
+                                  SCRATCH_PROJECT_CONFIG_KEY,
+                                  draft.draftId,
+                                  isVisible
+                                );
+                              }}
+                              onOpen={() =>
+                                handleOpenWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId)
+                              }
+                              onDelete={() => {
+                                if (isSelected) {
+                                  navigateToProject(SCRATCH_PROJECT_CONFIG_KEY);
+                                }
+                                deleteWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId);
+                              }}
+                            />
+                          );
+                        })}
+                        {visibleScratchWorkspaces.map((metadata) => {
+                          const rowRenderMeta = scratchRowMetaByWorkspaceId.get(metadata.id);
+                          return (
+                            <AgentListItem
+                              key={metadata.id}
+                              metadata={metadata}
+                              projectPath={metadata.projectPath}
+                              projectName={metadata.projectName}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
+                              isArchiving={archivingWorkspaceIds.has(metadata.id)}
+                              isRemoving={
+                                removingWorkspaceIds.has(metadata.id) ||
+                                metadata.isRemoving === true
+                              }
+                              onSelectWorkspace={handleSelectWorkspace}
+                              onForkWorkspace={handleForkWorkspace}
+                              onArchiveWorkspace={handleArchiveWorkspace}
+                              onCancelCreation={handleCancelWorkspaceCreation}
+                              depth={
+                                rowRenderMeta?.depth ?? scratchDepthByWorkspaceId[metadata.id] ?? 0
+                              }
+                              pinnedReorderGroup={SCRATCH_PINNED_REORDER_GROUP}
+                              onPinnedReorderDrop={handlePinnedReorderDrop}
+                              rowRenderMeta={rowRenderMeta}
+                              isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+                              delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+                              hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+                              getWorkflowRunName={getWorkflowRunName}
+                              completedChildrenExpanded={expandedCompletedParentIds.has(
+                                metadata.id
+                              )}
+                              onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+                            />
+                          );
+                        })}
+                        {scratchWorkspaces.length === 0 && scratchDrafts.length === 0 && (
+                          <button
+                            onClick={handleAddScratchWorkspace}
+                            className="text-muted hover:bg-hover mx-2 w-[calc(100%-1rem)] rounded px-2 py-2 text-left text-xs"
+                          >
+                            Start a scratch chat
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {!flatSidebarEnabled && multiProjectWorkspaces.length > 0 && (
                   <div>
                     <div className={PROJECT_ITEM_BASE_CLASS}>
                       <button
@@ -1784,7 +2743,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                           Multi-Project
                         </span>
                         <span className="text-muted ml-2 text-xs">
-                          ({multiProjectWorkspaces.length})
+                          ({topLevelMultiProjectWorkspaces.length})
                         </span>
                       </div>
                     </div>
@@ -1799,7 +2758,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               metadata={metadata}
                               projectPath={metadata.projectPath}
                               projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
                               isArchiving={archivingWorkspaceIds.has(metadata.id)}
                               isRemoving={
                                 removingWorkspaceIds.has(metadata.id) ||
@@ -1814,7 +2773,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 multiProjectDepthByWorkspaceId[metadata.id] ??
                                 0
                               }
+                              pinnedReorderGroup={MULTI_PROJECT_PINNED_REORDER_GROUP}
+                              onPinnedReorderDrop={handlePinnedReorderDrop}
                               rowRenderMeta={rowRenderMeta}
+                              isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+                              delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+                              hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+                              getWorkflowRunName={getWorkflowRunName}
                               completedChildrenExpanded={expandedCompletedParentIds.has(
                                 metadata.id
                               )}
@@ -1827,40 +2792,76 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </div>
                 )}
 
-                {sortedProjectPaths.length === 0 && multiProjectWorkspaces.length === 0 ? (
+                {!flatSidebarEnabled &&
+                projectHeaderPaths.length === 0 &&
+                multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
                     <p className="text-muted mb-4 text-[13px]">No projects</p>
-                    <button
-                      onClick={() => onAddProject()}
-                      className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
-                    >
-                      Add Project
-                    </button>
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={handleAddScratchWorkspace}
+                        className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
+                      >
+                        Start a scratch chat
+                      </button>
+                      <button
+                        onClick={() => onAddProject()}
+                        className="border-border-light text-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
+                      >
+                        Add Project
+                      </button>
+                    </div>
                   </div>
                 ) : (
-                  sortedProjectPaths.map((projectPath) => {
-                    const config = userProjects.get(projectPath);
-                    if (!config) return null;
-                    const projectFolderColor = config.color
-                      ? resolveSectionColor(config.color)
-                      : undefined;
-                    const projectName = getProjectNameFromPath(projectPath);
-                    const sanitizedProjectId =
-                      projectPath.replace(/[^a-zA-Z0-9_-]/g, "-") || "root";
-                    const workspaceListId = `workspace-list-${sanitizedProjectId}`;
-                    const isExpanded = expandedProjectsList.includes(projectPath);
-                    const displayProjectName =
-                      config.displayName ?? getProjectFallbackLabel(projectPath);
-                    const isEditingProjectDisplayName = editingProjectPath === projectPath;
-                    const projectWorkspaces =
-                      singleProjectWorkspacesByProject.get(projectPath) ?? [];
-                    const projectAgentCount = projectWorkspaces.length;
-                    const projectHasAttention = projectWorkspaces.some(
-                      (workspace) => workspaceAttentionById.get(workspace.id) === true
-                    );
+                  <>
+                    {flatSidebarEnabled && projectHeaderPaths.length > 0 && (
+                      <div className="text-muted border-hover mt-1 border-t px-3 py-2 text-xs font-medium">
+                        Projects
+                      </div>
+                    )}
+                    {projectHeaderPaths.map((projectPath) => {
+                      const config = userProjects.get(projectPath);
+                      if (!config) return null;
+                      const projectFolderColor = config.color
+                        ? resolveSectionColor(config.color)
+                        : undefined;
+                      const projectName = getProjectNameFromPath(projectPath);
+                      const sanitizedProjectId =
+                        projectPath.replace(/[^a-zA-Z0-9_-]/g, "-") || "root";
+                      const workspaceListId = `workspace-list-${sanitizedProjectId}`;
+                      const isExpanded = expandedProjectsList.includes(projectPath);
+                      const displayProjectName =
+                        config.displayName ?? getProjectFallbackLabel(projectPath);
+                      const isEditingProjectDisplayName = editingProjectPath === projectPath;
+                      const projectWorkspaces =
+                        singleProjectWorkspacesByProject.get(projectPath) ?? [];
+                      const topLevelProjectWorkspaces = excludeSubAgentRows(projectWorkspaces);
+                      const projectAgentCount = topLevelProjectWorkspaces.length;
+                      const projectHasAttention = projectWorkspaces.some(
+                        (workspace) => workspaceAttentionById.get(workspace.id) === true
+                      );
 
-                    return (
-                      <div key={projectPath}>
+                      // Shared by the grouped section drop zones and the flat
+                      // management rows so chats can be assigned to (or cleared
+                      // from) a sub-project in both modes.
+                      const handleWorkspaceSectionDrop = (
+                        workspaceId: string,
+                        targetSectionId: string | null
+                      ) => {
+                        void (async () => {
+                          const result = await assignWorkspaceToSubProject(
+                            projectPath,
+                            workspaceId,
+                            targetSectionId
+                          );
+                          if (result.success) {
+                            // Refresh workspace metadata so UI shows updated sectionId
+                            await refreshWorkspaceMetadata();
+                          }
+                        })();
+                      };
+
+                      const projectHeaderRow = (
                         <DraggableProjectItem
                           projectPath={projectPath}
                           onReorder={handleReorder}
@@ -1892,44 +2893,57 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                           }}
                           role="button"
                           tabIndex={0}
-                          aria-expanded={isExpanded}
-                          aria-controls={workspaceListId}
+                          aria-expanded={flatSidebarEnabled ? undefined : isExpanded}
+                          aria-controls={flatSidebarEnabled ? undefined : workspaceListId}
                           aria-label={`Create workspace in ${projectName}`}
                           data-project-path={projectPath}
                         >
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              toggleProject(projectPath);
-                            }}
-                            aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
-                            data-project-path={projectPath}
-                            className={PROJECT_TOGGLE_BUTTON_CLASSES}
-                          >
-                            <span className="relative flex h-4 w-4 items-center justify-center">
-                              <ChevronRight
-                                className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                style={{
-                                  transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                }}
+                          {flatSidebarEnabled ? (
+                            // Flat mode has no per-project chat nesting to
+                            // expand, so the folder renders as a static icon.
+                            <span className="text-secondary mr-1.5 flex h-5 w-5 shrink-0 items-center justify-center">
+                              <Folder
+                                className="h-4 w-4"
+                                style={
+                                  projectFolderColor ? { color: projectFolderColor } : undefined
+                                }
                               />
-                              {isExpanded ? (
-                                <FolderOpen
-                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                  style={
-                                    projectFolderColor ? { color: projectFolderColor } : undefined
-                                  }
-                                />
-                              ) : (
-                                <Folder
-                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                  style={
-                                    projectFolderColor ? { color: projectFolderColor } : undefined
-                                  }
-                                />
-                              )}
                             </span>
-                          </button>
+                          ) : (
+                            <button
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleProject(projectPath);
+                              }}
+                              aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
+                              data-project-path={projectPath}
+                              className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                            >
+                              <span className="relative flex h-4 w-4 items-center justify-center">
+                                <ChevronRight
+                                  className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                                  style={{
+                                    transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                  }}
+                                />
+                                {isExpanded ? (
+                                  <FolderOpen
+                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                    style={
+                                      projectFolderColor ? { color: projectFolderColor } : undefined
+                                    }
+                                  />
+                                ) : (
+                                  <Folder
+                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                    style={
+                                      projectFolderColor ? { color: projectFolderColor } : undefined
+                                    }
+                                  />
+                                )}
+                              </span>
+                            </button>
+                          )}
                           <div
                             className="flex min-w-0 flex-1 items-center pr-1"
                             onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
@@ -2042,759 +3056,79 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             <TooltipContent align="end">Project options</TooltipContent>
                           </Tooltip>
                         </DraggableProjectItem>
+                      );
 
-                        {isExpanded && (
-                          <div
-                            id={workspaceListId}
-                            role="region"
-                            aria-label={`Workspaces for ${projectName}`}
-                            className="pt-1"
-                          >
-                            {(() => {
-                              // Archived workspaces are excluded from workspaceMetadata so won't appear here
+                      return (
+                        <div key={projectPath}>
+                          {flatSidebarEnabled ? (
+                            // Dropping a chat on the project header clears its
+                            // sub-project assignment, mirroring the grouped
+                            // unsectioned drop zone.
+                            <WorkspaceSectionDropZone
+                              projectPath={projectPath}
+                              sectionId={null}
+                              onDrop={handleWorkspaceSectionDrop}
+                              testId={`flat-unsection-drop-${sanitizedProjectId}`}
+                            >
+                              {projectHeaderRow}
+                            </WorkspaceSectionDropZone>
+                          ) : (
+                            projectHeaderRow
+                          )}
 
-                              const draftsForProject = workspaceDraftsByProject[projectPath] ?? [];
-                              const activeDraftIds = new Set(
-                                draftsForProject.map((draft) => draft.draftId)
-                              );
-                              const draftPromotionsForProject =
-                                workspaceDraftPromotionsByProject[projectPath] ?? {};
-                              const activeDraftPromotions = Object.fromEntries(
-                                Object.entries(draftPromotionsForProject).filter(([draftId]) =>
-                                  activeDraftIds.has(draftId)
-                                )
-                              );
-                              const promotedWorkspaceIds = new Set(
-                                Object.values(activeDraftPromotions).map((metadata) => metadata.id)
-                              );
-                              const workspacesForNormalRendering = projectWorkspaces.filter(
-                                (workspace) => !promotedWorkspaceIds.has(workspace.id)
-                              );
-                              const sections: SectionConfig[] = getSubProjectsForParent(
-                                projectPath,
-                                userProjects
-                              ).map(([subProjectPath, subProjectConfig]) => ({
-                                id: subProjectPath,
-                                name: getProjectDisplayName(subProjectPath, subProjectConfig),
-                                color: subProjectConfig.color,
-                              }));
-                              const depthByWorkspaceId =
-                                computeWorkspaceDepthMap(projectWorkspaces);
-                              const visibleWorkspacesForNormalRendering = filterVisibleAgentRows(
-                                workspacesForNormalRendering,
-                                expandedCompletedParentIds
-                              );
-                              const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
-                                workspacesForNormalRendering,
-                                depthByWorkspaceId,
-                                expandedCompletedParentIds
-                              );
-                              const sortedDrafts = draftsForProject
-                                .slice()
-                                .sort((a, b) => b.createdAt - a.createdAt);
-                              const draftVisibilityForProject =
-                                draftVisibilityByProject[projectPath] ?? {};
-                              const hasVisibleDrafts = sortedDrafts.some((draft) => {
-                                const reactiveVisibility = draftVisibilityForProject[draft.draftId];
-                                return (
-                                  reactiveVisibility ?? isDraftVisible(projectPath, draft.draftId)
+                          {/* Flat mode keeps sub-project management reachable:
+                              the same SectionHeader controls (scoped new chat,
+                              rename, color, delete) render as compact rows with
+                              nothing nested beneath them. */}
+                          {flatSidebarEnabled &&
+                            getSubProjectsForParent(projectPath, userProjects).map(
+                              ([subProjectPath, subProjectConfig]) => {
+                                const sectionRows = topLevelProjectWorkspaces.filter(
+                                  (workspace) => workspace.subProjectPath === subProjectPath
                                 );
-                              });
-                              const projectHasNoAgentsOrDrafts =
-                                projectWorkspaces.length === 0 && !hasVisibleDrafts;
-                              const draftNumberById = new Map(
-                                sortedDrafts.map(
-                                  (draft, index) => [draft.draftId, index + 1] as const
-                                )
-                              );
-                              const getDraftSectionId = (
-                                draft: (typeof sortedDrafts)[number]
-                              ): string | null =>
-                                typeof draft.subProjectPath === "string" &&
-                                userProjects.get(draft.subProjectPath)?.parentProjectPath ===
-                                  projectPath
-                                  ? draft.subProjectPath
-                                  : null;
-
-                              // Drafts can reference a section that has since been deleted.
-                              // Treat those as unsectioned so they remain accessible.
-                              const unsectionedDrafts: typeof sortedDrafts = [];
-                              const draftsBySectionId = new Map<string, typeof sortedDrafts>();
-                              for (const draft of sortedDrafts) {
-                                const sectionId = getDraftSectionId(draft);
-                                if (sectionId === null) {
-                                  unsectionedDrafts.push(draft);
-                                  continue;
-                                }
-
-                                const existing = draftsBySectionId.get(sectionId);
-                                if (existing) {
-                                  existing.push(draft);
-                                } else {
-                                  draftsBySectionId.set(sectionId, [draft]);
-                                }
-                              }
-
-                              const renderWorkspace = (
-                                metadata: FrontendWorkspaceMetadata,
-                                sectionId?: string,
-                                rowRenderMetaOverride?: AgentRowRenderMeta | null,
-                                depthOverride?: number,
-                                keyOverride?: string,
-                                subAgentConnectorLayout?: "default" | "task-group-member"
-                              ) => {
-                                const rowRenderMeta =
-                                  rowRenderMetaOverride === undefined
-                                    ? baseRowMetaByWorkspaceId.get(metadata.id)
-                                    : (rowRenderMetaOverride ?? undefined);
-
-                                return (
-                                  <AgentListItem
-                                    key={keyOverride ?? metadata.id}
-                                    metadata={metadata}
-                                    projectPath={projectPath}
-                                    projectName={projectName}
-                                    isSelected={selectedWorkspace?.workspaceId === metadata.id}
-                                    isArchiving={archivingWorkspaceIds.has(metadata.id)}
-                                    isRemoving={
-                                      removingWorkspaceIds.has(metadata.id) ||
-                                      metadata.isRemoving === true
-                                    }
-                                    onSelectWorkspace={handleSelectWorkspace}
-                                    onForkWorkspace={handleForkWorkspace}
-                                    onStopRuntime={handleStopRuntime}
-                                    onArchiveWorkspace={handleArchiveWorkspace}
-                                    onCancelCreation={handleCancelWorkspaceCreation}
-                                    depth={
-                                      depthOverride ??
-                                      rowRenderMeta?.depth ??
-                                      depthByWorkspaceId[metadata.id] ??
-                                      0
-                                    }
-                                    sectionId={sectionId}
-                                    rowRenderMeta={rowRenderMeta}
-                                    subAgentConnectorLayout={subAgentConnectorLayout}
-                                    completedChildrenExpanded={expandedCompletedParentIds.has(
-                                      metadata.id
-                                    )}
-                                    onToggleCompletedChildren={toggleCompletedChildrenExpansion}
-                                  />
-                                );
-                              };
-
-                              const renderWorkspaceRowsWithTaskGroupCoalescing = ({
-                                rows,
-                                allRows,
-                                sectionId,
-                                rowMetaByWorkspaceId,
-                              }: {
-                                rows: FrontendWorkspaceMetadata[];
-                                allRows: FrontendWorkspaceMetadata[];
-                                sectionId?: string;
-                                rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                              }): React.ReactNode[] => {
-                                if (rows.length === 0) {
-                                  return [];
-                                }
-
-                                const childrenByParentId = new Map<
-                                  string,
-                                  FrontendWorkspaceMetadata[]
-                                >();
-                                for (const workspace of allRows) {
-                                  const parentId = workspace.parentWorkspaceId;
-                                  if (!parentId) {
-                                    continue;
-                                  }
-                                  const children = childrenByParentId.get(parentId) ?? [];
-                                  children.push(workspace);
-                                  childrenByParentId.set(parentId, children);
-                                }
-
-                                const getTaskGroupId = (
-                                  workspace: FrontendWorkspaceMetadata
-                                ): string | null => {
-                                  const groupId = workspace.bestOf?.groupId;
-                                  if (!groupId || !workspace.parentWorkspaceId) {
-                                    return null;
-                                  }
-                                  if ((workspace.bestOf?.total ?? 1) < 2) {
-                                    return null;
-                                  }
-                                  const hasChildren = childrenByParentId.has(workspace.id);
-                                  return hasChildren ? null : groupId;
-                                };
-
-                                const allMembersByGroupId = new Map<
-                                  string,
-                                  FrontendWorkspaceMetadata[]
-                                >();
-                                for (const workspace of allRows) {
-                                  const groupId = getTaskGroupId(workspace);
-                                  if (!groupId) {
-                                    continue;
-                                  }
-                                  const group = allMembersByGroupId.get(groupId) ?? [];
-                                  group.push(workspace);
-                                  allMembersByGroupId.set(groupId, group);
-                                }
-
-                                const visibleMembersByGroupId = new Map<
-                                  string,
-                                  FrontendWorkspaceMetadata[]
-                                >();
-                                for (const workspace of rows) {
-                                  const groupId = getTaskGroupId(workspace);
-                                  if (!groupId) {
-                                    continue;
-                                  }
-                                  const group = visibleMembersByGroupId.get(groupId) ?? [];
-                                  group.push(workspace);
-                                  visibleMembersByGroupId.set(groupId, group);
-                                }
-
-                                const indexByWorkspaceId = new Map(
-                                  rows.map((workspace, index) => [workspace.id, index] as const)
-                                );
-                                const validGroupIds = new Set<string>();
-                                for (const [groupId, visibleMembers] of visibleMembersByGroupId) {
-                                  const allMembers = allMembersByGroupId.get(groupId) ?? [];
-                                  if (visibleMembers.length < 2 || allMembers.length < 2) {
-                                    continue;
-                                  }
-                                  const indices = visibleMembers
-                                    .map((workspace) => indexByWorkspaceId.get(workspace.id))
-                                    .filter((index): index is number => index != null);
-                                  if (indices.length !== visibleMembers.length) {
-                                    continue;
-                                  }
-                                  const firstIndex = Math.min(...indices);
-                                  const lastIndex = Math.max(...indices);
-                                  if (lastIndex - firstIndex + 1 !== visibleMembers.length) {
-                                    continue;
-                                  }
-                                  validGroupIds.add(groupId);
-                                }
-
-                                const skippedWorkspaceIds = new Set<string>();
-                                const renderedRows: React.ReactNode[] = [];
-
-                                for (const workspace of rows) {
-                                  if (skippedWorkspaceIds.has(workspace.id)) {
-                                    continue;
-                                  }
-
-                                  const taskGroupId = getTaskGroupId(workspace);
-                                  if (!taskGroupId || !validGroupIds.has(taskGroupId)) {
-                                    renderedRows.push(
-                                      renderWorkspace(
-                                        workspace,
-                                        sectionId,
-                                        rowMetaByWorkspaceId.get(workspace.id)
-                                      )
-                                    );
-                                    continue;
-                                  }
-
-                                  const visibleMembers =
-                                    visibleMembersByGroupId.get(taskGroupId) ?? [];
-                                  if (visibleMembers[0]?.id !== workspace.id) {
-                                    continue;
-                                  }
-
-                                  for (const member of visibleMembers) {
-                                    skippedWorkspaceIds.add(member.id);
-                                  }
-
-                                  const sortTaskGroupMembers = (
-                                    members: FrontendWorkspaceMetadata[]
-                                  ): FrontendWorkspaceMetadata[] => {
-                                    return [...members].sort(
-                                      (left, right) =>
-                                        (left.bestOf?.index ?? Number.MAX_SAFE_INTEGER) -
-                                          (right.bestOf?.index ?? Number.MAX_SAFE_INTEGER) ||
-                                        left.id.localeCompare(right.id)
-                                    );
-                                  };
-                                  const allMembers = sortTaskGroupMembers(
-                                    allMembersByGroupId.get(taskGroupId) ?? visibleMembers
-                                  );
-                                  const sortedVisibleMembers = sortTaskGroupMembers(visibleMembers);
-                                  const depth =
-                                    rowMetaByWorkspaceId.get(workspace.id)?.depth ??
-                                    depthByWorkspaceId[workspace.id] ??
-                                    0;
-                                  const totalCount = Math.max(
-                                    allMembers[0]?.bestOf?.total ?? allMembers.length,
-                                    allMembers.length
-                                  );
-                                  const groupKind = getTaskGroupKindFromMetadata(
-                                    allMembers[0]?.bestOf
-                                  );
-                                  let completedCount = 0;
-                                  let runningCount = 0;
-                                  let queuedCount = 0;
-                                  let interruptedCount = 0;
-                                  for (const member of allMembers) {
-                                    const hasCompletedReport = hasCompletedAgentReport(member);
-                                    if (hasCompletedReport) {
-                                      completedCount += 1;
-                                      continue;
-                                    }
-                                    if (
-                                      member.taskStatus === "running" ||
-                                      member.taskStatus === "awaiting_report"
-                                    ) {
-                                      runningCount += 1;
-                                      continue;
-                                    }
-                                    if (member.taskStatus === "queued") {
-                                      queuedCount += 1;
-                                      continue;
-                                    }
-                                    if (member.taskStatus === "interrupted") {
-                                      interruptedCount += 1;
-                                    }
-                                  }
-                                  const groupTitle =
-                                    allMembers[0]?.title ?? allMembers[0]?.name ?? "Task group";
-                                  const isExpanded = expandedTaskGroups[taskGroupId] ?? false;
-
-                                  renderedRows.push(
-                                    <TaskGroupListItem
-                                      key={`task-group:${taskGroupId}`}
-                                      groupId={taskGroupId}
-                                      title={groupTitle}
-                                      kind={groupKind}
-                                      sectionId={sectionId}
-                                      depth={depth}
-                                      totalCount={totalCount}
-                                      visibleCount={sortedVisibleMembers.length}
-                                      completedCount={completedCount}
-                                      runningCount={runningCount}
-                                      queuedCount={queuedCount}
-                                      interruptedCount={interruptedCount}
-                                      isExpanded={isExpanded}
-                                      isSelected={allMembers.some(
-                                        (member) => member.id === selectedWorkspace?.workspaceId
-                                      )}
-                                      onToggle={() => {
-                                        toggleTaskGroupExpansion(taskGroupId);
-                                      }}
-                                    />
-                                  );
-
-                                  if (isExpanded) {
-                                    for (const member of sortedVisibleMembers) {
-                                      renderedRows.push(
-                                        renderWorkspace(
-                                          member,
-                                          sectionId,
-                                          rowMetaByWorkspaceId.get(member.id) ?? null,
-                                          getTaskGroupMemberDepth(depth),
-                                          `task-group-member:${taskGroupId}:${member.id}`,
-                                          "task-group-member"
-                                        )
-                                      );
-                                    }
-                                  }
-                                }
-
-                                return renderedRows;
-                              };
-
-                              const renderDraft = (
-                                draft: (typeof sortedDrafts)[number]
-                              ): React.ReactNode => {
-                                const sectionId = getDraftSectionId(draft);
-                                const promotedMetadata = activeDraftPromotions[draft.draftId];
-
-                                if (promotedMetadata) {
-                                  const liveMetadata =
-                                    projectWorkspaces.find(
-                                      (workspace) => workspace.id === promotedMetadata.id
-                                    ) ?? promotedMetadata;
-                                  return renderWorkspace(liveMetadata, sectionId ?? undefined);
-                                }
-
-                                const draftNumber = draftNumberById.get(draft.draftId) ?? 0;
-                                const isSelected =
-                                  pendingNewWorkspaceProject === projectPath &&
-                                  pendingNewWorkspaceDraftId === draft.draftId;
-
-                                return (
-                                  <DraftAgentListItemWrapper
-                                    key={draft.draftId}
-                                    projectPath={projectPath}
-                                    draftId={draft.draftId}
-                                    draftNumber={draftNumber}
-                                    isSelected={isSelected}
-                                    sectionId={sectionId ?? undefined}
-                                    onVisibilityChange={(isVisible) => {
-                                      handleDraftVisibilityChange(
-                                        projectPath,
-                                        draft.draftId,
-                                        isVisible
-                                      );
-                                    }}
-                                    onOpen={() =>
-                                      handleOpenWorkspaceDraft(projectPath, draft.draftId)
-                                    }
-                                    onDelete={() => {
-                                      if (isSelected) {
-                                        const currentIndex = sortedDrafts.findIndex(
-                                          (d) => d.draftId === draft.draftId
-                                        );
-                                        const fallback =
-                                          currentIndex >= 0
-                                            ? (sortedDrafts[currentIndex + 1] ??
-                                              sortedDrafts[currentIndex - 1])
-                                            : undefined;
-
-                                        if (fallback) {
-                                          openWorkspaceDraft(projectPath, fallback.draftId);
-                                        } else {
-                                          navigateToProject(sectionId ?? projectPath);
-                                        }
-                                      }
-
-                                      deleteWorkspaceDraft(projectPath, draft.draftId);
-                                    }}
-                                  />
-                                );
-                              };
-
-                              // Render age tiers for a list of workspaces
-                              const renderAgeTiers = (
-                                workspaces: FrontendWorkspaceMetadata[],
-                                tierKeyPrefix: string,
-                                sectionId?: string,
-                                allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
-                              ): React.ReactNode => {
-                                const { recent: topVisibleRows, buckets } =
-                                  partitionWorkspacesByAge(workspaces, workspaceRecency);
-
-                                const expandedTierVisibleIds = new Set<string>();
-                                const markExpandedTierRowsVisible = (tierIndex: number): void => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
-                                  if (remainingCount === 0) {
-                                    return;
-                                  }
-
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  if (!isTierExpanded) {
-                                    return;
-                                  }
-
-                                  for (const workspace of bucket) {
-                                    expandedTierVisibleIds.add(workspace.id);
-                                  }
-
-                                  const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
-                                  if (nextTier !== -1) {
-                                    markExpandedTierRowsVisible(nextTier);
-                                  }
-                                };
-
-                                const firstTier = findNextNonEmptyTier(buckets, 0);
-                                if (firstTier !== -1) {
-                                  markExpandedTierRowsVisible(firstTier);
-                                }
-
-                                // Connector geometry should match the rows users can currently see,
-                                // not hidden siblings parked behind collapsed age tiers.
-                                const visibleRowIds = new Set<string>([
-                                  ...topVisibleRows.map((workspace) => workspace.id),
-                                  ...expandedTierVisibleIds,
-                                ]);
-                                const visibleRows = workspaces.filter((workspace) =>
-                                  visibleRowIds.has(workspace.id)
-                                );
-                                const visibleRowsById = new Map(
-                                  visibleRows.map((workspace) => [workspace.id, workspace])
-                                );
-                                const visibleChildrenByParent = new Map<
-                                  string,
-                                  FrontendWorkspaceMetadata[]
-                                >();
-                                for (const workspace of visibleRows) {
-                                  const parentId = workspace.parentWorkspaceId;
-                                  if (!parentId) {
-                                    continue;
-                                  }
-
-                                  const siblings = visibleChildrenByParent.get(parentId) ?? [];
-                                  siblings.push(workspace);
-                                  visibleChildrenByParent.set(parentId, siblings);
-                                }
-
-                                const rowMetaByVisibleWorkspaceId = new Map<
-                                  string,
-                                  AgentRowRenderMeta
-                                >();
-                                for (const workspace of visibleRows) {
-                                  const baseRowMeta = baseRowMetaByWorkspaceId.get(workspace.id);
-                                  if (!baseRowMeta) {
-                                    continue;
-                                  }
-
-                                  const parentId = workspace.parentWorkspaceId;
-                                  if (!parentId) {
-                                    rowMetaByVisibleWorkspaceId.set(workspace.id, {
-                                      ...baseRowMeta,
-                                      ancestorTrunks: [],
-                                    });
-                                    continue;
-                                  }
-
-                                  const siblings = visibleChildrenByParent.get(parentId) ?? [];
-                                  const siblingIndex = siblings.findIndex(
-                                    (sibling) => sibling.id === workspace.id
-                                  );
-                                  let connectorPosition: AgentRowRenderMeta["connectorPosition"] =
-                                    "single";
-                                  if (siblings.length > 1) {
-                                    connectorPosition =
-                                      siblings[siblings.length - 1]?.id === workspace.id
-                                        ? "last"
-                                        : "middle";
-                                  }
-
-                                  let lastRunningSiblingIndex = -1;
-                                  for (let index = siblings.length - 1; index >= 0; index -= 1) {
-                                    if (siblings[index]?.taskStatus === "running") {
-                                      lastRunningSiblingIndex = index;
-                                      break;
-                                    }
-                                  }
-
-                                  const connectorStartsAtParent = siblingIndex === 0;
-                                  const sharedTrunkActiveThroughRow =
-                                    siblingIndex >= 0 &&
-                                    lastRunningSiblingIndex >= 0 &&
-                                    siblingIndex <= lastRunningSiblingIndex;
-                                  const sharedTrunkActiveBelowRow =
-                                    siblingIndex >= 0 &&
-                                    lastRunningSiblingIndex >= 0 &&
-                                    siblingIndex < lastRunningSiblingIndex;
-
-                                  const ancestorTrunks: Array<{
-                                    depth: number;
-                                    active: boolean;
-                                  }> = [];
-                                  const visitedAncestorIds = new Set<string>();
-                                  let ancestorId: string | undefined = parentId;
-                                  while (ancestorId && !visitedAncestorIds.has(ancestorId)) {
-                                    visitedAncestorIds.add(ancestorId);
-
-                                    const ancestorWorkspace = visibleRowsById.get(ancestorId);
-                                    if (!ancestorWorkspace) {
-                                      break;
-                                    }
-
-                                    const ancestorMeta =
-                                      rowMetaByVisibleWorkspaceId.get(ancestorId) ??
-                                      baseRowMetaByWorkspaceId.get(ancestorId);
-                                    const ancestorDepth = depthByWorkspaceId[ancestorId] ?? 0;
-                                    if (
-                                      ancestorDepth > 0 &&
-                                      ancestorMeta?.connectorPosition === "middle"
-                                    ) {
-                                      ancestorTrunks.push({
-                                        depth: ancestorDepth,
-                                        active: ancestorMeta.sharedTrunkActiveBelowRow,
-                                      });
-                                    }
-
-                                    ancestorId = ancestorWorkspace.parentWorkspaceId;
-                                  }
-                                  ancestorTrunks.sort((left, right) => left.depth - right.depth);
-
-                                  rowMetaByVisibleWorkspaceId.set(workspace.id, {
-                                    ...baseRowMeta,
-                                    connectorPosition,
-                                    connectorStartsAtParent,
-                                    sharedTrunkActiveThroughRow,
-                                    sharedTrunkActiveBelowRow,
-                                    ancestorTrunks,
-                                  });
-                                }
-
-                                const renderTier = (tierIndex: number): React.ReactNode => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, b) => sum + b.length, 0);
-
-                                  if (remainingCount === 0) return null;
-
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
-                                  const thresholdLabel = formatDaysThreshold(thresholdDays);
-                                  const displayCount = isTierExpanded
-                                    ? bucket.length
-                                    : remainingCount;
-
-                                  return (
-                                    <React.Fragment key={tierKey}>
-                                      <button
-                                        onClick={() => {
-                                          setExpandedOldWorkspaces((prev) => ({
-                                            ...prev,
-                                            [tierKey]: !prev[tierKey],
-                                          }));
-                                        }}
-                                        aria-label={
-                                          isTierExpanded
-                                            ? `Collapse workspaces older than ${thresholdLabel}`
-                                            : `Expand workspaces older than ${thresholdLabel}`
-                                        }
-                                        aria-expanded={isTierExpanded}
-                                        className="text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 pl-7 text-xs font-medium transition-all duration-150 hover:bg-white/3"
-                                      >
-                                        <span
-                                          className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
-                                          style={{
-                                            transform: isTierExpanded
-                                              ? "rotate(90deg)"
-                                              : "rotate(0deg)",
-                                          }}
-                                        >
-                                          <ChevronRight className="h-4 w-4" />
-                                        </span>
-                                        <div className="flex items-center gap-1.5">
-                                          <span>Older than {thresholdLabel}</span>
-                                          <span className="text-dim font-normal">
-                                            ({displayCount})
-                                          </span>
-                                        </div>
-                                      </button>
-                                      {isTierExpanded && (
-                                        <>
-                                          {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                            rows: bucket,
-                                            allRows: allRowsForTaskGroupCoalescing,
-                                            sectionId,
-                                            rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                          })}
-                                          {(() => {
-                                            const nextTier = findNextNonEmptyTier(
-                                              buckets,
-                                              tierIndex + 1
-                                            );
-                                            return nextTier !== -1 ? renderTier(nextTier) : null;
-                                          })()}
-                                        </>
-                                      )}
-                                    </React.Fragment>
-                                  );
-                                };
-
-                                return (
-                                  <>
-                                    {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                      rows: topVisibleRows,
-                                      allRows: allRowsForTaskGroupCoalescing,
-                                      sectionId,
-                                      rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                    })}
-                                    {firstTier !== -1 && renderTier(firstTier)}
-                                  </>
-                                );
-                              };
-
-                              // Partition both the full section membership and the filtered visible rows.
-                              // Best-of grouping stays leaf-only by consulting the unfiltered section data,
-                              // while actual rendering still follows the visible hierarchy.
-                              const {
-                                unsectioned: allUnsectionedForNormalRendering,
-                                bySectionId: allBySectionIdForNormalRendering,
-                              } = partitionWorkspacesBySection(
-                                workspacesForNormalRendering,
-                                sections
-                              );
-                              const { unsectioned, bySectionId } = partitionWorkspacesBySection(
-                                visibleWorkspacesForNormalRendering,
-                                sections
-                              );
-
-                              // Handle workspace drop into section
-                              const handleWorkspaceSectionDrop = (
-                                workspaceId: string,
-                                targetSectionId: string | null
-                              ) => {
-                                void (async () => {
-                                  const result = await assignWorkspaceToSubProject(
-                                    projectPath,
-                                    workspaceId,
-                                    targetSectionId
-                                  );
-                                  if (result.success) {
-                                    // Refresh workspace metadata so UI shows updated sectionId
-                                    await refreshWorkspaceMetadata();
-                                  }
-                                })();
-                              };
-
-                              // Render section with its workspaces
-                              const renderSection = (section: SectionConfig) => {
-                                const sectionWorkspaces = bySectionId.get(section.id) ?? [];
-                                const sectionAllWorkspaces =
-                                  allBySectionIdForNormalRendering.get(section.id) ?? [];
-                                const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
-                                const sectionHasPromotedAttention = sectionDrafts.some((draft) => {
-                                  const promotedMetadata = activeDraftPromotions[draft.draftId];
-                                  return promotedMetadata
-                                    ? workspaceAttentionById.get(promotedMetadata.id) === true
-                                    : false;
-                                });
-                                const sectionHasAttention =
-                                  sectionAllWorkspaces.some(
-                                    (workspace) => workspaceAttentionById.get(workspace.id) === true
-                                  ) || sectionHasPromotedAttention;
-
-                                const sectionExpandedKey = getSectionExpandedKey(
-                                  projectPath,
-                                  section.id
-                                );
-                                const isSectionExpanded =
-                                  expandedSections[sectionExpandedKey] ?? true;
+                                // Grouped mode counts a section's drafts too;
+                                // mirror that so toggling modes never changes
+                                // the displayed count.
+                                const sectionDraftCount = (
+                                  workspaceDraftsByProject[projectPath] ?? []
+                                ).filter((draft) => draft.subProjectPath === subProjectPath).length;
                                 const shouldAutoEditSection =
                                   autoEditingSection?.projectPath === projectPath &&
-                                  autoEditingSection?.sectionId === section.id;
-
+                                  autoEditingSection?.sectionId === subProjectPath;
                                 return (
                                   <WorkspaceSectionDropZone
-                                    key={section.id}
+                                    key={subProjectPath}
                                     projectPath={projectPath}
-                                    sectionId={section.id}
+                                    sectionId={subProjectPath}
                                     onDrop={handleWorkspaceSectionDrop}
+                                    className="pl-4"
                                   >
                                     <SectionHeader
-                                      section={section}
-                                      isExpanded={isSectionExpanded}
-                                      workspaceCount={
-                                        sectionWorkspaces.length + sectionDrafts.length
-                                      }
-                                      hasAttention={sectionHasAttention}
-                                      onToggleExpand={() => toggleSection(projectPath, section.id)}
+                                      section={{
+                                        id: subProjectPath,
+                                        name: getProjectDisplayName(
+                                          subProjectPath,
+                                          subProjectConfig
+                                        ),
+                                        color: subProjectConfig.color,
+                                      }}
+                                      isExpanded={false}
+                                      workspaceCount={sectionRows.length + sectionDraftCount}
+                                      hasAttention={sectionRows.some(
+                                        (workspace) =>
+                                          workspaceAttentionById.get(workspace.id) === true
+                                      )}
                                       onAddWorkspace={() => {
-                                        // Create workspace in this section
-                                        handleAddWorkspace(projectPath, section.id);
+                                        handleAddWorkspace(projectPath, subProjectPath);
                                       }}
                                       onRename={(name) => {
                                         if (shouldAutoEditSection) {
                                           setAutoEditingSection(null);
                                         }
-                                        void updateDisplayName(section.id, name);
+                                        void updateDisplayName(subProjectPath, name);
                                       }}
                                       onChangeColor={(color) => {
-                                        void updateProjectColor(section.id, color);
+                                        void updateProjectColor(subProjectPath, color);
                                       }}
                                       autoStartEditing={shouldAutoEditSection}
                                       onAutoCreateAbandon={
@@ -2802,7 +3136,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                           ? () => {
                                               void (async () => {
                                                 setAutoEditingSection(null);
-                                                await handleRemoveSection(projectPath, section.id);
+                                                await handleRemoveSection(
+                                                  projectPath,
+                                                  subProjectPath
+                                                );
                                               })();
                                             }
                                           : undefined
@@ -2815,85 +3152,462 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                           : undefined
                                       }
                                       onDelete={(anchorEl) => {
-                                        void handleRemoveSection(projectPath, section.id, anchorEl);
+                                        void handleRemoveSection(
+                                          projectPath,
+                                          subProjectPath,
+                                          anchorEl
+                                        );
                                       }}
                                     />
-                                    {isSectionExpanded && (
-                                      <div className="pb-1">
-                                        {sectionDrafts.map((draft) => renderDraft(draft))}
-                                        {sectionWorkspaces.length > 0 ? (
-                                          renderAgeTiers(
-                                            sectionWorkspaces,
-                                            getSectionTierKey(projectPath, section.id, 0).replace(
-                                              ":tier:0",
-                                              ":tier"
-                                            ),
-                                            section.id,
-                                            sectionAllWorkspaces
-                                          )
-                                        ) : sectionDrafts.length === 0 ? (
-                                          <div className="text-muted px-3 py-2 text-center text-xs italic">
-                                            No chats in this sub-project
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                    )}
                                   </WorkspaceSectionDropZone>
                                 );
-                              };
+                              }
+                            )}
 
-                              return (
-                                <>
-                                  {projectHasNoAgentsOrDrafts && (
-                                    <div className="text-content-disabled py-2 pl-12 text-xs">
-                                      Empty
-                                    </div>
-                                  )}
-                                  {/* Unsectioned workspaces first - always show drop zone when sections exist */}
-                                  {sections.length > 0 ? (
-                                    <WorkspaceSectionDropZone
+                          {!flatSidebarEnabled && isExpanded && (
+                            <div
+                              id={workspaceListId}
+                              role="region"
+                              aria-label={`Workspaces for ${projectName}`}
+                              className="pt-1"
+                            >
+                              {(() => {
+                                // Archived workspaces are excluded from workspaceMetadata so won't appear here
+
+                                const draftsForProject =
+                                  workspaceDraftsByProject[projectPath] ?? [];
+                                const activeDraftIds = new Set(
+                                  draftsForProject.map((draft) => draft.draftId)
+                                );
+                                const draftPromotionsForProject =
+                                  workspaceDraftPromotionsByProject[projectPath] ?? {};
+                                const activeDraftPromotions = Object.fromEntries(
+                                  Object.entries(draftPromotionsForProject).filter(([draftId]) =>
+                                    activeDraftIds.has(draftId)
+                                  )
+                                );
+                                const promotedWorkspaceIds = new Set(
+                                  Object.values(activeDraftPromotions).map(
+                                    (metadata) => metadata.id
+                                  )
+                                );
+                                const projectRowsForDisplay = hideSubAgentRows
+                                  ? topLevelProjectWorkspaces
+                                  : projectWorkspaces;
+                                const workspacesForNormalRendering = projectRowsForDisplay.filter(
+                                  (workspace) => !promotedWorkspaceIds.has(workspace.id)
+                                );
+                                const sections: SectionConfig[] = getSubProjectsForParent(
+                                  projectPath,
+                                  userProjects
+                                ).map(([subProjectPath, subProjectConfig]) => ({
+                                  id: subProjectPath,
+                                  name: getProjectDisplayName(subProjectPath, subProjectConfig),
+                                  color: subProjectConfig.color,
+                                }));
+                                const depthByWorkspaceId =
+                                  computeWorkspaceDepthMap(projectWorkspaces);
+                                // Track runs that are (or were, this session) active so their
+                                // groups stay mounted across step gaps where every member is
+                                // momentarily terminal (no flash-out between sequential steps).
+                                for (const key of collectActiveWorkflowGroupKeys(
+                                  workspacesForNormalRendering,
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
+                                )) {
+                                  sessionActiveTaskGroupKeysRef.current.add(key);
+                                }
+                                const visibleWorkspacesForNormalRendering = filterVisibleAgentRows(
+                                  workspacesForNormalRendering,
+                                  expandedCompletedParentIds,
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
+                                );
+                                const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+                                  workspacesForNormalRendering,
+                                  depthByWorkspaceId,
+                                  expandedCompletedParentIds,
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
+                                );
+                                const sortedDrafts = draftsForProject
+                                  .slice()
+                                  .sort((a, b) => b.createdAt - a.createdAt);
+                                const draftVisibilityForProject =
+                                  draftVisibilityByProject[projectPath] ?? {};
+                                const hasVisibleDrafts = sortedDrafts.some((draft) => {
+                                  const reactiveVisibility =
+                                    draftVisibilityForProject[draft.draftId];
+                                  return (
+                                    reactiveVisibility ?? isDraftVisible(projectPath, draft.draftId)
+                                  );
+                                });
+                                const projectHasNoAgentsOrDrafts =
+                                  projectWorkspaces.length === 0 && !hasVisibleDrafts;
+                                const draftNumberById = new Map(
+                                  sortedDrafts.map(
+                                    (draft, index) => [draft.draftId, index + 1] as const
+                                  )
+                                );
+                                const getDraftSectionId = (
+                                  draft: (typeof sortedDrafts)[number]
+                                ): string | null =>
+                                  typeof draft.subProjectPath === "string" &&
+                                  userProjects.get(draft.subProjectPath)?.parentProjectPath ===
+                                    projectPath
+                                    ? draft.subProjectPath
+                                    : null;
+
+                                // Drafts can reference a section that has since been deleted.
+                                // Treat those as unsectioned so they remain accessible.
+                                const unsectionedDrafts: typeof sortedDrafts = [];
+                                const draftsBySectionId = new Map<string, typeof sortedDrafts>();
+                                for (const draft of sortedDrafts) {
+                                  const sectionId = getDraftSectionId(draft);
+                                  if (sectionId === null) {
+                                    unsectionedDrafts.push(draft);
+                                    continue;
+                                  }
+
+                                  const existing = draftsBySectionId.get(sectionId);
+                                  if (existing) {
+                                    existing.push(draft);
+                                  } else {
+                                    draftsBySectionId.set(sectionId, [draft]);
+                                  }
+                                }
+
+                                const renderWorkspace = (
+                                  metadata: FrontendWorkspaceMetadata,
+                                  sectionId?: string,
+                                  rowRenderMetaOverride?: AgentRowRenderMeta | null,
+                                  depthOverride?: number,
+                                  keyOverride?: string,
+                                  subAgentConnectorLayout?: "default" | "task-group-member",
+                                  taskGroupHeaderTitle?: string
+                                ) => {
+                                  const rowRenderMeta =
+                                    rowRenderMetaOverride === undefined
+                                      ? baseRowMetaByWorkspaceId.get(metadata.id)
+                                      : (rowRenderMetaOverride ?? undefined);
+
+                                  return (
+                                    <AgentListItem
+                                      key={keyOverride ?? metadata.id}
+                                      metadata={metadata}
                                       projectPath={projectPath}
-                                      sectionId={null}
-                                      onDrop={handleWorkspaceSectionDrop}
-                                      testId="unsectioned-drop-zone"
-                                    >
-                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
-                                      {unsectioned.length > 0 ? (
-                                        renderAgeTiers(
-                                          unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", ""),
-                                          undefined,
-                                          allUnsectionedForNormalRendering
-                                        )
-                                      ) : unsectionedDrafts.length === 0 ? (
-                                        <div className="text-muted px-3 py-2 text-center text-xs italic">
-                                          No unsectioned chats
-                                        </div>
-                                      ) : null}
-                                    </WorkspaceSectionDropZone>
-                                  ) : (
-                                    <>
-                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
-                                      {unsectioned.length > 0 &&
-                                        renderAgeTiers(
-                                          unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", ""),
-                                          undefined,
-                                          allUnsectionedForNormalRendering
-                                        )}
-                                    </>
-                                  )}
+                                      projectName={projectName}
+                                      isSelected={visibleSelectedWorkspaceId === metadata.id}
+                                      isArchiving={archivingWorkspaceIds.has(metadata.id)}
+                                      isRemoving={
+                                        removingWorkspaceIds.has(metadata.id) ||
+                                        metadata.isRemoving === true
+                                      }
+                                      onSelectWorkspace={handleSelectWorkspace}
+                                      onForkWorkspace={handleForkWorkspace}
+                                      onStopRuntime={handleStopRuntime}
+                                      onArchiveWorkspace={handleArchiveWorkspace}
+                                      onCancelCreation={handleCancelWorkspaceCreation}
+                                      depth={
+                                        depthOverride ??
+                                        rowRenderMeta?.depth ??
+                                        depthByWorkspaceId[metadata.id] ??
+                                        0
+                                      }
+                                      sectionId={sectionId}
+                                      pinnedReorderGroup={getPinnedReorderGroup(
+                                        projectPath,
+                                        sectionId
+                                      )}
+                                      onPinnedReorderDrop={handlePinnedReorderDrop}
+                                      rowRenderMeta={rowRenderMeta}
+                                      subAgentConnectorLayout={subAgentConnectorLayout}
+                                      taskGroupHeaderTitle={taskGroupHeaderTitle}
+                                      isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+                                      delegatedActivity={delegatedActivityByWorkspaceId.get(
+                                        metadata.id
+                                      )}
+                                      hiddenSubAgentsSummary={getHiddenSubAgentsSummary(
+                                        metadata.id
+                                      )}
+                                      getWorkflowRunName={getWorkflowRunName}
+                                      completedChildrenExpanded={expandedCompletedParentIds.has(
+                                        metadata.id
+                                      )}
+                                      onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+                                    />
+                                  );
+                                };
 
-                                  {/* Sections */}
-                                  {sections.map(renderSection)}
-                                </>
-                              );
-                            })()}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })
+                                const renderDraft = (
+                                  draft: (typeof sortedDrafts)[number]
+                                ): React.ReactNode => {
+                                  const sectionId = getDraftSectionId(draft);
+                                  const promotedMetadata = activeDraftPromotions[draft.draftId];
+
+                                  if (promotedMetadata) {
+                                    const liveMetadata =
+                                      projectWorkspaces.find(
+                                        (workspace) => workspace.id === promotedMetadata.id
+                                      ) ?? promotedMetadata;
+                                    return renderWorkspace(liveMetadata, sectionId ?? undefined);
+                                  }
+
+                                  const draftNumber = draftNumberById.get(draft.draftId) ?? 0;
+                                  const isSelected =
+                                    pendingNewWorkspaceProject === projectPath &&
+                                    pendingNewWorkspaceDraftId === draft.draftId;
+
+                                  return (
+                                    <DraftAgentListItemWrapper
+                                      key={draft.draftId}
+                                      projectPath={projectPath}
+                                      draftId={draft.draftId}
+                                      draftNumber={draftNumber}
+                                      isSelected={isSelected}
+                                      sectionId={sectionId ?? undefined}
+                                      onVisibilityChange={(isVisible) => {
+                                        handleDraftVisibilityChange(
+                                          projectPath,
+                                          draft.draftId,
+                                          isVisible
+                                        );
+                                      }}
+                                      onOpen={() =>
+                                        handleOpenWorkspaceDraft(projectPath, draft.draftId)
+                                      }
+                                      onDelete={() => {
+                                        if (isSelected) {
+                                          const currentIndex = sortedDrafts.findIndex(
+                                            (d) => d.draftId === draft.draftId
+                                          );
+                                          const fallback =
+                                            currentIndex >= 0
+                                              ? (sortedDrafts[currentIndex + 1] ??
+                                                sortedDrafts[currentIndex - 1])
+                                              : undefined;
+
+                                          if (fallback) {
+                                            openWorkspaceDraft(projectPath, fallback.draftId);
+                                          } else {
+                                            navigateToProject(sectionId ?? projectPath);
+                                          }
+                                        }
+
+                                        deleteWorkspaceDraft(projectPath, draft.draftId);
+                                      }}
+                                    />
+                                  );
+                                };
+
+                                // Render age tiers for a list of workspaces
+                                const renderAgeTiers = (
+                                  workspaces: FrontendWorkspaceMetadata[],
+                                  tierKeyPrefix: string,
+                                  sectionId?: string,
+                                  allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
+                                ): React.ReactNode =>
+                                  renderCoalescedWorkspaceList(
+                                    workspaces,
+                                    allRowsForTaskGroupCoalescing,
+                                    {
+                                      sectionId,
+                                      tierKeyPrefix,
+                                      // Tier toggles align with folder-nested content.
+                                      tierButtonClassName: "pl-7",
+                                      depthByWorkspaceId,
+                                      baseRowMetaByWorkspaceId,
+                                      renderRow: (metadata, opts) =>
+                                        renderWorkspace(
+                                          metadata,
+                                          opts?.sectionId,
+                                          opts?.rowRenderMeta,
+                                          opts?.depthOverride,
+                                          opts?.keyOverride,
+                                          opts?.subAgentConnectorLayout,
+                                          opts?.taskGroupHeaderTitle
+                                        ),
+                                    }
+                                  );
+
+                                // Partition both the full section membership and the filtered visible rows.
+                                // Best-of grouping stays leaf-only by consulting the unfiltered section data,
+                                // while actual rendering still follows the visible hierarchy.
+                                const {
+                                  unsectioned: allUnsectionedForNormalRendering,
+                                  bySectionId: allBySectionIdForNormalRendering,
+                                } = partitionWorkspacesBySection(
+                                  workspacesForNormalRendering,
+                                  sections
+                                );
+                                const { unsectioned, bySectionId } = partitionWorkspacesBySection(
+                                  visibleWorkspacesForNormalRendering,
+                                  sections
+                                );
+
+                                // Render section with its workspaces
+                                const renderSection = (section: SectionConfig) => {
+                                  const sectionWorkspaces = bySectionId.get(section.id) ?? [];
+                                  const sectionAllWorkspaces =
+                                    allBySectionIdForNormalRendering.get(section.id) ?? [];
+                                  const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
+                                  const sectionHasPromotedAttention = sectionDrafts.some(
+                                    (draft) => {
+                                      const promotedMetadata = activeDraftPromotions[draft.draftId];
+                                      return promotedMetadata
+                                        ? workspaceAttentionById.get(promotedMetadata.id) === true
+                                        : false;
+                                    }
+                                  );
+                                  const sectionHasAttention =
+                                    sectionAllWorkspaces.some(
+                                      (workspace) =>
+                                        workspaceAttentionById.get(workspace.id) === true
+                                    ) || sectionHasPromotedAttention;
+
+                                  const sectionExpandedKey = getSectionExpandedKey(
+                                    projectPath,
+                                    section.id
+                                  );
+                                  const isSectionExpanded =
+                                    expandedSections[sectionExpandedKey] ?? true;
+                                  const shouldAutoEditSection =
+                                    autoEditingSection?.projectPath === projectPath &&
+                                    autoEditingSection?.sectionId === section.id;
+
+                                  return (
+                                    <WorkspaceSectionDropZone
+                                      key={section.id}
+                                      projectPath={projectPath}
+                                      sectionId={section.id}
+                                      onDrop={handleWorkspaceSectionDrop}
+                                    >
+                                      <SectionHeader
+                                        section={section}
+                                        isExpanded={isSectionExpanded}
+                                        workspaceCount={
+                                          sectionWorkspaces.length + sectionDrafts.length
+                                        }
+                                        hasAttention={sectionHasAttention}
+                                        onToggleExpand={() =>
+                                          toggleSection(projectPath, section.id)
+                                        }
+                                        onAddWorkspace={() => {
+                                          // Create workspace in this section
+                                          handleAddWorkspace(projectPath, section.id);
+                                        }}
+                                        onRename={(name) => {
+                                          if (shouldAutoEditSection) {
+                                            setAutoEditingSection(null);
+                                          }
+                                          void updateDisplayName(section.id, name);
+                                        }}
+                                        onChangeColor={(color) => {
+                                          void updateProjectColor(section.id, color);
+                                        }}
+                                        autoStartEditing={shouldAutoEditSection}
+                                        onAutoCreateAbandon={
+                                          shouldAutoEditSection
+                                            ? () => {
+                                                void (async () => {
+                                                  setAutoEditingSection(null);
+                                                  await handleRemoveSection(
+                                                    projectPath,
+                                                    section.id
+                                                  );
+                                                })();
+                                              }
+                                            : undefined
+                                        }
+                                        onAutoCreateRenameCancel={
+                                          shouldAutoEditSection
+                                            ? () => {
+                                                setAutoEditingSection(null);
+                                              }
+                                            : undefined
+                                        }
+                                        onDelete={(anchorEl) => {
+                                          void handleRemoveSection(
+                                            projectPath,
+                                            section.id,
+                                            anchorEl
+                                          );
+                                        }}
+                                      />
+                                      {isSectionExpanded && (
+                                        <div className="pb-1">
+                                          {sectionDrafts.map((draft) => renderDraft(draft))}
+                                          {sectionWorkspaces.length > 0 ? (
+                                            renderAgeTiers(
+                                              sectionWorkspaces,
+                                              getSectionTierKey(projectPath, section.id, 0).replace(
+                                                ":tier:0",
+                                                ":tier"
+                                              ),
+                                              section.id,
+                                              sectionAllWorkspaces
+                                            )
+                                          ) : sectionDrafts.length === 0 ? (
+                                            <div className="text-muted px-3 py-2 text-center text-xs italic">
+                                              No chats in this sub-project
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      )}
+                                    </WorkspaceSectionDropZone>
+                                  );
+                                };
+
+                                return (
+                                  <>
+                                    {projectHasNoAgentsOrDrafts && (
+                                      <div className="text-content-disabled py-2 pl-12 text-xs">
+                                        Empty
+                                      </div>
+                                    )}
+                                    {/* Unsectioned workspaces first - always show drop zone when sections exist */}
+                                    {sections.length > 0 ? (
+                                      <WorkspaceSectionDropZone
+                                        projectPath={projectPath}
+                                        sectionId={null}
+                                        onDrop={handleWorkspaceSectionDrop}
+                                        testId="unsectioned-drop-zone"
+                                      >
+                                        {unsectionedDrafts.map((draft) => renderDraft(draft))}
+                                        {unsectioned.length > 0 ? (
+                                          renderAgeTiers(
+                                            unsectioned,
+                                            getTierKey(projectPath, 0).replace(":0", ""),
+                                            undefined,
+                                            allUnsectionedForNormalRendering
+                                          )
+                                        ) : unsectionedDrafts.length === 0 ? (
+                                          <div className="text-muted px-3 py-2 text-center text-xs italic">
+                                            No unsectioned chats
+                                          </div>
+                                        ) : null}
+                                      </WorkspaceSectionDropZone>
+                                    ) : (
+                                      <>
+                                        {unsectionedDrafts.map((draft) => renderDraft(draft))}
+                                        {unsectioned.length > 0 &&
+                                          renderAgeTiers(
+                                            unsectioned,
+                                            getTierKey(projectPath, 0).replace(":0", ""),
+                                            undefined,
+                                            allUnsectionedForNormalRendering
+                                          )}
+                                      </>
+                                    )}
+
+                                    {/* Sections */}
+                                    {sections.map(renderSection)}
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </>
                 )}
               </ScrollArea>
             </>
@@ -2931,6 +3645,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
               disabled={!hasProjectMenuTarget}
               onClick={() => {
                 handleProjectMenuManageSecrets();
+              }}
+            />
+            <PositionedMenuItem
+              icon={<ScrollText className="h-4 w-4 shrink-0" strokeWidth={1.8} />}
+              label="Instructions"
+              disabled={!hasProjectMenuTarget}
+              onClick={() => {
+                handleProjectMenuInstructions();
               }}
             />
             <PositionedMenuItem
@@ -3003,30 +3725,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             />
           </PositionedMenu>
 
-          <ConfirmationModal
-            isOpen={archiveConfirmation !== null}
-            title={
-              archiveConfirmation?.untrackedPaths
-                ? "Archive workspace with untracked files?"
-                : archiveConfirmation
-                  ? `Archive "${archiveConfirmation.displayTitle}" while streaming?`
-                  : "Archive chat?"
-            }
-            description={buildArchiveConfirmDescription(
-              archiveConfirmation?.isStreaming ?? false,
-              archiveConfirmation?.untrackedPaths
-            )}
-            warning={buildArchiveConfirmWarning(
-              archiveConfirmation?.isStreaming ?? false,
-              archiveConfirmation?.untrackedPaths
-            )}
-            confirmLabel={
-              archiveConfirmation?.untrackedPaths ? "Archive and delete files" : "Archive"
-            }
-            confirmVariant="destructive"
-            onConfirm={handleArchiveWorkspaceConfirm}
-            onCancel={handleArchiveWorkspaceCancel}
-          />
+          <ConfirmationModal {...archiveFlow.modalProps} />
           <ProjectDeleteConfirmationModal
             isOpen={deleteConfirmation !== null}
             projectName={deleteConfirmation?.projectName ?? ""}
@@ -3054,6 +3753,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             error={workspaceRemoveError.error}
             prefix="Failed to cancel workspace creation"
             onDismiss={workspaceRemoveError.clearError}
+          />
+          <PopoverError
+            error={workspaceRemoveWarning.error}
+            prefix="Workspace creation cancelled, but something was left behind"
+            onDismiss={workspaceRemoveWarning.clearError}
           />
           <PopoverError
             error={projectRemoveError.error}

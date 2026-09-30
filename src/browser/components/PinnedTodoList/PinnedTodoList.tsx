@@ -56,12 +56,8 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
     <ChatInputDecoration
       expanded={expanded}
       onToggle={() => setExpanded(!expanded)}
-      className="bg-surface-primary"
       contentClassName="max-h-[300px] overflow-y-auto"
       dataComponent="PinnedTodoList"
-      // Keep the pinned TODO banner on the same decoration primitive and top
-      // border styling as the other chat-input decorations so the stack reads
-      // as one consistent set.
       summary={
         <>
           <List className="text-muted group-hover:text-secondary size-3.5 transition-colors" />

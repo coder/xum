@@ -4,6 +4,22 @@
 
 import { capitalize } from "../capitalize";
 
+/** Compact labels preserve the distinguishing model tier when the shared family prefix would truncate it. */
+export function formatCompactModelDisplayName(modelName: string): string {
+  // OpenAI's durable tier names (GPT-5.6 Sol/Terra/Luna, GPT-6 Astra) carry more information than
+  // the shared family prefix when the composer is space-constrained. Keep the full model name
+  // everywhere else.
+  const gptTierMatch =
+    /^gpt-\d+(?:\.\d+)?-(sol|terra|luna|astra)(?:-\d{8}|-\d{4}-\d{2}-\d{2})?$/.exec(
+      modelName.toLowerCase()
+    );
+  if (gptTierMatch) {
+    return capitalize(gptTierMatch[1]);
+  }
+
+  return formatModelDisplayName(modelName);
+}
+
 /**
  * Format a model name for display with proper capitalization and spacing.
  *
@@ -36,8 +52,9 @@ export function formatModelDisplayName(modelName: string): string {
   if (lower.startsWith("claude-")) {
     const parts = lower.replace("claude-", "").split("-");
 
-    // Known tiers for Claude models
-    const tiers = ["sonnet", "opus", "haiku"];
+    // Known tiers for Claude models. Fable / Mythos are the Mythos-class tier that
+    // sits above Opus (e.g. "claude-fable-5" -> "Fable 5", "claude-mythos-5" -> "Mythos 5").
+    const tiers = ["sonnet", "opus", "haiku", "fable", "mythos"];
 
     // Format: claude-{tier}-{major}-{minor} (newer naming)
     // e.g., "claude-sonnet-4-5" -> "Sonnet 4.5"
@@ -64,6 +81,12 @@ export function formatModelDisplayName(modelName: string): string {
       const tier = capitalize(parts[0]);
       return `${tier} ${parts[1]}`;
     }
+  }
+
+  // GLM models
+  if (lower.startsWith("glm-")) {
+    const parts = lower.slice("glm-".length).split("-");
+    return `GLM ${parts.map(capitalize).join(" ")}`;
   }
 
   // GPT models
@@ -225,7 +248,6 @@ function parseBedrockModelName(modelId: string): string | null {
     return null;
   }
 
-  // Split by dot to get parts
   const dotParts = modelId.split(".");
 
   // Need at least vendor.modelName (2 parts)

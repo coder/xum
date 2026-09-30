@@ -1,17 +1,30 @@
-import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "write-file-atomic";
+import * as fs from "fs/promises";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import {
+  normalizeUsage,
+  withCacheWriteMetadata,
+  type AiSdkUsageLike,
+} from "@/common/utils/tokens/usageHelpers";
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
+import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
+import {
+  normalizeUsageModelKey,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { log } from "./log";
 
 export interface SessionUsageTokenStatsCacheV1 {
@@ -91,20 +104,33 @@ export class SessionUsageService {
   private readonly fileLocks = workspaceFileLocks;
   private readonly config: Config;
   private readonly historyService: HistoryService;
+  private readonly getProvidersConfig: () => ProvidersConfigMap | null;
 
-  constructor(config: Config, historyService: HistoryService) {
+  constructor(
+    config: Config,
+    historyService: HistoryService,
+    /**
+     * Providers config accessor for mappedToModel alias resolution (mirrors
+     * StreamManager). Without it, headless usage for custom provider models
+     * configured with mappedToModel is priced against the raw custom ID
+     * (unknown → $0).
+     */
+    getProvidersConfig?: () => ProvidersConfigMap | null
+  ) {
     this.config = config;
     this.historyService = historyService;
+    this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
-  /**
-   * Collect all messages from iterateFullHistory into an array.
-   * Usage rebuild needs every epoch for accurate totals.
-   */
+  /** Usage rebuild needs every epoch for accurate totals. */
   private async collectFullHistory(workspaceId: string): Promise<MuxMessage[]> {
     const messages: MuxMessage[] = [];
-    const result = await this.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
-      messages.push(...chunk);
-    });
+    const result = await this.historyService.iterateFullHistoryUnderLock(
+      workspaceId,
+      "forward",
+      (chunk) => {
+        messages.push(...chunk);
+      }
+    );
     if (!result.success) {
       log.warn(`Failed to iterate history for ${workspaceId}: ${result.error}`);
       return [];
@@ -113,7 +139,7 @@ export class SessionUsageService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.SESSION_USAGE_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, this.SESSION_USAGE_FILE);
   }
 
   private createEmptyUsageFile(): SessionUsageFile {
@@ -141,17 +167,233 @@ export class SessionUsageService {
   /**
    * Record usage from a completed stream. Accumulates with existing usage
    * AND updates lastRequest in a single atomic write.
-   * Model should already be normalized via normalizeToCanonical().
+   * Model should already be normalized via normalizeUsageModelKey() (raw
+   * Coder identities are preserved so repricing resolves instance metadata).
    */
-  async recordUsage(workspaceId: string, model: string, usage: ChatUsageDisplay): Promise<void> {
+  async recordUsage(
+    workspaceId: string,
+    model: string,
+    usage: ChatUsageDisplay,
+    options?: {
+      /**
+       * Accumulate into byModel without touching lastRequest. Used for
+       * headless telemetry (status generation and memory sweeps) so a tiny
+       * background call cannot replace the Costs tab's "Last request" data
+       * for the user's actual last agent turn.
+       */
+      skipLastRequestUpdate?: boolean;
+    }
+  ): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readFile(workspaceId);
       const existing = current.byModel[model];
       // CRITICAL: Accumulate, don't overwrite
       current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
-      current.lastRequest = { model, usage, timestamp: Date.now() };
+      if (options?.skipLastRequestUpdate !== true) {
+        current.lastRequest = { model, usage, timestamp: Date.now() };
+      }
       await this.writeFile(workspaceId, current);
     });
+  }
+
+  /**
+   * Best-effort usage recording for headless AI calls that bypass the
+   * StreamManager pipeline (memory consolidation/harvest and status/title
+   * generation). Without this, their spend is invisible to
+   * per-workspace cost displays even though the provider bills it.
+   *
+   * Never throws: cost telemetry must not fail the feature that spent the
+   * tokens.
+   */
+  async recordHeadlessUsage(
+    workspaceId: string,
+    modelString: string,
+    usage: AiSdkUsageLike | undefined,
+    providerMetadata?: Record<string, unknown>,
+    options?: {
+      /**
+       * Preserve legacy subscription-covered usage at $0.
+       * New OAuth requests use API-equivalent estimates instead.
+       */
+      costsIncluded?: boolean;
+      /**
+       * When set, also append the raw usage to the workspace's
+       * headless-usage.jsonl sidecar so the analytics ETL can ingest it into
+       * dashboard totals. Use for callers whose spend produces no chat.jsonl
+       * assistant row, such as status generation and memory sweeps.
+       */
+      analyticsSource?: string;
+      /**
+       * Skip the session-usage.json byModel update. For callers that already
+       * recorded this turn's usage into the ledger through another path
+       * (StreamManager's abort handler) and only need the analytics sidecar.
+       */
+      skipSessionLedger?: boolean;
+      /**
+       * Request-pinned pricing identity resolved when the stream/tool call
+       * started. When set, it overrides the live re-resolution below so a
+       * Coder catalog refresh that removes/retags the instance mid-turn
+       * cannot corrupt the persisted analytics identity.
+       */
+      metadataModel?: string;
+    }
+  ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
+    if (!usage) return undefined;
+    try {
+      // r62/r63: headless writers (dream/harvest consolidation, status
+      // generation) can settle AFTER workspace removal — a foreign backend's
+      // run survives the remover's process-local cancellation entirely. The
+      // sidecar mkdir + append and the ledger write below would recreate the
+      // deleted session directory, so the durable removal tombstone gates
+      // these usage commit points too — and gate + commits run INSIDE the
+      // session-dir target mutation lock that removal's tombstone+delete
+      // critical section also holds (r63), so the check cannot go stale
+      // between here and the writes. Callers never hold memory target locks
+      // while recording usage, so this single-key acquisition cannot ABBA
+      // with removal's sorted multi-key acquisition. Dropping the spend row
+      // is correct: the workspace whose dashboards it would feed no longer
+      // exists.
+      return await withTargetMutationLock(
+        this.config.rootDir,
+        path.join(this.config.sessionsDir, workspaceId),
+        async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            log.debug("Skipping headless usage write for removed workspace", { workspaceId });
+            return undefined;
+          }
+          return await this.recordHeadlessUsageLocked(
+            workspaceId,
+            modelString,
+            usage,
+            providerMetadata,
+            options
+          );
+        }
+      );
+    } catch (error) {
+      log.warn("Failed to record headless usage", { workspaceId, modelString, error });
+      return undefined;
+    }
+  }
+
+  /** Body of recordHeadlessUsage; runs inside the session-dir target lock (r63). */
+  private async recordHeadlessUsageLocked(
+    workspaceId: string,
+    modelString: string,
+    usage: AiSdkUsageLike,
+    providerMetadata?: Record<string, unknown>,
+    options?: {
+      costsIncluded?: boolean;
+      analyticsSource?: string;
+      skipSessionLedger?: boolean;
+      metadataModel?: string;
+    }
+  ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
+    try {
+      // Headless callers pass live AI SDK usage. Normalize to mux's persisted
+      // flat shape and re-inject cache-write tokens (moved off providerMetadata
+      // in AI SDK 7) before the sidecar write and pricing below. No-ops for
+      // callers that already normalized.
+      providerMetadata = withCacheWriteMetadata(providerMetadata, usage);
+      usage = normalizeUsage(usage);
+      // Attribution key mirrors StreamManager.recordSessionUsage: Coder
+      // identities use the caller's request-pinned metadata identity so a
+      // catalog refresh mid-turn cannot re-key the row; all others keep the
+      // canonical key (their metadataModel can be a mappedToModel pricing
+      // alias, deliberately not the attribution bucket).
+      const canonicalModel =
+        modelString.startsWith("coder:") && options?.metadataModel
+          ? options.metadataModel
+          : normalizeUsageModelKey(modelString, this.getProvidersConfig());
+      // Resolve mappedToModel aliases for pricing (mirrors StreamManager's
+      // resolveMetadataModel): custom provider models would otherwise price
+      // against the raw custom ID (unknown → $0). A caller-pinned identity
+      // takes precedence over live re-resolution.
+      let metadataModel: string;
+      if (options?.metadataModel) {
+        metadataModel = options.metadataModel;
+      } else {
+        try {
+          metadataModel = resolveModelForMetadata(modelString, this.getProvidersConfig());
+        } catch {
+          metadataModel = modelString;
+        }
+      }
+      const existingMux = providerMetadata?.mux;
+      const effectiveProviderMetadata = options?.costsIncluded
+        ? {
+            ...(providerMetadata ?? {}),
+            mux: {
+              ...(typeof existingMux === "object" && existingMux !== null ? existingMux : {}),
+              costsIncluded: true,
+            },
+          }
+        : providerMetadata;
+      const displayUsage = createDisplayUsage(
+        usage,
+        canonicalModel,
+        effectiveProviderMetadata,
+        metadataModel
+      );
+      if (!displayUsage) return undefined;
+      // Sidecar append runs FIRST: it is the only source the analytics ETL
+      // can replay (there is no chat-row fallback for headless spend), so a
+      // crash between the two writes must leave the sidecar — a recorded
+      // ledger with a missing sidecar row would strand the spend out of the
+      // events table forever (startup sync would see no change to detect).
+      // The ledger is merely display state and self-heals via rebuilds.
+      if (options?.analyticsSource) {
+        // Raw usage + provider metadata (not display costs) so the ETL prices
+        // with the current tables — repricing rebuilds then cover these rows.
+        // metadataModel mirrors chat rows: model stays the canonical ID for
+        // attribution while pricing uses the resolved alias target.
+        const line = JSON.stringify({
+          timestamp: Date.now(),
+          source: options.analyticsSource,
+          model: canonicalModel,
+          metadataModel,
+          usage,
+          ...(effectiveProviderMetadata !== undefined
+            ? { providerMetadata: effectiveProviderMetadata }
+            : {}),
+        });
+        const sidecarPath = path.join(
+          path.dirname(this.getFilePath(workspaceId)),
+          HEADLESS_USAGE_FILE_NAME
+        );
+        await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
+        await fs.appendFile(sidecarPath, `${line}\n`);
+      }
+      // Ledger update is isolated: a corrupt session-usage.json (readFile
+      // throws on bad JSON) must not fail the whole call once the sidecar
+      // line is durable.
+      let ledgerRecorded = false;
+      if (options?.skipSessionLedger !== true) {
+        try {
+          await this.recordUsage(workspaceId, canonicalModel, displayUsage, {
+            skipLastRequestUpdate: true,
+          });
+          ledgerRecorded = true;
+        } catch (error) {
+          log.warn("Failed to update session-usage ledger for headless usage", {
+            workspaceId,
+            modelString,
+            error,
+          });
+        }
+      }
+      if (options?.analyticsSource) {
+        // Sidecar callers consume the return value to trigger an analytics
+        // ingest pass, so signal success once the sidecar line is durable
+        // even if the ledger update failed.
+        return { model: canonicalModel, usage: displayUsage };
+      }
+      // Without a durable sidecar, only report success when the ledger write succeeded.
+      return ledgerRecorded ? { model: canonicalModel, usage: displayUsage } : undefined;
+    } catch (error) {
+      log.warn("Failed to record headless usage", { workspaceId, modelString, error });
+      return undefined;
+    }
   }
 
   /**
@@ -413,8 +655,25 @@ export class SessionUsageService {
     const result: SessionUsageFile = this.createEmptyUsageFile();
     let lastAssistantUsage: { model: string; usage: ChatUsageDisplay } | undefined;
 
-    const mergeUsageForModel = (rawModel: string, usage: ChatUsageDisplay): void => {
-      const model = normalizeToCanonical(rawModel);
+    // Recovery bucket key: rebuilds run AFTER mutable Coder instance metadata
+    // may have changed (provider removed, retagged), so a raw coder: history
+    // model can no longer be re-resolved against the current config. The
+    // history already persists the record-time identity (metadataModel) and
+    // prices with it below — key the bucket with it too, or the raw/incorrect
+    // key gets repriced as unknown and its costs stripped. Non-Coder models
+    // keep the canonical key: their metadataModel can be a mappedToModel
+    // alias target (pricing identity, not the ledger bucket).
+    const usageBucketKey = (rawModel: string, metadataModel: string | undefined): string =>
+      rawModel.startsWith("coder:") && metadataModel
+        ? metadataModel
+        : normalizeUsageModelKey(rawModel, this.getProvidersConfig());
+
+    const mergeUsageForModel = (
+      rawModel: string,
+      usage: ChatUsageDisplay,
+      metadataModel?: string
+    ): void => {
+      const model = usageBucketKey(rawModel, metadataModel);
       const existing = result.byModel[model];
       result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
     };
@@ -428,6 +687,18 @@ export class SessionUsageService {
 
       const rawModel = toolModelUsage.model.trim();
       if (!rawModel) {
+        return;
+      }
+
+      // Zero-usage refusal markers exist only so analytics can count refused
+      // attempts; the live path never records them in the session ledger
+      // (recordRefusedAttemptUsage skips recordSessionUsage without tokens).
+      // Skip them here too so a rebuilt ledger matches the live one instead
+      // of growing 0-token/$0 Costs rows for models that only ever refused.
+      if (
+        toolModelUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME &&
+        !hasTokenUsage(toolModelUsage.usage)
+      ) {
         return;
       }
 
@@ -446,13 +717,13 @@ export class SessionUsageService {
         return;
       }
 
-      mergeUsageForModel(rawModel, usage);
+      mergeUsageForModel(rawModel, usage, metadataModel);
     };
 
     for (const msg of messages) {
       if (msg.role === "assistant") {
         // Include historicalUsage from legacy compaction summaries.
-        // This field was removed from MuxMetadata but may exist in persisted data.
+        // This field was removed from XumMetadata but may exist in persisted data.
         // It's a ChatUsageDisplay representing all pre-compaction costs (model-agnostic).
         const historicalUsage = (msg.metadata as { historicalUsage?: ChatUsageDisplay })
           ?.historicalUsage;
@@ -474,8 +745,11 @@ export class SessionUsageService {
           );
 
           if (usage) {
-            mergeUsageForModel(rawModel, usage);
-            lastAssistantUsage = { model: normalizeToCanonical(rawModel), usage };
+            mergeUsageForModel(rawModel, usage, msg.metadata.metadataModel);
+            lastAssistantUsage = {
+              model: usageBucketKey(rawModel, msg.metadata.metadataModel),
+              usage,
+            };
           }
         }
 
@@ -506,21 +780,6 @@ export class SessionUsageService {
   async rebuildFromMessages(workspaceId: string, messages: MuxMessage[]): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.rebuildFromMessagesInternal(workspaceId, messages);
-    });
-  }
-
-  /**
-   * Delete session usage file (when workspace is deleted).
-   */
-  async deleteSessionUsage(workspaceId: string): Promise<void> {
-    return this.fileLocks.withLock(workspaceId, async () => {
-      try {
-        await fs.unlink(this.getFilePath(workspaceId));
-      } catch (error) {
-        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
-          throw error;
-        }
-      }
     });
   }
 }

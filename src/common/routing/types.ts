@@ -1,7 +1,7 @@
 import type { ProviderName } from "@/common/constants/providers";
 
 export interface RouteContext {
-  /** Canonical model string (e.g., "anthropic:claude-opus-4-7") */
+  /** Canonical model string (e.g., "anthropic:claude-opus-4-8") */
   canonical: string;
   /** Origin provider — who made the model. Determines capabilities. */
   origin: ProviderName;

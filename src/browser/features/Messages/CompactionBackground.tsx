@@ -24,7 +24,6 @@ export const CompactionBackground: React.FC = () => {
           translateX 53.33% (of 300%) = 160%, moving highlight to 130% (off-screen right). */}
       <div
         className="absolute inset-0 animate-[shimmer-slide_3s_infinite_linear]"
-        data-chromatic="ignore"
         style={{
           background:
             "linear-gradient(90deg, transparent 0%, transparent 40%, var(--color-plan-mode-alpha) 50%, transparent 60%, transparent 100%)",

@@ -2,8 +2,11 @@ import "../../../../../tests/ui/dom";
 
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ReactNode } from "react";
 
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import { HEARTBEAT_DEFAULT_MESSAGE_BODY } from "@/constants/heartbeat";
 import { installDom } from "../../../../../tests/ui/dom";
 
@@ -16,25 +19,13 @@ interface MockOptions {
   getConfigError?: Error;
 }
 
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<MockConfig>;
-    updateHeartbeatDefaultPrompt: (input: { defaultPrompt?: string | null }) => Promise<void>;
-    updateHeartbeatDefaultIntervalMs: (input: { intervalMs?: number | null }) => Promise<void>;
-  };
+let mockApi: TestApiOverrides<APIClient>;
+
+// Inject the current client through the real provider; mocking the API module leaks across
+// files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
-
-let mockApi: MockAPIClient;
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
 
 import { HeartbeatSection } from "./HeartbeatSection";
 
@@ -62,12 +53,12 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}, options: MockO
         getConfig: mock(() =>
           options.getConfigError
             ? Promise.reject(options.getConfigError)
-            : Promise.resolve({ ...config })
+            : Promise.resolve(createTestConfig({ ...config }))
         ),
         updateHeartbeatDefaultPrompt: updateHeartbeatDefaultPromptMock,
         updateHeartbeatDefaultIntervalMs: updateHeartbeatDefaultIntervalMsMock,
       },
-    },
+    } satisfies TestApiOverrides<APIClient>,
     updateHeartbeatDefaultPromptMock,
     updateHeartbeatDefaultIntervalMsMock,
   };
@@ -84,7 +75,8 @@ function renderHeartbeatSection(
   const view = render(
     <ThemeProvider forcedTheme="dark">
       <HeartbeatSection />
-    </ThemeProvider>
+    </ThemeProvider>,
+    { wrapper: ApiWrapper }
   );
 
   return { view, updateHeartbeatDefaultPromptMock, updateHeartbeatDefaultIntervalMsMock };

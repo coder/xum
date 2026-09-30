@@ -24,7 +24,11 @@
 
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { getStorageChangeEvent } from "@/common/constants/events";
-import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedRawString,
+  readPersistedString,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 
 export type ResizableSidebarSide = "left" | "right";
 
@@ -101,7 +105,7 @@ export function useResizableSidebar({
 
     try {
       return resolveInitialResizableSidebarWidth({
-        storedValue: localStorage.getItem(storageKey),
+        storedValue: readPersistedRawString(storageKey),
         defaultWidth,
         minWidth,
         maxWidth: resolvedMaxWidth,

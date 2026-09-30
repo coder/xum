@@ -1,7 +1,7 @@
 import { tool } from "ai";
 import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -9,7 +9,11 @@ import type { AssistedReviewHunk } from "@/common/types/review";
 import {
   ASSISTED_REVIEW_MAX_HUNKS,
   formatAssistedFilter,
+  getToolPathProjectRelativeCandidates,
+  normalizeAssistedReviewHunk,
+  normalizeToolPathToProjectRelative,
   parseAssistedFilter,
+  type ProjectRelativePathContext,
 } from "@/common/utils/review/assistedReview";
 import {
   getAssistedReviewFilePath,
@@ -57,14 +61,15 @@ async function writeAssistedReviewFile(
 async function applyReviewPaneUpdateForSessionDir(
   workspaceId: string,
   workspaceSessionDir: string,
-  args: ReviewPaneUpdateArgs
+  args: ReviewPaneUpdateArgs,
+  pathContext?: ProjectRelativePathContext
 ): Promise<{ hunks: AssistedReviewHunk[]; rejected: string[] }> {
   return workspaceFileLocks.withLock(workspaceId, async () => {
     // Read prior state from disk so `operation: "add"` sees the right
     // baseline across app/backend restarts. The whole read-modify-write is
     // locked so concurrent `add` calls compose instead of last-writer-wins.
     const current = await readAssistedReviewForSessionDir(workspaceSessionDir);
-    const result = applyReviewPaneUpdate(current, args);
+    const result = applyReviewPaneUpdate(current, args, pathContext);
     // Persist before returning so a successful tool result is always backed
     // by durable state.
     await writeAssistedReviewFile(workspaceSessionDir, result.hunks);
@@ -77,6 +82,16 @@ interface ReviewPaneUpdateArgs {
   hunks: Array<{ path: string; comment?: string | null }>;
 }
 
+function formatFallbackKeys(
+  hunk: AssistedReviewHunk,
+  pathContext?: ProjectRelativePathContext
+): string[] {
+  const exactKey = formatAssistedFilter(hunk);
+  return getToolPathProjectRelativeCandidates(hunk.path, pathContext)
+    .fallbackPaths.map((pathValue) => formatAssistedFilter({ ...hunk, path: pathValue }))
+    .filter((key) => key !== exactKey);
+}
+
 /**
  * Apply an update operation against an existing list. Exported for testing
  * and to keep mutation logic in one place; the tool factory wraps this with
@@ -84,7 +99,8 @@ interface ReviewPaneUpdateArgs {
  */
 export function applyReviewPaneUpdate(
   current: readonly AssistedReviewHunk[],
-  args: ReviewPaneUpdateArgs
+  args: ReviewPaneUpdateArgs,
+  pathContext?: ProjectRelativePathContext
 ): { hunks: AssistedReviewHunk[]; rejected: string[] } {
   const rejected: string[] = [];
   const parsed: AssistedReviewHunk[] = [];
@@ -97,7 +113,10 @@ export function applyReviewPaneUpdate(
     }
     const trimmedComment = raw.comment?.trim();
     parsed.push({
-      path: filter.path,
+      // Tool calls run from the agent's cwd, while Review stores project-relative
+      // paths. Normalize explicit cwd-relative input here, then use candidate
+      // keys below for ambiguous plain paths.
+      path: normalizeToolPathToProjectRelative(filter.path, pathContext),
       range: filter.range,
       // Drop empty-after-trim comments so the UI doesn't render an empty
       // assisted-comment row.
@@ -105,21 +124,43 @@ export function applyReviewPaneUpdate(
     });
   }
 
-  const base = args.operation === "add" ? [...current] : [];
+  const base =
+    args.operation === "add"
+      ? current.map((hunk) => normalizeAssistedReviewHunk(hunk, pathContext))
+      : [];
   // Dedup by formatted path:range key, preferring the latest comment when
   // the same region is flagged twice (typical when an agent calls `add`
-  // and then re-flags a refined comment).
-  const seen = new Map<string, number>();
-  for (const h of base) {
-    seen.set(formatAssistedFilter(h), base.indexOf(h));
-  }
+  // and then re-flags a refined comment). Exact keys are kept separate from
+  // fallback keys: incoming ambiguous paths may refine a canonical fallback
+  // that existed before this update, but incoming hunks don't fallback-match
+  // each other, so root/scoped sibling pins can coexist regardless of order.
+  const exactSeen = new Map<string, number>();
+  const initialExactSeen = new Map<string, number>();
+  const initialFallbackSeen = new Map<string, number>();
+  base.forEach((h, index) => {
+    const exactKey = formatAssistedFilter(h);
+    exactSeen.set(exactKey, index);
+    initialExactSeen.set(exactKey, index);
+    for (const key of formatFallbackKeys(h, pathContext)) {
+      initialFallbackSeen.set(key, index);
+    }
+  });
   for (const h of parsed) {
-    const key = formatAssistedFilter(h);
-    const existing = seen.get(key);
+    const exactKey = formatAssistedFilter(h);
+    let existing = exactSeen.get(exactKey);
+    let replacementPath = existing === undefined ? h.path : (base[existing]?.path ?? h.path);
+    if (existing === undefined) {
+      for (const key of formatFallbackKeys(h, pathContext)) {
+        existing = initialExactSeen.get(key) ?? initialFallbackSeen.get(key);
+        replacementPath = existing === undefined ? h.path : (base[existing]?.path ?? h.path);
+        if (existing !== undefined) break;
+      }
+    }
     if (existing !== undefined) {
-      base[existing] = h;
+      base[existing] = { ...h, path: replacementPath };
     } else {
-      seen.set(key, base.length);
+      const nextIndex = base.length;
+      exactSeen.set(exactKey, nextIndex);
       base.push(h);
     }
   }
@@ -146,7 +187,11 @@ export const createReviewPaneUpdateTool: ToolFactory = (config) => {
       const { hunks, rejected } = await applyReviewPaneUpdateForSessionDir(
         config.workspaceId,
         config.workspaceSessionDir,
-        args
+        args,
+        {
+          projectPath: config.workspaceProjectPath,
+          executionRootPath: config.workspaceExecutionRootPath,
+        }
       );
 
       return {
@@ -168,7 +213,13 @@ export const createReviewPaneGetTool: ToolFactory = (config) => {
     inputSchema: TOOL_DEFINITIONS.review_pane_get.schema,
     execute: async () => {
       assert(config.workspaceSessionDir, "review_pane_get requires workspaceSessionDir");
-      const hunks = await readAssistedReviewForSessionDir(config.workspaceSessionDir);
+      const hunks = (await readAssistedReviewForSessionDir(config.workspaceSessionDir)).map(
+        (hunk) =>
+          normalizeAssistedReviewHunk(hunk, {
+            projectPath: config.workspaceProjectPath,
+            executionRootPath: config.workspaceExecutionRootPath,
+          })
+      );
       return {
         hunks: hunks.map((h) => ({
           path: formatAssistedFilter(h),

@@ -1,8 +1,13 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TelemetryRuntimeType } from "@/common/telemetry/payload";
-import type { Review } from "@/common/types/review";
+import type { Review, ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState, PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { QueuedMessage } from "@/common/types/message";
+import type {
+  PendingCreationInit,
+  PendingInitialUserMessage,
+} from "@/browser/utils/messages/pendingInitialUserMessage";
 
 export type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
@@ -23,11 +28,16 @@ export interface WorkspaceCreatedOptions {
   pendingStreamModel?: string | null;
   /** Set false when creation does not immediately enqueue an initial user send. */
   markPendingInitialSend?: boolean;
+  /** First message shown as a transcript row until the backend persists it. */
+  pendingUserMessage?: PendingInitialUserMessage;
+  /** Creation card shown until the backend's init events arrive (omitted when no init runs). */
+  pendingCreationInit?: PendingCreationInit;
 }
 
 // Workspace variant: full functionality for existing workspaces
 export interface ChatInputWorkspaceVariant {
   variant: "workspace";
+  kind?: "scratch";
   workspaceId: string;
   /** Runtime type for the workspace (for telemetry) - no sensitive details like SSH host */
   runtimeType?: TelemetryRuntimeType;
@@ -37,18 +47,41 @@ export interface ChatInputWorkspaceVariant {
   onResetContext: () => Promise<"reset" | "noop">;
   onTruncateHistory: (percentage?: number) => Promise<void>;
   onModelChange?: (model: string) => void;
+  isTranscriptCaughtUp?: boolean;
   isCompacting?: boolean;
   isStreamStarting?: boolean;
   editingMessage?: EditingMessageState;
   onCancelEdit?: () => void;
+  /**
+   * Functional update of the editing state the parent owns (conflict recovery marks the
+   * precondition invalidated and later stores the refreshed candidate). The updater receives
+   * the current state and must return it unchanged when it targets a different message.
+   */
+  onEditingMessageChange?: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage?: () => void;
+  /** An edit send started (true) or settled (false); no new edit may start meanwhile. */
+  onEditSendPendingChange?: (pending: boolean) => void;
   canInterrupt?: boolean;
   disabled?: boolean;
+  /** Queued follow-up currently waiting during an active workspace stream. */
+  queuedMessage?: QueuedMessage | null;
+  onQueuedDispatchModeChange?: (mode: QueueDispatchMode) => Promise<void>;
+  onQueuedActionError?: (error: unknown) => void;
+  onSendQueuedImmediately?: () => Promise<void>;
+  /** Oldest held (refused, unsent) input: the one the held-input shortcuts act on. */
+  heldInputId?: string;
   /** Optional explanation displayed when input is disabled */
   disabledReason?: string;
   onReady?: (api: ChatInputAPI) => void;
   /** Reviews currently attached to chat (from useReviews hook) */
   attachedReviews?: Review[];
+  /** Add a review to the workspace's review store, attached to chat input */
+  onAddReview?: (data: ReviewNoteData) => Review;
+  /**
+   * The composer applied a restore naming these backend held inputs; release them once `durable`
+   * resolves true, i.e. the backend confirmed the restored draft (#4448)
+   */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[], durable: Promise<boolean>) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */
@@ -66,6 +99,7 @@ export interface ChatInputWorkspaceVariant {
 // Creation variant: simplified for first message / workspace creation
 export interface ChatInputCreationVariant {
   variant: "creation";
+  kind?: "scratch";
   projectPath: string;
   projectName: string;
   /** Sub-project path for parent-owned draft creation. */

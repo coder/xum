@@ -1,16 +1,41 @@
 import type { TaskSettings as TaskSettingsOnDisk } from "@/common/config/schemas/taskSettings";
 import { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
-import type {
-  SubagentAiDefaults,
-  SubagentAiDefaultsEntry,
-} from "@/common/config/schemas/appConfigOnDisk";
-import { AgentIdSchema } from "@/common/orpc/schemas";
 import assert from "@/common/utils/assert";
-import { normalizeAgentId } from "@/common/utils/agentIds";
-import { coerceThinkingLevel, type ThinkingLevel } from "./thinking";
 
-export type { SubagentAiDefaults, SubagentAiDefaultsEntry };
 export { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
+
+/**
+ * An attempt is replaceable only after its owner has settled and its report is positively absent.
+ * Missing config or an interrupted status alone cannot distinguish a dead owner from preparation.
+ */
+export type TaskAttemptOutcome<Report> =
+  | { kind: "reported"; report: Report }
+  | { kind: "live"; executionId: string }
+  | { kind: "cleanup-pending" }
+  /**
+   * `code: "no-record"`: a strict config read (well-formed, or no config file) has no row for
+   * the task: it was removed, or never published. Never set for an unreadable or malformed
+   * config. Not proof of absence by itself: a reservation stalled before its publishing commit
+   * can still publish the row later (see WorkflowRunner.consultFailedCheckpoint).
+   */
+  | { kind: "indeterminate"; reason: string; code?: "no-record" }
+  /**
+   * `attemptId`: the attempt that ended (the owned attempt, or the row's current attempt named
+   * by the parent's settlement receipt). A replacement may retire exactly this attempt
+   * (claimRetiredAttempt); absent for a pre-identity owned attempt, which is never replaced.
+   * `failure`: the attempt failed terminally (persisted failure artifact, e.g. model_refusal). It
+   * ended, but its failure is the step's result: never replaced, the failure propagates.
+   */
+  | {
+      kind: "terminal-no-report";
+      attemptId?: string;
+      failure?: { errorMessage: string };
+      /** Same strict-read meaning as on `indeterminate`: the ended attempt has no row. */
+      code?: "no-record";
+    };
+
+/** A bounded settlement wait never turns unresolved cleanup into permission to replace a child. */
+export type TaskAttemptSettlement<Report> = TaskAttemptOutcome<Report> | { kind: "timeout" };
 
 // Normalized runtime settings always include numeric task limits.
 export type TaskSettings = Required<
@@ -22,65 +47,10 @@ export const DEFAULT_TASK_SETTINGS: TaskSettings = {
   maxParallelAgentTasks: TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default,
   maxTaskNestingDepth: TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default,
   proposePlanImplementReplacesChatHistory: false,
-  preserveSubagentsUntilArchive: false,
+  // Completed user-spawned sub-agents are durable workspace records. Archive is reversible;
+  // explicit remove owns irreversible cleanup. Workflow-owned tasks keep their transient cleanup.
+  preserveSubagentsUntilArchive: true,
 };
-
-const AGENT_DEFAULT_IDS_EXCLUDED_FROM_LEGACY_SUBAGENTS: ReadonlySet<string> = new Set([
-  "plan",
-  "exec",
-  "compact",
-]);
-
-export function shouldMirrorAgentDefaultToLegacySubagent(agentId: string): boolean {
-  return !AGENT_DEFAULT_IDS_EXCLUDED_FROM_LEGACY_SUBAGENTS.has(agentId);
-}
-
-export function normalizeSubagentAiDefaults(raw: unknown): SubagentAiDefaults {
-  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : ({} as const);
-
-  const result: SubagentAiDefaults = {};
-
-  for (const [agentTypeRaw, entryRaw] of Object.entries(record)) {
-    const agentType = normalizeAgentId(agentTypeRaw, "");
-    if (!agentType) continue;
-    if (!AgentIdSchema.safeParse(agentType).success) continue;
-    if (!entryRaw || typeof entryRaw !== "object") continue;
-
-    const entry = entryRaw as Record<string, unknown>;
-
-    const modelString =
-      typeof entry.modelString === "string" && entry.modelString.trim().length > 0
-        ? entry.modelString.trim()
-        : undefined;
-
-    const thinkingLevel: ThinkingLevel | undefined = coerceThinkingLevel(entry.thinkingLevel);
-
-    if (!modelString && !thinkingLevel) {
-      continue;
-    }
-
-    result[agentType] = { modelString, thinkingLevel };
-  }
-
-  return result;
-}
-
-export function deriveLegacySubagentAiDefaultsFromAgentDefaults(params: {
-  agentAiDefaults: Record<string, unknown>;
-  preservedExec?: SubagentAiDefaultsEntry;
-}): SubagentAiDefaults {
-  const legacySubagentDefaultsRaw: Record<string, unknown> = {};
-  for (const [agentId, entry] of Object.entries(params.agentAiDefaults)) {
-    if (!shouldMirrorAgentDefaultToLegacySubagent(agentId)) continue;
-    legacySubagentDefaultsRaw[agentId] = entry;
-  }
-
-  const legacySubagentDefaults = normalizeSubagentAiDefaults(legacySubagentDefaultsRaw);
-  if (params.preservedExec) {
-    legacySubagentDefaults.exec = params.preservedExec;
-  }
-  return legacySubagentDefaults;
-}
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -114,10 +84,9 @@ export function normalizeTaskSettings(raw: unknown): TaskSettings {
       ? record.proposePlanImplementReplacesChatHistory
       : (DEFAULT_TASK_SETTINGS.proposePlanImplementReplacesChatHistory ?? false);
 
-  const preserveSubagentsUntilArchive =
-    typeof record.preserveSubagentsUntilArchive === "boolean"
-      ? record.preserveSubagentsUntilArchive
-      : DEFAULT_TASK_SETTINGS.preserveSubagentsUntilArchive;
+  // Legacy compatibility field: modern user-owned sub-agents always persist until explicit remove.
+  // Keep writing true so older builds choose their most conservative retention behavior.
+  const preserveSubagentsUntilArchive = true;
 
   const result: TaskSettings = {
     maxParallelAgentTasks,

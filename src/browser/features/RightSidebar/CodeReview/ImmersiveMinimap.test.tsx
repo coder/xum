@@ -97,6 +97,7 @@ describe("ImmersiveMinimap", () => {
       />
     );
 
+    expect(view.getByTestId("immersive-minimap").className).toContain("h-full");
     // Synchronous render — no waitFor needed since parseDiffLines runs during render
     expect(view.getByTestId("immersive-minimap-canvas")).toBeTruthy();
   });
@@ -131,6 +132,41 @@ describe("ImmersiveMinimap", () => {
     );
 
     expect(parseSpy).toHaveBeenCalledWith(updatedContent);
+  });
+
+  test("redraws from the latest scroll position when parent bumps redraw nonce", () => {
+    const stableLineCategories: immersiveMinimapMath.LineCategory[] = ["add", "remove", "context"];
+    spyOn(immersiveMinimapMath, "parseDiffLines").mockImplementation(() => stableLineCategories);
+    const getThumbMetricsSpy = spyOn(immersiveMinimapMath, "getThumbMetrics");
+    const scrollFixture = createScrollContainerFixture();
+    const scrollContainerRef = { current: scrollFixture.element };
+    const commentLineIndices = new Set<number>();
+    const onSelectLineIndex = mock(() => undefined);
+
+    const renderMinimap = (redrawNonce: number) => (
+      <ImmersiveMinimap
+        content="+line a\n-line b\n context"
+        scrollContainerRef={scrollContainerRef}
+        activeLineIndex={null}
+        redrawNonce={redrawNonce}
+        onSelectLineIndex={onSelectLineIndex}
+        commentLineIndices={commentLineIndices}
+      />
+    );
+
+    const view = render(renderMinimap(0));
+    const canvas = view.getByTestId("immersive-minimap-canvas") as HTMLCanvasElement;
+    Object.defineProperty(canvas, "clientWidth", { configurable: true, get: () => 48 });
+    Object.defineProperty(canvas, "clientHeight", { configurable: true, get: () => 120 });
+    getThumbMetricsSpy.mockClear();
+
+    scrollFixture.element.scrollTop = 375;
+    view.rerender(renderMinimap(1));
+
+    // Parent reveal scroll happens outside the minimap. The nonce is the contract
+    // that forces a hidden pre-reveal canvas redraw using the new scrollTop even
+    // when React Compiler keeps parsed line categories stable across renders.
+    expect(getThumbMetricsSpy).toHaveBeenCalledWith(375, 1000, 250, 120);
   });
 
   test("clicking minimap dispatches the mapped line index", () => {

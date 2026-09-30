@@ -23,7 +23,8 @@ async function executeBashUntilReady(
   timeoutMs = 5000
 ): Promise<ExecuteBashResult> {
   let lastResult: ExecuteBashResult | null = null;
-  let lastFailure: string | null = null;
+  // Widened explicitly: assignments inside the waitFor callback are invisible to narrowing.
+  let lastFailure = null as string | null;
 
   const ready = await waitFor(async () => {
     try {
@@ -361,21 +362,8 @@ describeIntegration("executeBash", () => {
         if (!invalidFetchResult.success) return;
         expect(invalidFetchResult.data.success).toBe(true);
 
-        // Test 2: Verify git fetch to real GitHub org repo doesn't hang
-        // Uses OpenAI org - will fail if no auth configured, but should fail quickly without prompting
-        const githubFetchResult = await client.workspace.executeBash({
-          workspaceId,
-          script: "git fetch https://github.com/openai/private-test-repo-nonexistent 2>&1 || true",
-          options: { timeout_secs: GIT_FETCH_TIMEOUT_SECS },
-        });
-
-        // Should complete quickly (not hang waiting for credentials)
-        expect(githubFetchResult.success).toBe(true);
-        if (!githubFetchResult.success) return;
-        // Command should complete within timeout - the "|| true" ensures success even if fetch fails
-        expect(githubFetchResult.data.success).toBe(true);
-        // Output should contain error message, not hang
-        expect(githubFetchResult.data.output).toContain("fatal");
+        // Avoid a live GitHub fetch here: the env assertion above is the contract, and
+        // live HTTPS remotes can exceed the short timeout in network-isolated CI.
 
         // Clean up
         await client.workspace.remove({ workspaceId });

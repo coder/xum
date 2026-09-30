@@ -10,6 +10,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { NOW, createArchivedWorkspace } from "@/browser/stories/mocks/workspaces";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
@@ -73,8 +74,12 @@ function ArchivedWorkspacesStoryShell(props: {
 
   useEffect(() => {
     workspaceStore.setClient(client);
+    // useProvidersConfig consumers read the shared store, which gets its
+    // client from AppLoader in the real app — wire it manually here too.
+    getProvidersConfigStore().setClient(client);
     return () => {
       workspaceStore.setClient(null);
+      getProvidersConfigStore().setClient(null);
     };
   }, [client, workspaceStore]);
 

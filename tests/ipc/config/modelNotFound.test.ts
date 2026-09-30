@@ -1,6 +1,5 @@
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
 import { sendMessageWithModel, createStreamCollector, modelString } from "../helpers";
-import type { StreamErrorMessage } from "@/common/orpc/types";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -32,9 +31,7 @@ describeIntegration("model_not_found error handling", () => {
         await collector.waitForEvent("stream-error", 10000);
 
         const events = collector.getEvents();
-        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error") as
-          | StreamErrorMessage
-          | undefined;
+        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error");
 
         expect(errorEvent).toBeDefined();
 
@@ -50,7 +47,7 @@ describeIntegration("model_not_found error handling", () => {
   );
 
   test.concurrent(
-    "should classify OpenAI 400 model_not_found as model_not_found (not retryable)",
+    "should classify OpenAI model_not_found as model_not_found (not retryable)",
     async () => {
       const { env, workspaceId, cleanup } = await setupWorkspace("openai");
       const collector = createStreamCollector(env.orpc, workspaceId);
@@ -58,7 +55,7 @@ describeIntegration("model_not_found error handling", () => {
       await collector.waitForSubscription();
       try {
         // Send a message with a non-existent model
-        // OpenAI returns 400 with error.code === 'model_not_found'
+        // OpenAI returns 400 or 404 with error.code === 'model_not_found'
         void sendMessageWithModel(
           env,
           workspaceId,
@@ -70,9 +67,7 @@ describeIntegration("model_not_found error handling", () => {
         await collector.waitForEvent("stream-error", 10000);
 
         const events = collector.getEvents();
-        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error") as
-          | StreamErrorMessage
-          | undefined;
+        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error");
 
         expect(errorEvent).toBeDefined();
 

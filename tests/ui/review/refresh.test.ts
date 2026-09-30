@@ -1,37 +1,30 @@
 import "../dom";
 import { fireEvent, waitFor } from "@testing-library/react";
 
-import { shouldRunIntegrationTests, validateApiKeys } from "../../testUtils";
+import { shouldRunIntegrationTests } from "../../testUtils";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
-import { getReviewsKey } from "@/common/constants/storage";
 import {
   cleanupSharedRepo,
   configureTestRetries,
   createSharedRepo,
   withSharedWorkspace,
 } from "../../ipc/sendMessageTestHelpers";
-import { HAIKU_MODEL, sendMessageWithModel } from "../../ipc/helpers";
-import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
-
 import { installDom } from "../dom";
 import { renderReviewPanel, type RenderedApp } from "../renderReviewPanel";
 import {
   cleanupView,
   setupWorkspaceView,
-  waitForToolCallEnd,
   waitForRefreshButtonIdle,
   assertRefreshButtonHasLastRefreshInfo,
   simulateFileModifyingToolEnd,
 } from "../helpers";
 import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 configureTestRetries(2);
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
-
-validateApiKeys(["ANTHROPIC_API_KEY"]);
 
 /**
  * Helper to set up the full App UI and navigate to the Review tab.
@@ -425,10 +418,10 @@ describeIntegration("ReviewPanel simulated tool refresh (UI + ORPC, no LLM)", ()
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUTO REFRESH TEST (slow, requires LLM)
+// AUTO REFRESH TEST
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describeIntegration("ReviewPanel auto refresh (UI + ORPC + live LLM)", () => {
+describeIntegration("ReviewPanel auto refresh (UI + ORPC)", () => {
   beforeAll(async () => {
     await createSharedRepo();
   });
@@ -438,7 +431,7 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC + live LLM)", () => {
   });
 
   test("tool-call-end triggers scheduled refresh", async () => {
-    await withSharedWorkspace("anthropic", async ({ env, workspaceId, collector, metadata }) => {
+    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
       const view = renderReviewPanelForRefreshTests({
@@ -465,24 +458,10 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC + live LLM)", () => {
         // Without a scheduled refresh, the UI should not pick this up yet.
         expect(view.queryByText(new RegExp(AUTO_MARKER))).toBeNull();
 
-        // Trigger a tool-call-end event via bash.
-        const FORCE_BASH: ToolPolicy = [{ regex_match: "bash", action: "require" }];
-
-        const autoRes = await sendMessageWithModel(
-          env,
-          workspaceId,
-          'Use bash to run: echo ping. Set display_name="ping" and timeout_secs=30. Do not modify files.',
-          HAIKU_MODEL,
-          {
-            agentId: "exec",
-            thinkingLevel: "off",
-            toolPolicy: FORCE_BASH,
-          }
-        );
-        expect(autoRes.success).toBe(true);
-
-        await collector.waitForEvent("stream-end", 30_000);
-        await waitForToolCallEnd(collector, "bash");
+        // Exercise the same WorkspaceStore event emitted after file-modifying tools complete.
+        // A live model made this behavioral test depend on whether the provider chose/called bash,
+        // which repeatedly flaked in CI before the event under test was ever emitted.
+        simulateFileModifyingToolEnd(workspaceId);
 
         // Verify the workspace actually changed
         const statusRes = await env.orpc.workspace.executeBash({
@@ -598,6 +577,7 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC + live LLM)", () => {
         textarea.focus();
         fireEvent.focus(textarea);
 
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- native setter is invoked with .call(textarea) below
         const valueSetter = Object.getOwnPropertyDescriptor(
           Object.getPrototypeOf(textarea),
           "value"
@@ -623,12 +603,12 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC + live LLM)", () => {
           if (stillThere) throw new Error("Review note input still visible after submit");
         });
 
-        // Ensure the review was persisted before asserting UI updates.
+        // Ensure the review was persisted to the backend review-state store before asserting
+        // UI updates.
         await waitFor(
-          () => {
-            const persisted = readPersistedState<unknown>(getReviewsKey(workspaceId), null);
-            if (!persisted) throw new Error("Review not persisted");
-            expect(JSON.stringify(persisted)).toContain(NOTE_TEXT);
+          async () => {
+            const snapshot = await env.services.reviewStateService.getSnapshot(workspaceId);
+            expect(JSON.stringify(snapshot.sections.reviews ?? {})).toContain(NOTE_TEXT);
           },
           { timeout: 10_000 }
         );

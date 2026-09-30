@@ -1,61 +1,112 @@
 import { describe, expect, test } from "bun:test";
 
 import { AgentReportToolCall } from "../AgentReportToolCall";
-import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
-import { AgentSkillReadToolCall } from "../AgentSkillReadToolCall";
-import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
-import { DesktopActionToolCall } from "../DesktopActionToolCall";
-import { DesktopScreenshotToolCall } from "../DesktopScreenshotToolCall";
 import { GenericToolCall } from "../GenericToolCall";
-import { GetGoalToolCall } from "../GetGoalToolCall";
+import { IntuitionToolCall } from "../IntuitionToolCall";
+import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
+import { ToolSearchToolCall } from "../ToolSearchToolCall";
+import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
+import { WorkflowRunToolCall } from "../WorkflowRunToolCall";
 import { getToolComponent } from "./getToolComponent";
+import { BashToolCall } from "../BashToolCall";
+import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 
 describe("getToolComponent", () => {
-  test("returns AgentReportToolCall for agent_report", () => {
-    const component = getToolComponent("agent_report", { reportMarkdown: "# Hello" });
-    expect(component).toBe(AgentReportToolCall);
+  test("routes a depth-rejected result to the generic card, even with valid args", () => {
+    // Tool-specific cards assume object results; the placeholder string would make them throw.
+    const args = { script: "cat huge.json", timeout_secs: 60, display_name: "Dump" };
+    expect(getToolComponent("bash", args, TOOL_PAYLOAD_DEPTH_REJECTION)).toBe(GenericToolCall);
+    expect(getToolComponent("bash", args, { success: true, output: "ok" })).toBe(BashToolCall);
   });
 
-  test("returns AgentSkillReadToolCall for agent_skill_read", () => {
-    const component = getToolComponent("agent_skill_read", { name: "react-effects" });
-    expect(component).toBe(AgentSkillReadToolCall);
+  test("falls back to generic rendering for removed or unknown tools", () => {
+    expect(getToolComponent("workflow_list", {}, undefined)).toBe(GenericToolCall);
+    expect(getToolComponent("unknown_tool", {}, undefined)).toBe(GenericToolCall);
   });
 
-  test("returns AgentSkillReadFileToolCall for agent_skill_read_file", () => {
-    const component = getToolComponent("agent_skill_read_file", {
-      name: "react-effects",
-      filePath: "references/README.md",
-    });
-    expect(component).toBe(AgentSkillReadFileToolCall);
+  test("renders legacy file-backed agent_report transcripts", () => {
+    expect(
+      getToolComponent(
+        "agent_report",
+        {
+          reportMarkdownPath: "report.md",
+          structuredOutputPath: "structured-output.json",
+          title: null,
+        },
+        undefined
+      )
+    ).toBe(AgentReportToolCall);
+    expect(getToolComponent("agent_report", {}, undefined)).toBe(AgentReportToolCall);
   });
 
-  test("returns DesktopScreenshotToolCall for desktop_screenshot", () => {
-    const component = getToolComponent("desktop_screenshot", { scaledWidth: 640 });
-    expect(component).toBe(DesktopScreenshotToolCall);
+  test("routes kernel-bounded workflow_run args to the workflow card", () => {
+    // Kernel-nested calls with oversized launch args arrive as a marker; the
+    // card renders from the attached durable run instead of raw JSON.
+    const marker = { __kernelBounded: true, bytes: 18_457, preview: '{"script_path":"skill…' };
+    expect(getToolComponent("workflow_run", marker, undefined)).toBe(WorkflowRunToolCall);
+    expect(
+      getToolComponent(
+        "workflow_run",
+        { ...marker, script_path: "skill://demo/workflow.js" },
+        undefined
+      )
+    ).toBe(WorkflowRunToolCall);
+    // Other tools keep the generic fallback for bounded args.
+    expect(getToolComponent("bash", marker, undefined)).toBe(GenericToolCall);
   });
 
-  test("returns DesktopActionToolCall for desktop_click", () => {
-    const component = getToolComponent("desktop_click", { x: 12, y: 34 });
-    expect(component).toBe(DesktopActionToolCall);
+  test("renders historical workspace lifecycle actions", () => {
+    expect(
+      getToolComponent(
+        "task_workspace_lifecycle",
+        {
+          action: "remove",
+          targets: [{ workspaceId: "workspace-id" }],
+          force: true,
+        },
+        undefined
+      )
+    ).toBe(WorkspaceLifecycleToolCall);
   });
 
-  test("returns GetGoalToolCall for get_goal", () => {
-    const component = getToolComponent("get_goal", {});
-    expect(component).toBe(GetGoalToolCall);
+  test("falls back when catalog schema validation fails", () => {
+    expect(getToolComponent("agent_skill_list", { includeUnadvertised: "yes" }, undefined)).toBe(
+      GenericToolCall
+    );
+    expect(getToolComponent("agent_report", { reportMarkdown: "" }, undefined)).toBe(
+      GenericToolCall
+    );
   });
 
-  test("returns CompleteGoalToolCall for complete_goal", () => {
-    const component = getToolComponent("complete_goal", { summary: "Done." });
-    expect(component).toBe(CompleteGoalToolCall);
+  test("keeps provider-executed Google search calls visible while arguments stream", () => {
+    expect(
+      getToolComponent("server:GOOGLE_SEARCH_WEB", { queries: ["gemini 3 pricing"] }, undefined)
+    ).toBe(GoogleSearchToolCall);
+    expect(getToolComponent("server:GOOGLE_SEARCH_WEB", {}, undefined)).toBe(GoogleSearchToolCall);
+    expect(
+      getToolComponent("server:GOOGLE_SEARCH_WEB", { queries: "not-an-array" }, undefined)
+    ).toBe(GenericToolCall);
   });
 
-  test("complete_goal falls back to GenericToolCall when summary is empty (zod min(1) fails)", () => {
-    const component = getToolComponent("complete_goal", { summary: "" });
-    expect(component).toBe(GenericToolCall);
+  test("uses the intuition card only for valid cue arguments", () => {
+    expect(getToolComponent("intuition", { cue: "Recall deployment constraints" }, undefined)).toBe(
+      IntuitionToolCall
+    );
+    expect(getToolComponent("intuition", { cue: "" }, undefined)).toBe(GenericToolCall);
+    expect(getToolComponent("intuition", { cue: { nested: true } }, undefined)).toBe(
+      GenericToolCall
+    );
   });
 
-  test("falls back to GenericToolCall when args validation fails", () => {
-    const component = getToolComponent("agent_report", { reportMarkdown: "" });
-    expect(component).toBe(GenericToolCall);
+  test("renders legacy tool_search transcript calls", () => {
+    expect(getToolComponent("tool_search", { query: "send slack message" }, undefined)).toBe(
+      ToolSearchToolCall
+    );
+  });
+
+  test("Object.prototype member names fall back instead of throwing", () => {
+    expect(getToolComponent("constructor", {}, undefined)).toBe(GenericToolCall);
+    expect(getToolComponent("__proto__", {}, undefined)).toBe(GenericToolCall);
+    expect(getToolComponent("toString", {}, undefined)).toBe(GenericToolCall);
   });
 });

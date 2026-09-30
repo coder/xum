@@ -10,30 +10,18 @@ import {
   LoadingDots,
   ToolIcon,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useToolExpansion,
+  getStatusDisplay,
+  unwrapResult,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 
 interface WebSearchToolCallProps {
   args: { query?: string }; // Anthropic puts query in args
   result?: unknown;
   status?: ToolStatus;
-}
-
-/**
- * Unwrap JSON container from streamManager's stripEncryptedContent.
- * Results arrive as { type: "json", value: [...] } or direct array/object.
- */
-function unwrapResult(result: unknown): unknown {
-  if (
-    result !== null &&
-    typeof result === "object" &&
-    "type" in result &&
-    (result as { type: string }).type === "json" &&
-    "value" in result
-  ) {
-    return (result as { value: unknown }).value;
-  }
-  return result;
 }
 
 /**

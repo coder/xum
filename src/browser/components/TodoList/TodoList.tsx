@@ -68,6 +68,13 @@ function calculateTextOpacity(
 
 interface TodoListProps {
   todos: TodoItem[];
+  /**
+   * Orientation of the list:
+   *  - "vertical" (default): stacked rows — used by the pinned list and tool history.
+   *  - "horizontal": a single horizontally-scrolling row of compact chips, used by the
+   *    immersive review status bar to keep the plan to one row of vertical space.
+   */
+  layout?: "vertical" | "horizontal";
 }
 
 function getStatusIcon(status: TodoItem["status"]): React.ReactNode {
@@ -75,7 +82,13 @@ function getStatusIcon(status: TodoItem["status"]): React.ReactNode {
     case "completed":
       return <Check aria-hidden="true" className="h-3 w-3" />;
     case "in_progress":
-      return <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" />;
+      return (
+        // Chromium composites transforms on this HTML wrapper; animating the SVG
+        // itself keeps the renderer main thread busy even while mux is otherwise idle.
+        <span className="inline-flex animate-spin">
+          <Loader2 aria-hidden="true" className="h-3 w-3" />
+        </span>
+      );
     case "pending":
     default:
       return <Circle aria-hidden="true" className="h-3 w-3" />;
@@ -87,7 +100,8 @@ function getStatusIcon(status: TodoItem["status"]): React.ReactNode {
  * - TodoToolCall (in expanded tool history)
  * - PinnedTodoList (pinned at bottom of chat)
  */
-export const TodoList: React.FC<TodoListProps> = ({ todos }) => {
+export const TodoList: React.FC<TodoListProps> = ({ todos, layout = "vertical" }) => {
+  const isHorizontal = layout === "horizontal";
   // Count completed and pending items for fade effects
   const completedCount = todos.filter((t) => t.status === "completed").length;
   const pendingCount = todos.filter((t) => t.status === "pending").length;
@@ -95,7 +109,16 @@ export const TodoList: React.FC<TodoListProps> = ({ todos }) => {
   let pendingIndex = 0;
 
   return (
-    <div className="flex flex-col gap-[3px] px-2 py-1.5">
+    <div
+      className={cn(
+        "px-2 py-1.5",
+        isHorizontal
+          ? // Single row, horizontal scroll: stays one row tall no matter how many
+            // todos so the immersive bar reserves minimal review height.
+            "flex flex-row gap-1.5 overflow-x-auto"
+          : "flex flex-col gap-[3px]"
+      )}
+    >
       {todos.map((todo, index) => {
         const currentCompletedIndex = todo.status === "completed" ? completedIndex++ : undefined;
         const currentPendingIndex = todo.status === "pending" ? pendingIndex++ : undefined;
@@ -111,14 +134,19 @@ export const TodoList: React.FC<TodoListProps> = ({ todos }) => {
         return (
           <div
             key={index}
-            className="font-monospace flex items-start gap-1.5 rounded border-l-2 px-2 py-1 text-[11px] leading-[1.35]"
+            className={cn(
+              "font-monospace flex gap-1.5 rounded border-l-2 px-2 py-1 text-[11px] leading-[1.35]",
+              isHorizontal ? "max-w-[220px] shrink-0 items-center" : "items-start"
+            )}
             style={{
               background: statusBgColors[todo.status],
               borderLeftColor: statusBorderColors[todo.status],
               color: "var(--color-text)",
             }}
           >
-            <div className="mt-px shrink-0 text-xs opacity-80">{getStatusIcon(todo.status)}</div>
+            <div className={cn("shrink-0 text-xs opacity-80", !isHorizontal && "mt-px")}>
+              {getStatusIcon(todo.status)}
+            </div>
             <div className="min-w-0 flex-1">
               <div
                 title={todo.content}

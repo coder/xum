@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hello-plugin",
+  "version": "1.0.0",
+  "description": "Mux fixture plugin exercising Agent Plugins skills + MCP discovery",
+  "author": { "name": "Mux" },
+  "license": "MIT",
+  "keywords": ["fixture", "testing"]
+}

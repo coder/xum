@@ -54,113 +54,120 @@ export const NotEnrolled: Story = {
   render: () => renderGovernorSection(() => setupGovernorStory()),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByRole("button", { name: /enroll in mux governor/i });
+    await canvas.findByRole("button", { name: /enroll in xum governor/i });
   },
 };
 
-export const EnrolledWithPolicy: Story = {
-  render: () =>
-    renderGovernorSection(() =>
-      setupGovernorStory({
-        muxGovernorUrl: "https://governor.example.com",
-        muxGovernorEnrolled: true,
-        policyResponse: {
-          source: "governor",
-          status: { state: "enforced" },
-          policy: {
-            policyFormatVersion: "0.1",
-            providerAccess: [{ id: "anthropic", allowedModels: ["claude-sonnet-4-20250514"] }],
-            mcp: { allowUserDefined: { stdio: false, remote: true } },
-            runtimes: ["local", "worktree", "ssh"],
-          },
+// Gallery of enrolled-policy variants. Folded into one composite snapshot (was
+// five separate stories) to compress the snapshot budget while preserving each
+// unique visual state in a labeled section. None of these variants have a `play`
+// function, so merging them loses no interaction coverage.
+const ENROLLED_POLICY_VARIANTS: ReadonlyArray<{ label: string; options: GovernorStoryOptions }> = [
+  {
+    label: "Enrolled with policy (governor source, enforced)",
+    options: {
+      muxGovernorUrl: "https://governor.example.com",
+      muxGovernorEnrolled: true,
+      policyResponse: {
+        source: "governor",
+        status: { state: "enforced" },
+        policy: {
+          policyFormatVersion: "0.1",
+          providerAccess: [{ id: "anthropic", allowedModels: ["claude-sonnet-4-20250514"] }],
+          mcp: { allowUserDefined: { stdio: false, remote: true } },
+          runtimes: ["local", "worktree", "ssh"],
         },
-      })
-    ),
-};
+      },
+    },
+  },
+  {
+    label: "Enrolled, policy disabled",
+    options: {
+      muxGovernorUrl: "https://governor.example.com",
+      muxGovernorEnrolled: true,
+      policyResponse: {
+        source: "governor",
+        status: { state: "disabled" },
+        policy: null,
+      },
+    },
+  },
+  {
+    label: "Enrolled, env override (enforced)",
+    options: {
+      muxGovernorUrl: "https://governor.example.com",
+      muxGovernorEnrolled: true,
+      policyResponse: {
+        source: "env",
+        status: { state: "enforced" },
+        policy: {
+          policyFormatVersion: "0.1",
+          providerAccess: [{ id: "anthropic", allowedModels: null }],
+          mcp: { allowUserDefined: { stdio: true, remote: true } },
+          runtimes: null,
+        },
+      },
+    },
+  },
+  {
+    label: "Policy blocked",
+    options: {
+      muxGovernorUrl: "https://governor.example.com",
+      muxGovernorEnrolled: true,
+      policyResponse: {
+        source: "governor",
+        status: { state: "blocked", reason: "blocked by policy" },
+        policy: {
+          policyFormatVersion: "0.1",
+          providerAccess: [],
+          mcp: { allowUserDefined: { stdio: false, remote: false } },
+          runtimes: ["local"],
+        },
+      },
+    },
+  },
+  {
+    label: "Rich policy (multiple providers, server version)",
+    options: {
+      muxGovernorUrl: "https://governor.example.com",
+      muxGovernorEnrolled: true,
+      policyResponse: {
+        source: "governor",
+        status: { state: "enforced" },
+        policy: {
+          policyFormatVersion: "0.1",
+          serverVersion: "2.0.0",
+          providerAccess: [
+            {
+              id: "anthropic",
+              allowedModels: ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"],
+            },
+            {
+              id: "openai",
+              allowedModels: ["gpt-4o", "gpt-4o-mini"],
+              forcedBaseUrl: "https://proxy.corp.example.com/v1",
+            },
+            { id: "google", allowedModels: null },
+          ],
+          mcp: { allowUserDefined: { stdio: true, remote: false } },
+          runtimes: ["local", "worktree"],
+        },
+      },
+    },
+  },
+];
 
-export const EnrolledPolicyDisabled: Story = {
-  render: () =>
-    renderGovernorSection(() =>
-      setupGovernorStory({
-        muxGovernorUrl: "https://governor.example.com",
-        muxGovernorEnrolled: true,
-        policyResponse: {
-          source: "governor",
-          status: { state: "disabled" },
-          policy: null,
-        },
-      })
-    ),
-};
-
-export const EnrolledEnvOverride: Story = {
-  render: () =>
-    renderGovernorSection(() =>
-      setupGovernorStory({
-        muxGovernorUrl: "https://governor.example.com",
-        muxGovernorEnrolled: true,
-        policyResponse: {
-          source: "env",
-          status: { state: "enforced" },
-          policy: {
-            policyFormatVersion: "0.1",
-            providerAccess: [{ id: "anthropic", allowedModels: null }],
-            mcp: { allowUserDefined: { stdio: true, remote: true } },
-            runtimes: null,
-          },
-        },
-      })
-    ),
-};
-
-export const PolicyBlocked: Story = {
-  render: () =>
-    renderGovernorSection(() =>
-      setupGovernorStory({
-        muxGovernorUrl: "https://governor.example.com",
-        muxGovernorEnrolled: true,
-        policyResponse: {
-          source: "governor",
-          status: { state: "blocked", reason: "blocked by policy" },
-          policy: {
-            policyFormatVersion: "0.1",
-            providerAccess: [],
-            mcp: { allowUserDefined: { stdio: false, remote: false } },
-            runtimes: ["local"],
-          },
-        },
-      })
-    ),
-};
-
-export const RichPolicy: Story = {
-  render: () =>
-    renderGovernorSection(() =>
-      setupGovernorStory({
-        muxGovernorUrl: "https://governor.example.com",
-        muxGovernorEnrolled: true,
-        policyResponse: {
-          source: "governor",
-          status: { state: "enforced" },
-          policy: {
-            policyFormatVersion: "0.1",
-            serverVersion: "2.0.0",
-            providerAccess: [
-              {
-                id: "anthropic",
-                allowedModels: ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"],
-              },
-              {
-                id: "openai",
-                allowedModels: ["gpt-4o", "gpt-4o-mini"],
-                forcedBaseUrl: "https://proxy.corp.example.com/v1",
-              },
-              { id: "google", allowedModels: null },
-            ],
-            mcp: { allowUserDefined: { stdio: true, remote: false } },
-            runtimes: ["local", "worktree"],
-          },
-        },
-      })
-    ),
+export const EnrolledPolicyGallery: Story = {
+  render: () => (
+    <div className="flex flex-col gap-8">
+      {ENROLLED_POLICY_VARIANTS.map((variant) => (
+        <section key={variant.label} className="flex flex-col gap-2">
+          <h3 className="text-foreground/70 px-6 text-xs font-semibold tracking-wide uppercase">
+            {variant.label}
+          </h3>
+          {renderGovernorSection(() => setupGovernorStory(variant.options))}
+        </section>
+      ))}
+    </div>
+  ),
 };

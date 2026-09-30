@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "Installing dependencies with bun..."
-# Keep tool bootstrap read-only for lockfiles so opening a workspace never dirties bun.lock.
-bun install --frozen-lockfile
-echo "Dependencies installed successfully!"
-

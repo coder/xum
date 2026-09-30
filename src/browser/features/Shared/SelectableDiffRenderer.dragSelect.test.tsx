@@ -1,33 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test, type Mock } from "bun:test";
-import { copyFile, rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
-import { requireTestModule } from "@/browser/testUtils";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import type * as DiffRendererModule from "./DiffRenderer";
-
-let SelectableDiffRenderer!: typeof DiffRendererModule.SelectableDiffRenderer;
-let isolatedDiffRendererPath: string | null = null;
-
-const sharedDir = dirname(fileURLToPath(import.meta.url));
-
-async function importIsolatedSelectableDiffRenderer() {
-  const isolatedPath = join(sharedDir, `DiffRenderer.dragSelect.real.${randomUUID()}.tsx`);
-
-  // Load a unique temp copy of the real module so earlier Bun mock.module registrations for
-  // @/browser/features/Shared/DiffRenderer cannot swap in the stubbed renderer for this suite.
-  await copyFile(join(sharedDir, "DiffRenderer.tsx"), isolatedPath);
-  ({ SelectableDiffRenderer } = requireTestModule<{
-    SelectableDiffRenderer: typeof DiffRendererModule.SelectableDiffRenderer;
-  }>(isolatedPath));
-
-  return isolatedPath;
-}
+import { SelectableDiffRenderer } from "./DiffRenderer";
 
 describe("SelectableDiffRenderer drag selection", () => {
   let onReviewNote: Mock<(data: unknown) => void>;
@@ -36,9 +14,8 @@ describe("SelectableDiffRenderer drag selection", () => {
   let rafHandleCounter = 0;
   const rafTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
-  beforeEach(async () => {
-    isolatedDiffRendererPath = await importIsolatedSelectableDiffRenderer();
-
+  beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -78,7 +55,7 @@ describe("SelectableDiffRenderer drag selection", () => {
     onReviewNote = mock(() => undefined);
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
 
     for (const timeout of rafTimeouts.values()) {
@@ -94,13 +71,7 @@ describe("SelectableDiffRenderer drag selection", () => {
       globalThis.window.cancelAnimationFrame = originalCancelAnimationFrame;
     }
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-
-    if (isolatedDiffRendererPath) {
-      await rm(isolatedDiffRendererPath, { force: true });
-      isolatedDiffRendererPath = null;
-    }
+    restoreDomGlobals();
   });
 
   test("hovering the review button uses the full custom range-selection tooltip", async () => {
@@ -133,6 +104,40 @@ describe("SelectableDiffRenderer drag selection", () => {
         "Add review comment (Shift-click or drag to select range)"
       );
     });
+  });
+
+  test("typing in the review composer does not schedule textarea layout work per key", async () => {
+    const content = Array.from({ length: 200 }, (_, index) => ` line ${index + 1}`).join("\n");
+
+    const { container, getByPlaceholderText } = render(
+      <ThemeProvider forcedTheme="dark">
+        <TooltipProvider>
+          <SelectableDiffRenderer
+            content={content}
+            filePath="src/test.ts"
+            onReviewNote={onReviewNote}
+            maxHeight="none"
+            enableHighlighting={false}
+          />
+        </TooltipProvider>
+      </ThemeProvider>
+    );
+
+    const commentButton = await waitFor(() =>
+      container.querySelector<HTMLButtonElement>('button[aria-label="Add review comment"]')
+    );
+    expect(commentButton).toBeTruthy();
+
+    fireEvent.click(commentButton!);
+    const textarea = (await waitFor(() =>
+      getByPlaceholderText(/Add a review note/i)
+    )) as HTMLTextAreaElement;
+
+    const animationFramesBeforeTyping = rafHandleCounter;
+    fireEvent.input(textarea, { target: { value: "a" } });
+    fireEvent.input(textarea, { target: { value: "ab" } });
+
+    expect(rafHandleCounter).toBe(animationFramesBeforeTyping);
   });
 
   test("dragging on the indicator column selects a line range", async () => {

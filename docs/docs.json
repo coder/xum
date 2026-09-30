@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "maple",
-  "name": "Mux",
+  "name": "Xum",
   "logo": {
     "light": "/img/logo-black.svg",
     "dark": "/img/logo-white.svg"
@@ -45,15 +45,16 @@
             "group": "Workspaces",
             "pages": [
               "workspaces",
+              "workspaces/scratch-chats",
               "workspaces/fork",
-              "workspaces/sharing",
-              "workspaces/muxignore",
+              "workspaces/xumignore",
               {
                 "group": "Compaction",
                 "pages": [
                   "workspaces/compaction",
                   "workspaces/compaction/manual",
                   "workspaces/compaction/automatic",
+                  "workspaces/compaction/token-budget",
                   "workspaces/compaction/customization"
                 ]
               },
@@ -71,7 +72,7 @@
               },
               {
                 "group": "Hooks",
-                "pages": ["hooks/init", "hooks/tools", "hooks/environment-variables"]
+                "pages": ["hooks/init", "hooks/lifecycle", "hooks/tools", "hooks/environment-variables"]
               }
             ]
           },
@@ -81,7 +82,6 @@
               "agents",
               "agents/instruction-files",
               "agents/agent-skills",
-              "agents/advisors",
               "agents/plan-mode",
               "agents/system-prompt",
               "agents/prompting-tips",
@@ -106,6 +106,7 @@
             "group": "Guides",
             "pages": [
               "guides/github-actions",
+              "guides/symbol-shortcuts",
               "config/agentic-git-identity",
               "agents/prompting-tips"
             ]
@@ -117,14 +118,16 @@
           {
             "group": "Reference",
             "pages": [
+              "reference/mux-compatibility",
               "reference/debugging",
               "reference/telemetry",
               "reference/storybook",
               "reference/benchmarking",
-              "adr/0001-experimental-image-generation-tool",
-              "adr/0002-image-editing-visual-mockups",
               "adr/0003-context-boundaries-for-compaction-and-reset",
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
+              "adr/0005-token-budget-context-windows",
+              "adr/0006-agent-led-context-handoff",
+              "adr/0007-session-memory-is-the-rollover-checkpoint",
               "AGENTS"
             ]
           }
@@ -147,6 +150,7 @@
     { "source": "/why-parallelize", "destination": "/getting-started/why-parallelize" },
     { "source": "/mux-codes", "destination": "/getting-started/mux-gateway" },
     { "source": "/getting-started/mux-codes", "destination": "/getting-started/mux-gateway" },
+    { "source": "/workspaces/muxignore", "destination": "/workspaces/xumignore" },
     { "source": "/fork", "destination": "/workspaces/fork" },
     { "source": "/init-hooks", "destination": "/hooks/init" },
     { "source": "/agent-skills", "destination": "/agents/agent-skills" },
@@ -168,8 +172,6 @@
     { "source": "/guides/compaction", "destination": "/workspaces/compaction" },
     { "source": "/guides/compaction/manual", "destination": "/workspaces/compaction/manual" },
     { "source": "/guides/compaction/automatic", "destination": "/workspaces/compaction/automatic" },
-    { "source": "/sharing", "destination": "/workspaces/sharing" },
-    { "source": "/guides/sharing", "destination": "/workspaces/sharing" },
     { "source": "/prompting-tips", "destination": "/agents/prompting-tips" },
     { "source": "/prompting-tips.html", "destination": "/agents/prompting-tips" },
     { "source": "/guides/prompting-tips", "destination": "/agents/prompting-tips" },

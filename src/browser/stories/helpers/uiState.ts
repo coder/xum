@@ -1,3 +1,4 @@
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   SELECTED_WORKSPACE_KEY,
@@ -5,7 +6,6 @@ import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   getInputKey,
-  getModelKey,
 } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -35,11 +35,6 @@ export function setWorkspaceInput(workspaceId: string, text: string): void {
   localStorage.setItem(getInputKey(workspaceId), JSON.stringify(text));
 }
 
-/** Set model for a workspace */
-export function setWorkspaceModel(workspaceId: string, model: string): void {
-  localStorage.setItem(getModelKey(workspaceId), model);
-}
-
 /** Expand projects in the sidebar */
 export function expandProjects(projectPaths: string[]): void {
   localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(projectPaths));
@@ -58,4 +53,13 @@ export function collapseLeftSidebar(): void {
 /** Expand the right sidebar (for stories testing it) */
 export function expandRightSidebar(): void {
   localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
+}
+
+/**
+ * Expand the left sidebar (project tree). The app defaults it to collapsed at
+ * mobile widths, so stories whose play functions click sidebar controls must
+ * force it open to pass under Pixel's phone viewport.
+ */
+export function expandLeftSidebar(): void {
+  updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
 }

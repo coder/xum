@@ -62,12 +62,9 @@ const meta: Meta<typeof PlanFileDialog> = {
   component: PlanFileDialog,
   parameters: {
     layout: "fullscreen",
-    chromatic: {
-      delay: 500,
-      modes: {
-        dark: { theme: "dark", viewport: 1600 },
-        light: { theme: "light", viewport: 1600 },
-      },
+    pixel: {
+      // Wide variant: these stories need >=1600px, so use the 1900px desktop viewport.
+      matrix: { themes: ["dark", "light"], viewports: ["desktop"] },
     },
   },
   decorators: [

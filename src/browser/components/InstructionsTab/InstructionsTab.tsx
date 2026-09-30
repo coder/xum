@@ -16,6 +16,7 @@ import {
   type WorkspaceInstructions,
 } from "@/common/types/instructions";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatBytes } from "@/common/utils/formatBytes";
 
 interface InstructionsTabProps {
   workspaceId: string;
@@ -24,7 +25,7 @@ interface InstructionsTabProps {
 /**
  * The Instructions panel renders the structured `WorkspaceInstructions` payload
  * returned by `workspace.getInstructions`. The same `InstructionFile` objects
- * the agent sees are rendered here — type-system parity with `buildSystemMessage`
+ * the agent sees are rendered here — type-system parity with `buildSystemMessageFromSources`
  * is enforced by sharing `@/common/types/instructions`.
  */
 export function InstructionsTab(props: InstructionsTabProps) {
@@ -129,8 +130,8 @@ function Header({ totalTokens, fileCount, loading, onRefresh }: HeaderProps) {
 function InstructionsBody({ data }: { data: WorkspaceInstructions }) {
   // Render structured groups so the panel layout reflects the prompt structure.
   const groups: Array<{ title: string; sets: InstructionSet[] }> = [];
-  if (data.sources.global) {
-    groups.push({ title: "Global (~/.mux)", sets: [data.sources.global] });
+  if (data.sources.global.length > 0) {
+    groups.push({ title: "Global", sets: data.sources.global });
   }
   const workspaceSets = data.sources.context.filter((s) => s.scope === INSTRUCTION_SCOPE.WORKSPACE);
   if (workspaceSets.length > 0) {
@@ -213,6 +214,13 @@ function FileRow({ file, projectName }: FileRowProps) {
               )}
             </span>
             <ScopeBadge scope={file.scope} projectName={projectName} />
+            {/* Xum-dedicated files (~/.xum/AGENTS.md, <dir>/.xum/AGENTS.md) are the
+                only sources where scoped Model:/Mode: directives are honored. */}
+            {file.xumOnly && (
+              <span className="text-muted bg-muted/20 shrink-0 rounded px-1.5 py-0.5 text-[9px] tracking-wider uppercase">
+                mux-only
+              </span>
+            )}
             <span className="text-muted ml-auto shrink-0 text-[10px] tabular-nums">
               {file.tokens != null && <>~{formatTokens(file.tokens)}t · </>}
               {formatBytes(file.bytes)}
@@ -276,7 +284,7 @@ function EmptyState() {
       <p>No instruction files loaded for this workspace.</p>
       <p className="text-[10px]">
         Add an <code className="bg-muted/30 rounded px-1">AGENTS.md</code> at the workspace root or
-        in <code className="bg-muted/30 rounded px-1">~/.mux/</code> to provide context.
+        in <code className="bg-muted/30 rounded px-1">~/.xum/</code> to provide context.
       </p>
     </div>
   );
@@ -306,10 +314,4 @@ function formatTokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
   return `${Math.round(n / 1000)}k`;
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n}B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)}MB`;
 }

@@ -15,11 +15,21 @@
     "src/version.ts",
     "src/cli/index.ts",
     "src/cli/run.ts",
+    "src/cli/workflow.ts",
     "src/cli/server.ts",
     "src/cli/acp.ts",
     "src/desktop/**/*",
     "src/node/**/*",
     "src/common/**/*"
   ],
-  "exclude": ["src/browser/**/*", "src/cli/debug/**/*"]
+  "exclude": [
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.testHarness.ts",
+    "src/node/services/testHistoryService.ts",
+    "src/browser/**/*",
+    "src/cli/debug/**/*",
+    "src/node/builtinWorkflowActions/**/*",
+    "src/node/workflowRuntime/**/*"
+  ]
 }

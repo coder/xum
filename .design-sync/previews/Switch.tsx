@@ -1,0 +1,41 @@
+import * as React from "react";
+import { MuxPreviewShell } from "../preview-harness";
+import { Switch } from "@/browser/components/Switch/Switch";
+
+// Toggle switch primitive — mirrors the Switch "States" story. Switch is
+// controlled, so each demo holds its own state; the initial state is captured.
+interface DemoProps {
+  label: string;
+  initial?: boolean;
+  size?: "default" | "sm";
+  disabled?: boolean;
+}
+
+const Toggle = (props: DemoProps) => {
+  const [on, setOn] = React.useState(props.initial ?? false);
+  return (
+    <div className="flex items-center gap-2.5">
+      <Switch
+        checked={on}
+        onCheckedChange={setOn}
+        size={props.size}
+        disabled={props.disabled}
+        aria-label={props.label}
+      />
+      <span className="text-sm select-none">{props.label}</span>
+    </div>
+  );
+};
+
+export const States = () => (
+  <MuxPreviewShell>
+    <div className="bg-background text-foreground flex flex-col gap-4 p-8">
+      <Toggle label="Off" initial={false} />
+      <Toggle label="On" initial={true} />
+      <Toggle label="Small / off" size="sm" initial={false} />
+      <Toggle label="Small / on" size="sm" initial={true} />
+      <Toggle label="Disabled" disabled initial={false} />
+      <Toggle label="Disabled / on" disabled initial={true} />
+    </div>
+  </MuxPreviewShell>
+);

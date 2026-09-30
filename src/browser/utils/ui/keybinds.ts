@@ -23,6 +23,7 @@ export function isMac(): boolean {
     interface MinimalAPI {
       platform?: string;
     }
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const api = (window as unknown as { api?: MinimalAPI }).api;
     if (api?.platform != null) {
       return api.platform === "darwin";
@@ -37,6 +38,7 @@ export function isMac(): boolean {
         platform?: string;
       };
     }
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const nav = navigator as unknown as MinimalNavigator;
     const platform = nav.userAgentData?.platform ?? nav.platform ?? nav.userAgent ?? "";
     return /mac|iphone|ipad|ipod/i.test(platform);
@@ -170,6 +172,11 @@ export const TERMINAL_CONTAINER_ATTR = "data-terminal-container";
  * keystrokes instead of having capture/bubble-phase app shortcuts steal them first.
  */
 export const BROWSER_VIEWPORT_ATTR = "data-browser-viewport";
+export const DESKTOP_VIEWPORT_ATTR = "data-desktop-viewport";
+
+export function isDesktopViewportFocused(target: EventTarget | null): boolean {
+  return hasClosestWithAttr(target, DESKTOP_VIEWPORT_ATTR);
+}
 
 /**
  * Data attribute used to opt an element (or one of its ancestors) into allowing Escape
@@ -218,16 +225,27 @@ export function isBrowserViewportFocused(target: EventTarget | null): boolean {
 }
 
 /**
+ * Marker the shared Dialog primitive puts on its overlay so isDialogOpen() can see it. Radix
+ * renders the overlay only for modal roots and sets no aria-modal on dialog content, so an OPEN
+ * marked overlay is the reliable "a modal is up" signal for every dialog built on that primitive.
+ */
+export const MODAL_DIALOG_OVERLAY_ATTRIBUTE = "data-modal-dialog-overlay";
+
+/**
  * Check if a modal dialog is currently open.
  * Used by capture-phase keyboard handlers to skip shortcuts while a modal is active,
  * since bubble-phase stopPropagation from dialog onKeyDown can't block capture-phase listeners.
  *
- * Only matches true modal dialogs (aria-modal="true"), not non-modal Radix popovers
- * which also use role="dialog" but should not suppress global shortcuts.
+ * Matches an open overlay of the shared Dialog primitive (see MODAL_DIALOG_OVERLAY_ATTRIBUTE) or
+ * an explicit aria-modal="true" dialog built outside it. Non-modal Radix popovers also use
+ * role="dialog" but render neither, so they do not suppress global shortcuts.
  */
 export function isDialogOpen(): boolean {
   if (typeof document === "undefined") return false;
-  return document.querySelector('[role="dialog"][aria-modal="true"]') !== null;
+  return (
+    document.querySelector(`[${MODAL_DIALOG_OVERLAY_ATTRIBUTE}][data-state="open"]`) !== null ||
+    document.querySelector('[role="dialog"][aria-modal="true"]') !== null
+  );
 }
 
 /**
@@ -276,12 +294,24 @@ export function formatKeybind(keybind: Keybind): string {
 }
 
 /**
+ * Whether a keybind is deprecated. Deprecated keybinds still match/fire, but
+ * generated keybind references (e.g. Settings → Keybinds) filter them out so we
+ * don't advertise legacy shortcuts to users.
+ */
+export function isKeybindDeprecated(keybind: Keybind): boolean {
+  return keybind.deprecated === true;
+}
+
+/**
  * Centralized registry of application keybinds.
  * Single source of truth for all keyboard shortcuts.
  * In general we try to use shortcuts the user would naturally expect.
  * We also like vim keybinds.
  */
 export const KEYBINDS = {
+  /** Copy selected transcript Markdown while its context menu is open. */
+  COPY_MARKDOWN: { key: "m" },
+
   /** Open agent picker (focuses search) */
   TOGGLE_AGENT: { key: "A", ctrl: true, shift: true },
 
@@ -292,6 +322,15 @@ export const KEYBINDS = {
 
   /** Send message / Submit form */
   SEND_MESSAGE: { key: "Enter" },
+
+  /** Send an existing queued message immediately */
+  SEND_QUEUED_MESSAGE_NOW: { key: "Enter", ctrl: true, shift: true },
+
+  /** Send the oldest held (refused, unsent) message from an empty composer */
+  SEND_HELD_INPUT: { key: "Enter", ctrl: true, alt: true },
+
+  /** Discard the oldest held (refused, unsent) message from an empty composer */
+  DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
 
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
@@ -314,6 +353,9 @@ export const KEYBINDS = {
   INTERRUPT_STREAM_VIM: { key: "c", ctrl: true, macCtrlBehavior: "control" },
   INTERRUPT_STREAM_NORMAL: { key: "Escape" },
 
+  /** Continue an interrupted stream (R = resume; transcript-focused, like Shift+G) */
+  RESUME_STREAM: { key: "R", shift: true },
+
   /** Focus chat input */
   FOCUS_INPUT_I: { key: "i" },
 
@@ -322,6 +364,9 @@ export const KEYBINDS = {
 
   /** Create new workspace for current project */
   NEW_WORKSPACE: { key: "n", ctrl: true },
+
+  /** Create a project-less scratch chat */
+  NEW_SCRATCH_CHAT: { key: "n", ctrl: true, shift: true },
 
   /** Edit title of current workspace (inline edit) */
   EDIT_WORKSPACE_TITLE: { key: "F2" },
@@ -332,6 +377,16 @@ export const KEYBINDS = {
   /** Archive current workspace */
   // macOS: Cmd+Shift+Backspace, Win/Linux: Ctrl+Shift+Backspace
   ARCHIVE_WORKSPACE: { key: "Backspace", ctrl: true, shift: true, macCtrlBehavior: "command" },
+
+  /** Pin/unpin current workspace (chat) in the sidebar */
+  // Use the physical P key: macOS Option+P produces "π" for event.key, so match on code.
+  PIN_WORKSPACE: { key: "p", code: "KeyP", ctrl: true, alt: true },
+
+  /** Move the selected pinned chat up/down within its pinned block */
+  // Same ctrl+alt layer as PIN_WORKSPACE. Arrow keys are unaffected by macOS
+  // Option remapping, so matching on key alone is safe here.
+  MOVE_PINNED_UP: { key: "ArrowUp", ctrl: true, alt: true },
+  MOVE_PINNED_DOWN: { key: "ArrowDown", ctrl: true, alt: true },
 
   /** Jump to bottom of chat */
   JUMP_TO_BOTTOM: { key: "G", shift: true },
@@ -361,11 +416,6 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+E, Win/Linux: Ctrl+Shift+E
   OPEN_IN_EDITOR: { key: "E", ctrl: true, shift: true },
 
-  /** Share transcript for current workspace */
-  // macOS: Cmd+Shift+S, Win/Linux: Ctrl+Shift+S
-  // (was Cmd+Shift+L, but Chrome intercepts that in server/browser mode)
-  SHARE_TRANSCRIPT: { key: "S", ctrl: true, shift: true },
-
   /** Configure MCP servers for current workspace */
   // macOS: Cmd+Shift+M, Win/Linux: Ctrl+Shift+M
   CONFIGURE_MCP: { key: "M", ctrl: true, shift: true },
@@ -373,6 +423,10 @@ export const KEYBINDS = {
   /** Configure heartbeat settings for current workspace */
   // macOS: Cmd+Shift+H, Win/Linux: Ctrl+Shift+H
   CONFIGURE_HEARTBEAT: { key: "H", ctrl: true, shift: true },
+
+  /** Configure whether unrelated workspaces may discover/message the current workspace */
+  // macOS: Cmd+Shift+U, Win/Linux: Ctrl+Shift+U
+  CONFIGURE_UNRELATED_MESSAGING: { key: "U", ctrl: true, shift: true },
 
   /** Open Command Palette */
   // VS Code-style palette
@@ -383,10 +437,28 @@ export const KEYBINDS = {
   // F4 avoids browser-level collisions with Ctrl/Cmd+Shift+P in Firefox.
   OPEN_COMMAND_PALETTE_ACTIONS: { key: "F4" },
 
-  /** Toggle thinking level between off and last-used value for current model */
-  // Saves/restores thinking level per model (defaults to "medium" if not found)
+  /**
+   * @deprecated Superseded by INCREASE_THINKING / DECREASE_THINKING.
+   * Cycles the thinking level forward, wrapping at the ends. Still honored so
+   * existing muscle memory keeps working, but marked `deprecated` so it stays
+   * out of generated keybind references (Settings → Keybinds, docs).
+   */
   // macOS: Cmd+Shift+T, Win/Linux: Ctrl+Shift+T
-  TOGGLE_THINKING: { key: "T", ctrl: true, shift: true },
+  TOGGLE_THINKING: { key: "T", ctrl: true, shift: true, deprecated: true },
+
+  /** Increase thinking level by one step (clamps at the model's maximum) */
+  // macOS: Cmd+Shift+], Win/Linux: Ctrl+Shift+]
+  // `code` pins the physical bracket key so Shift producing "}" doesn't break matching.
+  INCREASE_THINKING: { key: "]", code: "BracketRight", ctrl: true, shift: true },
+
+  /** Decrease thinking level by one step (clamps at the model's minimum / off) */
+  // macOS: Cmd+Shift+[, Win/Linux: Ctrl+Shift+[
+  // `code` pins the physical bracket key so Shift producing "{" doesn't break matching.
+  DECREASE_THINKING: { key: "[", code: "BracketLeft", ctrl: true, shift: true },
+
+  /** Toggle OpenAI fast mode for the selected workspace model */
+  // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
+  TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
   /** Focus chat input from anywhere */
   // Works even when focus is already in an input field
@@ -396,6 +468,15 @@ export const KEYBINDS = {
   /** Close current tab in right sidebar (if closeable - currently only terminal tabs) */
   // macOS: Cmd+W (matches Ghostty), Win/Linux: Ctrl+W
   CLOSE_TAB: { key: "w", ctrl: true, macCtrlBehavior: "command" },
+
+  /** Reveal the selected timeline event in the transcript */
+  REVEAL_TIMELINE_EVENT: { key: "Enter", ctrl: true, shift: true },
+
+  /** Open the timeline dialog on small viewports where the right sidebar is hidden */
+  OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
+
+  /** Reveal the last prompt in the transcript while its popup is open */
+  REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
 
   /** Switch to tab by position in right sidebar (1-9) */
   // macOS: Cmd+N, Win/Linux: Ctrl+N
@@ -441,6 +522,10 @@ export const KEYBINDS = {
   // macOS: Cmd+, Win/Linux: Ctrl+,
   OPEN_SETTINGS: { key: ",", ctrl: true },
 
+  /** Open a window for the xum server running on this Xum root (desktop only, #4846) */
+  // macOS: Cmd+Shift+O, Win/Linux: Ctrl+Shift+O
+  OPEN_SERVER_WINDOW: { key: "O", ctrl: true, shift: true },
+
   /** Open analytics dashboard */
   // macOS: Cmd+Shift+Y, Win/Linux: Ctrl+Shift+Y
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT
@@ -466,6 +551,30 @@ export const KEYBINDS = {
   // "N" for Notifications
   TOGGLE_NOTIFICATIONS: { key: "N", ctrl: true, shift: true },
 
+  TOGGLE_DRIFT_MODE: { key: "G", ctrl: true, shift: true },
+
+  SHOW_WORKSPACE_DETAILS: { key: "D", ctrl: true, shift: true },
+
+  SHOW_LAST_PROMPT: { key: "L", ctrl: true, shift: true },
+
+  SETTINGS_BACKUP_SAVE: { key: "s", code: "KeyS", ctrl: true, alt: true },
+  SETTINGS_BACKUP_VALIDATE: { key: "v", code: "KeyV", ctrl: true, alt: true },
+  SETTINGS_BACKUP_PREVIEW: { key: "e", code: "KeyE", ctrl: true, alt: true },
+  SETTINGS_BACKUP_PUSH: { key: "b", code: "KeyB", ctrl: true, alt: true },
+  SETTINGS_BACKUP_RESTORE: { key: "r", code: "KeyR", ctrl: true, alt: true },
+  SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  SETTINGS_BACKUP_APPROVE_COMMANDS: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS: { key: "i", code: "KeyI", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_AGENTS: { key: "g", code: "KeyG", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_SKILLS: { key: "k", code: "KeyK", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY: { key: "m", code: "KeyM", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_PREFERENCES: { key: "f", code: "KeyF", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP: { key: "c", code: "KeyC", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP_HEADERS: { key: "h", code: "KeyH", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: { key: "d", code: "KeyD", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },
 
@@ -474,6 +583,17 @@ export const KEYBINDS = {
 
   /** Toggle immersive review mode */
   TOGGLE_REVIEW_IMMERSIVE: { key: "i", shift: true },
+
+  /**
+   * Toggle the Assisted (agent-flagged hunks only) filter in the Code Review panel.
+   *
+   * Plain "p" (Pin filter) — chosen to avoid the global FOCUS_INPUT_A
+   * collision on plain "a" and the dual-handler clash with
+   * `TOGGLE_PLAN_ANNOTATE` on Shift+A. The review-panel handler already
+   * gates on `isPanelFocused` + `isEditableElement`, so this single-letter
+   * binding only fires when the user is genuinely in the review pane.
+   */
+  TOGGLE_ASSISTED_REVIEW: { key: "p" },
 
   /** Navigate to next file in immersive review */
   REVIEW_NEXT_FILE: { key: "l" },
@@ -511,8 +631,23 @@ export const KEYBINDS = {
   /** Toggle focus between diff and notes sidebar in immersive review */
   REVIEW_FOCUS_NOTES: { key: "Tab" },
 
+  /** Copy the active file's full contents to the clipboard in immersive review */
+  REVIEW_COPY_FILE: { key: "y" },
+
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
+
+  /**
+   * Run the latest plan's primary action (Implement, or Continue in Auto in Auto mode).
+   * Not while typing: only from an empty or unfocused field.
+   */
+  RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
+
+  /** Copy image to clipboard (scoped to image lightbox / image context menu) */
+  IMAGE_COPY: { key: "c", ctrl: true },
+
+  /** Download image (scoped to image lightbox / image context menu) */
+  IMAGE_DOWNLOAD: { key: "s", ctrl: true },
 
   TOGGLE_POWER_MODE: { key: "F12", shift: true },
 } as const;

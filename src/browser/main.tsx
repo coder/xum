@@ -2,8 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
+import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
+import { installViewportHeightSync } from "@/browser/utils/viewportHeight";
+import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
-import { initTelemetry, trackAppStarted } from "@/common/telemetry";
+import { initTelemetry } from "@/common/telemetry";
+import { trackAppStarted } from "@/browser/utils/telemetryLifecycle";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 
@@ -14,7 +18,20 @@ try {
   // Silent failure — never crash the app for logging capture
 }
 
+try {
+  installInactiveAnimationPause();
+} catch {
+  // Animation throttling is an optimization and must never block renderer startup.
+}
+
+try {
+  removeDroppedCacheKeys();
+} catch {
+  // Reclaiming localStorage quota is best-effort and must never block renderer startup.
+}
+
 installWindowOpenLocalhostProxyNormalization();
+installViewportHeightSync();
 
 initTelemetry();
 trackAppStarted();

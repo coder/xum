@@ -9,6 +9,9 @@ import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createReview } from "@/browser/stories/helpers/reviews";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import type { TodoItem } from "@/common/types/tools";
 import type { DiffHunk, Review } from "@/common/types/review";
 import { extractAllHunks, parseDiff } from "@/common/utils/git/diffParser";
 import {
@@ -265,6 +268,92 @@ function createImmersiveStoryClient(): APIClient {
   });
 }
 
+interface AgentStatusSeed {
+  /**
+   * TODO plan the agent has written (drives the horizontal TODO strip +
+   * summary). Omit (or pass an empty array) to model "streaming before any plan
+   * is written", where the bar shows only the streaming chip.
+   */
+  todos?: TodoItem[];
+  /**
+   * When true, leaves the seeded stream open so the bar shows the live
+   * "Streaming…" chip. When false the stream is left un-started, so only the
+   * persisted (incomplete) plan shows.
+   */
+  streaming?: boolean;
+}
+
+/**
+ * Register a workspace in the singleton WorkspaceStore and push a `todo_write`
+ * tool call through its aggregator so the immersive view's
+ * ImmersiveReviewAgentStatusBar has real plan + streaming state to render.
+ * Seeds exactly once per workspace (addWorkspace is idempotent and the stream
+ * events are replayed only when the aggregator is freshly created), and runs
+ * during render before the child subscribes so the bar paints populated on the
+ * first frame (flash-free for snapshots).
+ */
+function seedAgentStatus(
+  workspaceStore: ReturnType<typeof useWorkspaceStoreRaw>,
+  workspaceId: string,
+  seed: AgentStatusSeed
+): void {
+  const alreadyRegistered = workspaceStore.hasRegisteredWorkspace(workspaceId);
+  workspaceStore.addWorkspace({
+    id: workspaceId,
+    name: workspaceId,
+    projectName: "story-project",
+    projectPath: "/story/project",
+    namedWorkspacePath: "/story/workspace",
+    createdAt: new Date(0).toISOString(),
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+  });
+  if (alreadyRegistered) {
+    return;
+  }
+
+  const aggregator = workspaceStore.getAggregator(workspaceId);
+  if (!aggregator) {
+    return;
+  }
+
+  const messageId = `${workspaceId}-stream`;
+  aggregator.handleStreamStart({
+    type: "stream-start",
+    workspaceId,
+    messageId,
+    historySequence: 1,
+    model: "anthropic:claude-sonnet-4",
+    startTime: 0,
+  });
+  // Only push a plan when the seed has one; omitting it models "streaming
+  // before any TODO is written" so the bar renders the chip-only state.
+  if (seed.todos && seed.todos.length > 0) {
+    aggregator.handleToolCallStart({
+      type: "tool-call-start",
+      workspaceId,
+      messageId,
+      toolCallId: `${workspaceId}-todo`,
+      toolName: "todo_write",
+      args: { todos: seed.todos },
+      tokens: 10,
+      timestamp: 1,
+    });
+    aggregator.handleToolCallEnd({
+      type: "tool-call-end",
+      workspaceId,
+      messageId,
+      toolCallId: `${workspaceId}-todo`,
+      toolName: "todo_write",
+      result: { success: true },
+      timestamp: 2,
+    });
+  }
+  if (seed.streaming !== true) {
+    // Collapse the active stream so the chip clears; incomplete todos persist.
+    aggregator.clearActiveStreams();
+  }
+}
+
 const ImmersiveStoryShell: FC<{ client: APIClient; children: ReactNode }> = ({
   client,
   children,
@@ -285,6 +374,19 @@ interface ImmersiveReviewStoryProps {
   fixture: ImmersiveStoryFixture;
   reviewActions?: ComponentProps<typeof ImmersiveReviewView>["reviewActions"];
   initialReadHunkIds?: string[];
+  /** Hunk IDs flagged by the agent (via `review_pane_update`). */
+  assistedHunkIds?: ReadonlySet<string>;
+  /** Per-hunk agent comments — drives the immersive assisted-review banner. */
+  assistedCommentByHunkId?: Map<string, string>;
+  /** Whether the Assisted worklist filter is active — drives the header badge. */
+  assistedOnly?: boolean;
+  assistedCount?: number;
+  assistedUnreadCount?: number;
+  /**
+   * Seeds the singleton WorkspaceStore so the immersive view's top status bar
+   * (ImmersiveReviewAgentStatusBar) renders a real TODO plan + streaming chip.
+   */
+  agentStatusSeed?: AgentStatusSeed;
 }
 
 function ImmersiveReviewStory(props: ImmersiveReviewStoryProps) {
@@ -295,6 +397,13 @@ function ImmersiveReviewStory(props: ImmersiveReviewStoryProps) {
   const [readHunkIds, setReadHunkIds] = useState<Set<string>>(
     () => new Set(props.initialReadHunkIds ?? [])
   );
+
+  // Seed agent status synchronously during render (before the child subscribes)
+  // so the top status bar paints with its plan/stream on the first frame.
+  const workspaceStore = useWorkspaceStoreRaw();
+  if (props.agentStatusSeed) {
+    seedAgentStatus(workspaceStore, props.workspaceId, props.agentStatusSeed);
+  }
 
   return (
     <ImmersiveStoryShell client={client}>
@@ -334,6 +443,11 @@ function ImmersiveReviewStory(props: ImmersiveReviewStoryProps) {
         reviewActions={props.reviewActions}
         reviewsByFilePath={props.fixture.reviewsByFilePath}
         firstSeenMap={props.fixture.firstSeenMap}
+        assistedHunkIds={props.assistedHunkIds}
+        assistedCommentByHunkId={props.assistedCommentByHunkId}
+        assistedOnly={props.assistedOnly}
+        assistedCount={props.assistedCount}
+        assistedUnreadCount={props.assistedUnreadCount}
       />
     </ImmersiveStoryShell>
   );
@@ -351,12 +465,9 @@ const meta: Meta<typeof ImmersiveReviewView> = {
   ],
   parameters: {
     layout: "fullscreen",
-    chromatic: {
-      delay: 500,
-      modes: {
-        dark: { theme: "dark", viewport: 1600 },
-        light: { theme: "light", viewport: 1600 },
-      },
+    pixel: {
+      // Wide variant: these stories need >=1600px, so use the 1900px desktop viewport.
+      matrix: { themes: ["dark", "light"], viewports: ["desktop"] },
     },
   },
 };
@@ -430,7 +541,9 @@ export const ImmersiveNotesSidebarActionFooter: Story = {
     await waitFor(
       () => {
         canvas.getByTestId("immersive-review-view");
-        canvas.getByText(/Keep the formatter instance shared/i);
+        if (canvas.queryAllByText(/Keep the formatter instance shared/i).length === 0) {
+          throw new Error("Expected the immersive review formatter note to render.");
+        }
       },
       { timeout: 10_000 }
     );
@@ -492,6 +605,154 @@ export const ImmersiveWithMinimap: Story = {
       () => {
         canvas.getByTestId("immersive-review-view");
         canvas.getByRole("button", { name: /exit immersive review/i });
+      },
+      { timeout: 10_000 }
+    );
+  },
+};
+
+const IMMERSIVE_ASSISTED_WORKSPACE_ID = "ws-review-immersive-assisted";
+const IMMERSIVE_ASSISTED_FIXTURE = LINE_HEIGHT_FIXTURE;
+const IMMERSIVE_ASSISTED_FIRST_HUNK_ID = IMMERSIVE_ASSISTED_FIXTURE.hunks[0]?.id ?? "";
+const IMMERSIVE_ASSISTED_HUNK_IDS: ReadonlySet<string> = new Set([
+  IMMERSIVE_ASSISTED_FIRST_HUNK_ID,
+]);
+// Map literal lookup matches production — ImmersiveReviewView reads the comment
+// for the *selected* hunk and renders the assisted banner above the diff.
+const IMMERSIVE_ASSISTED_COMMENT_BY_HUNK_ID = new Map<string, string>([
+  [
+    IMMERSIVE_ASSISTED_FIRST_HUNK_ID,
+    "Hoist the formatter out of formatPrice — recreating it on every call defeats the Intl.NumberFormat cache.",
+  ],
+]);
+
+/**
+ * Immersive review with an active assisted-review pin. Locks in the
+ * `--color-review-accent` blue accent for the immersive banner (Sparkles +
+ * border + background tint) in both light + dark themes.
+ */
+export const ImmersiveWithAssistedBanner: Story = {
+  render: () => (
+    <ImmersiveReviewStory
+      workspaceId={IMMERSIVE_ASSISTED_WORKSPACE_ID}
+      fixture={IMMERSIVE_ASSISTED_FIXTURE}
+      assistedHunkIds={IMMERSIVE_ASSISTED_HUNK_IDS}
+      assistedCommentByHunkId={IMMERSIVE_ASSISTED_COMMENT_BY_HUNK_ID}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-view");
+        canvas.getByTestId("immersive-assisted-banner");
+      },
+      { timeout: 10_000 }
+    );
+  },
+};
+
+/**
+ * Immersive review with the Assisted worklist filter active. Locks in the
+ * header "Assisted unread/total" badge (Sparkles + review-accent) that tells
+ * the user the diff is filtered to agent-flagged hunks — the control bar that
+ * normally hosts this toggle is hidden behind the immersive overlay.
+ */
+export const ImmersiveWithAssistedMode: Story = {
+  render: () => (
+    <ImmersiveReviewStory
+      workspaceId={IMMERSIVE_ASSISTED_WORKSPACE_ID}
+      fixture={IMMERSIVE_ASSISTED_FIXTURE}
+      assistedHunkIds={IMMERSIVE_ASSISTED_HUNK_IDS}
+      assistedCommentByHunkId={IMMERSIVE_ASSISTED_COMMENT_BY_HUNK_ID}
+      assistedOnly
+      assistedCount={3}
+      assistedUnreadCount={2}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-view");
+        canvas.getByTestId("immersive-assisted-mode-badge");
+      },
+      { timeout: 10_000 }
+    );
+  },
+};
+
+const IMMERSIVE_AGENT_STATUS_WORKSPACE_ID = "ws-review-immersive-agent-status";
+const IMMERSIVE_AGENT_STATUS_TODOS: TodoItem[] = [
+  { content: "Audit immersive review layout", status: "completed" },
+  { content: "Scope assisted comment to the diff column", status: "completed" },
+  { content: "Add the top status bar (TODO + streaming)", status: "in_progress" },
+  { content: "Wire up flash-free loading states", status: "pending" },
+  { content: "Add Storybook + tests", status: "pending" },
+];
+
+/**
+ * Immersive review with the top agent status bar populated: the agent's TODO
+ * plan as a horizontal strip plus the live "Streaming…" chip. This is the piece
+ * that keeps chat status visible while the user reviews code behind the
+ * full-screen overlay. Seeds the WorkspaceStore so the bar has real state.
+ */
+export const ImmersiveWithAgentStatusBar: Story = {
+  render: () => (
+    <ImmersiveReviewStory
+      workspaceId={IMMERSIVE_AGENT_STATUS_WORKSPACE_ID}
+      fixture={LINE_HEIGHT_FIXTURE}
+      agentStatusSeed={{ todos: IMMERSIVE_AGENT_STATUS_TODOS, streaming: true }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-view");
+        // The single-line TODO bar + its inline horizontal plan strip render.
+        canvas.getByTestId("immersive-agent-status-bar");
+        canvas.getByText("Add the top status bar (TODO + streaming)");
+        // Live streaming chip is visible alongside the plan.
+        canvas.getByText("Streaming…");
+      },
+      { timeout: 10_000 }
+    );
+  },
+};
+
+const IMMERSIVE_STREAMING_NO_TODO_WORKSPACE_ID = "ws-review-immersive-streaming-no-todo";
+
+/**
+ * Immersive review while the agent is streaming but has not written a TODO plan
+ * yet. Locks in the chip-only state of the status bar: with no plan on the left
+ * the "Streaming…" chip is left-aligned (reads as a status label) instead of
+ * floating alone on the far right of an otherwise-empty bar, and the bar stays
+ * a single row tall. Seeds an open stream with no `todo_write` call.
+ */
+export const ImmersiveWithStreamingNoTodo: Story = {
+  render: () => (
+    <ImmersiveReviewStory
+      workspaceId={IMMERSIVE_STREAMING_NO_TODO_WORKSPACE_ID}
+      fixture={LINE_HEIGHT_FIXTURE}
+      agentStatusSeed={{ streaming: true }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-view");
+        // The bar renders the streaming chip with no TODO label/plan.
+        canvas.getByTestId("immersive-agent-status-bar");
+        canvas.getByText("Streaming…");
+        if (canvas.queryByText("TODO")) {
+          throw new Error("Expected the chip-only status bar with no TODO plan.");
+        }
       },
       { timeout: 10_000 }
     );

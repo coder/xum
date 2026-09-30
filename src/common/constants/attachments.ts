@@ -27,3 +27,10 @@ export const MAX_POST_COMPACTION_INJECTION_CHARS = 80_000;
 
 /** Maximum size of plan content included in post-compaction attachments */
 export const MAX_POST_COMPACTION_PLAN_CHARS = 30_000;
+
+/**
+ * Maximum number of completed sub-agent/workflow report index entries to surface
+ * after compaction (newest first). Entries are one-liners (ID + title + size), so
+ * the cap bounds noise rather than context size.
+ */
+export const MAX_POST_COMPACTION_REPORT_INDEX_ENTRIES = 20;

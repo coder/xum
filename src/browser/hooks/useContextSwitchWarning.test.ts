@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import React from "react";
@@ -13,6 +14,9 @@ import {
   recordWorkspaceModelChange,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
+import { getModelKey } from "@/common/constants/storage";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { createTestApiClient } from "@/browser/testUtils";
 
 async function* emptyStream() {
   // no-op
@@ -21,16 +25,16 @@ async function* emptyStream() {
 function createStubApiClient(): APIClient {
   // Avoid mock.module (global) by injecting a minimal client through providers.
   // Keep this stub local unless other tests need the same wiring.
-  return {
+  return createTestApiClient({
     providers: {
-      getConfig: () => Promise.resolve(null),
+      getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(emptyStream()),
     },
     policy: {
-      get: () => Promise.resolve({ status: { state: "disabled" }, policy: null }),
+      get: () => Promise.resolve({ source: "none", status: { state: "disabled" }, policy: null }),
       onChanged: () => Promise.resolve(emptyStream()),
     },
-  } as unknown as APIClient;
+  });
 }
 
 const stubClient = createStubApiClient();
@@ -54,18 +58,20 @@ const createPolicyChurnClient = () => {
   async function* policyEvents() {
     for (let i = 0; i < 2; i++) {
       await new Promise<void>((resolve) => policyEventResolvers.push(resolve));
-      yield {};
+      yield;
     }
   }
 
-  const client = {
+  const client = createTestApiClient({
     providers: {
-      getConfig: () => Promise.resolve(null),
+      getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(emptyStream()),
     },
     policy: {
       get: () =>
         Promise.resolve({
+          // PolicyContext reads a missing source as "none"; the real response always sets one.
+          source: "none",
           status: { state: "enforced" },
           policy: {
             policyFormatVersion: "0.1",
@@ -76,7 +82,7 @@ const createPolicyChurnClient = () => {
         }),
       onChanged: () => Promise.resolve(policyEvents()),
     },
-  } as unknown as APIClient;
+  });
 
   return { client, triggerPolicyEvent };
 };
@@ -126,6 +132,7 @@ const buildProvidersConfigWithCustomContext = (
 
 describe("useContextSwitchWarning", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -134,9 +141,7 @@ describe("useContextSwitchWarning", () => {
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("does not warn on initial load without a user switch", async () => {
@@ -384,6 +389,44 @@ describe("useContextSwitchWarning", () => {
     });
 
     await waitFor(() => expect(result.current.warning).toBeNull());
+  });
+
+  test("handleModelChange treats a Coder gateway entry as distinct from the direct model", () => {
+    // Cross-typed instance scenario: coder:openai/<model> and openai:<model>
+    // are different selections; name-only canonicalization made them compare
+    // equal, so the picker returned before persisting the switch.
+    const directModel = "openai:claude-opus-4-1";
+    const coderModel = "coder:openai/claude-opus-4-1";
+    const props = {
+      workspaceId: "workspace-coder-eq",
+      messages: [buildAssistantMessage(directModel)],
+      pendingModel: directModel,
+      use1M: false,
+      workspaceUsage: buildUsage(1_000, directModel),
+      api: undefined,
+      pendingSendOptions: buildSendOptions(directModel),
+      providersConfig: null,
+    };
+
+    const { result } = renderHook((hookProps: typeof props) => useContextSwitchWarning(hookProps), {
+      initialProps: props,
+      wrapper,
+    });
+
+    act(() => {
+      result.current.handleModelChange(coderModel);
+    });
+
+    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBe(
+      coderModel
+    );
+
+    // Re-selecting the identical selection stays a no-op.
+    window.localStorage.clear();
+    act(() => {
+      result.current.handleModelChange(directModel);
+    });
+    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBeNull();
   });
 
   test("warns when gateway model strings are normalized for explicit switches", async () => {

@@ -2,10 +2,10 @@ import { useCallback, useEffect } from "react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import {
-  getInputKey,
+  getAutoModelRoutingKey,
   getModelKey,
-  getPendingScopeId,
   getProjectScopeId,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
@@ -29,11 +29,17 @@ export function persistWorkspaceCreationPrefill(
   }
 
   if (detail.startMessage !== undefined) {
-    persist(getInputKey(getPendingScopeId(projectPath)), detail.startMessage);
+    // The creation composer opened without a draft id edits the project's default creation
+    // draft; WorkspaceContext moves it into a listed creation draft when it creates one.
+    getDraftStore().setText(defaultCreationDraftScope(projectPath), detail.startMessage);
   }
 
   if (detail.model !== undefined) {
-    persist(getModelKey(getProjectScopeId(projectPath)), detail.model);
+    const projectScopeId = getProjectScopeId(projectPath);
+    persist(getModelKey(projectScopeId), detail.model);
+    // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin);
+    // otherwise the creation send would treat it as the routing fallback.
+    persist(getAutoModelRoutingKey(projectScopeId), false);
   }
 
   if (detail.trunkBranch !== undefined) {

@@ -12,11 +12,11 @@ export default meta;
 
 type Story = StoryObj<typeof meta>;
 
-/** agent_report tool call with markdown report body */
+/** agent_report tool call with an incremental markdown update */
 export const AgentReportWithMarkdown: Story = {
   args: {
     args: {
-      title: "Agent report",
+      title: "Agent update",
       reportMarkdown: `## Summary
 
 - Converted deleted app-level stories to lightweight component-level stories.

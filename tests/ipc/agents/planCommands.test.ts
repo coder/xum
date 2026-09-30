@@ -1,3 +1,4 @@
+import * as path from "path";
 /**
  * Integration tests for plan commands (/plan, /plan open)
  *
@@ -8,7 +9,6 @@
  */
 
 import * as fs from "fs/promises";
-import * as path from "path";
 import { shouldRunIntegrationTests, createTestEnvironment, cleanupTestEnvironment } from "../setup";
 import type { TestEnvironment } from "../setup";
 import {
@@ -233,7 +233,10 @@ describeIntegration("Plan Commands Integration", () => {
 
         expect(replaceResult.success).toBe(true);
 
-        const chatHistoryPath = path.join(env.config.getSessionDir(workspaceId), "chat.jsonl");
+        const chatHistoryPath = path.join(
+          path.join(env.config.sessionsDir, workspaceId),
+          "chat.jsonl"
+        );
         const data = await fs.readFile(chatHistoryPath, "utf-8");
         const firstLine = data
           .split("\n")
@@ -295,7 +298,10 @@ describeIntegration("Plan Commands Integration", () => {
         }
       );
 
-      const chatHistoryPath = path.join(env.config.getSessionDir(workspaceId), "chat.jsonl");
+      const chatHistoryPath = path.join(
+        path.join(env.config.sessionsDir, workspaceId),
+        "chat.jsonl"
+      );
       await fs.appendFile(
         chatHistoryPath,
         JSON.stringify({ ...malformedBoundaryMessage, workspaceId }) + "\n"
@@ -320,7 +326,24 @@ describeIntegration("Plan Commands Integration", () => {
 
       expect(appendResult.success).toBe(true);
 
-      const data = await fs.readFile(chatHistoryPath, "utf-8");
+      // Appending a durable boundary rotates the sealed prefix (legacy summary +
+      // malformed boundary) into chat-archive.jsonl; full history spans both files.
+      const archivePath = path.join(
+        path.join(env.config.sessionsDir, workspaceId),
+        "chat-archive.jsonl"
+      );
+      const archiveData = await fs.readFile(archivePath, "utf-8");
+      const activeData = await fs.readFile(chatHistoryPath, "utf-8");
+
+      // The active file holds only the new durable boundary onward.
+      const activeEntries = activeData
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { id: string });
+      expect(activeEntries.map((entry) => entry.id)).toEqual([appendSummary.id]);
+
+      const data = archiveData + activeData;
       const entries = data
         .split("\n")
         .map((line) => line.trim())

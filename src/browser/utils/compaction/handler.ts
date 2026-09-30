@@ -8,6 +8,8 @@
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { getCompactionFollowUpContent } from "@/common/types/message";
 import type { APIClient } from "@/browser/contexts/API";
+import { stopStream } from "@/browser/utils/stopStream";
+import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   buildEditingStateFromCompaction,
   type EditingMessageState,
@@ -47,11 +49,13 @@ export function getCompactionCommand(aggregator: StreamingMessageAggregator): st
   const muxMeta = compactionMsg.metadata?.muxMetadata;
   if (muxMeta?.type !== "compaction-request") return null;
 
-  const followUpText = getFollowUpContentText(getCompactionFollowUpContent(muxMeta));
+  const followUpText = getFollowUpContentText(getCompactionFollowUpContent(muxMeta), {
+    stripStagedAttachmentNotice: true,
+  });
   if (followUpText && !muxMeta.rawCommand.includes("\n")) {
     return `${muxMeta.rawCommand}\n${followUpText}`;
   }
-  return muxMeta.rawCommand;
+  return stripStagedAttachmentNotice(muxMeta.rawCommand);
 }
 
 /**
@@ -73,7 +77,6 @@ export async function cancelCompaction(
   aggregator: StreamingMessageAggregator,
   startEditingMessage: (editing: EditingMessageState) => void
 ): Promise<boolean> {
-  // Find the compaction request message
   const compactionRequestMsg = findCompactionRequestMessage(aggregator);
   if (!compactionRequestMsg) {
     return false;
@@ -97,10 +100,7 @@ export async function cancelCompaction(
 
   // Interrupt stream with abandonPartial flag
   // Backend detects this and skips compaction (Ctrl+C flow)
-  await client.workspace.interruptStream({
-    workspaceId,
-    options: { abandonPartial: true },
-  });
+  await stopStream(client, workspaceId, { abandonPartial: true, disableAutoRetry: true });
 
   return true;
 }

@@ -1,58 +1,388 @@
+/* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createRouterClient } from "@orpc/server";
+import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { Err, Ok, type Result } from "@/common/types/result";
+import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
+import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
+import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
+
 import type { ORPCContext } from "./context";
+import { inFlightProcedureCount } from "./inFlightProcedures";
+import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
 
-describe("router workspace goal validation", () => {
-  test("goal routes do not touch goal files for unknown workspaces", async () => {
-    const getGoal = mock(() => Promise.resolve({ goalId: "should-not-read" }));
-    const clearGoal = mock(() => Promise.resolve({ goalId: "should-not-clear" }));
-    const setGoal = mock(() =>
-      Promise.resolve({ success: true, data: { goalId: "should-not-set" } })
-    );
+describe("config.previewAutoModelRouting", () => {
+  const PREVIEW_TIERS = {
+    tiers: [
+      { id: "easy", label: "Easy", description: "Trivial" },
+      { id: "hard", label: "Hard", description: "Complex", model: "openai:gpt-5.5" },
+    ],
+  };
+  const EVALUATOR_USAGE = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+
+  function createPreviewClient(outcome: Result<AutoModelRoutingDecision, AutoModelRouterFailure>) {
+    const classifyEffect = mock((_input: unknown) => Effect.succeed(outcome));
+    const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
     const context = {
-      workspaceService: {
-        getInfo: mock(() => Promise.resolve(null)),
+      config: {
+        loadConfigOrDefault: () => ({}),
+        // Only ws-live is registered; a stale persisted selection resolves to nothing.
+        findWorkspace: (workspaceId: string) =>
+          workspaceId === "ws-live" ? { workspacePath: "/repo/ws", projectPath: "/repo" } : null,
       },
-      workspaceGoalService: {
-        getGoal,
-        clearGoal,
-        setGoal,
+      initStateManager: { waitForInit: mock(async () => undefined) },
+      sessionUsageService: { recordHeadlessUsage },
+      "effect/context": Context.make(AutoModelRouterTag, {
+        classifyEffect,
+      } as unknown as AutoModelRouter),
+    } as unknown as ORPCContext;
+    return {
+      client: createRouterClient(router(), { context }),
+      classifyEffect,
+      recordHeadlessUsage,
+    };
+  }
+
+  test("bills the evaluator's usage to the named workspace like the send path", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+        providerMetadata: { typesafe: { requestId: "req-1" } },
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result).toEqual(
+      Ok({
+        tierId: "hard",
+        tierLabel: "Hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        model: "openai:gpt-5.5",
+      })
+    );
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]).toEqual([
+      "ws-live",
+      "typesafe:jev-latest",
+      EVALUATOR_USAGE,
+      { typesafe: { requestId: "req-1" } },
+      { analyticsSource: "auto_model_routing_preview" },
+    ]);
+  });
+
+  test("a verdict naming a tier the panel no longer has still bills its usage", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "extreme",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(true);
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+  });
+
+  test("bills a rejected verdict the provider already billed (#4774)", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Err({ reason: "Evaluation failed (AI_InvalidResponseDataError)", usage: EVALUATOR_USAGE })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result).toEqual(Err("Evaluation failed (AI_InvalidResponseDataError)"));
+    expect(recordHeadlessUsage.mock.calls).toEqual([
+      [
+        "ws-live",
+        "typesafe:jev-latest",
+        EVALUATOR_USAGE,
+        undefined,
+        { analyticsSource: "auto_model_routing_preview" },
+      ],
+    ]);
+  });
+
+  test("refuses a workspace it does not know before calling the evaluator", async () => {
+    const { client, classifyEffect, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-removed",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(false);
+    expect(classifyEffect).not.toHaveBeenCalled();
+    expect(recordHeadlessUsage).not.toHaveBeenCalled();
+  });
+});
+
+describe("router drafts.update", () => {
+  test("the size refusal reaches the client with its message, so it is not retried", async () => {
+    const message = draftTooLargeMessage(41 * 1024 * 1024);
+    const context = {
+      draftService: { update: mock(() => Promise.reject(new Error(message))) },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+
+    let refused: unknown;
+    await client.drafts
+      .update({ scope: { kind: "workspace", workspaceId: "ws-1" }, text: "x" })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("BAD_REQUEST");
+    expect(isDraftTooLargeError(refused)).toBe(true);
+  });
+});
+
+describe("router terminal.create", () => {
+  test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
+    const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
+    const context = {
+      terminalService: {
+        create: mock(() => Promise.reject(new WorkspaceMutationInProgressError(message))),
       },
     } as unknown as ORPCContext;
     const client = createRouterClient(router(), { context });
 
-    const goalResult = await Promise.resolve(
-      client.workspace.getGoal({ workspaceId: "../../tmp/not-a-workspace" })
-    );
-    expect(goalResult).toEqual({ goal: null });
-    const clearResult = await Promise.resolve(
-      client.workspace.clearGoal({ workspaceId: "../../tmp/not-a-workspace" })
-    );
-    expect(clearResult).toEqual({ cleared: false });
-    const setResult = await Promise.resolve(
-      client.workspace.setGoal({
-        workspaceId: "../../tmp/not-a-workspace",
-        objective: "do not write",
-      })
-    );
-    expect(setResult).toEqual({
-      success: false,
-      error: { type: "invalid_transition", message: "Workspace not found." },
-    });
-
-    expect(getGoal).not.toHaveBeenCalled();
-    expect(setGoal).not.toHaveBeenCalled();
-    expect(clearGoal).not.toHaveBeenCalled();
+    let refused: unknown;
+    await client.terminal
+      .create({ workspaceId: "ws-1", cols: 80, rows: 24 })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("CONFLICT");
+    expect((refused as Error).message).toBe(message);
   });
 });
 
-describe("router config.saveConfig", () => {
+describe("router agent skill routes", () => {
+  test("subproject workspaces inherit parent skills with nearest precedence", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-skills-test-"));
+    try {
+      const checkoutRoot = path.join(tempDir, "checkout");
+      const packagesRoot = path.join(checkoutRoot, "packages");
+      const subProjectPath = path.join(packagesRoot, "app");
+      const writeSkill = (root: string, name: string, description: string, body: string): void => {
+        const skillDir = path.join(root, name);
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(skillDir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`
+        );
+      };
+
+      fs.mkdirSync(subProjectPath, { recursive: true });
+      writeSkill(
+        path.join(checkoutRoot, ".mux", "skills"),
+        "parent-only",
+        "from checkout",
+        "parent body"
+      );
+      writeSkill(
+        path.join(checkoutRoot, ".mux", "skills"),
+        "shared",
+        "from checkout",
+        "checkout body"
+      );
+      writeSkill(
+        path.join(packagesRoot, ".agents", "skills"),
+        "shared",
+        "from packages",
+        "packages body"
+      );
+
+      const outsideRoot = path.join(tempDir, "outside-skills");
+      writeSkill(outsideRoot, "escaped", "outside checkout", "outside body");
+      fs.symlinkSync(
+        path.join(outsideRoot, "escaped"),
+        path.join(checkoutRoot, ".mux", "skills", "escaped"),
+        "dir"
+      );
+
+      const context = {
+        config: new Config(tempDir),
+        initStateManager: { waitForInit: mock(async () => undefined) },
+        aiService: {
+          resolveXumToolScopeForWorkspace: mock(() => ({
+            type: "project",
+            xumHome: tempDir,
+            projectRoot: subProjectPath,
+            projectStorageAuthority: "host-local",
+            checkoutRoot,
+          })),
+          getWorkspaceMetadata: mock(async () => ({
+            success: true,
+            data: {
+              id: "workspace-1",
+              name: "workspace-1",
+              projectPath: checkoutRoot,
+              namedWorkspacePath: checkoutRoot,
+              subProjectPath,
+              runtimeConfig: { type: "local", srcBaseDir: tempDir },
+            },
+          })),
+        },
+        experimentsService: {
+          isExperimentEnabled: mock(() => false),
+        },
+      } as unknown as ORPCContext;
+      const client = createRouterClient(router(), { context });
+
+      const skills = await client.agentSkills.list({ workspaceId: "workspace-1" });
+      expect(skills.find((skill) => skill.name === "parent-only")).toMatchObject({
+        description: "from checkout",
+        scope: "project",
+      });
+      expect(skills.find((skill) => skill.name === "shared")).toMatchObject({
+        description: "from packages",
+        scope: "project",
+      });
+
+      expect(skills.find((skill) => skill.name === "escaped")).toBeUndefined();
+      await expect(
+        client.agentSkills.get({ workspaceId: "workspace-1", skillName: "escaped" })
+      ).rejects.toThrow("Agent skill not found");
+
+      await expect(
+        client.agentSkills.get({ workspaceId: "workspace-1", skillName: "parent-only" })
+      ).resolves.toMatchObject({ body: "parent body\n" });
+      await expect(
+        client.agentSkills.get({ workspaceId: "workspace-1", skillName: "shared" })
+      ).resolves.toMatchObject({ body: "packages body\n" });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("devcontainer workspaces read inherited skills from host-local storage", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-devcontainer-skills-"));
+    try {
+      const checkoutRoot = path.join(tempDir, "checkout");
+      const subProjectPath = path.join(checkoutRoot, "packages", "app");
+      const skillDir = path.join(checkoutRoot, ".mux", "skills", "parent-only");
+      fs.mkdirSync(subProjectPath, { recursive: true });
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: parent-only\ndescription: Parent skill\n---\nHost parent body\n"
+      );
+
+      const context = {
+        config: new Config(tempDir),
+        initStateManager: { waitForInit: mock(async () => undefined) },
+        aiService: {
+          resolveXumToolScopeForWorkspace: mock(() => ({
+            type: "project",
+            xumHome: tempDir,
+            projectRoot: subProjectPath,
+            projectStorageAuthority: "host-local",
+            checkoutRoot,
+          })),
+          getWorkspaceMetadata: mock(async () => ({
+            success: true,
+            data: {
+              id: "workspace-1",
+              name: "workspace-1",
+              projectPath: checkoutRoot,
+              namedWorkspacePath: checkoutRoot,
+              subProjectPath,
+              runtimeConfig: {
+                type: "devcontainer",
+                configPath: ".devcontainer/devcontainer.json",
+              },
+            },
+          })),
+        },
+        experimentsService: {
+          isExperimentEnabled: mock(() => false),
+        },
+      } as unknown as ORPCContext;
+      const client = createRouterClient(router(), { context });
+
+      await expect(client.agentSkills.list({ workspaceId: "workspace-1" })).resolves.toContainEqual(
+        expect.objectContaining({
+          name: "parent-only",
+          description: "Parent skill",
+          scope: "project",
+        })
+      );
+      await expect(
+        client.agentSkills.get({ workspaceId: "workspace-1", skillName: "parent-only" })
+      ).resolves.toMatchObject({ body: "Host parent body\n" });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("project-path discovery inherits skills from a registered parent", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-project-skills-test-"));
+    try {
+      const parentProjectPath = path.join(tempDir, "checkout");
+      const subProjectPath = path.join(parentProjectPath, "packages", "app");
+      const skillDir = path.join(parentProjectPath, ".mux", "skills", "parent-only");
+      fs.mkdirSync(subProjectPath, { recursive: true });
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: parent-only\ndescription: Parent skill\n---\nParent body\n"
+      );
+
+      const config = new Config(tempDir);
+      await config.editConfig((current) => {
+        current.projects.set(parentProjectPath, { workspaces: [] });
+        current.projects.set(subProjectPath, {
+          workspaces: [],
+          parentProjectPath,
+        });
+        return current;
+      });
+      const context = {
+        config,
+        experimentsService: {
+          isExperimentEnabled: mock(() => false),
+        },
+      } as unknown as ORPCContext;
+      const client = createRouterClient(router(), { context });
+
+      await expect(
+        client.agentSkills.list({ projectPath: subProjectPath })
+      ).resolves.toContainEqual(
+        expect.objectContaining({
+          name: "parent-only",
+          description: "Parent skill",
+          scope: "project",
+        })
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("router config transcript mutation", () => {
   let tempDir: string;
   let config: Config;
 
@@ -66,82 +396,85 @@ describe("router config.saveConfig", () => {
   });
 
   function createContext(): ORPCContext {
-    // saveConfig only touches Config and TaskService, so this partial context keeps the
-    // router-level test focused on the config mutation under test.
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Other services are not used by saveConfig.
-    return {
-      config,
-      taskService: {
-        maybeStartQueuedTasks: () => Promise.resolve(undefined),
-      },
-    } as ORPCContext;
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
+    return { config } as ORPCContext;
   }
 
-  test("preserves agent enable flags when a mirrored legacy subagent entry is removed", async () => {
-    await config.editConfig((current) => ({
-      ...current,
-      agentAiDefaults: {
-        foo: {
-          modelString: "anthropic:claude-3-5-sonnet",
-          thinkingLevel: "high",
-          enabled: true,
-        },
-      },
-      subagentAiDefaults: {
-        foo: {
-          modelString: "anthropic:claude-3-5-sonnet",
-          thinkingLevel: "high",
-        },
-      },
-    }));
-
+  test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
 
-    await client.config.saveConfig({
-      taskSettings: DEFAULT_TASK_SETTINGS,
-      subagentAiDefaults: {},
-    });
+    expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(false);
+    await client.config.updateChatTranscriptFullWidth({ enabled: true });
+    expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(true);
+    expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBe(true);
 
-    const saved = config.loadConfigOrDefault();
-
-    expect(saved.agentAiDefaults?.foo?.modelString).toBeUndefined();
-    expect(saved.agentAiDefaults?.foo?.thinkingLevel).toBeUndefined();
-    expect(saved.agentAiDefaults?.foo?.enabled).toBe(true);
-    expect(saved.subagentAiDefaults?.foo).toBeUndefined();
+    await client.config.updateChatTranscriptFullWidth({ enabled: false });
+    expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(false);
+    expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
   });
 
-  test("preserves optional task settings when a save omits them", async () => {
-    await config.editConfig((current) => ({
-      ...current,
-      taskSettings: {
-        ...DEFAULT_TASK_SETTINGS,
-        preserveSubagentsUntilArchive: true,
-        proposePlanImplementReplacesChatHistory: true,
-      },
-    }));
-
+  test("persists the keep-screen-awake config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
 
-    await client.config.saveConfig({
-      // Simulate an older/unrelated settings client that only sends the originally required
-      // task limits. Optional task flags must stay sticky, or the sub-agent preservation toggle
-      // silently turns itself off before cleanup evaluates it.
-      taskSettings: {
-        maxParallelAgentTasks: 4,
-        maxTaskNestingDepth: 5,
-      },
-      advisorModelString: null,
-    });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+    await client.config.updateKeepScreenAwake({ enabled: true });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(true);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBe(true);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(true);
 
-    const saved = config.loadConfigOrDefault();
-    const savedTaskSettings = saved.taskSettings;
-    if (!savedTaskSettings) {
-      throw new Error("Expected saved task settings");
+    // Off state removes the key entirely (absent = off) instead of persisting `false`.
+    await client.config.updateKeepScreenAwake({ enabled: false });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBeUndefined();
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+  });
+
+  test("refuses procedure calls once the server has begun shutting down", async () => {
+    let shuttingDown = false;
+    const context = {
+      config,
+      serverService: { isShuttingDown: () => shuttingDown },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    expect(await client.general.ping("alive")).toBe("Pong: alive");
+
+    shuttingDown = true;
+    let error: unknown;
+    try {
+      await client.general.ping("late");
+    } catch (caught) {
+      error = caught;
     }
+    expect(error).toBeInstanceOf(ORPCError);
+    expect((error as ORPCError<string, unknown>).code).toBe("SERVICE_UNAVAILABLE");
+  });
 
-    expect(savedTaskSettings.maxParallelAgentTasks).toBe(4);
-    expect(savedTaskSettings.maxTaskNestingDepth).toBe(5);
-    expect(savedTaskSettings.preserveSubagentsUntilArchive).toBe(true);
-    expect(savedTaskSettings.proposePlanImplementReplacesChatHistory).toBe(true);
+  test("an aborted config mutation stays in flight until its write settles", async () => {
+    let started!: () => void;
+    const writeStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const write = new Promise<void>((resolve) => (finish = resolve));
+    const context = {
+      config: {
+        markSplashScreenViewed: () => {
+          started();
+          return write;
+        },
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    const controller = new AbortController();
+    const call = client.splashScreens
+      .markSplashScreenViewed({ splashId: "late" }, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    await writeStarted;
+    expect(inFlightProcedureCount()).toBe(1);
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(inFlightProcedureCount()).toBe(1);
+    finish();
+    await call;
+    expect(inFlightProcedureCount()).toBe(0);
   });
 });

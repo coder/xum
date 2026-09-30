@@ -1,9 +1,9 @@
 ---
 title: Server Access
-description: Configure authentication and session controls for mux server/browser mode
+description: Configure authentication and session controls for xum server/browser mode
 ---
 
-`mux server` can be accessed from browsers, mobile devices, and other machines on your network. This page covers how access control works, including the GitHub owner login allowlist.
+`xum server` can be accessed from browsers, mobile devices, and other machines on your network. This page covers how access control works, including the GitHub owner login allowlist.
 
 ## Authentication modes
 
@@ -13,7 +13,7 @@ Token resolution order:
 
 1. `--no-auth` (disables auth entirely)
 2. `--auth-token <token>`
-3. `MUX_SERVER_AUTH_TOKEN`
+3. `XUM_SERVER_AUTH_TOKEN`
 4. Auto-generated token at startup
 
 <Warning>
@@ -23,12 +23,12 @@ Token resolution order:
 
 ## Configure GitHub owner login
 
-Mux can optionally allow GitHub Device Flow login for exactly one GitHub account.
+Xum can optionally allow GitHub Device Flow login for exactly one GitHub account.
 
 Set the allowed account with either:
 
-- Environment variable: `MUX_SERVER_AUTH_GITHUB_OWNER`
-- Config file key: `serverAuthGithubOwner` in `~/.mux/config.json`
+- Environment variable: `XUM_SERVER_AUTH_GITHUB_OWNER`
+- Config file key: `serverAuthGithubOwner` in `~/.xum/config.json`
 
 There is currently no UI control for this setting; configure it via env/config.
 
@@ -40,16 +40,16 @@ Example:
 }
 ```
 
-If both are set, `MUX_SERVER_AUTH_GITHUB_OWNER` takes precedence.
+If both are set, `XUM_SERVER_AUTH_GITHUB_OWNER` takes precedence.
 
-When enabled, the auth modal shows **Login with GitHub**. Mux verifies the GitHub `login` value against the configured owner (case-insensitive). Non-matching users are rejected.
+When enabled, the auth modal shows **Login with GitHub**. Xum verifies the GitHub `login` value against the configured owner (case-insensitive). Non-matching users are rejected.
 
 <Note>
   This allowlist currently supports a single GitHub username. It does not support multiple users or
   GitHub organization membership rules.
 </Note>
 
-## Server Access settings page
+## Server Access settings
 
 Open **Settings → Server Access** to manage browser sessions.
 
@@ -64,11 +64,11 @@ This page manages cookie-backed browser sessions. Token-based access remains val
 
 ## Network exposure and bind settings
 
-To expose Mux beyond localhost and configure bind host/port in the UI:
+To expose Xum beyond localhost and configure bind host/port in the UI:
 
 1. Open **Settings → Experiments**
 2. Enable **Expose API server on LAN/VPN**
-3. Configure bind host, port, and **Serve mux web UI**
+3. Configure bind host, port, and **Serve xum web UI**
 4. Click **Apply**
 
 Equivalent CLI options:
@@ -77,6 +77,76 @@ Equivalent CLI options:
 - `--port <port>`
 - `--ssh-host <host>`
 - `--add-project <path>`
+
+## Updating the server
+
+Open **About** (or use the **Check for Updates**, **Download Update**, **Install Update and Restart**, and **Update Channel** command palette actions) to check for updates, download, then choose **Install & restart**. The server uses the saved update channel, or infers Nightly from an installed `-next.` version when no channel is saved. Stable follows the npm `latest` tag; Nightly follows `next`. **Newest npm** in the About dialog selects the most recently published package, including pre-releases, regardless of tags. Switching channels can install an older version. Checks and restarts are manual. The registry must be reachable over HTTPS without credentials (`XUM_UPDATE_REGISTRY_URL` or `npm_config_registry` override the default) and must answer metadata and tarball requests itself: redirects are refused, and registries that require authentication for metadata report the registry error at check time. The server downloads the release tarball and verifies it against the registry's published sha512 digest before the package manager installs it and its dependencies. After the install, every dependency recorded in the staged lockfile is checked against the digest the registry publishes for that exact version, so a dependency the package manager fetched through a redirect or from a tampered mirror is refused. Every request validates the registry certificate, ignoring `strict-ssl=false` and `NODE_TLS_REJECT_UNAUTHORIZED`; trust a private CA by starting the server with `NODE_EXTRA_CA_CERTS`, which the server and the package manager both honor (`cafile` is not consulted).
+
+Self-update requires a supervisor that restarts the server after it exits, an external launcher symlink pointing to an installed `@coder/xum` CLI with a bun, npm, or pnpm lockfile, and a stable auth token (`MUX_SERVER_AUTH_TOKEN`, `--auth-token`, or `--no-auth`). A generated token dies with the process, so the relaunched server would lock every browser session out. Set `XUM_BINARY` to that symlink and `XUM_SERVER_SUPERVISED=true` only when a supervisor is configured. The `coder/mux` registry module with `restart_on_kill=true` already declares these through its launcher environment. Unsupported installations show a reason instead of offering an update.
+
+Downloads install an exact package version in a sibling staging directory without changing the running installation. Restart is blocked by active streams, pending turns, workspaces still initializing or being archived, removed, renamed, forked, or staged, workflow runs, project clones and creations, any other request still in flight, queued messages, pending auto-retries, open or starting terminals, live desktop sessions, and running processes without recoverable monitors. Armed background watchers with verified, persisted monitor registrations do not block restart. After restart, their workspaces receive a lost-monitor wake and can relaunch them as needed; shell commands are not replayed automatically. Finish or stop any blocking work and retry, or choose **Restart anyway** (also the **Install Update and Restart Anyway** palette action) to skip the check: the server shuts down the same way it does under a supervisor restart, so in-flight streams stop with their partial output kept, and terminals and background processes are closed. There is no automatic restart-when-idle in this version.
+
+After activation, the server exits gracefully and the supervisor relaunches it. Browser clients reconnect and reload when the server build changes. If reconnection takes longer than about 45 seconds, use **Retry**.
+
+<Warning>
+  The registry module counts self-updates toward `max_restart_attempts`, just like other exits. The
+  server cannot read the remaining restart budget. Ensure the supervisor has restarts available, or
+  configure unlimited restarts (`max_restart_attempts=0`) before relying on self-update.
+</Warning>
+
+## Running the desktop app and `xum server` together
+
+If `xum server` is already running when you open the desktop app on the same machine and Xum data directory, the desktop app does not start a second API server. It still runs its own full backend on the same data: both processes read and write the same projects, workspaces, chat history, and tasks.
+
+What stays consistent between the two:
+
+- Config changes, such as creating a workspace or changing a setting, are written under a shared lock.
+- Chat history appends are written under a shared lock.
+- A workspace turn that one process runs is never marked interrupted by the other while the first process is alive.
+- A consent change you make in one app wins over a default that the other app was about to apply.
+- Background commands that both apps run in one local workspace get separate output records, even when they have the same name. This also holds when you send a running command to the background, and after a command finishes.
+- Renaming or deleting a workspace fails while the other app has a turn, an open terminal, or a background command in it, or in a sub-agent that shares its checkout. Deleting a workspace together with its sub-agents checks all of them first: if the other app uses any of them, nothing is deleted. The same holds for archiving a workspace, which also archives its sub-agents with the same archive setting (unarchiving the workspace later leaves them archived). The same applies to an archive that removes the checkout (the **Delete** or **Snapshot** archive setting) or stops or deletes a Coder workspace that Xum created for it, to restoring that snapshot on unarchive, and to deleting an archived workspace's worktree. Any unarchive fails while the other app renames, deletes, or archives the workspace, or deletes its worktree. The same applies while the other app runs an MCP server that runs in the workspace (a stdio server), an init hook, or a one-off command such as a git status refresh, and after it opened a native terminal or an external editor for the workspace, until it archives or removes the workspace (it cannot tell when those apps close). The error names the activity; try again when it ends. Background commands of the other app in SSH or Docker workspaces are not checked yet.
+
+What does not work across the two:
+
+- Streams, Stop, and message queues belong to the process that started them. Stopping a turn in one app does not stop a turn that the other app runs.
+- Busy state and delegated-turn checks are per process. The other app can admit a message into a workspace that looks busy only in the first app.
+- An open chat or sidebar does not update when the other app writes. Reload the app or reopen the workspace to see the other app's messages and changes.
+
+<Note>
+  You can use one workspace from both apps at the same time, within the limits above. Known gaps:
+  the rename, delete, and archive checks do not see background commands of the other app in SSH,
+  Docker, dev container, and multi-project workspaces, where same-name commands can also share
+  output records ([#4889](https://github.com/coder/xum/issues/4889)).
+</Note>
+
+<Note>
+  When one of the two processes starts, it recovers the sub-agent tasks that were starting, running,
+  or awaiting a report. It leaves alone a task that the other process is using right now: running a
+  turn, an init hook, an MCP server, or a command in it, or having opened a terminal or editor for
+  it. A task that the other process is not actively working on at that moment (while it is being set
+  up, between turns, or while it waits for its own sub-agents) can still be restarted by the
+  starting process. The other process's copy then stops counting: its report and status updates are
+  refused, but it keeps running until it finishes or you stop it in that app.
+</Note>
+
+Running two different Xum versions on the same data directory is not supported.
+
+### Open the running server in a desktop window
+
+To work with the server's own state (its streams, Stop, and queues) from the desktop app, open a server window:
+
+- Press Ctrl+Shift+O (Cmd+Shift+O on macOS) in the desktop window.
+- Run **Open Server Window** from the command palette or the **Window** menu.
+- Or select **Settings → Remote Connection → Open local xum server**.
+
+How it works:
+
+- The desktop app reads the server's address and token from `server.lock` in the Xum data directory, so you do not paste a token. The token is only used to sign the server window in.
+- The server window opens next to your local window, which keeps working. One server window can be open at a time. Running the action again focuses it. If the server restarted with a new token, the window reloads and signs in again.
+- If no server runs for this data directory, the action opens **Settings → Remote Connection**. You can also connect to another server by URL there.
+- The server window runs the server's web UI in an isolated window. It cannot use desktop-only features: opening files in your editor, native file pickers, notifications, and voice input. Terminal and desktop pop-outs open inside the server window's session.
+- Press Ctrl+Shift+L (Cmd+Shift+L on macOS) in the server window to close it and return to the local window.
 
 ## Related
 

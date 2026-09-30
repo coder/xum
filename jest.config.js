@@ -1,18 +1,6 @@
-const os = require("node:os");
+const { workerBudgetFor } = require("./scripts/lib/worker_budget.js");
 
-// Use cgroup-aware memory when available (containers), fall back to host RAM.
-// process.constrainedMemory() returns the cgroup v2 limit (Node 19.6+),
-// or 0/undefined outside a cgroup.
-const totalMemoryBytes =
-  (typeof process.constrainedMemory === "function" &&
-    process.constrainedMemory()) ||
-  os.totalmem();
-
-const cpuWorkerCap = Math.max(1, Math.floor(os.cpus().length * 0.5));
-const memoryWorkerCap = Math.floor(
-  totalMemoryBytes / (1024 * 1024 * 1024) / 1.5,
-);
-const maxWorkers = Math.max(1, Math.min(cpuWorkerCap, memoryWorkerCap));
+const maxWorkers = workerBudgetFor("jest");
 
 /** @type {import('jest').Config} */
 module.exports = {
@@ -35,14 +23,14 @@ module.exports = {
     // lottie-web probes canvas on import, which crashes in happy-dom/jsdom
     "^lottie-react$": "<rootDir>/tests/__mocks__/lottieReactMock.js",
     "^chalk$": "<rootDir>/tests/__mocks__/chalk.js",
-    "^jsdom$": "<rootDir>/tests/__mocks__/jsdom.js",
     // Mock static assets for full App rendering
     "\\.css$": "<rootDir>/tests/__mocks__/styleMock.js",
     "\\.txt$": "<rootDir>/tests/__mocks__/textMock.js",
     "\\.svg$": "<rootDir>/tests/__mocks__/svgMock.js",
   },
-  // Storybook UI tests use bun:test and are run via `bun test`, so Jest must skip them.
-  testPathIgnorePatterns: ["<rootDir>/tests/ui/storybook/"],
+  // Storybook UI tests and the DOM-harness isolation guards use bun:test and
+  // are run via `bun test`, so Jest must skip them.
+  testPathIgnorePatterns: ["<rootDir>/tests/ui/storybook/", "<rootDir>/tests/ui/domIsolation\\.test\\.ts"],
   // Avoid haste module collision with vscode extension
   modulePathIgnorePatterns: ["<rootDir>/vscode/"],
   transform: {
@@ -55,10 +43,13 @@ module.exports = {
     // This is slower but ensures compatibility
     "node_modules/(?!\\.pnpm)(?!.*)",
   ],
-  // High core-count containers with limited cgroup memory (for example 96 cores /
-  // 32 GB) can OOM if Jest uses CPU-only parallelism, so keep roughly 1.5 GB
-  // per worker.
   maxWorkers,
+  // Integration suites leak memory across test files (app harnesses, DuckDB analytics
+  // workers), so a long-lived worker accumulates heap until it dies at V8's ~4GB cap
+  // ("Jest worker ran out of memory and crashed", PR #3939 CI run 32720490232). The
+  // fewer workers the budget selects, the more files each one runs and the sooner it
+  // crashes. Recycle any worker still holding >2GB when idle between test files.
+  workerIdleMemoryLimit: "2GB",
   // Force exit after tests complete to avoid hanging on lingering handles
   forceExit: true,
   // 10 minute timeout for integration tests, 10s for unit tests

@@ -1,5 +1,5 @@
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
+import { KEYBINDS, formatKeybind, isKeybindDeprecated } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 /**
@@ -10,6 +10,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_AGENT: "Open agent picker",
   CYCLE_AGENT: "Cycle agent",
   SEND_MESSAGE: "Send message",
+  SEND_QUEUED_MESSAGE_NOW: "Send queued message now",
+  SEND_HELD_INPUT: "Send oldest unsent message",
+  DISCARD_HELD_INPUT: "Discard oldest unsent message",
   SEND_MESSAGE_AFTER_TURN: "Send after turn",
   NEW_LINE: "Insert newline",
   CANCEL: "Cancel / Close modal",
@@ -17,12 +20,17 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SAVE_EDIT: "Save edit",
   INTERRUPT_STREAM_VIM: "Interrupt stream (Vim mode)",
   INTERRUPT_STREAM_NORMAL: "Interrupt stream",
+  RESUME_STREAM: "Continue interrupted stream",
   FOCUS_INPUT_I: "Focus input (i)",
   FOCUS_INPUT_A: "Focus input (a)",
   NEW_WORKSPACE: "New workspace",
+  NEW_SCRATCH_CHAT: "New scratch chat",
   EDIT_WORKSPACE_TITLE: "Edit workspace title",
   GENERATE_WORKSPACE_TITLE: "Generate new title",
   ARCHIVE_WORKSPACE: "Archive workspace",
+  PIN_WORKSPACE: "Pin/unpin chat",
+  MOVE_PINNED_UP: "Move pinned chat up",
+  MOVE_PINNED_DOWN: "Move pinned chat down",
   JUMP_TO_BOTTOM: "Jump to bottom",
   LOAD_OLDER_MESSAGES: "Load older messages",
   NEXT_WORKSPACE: "Next workspace",
@@ -31,14 +39,20 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CYCLE_MODEL: "Cycle model",
   OPEN_TERMINAL: "New terminal",
   OPEN_IN_EDITOR: "Open in editor",
-  SHARE_TRANSCRIPT: "Share transcript",
   CONFIGURE_MCP: "Configure MCP servers",
   CONFIGURE_HEARTBEAT: "Configure heartbeat",
+  CONFIGURE_UNRELATED_MESSAGING: "Configure messages from other workspaces",
   OPEN_COMMAND_PALETTE: "Command palette",
   OPEN_COMMAND_PALETTE_ACTIONS: "Command palette (alternate)",
   TOGGLE_THINKING: "Toggle thinking",
+  INCREASE_THINKING: "Increase thinking level",
+  DECREASE_THINKING: "Decrease thinking level",
+  TOGGLE_FAST_MODE: "Toggle fast mode",
   FOCUS_CHAT: "Focus chat input",
   CLOSE_TAB: "Close tab",
+  REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
+  OPEN_TIMELINE_DIALOG: "Open timeline dialog (small viewports)",
+  REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
   SIDEBAR_TAB_3: "Tab 3",
@@ -56,12 +70,33 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   MARK_HUNK_UNREAD: "Mark hunk unread",
   MARK_FILE_READ: "Mark file read",
   TOGGLE_HUNK_COLLAPSE: "Toggle hunk collapse",
+  TOGGLE_ASSISTED_REVIEW: "Toggle Assisted filter",
   OPEN_SETTINGS: "Open settings",
   OPEN_ANALYTICS: "Open analytics",
+  OPEN_SERVER_WINDOW: "Open server window (desktop)",
   TOGGLE_VOICE_INPUT: "Toggle voice input",
   NAVIGATE_BACK: "Navigate back",
   NAVIGATE_FORWARD: "Navigate forward",
   TOGGLE_NOTIFICATIONS: "Toggle notifications",
+  TOGGLE_DRIFT_MODE: "Toggle git drift lines/commits",
+  SHOW_WORKSPACE_DETAILS: "Show workspace details",
+  SHOW_LAST_PROMPT: "Show last prompt",
+  SETTINGS_BACKUP_SAVE: "Save backup settings",
+  SETTINGS_BACKUP_VALIDATE: "Validate backup repository",
+  SETTINGS_BACKUP_PREVIEW: "Preview settings backup",
+  SETTINGS_BACKUP_PUSH: "Back up settings",
+  SETTINGS_BACKUP_RESTORE: "Restore settings backup",
+  SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: "Toggle secret scan override",
+  SETTINGS_BACKUP_APPROVE_COMMANDS: "Toggle MCP command approval",
+  SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS: "Toggle global instructions backup",
+  SETTINGS_BACKUP_TOGGLE_AGENTS: "Toggle agent definitions backup",
+  SETTINGS_BACKUP_TOGGLE_SKILLS: "Toggle agent skills backup",
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY: "Toggle global memory backup",
+  SETTINGS_BACKUP_TOGGLE_PREFERENCES: "Toggle preferences backup",
+  SETTINGS_BACKUP_TOGGLE_MCP: "Toggle MCP configuration backup",
+  SETTINGS_BACKUP_TOGGLE_MCP_HEADERS: "Toggle MCP header values in backup",
+  SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: "Toggle MCP stdio commands in backup",
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -78,13 +113,25 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_QUICK_DISLIKE: "Quick dislike (immersive)",
   REVIEW_COMMENT: "Add comment (immersive)",
   REVIEW_FOCUS_NOTES: "Focus notes sidebar (immersive)",
+  REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
+  RUN_LATEST_PLAN_ACTION: "Implement latest plan",
+  // Transcript-menu-only actions show their shortcuts in that menu.
+  COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
+  // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
+  // omitted from KEYBIND_GROUPS because they only apply while an image surface
+  // is focused.
+  IMAGE_COPY: "Copy image (image viewer)",
+  IMAGE_DOWNLOAD: "Download image (image viewer)",
   // Easter egg keybind; intentionally omitted from KEYBIND_GROUPS.
   TOGGLE_POWER_MODE: "",
 };
 
 /** Groups for organizing keybinds in the UI */
-const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> }> = [
+const KEYBIND_GROUPS: Array<{
+  label: string;
+  keys: Array<keyof typeof KEYBINDS>;
+}> = [
   {
     label: "General",
     keys: [
@@ -93,13 +140,18 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "OPEN_COMMAND_PALETTE",
       "OPEN_SETTINGS",
       "OPEN_ANALYTICS",
+      "OPEN_SERVER_WINDOW",
       "TOGGLE_SIDEBAR",
       "CYCLE_MODEL",
-      "TOGGLE_THINKING",
+      "DECREASE_THINKING",
+      "INCREASE_THINKING",
+      "TOGGLE_FAST_MODE",
       "TOGGLE_NOTIFICATIONS",
-      "SHARE_TRANSCRIPT",
+      "TOGGLE_DRIFT_MODE",
+      "SHOW_WORKSPACE_DETAILS",
       "CONFIGURE_MCP",
       "CONFIGURE_HEARTBEAT",
+      "CONFIGURE_UNRELATED_MESSAGING",
     ],
   },
   {
@@ -112,10 +164,14 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "FOCUS_INPUT_I",
       "FOCUS_INPUT_A",
       "TOGGLE_PLAN_ANNOTATE",
+      "RUN_LATEST_PLAN_ACTION",
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",
+      "RESUME_STREAM",
       "TOGGLE_VOICE_INPUT",
+      "SHOW_LAST_PROMPT",
+      "REVEAL_LAST_PROMPT",
     ],
   },
   {
@@ -126,6 +182,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
     label: "Navigation",
     keys: [
       "NEW_WORKSPACE",
+      "NEW_SCRATCH_CHAT",
       "EDIT_WORKSPACE_TITLE",
       "GENERATE_WORKSPACE_TITLE",
       "ARCHIVE_WORKSPACE",
@@ -150,6 +207,8 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "SIDEBAR_TAB_8",
       "SIDEBAR_TAB_9",
       "CLOSE_TAB",
+      "REVEAL_TIMELINE_EVENT",
+      "OPEN_TIMELINE_DIALOG",
     ],
   },
   {
@@ -163,6 +222,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "MARK_HUNK_UNREAD",
       "MARK_FILE_READ",
       "TOGGLE_HUNK_COLLAPSE",
+      "TOGGLE_ASSISTED_REVIEW",
     ],
   },
   {
@@ -177,6 +237,28 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "REVIEW_QUICK_DISLIKE",
       "REVIEW_COMMENT",
       "REVIEW_FOCUS_NOTES",
+      "REVIEW_COPY_FILE",
+    ],
+  },
+  {
+    label: "Settings backup",
+    keys: [
+      "SETTINGS_BACKUP_SAVE",
+      "SETTINGS_BACKUP_VALIDATE",
+      "SETTINGS_BACKUP_PREVIEW",
+      "SETTINGS_BACKUP_PUSH",
+      "SETTINGS_BACKUP_RESTORE",
+      "SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN",
+      "SETTINGS_BACKUP_APPROVE_COMMANDS",
+      "SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS",
+      "SETTINGS_BACKUP_TOGGLE_AGENTS",
+      "SETTINGS_BACKUP_TOGGLE_SKILLS",
+      "SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY",
+      "SETTINGS_BACKUP_TOGGLE_PREFERENCES",
+      "SETTINGS_BACKUP_TOGGLE_MCP",
+      "SETTINGS_BACKUP_TOGGLE_MCP_HEADERS",
+      "SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS",
+      "SETTINGS_BACKUP_TOGGLE_PROJECTS",
     ],
   },
   {
@@ -196,7 +278,11 @@ export function KeybindsSection() {
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const visibleKeybindGroups = KEYBIND_GROUPS.map((group) => ({
     ...group,
-    keys: group.keys.filter((key) => key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled),
+    keys: group.keys.filter(
+      (key) =>
+        !isKeybindDeprecated(KEYBINDS[key]) &&
+        (key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled)
+    ),
   })).filter((group) => group.keys.length > 0);
 
   return (

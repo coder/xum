@@ -1,10 +1,11 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useState, useCallback, useLayoutEffect } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   DEFAULT_TERMINAL_FONT_CONFIG,
   TERMINAL_FONT_CONFIG_KEY,
+  normalizeTerminalFontConfig,
   type TerminalFontConfig,
 } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
@@ -18,27 +19,8 @@ import {
   TERMINAL_ICON_FALLBACK_FAMILY,
 } from "@/browser/terminal/terminalFontFamily";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
-
-function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig {
-  if (!value || typeof value !== "object") {
-    return DEFAULT_TERMINAL_FONT_CONFIG;
-  }
-
-  const record = value as { fontFamily?: unknown; fontSize?: unknown };
-
-  const fontFamily =
-    typeof record.fontFamily === "string" && record.fontFamily.trim()
-      ? record.fontFamily
-      : DEFAULT_TERMINAL_FONT_CONFIG.fontFamily;
-
-  const fontSizeNumber = Number(record.fontSize);
-  const fontSize =
-    Number.isFinite(fontSizeNumber) && fontSizeNumber > 0
-      ? fontSizeNumber
-      : DEFAULT_TERMINAL_FONT_CONFIG.fontSize;
-
-  return { fontFamily, fontSize };
-}
+import { TerminalBadgeOverlay } from "@/browser/components/TerminalView/TerminalBadgeOverlay";
+import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 
 function canLoadFontFamily(primary: string, fontSize: number): boolean {
   const family = stripOuterQuotes(primary).trim();
@@ -149,6 +131,21 @@ interface TerminalViewProps {
   autoFocus?: boolean;
   /** Called when the terminal process exits. */
   onExit?: (exitCode: number) => void;
+  /**
+   * Workspace/tab identity for the badge overlay. When omitted (pop-out
+   * window), workspace names are resolved via the API and the tab name
+   * falls back to the latest OSC title.
+   */
+  workspaceName?: string;
+  projectName?: string;
+  tabName?: string;
+  /** 0-based tab position for the badge's {index} token; unknown in pop-out windows. */
+  tabIndex?: number;
+  /**
+   * OSC title carried over from before a pop-out handoff, so the badge doesn't
+   * reset to "Terminal" until the shell emits another title.
+   */
+  initialTitle?: string;
 }
 
 export function TerminalView({
@@ -160,12 +157,23 @@ export function TerminalView({
   onAutoFocusConsumed,
   autoFocus = true,
   onExit,
+  workspaceName,
+  projectName,
+  tabName,
+  tabIndex,
+  initialTitle,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const autoFocusRef = useRef(autoFocus);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const exitHandledRef = useRef(false);
+  const onExitRef = useRef(onExit);
+  // The right sidebar can recreate onExit while chat streams. Sync the latest committed
+  // callback through a ref so subscriptions stay stable without exposing render-time props.
+  useLayoutEffect(() => {
+    onExitRef.current = onExit;
+  }, [onExit]);
   const [terminalError, setTerminalError] = useState<string | null>(null);
   const [terminalReady, setTerminalReady] = useState(false);
   // Track whether we've received the initial screen state from backend
@@ -185,6 +193,16 @@ export function TerminalView({
   routerRef.current = router;
   sessionIdRef.current = sessionId;
 
+  // Pop-out windows have no WorkspaceProvider, so the badge overlay's
+  // workspace identity is resolved here alongside the window title.
+  const [resolvedNames, setResolvedNames] = useState<{
+    workspaceName: string;
+    projectName: string;
+  } | null>(null);
+  // Latest OSC 0/1/2 title; badge fallback for pop-out windows where the
+  // sidebar's per-tab title map is unavailable.
+  const [oscTitle, setOscTitle] = useState<string | null>(initialTitle ?? null);
+
   // Set window title (dedicated terminal window only)
   useEffect(() => {
     if (!api || !setDocumentTitle) return;
@@ -194,6 +212,7 @@ export function TerminalView({
         const workspace = workspaces.find((ws) => ws.id === workspaceId);
         if (workspace) {
           document.title = `Terminal — ${workspace.projectName}/${workspace.name}`;
+          setResolvedNames({ workspaceName: workspace.name, projectName: workspace.projectName });
         } else {
           document.title = `Terminal — ${workspaceId}`;
         }
@@ -214,26 +233,23 @@ export function TerminalView({
     onAutoFocusConsumed?.();
   }, [onAutoFocusConsumed]);
 
-  const handleExit = useCallback(
-    (code: number) => {
-      if (exitHandledRef.current) {
-        return;
-      }
-      exitHandledRef.current = true;
+  const handleExit = useCallback((code: number) => {
+    if (exitHandledRef.current) {
+      return;
+    }
+    exitHandledRef.current = true;
 
-      const term = termRef.current;
-      if (term) {
-        try {
-          term.write(`\r\n[Process exited with code ${code}]\r\n`);
-        } catch (err) {
-          console.warn("[TerminalView] Error writing exit message:", err);
-        }
+    const term = termRef.current;
+    if (term) {
+      try {
+        term.write(`\r\n[Process exited with code ${code}]\r\n`);
+      } catch (err) {
+        console.warn("[TerminalView] Error writing exit message:", err);
       }
+    }
 
-      onExit?.(code);
-    },
-    [onExit]
-  );
+    onExitRef.current?.(code);
+  }, []);
 
   useEffect(() => {
     autoFocusRef.current = autoFocus;
@@ -573,6 +589,7 @@ export function TerminalView({
         // Terminal title changes (from OSC escape sequences like "echo -ne '\033]0;Title\007'")
         // Use ref to always get latest callback
         disposeOnTitleChange = terminal.onTitleChange((title: string) => {
+          setOscTitle(title);
           onTitleChangeRef.current?.(title);
         });
 
@@ -904,6 +921,14 @@ export function TerminalView({
         >
           <span className="text-muted animate-pulse text-sm">Connecting...</span>
         </div>
+      )}
+      {!showLoading && (
+        <TerminalBadgeOverlay
+          workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? workspaceId}
+          projectName={projectName ?? resolvedNames?.projectName ?? ""}
+          tabName={tabName ?? oscTitle ?? getTerminalTabFallbackName(0)}
+          tabIndex={tabIndex}
+        />
       )}
     </div>
   );

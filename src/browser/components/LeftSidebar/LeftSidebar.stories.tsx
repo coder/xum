@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { useRef } from "react";
 import { LeftSidebar } from "./LeftSidebar";
-import { CHROMATIC_SMOKE_MODES } from "@/browser/stories/meta.js";
+import { PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { createOnChatAdapter, type ChatHandler } from "@/browser/stories/helpers/chatSetup";
 import { setWorkspaceDrafts } from "@/browser/stories/helpers/drafts";
 import { clearWorkspaceSelection, expandProjects } from "@/browser/stories/helpers/uiState";
@@ -28,15 +29,16 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { AboutDialogProvider } from "@/browser/contexts/AboutDialogContext";
-import { TelemetryEnabledProvider } from "@/browser/contexts/TelemetryEnabledContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { useWorkspaceRecency } from "@/browser/stores/WorkspaceStore";
 import { buildSortedWorkspacesByProject } from "@/browser/utils/ui/workspaceFiltering";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   SELECTED_WORKSPACE_KEY,
+  SIDEBAR_AGE_GROUPING_KEY,
   UI_THEME_KEY,
   getWorkspaceLastReadKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
 } from "@/common/constants/storage";
 
 const meta: Meta<typeof LeftSidebar> = {
@@ -44,7 +46,6 @@ const meta: Meta<typeof LeftSidebar> = {
   component: LeftSidebar,
   parameters: {
     layout: "fullscreen",
-    chromatic: { delay: 500 },
   },
   decorators: [
     (Story: () => JSX.Element) => {
@@ -109,6 +110,9 @@ function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
     localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
+    // FlatListWhenAgeGroupingDisabled writes this key; clear it so later
+    // stories are not affected by story execution order.
+    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
   }
 }
 
@@ -149,7 +153,12 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
     clientRef.current = null;
   }
 
-  clientRef.current ??= props.setup();
+  if (clientRef.current === null) {
+    clientRef.current = props.setup();
+    // No AppLoader here: connect the drafts store, which owns the creation draft list and imports
+    // the story's seeded legacy list from the mock backend.
+    getDraftStore().setClient(clientRef.current);
+  }
   const providerTreeKey = `${renderKey ?? "left-sidebar"}:${MODULE_RENDER_TOKEN}:${remountEpochRef.current}`;
 
   return (
@@ -161,15 +170,13 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
               <TooltipProvider delayDuration={200}>
                 <SettingsProvider>
                   <AboutDialogProvider>
-                    <TelemetryEnabledProvider>
-                      <ConfirmDialogProvider>
-                        <ProjectProvider>
-                          <WorkspaceProvider>
-                            <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
-                          </WorkspaceProvider>
-                        </ProjectProvider>
-                      </ConfirmDialogProvider>
-                    </TelemetryEnabledProvider>
+                    <ConfirmDialogProvider>
+                      <ProjectProvider>
+                        <WorkspaceProvider>
+                          <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
+                        </WorkspaceProvider>
+                      </ProjectProvider>
+                    </ConfirmDialogProvider>
                   </AboutDialogProvider>
                 </SettingsProvider>
               </TooltipProvider>
@@ -268,7 +275,7 @@ function createGitStatusExecutor(gitStatus?: Map<string, GitStatusFixture>) {
 /** Single project with multiple workspaces including SSH */
 export const SingleProject: AppStory = {
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   render: () => (
     <LeftSidebarStoryShell
@@ -434,11 +441,8 @@ export const ResizeHandleActive: AppStory = {
 /** Mobile open state should show overlay backdrop */
 export const MobileOpenOverlay: AppStory = {
   parameters: {
-    chromatic: {
-      modes: {
-        "dark-mobile": { theme: "dark", viewport: "mobile1", hasTouch: true },
-        "light-mobile": { theme: "light", viewport: "mobile1", hasTouch: true },
-      },
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
     },
   },
   render: () => (
@@ -589,86 +593,8 @@ export const BestOfSubagents: AppStory = {
 };
 
 /**
- * Variant sub-agents reuse the grouped sidebar row but show a variants label.
- */
-export const VariantSubagents: AppStory = {
-  render: () => (
-    <LeftSidebarStoryShell
-      setup={() => {
-        const projectPath = "/home/user/projects/variants-demo";
-        const parent = createWorkspace({
-          id: "ws-parent-variants",
-          name: "main",
-          title: "Main workspace",
-          projectName: "variants-demo",
-          projectPath,
-        });
-        const taskGroupBase = {
-          groupId: "variants-story",
-          index: 0,
-          total: 3,
-          kind: "variants",
-          label: "frontend",
-        } as const;
-        const workspaces = [
-          parent,
-          createWorkspace({
-            id: "ws-variant-1",
-            name: "variant-1",
-            title: "Split review",
-            projectName: "variants-demo",
-            projectPath,
-            bestOf: taskGroupBase,
-          }),
-          createWorkspace({
-            id: "ws-variant-2",
-            name: "variant-2",
-            title: "Split review",
-            projectName: "variants-demo",
-            projectPath,
-            bestOf: { ...taskGroupBase, index: 1, label: "backend" },
-          }),
-          createWorkspace({
-            id: "ws-variant-3",
-            name: "variant-3",
-            title: "Split review",
-            projectName: "variants-demo",
-            projectPath,
-            bestOf: { ...taskGroupBase, index: 2, label: "tests" },
-          }),
-        ].map((workspace, index) =>
-          index === 0
-            ? workspace
-            : {
-                ...workspace,
-                parentWorkspaceId: parent.id,
-                taskStatus: index % 2 === 0 ? ("queued" as const) : ("running" as const),
-              }
-        );
-
-        expandProjects([projectPath]);
-
-        return createMockORPCClient({
-          projects: groupWorkspacesByProject(workspaces),
-          workspaces,
-        });
-      }}
-    />
-  ),
-  play: async ({ canvasElement }) => {
-    await waitFor(() => {
-      const groupRow = canvasElement.querySelector('[data-testid="task-group-variants-story"]');
-      if (!groupRow) {
-        throw new Error("Variants sidebar group row not rendered");
-      }
-    });
-  },
-};
-
-/**
- * Regression test: when all workspaces are older than 1 day, they should still
- * appear under the "Older than 1 day" tier instead of being forced into recent.
- * Also verifies expanded parent rows can reveal both active and completed sub-agents.
+ * Regression test: when active workspaces are older than 1 day, they still appear under the
+ * "Older than 1 day" tier. Inactive persistent children remain out of the left sidebar.
  */
 export const SingleOldWorkspaceInOlderTier: AppStory = {
   render: () => (
@@ -732,13 +658,7 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
         expandProjects([projectPath]);
         // Keep this regression deterministic even when Storybook reuses localStorage
         // across stories/runs and a prior interaction expanded an old-age tier.
-        localStorage.setItem("expandedOldWorkspaces", JSON.stringify({}));
-        // Pre-expand completed children so this regression also covers nested reported rows.
-        localStorage.setItem(
-          "expandedCompletedSubAgents",
-          JSON.stringify({ [oldWorkspace.id]: true })
-        );
-
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
@@ -754,8 +674,8 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
 
     await waitFor(() => {
       const tierToggle = getTierToggle();
-      if (!tierToggle.textContent?.includes("(4)")) {
-        throw new Error("Expected older-than-1-day tier count to be 4");
+      if (!tierToggle.textContent?.includes("(2)")) {
+        throw new Error("Expected older-than-1-day tier count to include only active rows");
       }
     });
 
@@ -772,12 +692,7 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
       }
     });
 
-    for (const workspaceId of [
-      "ws-old-only",
-      "ws-old-active-subagent",
-      "ws-old-completed-subagent-1",
-      "ws-old-completed-subagent-2",
-    ]) {
+    for (const workspaceId of ["ws-old-only", "ws-old-active-subagent"]) {
       if (canvasElement.querySelector(`[data-workspace-id="${workspaceId}"]`)) {
         throw new Error(`Workspace ${workspaceId} rendered before expanding old tier`);
       }
@@ -786,12 +701,7 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
     await userEvent.click(getTierToggle());
 
     await waitFor(() => {
-      for (const workspaceId of [
-        "ws-old-only",
-        "ws-old-active-subagent",
-        "ws-old-completed-subagent-1",
-        "ws-old-completed-subagent-2",
-      ]) {
+      for (const workspaceId of ["ws-old-only", "ws-old-active-subagent"]) {
         const row = canvasElement.querySelector<HTMLElement>(
           `[data-workspace-id="${workspaceId}"]`
         );
@@ -800,12 +710,17 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
         }
       }
     });
+    for (const workspaceId of ["ws-old-completed-subagent-1", "ws-old-completed-subagent-2"]) {
+      if (canvasElement.querySelector(`[data-workspace-id="${workspaceId}"]`)) {
+        throw new Error(`Inactive workspace ${workspaceId} should stay out of the left sidebar`);
+      }
+    }
   },
 };
 
 /**
- * Regression variant: mirrors SingleOldWorkspaceInOlderTier, but the parent agent
- * is less than 1 day old so the full hierarchy should render in the recent section.
+ * Regression variant: the parent and active child are less than 1 day old, so they render in the
+ * recent section while inactive persistent children remain available only in the transcript.
  */
 export const SingleRecentWorkspaceInTopTier: AppStory = {
   render: () => (
@@ -867,10 +782,6 @@ export const SingleRecentWorkspaceInTopTier: AppStory = {
         ];
 
         expandProjects([projectPath]);
-        localStorage.setItem(
-          "expandedCompletedSubAgents",
-          JSON.stringify({ [recentWorkspace.id]: true })
-        );
 
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
@@ -890,12 +801,7 @@ export const SingleRecentWorkspaceInTopTier: AppStory = {
     });
 
     await waitFor(() => {
-      for (const workspaceId of [
-        "ws-recent-only",
-        "ws-recent-active-subagent",
-        "ws-recent-completed-subagent-1",
-        "ws-recent-completed-subagent-2",
-      ]) {
+      for (const workspaceId of ["ws-recent-only", "ws-recent-active-subagent"]) {
         const row = canvasElement.querySelector<HTMLElement>(
           `[data-workspace-id="${workspaceId}"]`
         );
@@ -904,6 +810,96 @@ export const SingleRecentWorkspaceInTopTier: AppStory = {
         }
       }
     });
+    for (const workspaceId of [
+      "ws-recent-completed-subagent-1",
+      "ws-recent-completed-subagent-2",
+    ]) {
+      if (canvasElement.querySelector(`[data-workspace-id="${workspaceId}"]`)) {
+        throw new Error(`Inactive workspace ${workspaceId} should stay out of the left sidebar`);
+      }
+    }
+  },
+};
+
+/**
+ * With sidebar age grouping disabled (Settings toggle), workspaces older than
+ * the first tier threshold render inline as one flat recency-sorted list:
+ * no "Older than X" toggle and no expansion needed to see old rows.
+ */
+export const FlatListWhenAgeGroupingDisabled: AppStory = {
+  render: () => (
+    <LeftSidebarStoryShell
+      setup={() => {
+        const projectPath = "/home/user/projects/age-tier-demo";
+        const oldCreatedAt = new Date(NOW - 2 * 24 * 60 * 60 * 1000).toISOString();
+        const oldWorkspace = createWorkspace({
+          id: "ws-flat-old",
+          name: "old-workspace",
+          title: "Old workspace",
+          projectName: "age-tier-demo",
+          projectPath,
+          createdAt: oldCreatedAt,
+        });
+        const activeSubAgent = {
+          ...createWorkspace({
+            id: "ws-flat-old-active-subagent",
+            name: "active-subagent",
+            title: "Active sub-agent",
+            projectName: "age-tier-demo",
+            projectPath,
+            createdAt: oldCreatedAt,
+          }),
+          parentWorkspaceId: oldWorkspace.id,
+          taskStatus: "running" as const,
+        };
+        const completedSubAgent = {
+          ...createWorkspace({
+            id: "ws-flat-old-completed-subagent",
+            name: "completed-subagent",
+            title: "Completed sub-agent",
+            projectName: "age-tier-demo",
+            projectPath,
+            createdAt: oldCreatedAt,
+          }),
+          parentWorkspaceId: oldWorkspace.id,
+          taskStatus: "reported" as const,
+          reportedAt: oldCreatedAt,
+        };
+        const workspaces = [oldWorkspace, activeSubAgent, completedSubAgent];
+
+        expandProjects([projectPath]);
+        updatePersistedState(SIDEBAR_AGE_GROUPING_KEY, false);
+        // Grouping is off, so no tier should need expansion for rows to show.
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
+        return createMockORPCClient({
+          projects: groupWorkspacesByProject(workspaces),
+          workspaces,
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await waitFor(() => {
+      for (const workspaceId of ["ws-flat-old", "ws-flat-old-active-subagent"]) {
+        const row = canvasElement.querySelector<HTMLElement>(
+          `[data-workspace-id="${workspaceId}"]`
+        );
+        if (!row) {
+          throw new Error(`Workspace ${workspaceId} did not render inline with grouping off`);
+        }
+      }
+    });
+
+    if (canvasElement.querySelector('[data-workspace-id="ws-flat-old-completed-subagent"]')) {
+      throw new Error("Inactive sub-agent should stay out of the flat left-sidebar list");
+    }
+
+    const tierToggle = within(canvasElement).queryByRole("button", {
+      name: /workspaces older than/i,
+    });
+    if (tierToggle) {
+      throw new Error("Did not expect an age-tier toggle when grouping is disabled");
+    }
   },
 };
 
@@ -1458,7 +1454,7 @@ export const MixedAgentStatesAndAges: AppStory = {
         );
 
         // Expand age tiers so older-than-1-day and older-than-7-days rows are visible.
-        updatePersistedState("expandedOldWorkspaces", {
+        updatePersistedState(EXPANDED_OLD_WORKSPACES_KEY, {
           [`${projectPath}:0`]: true,
           [`${projectPath}:1`]: true,
         });
@@ -1467,7 +1463,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             activeWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: activeWorkspace.id,
@@ -1482,7 +1478,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             parentWithActiveSubagentsWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: parentWithActiveSubagentsWorkspace.id,
@@ -1497,7 +1493,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             errorWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: errorWorkspace.id,

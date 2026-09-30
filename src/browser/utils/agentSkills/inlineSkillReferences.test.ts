@@ -7,6 +7,7 @@ import {
   resolveInlineSkillReferences,
   type InlineSkillCandidate,
 } from "./inlineSkillReferences";
+import { createTestApiClient } from "@/browser/testUtils";
 
 type AgentSkillsGetInput = Parameters<APIClient["agentSkills"]["get"]>[0];
 type AgentSkillsGetOutput = Awaited<ReturnType<APIClient["agentSkills"]["get"]>>;
@@ -35,7 +36,7 @@ function skillPackage(
 }
 
 function apiClient(get: APIClient["agentSkills"]["get"]): APIClient {
-  return { agentSkills: { get } } as unknown as APIClient;
+  return createTestApiClient({ agentSkills: { get } });
 }
 
 describe("extractInlineSkillReferenceCandidates", () => {
@@ -53,6 +54,12 @@ describe("extractInlineSkillReferenceCandidates", () => {
     expect(extractInlineSkillReferenceCandidates("$tdd and $deep-review")).toEqual([
       { skillName: "tdd", startIndex: 0, endIndex: 4 },
       { skillName: "deep-review", startIndex: 9, endIndex: 21 },
+    ]);
+  });
+
+  test("extracts normalized MCP prompt references with underscores", () => {
+    expect(extractInlineSkillReferenceCandidates("Use $mcp__coder__review")).toEqual([
+      { skillName: "mcp__coder__review", startIndex: 4, endIndex: 23 },
     ]);
   });
 

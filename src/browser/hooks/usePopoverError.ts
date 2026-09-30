@@ -14,9 +14,11 @@ export interface UsePopoverErrorResult {
 
 /**
  * Hook for managing popover error state with auto-dismiss and click-outside behavior.
- * @param autoDismissMs - Time in ms before auto-dismissing (default: 5000)
+ * @param autoDismissMs - Time in ms before auto-dismissing (default: 5000). `null` keeps the
+ *   popover until its dismiss button: for text the user must be able to reread or copy after
+ *   the row it came from is gone, such as what a forced removal left behind (#5143).
  */
-export function usePopoverError(autoDismissMs = 5000): UsePopoverErrorResult {
+export function usePopoverError(autoDismissMs: number | null = 5000): UsePopoverErrorResult {
   const [error, setError] = useState<PopoverErrorState | null>(null);
   const timeoutRef = useRef<number | null>(null);
 
@@ -40,6 +42,7 @@ export function usePopoverError(autoDismissMs = 5000): UsePopoverErrorResult {
       };
 
       setError({ id, error: errorMsg, position });
+      if (autoDismissMs === null) return;
 
       timeoutRef.current = window.setTimeout(() => {
         setError(null);
@@ -60,7 +63,7 @@ export function usePopoverError(autoDismissMs = 5000): UsePopoverErrorResult {
 
   // Click-outside to dismiss
   useEffect(() => {
-    if (!error) return;
+    if (!error || autoDismissMs === null) return;
 
     const handleClickOutside = () => clearError();
 
@@ -73,7 +76,7 @@ export function usePopoverError(autoDismissMs = 5000): UsePopoverErrorResult {
       window.clearTimeout(timeoutId);
       document.removeEventListener("click", handleClickOutside);
     };
-  }, [error, clearError]);
+  }, [error, clearError, autoDismissMs]);
 
   return useMemo(() => ({ error, showError, clearError }), [error, showError, clearError]);
 }

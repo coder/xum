@@ -57,18 +57,16 @@ function normalizeHeartbeatSettings(
 
   const message = normalizeHeartbeatDefaultMessage(heartbeat.message);
   const contextMode = heartbeat.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
-  return message
-    ? {
-        enabled: heartbeat.enabled,
-        intervalMs: heartbeat.intervalMs,
-        contextMode,
-        message,
-      }
-    : {
-        enabled: heartbeat.enabled,
-        intervalMs: heartbeat.intervalMs,
-        contextMode,
-      };
+  return {
+    enabled: heartbeat.enabled,
+    intervalMs: heartbeat.intervalMs,
+    contextMode,
+    ...(message ? { message } : {}),
+    // Keep trigger/whenBusy sparse (no client-side defaulting) so the modal can distinguish
+    // "unset (read-time default)" from an explicit choice.
+    ...(heartbeat.trigger != null ? { trigger: heartbeat.trigger } : {}),
+    ...(heartbeat.whenBusy != null ? { whenBusy: heartbeat.whenBusy } : {}),
+  };
 }
 
 function getHeartbeatErrorMessage(error: unknown, fallbackMessage: string): string {

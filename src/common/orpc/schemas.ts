@@ -1,47 +1,19 @@
-// Re-export all schemas from subdirectory modules
-// This file serves as the single entry point for all schema imports
-
-// Result helper
-export { ResultSchema } from "./schemas/result";
+// Schemas re-exported for consumers that import from "@/common/orpc/schemas".
 
 // Runtime schemas
 export {
   RuntimeConfigSchema,
   RuntimeModeSchema,
   RuntimeEnablementIdSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeAvailabilityStatusSchema,
-  DevcontainerConfigInfoSchema,
 } from "./schemas/runtime";
 
 // Project schemas
 export { ProjectConfigSchema, WorkspaceConfigSchema } from "./schemas/project";
 
-// Goal schemas
-export {
-  GoalBoardAddUpcomingInputSchema,
-  GoalBoardArchiveInputSchema,
-  GoalBoardEntrySchema,
-  GoalBoardGetInputSchema,
-  GoalBoardPromoteInputSchema,
-  GoalBoardReorderInputSchema,
-  GoalBoardReviveInputSchema,
-  GoalBoardUpdateUpcomingInputSchema,
-  GoalBoardSectionSchema,
-  GoalBoardSnapshotSchema,
-  GoalBoardV1Schema,
-  GoalClearInputSchema,
-  GoalGetInputSchema,
-  GoalRecordV1Schema,
-  GoalSetErrorSchema,
-  GoalSetInputSchema,
-  GoalSnapshotSchema,
-  GoalStatusSchema,
-} from "./schemas/goal";
-
 // Workspace schemas
 export { WorkspaceAISettingsSchema } from "./schemas/workspaceAiSettings";
 export {
+  BestOfGroupSchema,
   FrontendWorkspaceMetadataSchema,
   GitStatusSchema,
   ProjectRefSchema,
@@ -52,46 +24,19 @@ export {
 } from "./schemas/workspace";
 
 // Workspace stats schemas
-export {
-  ActiveStreamStatsSchema,
-  CompletedStreamStatsSchema,
-  ModelTimingStatsSchema,
-  SessionTimingFileSchema,
-  SessionTimingStatsSchema,
-  TimingAnomalySchema,
-  WorkspaceStatsSnapshotSchema,
-} from "./schemas/workspaceStats";
+export { WorkspaceStatsSnapshotSchema } from "./schemas/workspaceStats";
 
-// Analytics schemas
+// Workspace review-state schemas
 export {
-  AgentCostRowSchema,
-  EventRowSchema,
-  HistogramBucketSchema,
-  SpendByModelRowSchema,
-  SpendByProjectRowSchema,
-  SpendOverTimeRowSchema,
-  SummaryRowSchema,
-  TimingPercentilesRowSchema,
-} from "./schemas/analytics";
-export type {
-  AgentCostRow,
-  EventRow,
-  HistogramBucket,
-  SpendByModelRow,
-  SpendByProjectRow,
-  SpendOverTimeRow,
-  SummaryRow,
-  TimingPercentilesRow,
-} from "./schemas/analytics";
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./schemas/reviewState";
 
 // Chat stats schemas
-export {
-  ChatStatsSchema,
-  ChatUsageComponentSchema,
-  ChatUsageDisplaySchema,
-  SessionUsageFileSchema,
-  TokenConsumerSchema,
-} from "./schemas/chatStats";
+export { ChatStatsSchema, TokenConsumerSchema } from "./schemas/chatStats";
 
 // Agent Skill schemas
 export {
@@ -101,28 +46,35 @@ export {
   AgentSkillPackageSchema,
   AgentSkillScopeSchema,
   SkillNameSchema,
+  resolveSkillAdvertise,
+  resolveSkillUserInvocable,
+  resolveSkillWhenToUse,
 } from "./schemas/agentSkill";
 
-// Advisor schemas (configuration-as-code; advisors live at .mux/advisors/<name>/ADVISOR.md)
+// Workflow schemas
 export {
-  AdvisorDescriptorSchema,
-  AdvisorFrontmatterSchema,
-  AdvisorIssueSchema,
-  AdvisorNameSchema,
-  AdvisorPackageSchema,
-  AdvisorScopeSchema,
-} from "./schemas/advisor";
-
-// Instruction context schemas (AGENTS.md, CLAUDE.md, …)
-export {
-  AdditionalSystemContextSchema,
-  INSTRUCTION_SCOPE,
-  InstructionFileSchema,
-  InstructionScopeSchema,
-  InstructionSetSchema,
-  InstructionSourcesSchema,
-  WorkspaceInstructionsSchema,
-} from "./schemas/instructions";
+  AvailableWorkflowSchema,
+  StructuredTaskOutputSchema,
+  WorkflowArgSummarySchema,
+  WorkflowDeclaredPhaseSchema,
+  WorkflowPhaseManifestSchema,
+  WORKFLOW_DECLARED_PHASES_MAX,
+  WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH,
+  WORKFLOW_PHASE_NAME_MAX_LENGTH,
+  WorkflowScriptDescriptorSchema,
+  WorkflowMetadataSchema,
+  WorkflowScriptScopeSchema,
+  WorkflowEventSequenceSchema,
+  WorkflowResultSchema,
+  WorkflowRunEventSchema,
+  WorkflowRunIdSchema,
+  WorkflowRunParentSchema,
+  WorkflowRunRecordSchema,
+  WorkflowRunStatusSchema,
+  WorkflowRunStreamEventSchema,
+  WorkflowStepRecordSchema,
+  WorkflowStepStatusSchema,
+} from "./schemas/workflow";
 
 // Error schemas
 // Agent Definition schemas
@@ -138,17 +90,14 @@ export {
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
 } from "./schemas/errors";
-
-// Tool schemas
-export { BashToolResultSchema, FileTreeNodeSchema } from "./schemas/tools";
 
 // Secrets schemas
 export { SecretSchema } from "./schemas/secrets";
 
 // Policy schemas
 export {
-  PolicyFileSchema,
   PolicySourceSchema,
   PolicyStatusSchema,
   EffectivePolicySchema,
@@ -158,30 +107,7 @@ export {
 // Provider options schemas
 export { MuxProviderOptionsSchema } from "./schemas/providerOptions";
 
-// MCP schemas
-export {
-  MCPAddParamsSchema,
-  MCPRemoveParamsSchema,
-  MCPServerMapSchema,
-  MCPSetEnabledParamsSchema,
-  MCPTestParamsSchema,
-  MCPTestResultSchema,
-} from "./schemas/mcp";
-
-// 1Password schemas
-export { onePassword } from "./schemas/onePassword";
-
-// UI Layouts schemas
-export {
-  KeybindSchema,
-  LayoutPresetSchema,
-  LayoutPresetsConfigSchema,
-  LayoutSlotSchema,
-  RightSidebarLayoutPresetNodeSchema,
-  RightSidebarLayoutPresetStateSchema,
-  RightSidebarPresetTabSchema,
-  RightSidebarWidthPresetSchema,
-} from "./schemas/uiLayouts";
+export { backup } from "./schemas/backup";
 // Terminal schemas
 export {
   TerminalCreateParamsSchema,
@@ -192,43 +118,33 @@ export {
 // Message schemas
 export {
   BranchListResultSchema,
-  DynamicToolPartAvailableSchema,
   DynamicToolPartPendingSchema,
-  DynamicToolPartRedactedSchema,
   DynamicToolPartSchema,
   FilePartSchema,
-  MuxFilePartSchema,
-  MuxMessageSchema,
-  MuxReasoningPartSchema,
-  MuxTextPartSchema,
   MuxToolPartSchema,
 } from "./schemas/message";
-export type { FilePart, MuxFilePart } from "./schemas/message";
+export type { FilePart } from "./schemas/message";
 
 // Stream event schemas
 export {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
   CaughtUpMessageSchema,
   ChatMuxMessageSchema,
-  CompletedMessagePartSchema,
   DeleteMessageSchema,
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
-  LanguageModelV2UsageSchema,
-  QueuedMessageChangedEventSchema,
+  OnChatDowngradeReasonSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
-  RestoreToInputEventSchema,
   RuntimeStatusEventSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
+  HistoryEditPreconditionSchema,
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
@@ -236,11 +152,15 @@ export {
   StreamStartEventSchema,
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
+  ToolCallExecutionStartEventSchema,
   ToolCallStartEventSchema,
   BashOutputEventSchema,
   TaskCreatedEventSchema,
+  WorkflowRunAttachedEventSchema,
   AdvisorOutputEventSchema,
+  AdvisorReasoningOutputEventSchema,
   AdvisorPhaseEventSchema,
+  RestartBlockerSchema,
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,
@@ -253,36 +173,35 @@ export {
   AWSCredentialStatusSchema,
   analytics,
   coder,
-  CoderInfoSchema,
-  CoderPresetSchema,
-  CoderTemplateSchema,
-  CoderWorkspaceConfigSchema,
-  CoderWorkspaceSchema,
-  CoderWorkspaceStatusSchema,
   config,
   browser,
   devtools,
+  drafts,
   uiLayouts,
-  debug,
   desktop,
   general,
   menu,
+  agentPlugins,
   agentSkills,
-  advisors,
   agents,
+  workflows,
   nameGeneration,
   projects,
   mcpOauth,
   mcp,
+  memory,
+  refinements,
   secrets,
   CustomProviderMutationErrorSchema,
   ProviderConfigInfoSchema,
+  ProviderModelDiscoveryResultSchema,
   ProviderModelEntrySchema,
   muxGateway,
   muxGatewayOauth,
   copilotOauth,
   muxGovernorOauth,
   codexOauth,
+  coderOauth,
   policy,
   providers,
   ProvidersConfigMapSchema,
@@ -292,12 +211,7 @@ export {
   splashScreens,
   tasks,
   experiments,
-  ExperimentValueSchema,
   telemetry,
-  TelemetryEventSchema,
-  signing,
-  type SigningCapabilities,
-  type SignatureEnvelope,
   ssh,
   terminal,
   tokenizer,

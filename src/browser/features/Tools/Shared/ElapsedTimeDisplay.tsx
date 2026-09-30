@@ -10,6 +10,10 @@ interface ElapsedTimeDisplayProps {
 /**
  * Shared elapsed time display for tool headers.
  * Keeps requestAnimationFrame + per-second updates at the leaf so parent tool calls do not re-render.
+ *
+ * Renders nothing until `startedAt` is known: for tool calls, that is when execute()
+ * actually begins running. Parallel tool calls run sequentially, so a queued call has
+ * no start time yet and must not show a ticking timer (it could exceed its own timeout).
  */
 export const ElapsedTimeDisplay: React.FC<ElapsedTimeDisplayProps> = ({
   startedAt,
@@ -23,7 +27,7 @@ export const ElapsedTimeDisplay: React.FC<ElapsedTimeDisplayProps> = ({
   const baseStart = useRef(startedAt ?? Date.now());
 
   useEffect(() => {
-    if (!isActive) {
+    if (!isActive || startedAt === undefined) {
       elapsedRef.current = 0;
       if (frameRef.current !== null) {
         cancelAnimationFrame(frameRef.current);
@@ -32,7 +36,7 @@ export const ElapsedTimeDisplay: React.FC<ElapsedTimeDisplayProps> = ({
       return;
     }
 
-    baseStart.current = startedAt ?? Date.now();
+    baseStart.current = startedAt;
     let lastSecond = -1;
 
     const tick = () => {
@@ -60,7 +64,7 @@ export const ElapsedTimeDisplay: React.FC<ElapsedTimeDisplayProps> = ({
     };
   }, [isActive, startedAt]);
 
-  if (!isActive || elapsedRef.current === 0) {
+  if (!isActive || startedAt === undefined || elapsedRef.current === 0) {
     return null;
   }
 

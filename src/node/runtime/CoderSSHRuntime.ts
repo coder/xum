@@ -25,7 +25,7 @@ import type { SSHTransport } from "./transports";
 import type { CoderWorkspaceConfig, RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime } from "@/common/types/runtime";
 import { resolveCoderSSHHost } from "@/constants/coder";
-import type { CoderService } from "@/node/services/coderService";
+import type { CoderService, WorkspaceStatusResult } from "@/node/services/coderService";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { log } from "@/node/services/log";
@@ -141,6 +141,77 @@ export class CoderSSHRuntime extends SSHRuntime {
     activityByWorkspace.set(workspaceName, now);
   }
 
+  private coderWorkspaceNotFound(workspaceName: string): EnsureReadyResult {
+    return {
+      ready: false,
+      error: `Coder workspace "${workspaceName}" not found`,
+      errorType: "runtime_not_ready",
+    };
+  }
+
+  private async markReadyIfRepoPresent(
+    workspaceName: string,
+    options: EnsureReadyOptions | undefined,
+    emitStatus: (phase: RuntimeStatusEvent["phase"], detail?: string) => void
+  ): Promise<EnsureReadyResult> {
+    const repoCheck = await this.checkWorkspaceRepo(options);
+    if (repoCheck && !repoCheck.ready) {
+      emitStatus("error", repoCheck.error);
+      return repoCheck;
+    }
+
+    this.markActivity(workspaceName);
+    emitStatus("ready");
+    return { ready: true };
+  }
+
+  private isStoppingOrCanceling(status: WorkspaceStatusResult): boolean {
+    return status.kind === "ok" && (status.status === "stopping" || status.status === "canceling");
+  }
+
+  private async waitForStoppingOrCancelingToClear(
+    workspaceName: string,
+    status: WorkspaceStatusResult,
+    options: {
+      abortSignal?: AbortSignal;
+      timeoutMs?: () => number;
+      isTimedOut?: () => boolean;
+      onWait?: () => void;
+    } = {}
+  ): Promise<WorkspaceStatusResult> {
+    if (!this.isStoppingOrCanceling(status)) {
+      return status;
+    }
+
+    options.onWait?.();
+    while (this.isStoppingOrCanceling(status)) {
+      if (options.abortSignal?.aborted) {
+        throw new Error("Aborted while waiting for Coder workspace to stop");
+      }
+      if (options.isTimedOut?.()) {
+        return status;
+      }
+
+      await this.sleep(CODER_STATUS_POLL_INTERVAL_MS, options.abortSignal);
+      status = await this.coderService.getWorkspaceStatus(workspaceName, {
+        timeoutMs: options.timeoutMs?.(),
+        signal: options.abortSignal,
+      });
+    }
+
+    return status;
+  }
+
+  /** Keep cleanup hooks from starting stopped Coder workspaces through SSH. */
+  async isRunningWithoutStart(abortSignal: AbortSignal): Promise<boolean> {
+    const workspaceName = this.coderConfig.workspaceName;
+    if (!workspaceName) return false;
+    const status = await this.coderService.getWorkspaceStatus(workspaceName, {
+      signal: abortSignal,
+    });
+    return status.kind === "ok" && status.status === "running";
+  }
+
   /** In-flight ensureReady promise to avoid duplicate start/wait sequences */
   private ensureReadyPromise: Promise<EnsureReadyResult> | null = null;
 
@@ -178,7 +249,12 @@ export class CoderSSHRuntime extends SSHRuntime {
       return { ready: true };
     }
 
-    // Avoid duplicate concurrent start/wait sequences
+    // Avoid duplicate start/wait sequences only for calls without request-local observers.
+    // Abort signals and status sinks are per caller; sharing those would make cancellation/status
+    // delivery depend on whichever caller happened to start the singleflight.
+    if (options?.signal || options?.statusSink) {
+      return this.doEnsureReady(workspaceName, options);
+    }
     if (this.ensureReadyPromise) {
       return this.ensureReadyPromise;
     }
@@ -232,25 +308,13 @@ export class CoderSSHRuntime extends SSHRuntime {
 
     // Short-circuit: already running
     if (statusResult.kind === "ok" && statusResult.status === "running") {
-      const repoCheck = await this.checkWorkspaceRepo(options);
-      if (repoCheck && !repoCheck.ready) {
-        emitStatus("error", repoCheck.error);
-        return repoCheck;
-      }
-
-      this.markActivity(workspaceName);
-      emitStatus("ready");
-      return { ready: true };
+      return this.markReadyIfRepoPresent(workspaceName, options, emitStatus);
     }
 
     // Short-circuit: workspace doesn't exist
     if (statusResult.kind === "not_found") {
       emitStatus("error");
-      return {
-        ready: false,
-        error: `Coder workspace "${workspaceName}" not found`,
-        errorType: "runtime_not_ready",
-      };
+      return this.coderWorkspaceNotFound(workspaceName);
     }
 
     // For status check errors (timeout, auth issues), proceed optimistically
@@ -267,59 +331,37 @@ export class CoderSSHRuntime extends SSHRuntime {
     }
 
     // Step 2: Wait for "stopping"/"canceling" to clear (coder ssh can't autostart during these)
-    if (
-      statusResult.kind === "ok" &&
-      (statusResult.status === "stopping" || statusResult.status === "canceling")
-    ) {
-      emitStatus("waiting", "Waiting for Coder workspace to stop...");
-
-      while (
-        statusResult.kind === "ok" &&
-        (statusResult.status === "stopping" || statusResult.status === "canceling") &&
-        !isTimedOut()
-      ) {
-        if (signal?.aborted) {
-          emitStatus("error");
-          return { ready: false, error: "Aborted", errorType: "runtime_start_failed" };
-        }
-
-        await this.sleep(CODER_STATUS_POLL_INTERVAL_MS, signal);
-        statusResult = await this.coderService.getWorkspaceStatus(workspaceName, {
-          timeoutMs: Math.min(remainingMs(), 10_000),
-          signal,
-        });
-
-        // Check for state changes during polling
-        if (statusResult.kind === "ok" && statusResult.status === "running") {
-          // Ensure setup failures (missing repo) surface before marking ready.
-          const repoCheck = await this.checkWorkspaceRepo(options);
-          if (repoCheck && !repoCheck.ready) {
-            emitStatus("error", repoCheck.error);
-            return repoCheck;
-          }
-
-          this.markActivity(workspaceName);
-          emitStatus("ready");
-          return { ready: true };
-        }
-        if (statusResult.kind === "not_found") {
-          emitStatus("error");
-          return {
-            ready: false,
-            error: `Coder workspace "${workspaceName}" not found`,
-            errorType: "runtime_not_ready",
-          };
-        }
-      }
-
-      if (isTimedOut()) {
+    try {
+      statusResult = await this.waitForStoppingOrCancelingToClear(workspaceName, statusResult, {
+        abortSignal: signal,
+        timeoutMs: () => Math.min(remainingMs(), 10_000),
+        isTimedOut,
+        onWait: () => emitStatus("waiting", "Waiting for Coder workspace to stop..."),
+      });
+    } catch (error) {
+      if (signal?.aborted) {
         emitStatus("error");
-        return {
-          ready: false,
-          error: "Coder workspace is still stopping... Please retry shortly.",
-          errorType: "runtime_start_failed",
-        };
+        return { ready: false, error: "Aborted", errorType: "runtime_start_failed" };
       }
+      throw error;
+    }
+
+    // Check for state changes during polling
+    if (statusResult.kind === "ok" && statusResult.status === "running") {
+      // Ensure setup failures (missing repo) surface before marking ready.
+      return this.markReadyIfRepoPresent(workspaceName, options, emitStatus);
+    }
+    if (statusResult.kind === "not_found") {
+      emitStatus("error");
+      return this.coderWorkspaceNotFound(workspaceName);
+    }
+    if (isTimedOut() && this.isStoppingOrCanceling(statusResult)) {
+      emitStatus("error");
+      return {
+        ready: false,
+        error: "Coder workspace is still stopping... Please retry shortly.",
+        errorType: "runtime_start_failed",
+      };
     }
 
     // Step 3: Use coder ssh --wait=yes to handle all other states
@@ -349,15 +391,7 @@ export class CoderSSHRuntime extends SSHRuntime {
         // Consume output for timeout/abort handling
       }
 
-      const repoCheck = await this.checkWorkspaceRepo(options);
-      if (repoCheck && !repoCheck.ready) {
-        emitStatus("error", repoCheck.error);
-        return repoCheck;
-      }
-
-      this.markActivity(workspaceName);
-      emitStatus("ready");
-      return { ready: true };
+      return this.markReadyIfRepoPresent(workspaceName, options, emitStatus);
     } catch (error) {
       const errorMsg = getErrorMessage(error);
 
@@ -377,11 +411,7 @@ export class CoderSSHRuntime extends SSHRuntime {
 
       // Map "not found" errors to runtime_not_ready
       if (/not found|no access/i.test(errorMsg)) {
-        return {
-          ready: false,
-          error: `Coder workspace "${workspaceName}" not found`,
-          errorType: "runtime_not_ready",
-        };
+        return this.coderWorkspaceNotFound(workspaceName);
       }
 
       return {
@@ -413,6 +443,9 @@ export class CoderSSHRuntime extends SSHRuntime {
       };
 
       abortSignal?.addEventListener("abort", onAbort, { once: true });
+      if (abortSignal?.aborted) {
+        onAbort();
+      }
     });
   }
 
@@ -547,7 +580,7 @@ export class CoderSSHRuntime extends SSHRuntime {
   }
 
   /**
-   * Delete workspace: removes SSH files AND deletes Coder workspace (if Mux-managed).
+   * Delete workspace: removes SSH files AND deletes Coder workspace (if Xum-managed).
    *
    * IMPORTANT: Only delete the Coder workspace once we're confident mux will commit
    * the deletion. In the non-force path, WorkspaceService.remove() aborts and keeps
@@ -558,21 +591,36 @@ export class CoderSSHRuntime extends SSHRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Deleting a Coder workspace is dangerous; CoderService refuses to delete workspaces
     // without the mux- prefix to avoid accidentally deleting user-owned Coder workspaces.
 
     // If this workspace is an existing Coder workspace that mux didn't create, just do SSH cleanup.
     if (this.coderConfig.existingWorkspace) {
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     const coderWorkspaceName = this.coderConfig.workspaceName;
 
     if (!coderWorkspaceName) {
       log.warn("Coder workspace name not set, falling back to SSH-only deletion");
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     // For force deletes ("cancel creation"), skip SSH cleanup and focus on deleting the
@@ -597,7 +645,9 @@ export class CoderSSHRuntime extends SSHRuntime {
 
     // Check if Coder workspace still exists before attempting SSH operations.
     // If it's already gone, skip SSH cleanup (would hang trying to connect to non-existent host).
-    const statusResult = await this.coderService.getWorkspaceStatus(coderWorkspaceName);
+    const statusResult = await this.coderService.getWorkspaceStatus(coderWorkspaceName, {
+      signal: abortSignal,
+    });
     if (statusResult.kind === "not_found") {
       log.debug("Coder workspace already deleted, skipping SSH cleanup", { coderWorkspaceName });
       return { success: true, deletedPath: this.getWorkspacePath(projectPath, workspaceName) };
@@ -669,7 +719,8 @@ export class CoderSSHRuntime extends SSHRuntime {
       workspaceName,
       force,
       abortSignal,
-      trusted
+      trusted,
+      options
     );
 
     // In the normal (force=false) delete path, only delete the Coder workspace if the SSH delete
@@ -743,6 +794,15 @@ export class CoderSSHRuntime extends SSHRuntime {
     };
   }
 
+  /** A new-mode creation's provisioning session is consumed only by postCreateSetup (#5113). */
+  async releaseCreationSetup(): Promise<void> {
+    const coderWorkspaceName = this.coderConfig.workspaceName;
+    if (this.coderConfig.existingWorkspace || !coderWorkspaceName) {
+      return;
+    }
+    await this.coderService.disposeProvisioningSession(coderWorkspaceName).catch(() => undefined);
+  }
+
   /**
    * Post-create setup: provision Coder workspace and configure SSH.
    * This runs after mux persists workspace metadata, so build logs stream to UI.
@@ -801,25 +861,14 @@ export class CoderSSHRuntime extends SSHRuntime {
       // For existing workspaces, wait for "stopping"/"canceling" to clear before SSH
       // (coder ssh --wait=yes can't autostart while a stop/cancel build is in progress)
       const workspaceName = this.coderConfig.workspaceName;
-      let status = await this.coderService.getWorkspaceStatus(workspaceName, {
+      const status = await this.coderService.getWorkspaceStatus(workspaceName, {
         signal: abortSignal,
       });
-
-      if (status.kind === "ok" && (status.status === "stopping" || status.status === "canceling")) {
-        initLogger.logStep(`Waiting for Coder workspace "${workspaceName}" to stop...`);
-        while (
-          status.kind === "ok" &&
-          (status.status === "stopping" || status.status === "canceling")
-        ) {
-          if (abortSignal?.aborted) {
-            throw new Error("Aborted while waiting for Coder workspace to stop");
-          }
-          await this.sleep(CODER_STATUS_POLL_INTERVAL_MS, abortSignal);
-          status = await this.coderService.getWorkspaceStatus(workspaceName, {
-            signal: abortSignal,
-          });
-        }
-      }
+      await this.waitForStoppingOrCancelingToClear(workspaceName, status, {
+        abortSignal,
+        onWait: () =>
+          initLogger.logStep(`Waiting for Coder workspace "${workspaceName}" to stop...`),
+      });
 
       // waitForStartupScripts (coder ssh --wait=yes) handles all other states:
       // - stopped: auto-starts, streams build logs, waits for scripts
@@ -853,7 +902,7 @@ export class CoderSSHRuntime extends SSHRuntime {
     }
 
     // Create parent directory for workspace (git clone won't create it)
-    // This must happen after ensureMuxCoderSSHConfig() so SSH is configured
+    // This must happen after ensureXumCoderSSHConfig() so SSH is configured
     initLogger.logStep("Preparing workspace directory...");
     const parentDir = path.posix.dirname(params.workspacePath);
     const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {

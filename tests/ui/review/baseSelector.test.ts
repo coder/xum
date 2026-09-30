@@ -60,7 +60,7 @@ async function setupReviewPanel(
 async function openBaseSelectorDropdown(container: HTMLElement): Promise<void> {
   const trigger = await waitFor(
     () => {
-      const btn = container.querySelector('[data-testid="review-base-value"]') as HTMLElement;
+      const btn = container.querySelector('[data-testid="review-base-value"]')!;
       if (!btn) throw new Error("Base selector trigger not found");
       return btn;
     },
@@ -85,7 +85,7 @@ async function openBaseSelectorDropdown(container: HTMLElement): Promise<void> {
 async function selectBaseSuggestion(container: HTMLElement, base: string): Promise<void> {
   const button = await waitFor(
     () => {
-      const btn = container.querySelector(`[data-testid="base-suggestion-${base}"]`) as HTMLElement;
+      const btn = container.querySelector(`[data-testid="base-suggestion-${base}"]`)!;
       if (!btn) throw new Error(`Base suggestion "${base}" not found`);
       return btn;
     },

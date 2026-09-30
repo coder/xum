@@ -198,6 +198,8 @@ function removeTabFromNode(
 ): RightSidebarLayoutNode | null {
   if (node.type === "tabset") {
     const oldIndex = node.tabs.indexOf(tab);
+    if (oldIndex === -1) return node;
+
     const tabs = node.tabs.filter((t) => t !== tab);
     if (tabs.length === 0) return null;
 
@@ -222,6 +224,7 @@ function removeTabFromNode(
   // If one side goes empty, promote the other side to avoid empty panes.
   if (!left) return right;
   if (!right) return left;
+  if (left === node.children[0] && right === node.children[1]) return node;
 
   return {
     ...node,
@@ -234,6 +237,9 @@ export function removeTabEverywhere(
   tab: TabType
 ): RightSidebarLayoutState {
   const nextRoot = removeTabFromNode(state.root, tab);
+  if (nextRoot === state.root) {
+    return state;
+  }
   if (!nextRoot) {
     return getDefaultRightSidebarLayoutState("costs");
   }
@@ -795,48 +801,6 @@ export function dockTabToEdge(
     ...state,
     nextId: tabsetAlloc.nextId,
     focusedTabsetId: findTabset(newRoot, newFocusedId) ? newFocusedId : state.focusedTabsetId,
-    root: newRoot,
-  };
-}
-
-/**
- * Close (remove) a split, keeping one of its children.
- * Called when user wants to close a pane.
- *
- * @param keepChildIndex Which child to keep (0 = first/left/top, 1 = second/right/bottom)
- */
-export function closeSplit(
-  state: RightSidebarLayoutState,
-  splitId: string,
-  keepChildIndex: 0 | 1
-): RightSidebarLayoutState {
-  const replaceNode = (node: RightSidebarLayoutNode): RightSidebarLayoutNode => {
-    if (node.type === "tabset") {
-      return node;
-    }
-
-    if (node.id === splitId) {
-      // Replace this split with the kept child
-      return node.children[keepChildIndex];
-    }
-
-    return {
-      ...node,
-      children: [replaceNode(node.children[0]), replaceNode(node.children[1])],
-    };
-  };
-
-  const newRoot = replaceNode(state.root);
-
-  // Ensure focusedTabsetId is still valid
-  let newFocusedId: string = state.focusedTabsetId;
-  if (findTabset(newRoot, newFocusedId) === null) {
-    newFocusedId = findFirstTabsetId(newRoot) ?? state.focusedTabsetId;
-  }
-
-  return {
-    ...state,
-    focusedTabsetId: newFocusedId,
     root: newRoot,
   };
 }

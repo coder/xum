@@ -16,7 +16,7 @@ import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import { assert } from "@/common/utils/assert";
 import { isExperimentEnabled as readExperimentEnabled } from "@/browser/hooks/useExperiments";
-import { normalizeModelInput } from "@/browser/utils/models/normalizeModelInput";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { parseGoalBudgetInputCents } from "@/common/utils/goals/budgetParser";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { WORKSPACE_ONLY_COMMAND_KEYS } from "@/constants/slashCommands";
@@ -75,9 +75,6 @@ function parseCommandHeaderBody(rawInput: string): CommandHeaderBody {
   };
 }
 
-// Re-export MODEL_ABBREVIATIONS from constants for backwards compatibility
-export { MODEL_ABBREVIATIONS };
-
 // Suggestion helper functions
 function filterAndMapSuggestions<T extends SuggestionDefinition>(
   definitions: readonly T[],
@@ -111,6 +108,32 @@ const clearCommandDefinition: SlashCommandDefinition = {
       command: "clear",
       subcommand: cleanRemainingTokens[0],
     };
+  },
+};
+
+const dreamCommandDefinition: SlashCommandDefinition = {
+  key: "dream",
+  experimentGate: EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+  description:
+    "Consolidate this workspace's agent memory now (merge duplicates, prune stale facts)",
+  handler: (): ParsedCommand => ({ type: "dream" }),
+};
+
+const refineCommandDefinition: SlashCommandDefinition = {
+  key: "refine",
+  experimentGate: EXPERIMENT_IDS.RLM,
+  description:
+    "Distill durable lessons from this workspace's trajectory into staged memory/skill edits; approve them with '/refine apply'",
+  handler: ({ rawInput }): ParsedCommand => {
+    // Security: /refine only STAGES model-proposed edits; the explicit
+    // "apply" argument is the user's approval step that writes them.
+    const arg = rawInput.trim();
+    if (arg === "apply") return { type: "refine", apply: true };
+    if (arg === "") return { type: "refine" };
+    // Mistyped approvals ("/refine Apply", "/refine apply now") must NOT
+    // fall through to a fresh run: that would overwrite the staged proposal
+    // the user meant to approve and cost another model call.
+    return { type: "unknown-command", command: "refine", subcommand: arg };
   },
 };
 
@@ -636,24 +659,26 @@ const goalCommandDefinition: SlashCommandDefinition = {
   },
 };
 
-const BTW_USAGE = `/btw ${SLASH_COMMAND_HINTS.btw}`;
+const WORKFLOW_COMMAND_USAGE = `/workflow ${SLASH_COMMAND_HINTS.workflow}`;
 
-const btwCommandDefinition: SlashCommandDefinition = {
-  key: "btw",
-  description:
-    "Ask a quick side question about the current conversation. The inline answer is saved in chat but kept out of future agent context.",
-  inputHint: SLASH_COMMAND_HINTS.btw,
-  appendSpace: true,
+const workflowCommandDefinition: SlashCommandDefinition = {
+  key: "workflow",
+  description: "Run an explicit workflow by script path",
+  experimentGate: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
+  inputHint: SLASH_COMMAND_HINTS.workflow,
   handler: ({ rawInput }): ParsedCommand => {
     const trimmed = rawInput.trim();
-    if (trimmed.length === 0) {
-      return {
-        type: "command-missing-args",
-        command: "btw",
-        usage: BTW_USAGE,
-      };
+    if (!trimmed) {
+      return { type: "command-missing-args", command: "workflow", usage: WORKFLOW_COMMAND_USAGE };
     }
-    return { type: "side-question", question: trimmed };
+    const firstWhitespace = trimmed.search(/\s/u);
+    const scriptPath = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace);
+    const argsText = firstWhitespace === -1 ? undefined : trimmed.slice(firstWhitespace).trim();
+    return {
+      type: "workflow-run",
+      scriptPath,
+      ...(argsText ? { argsText } : {}),
+    };
   },
 };
 
@@ -664,58 +689,11 @@ const debugLlmRequestCommandDefinition: SlashCommandDefinition = {
   handler: (): ParsedCommand => ({ type: "debug-llm-request" }),
 };
 
-const ADVISOR_INIT_USAGE = "/advisor init <name>";
-
-const advisorInitCommandDefinition: SlashCommandDefinition = {
-  key: "init",
-  description: "Scaffold a new advisor at .mux/advisors/<name>/ADVISOR.md.",
-  appendSpace: false,
-  handler: ({ cleanRemainingTokens }): ParsedCommand => {
-    if (cleanRemainingTokens.length !== 1) {
-      return {
-        type: "command-missing-args",
-        command: "advisor init",
-        usage: ADVISOR_INIT_USAGE,
-      };
-    }
-    const name = cleanRemainingTokens[0];
-    // Loose kebab-case gate matches the AdvisorNameSchema regex; the backend
-    // re-validates, but failing fast here gives a clearer error message before
-    // the round-trip.
-    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
-      return {
-        type: "command-invalid-args",
-        command: "advisor init",
-        input: name,
-        usage: ADVISOR_INIT_USAGE,
-      };
-    }
-    return { type: "advisor-init", name };
-  },
-};
-
-const advisorCommandDefinition: SlashCommandDefinition = {
-  key: "advisor",
-  description:
-    "List configured advisors, or use `/advisor init <name>` to scaffold a new ADVISOR.md template.",
-  inputHint: "[init <name>]",
-  appendSpace: false,
-  handler: ({ cleanRemainingTokens }): ParsedCommand => {
-    if (cleanRemainingTokens.length === 0) {
-      return { type: "advisor-list" };
-    }
-    return {
-      type: "unknown-command",
-      command: "advisor",
-      subcommand: cleanRemainingTokens[0],
-    };
-  },
-  children: [advisorInitCommandDefinition],
-};
-
 export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   clearCommandDefinition,
   compactCommandDefinition,
+  dreamCommandDefinition,
+  refineCommandDefinition,
   modelCommandDefinition,
   planCommandDefinition,
 
@@ -725,8 +703,7 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   idleCommandDefinition,
   heartbeatCommandDefinition,
   goalCommandDefinition,
-  btwCommandDefinition,
-  advisorCommandDefinition,
+  workflowCommandDefinition,
   debugLlmRequestCommandDefinition,
 ];
 

@@ -18,8 +18,7 @@ import {
   TooltipContent,
   TooltipIfPresent,
 } from "@/browser/components/Tooltip/Tooltip";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewExpandStateKey } from "@/common/constants/storage";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import { cn } from "@/common/lib/utils";
@@ -63,6 +62,13 @@ interface HunkViewerProps {
    * accent indicator on the hunk header even when no comment was provided.
    */
   isAssisted?: boolean;
+  /**
+   * True when this pin was added to the assisted set recently enough to
+   * deserve a transient "new" badge. Used together with `isAssisted` so the
+   * badge only renders for genuinely-new pins (not historical ones that
+   * happened to be replayed from chat).
+   */
+  isAssistedNew?: boolean;
   /**
    * When set, the hunk body is trimmed to just these new-side line numbers
    * (inclusive) by default. Lines before/after the range hide behind a
@@ -151,6 +157,7 @@ export const HunkViewer = React.memo<HunkViewerProps>(
     preferCollapsed = false,
     assistedComment,
     isAssisted = false,
+    isAssistedNew = false,
     visibleNewLineRange,
   }) => {
     // Ref for the hunk container to track visibility
@@ -234,18 +241,16 @@ export const HunkViewer = React.memo<HunkViewerProps>(
       setShowSliceAfter(false);
     }, [hunkSlice]);
 
-    // Persist manual expand/collapse state across remounts per workspace
+    // Persist manual expand/collapse state across remounts per workspace (backend
+    // review-state store, shared by all HunkViewer instances).
     // Maps hunkId -> isExpanded for user's manual preferences
-    // Enable listener to synchronize updates across all HunkViewer instances
-    const [expandStateMap, setExpandStateMap] = usePersistedState<Record<string, boolean>>(
-      getReviewExpandStateKey(workspaceId),
-      {},
-      { listener: true }
+    const manualExpandState = useReviewStateSelector(
+      workspaceId,
+      (view) => view.sections.hunkExpand?.[hunkId]
     );
 
     // Check if user has manually set expand state for this hunk
-    const hasManualState = hunkId in expandStateMap;
-    const manualExpandState = expandStateMap[hunkId];
+    const hasManualState = manualExpandState !== undefined;
 
     // Agent-flagged hunks should default to expanded even when they're already
     // read, "large", or in a heavy review where everything else is collapsed —
@@ -302,12 +307,11 @@ export const HunkViewer = React.memo<HunkViewerProps>(
         const newExpandState = !isExpanded;
         setIsExpanded(newExpandState);
         // Persist manual expand/collapse choice
-        setExpandStateMap((prev) => ({
-          ...prev,
-          [hunkId]: newExpandState,
+        getReviewStateStore().mutate(workspaceId, "hunkExpand", () => ({
+          set: { [hunkId]: newExpandState },
         }));
       },
-      [isExpanded, hunkId, setExpandStateMap]
+      [isExpanded, hunkId, workspaceId]
     );
 
     // Register toggle method with parent component
@@ -355,11 +359,27 @@ export const HunkViewer = React.memo<HunkViewerProps>(
             data-testid="hunk-assisted-comment"
           >
             <Sparkles aria-hidden="true" className="text-review-accent mt-[2px] h-3 w-3 shrink-0" />
-            {assistedComment ? (
-              <span className="min-w-0 break-words whitespace-pre-wrap">{assistedComment}</span>
-            ) : (
-              <span className="text-muted italic">Flagged by agent for review</span>
-            )}
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <div className="flex flex-wrap items-baseline gap-1">
+                {assistedComment ? (
+                  <span className="min-w-0 break-words whitespace-pre-wrap">{assistedComment}</span>
+                ) : (
+                  <span className="text-muted italic">Flagged by agent for review</span>
+                )}
+                {isAssistedNew && (
+                  // Transient highlight for pins added recently. Uses the same
+                  // accent as the rest of the strip so it reads as a single
+                  // visual group instead of a competing status pill.
+                  <span
+                    aria-label="Newly flagged"
+                    className="border-review-accent/40 text-review-accent bg-review-accent/10 inline-flex shrink-0 items-center rounded border px-1 text-[9px] tracking-wide uppercase"
+                    data-testid="hunk-assisted-new-badge"
+                  >
+                    new
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
         )}
         <div
@@ -481,6 +501,7 @@ export const HunkViewer = React.memo<HunkViewerProps>(
                   className="rounded-none border-0 [&>div]:overflow-x-visible"
                   onReviewNote={onReviewNote}
                   onLineClick={() => {
+                    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
                     const syntheticEvent = {
                       currentTarget: { dataset: { hunkId } },
                     } as unknown as React.MouseEvent<HTMLElement>;

@@ -3,34 +3,71 @@
  */
 
 import { describe, test, expect } from "@jest/globals";
-import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import {
+  KNOWN_MODELS,
+  MODEL_ABBREVIATIONS,
+  TOKENIZER_MODEL_OVERRIDES,
+} from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
-import { modelsExtra } from "@/common/utils/tokens/models-extra";
+import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
 describe("Known Models Integration", () => {
   test("all known models exist in token metadata", () => {
-    const missingModels: string[] = [];
-
-    for (const [key, model] of Object.entries(KNOWN_MODELS)) {
-      const modelId = model.providerModelId;
-
-      // xAI models are prefixed with "xai/" in models.json.
-      const lookupKey = model.provider === "xai" ? `xai/${modelId}` : modelId;
-      if (!(lookupKey in modelsJson) && !(modelId in modelsExtra)) {
-        missingModels.push(`${key}: ${model.provider}:${modelId}`);
-      }
-    }
+    const missingModels = findMissingKnownModels(modelsJson);
 
     if (missingModels.length > 0) {
       throw new Error(
         `The following known models are missing from token metadata:\n${missingModels.join("\n")}\n\n` +
-          `Run 'bun scripts/update_models.ts' to refresh models.json from LiteLLM.`
+          `Run 'make update-models' to refresh models.json from LiteLLM.`
       );
     }
   });
 
-  test("gemini-flash resolves to the stable Gemini 3.5 Flash model", () => {
-    expect(MODEL_ABBREVIATIONS["gemini-flash"]).toBe("google:gemini-3.5-flash");
+  // Aliases users type or that hand-written UI/docs reference (e.g. the composer
+  // tooltip examples, `/model sonnet` and `/compact -m gpt` hints, docs agent and
+  // compaction examples), plus each provider's bare family name. Pin the family,
+  // not the exact id, so a model release that moves an alias to a newer tier of
+  // the same family does not churn this table; it fails only when a user-facing
+  // alias disappears or starts resolving to a different family.
+  test.each([
+    ["opus", /^anthropic:claude-opus-/],
+    ["sonnet", /^anthropic:claude-sonnet-/],
+    ["haiku", /^anthropic:claude-haiku-/],
+    ["gpt", /^openai:gpt-[\d.]+-sol$/],
+    ["gpt-pro", /^openai:gpt-[\d.]+-pro$/],
+    // GPT tier names users type with /model (tier, not version, so they survive releases).
+    ["sol", /^openai:gpt-[\d.]+-sol$/],
+    ["terra", /^openai:gpt-[\d.]+-terra$/],
+    ["luna", /^openai:gpt-[\d.]+-luna$/],
+    ["astra", /^openai:gpt-[\d.]+-astra$/],
+    ["codex", /^openai:gpt-[\d.]+-codex$/],
+    ["gemini", /^google:gemini-.*pro/],
+    ["gemini-flash", /^google:gemini-.*flash/],
+    ["grok", /^xai:grok-/],
+    ["deepseek", /^deepseek:deepseek-.*pro/],
+    ["kimi", /^moonshotai:kimi-/],
+    ["glm", /^zai:glm-/],
+    ["glm-flash", /^zai:glm-.*flash/],
+  ])("user-facing alias %s resolves within its model family", (alias, family) => {
+    expect(MODEL_ABBREVIATIONS[alias]).toMatch(family);
+  });
+
+  // The flagship alias follows the Sol tier, never the pricier Astra tier (Astra is additive).
+  test("gpt alias tracks the same model as sol", () => {
+    expect(MODEL_ABBREVIATIONS.gpt).toBe(MODEL_ABBREVIATIONS.sol);
+  });
+
+  // Exact-id lookup for retired-but-documented custom model strings must keep
+  // resolving to an approximate tokenizer instead of falling back (with a
+  // warning) to the generic per-provider tokenizer.
+  test.each([
+    ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
+    ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
+    ["openai:gpt-5.6-sol", "openai/gpt-5"],
+    ["openai:gpt-5.6-luna", "openai/gpt-5"],
+    ["openai:gpt-6-sol", "openai/gpt-5"],
+  ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
+    expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });
 
   test("known model ids and aliases stay unique across the curated registry", () => {

@@ -1,0 +1,257 @@
+{
+  "projectId": "6135a989-4a89-4567-8d48-531d88e66152",
+  "shape": "storybook",
+  "pkg": "xum",
+  "globalName": "Xum",
+  "storybookConfigDir": ".storybook",
+  "storybookStatic": ".design-sync/sb-reference",
+  "entry": "./.design-sync/ds-barrel.ts",
+  "extraEntries": [
+    "./.design-sync/ds-barrel.ts"
+  ],
+  "tsconfig": "./.design-sync/tsconfig.ds.json",
+  "storyImports": {
+    "shim": [
+      "/src/browser/"
+    ],
+    "bundle": [
+      "/src/browser/stories/"
+    ]
+  },
+  "provider": {
+    "component": "ThemeProvider",
+    "props": {
+      "forcedTheme": "dark"
+    }
+  },
+  "titleMap": {
+    "WorkspaceSwitcher": null,
+    "PhoneViewports": null,
+    "READMEScreenshots": null,
+    "TranscriptDensity": null,
+    "AIView": null,
+    "RightSidebar": null,
+    "CodeExecution": null,
+    "Messages": null,
+    "Task": null,
+    "WorkflowRun": null,
+    "Timeouts": null,
+    "ProposePlan": null,
+    "Media": null,
+    "AttachFile": null,
+    "PlanFileDialog": null,
+    "AgentSkillRead": null,
+    "AgentReport": null,
+    "MarkdownRenderer": null,
+    "ProjectPage": null,
+    "SettingsPage": null,
+    "ImmersiveReviewView": null,
+    "HunkViewer": null,
+    "FileEdit": null,
+    "Generic": null,
+    "GovernorSection": null,
+    "GoogleSearch": null,
+    "AnalyticsDashboard": null,
+    "ProjectSidebar": null,
+    "LeftSidebar": null,
+    "WorkspaceMenuBar": null,
+    "AgentListItem": null,
+    "AskUserQuestion": null,
+    "Bash": null,
+    "ModelsSection": null,
+    "ProvidersSection": null,
+    "TasksSection": null,
+    "CreationControls": null,
+    "ArchivedWorkspaces": null,
+    "LayoutsSection": null,
+    "AgentModePicker": null,
+    "WorkspaceHeartbeatModal": null,
+    "ExperimentsSection": null,
+    "ConcurrentLocalWarning": null,
+    "BackgroundProcesses": null,
+    "MemoryTab": null,
+    "ModelSelector": null,
+    "MultiProjectGitStatusIndicator": null,
+    "WorkspaceMCPModal": null,
+    "CoderControls": "CoderWorkspaceForm",
+    "Compaction": "CompactingMessageContent",
+    "ContextUsageIndicator": "ContextUsageIndicatorButton",
+    "Goal": "GetGoalToolCall",
+    "Heartbeat": "HeartbeatToolCall",
+    "HookOutput": "HookOutputDisplay",
+    "Init": "InitMessage",
+    "Streaming": "StreamingBarrierView",
+    "Todo": "TodoToolCall",
+    "WorkspaceLifecycle": "WorkspaceLifecycleToolCall"
+  },
+  "overrides": {
+    "StreamingBarrierView": {
+      "cardMode": "column",
+      "skip": [
+        "app-chat-barriers-streaming--loading-tools-diagnostic"
+      ]
+    },
+    "DebugLlmRequestModal": {
+      "cardMode": "single",
+      "primaryStory": "Open",
+      "skip": []
+    },
+    "ProjectCreateModal": {
+      "cardMode": "single",
+      "primaryStory": "LocalFolder",
+      "skip": [
+        "components-projectcreatemodal--clone-repo"
+      ]
+    },
+    "CoderWorkspaceForm": {
+      "skip": [
+        "features-runtime-codercontrols--existing-workspace",
+        "features-runtime-codercontrols--templates-parse-error",
+        "features-runtime-codercontrols--presets-parse-error",
+        "features-runtime-codercontrols--existing-workspace-parse-error",
+        "features-runtime-codercontrols--no-presets",
+        "features-runtime-codercontrols--no-running-workspaces",
+        "features-runtime-codercontrols--with-login-info",
+        "features-runtime-codercontrols--availability-loading",
+        "features-runtime-codercontrols--availability-outdated",
+        "features-runtime-codercontrols--availability-unavailable-not-logged-in"
+      ]
+    },
+    "CompactingMessageContent": {
+      "skip": [
+        "app-chat-messages-compaction--streaming-compaction-with-configure-hint"
+      ]
+    },
+    "ContextUsageIndicatorButton": {
+      "skip": [
+        "app-chat-components-contextusageindicator--context-meter-hover-summary-tooltip"
+      ]
+    },
+    "GoalTab": {
+      "skip": [
+        "features-rightsidebar-goaltab--complete-with-board"
+      ]
+    },
+    "HookOutputDisplay": {
+      "skip": [
+        "app-chat-tools-hookoutput--tool-hooks-output-expanded"
+      ]
+    },
+    "MemorySection": {
+      "skip": [
+        "settings-sections-memorysection--empty"
+      ]
+    },
+    "PRLinkBadge": {
+      "skip": [
+        "app-header-prlinkbadge--pr-status-badges",
+        "app-header-prlinkbadge--links-dropdown-context"
+      ]
+    },
+    "TitleBar": {
+      "skip": [
+        "components-titlebar--browser-mode"
+      ]
+    },
+    "MCPSettingsSection": {
+      "skip": [
+        "features-settings-sections-mcpsettingssection--project-settings-empty",
+        "features-settings-sections-mcpsettingssection--project-settings-add-remote-server-headers",
+        "features-settings-sections-mcpsettingssection--project-settings-mixed-state",
+        "features-settings-sections-mcpsettingssection--project-settings-with-tool-allowlist",
+        "features-settings-sections-mcpsettingssection--project-settings-o-auth-not-logged-in",
+        "features-settings-sections-mcpsettingssection--project-settings-o-auth-logged-in"
+      ]
+    },
+    "SecretsSection": {
+      "skip": [
+        "settings-sections-secretssection--global-secrets-view",
+        "settings-sections-secretssection--project-secrets"
+      ]
+    },
+    "SecuritySection": {
+      "skip": [
+        "settings-sections-securitysection--security-empty",
+        "settings-sections-securitysection--security-all-trusted",
+        "settings-sections-securitysection--security-all-untrusted"
+      ]
+    },
+    "ContextSwitchWarning": {
+      "skip": []
+    },
+    "DevToolsStepCard": {
+      "skip": []
+    },
+    "GeneralSection": {
+      "skip": []
+    },
+    "GetGoalToolCall": {
+      "skip": []
+    },
+    "HeartbeatToolCall": {
+      "skip": [],
+      "cardMode": "column"
+    },
+    "WorkspaceLifecycleToolCall": {
+      "skip": [],
+      "cardMode": "column"
+    },
+    "InitMessage": {
+      "skip": []
+    },
+    "InterruptedBarrier": {
+      "skip": []
+    },
+    "KeybindsSection": {
+      "skip": []
+    },
+    "RosettaBanner": {
+      "skip": []
+    },
+    "ServerAccessSection": {
+      "skip": []
+    },
+    "TodoToolCall": {
+      "skip": []
+    },
+    "TranscriptHydrationSkeleton": {
+      "skip": []
+    },
+    "Button": {
+      "skip": []
+    },
+    "Input": {
+      "skip": [
+        "app-chat-input--voice-input-no-api-key",
+        "app-chat-input--editing-message"
+      ]
+    },
+    "Checkbox": {
+      "skip": []
+    },
+    "Switch": {
+      "skip": []
+    },
+    "Select": {
+      "skip": [
+        "components-select--open"
+      ]
+    },
+    "Dialog": {
+      "cardMode": "single",
+      "primaryStory": "Default",
+      "skip": []
+    },
+    "Tooltip": {
+      "cardMode": "single",
+      "primaryStory": "Default",
+      "skip": []
+    },
+    "Popover": {
+      "cardMode": "single",
+      "primaryStory": "Default",
+      "skip": []
+    }
+  },
+  "readmeHeader": ".design-sync/conventions.md"
+}

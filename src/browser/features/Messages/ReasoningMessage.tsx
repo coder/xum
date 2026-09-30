@@ -1,6 +1,7 @@
-import React, { useState, useRef, useLayoutEffect } from "react";
+import React from "react";
 import type { DisplayedMessage } from "@/common/types/message";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { useStickyExpand } from "./useStickyExpand";
 import { normalizeReasoningMarkdown } from "./MarkdownStyles";
 import { cn } from "@/common/lib/utils";
 import { Shimmer } from "../AIElements/Shimmer";
@@ -51,7 +52,11 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   className,
   workspaceId,
 }) => {
-  const [isExpanded, setIsExpanded] = useState(message.isStreaming);
+  // Quiet default: new thinking starts collapsed (even while streaming). The sticky
+  // "thinking" preference — set when the user expands/collapses any thinking block —
+  // wins once present. Seeded once at mount, so a preference change never mutates a
+  // present block.
+  const { expanded: isExpanded, setExpanded: setIsExpanded } = useStickyExpand("thinking", false);
   const content = message.content;
   const isStreaming = message.isStreaming;
   const trimmedContent = content?.trim() ?? "";
@@ -65,36 +70,17 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   const hasAdditionalLines = hasContent && /[\r\n]/.test(trimmedContent);
   // OpenAI models often emit terse, single-line traces; surface them inline instead of hiding behind the label.
   const isSingleLineTrace = !isStreaming && hasContent && !hasAdditionalLines;
-  const isCollapsible = !isStreaming && hasContent && hasAdditionalLines;
+  // Collapsible whenever there's multi-line content — including while streaming, so
+  // the user can opt into watching the live trace. We deliberately no longer
+  // auto-collapse on stream completion: that mutated a present block (a visible
+  // height tear) and fought the sticky preference. A block keeps whatever expand
+  // state it mounted with until the user toggles it.
+  const isCollapsible = hasContent && hasAdditionalLines;
   const showEllipsis = isCollapsible && !isExpanded;
   const showExpandedContent = isExpanded && !isSingleLineTrace;
-
-  const wasStreamingRef = useRef(isStreaming);
-  const isLastPartOfMessage =
-    "isLastPartOfMessage" in message ? message.isLastPartOfMessage : false;
-  // When the parent message contains *only* reasoning (e.g. the stream was
-  // truncated at max_tokens before any text/tool emerged), collapsing leaves
-  // the user staring at a single "Thinking" header and nothing else. Skip the
-  // auto-collapse in that case so the work the model did is still readable;
-  // the accompanying stream-error row from SMA explains why the turn stopped.
-  const isOnlyMessageContent =
-    "isOnlyMessageContent" in message ? message.isOnlyMessageContent === true : false;
-
-  // Auto-collapse only when reasoning reached *natural* completion — i.e. the
-  // stream ended while this reasoning part was still the terminal block of the
-  // message. When another part (text/tool) follows the reasoning, its
-  // `isLastPartOfMessage` flips false in the same aggregator snapshot that turns
-  // `isStreaming` off, which used to trigger a mid-turn 200ms height→0 animation
-  // (a very visible vertical tear). Keeping the reasoning expanded in that case
-  // lets the user continue reading it while the assistant moves on.
-  useLayoutEffect(() => {
-    const wasStreaming = wasStreamingRef.current;
-    wasStreamingRef.current = isStreaming;
-
-    if (wasStreaming && !isStreaming && isLastPartOfMessage && !isOnlyMessageContent) {
-      setIsExpanded(false);
-    }
-  }, [isStreaming, isLastPartOfMessage, isOnlyMessageContent]);
+  // Keep height uncontrolled while a streaming block is expanded so live markdown
+  // growth (Shiki/Mermaid) can't be clipped by a stale measured height.
+  const showStreamingExpanded = isStreaming && isExpanded;
 
   const toggleExpanded = () => {
     if (!isCollapsible) {
@@ -165,7 +151,10 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
           </span>
           <div className="flex min-w-0 items-center gap-1 truncate">
             {isStreaming ? (
-              <Shimmer colorClass="var(--color-thinking-mode)">Thinking...</Shimmer>
+              <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
+                {/* The collapsed-content ellipsis below already communicates truncation. */}
+                {showEllipsis ? "Thinking" : "Thinking..."}
+              </Shimmer>
             ) : hasContent ? (
               <span className={cn("truncate whitespace-nowrap text-text", REASONING_FONT_CLASSES)}>
                 {parsedLeadingBoldSummary ? (
@@ -202,18 +191,19 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
         )}
       </div>
 
-      {/* Always render the content container to prevent layout shifts. Keep live and
-          expanded content height uncontrolled so async markdown growth (Shiki/Mermaid)
-          cannot be clipped by a stale measured height; only collapsed settled content
-          gets height:0. */}
+      {/* Always render the content container to prevent layout shifts. Keep an
+          expanded streaming block's height uncontrolled so async markdown growth
+          (Shiki/Mermaid) cannot be clipped by a stale measured height; everything
+          else is driven by showExpandedContent so a collapsed block (including a
+          collapsed streaming one) gets height:0. */}
       <div
         className={cn(
           REASONING_FONT_CLASSES,
           "italic opacity-85 [&_p]:mt-0 [&_p]:mb-1 [&_p:last-child]:mb-0",
-          !isStreaming && "overflow-hidden transition-opacity duration-200 ease-in-out"
+          !showStreamingExpanded && "overflow-hidden transition-opacity duration-200 ease-in-out"
         )}
         style={
-          isStreaming
+          showStreamingExpanded
             ? undefined
             : {
                 height: showExpandedContent ? undefined : 0,
@@ -222,7 +212,7 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
         }
         aria-hidden={!showExpandedContent}
       >
-        {isStreaming || showExpandedContent ? renderContent() : null}
+        {showExpandedContent ? renderContent() : null}
       </div>
     </div>
   );

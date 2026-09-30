@@ -1,11 +1,19 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import {
+  AGENT_STATUS_MAX_TRAILING_MESSAGES,
   AGENT_STATUS_PROVIDER_FAILURE_IDLE_COOLDOWN_MS,
   AGENT_STATUS_PROVIDER_FAILURE_RETRY_ATTEMPTS,
 } from "@/constants/agentStatus";
@@ -18,6 +26,8 @@ import type { TokenizerService } from "./tokenizerService";
 import { AgentStatusService } from "./agentStatusService";
 import * as workspaceStatusGenerator from "./workspaceStatusGenerator";
 import { createTestHistoryService } from "./testHistoryService";
+import { PAYLOAD_ROW_SHAPES, payloadRow } from "./historyScanner.generator.testHarness";
+import { createContextResetBoundaryMessageId } from "./utils/messageIds";
 
 interface AgentStatusServiceInternals {
   runTick(): Promise<void>;
@@ -51,13 +61,18 @@ describe("AgentStatusService", () => {
       (
         workspaceId: string,
         status: unknown,
-        options?: { skipIfRecencyAdvancedSince?: number | null }
+        options?: { skipIfRecencyAdvancedSince?: number | null; inputHash?: string | null }
       ) => Promise<{ recency: number } | null>
     >
   >;
   let getAllSnapshotsMock: ReturnType<
     typeof mock<() => Promise<Map<string, ActivitySnapshotForTest>>>
   >;
+  let getSidebarStatusInputHashMock: ReturnType<
+    typeof mock<(workspaceId: string) => Promise<string | null>>
+  >;
+  /** workspaceId → inputHash persisted with the current sidebar status. */
+  let sidebarSlot: Map<string, string | null>;
   let getSnapshotMock: ReturnType<
     typeof mock<(workspaceId: string) => Promise<{ recency: number } | null>>
   >;
@@ -113,7 +128,7 @@ describe("AgentStatusService", () => {
 
     mockConfig = {
       loadConfigOrDefault: mock(() => projectsConfig),
-      getSessionDir: historyHandle.config.getSessionDir.bind(historyHandle.config),
+      sessionsDir: historyHandle.config.sessionsDir,
     } as unknown as Config;
 
     emitWorkspaceActivityMock = mock(() => undefined);
@@ -123,17 +138,33 @@ describe("AgentStatusService", () => {
       emitWorkspaceActivity: emitWorkspaceActivityMock,
     } as unknown as WorkspaceService;
 
-    setSidebarStatusMock = mock((_workspaceId: string, _status: unknown, _options?: unknown) =>
-      Promise.resolve({ recency: 0 })
+    // Stateful fake for the shared status slot: mirrors the real service,
+    // where the reader returns a hash only while a live status backs it. The
+    // dedup recheck depends on this coupling, so a plain null-returning mock
+    // would wrongly invalidate every persisted settle.
+    sidebarSlot = new Map();
+    setSidebarStatusMock = mock(
+      (workspaceId: string, status: unknown, options?: { inputHash?: string | null }) => {
+        if (status) {
+          sidebarSlot.set(workspaceId, options?.inputHash ?? null);
+        } else {
+          sidebarSlot.delete(workspaceId);
+        }
+        return Promise.resolve({ recency: 0 });
+      }
     );
     // Default: no snapshots → no workspaces are streaming → idle intervals.
     // Tests that exercise the active intervals override this per-test.
     getAllSnapshotsMock = mock(() => Promise.resolve(new Map<string, ActivitySnapshotForTest>()));
     getSnapshotMock = mock((_workspaceId: string) => Promise.resolve(null));
+    getSidebarStatusInputHashMock = mock((workspaceId: string) =>
+      Promise.resolve(sidebarSlot.get(workspaceId) ?? null)
+    );
     mockExtensionMetadata = {
       setSidebarStatus: setSidebarStatusMock,
       getAllSnapshots: getAllSnapshotsMock,
       getSnapshot: getSnapshotMock,
+      getSidebarStatusInputHash: getSidebarStatusInputHashMock,
     } as unknown as ExtensionMetadataService;
 
     mockTokenizer = {
@@ -230,6 +261,266 @@ describe("AgentStatusService", () => {
     expect(generateSpy.mock.calls[1][0]).toContain("Assistant (in progress): Reading config files");
   });
 
+  test("hidden plan-review record rows never reach the status transcript", async () => {
+    // Snapshot/resolve/reopen records are synthetic user rows that carry the
+    // whole plan text. They are UI state, not conversation: the status model
+    // must not see them, and appending one must not trigger a regeneration.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please propose the plan")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Proposed the plan")
+    );
+    const planContent = "# Secret plan\n\nDo the thing.\n";
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec-1",
+      snapshotId: "snap-1",
+      planPath: "/tmp/plan.md",
+      contentHash: "a".repeat(64),
+      proposalToolCallId: "call-1",
+      content: planContent,
+    };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-1", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Please propose the plan");
+    expect(transcript).toContain("Assistant: Proposed the plan");
+    expect(transcript).not.toContain("mux_plan_review");
+    expect(transcript).not.toContain("Secret plan");
+
+    // A later resolve record changes history but not the transcript → dedup holds.
+    const resolve = { v: 1 as const, kind: "resolve" as const, recordId: "rec-2", threadId: "t-1" };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-2", "user", formatPlanReviewEnvelope(resolve), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(resolve),
+      })
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("hidden plan-review records do not consume the status transcript window", async () => {
+    // Resolving/reopening many threads appends one hidden record row each. The trailing window
+    // is counted in VISIBLE rows: a burst of hidden records must neither evict the recent
+    // conversation from the transcript nor change its hash by evicting a visible row.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please propose the plan")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Proposed the plan")
+    );
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const before = generateSpy.mock.calls[0][0];
+    expect(before).toContain("User: Please propose the plan");
+
+    for (let i = 0; i < AGENT_STATUS_MAX_TRAILING_MESSAGES; i++) {
+      const record = {
+        v: 1 as const,
+        kind: "resolve" as const,
+        recordId: `rec-${i}`,
+        threadId: "t",
+      };
+      await historyHandle.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(`pr-${i}`, "user", formatPlanReviewEnvelope(record), {
+          timestamp: Date.now(),
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(record),
+        })
+      );
+    }
+    // Same visible transcript → dedup holds (no regeneration) even though the last 80 rows are
+    // all hidden records.
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // A new visible row regenerates with the whole recent conversation still present.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u2", "user", "Looks good, continue")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const after = generateSpy.mock.calls[1][0];
+    expect(after).toContain("User: Please propose the plan");
+    expect(after).toContain("Assistant: Proposed the plan");
+    expect(after).toContain("User: Looks good, continue");
+    expect(after).not.toContain("mux_plan_review");
+    // ~80 real history appends: the default 5s budget flaked once under a loaded host.
+  }, 20_000);
+
+  test("the status transcript never crosses a durable manual context reset", async () => {
+    // A manual reset is a privacy floor: everything before the reset marker is discarded
+    // conversation and must not reach any provider request — including the sidebar status
+    // model. Provider-request assembly enforces this via
+    // sliceMessagesForProviderFromLatestContextBoundary; the trailing-window scan must stop at
+    // the same marker instead of refilling a short post-reset window with pre-reset rows.
+    // The reset lands via the same path WorkspaceService.resetContext uses (appendToHistory of
+    // a reset boundary row), which also rotates the sealed pre-reset prefix into
+    // chat-archive.jsonl — so this covers the archived case, not only an unrotated chat.jsonl.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-RESET-SECRET: my API token is hunter2")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a0", "assistant", "PRE-RESET-SECRET: acknowledged the token")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(createContextResetBoundaryMessageId(), "assistant", "", {
+        timestamp: Date.now(),
+        contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+      })
+    );
+    // Rotation is part of the reset write path: the discarded rows now live in the archive.
+    const archivePath = join(historyHandle.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME);
+    expect(existsSync(archivePath)).toBe(true);
+    expect(readFileSync(archivePath, "utf8")).toContain("PRE-RESET-SECRET");
+
+    // Post-reset epoch: fewer visible rows than the window, plus one hidden plan-review row so
+    // the visible-row counting has a reason to keep scanning.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Fresh start after reset")
+    );
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec-post-reset",
+      snapshotId: "snap-post-reset",
+      planPath: "/tmp/plan.md",
+      contentHash: "b".repeat(64),
+      content: "# Post-reset plan\n",
+    };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-post-reset", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Fresh start after reset");
+    expect(transcript).not.toContain("mux_plan_review");
+    expect(transcript).not.toContain("PRE-RESET-SECRET");
+  });
+
+  test("a malformed reset row is still a floor for the status transcript (#4555)", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-RESET-SECRET: my API token is hunter2")
+    );
+    // Raw reset evidence on a row that does not parse: provider requests treat it as a floor,
+    // so the sidebar status request must too.
+    appendFileSync(
+      join(historyHandle.config.sessionsDir, workspaceId, CHAT_FILE_NAME),
+      '{"metadata":{"contextBoundaryKind" : "reset"},broken\n'
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Fresh start after reset")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Fresh start after reset");
+    expect(transcript).not.toContain("PRE-RESET-SECRET");
+  });
+
+  test("the status transcript starts at the latest compaction summary (#4421)", async () => {
+    // The status model sees the same context as the agent's model: the compaction summary and
+    // what follows it, not the conversation the summary replaced.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-COMPACTION-DETAIL: refactor the parser")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "Summary: the parser refactor is underway", {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      })
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Now write the tests")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("Summary: the parser refactor is underway");
+    expect(transcript).toContain("User: Now write the tests");
+    expect(transcript).not.toContain("PRE-COMPACTION-DETAIL");
+  });
+
+  test("payload size never changes the status transcript (#4790)", async () => {
+    // Rows over 1 MiB come back status-grade (null tool payloads, empty file URLs). The
+    // formatter must never read those fields: the same conversation with giant payloads (tool
+    // output and input, file URL, nested call output) and with tiny ones gives one transcript.
+    projectsConfig = makeProjectsConfig([
+      makeWorkspaceEntry({ id: "ws-giant", name: "ws-giant" }),
+      makeWorkspaceEntry({ id: "ws-tiny", name: "ws-tiny" }),
+    ]);
+    const service = createService();
+    const transcripts: string[] = [];
+    for (const [id, payload] of [
+      ["ws-giant", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 1)],
+      ["ws-tiny", "x"],
+    ] as const) {
+      await historyHandle.historyService.appendToHistory(
+        id,
+        createMuxMessage("u1", "user", "Please look at the logs")
+      );
+      for (let shape = 0; shape < PAYLOAD_ROW_SHAPES; shape++)
+        await historyHandle.historyService.appendToHistory(
+          id,
+          payloadRow(`p${shape}`, shape, payload)
+        );
+      await getInternals(service).runForWorkspace(id);
+      expect(generateSpy).toHaveBeenCalledTimes(transcripts.length + 1);
+      transcripts.push(generateSpy.mock.calls[transcripts.length][0]);
+    }
+    expect(transcripts[0]).toContain("payload row p3");
+    expect(transcripts[0]).toEqual(transcripts[1]);
+  });
+
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {
     // Lifecycle markers are the highest-signal datum the status model has
     // for distinguishing "Deploying service" (call still running) from
@@ -293,7 +584,9 @@ describe("AgentStatusService", () => {
     // Asserting the options object reaches the generator catches a
     // regression where the streaming bit gets silently dropped at the
     // dispatch boundary.
-    expect(generateSpy.mock.calls[0][3]).toEqual({ streaming: true });
+    // toMatchObject: the options also carry a recordUsage cost-telemetry
+    // callback; this test only cares that the streaming bit is forwarded.
+    expect(generateSpy.mock.calls[0][3]).toMatchObject({ streaming: true });
   });
 
   test("dedup hash includes the streaming bit so liveness flips force a re-generation", async () => {
@@ -320,7 +613,7 @@ describe("AgentStatusService", () => {
     // sidebar would never re-evaluate tense after the stream ended.
     await getInternals(service).runForWorkspace(workspaceId, null, false);
     expect(generateSpy).toHaveBeenCalledTimes(2);
-    expect(generateSpy.mock.calls[1][3]).toEqual({ streaming: false });
+    expect(generateSpy.mock.calls[1][3]).toMatchObject({ streaming: false });
   });
 
   test("re-generates after the trailing transcript changes", async () => {
@@ -863,7 +1156,9 @@ describe("AgentStatusService", () => {
 
     expect(generateSpy).toHaveBeenCalledTimes(1);
     expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
-    expect(setSidebarStatusMock.mock.calls[0][2]).toEqual({ skipIfRecencyAdvancedSince: 100 });
+    const persistOptions = setSidebarStatusMock.mock.calls[0][2];
+    expect(persistOptions?.skipIfRecencyAdvancedSince).toBe(100);
+    expect(typeof persistOptions?.inputHash).toBe("string");
     expect(emitWorkspaceActivityMock).not.toHaveBeenCalled();
   });
 
@@ -921,16 +1216,225 @@ describe("AgentStatusService", () => {
       const skipped = await svc.setSidebarStatus(
         "ws",
         { emoji: "🛠️", message: "Old status" },
-        { skipIfRecencyAdvancedSince: 100 }
+        { skipIfRecencyAdvancedSince: 100, inputHash: "hash-of-stale-input" }
       );
       const after = await svc.getSnapshot("ws");
 
       expect(skipped).toBeNull();
       expect(after?.todoStatus).toBeUndefined();
       expect(after?.recency).toBe(200);
+      // The hash must only record actually-persisted statuses: a skipped
+      // write must not seed a post-restart dedup hit for a status that
+      // never reached the sidebar.
+      expect(await svc.getSidebarStatusInputHash("ws")).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // Restart-rehydration tests use a real ExtensionMetadataService on disk so
+  // the dedup hash persisted by one service instance is visible to a
+  // "restarted" one (fresh AgentStatusService + fresh metadata service over
+  // the same file), mirroring a server restart.
+  async function withRestartableMetadata(
+    fn: (ctx: {
+      metadataPath: string;
+      newInstance: () => AgentStatusServiceInternals;
+    }) => Promise<void>
+  ): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "mux-agent-status-restart-"));
+    try {
+      const metadataPath = join(dir, "metadata.json");
+      await fn({
+        metadataPath,
+        newInstance: () => {
+          mockExtensionMetadata = new ExtensionMetadataService(metadataPath);
+          return getInternals(createService());
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("restart: skips regeneration when the persisted hash matches the unchanged transcript", async () => {
+    // A server restart wipes the in-memory dedup state. Without the persisted
+    // seed, every restart regenerated the status for every non-empty
+    // workspace — even chats idle for months (cost scales as restarts ×
+    // workspaces × users, and churns status wording).
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Same history after a restart: the persisted hash must satisfy dedup.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("restart: regenerates when history changed while down, then settles on the new hash", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Initial request")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      await historyHandle.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u2", "user", "Pivot while the server was down")
+      );
+
+      // Stale persisted hash misses dedup → regenerate. observedRecency
+      // matches the on-disk recency (0, seeded by setSidebarStatus) so the
+      // atomic recency-advance check doesn't drop the persist.
+      await newInstance().runForWorkspace(workspaceId, 0);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+
+      // The regenerated status persisted its own hash: the next restart skips.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("restart: legacy metadata with a status but no hash regenerates once, then settles", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Chat from an older build")
+    );
+
+    await withRestartableMetadata(async ({ metadataPath, newInstance }) => {
+      // Metadata written by a build that predates sidebarStatusInputHash:
+      // status present, hash absent. Must self-heal without migration.
+      writeFileSync(
+        metadataPath,
+        JSON.stringify({
+          version: 1,
+          workspaces: {
+            [workspaceId]: {
+              recency: 100,
+              streaming: false,
+              lastModel: null,
+              lastThinkingLevel: null,
+              agentStatus: null,
+              todoStatus: { emoji: "🛠️", message: "Pre-upgrade status" },
+            },
+          },
+        })
+      );
+
+      // No persisted hash → falls through to the regenerate path once.
+      await newInstance().runForWorkspace(workspaceId, 100);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // The regenerated status recorded its hash → the next restart skips.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("restart: does not dedup against a hash orphaned by a todo-path clear", async () => {
+    // Codex review: setTodoStatus(null) clears the shared todoStatus slot
+    // without touching the persisted hash. The orphaned hash must not
+    // suppress regeneration after a restart, or the sidebar stays blank
+    // until the transcript changes.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Todo path clears the slot (e.g. stream stopped with an empty todo list).
+      await mockExtensionMetadata.setTodoStatus(workspaceId, null, false);
+
+      await newInstance().runForWorkspace(workspaceId, 0);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("regenerates when another writer clears the status slot behind a settled hash", async () => {
+    // Codex review rounds 2-3: setTodoStatus(null) can clear the shared
+    // todoStatus slot at any time after we settled by persisting — including
+    // between the scheduler's snapshot read and the dedup check. The dedup
+    // branch must confirm the persisted hash still exists at the skip
+    // decision, or the sidebar stays blank on an unchanged transcript.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
+
+    // Status still present: normal dedup skip.
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // Slot cleared by the todo path: the settled hash must drop and the
+    // same transcript must regenerate on the very next consideration.
+    sidebarSlot.delete(workspaceId);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("an empty status slot does not retrigger placeholder-settled transcripts", async () => {
+    // Placeholder settles never persisted a status, so "slot has no status"
+    // is their steady state, not an invalidation signal. Rechecking them
+    // would re-call the model on the same placeholder-producing transcript
+    // every tick and burn provider budget.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "kick off a task")
+    );
+
+    generateSpy.mockResolvedValueOnce(
+      Ok({
+        status: { emoji: "💤", message: "Awaiting next task" },
+        modelUsed: "anthropic:claude-haiku-4-5",
+      })
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("restart: persisted hash folds the streaming bit so an idle restart regenerates", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "kick off a long task")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      // Status generated mid-stream: hash covers transcript + streaming=true.
+      await newInstance().runForWorkspace(workspaceId, null, true);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Restart with the workspace now idle (ExtensionMetadataService clears
+      // stale streaming flags at startup): same transcript bytes, but the
+      // tense guidance changed, so the persisted hash must not dedup.
+      await newInstance().runForWorkspace(workspaceId, 0, false);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
   });
 
   test("rejects generic placeholder messages and advances dedup so we don't loop", async () => {

@@ -21,9 +21,10 @@ import type { PTCEvent, PTCExecutionResult, PTCToolCallEndEvent } from "@/node/s
 import { createTestToolConfig, TestTempDir, getTestDeps } from "./testHelpers";
 import { z } from "zod";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "integration-test-call",
   messages: [],
+  context: undefined,
 };
 
 describe("code_execution integration tests", () => {

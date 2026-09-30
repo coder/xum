@@ -4,14 +4,18 @@
 
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek";
+type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
   provider: ModelProvider;
   /** Provider-specific model name (no provider prefix) */
   providerModelId: string;
-  /** Aliases that should resolve to this model */
+  /**
+   * Aliases that should resolve to this model. User-facing family aliases are
+   * pinned by family (not exact id) in knownModels.test.ts, so moving one to a
+   * newer tier of the same family needs no test change.
+   */
   aliases?: string[];
   /** Preload tokenizer encodings at startup */
   warm?: boolean;
@@ -27,20 +31,65 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  OPUS: {
+  // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
+  // (released June 9, 2026) as the generally-available safeguarded variant, at the same
+  // pricing ($10/M input, $50/M output) except cheaper cache reads (0.025x input).
+  // API id `claude-fable-5-1`; Fable 5 stays usable as the custom model string
+  // `anthropic:claude-fable-5`.
+  FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-opus-4-7",
-    aliases: ["opus"],
+    providerModelId: "claude-fable-5-1",
+    aliases: ["fable"],
     warm: true,
-    // Opus 4.7 tokenizer not yet available upstream; reuse 4.6 for approximate counting
+    // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
+    // reuse Opus 4.5 (the newest Anthropic tokenizer in ai-tokenizer) for approximate
+    // counting. Anthropic says the newer tokenizer produces ~30% more tokens for the
+    // same text, so real usage can run ~1.0-1.3x higher than this estimate.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
+  // Claude Mythos 5.1 - successor to Mythos 5 (released June 9, 2026 alongside Fable 5)
+  // as the restricted-access, safeguards-lifted twin of Fable 5.1, with identical specs
+  // and pricing ($10/M input, $50/M output, 0.025x-input cache reads) and unchanged
+  // availability (approved Project Glasswing customers only, no self-serve sign-up).
+  // API id `claude-mythos-5-1`; Mythos 5 stays usable as the custom model string
+  // `anthropic:claude-mythos-5`.
+  // Not warmed: most users cannot access it, and its tokenizer override is already
+  // warmed via FABLE.
+  MYTHOS: {
+    provider: "anthropic",
+    providerModelId: "claude-mythos-5-1",
+    aliases: ["mythos"],
+    // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
+    // approximate counting; real usage can run ~1.0-1.3x higher.
+    tokenizerOverride: "anthropic/claude-opus-4.5",
+  },
+  // Claude Opus 5.5 - released September 22, 2026, successor to Opus 5. $4/M input,
+  // $20/M output, 20% below Opus 5. API id `claude-opus-5-5`; Opus 5 stays usable
+  // as the custom model string `anthropic:claude-opus-5`. Unlike Opus 5, thinking
+  // cannot be disabled (see anthropicRejectsDisabledThinking).
+  OPUS: {
+    provider: "anthropic",
+    providerModelId: "claude-opus-5-5",
+    aliases: ["opus"],
+    warm: true,
+    // Opus 5.5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
+    // which isn't published upstream; reuse Opus 4.5 for approximate counting. Real
+    // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
+    tokenizerOverride: "anthropic/claude-opus-4.5",
+  },
+  // Claude Sonnet 5.5 - released September 28, 2026, successor to Sonnet 5 at the same
+  // pricing ($2/M input, $10/M output). API id `claude-sonnet-5-5`; Sonnet 5 stays usable as
+  // the custom model string `anthropic:claude-sonnet-5`. Unlike Sonnet 5, thinking cannot be
+  // disabled (see anthropicRejectsDisabledThinking). The bare `sonnet` alias tracks the latest
+  // Sonnet tier.
   SONNET: {
     provider: "anthropic",
-    providerModelId: "claude-sonnet-4-6",
+    providerModelId: "claude-sonnet-5-5",
     aliases: ["sonnet"],
     warm: true,
-    // Sonnet 4.6 tokenizer not yet available upstream; reuse 4.5 for approximate counting
+    // Sonnet 5.5 keeps Sonnet 5's updated tokenizer, which isn't published upstream;
+    // reuse Sonnet 4.5 for approximate counting. Real usage can run ~1.0-1.35x higher than this
+    // estimate depending on content type.
     tokenizerOverride: "anthropic/claude-sonnet-4.5",
   },
   HAIKU: {
@@ -49,12 +98,42 @@ const MODEL_DEFINITIONS = {
     aliases: ["haiku"],
     tokenizerOverride: "anthropic/claude-3.5-haiku",
   },
-  // GPT alias tracks the latest stable GPT-5 tier.
+  // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
+  // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
+  // Keep the durable gpt/sol aliases on the latest Sol tier without moving users to
+  // the more expensive Astra tier. GPT-6 Sol and the retired GPT-5.6 Sol/Luna stay
+  // usable as custom model strings with their own metadata.
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-5.5",
-    aliases: ["gpt", "gpt-5.5"],
+    providerModelId: "gpt-6.1-sol",
+    aliases: ["gpt", "sol"],
     warm: true,
+    // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
+    tokenizerOverride: "openai/gpt-5",
+  },
+  // GPT-5.6 Terra - balanced everyday tier, released July 9, 2026.
+  // GPT-5.5-class quality at a fraction of the cost: $2/M input, $12/M output; 1.05M context.
+  GPT_56_TERRA: {
+    provider: "openai",
+    providerModelId: "gpt-5.6-terra",
+    aliases: ["terra"],
+    tokenizerOverride: "openai/gpt-5",
+  },
+  // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
+  GPT_6_LUNA: {
+    provider: "openai",
+    providerModelId: "gpt-6-luna",
+    aliases: ["luna"],
+    tokenizerOverride: "openai/gpt-5",
+  },
+  // Astra stays a separate frontier-tier choice rather than taking over `gpt`.
+  // Not warmed: its tokenizer override is already warmed via GPT.
+  GPT_6_ASTRA: {
+    provider: "openai",
+    providerModelId: "gpt-6-astra",
+    aliases: ["astra", "gpt-6-astra"],
+    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate
+    // counting (same approach as the GPT-5.6 family).
     tokenizerOverride: "openai/gpt-5",
   },
   // GPT Pro alias tracks the latest GPT-5 Pro tier.
@@ -108,6 +187,16 @@ const MODEL_DEFINITIONS = {
     warm: true,
     tokenizerOverride: "openai/gpt-5",
   },
+  DAYBREAK_BLUE: {
+    provider: "openai",
+    providerModelId: "daybreak-blue-latest",
+    tokenizerOverride: "openai/gpt-5",
+  },
+  DAYBREAK_RED: {
+    provider: "openai",
+    providerModelId: "daybreak-red-latest",
+    tokenizerOverride: "openai/gpt-5",
+  },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
     provider: "google",
@@ -115,27 +204,28 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini", "gemini-pro"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Gemini Flash alias tracks the latest stable Flash tier.
+  // Gemini Flash alias tracks the latest stable Flash tier (3.8 Flash, GA September 2, 2026).
+  // Older Flash tiers stay usable as custom model strings (e.g. `google:gemini-3.7-flash`).
   GEMINI_FLASH: {
     provider: "google",
-    providerModelId: "gemini-3.5-flash",
+    providerModelId: "gemini-3.8-flash",
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  GROK_4_1: {
+  // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
+  // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
+  // context, native xhigh); Grok 4.6 remains usable as the custom model string
+  // `xai:grok-4.6`. The Grok 4.7 Fast variant is Cursor/Grok Build-only (not on the
+  // public xAI API), so it is intentionally not listed.
+  GROK_47: {
     provider: "xai",
-    providerModelId: "grok-4-1-fast",
-    aliases: ["grok", "grok-4", "grok-4.1", "grok-4-1"],
-  },
-  GROK_CODE: {
-    provider: "xai",
-    providerModelId: "grok-code-fast-1",
-    aliases: ["grok-code"],
+    providerModelId: "grok-4.7",
+    aliases: ["grok", "grok-4.7"],
   },
   // DeepSeek V4 Pro is the flagship V4 tier (1.6T total / 49B active params, 1M context,
   // 384K max output). Bare `deepseek` alias points here per the convention that the
   // shortest alias tracks each provider's flagship model (mirrors `gemini` → Gemini Pro,
-  // `grok` → Grok 4.1).
+  // `grok` → Grok 4.7).
   DEEPSEEK_V4_PRO: {
     provider: "deepseek",
     providerModelId: "deepseek-v4-pro",
@@ -152,6 +242,24 @@ const MODEL_DEFINITIONS = {
     providerModelId: "deepseek-v4-flash",
     aliases: ["deepseek-flash", "deepseek-v4-flash"],
     tokenizerOverride: "deepseek/deepseek-v3.1",
+  },
+  // Kimi K3 - Moonshot AI's flagship open-weight multimodal reasoning model (released
+  // July 16, 2026; 1M context, text+image input; $3/M in, $15/M out).
+  // Bare `kimi` alias tracks Moonshot's flagship per the shortest-alias convention.
+  KIMI_K3: {
+    provider: "moonshotai",
+    providerModelId: "kimi-k3",
+    aliases: ["kimi", "k3", "kimi-k3"],
+    // K3's tokenizer isn't published in ai-tokenizer yet; reuse Kimi K2 (the newest
+    // Moonshot tokenizer available) for approximate counting.
+    tokenizerOverride: "moonshotai/kimi-k2",
+  },
+  GLM_53_FLASH: {
+    provider: "zai",
+    providerModelId: "glm-5.3-flash",
+    aliases: ["glm", "glm-flash", "glm-5.3-flash"],
+    // GLM 5.3 is not in ai-tokenizer yet; use the closest published GLM encoding.
+    tokenizerOverride: "zai/glm-4.5",
   },
 } as const satisfies Record<string, KnownModelDefinition>;
 
@@ -193,6 +301,8 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
+export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
+
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)
   .map((model) => model.id);
@@ -203,11 +313,29 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
     .sort(([a], [b]) => a.localeCompare(b))
 );
 
-export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = Object.fromEntries(
-  Object.values(KNOWN_MODELS)
-    .filter((model) => Boolean(model.tokenizerOverride))
-    .map((model) => [model.id, model.tokenizerOverride!])
-);
+// Retired first-class models stay documented as custom model strings (see the
+// FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
+// lookup does not fall back to the generic per-provider tokenizer.
+const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
+  "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:gpt-5.6-sol": "openai/gpt-5",
+  "openai:gpt-5.6-luna": "openai/gpt-5",
+  "openai:gpt-6-sol": "openai/gpt-5",
+};
+
+export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  ...LEGACY_TOKENIZER_MODEL_OVERRIDES,
+  // Spread current models last so a returning id always wins over its legacy entry.
+  ...Object.fromEntries(
+    Object.values(KNOWN_MODELS)
+      .filter((model) => Boolean(model.tokenizerOverride))
+      .map((model) => [model.id, model.tokenizerOverride!])
+  ),
+};
 
 /** Tooltip-friendly abbreviation examples: show representative shortcuts */
 export const MODEL_ABBREVIATION_EXAMPLES = (["opus", "sonnet"] as const).map((abbrev) => ({

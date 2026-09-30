@@ -1,7 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { getXumHome } from "@/common/constants/paths";
 import { createAskpassSession, parseHostKeyPrompt } from "./sshAskpass";
 
 describe("sshAskpass", () => {
@@ -139,10 +141,26 @@ describe("sshAskpass", () => {
     });
 
     test("cleanup is idempotent", async () => {
-      const session = await createAskpassSession(() => Promise.resolve("ok"));
+      // This test closes the session right after creating it. Bun 1.3.5 leaks one blocked
+      // thread-pool thread for each real directory watcher closed that early, and enough
+      // leaks stall every later fs call in the shared test process (#4715). Cleanup only
+      // needs something to close, so hand the session a stand-in watcher.
+      const watcher = Object.assign(new EventEmitter(), { close: () => undefined });
+      const watch = spyOn(fs, "watch").mockReturnValue(watcher as unknown as fs.FSWatcher);
+      try {
+        const session = await createAskpassSession(() => Promise.resolve("ok"));
+        expect(watch).toHaveBeenCalledTimes(1);
 
-      session.cleanup();
-      expect(() => session.cleanup()).not.toThrow();
+        session.cleanup();
+        expect(() => session.cleanup()).not.toThrow();
+        const dirRemoved = await fs.promises.access(session.env.MUX_ASKPASS_DIR).then(
+          () => false,
+          () => true
+        );
+        expect(dirRemoved).toBe(true);
+      } finally {
+        watch.mockRestore();
+      }
     });
 
     test("ignores duplicate request IDs", async () => {
@@ -191,6 +209,34 @@ describe("sshAskpass", () => {
         expect(stat.isDirectory()).toBe(true);
       } finally {
         session.cleanup();
+      }
+    });
+
+    test("writes mux-askpass under getXumHome() instead of creating ~/.mux", async () => {
+      const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "xum-askpass-home-"));
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = isolatedHome;
+      // Force rewrite if an earlier test cached a helper from a different home.
+      const accessSpy = spyOn(fs.promises, "access").mockRejectedValueOnce(new Error("missing"));
+
+      try {
+        const session = await createAskpassSession(() => Promise.resolve("ok"));
+        try {
+          const expectedPath = path.join(getXumHome(), "bin", "mux-askpass");
+          expect(session.env.SSH_ASKPASS).toBe(expectedPath);
+          expect((await fs.promises.stat(expectedPath)).isFile()).toBe(true);
+          expect(expectedPath.startsWith(path.join(os.homedir(), ".mux"))).toBe(false);
+        } finally {
+          session.cleanup();
+        }
+      } finally {
+        accessSpy.mockRestore();
+        if (previousRoot === undefined) {
+          delete process.env.XUM_ROOT;
+        } else {
+          process.env.XUM_ROOT = previousRoot;
+        }
+        fs.rmSync(isolatedHome, { recursive: true, force: true });
       }
     });
   });

@@ -37,7 +37,7 @@ type UserMessageChunkUpdate = Extract<
 
 interface AcpTestClient {
   client: ClientSideConnection;
-  sessionUpdates: Array<schema.SessionNotification>;
+  sessionUpdates: schema.SessionNotification[];
   getStderr: () => string;
   runRpc: <T>(label: string, operation: Promise<T>) => Promise<T>;
   close: () => Promise<void>;
@@ -45,8 +45,6 @@ interface AcpTestClient {
 
 interface CreateAcpClientOptions {
   logFilePath?: string;
-  /** Project path to pre-trust in the ephemeral config. */
-  projectPath?: string;
 }
 
 let buildMainPromise: Promise<void> | null = null;
@@ -122,15 +120,13 @@ async function runCommand(
 }
 
 async function ensureMainCliBuilt(): Promise<void> {
-  if (buildMainPromise == null) {
-    // Build the real CLI artifact once so this test catches missing tsconfig entries
-    // and runtime transport/framing regressions in dist output.
-    buildMainPromise = (async () => {
-      await runCommand("make", ["build-main"]);
-      await fs.access(path.join(process.cwd(), "dist/cli/index.js"));
-      await fs.access(path.join(process.cwd(), "dist/cli/acp.js"));
-    })();
-  }
+  // Build the real CLI artifact once so this test catches missing tsconfig entries
+  // and runtime transport/framing regressions in dist output.
+  buildMainPromise ??= (async () => {
+    await runCommand("make", ["build-main"]);
+    await fs.access(path.join(process.cwd(), "dist/cli/index.js"));
+    await fs.access(path.join(process.cwd(), "dist/cli/acp.js"));
+  })();
 
   await buildMainPromise;
 }
@@ -181,16 +177,6 @@ async function createAcpClient(options: CreateAcpClientOptions = {}): Promise<Ac
 
   const muxRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-acp-test-root-"));
 
-  // Pre-trust the repo in this test's ephemeral MUX_ROOT so workspace creation
-  // succeeds when newSession runs against a fresh config directory.
-  if (options.projectPath != null) {
-    const configPath = path.join(muxRoot, "config.json");
-    const trustedProjectConfig = {
-      projects: [[options.projectPath, { workspaces: [], trusted: true }]],
-    };
-    await fs.writeFile(configPath, JSON.stringify(trustedProjectConfig, null, 2));
-  }
-
   const acpArgs = ["dist/cli/index.js", "acp"];
   if (options.logFilePath != null) {
     acpArgs.push("--log-file", options.logFilePath);
@@ -227,7 +213,7 @@ async function createAcpClient(options: CreateAcpClientOptions = {}): Promise<Ac
     );
   }
 
-  const sessionUpdates: Array<schema.SessionNotification> = [];
+  const sessionUpdates: schema.SessionNotification[] = [];
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
     Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
@@ -326,7 +312,7 @@ function isUserMessageChunk(
   return notification.update.sessionUpdate === "user_message_chunk";
 }
 
-function extractTextChunks(notifications: Array<schema.SessionNotification>): string {
+function extractTextChunks(notifications: schema.SessionNotification[]): string {
   return notifications
     .filter(isAgentMessageChunk)
     .map((notification) => {
@@ -349,7 +335,7 @@ describeIntegration("ACP built CLI integration", () => {
   }, ACP_TEST_TIMEOUT_MS);
 
   test(
-    "initialize returns mux agent info",
+    "initialize returns xum agent info",
     async () => {
       const acpClient = await createAcpClient();
       try {
@@ -360,7 +346,7 @@ describeIntegration("ACP built CLI integration", () => {
           })
         );
 
-        expect(initializeResponse.agentInfo?.name).toBe("mux");
+        expect(initializeResponse.agentInfo?.name).toBe("xum");
       } finally {
         await acpClient.close();
       }
@@ -373,7 +359,7 @@ describeIntegration("ACP built CLI integration", () => {
     async () => {
       assert(repoPath.length > 0, "Temporary git repo path must be set");
 
-      const acpClient = await createAcpClient({ projectPath: repoPath });
+      const acpClient = await createAcpClient();
       try {
         await acpClient.runRpc(
           "initialize",
@@ -412,7 +398,7 @@ describeIntegration("ACP built CLI integration", () => {
       try {
         let acpClient: AcpTestClient | undefined;
         try {
-          acpClient = await createAcpClient({ logFilePath, projectPath: repoPath });
+          acpClient = await createAcpClient({ logFilePath });
 
           await acpClient.runRpc(
             "initialize",
@@ -458,7 +444,7 @@ describeIntegration("ACP built CLI integration", () => {
     async () => {
       assert(repoPath.length > 0, "Temporary git repo path must be set");
 
-      const acpClient = await createAcpClient({ projectPath: repoPath });
+      const acpClient = await createAcpClient();
       try {
         await acpClient.runRpc(
           "initialize",
@@ -523,7 +509,7 @@ describeIntegration("ACP built CLI integration", () => {
         const responseText = extractTextChunks(updatesForSession).toLowerCase();
         if (!responseText.includes("test")) {
           throw new Error(
-            `Expected response to include README contents (\"test\"). Got: ${responseText}\n\nACP stderr:\n${acpClient.getStderr()}`
+            `Expected response to include README contents ("test"). Got: ${responseText}\n\nACP stderr:\n${acpClient.getStderr()}`
           );
         }
       } finally {

@@ -8,6 +8,7 @@ const WORKSPACE_ID = "workspace1";
 const MODEL = "test-model";
 const originalLocalStorage: Storage | undefined = (globalThis as { localStorage?: Storage })
   .localStorage;
+const originalWindow: unknown = (globalThis as { window?: unknown }).window;
 
 interface StatusInput {
   emoji: string;
@@ -126,10 +127,18 @@ function statusMessage(
 }
 
 beforeEach(() => {
+  const localStorage = createMockLocalStorage();
   Object.defineProperty(globalThis, "localStorage", {
-    value: createMockLocalStorage(),
+    value: localStorage,
     configurable: true,
   });
+  // Status persistence goes through the persisted-state helpers, which read `window.localStorage`
+  // (and dispatch same-tab change events on `window`).
+  const testWindow: Pick<Window, "localStorage" | "dispatchEvent"> = {
+    localStorage,
+    dispatchEvent: () => true,
+  };
+  Object.defineProperty(globalThis, "window", { value: testWindow, configurable: true });
 });
 
 afterEach(() => {
@@ -137,6 +146,11 @@ afterEach(() => {
 });
 
 afterAll(() => {
+  if (originalWindow !== undefined) {
+    Object.defineProperty(globalThis, "window", { value: originalWindow, configurable: true });
+  } else {
+    delete (globalThis as { window?: unknown }).window;
+  }
   if (originalLocalStorage !== undefined) {
     Object.defineProperty(globalThis, "localStorage", { value: originalLocalStorage });
   } else {
@@ -258,6 +272,8 @@ describe("StreamingMessageAggregator - Agent Status", () => {
       }),
     });
     expect(aggregator.getAgentStatus()).toBeUndefined();
+    // The persisted copy is cleared too, so a reload does not resurrect the stale status.
+    expect(createAggregator(WORKSPACE_ID).getAgentStatus()).toBeUndefined();
   });
 
   const toolStatusScenarios = [

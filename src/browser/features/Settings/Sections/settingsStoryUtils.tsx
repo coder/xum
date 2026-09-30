@@ -13,12 +13,24 @@ import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { selectWorkspace } from "@/browser/stories/helpers/uiState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { getExperimentKey, type ExperimentId } from "@/common/constants/experiments";
-import { SELECTED_WORKSPACE_KEY, UI_THEME_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import {
+  getExperimentKey,
+  getExperimentList,
+  type ExperimentId,
+} from "@/common/constants/experiments";
+import {
+  LAST_CUSTOM_MODEL_PROVIDER_KEY,
+  SELECTED_WORKSPACE_KEY,
+  SIDEBAR_AGE_GROUPING_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
+  UI_THEME_KEY,
+} from "@/common/constants/storage";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
-import type { ImageGenerationConfig } from "@/common/types/imageGeneration";
 import type { TaskSettings } from "@/common/types/tasks";
 import type { GoalDefaults } from "@/constants/goals";
 import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
@@ -29,10 +41,29 @@ interface SettingsSectionStoryProps {
   children: ReactNode;
 }
 
-function resetStorybookPersistedStateForStory(): void {
+export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
     localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
+
+    // Storybook reuses one browser origin across stories, so experiment
+    // localStorage overrides from one story must not decide another story's
+    // switch positions. Each story can opt back in through setupSettingsStory().
+    for (const experiment of getExperimentList()) {
+      localStorage.removeItem(getExperimentKey(experiment.id));
+    }
+
+    // Sidebar stories can write sidebarAgeGrouping=false into the shared
+    // origin; clear it so the GeneralSection switch snapshots its default.
+    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
+
+    // Terminal badge stories seed an enabled badge config; clear it so the
+    // default GeneralSection story snapshots the disabled (collapsed) rows.
+    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
+
+    // The Coder catalog ModelsSection stories seed the add row's provider;
+    // clear it so the other ModelsSection stories snapshot their default.
+    localStorage.removeItem(LAST_CUSTOM_MODEL_PROVIDER_KEY);
   }
 }
 
@@ -56,6 +87,7 @@ function getStorybookRenderKey(): string | null {
 export function SettingsSectionStory(props: SettingsSectionStoryProps) {
   const lastRenderKeyRef = useRef<string | null>(null);
   const clientRef = useRef<APIClient | null>(null);
+  const wiredProvidersClientRef = useRef<APIClient | null>(null);
 
   const renderKey = getStorybookRenderKey();
   const shouldReset = clientRef.current === null || lastRenderKeyRef.current !== renderKey;
@@ -67,6 +99,18 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
   }
 
   clientRef.current ??= props.setup();
+
+  // useProvidersConfig consumers (ProvidersSection, ModelsSection, ...) read
+  // the shared ProvidersConfigStore, which gets its client from AppLoader in
+  // the real app. These stories bypass AppLoader, so wire the store to the
+  // story client (once per client instance, alongside the client creation
+  // above, so the config fetch starts before the section mounts).
+  if (wiredProvidersClientRef.current !== clientRef.current) {
+    wiredProvidersClientRef.current = clientRef.current;
+    getProvidersConfigStore().setClient(clientRef.current);
+    // useRouting/useMinThinkingLevels consumers read the shared AppConfigStore.
+    getAppConfigStore().setClient(clientRef.current);
+  }
 
   return (
     <APIProvider key={renderKey ?? "settings-section-story"} client={clientRef.current}>
@@ -103,14 +147,15 @@ interface SetupSettingsStoryOptions {
       baseUrl?: string;
       baseUrlSource?: "config" | "env";
       baseUrlResolved?: string;
+      serviceTier?: ServiceTier;
       models?: string[];
+      coderOauthSet?: boolean;
+      discoveredModels?: string[];
     }
   >;
   providersList?: string[];
   agentAiDefaults?: AgentAiDefaults;
   taskSettings?: Partial<TaskSettings>;
-  /** Initial image generation config for config.getConfig */
-  imageGeneration?: Partial<ImageGenerationConfig>;
   /** Initial global heartbeat default prompt for config.getConfig */
   heartbeatDefaultPrompt?: string;
   /** Initial global heartbeat default interval for config.getConfig */
@@ -142,7 +187,6 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     providersConfig: options.providersConfig ?? {},
     agentAiDefaults: options.agentAiDefaults,
     providersList: options.providersList ?? ["anthropic", "openai", "xai"],
-    imageGeneration: options.imageGeneration,
     heartbeatDefaultPrompt: options.heartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: options.heartbeatDefaultIntervalMs,
     goalDefaults: options.goalDefaults,

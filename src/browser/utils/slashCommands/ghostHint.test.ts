@@ -58,6 +58,17 @@ describe("getCommandGhostHint", () => {
     ).toBe(SLASH_COMMAND_HINTS.heartbeat);
   });
 
+  it("returns only workflow args after the typed /workflow command", () => {
+    const enabledExperiments = new Set<ExperimentId>([EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]);
+
+    const hint = getCommandGhostHint("/workflow ", false, {
+      isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
+    });
+
+    expect(hint).toBe("<script_path> [json_args]");
+    expect(hint).not.toContain("/workflow");
+  });
+
   it("returns goal hints regardless of experiment state after GA", () => {
     expect(
       getCommandGhostHint("/goal ", false, {

@@ -19,11 +19,8 @@ export function getPlanModeInstruction(planFilePath: string, planExists: boolean
 ${fileStatus}
 
 Build your plan incrementally by writing to or editing this file.
-NOTE: The plan file is the only file you are allowed to edit. Other than that you may only take READ-ONLY actions.
-${exactPlanPathRule}
+NOTE: The \`file_edit_*\` tools are locked to the plan file — it is the only file they can modify. ${exactPlanPathRule} You may freely create, rewrite, or delete the plan file itself.
 
-Do not make other edits in plan mode. You may have tools like bash but only use them for read-only operations.
-Read-only bash means: no redirects/heredocs, no rm/mv/cp/mkdir/touch, no git add/commit, and no dependency installs.
 When the plan is ready for user review, call \`propose_plan\`.
 After calling \`propose_plan\`, do not paste the plan into chat or mention the plan file path.
 `;

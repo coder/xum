@@ -9,9 +9,10 @@ import type { ToolExecutionOptions } from "ai";
 import { TestTempDir, createTestToolConfig, getTestDeps } from "./testHelpers";
 
 // Mock ToolCallOptions for testing
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 // Helper to create file_read tool with test configuration

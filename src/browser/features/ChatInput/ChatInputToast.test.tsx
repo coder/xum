@@ -1,5 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
@@ -8,14 +9,14 @@ import { ChatInputToast, type Toast } from "./ChatInputToast";
 
 describe("ChatInputToast", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("labels known command flag errors without unknown-command wording", () => {

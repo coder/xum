@@ -463,3 +463,172 @@ describe("SSHRuntime.forkWorkspace staging-name uniqueness", () => {
     expect(extract(runtime1.commands)).not.toBe(extract(runtime2.commands));
   });
 });
+
+// Fork rollbacks delete the fork's branch only when the fork reports creating it (#5119).
+describe("SSHRuntime.forkWorkspace createdBranch", () => {
+  function createRuntime(): ForkTestSSHRuntime {
+    return new ForkTestSSHRuntime("/remote/src", {
+      project: "/Users/me/Projects/coder/mux",
+      name: "feature-source",
+      path: "/remote/src/mux-canonical/feature-source",
+    });
+  }
+
+  it("reports the branch its own `worktree add -b` created", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree add -b "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree move "), exitCode: 0 }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(true);
+    expect(result.createdBranch).toBe(true);
+  });
+
+  it("does not claim the branch when `worktree add -b` failed and the copy fallback ran", async () => {
+    // `worktree add -b` fails when the branch already exists; the fallback may then check out
+    // that existing branch, which a rollback must keep.
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      {
+        matches: (c) => c.includes("worktree add -b "),
+        stderr: "fatal: a branch named 'feature-new' already exists\n",
+        exitCode: 128,
+      }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(true);
+    expect(runtime.commands.some((c) => c.startsWith("cp -R -P "))).toBe(true);
+    expect(result.createdBranch).not.toBe(true);
+  });
+});
+
+// A failed finalize must not strand the branch this fork's `worktree add -b` created: a retry of the
+// name would miss the fast path and the copy fallback would check out the stale branch (#5125).
+describe("SSHRuntime.forkWorkspace finalize-failure branch cleanup", () => {
+  function createRuntime(): ForkTestSSHRuntime {
+    return new ForkTestSSHRuntime("/remote/src", {
+      project: "/Users/me/Projects/coder/mux",
+      name: "feature-source",
+      path: "/remote/src/mux-canonical/feature-source",
+    });
+  }
+
+  const isBranchDelete = (c: string): boolean => /branch -D ['"]?feature-new['"]?/.test(c);
+
+  function expectBranchDeletedAfterStagingRemoval(commands: string[]): void {
+    const removeIndex = commands.findIndex((c) => c.includes("worktree remove --force "));
+    const deleteIndex = commands.findIndex(isBranchDelete);
+    expect(removeIndex).toBeGreaterThanOrEqual(0);
+    // `branch -D` refuses a branch that is still checked out, so it must run after the staging
+    // worktree is gone; a failed removal then keeps the branch.
+    expect(deleteIndex).toBeGreaterThan(removeIndex);
+  }
+
+  it("deletes the branch its own `worktree add -b` created when `worktree move` fails", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree add -b "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree move "), stderr: "fatal: boom\n", exitCode: 128 }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(false);
+    expectBranchDeletedAfterStagingRemoval(runtime.commands);
+  });
+
+  it("deletes the created branch on a finalize collision", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree add -b "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree move "), stdout: "MUX_FORK_COLLISION\n", exitCode: 7 }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(false);
+    expectBranchDeletedAfterStagingRemoval(runtime.commands);
+  });
+
+  it("deletes the created branch when the finalize step throws", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      { matches: (c) => c.includes("worktree add -b "), exitCode: 0 }
+    );
+    const exec = runtime.exec.bind(runtime);
+    runtime.exec = (command, options) =>
+      command.includes("worktree move ")
+        ? Promise.reject(new Error("connection lost"))
+        : exec(command, options);
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(false);
+    expectBranchDeletedAfterStagingRemoval(runtime.commands);
+  });
+
+  it("keeps the branch when the copy fallback's finalize fails", async () => {
+    // `worktree add -b` refused (branch exists), so the fallback may be using an existing branch.
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 },
+      {
+        matches: (c) => c.includes("worktree add -b "),
+        stderr: "fatal: a branch named 'feature-new' already exists\n",
+        exitCode: 128,
+      },
+      {
+        matches: (c) => c.includes("MUX_FORK_MV_FAILED"),
+        stdout: "MUX_FORK_MV_FAILED\n",
+        exitCode: 8,
+      }
+    );
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(false);
+    expect(runtime.commands.some((c) => c.startsWith("cp -R -P "))).toBe(true);
+    expect(runtime.commands.some(isBranchDelete)).toBe(false);
+  });
+
+  it("keeps the branch when `worktree add -b` itself threw (creation unknown)", async () => {
+    const runtime = createRuntime();
+    runtime.canned.push(
+      { matches: (c) => c.startsWith("test -e "), exitCode: 1 },
+      { matches: (c) => c.includes("branch --show-current"), stdout: "feature-source\n" },
+      { matches: (c) => c.startsWith("test -d "), exitCode: 0 }
+    );
+    const exec = runtime.exec.bind(runtime);
+    runtime.exec = (command, options) =>
+      command.includes("worktree add -b ")
+        ? Promise.reject(new Error("connection lost"))
+        : exec(command, options);
+
+    const result = await runtime.forkWorkspace(buildForkParams());
+
+    expect(result.success).toBe(false);
+    expect(runtime.commands.some(isBranchDelete)).toBe(false);
+  });
+});

@@ -6,6 +6,8 @@ type ConfirmVariant = "default" | "destructive" | "secondary" | "outline" | "gho
 export interface ConfirmDialogOptions {
   title: string;
   description?: string;
+  /** Items listed under the description, e.g. the files a removal would delete. */
+  details?: { label: string; items: string[] };
   /** Warning message shown in red warning box */
   warning?: string;
   confirmLabel?: string;
@@ -66,6 +68,7 @@ export function ConfirmDialogProvider(props: { children: React.ReactNode }) {
           isOpen={dialogState.isOpen}
           title={dialogState.title}
           description={dialogState.description}
+          details={dialogState.details}
           warning={dialogState.warning}
           confirmLabel={dialogState.confirmLabel}
           cancelLabel={dialogState.cancelLabel}

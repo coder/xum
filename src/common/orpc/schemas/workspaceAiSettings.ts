@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 /**
  * Workspace-scoped AI settings that should persist across devices.
@@ -13,6 +13,11 @@ export const WorkspaceAISettingsSchema = z.object({
   model: z.string().meta({ description: 'Canonical model id in the form "provider:model"' }),
   thinkingLevel: ThinkingLevelSchema.meta({
     description: "Thinking/reasoning effort level",
+  }),
+  // Optional so legacy persisted settings without the field parse unchanged.
+  reasoningMode: OpenAIReasoningModeSchema.optional().meta({
+    description:
+      'OpenAI reasoning mode (orthogonal to effort). Applies to supported models on direct OpenAI Responses API routes; inert elsewhere. Absent = "standard".',
   }),
 });
 

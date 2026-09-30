@@ -1,10 +1,14 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+
+// bun test shares module mocks across suites; leaking this stub would hide later dialogs.
+const realDialogExports = { ...RealDialogModule };
 
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
@@ -45,6 +49,10 @@ describe("MultiProjectWorkspaceCreateModal", () => {
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  afterAll(() => {
+    void mock.module("@/browser/components/Dialog/Dialog", () => realDialogExports);
   });
 
   test("renders when the experiment is enabled", () => {

@@ -1,23 +1,66 @@
+import { execFile } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { promisify } from "node:util";
 import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import type { ProjectConfig } from "../../src/common/types/project";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
 
+const execFileAsyncForTest = promisify(execFile);
+
 type WorkspaceInfo = NonNullable<Awaited<ReturnType<ORPCClient["workspace"]["getInfo"]>>>;
+
+interface WorkspaceCreateInput {
+  projectPath: string;
+  branchName: string;
+  trunkBranch?: string;
+  title?: string;
+  runtimeConfig?: WorkspaceInfo["runtimeConfig"];
+  subProjectPath?: string;
+}
 
 interface HarnessOptions {
   getReplayEvents?: (workspaceId: string) => WorkspaceChatMessage[];
   beforeCreateResolves?: Promise<void>;
   disconnectCleanupMaxWaitMs?: number;
+  requireTrustedProjectForCreate?: boolean;
+  projectEntries?: [string, ProjectConfig][];
 }
 
 interface Harness {
   agent: MuxAgent;
   createdWorkspaceIds: string[];
+  createCalls: WorkspaceCreateInput[];
   removeCalls: string[];
   replayChecks: string[];
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
   closeConnection: () => void;
   connectionClosed: Promise<void>;
+}
+
+function findTestParentProjectPath(
+  projectPath: string,
+  projectsByPath: ReadonlyMap<string, ProjectConfig>
+): string | undefined {
+  let parentProjectPath: string | undefined;
+  for (const [candidatePath, candidateConfig] of projectsByPath) {
+    if (candidateConfig.parentProjectPath != null) {
+      continue;
+    }
+
+    const descendantPrefix = `${candidatePath}${path.sep}`;
+    if (!projectPath.startsWith(descendantPrefix)) {
+      continue;
+    }
+
+    if (parentProjectPath == null || candidatePath.length > parentProjectPath.length) {
+      parentProjectPath = candidatePath;
+    }
+  }
+  return parentProjectPath;
 }
 
 function createWorkspaceInfo(overrides?: Partial<WorkspaceInfo>): WorkspaceInfo {
@@ -94,20 +137,46 @@ function createDeferred<T>(): {
 function createHarness(options?: HarnessOptions): Harness {
   const workspacesById = new Map<string, WorkspaceInfo>();
   const createdWorkspaceIds: string[] = [];
+  const createCalls: WorkspaceCreateInput[] = [];
   const removeCalls: string[] = [];
   const replayChecks: string[] = [];
+  const setTrustCalls: { projectPath: string; trusted: boolean }[] = [];
+  const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
 
   const client = {
     config: {
       getConfig: async () => ({}),
     },
     projects: {
+      create: async (input: { projectPath: string }) => {
+        const parentProjectPath = findTestParentProjectPath(input.projectPath, projectsByPath);
+        const projectConfig: ProjectConfig = {
+          workspaces: [],
+          parentProjectPath,
+        };
+        projectsByPath.set(input.projectPath, projectConfig);
+        return {
+          success: true as const,
+          data: {
+            projectConfig,
+            normalizedPath: input.projectPath,
+          },
+        };
+      },
+      list: async () => Array.from(projectsByPath.entries()),
       listBranches: async () => ({
         branches: ["main"],
         currentBranch: "main",
         recommendedTrunk: "main",
       }),
-      setTrust: async () => {},
+      setTrust: async (input: { projectPath: string; trusted: boolean }) => {
+        setTrustCalls.push(input);
+        const currentProject = projectsByPath.get(input.projectPath) ?? { workspaces: [] };
+        projectsByPath.set(input.projectPath, {
+          ...currentProject,
+          trusted: input.trusted,
+        });
+      },
     },
     agents: {
       list: async () => [],
@@ -122,13 +191,18 @@ function createHarness(options?: HarnessOptions): Harness {
       },
     },
     workspace: {
-      create: async (input: {
-        projectPath: string;
-        branchName: string;
-        trunkBranch?: string;
-        title?: string;
-        runtimeConfig?: WorkspaceInfo["runtimeConfig"];
-      }) => {
+      create: async (input: WorkspaceCreateInput) => {
+        createCalls.push(input);
+        if (
+          options?.requireTrustedProjectForCreate === true &&
+          projectsByPath.get(input.projectPath)?.trusted !== true
+        ) {
+          return {
+            success: false as const,
+            error: "project not trusted",
+          };
+        }
+
         const workspaceId = `ws-${workspacesById.size + 1}`;
         if (options?.beforeCreateResolves != null) {
           await options.beforeCreateResolves;
@@ -139,6 +213,7 @@ function createHarness(options?: HarnessOptions): Harness {
           name: input.branchName,
           title: input.title ?? input.branchName,
           projectPath: input.projectPath,
+          subProjectPath: input.subProjectPath,
           namedWorkspacePath: `${input.projectPath}/.mux/${input.branchName}`,
           runtimeConfig: input.runtimeConfig ?? { type: "local" },
         });
@@ -154,7 +229,9 @@ function createHarness(options?: HarnessOptions): Harness {
       getInfo: async ({ workspaceId }: { workspaceId: string }) =>
         workspacesById.get(workspaceId) ?? null,
       onChat: async (_input: { workspaceId: string; mode?: OnChatMode }) =>
-        createChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+        createChatStream([
+          { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+        ]),
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
       getFullReplay: async ({ workspaceId }: { workspaceId: string }) => {
@@ -193,8 +270,10 @@ function createHarness(options?: HarnessOptions): Harness {
   return {
     agent: agentInstance,
     createdWorkspaceIds,
+    createCalls,
     removeCalls,
     replayChecks,
+    setTrustCalls,
     closeConnection: closeInput,
     connectionClosed: connection.closed,
   };
@@ -211,6 +290,175 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 1_000): Pr
 }
 
 describe("ACP disconnect cleanup for untouched session/new workspaces", () => {
+  it("trusts the ACP cwd before creating a session workspace", async () => {
+    const harness = createHarness({ requireTrustedProjectForCreate: true });
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const newSessionResponse = await harness.agent.newSession({
+      cwd: "/repo/acp-go-sdk",
+      mcpServers: [],
+      _meta: { trunkBranch: "main" },
+    });
+
+    expect(newSessionResponse.sessionId).toBe("ws-1");
+    expect(harness.setTrustCalls).toEqual([{ projectPath: "/repo/acp-go-sdk", trusted: true }]);
+    expect(harness.createdWorkspaceIds).toEqual(["ws-1"]);
+  });
+
+  it("accepts normalized-equivalent _meta.projectPath values", async () => {
+    const harness = createHarness({ requireTrustedProjectForCreate: true });
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const newSessionResponse = await harness.agent.newSession({
+      cwd: "/repo/acp-go-sdk",
+      mcpServers: [],
+      _meta: {
+        projectPath: "/repo/acp-go-sdk/.",
+        trunkBranch: "main",
+      },
+    });
+
+    expect(newSessionResponse.sessionId).toBe("ws-1");
+    expect(harness.setTrustCalls).toEqual([{ projectPath: "/repo/acp-go-sdk", trusted: true }]);
+    expect(harness.createCalls[0]?.projectPath).toBe("/repo/acp-go-sdk");
+  });
+
+  it("rejects mismatched _meta.projectPath before trusting any project", async () => {
+    const harness = createHarness({ requireTrustedProjectForCreate: true });
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    await expect(
+      harness.agent.newSession({
+        cwd: "/repo/acp-go-sdk",
+        mcpServers: [],
+        _meta: {
+          projectPath: "/repo/other",
+          trunkBranch: "main",
+        },
+      })
+    ).rejects.toThrow("_meta.projectPath must match cwd");
+
+    expect(harness.setTrustCalls).toEqual([]);
+    expect(harness.createCalls).toEqual([]);
+  });
+
+  it("registers the git top-level and requested cwd for fresh subdirectory launches", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-acp-fresh-git-root-"));
+    try {
+      const parentPath = path.join(tempDir, "monorepo");
+      const packagePath = path.join(parentPath, "packages", "api");
+      await fs.mkdir(packagePath, { recursive: true });
+      await execFileAsyncForTest("git", ["init", "-q"], { cwd: parentPath });
+
+      const harness = createHarness({ requireTrustedProjectForCreate: true });
+      await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+      const newSessionResponse = await harness.agent.newSession({
+        cwd: packagePath,
+        mcpServers: [],
+        _meta: { trunkBranch: "main" },
+      });
+
+      expect(newSessionResponse.sessionId).toBe("ws-1");
+      expect(harness.setTrustCalls).toEqual([
+        { projectPath: packagePath, trusted: true },
+        { projectPath: parentPath, trusted: true },
+      ]);
+      expect(harness.createCalls[0]?.projectPath).toBe(parentPath);
+      expect(harness.createCalls[0]?.subProjectPath).toBe(packagePath);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an unregistered descendant as its own project when git root cannot be verified", async () => {
+    const parentPath = "/repo/monorepo";
+    const packagePath = "/repo/monorepo/packages/unregistered";
+    const harness = createHarness({
+      requireTrustedProjectForCreate: true,
+      projectEntries: [[parentPath, { workspaces: [], trusted: false }]],
+    });
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const newSessionResponse = await harness.agent.newSession({
+      cwd: packagePath,
+      mcpServers: [],
+      _meta: { trunkBranch: "main" },
+    });
+
+    expect(newSessionResponse.sessionId).toBe("ws-1");
+    expect(harness.setTrustCalls).toEqual([{ projectPath: packagePath, trusted: true }]);
+    expect(harness.createCalls[0]?.projectPath).toBe(packagePath);
+    expect(harness.createCalls[0]?.subProjectPath).toBeUndefined();
+  });
+
+  it("uses the containing parent when an unregistered descendant shares the same git root", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-acp-git-root-"));
+    try {
+      const parentPath = path.join(tempDir, "monorepo");
+      const packagePath = path.join(parentPath, "packages", "api");
+      await fs.mkdir(packagePath, { recursive: true });
+      await execFileAsyncForTest("git", ["init", "-q"], { cwd: parentPath });
+
+      const harness = createHarness({
+        requireTrustedProjectForCreate: true,
+        projectEntries: [[parentPath, { workspaces: [], trusted: false }]],
+      });
+      await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+      const newSessionResponse = await harness.agent.newSession({
+        cwd: packagePath,
+        mcpServers: [],
+        _meta: { trunkBranch: "main" },
+      });
+
+      expect(newSessionResponse.sessionId).toBe("ws-1");
+      expect(harness.setTrustCalls).toEqual([
+        { projectPath: packagePath, trusted: true },
+        { projectPath: parentPath, trusted: true },
+      ]);
+      expect(harness.createCalls[0]?.projectPath).toBe(parentPath);
+      expect(harness.createCalls[0]?.subProjectPath).toBe(packagePath);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts the owning parent when ACP starts from a registered sub-project", async () => {
+    const parentPath = "/repo/monorepo";
+    const childPath = "/repo/monorepo/packages/api";
+    const harness = createHarness({
+      requireTrustedProjectForCreate: true,
+      projectEntries: [
+        [parentPath, { workspaces: [], trusted: false }],
+        [childPath, { workspaces: [], parentProjectPath: parentPath, trusted: false }],
+      ],
+    });
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const newSessionResponse = await harness.agent.newSession({
+      cwd: childPath,
+      mcpServers: [],
+      _meta: { trunkBranch: "main" },
+    });
+
+    expect(newSessionResponse.sessionId).toBe("ws-1");
+    expect(harness.setTrustCalls).toEqual([
+      { projectPath: childPath, trusted: true },
+      { projectPath: parentPath, trusted: true },
+    ]);
+    expect(harness.createCalls).toEqual([
+      {
+        projectPath: parentPath,
+        branchName: harness.createCalls[0]?.branchName ?? "",
+        trunkBranch: "main",
+        runtimeConfig: undefined,
+        subProjectPath: childPath,
+        title: undefined,
+      },
+    ]);
+  });
+
   it("removes empty session/new workspace when connection closes", async () => {
     const harness = createHarness();
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });

@@ -1,40 +1,58 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
+  DEFAULT_MODEL_KEY,
+  HIDDEN_MODELS_KEY,
+  RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
+  getDraftScopeId,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import {
+  readPersistedState,
+  syncPersistedStateFromBackend,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
+import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
 
-import type { APIClient } from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as path from "path";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { Config } from "@/node/config";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { DraftService } from "@/node/services/draftService";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { TestTempDir } from "@/node/services/tools/testHelpers";
+import type { DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 
-// Mock API
-let currentClientMock: RecursivePartial<APIClient> = {};
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: currentClientMock as APIClient,
-    status: "connected" as const,
-    error: null,
-  }),
-  APIProvider: ({ children }: { children: React.ReactNode }) => children,
-}));
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 // Helper to create test workspace metadata with default runtime config
 const createWorkspaceMetadata = (
@@ -66,6 +84,7 @@ const createProjectWorkspaceMetadata = (
 type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
 
 describe("WorkspaceContext", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
     mock.restore();
@@ -73,12 +92,150 @@ describe("WorkspaceContext", () => {
     // Reset global workspace store to avoid cross-test leakage
     getWorkspaceStoreRaw().dispose();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
 
     currentClientMock = {};
   });
+
+  test.each(["resolves", "rejects", "stalls"])(
+    "hydrates preferences when migration persistence %s",
+    async (writeState) => {
+      const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+      const legacyHidden = "openrouter:openai/gpt-5";
+      const defaultModel = "openai:gpt-5.6-terra";
+      createMockAPI({
+        localStorage: {
+          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+          [DEFAULT_MODEL_KEY]: JSON.stringify(defaultModel),
+          [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: true }),
+        },
+      });
+      const updateModelPreferences = mock(() => {
+        if (writeState === "stalls") return new Promise<void>(() => undefined);
+        if (writeState === "rejects") return Promise.reject(new Error("config write failed"));
+        return Promise.resolve();
+      });
+      const cfg = await createMockORPCClient().config.getConfig();
+      currentClientMock.config = {
+        getConfig: () =>
+          Promise.resolve({
+            ...cfg,
+            hiddenModels: seeded,
+            hiddenModelsInitialized: false,
+            runtimeEnablement: { ssh: false },
+          }),
+        updateModelPreferences,
+      };
+      await setup();
+      await waitFor(() => {
+        expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
+          ...seeded,
+          legacyHidden,
+        ]);
+      });
+      expect(updateModelPreferences).toHaveBeenCalledWith({
+        defaultModel,
+        hiddenModels: [...seeded, legacyHidden],
+      });
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
+      expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
+    }
+  );
+
+  test.each(
+    ["local", "cross-tab", "cross-tab-delayed"].flatMap((source) =>
+      (source === "cross-tab-delayed"
+        ? ["hidden", "default"]
+        : ["hidden", "default", "hidden-aba", "default-aba"]
+      ).map((changed) => [source, changed])
+    )
+  )(
+    "keeps %s %s preference edits ahead of stale startup config until reconnect",
+    async (source, changed) => {
+      const blue = "openai:daybreak-blue-latest";
+      const red = "openai:daybreak-red-latest";
+      const legacyHidden = "openrouter:openai/gpt-5";
+      const legacyDefault = "openai:gpt-5.6-terra";
+      const chosenDefault = "anthropic:claude-opus-4-6";
+      createMockAPI({
+        localStorage: {
+          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+          [DEFAULT_MODEL_KEY]: JSON.stringify(legacyDefault),
+        },
+      });
+      const cfg = await createMockORPCClient().config.getConfig();
+      let resolveConfig!: (value: typeof cfg) => void;
+      const pendingConfig = new Promise<typeof cfg>((resolve) => {
+        resolveConfig = resolve;
+      });
+      const updateModelPreferences = mock(() => Promise.resolve());
+      currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
+      await setup();
+      const writePreference = (key: string, value: unknown) => {
+        if (source === "local") {
+          updatePersistedState(key, value);
+          return;
+        }
+        // Seed the shared value without emitting a local write in this tab.
+        syncPersistedStateFromBackend(key, value);
+        if (source === "cross-tab-delayed") return;
+        window.dispatchEvent(
+          new window.StorageEvent("storage", { key, storageArea: window.localStorage })
+        );
+      };
+      act(() => {
+        if (changed.startsWith("default")) {
+          writePreference(DEFAULT_MODEL_KEY, chosenDefault);
+          if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
+        } else {
+          writePreference(HIDDEN_MODELS_KEY, [red, legacyHidden]);
+          if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
+        }
+      });
+      resolveConfig({
+        ...cfg,
+        hiddenModels: [blue, red],
+        hiddenModelsInitialized: false,
+        runtimeEnablement: { ssh: false },
+      });
+      await waitFor(() =>
+        expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(
+        changed === "default" ? chosenDefault : legacyDefault
+      );
+      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
+        changed.startsWith("default")
+          ? [blue, red, legacyHidden]
+          : changed === "hidden"
+            ? [red, legacyHidden]
+            : [legacyHidden]
+      );
+      expect(updateModelPreferences).toHaveBeenCalledWith(
+        changed.startsWith("default")
+          ? { hiddenModels: [blue, red, legacyHidden] }
+          : { defaultModel: legacyDefault }
+      );
+
+      cleanup();
+      getWorkspaceStoreRaw().dispose();
+      currentClientMock.config = {
+        getConfig: () =>
+          Promise.resolve({
+            ...cfg,
+            defaultModel: legacyDefault,
+            hiddenModels: [],
+            hiddenModelsInitialized: true,
+          }),
+        updateModelPreferences,
+      };
+      await setup();
+      await waitFor(() =>
+        expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([])
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
+    }
+  );
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
@@ -103,12 +260,24 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() =>
       expect(
-        workspaceApi.onChat.mock.calls.some(
-          ([{ workspaceId }]: [{ workspaceId: string }, ...unknown[]]) =>
-            workspaceId === "ws-sync-load"
-        )
+        workspaceApi.onChat.mock.calls.some(([input]) => input?.workspaceId === "ws-sync-load")
       ).toBe(true)
     );
+  });
+
+  test("exposes workspace metadata load failures without marking metadata as loaded", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.reject(new Error("workspace metadata unavailable")),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().loaded).toBe(false);
+    expect(ctx().loadError).toContain("workspace metadata unavailable");
+    expect(ctx().workspaceMetadata.size).toBe(0);
   });
 
   test("subscribes to new workspace immediately when metadata event fires", async () => {
@@ -122,6 +291,58 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(workspaceApi.onMetadata.mock.calls.length).toBeGreaterThan(0));
     expect(workspaceApi.onMetadata).toHaveBeenCalled();
+  });
+
+  test("deletion metadata waits for one config notification to refresh projects", async () => {
+    const workspaces = Array.from({ length: 5 }, (_, index) =>
+      createProjectWorkspaceMetadata("child-" + index, "/alpha")
+    );
+    const deletions = workspaces.map(() => Promise.withResolvers<void>());
+    const configChanged = Promise.withResolvers<void>();
+    const { projects } = createMockAPI({
+      workspace: {
+        list: () => Promise.resolve(workspaces),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              for (const [index, workspace] of workspaces.entries()) {
+                await deletions[index].promise;
+                yield { workspaceId: workspace.id, metadata: null };
+              }
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+    currentClientMock = {
+      ...currentClientMock,
+      config: {
+        onConfigChanged: () =>
+          Promise.resolve(
+            (async function* () {
+              await configChanged.promise;
+              yield undefined;
+            })() as unknown as Awaited<ReturnType<APIClient["config"]["onConfigChanged"]>>
+          ),
+      },
+    };
+    const contexts = await setupWithProjectContext();
+    await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(5));
+    await waitFor(() => expect(contexts.project().loading).toBe(false));
+    await act(async () => {
+      await contexts.project().refreshProjects();
+    });
+    const initialRequests = projects.list.mock.calls.length;
+    for (const [index, deletion] of deletions.entries()) {
+      act(() => {
+        deletion.resolve();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(4 - index));
+      expect(projects.list).toHaveBeenCalledTimes(initialRequests);
+    }
+    act(() => {
+      configChanged.resolve();
+    });
+    await waitFor(() => expect(projects.list).toHaveBeenCalledTimes(initialRequests + 1));
   });
 
   test("switches selection to parent when selected child workspace is deleted", async () => {
@@ -235,6 +456,63 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace).toBeNull();
     await waitFor(() => expect(ctx().workspaceMetadata.has(workspaceId)).toBe(false));
     expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toBeNull();
+  });
+
+  test("navigates to scratch creation when selected scratch workspace is archived", async () => {
+    const workspaceId = "scratch-archive";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-archive";
+    const scratchMetadata = createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+      kind: "scratch",
+      projectName: "Scratch",
+      namedWorkspacePath: scratchWorkdir,
+    });
+
+    let emitArchive:
+      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
+      | null = null;
+
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([scratchMetadata]),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              const event = await new Promise<{
+                workspaceId: string;
+                metadata: FrontendWorkspaceMetadata | null;
+              }>((resolve) => {
+                emitArchive = resolve;
+              });
+              yield event;
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: {
+        list: () => Promise.resolve([]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    await waitFor(() => expect(emitArchive).toBeTruthy());
+
+    act(() => {
+      emitArchive?.({
+        workspaceId,
+        metadata: {
+          ...scratchMetadata,
+          archivedAt: "2025-02-01T00:00:00.000Z",
+        },
+      });
+    });
+
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+    expect(ctx().selectedWorkspace).toBeNull();
   });
 
   test("archiving does not override a rapid manual workspace switch", async () => {
@@ -373,58 +651,39 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace?.workspaceId).toBe(parentId);
   });
 
-  test("refreshes projects when metadata delete event is received", async () => {
-    const workspaceId = "ws-delete-refresh";
-
-    const workspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
+  test.each([true, false])(
+    "seeds settings only for non-archived metadata events (archived=%s)",
+    async (archived) => {
+      const workspaceId = "metadata-settings";
+      const metadata = createWorkspaceMetadata({
         id: workspaceId,
-        projectPath: "/alpha",
-        projectName: "alpha",
-        name: "main",
-        namedWorkspacePath: "/alpha-main",
-      }),
-    ];
-
-    let emitDelete:
-      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
-      | null = null;
-
-    const { projects: projectsApi } = createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(workspaces),
-        onMetadata: () =>
-          Promise.resolve(
-            (async function* () {
-              const event = await new Promise<{
-                workspaceId: string;
-                metadata: FrontendWorkspaceMetadata | null;
-              }>((resolve) => {
-                emitDelete = resolve;
-              });
-              yield event;
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          ),
-      },
-      projects: {
-        list: () => Promise.resolve([]),
-      },
-    });
-
-    await setup();
-
-    await waitFor(() => expect(emitDelete).toBeTruthy());
-    await waitFor(() => expect(projectsApi.list).toHaveBeenCalled());
-    const callsBeforeDelete = projectsApi.list.mock.calls.length;
-
-    act(() => {
-      emitDelete?.({ workspaceId, metadata: null });
-    });
-
-    await waitFor(() => {
-      expect(projectsApi.list.mock.calls.length).toBeGreaterThan(callsBeforeDelete);
-    });
-  });
+        archivedAt: "2025-02-01T00:00:00.000Z",
+        ...(archived ? {} : { unarchivedAt: "2025-03-01T00:00:00.000Z" }),
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
+      });
+      let processed = false;
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([]),
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                yield await Promise.resolve({ workspaceId, metadata });
+                processed = true;
+              })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+            ),
+        },
+      });
+      await setup();
+      await waitFor(() => expect(processed).toBe(true));
+      expect(readPersistedState<string | null>(getModelKey(workspaceId), null)).toBe(
+        archived ? null : "openai:gpt-5.2"
+      );
+      expect(readPersistedState<string | null>(getThinkingLevelKey(workspaceId), null)).toBe(
+        archived ? null : "xhigh"
+      );
+    }
+  );
 
   test("seeds model + thinking localStorage from backend metadata", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
@@ -456,15 +715,22 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test("stale metadata does not override a main workspace agent selection", async () => {
+  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
+    const changed = change !== "unchanged";
+    const nextAgentId = change === "mode" ? "auto" : "plan";
     const workspaceId = "ws-agent-main";
+    const saved = createWorkspaceMetadata({
+      id: workspaceId,
+      agentId: "plan",
+      aiSettingsByAgent: { plan: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
+    });
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
 
     createMockAPI({
       workspace: {
-        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        list: () => Promise.resolve([saved]),
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
@@ -487,19 +753,34 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
     act(() => {
+      updatePersistedState(getAgentIdKey(workspaceId), "exec");
+      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
       emitMetadata?.({
         workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+        metadata: {
+          ...saved,
+          title: "Updated title",
+          ...(changed
+            ? {
+                agentId: nextAgentId,
+                aiSettingsByAgent: {
+                  [nextAgentId]: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+                },
+              }
+            : {}),
+        },
       });
     });
 
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "exec"
+    await waitFor(() =>
+      expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
   });
 
   test("child workspace metadata still seeds the locked backend agent", async () => {
@@ -528,6 +809,48 @@ describe("WorkspaceContext", () => {
     expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
       "plan"
     );
+  });
+
+  test.each([
+    { name: "keeps a pending Exec pick", pickAgent: "exec", expectedModel: "openai:gpt-5.2" },
+    {
+      name: "reseeds over a Plan-scoped pick",
+      pickAgent: "plan",
+      expectedModel: "anthropic:claude-opus-4-6",
+    },
+  ])("child metadata reseed $name", async (row) => {
+    const workspaceId = "ws-pick-child";
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              parentWorkspaceId: "ws-parent",
+              agentId: "exec",
+              aiSettingsByAgent: {
+                exec: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+              },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify(row.pickAgent),
+        [getModelKey(workspaceId)]: JSON.stringify("openai:gpt-5.2"),
+        [getThinkingLevelKey(workspaceId)]: JSON.stringify("low"),
+      },
+    });
+    // A deliberate, not yet sent pick made while the child's active agent was row.pickAgent.
+    resetAiSelectionIntentForTests();
+    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(row.expectedModel);
+    // Fields without a pending pick always follow the backend.
+    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
+    resetAiSelectionIntentForTests();
   });
 
   test("loads workspace metadata on mount", async () => {
@@ -638,6 +961,36 @@ describe("WorkspaceContext", () => {
     await waitFor(() => expect(ctx().selectedWorkspace).toBeNull());
   });
 
+  test("removeWorkspace returns selected scratch workspace to scratch creation", async () => {
+    const workspaceId = "scratch-remove";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-remove";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+              kind: "scratch",
+              projectName: "Scratch",
+              namedWorkspacePath: scratchWorkdir,
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    await ctx().removeWorkspace(workspaceId);
+
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
   test("removeWorkspace handles failure gracefully", async () => {
     const { workspace: workspaceApi } = createMockAPI();
 
@@ -651,6 +1004,23 @@ describe("WorkspaceContext", () => {
     const result = await ctx().removeWorkspace("ws-1");
     expect(result.success).toBe(false);
     expect(result.error).toBe("Failed");
+  });
+
+  test("removeWorkspace forwards descendant consent and preserves blockers", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    const ctx = await setup();
+    const failure = {
+      success: false,
+      error: "A descendant is active",
+      descendants: [{ workspaceId: "child", title: "Reviewer", active: true }],
+    };
+    workspaceApi.remove.mockResolvedValue(failure);
+    const options = { force: true, acknowledgedDescendantIds: ["child"] };
+
+    const result = await ctx().removeWorkspace("parent", options);
+
+    expect(workspaceApi.remove).toHaveBeenCalledWith({ workspaceId: "parent", options });
+    expect(result).toEqual(failure);
   });
 
   describe("archiveWorkspace", () => {
@@ -774,6 +1144,101 @@ describe("WorkspaceContext", () => {
       expect(readPersistedState<Record<string, string>>(terminalTitlesKey, {})).toEqual({
         t1: "still-open",
       });
+    });
+
+    test("marks the workspace as archiving only while preflight or archive is in flight", async () => {
+      const workspaceId = "ws-archive-pending";
+      let settleArchive: (() => void) | undefined;
+      let failPreflight: ((error: Error) => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((_resolve, reject) => {
+              failPreflight = reject;
+            }),
+        },
+      });
+
+      const ctx = await setup();
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      let archivePromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      // A failed request must clear the indicator too, or the row would read "Archiving..."
+      // forever after a dropped connection.
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        failPreflight?.(new Error("WebSocket closed"));
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
+
+    test("keeps the workspace marked until the last overlapping request settles", async () => {
+      const workspaceId = "ws-archive-overlap";
+      let settleArchive: (() => void) | undefined;
+      let settlePreflight: (() => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((resolve) => {
+              settlePreflight = () =>
+                resolve({ success: true as const, data: { kind: "ready" as const } });
+            }),
+        },
+      });
+
+      const ctx = await setup();
+
+      // Header-started archive in flight, then the sidebar shortcut fires a preflight.
+      let archivePromise: Promise<unknown> | undefined;
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      // The first request to finish must not clear the indicator while the other is running.
+      await act(async () => {
+        settlePreflight?.();
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
     });
   });
 
@@ -922,6 +1387,31 @@ describe("WorkspaceContext", () => {
     expect(ctx().pendingNewWorkspaceProject).toBe("/new/project");
   });
 
+  // The project creation header lists Scratch as a switch target and routes
+  // it through the same call as a real project path.
+  test("beginWorkspaceCreation routes the scratch key to the scratch creation page", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: "/workspace/ws-existing",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace).toBeTruthy());
+
+    act(() => {
+      ctx().beginWorkspaceCreation(SCRATCH_PROJECT_CONFIG_KEY);
+    });
+
+    expect(ctx().selectedWorkspace).toBeNull();
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+  });
+
   test("reacts to metadata update events (new workspace)", async () => {
     const { workspace: workspaceApi } = createMockAPI();
     await setup();
@@ -1003,6 +1493,89 @@ describe("WorkspaceContext", () => {
     expect(ctx().pendingNewWorkspaceProject).toBeNull();
   });
 
+  test("browser direct open restores an existing scratch workspace", async () => {
+    const workspaceId = "scratch-direct";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-direct";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+              kind: "scratch",
+              projectName: "Scratch",
+              namedWorkspacePath: scratchWorkdir,
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
+  });
+
+  test("browser direct open clears an unknown workspace after metadata loads", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+      },
+      locationPath: "/workspace/ws-missing",
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe("/existing"));
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
+  test("browser direct open keeps the persisted selection when the workspace list is empty", async () => {
+    // workspace.list swallows backend read failures and resolves [], so an
+    // empty list is not proof the workspace is gone; the stale-route cleanup
+    // must not wipe the persisted selection. (The startup fallback may still
+    // navigate to a project page; that pre-existing behavior is not under test.)
+    const persistedSelection = {
+      workspaceId: "ws-maybe-alive",
+      projectPath: "/existing",
+      projectName: "existing",
+      namedWorkspacePath: "/existing-main",
+    };
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([]),
+      },
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+        [SELECTED_WORKSPACE_KEY]: JSON.stringify(persistedSelection),
+      },
+      locationPath: "/workspace/ws-maybe-alive",
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toContain("ws-maybe-alive");
+  });
+
   test("resolves system project route IDs for pending workspace creation", async () => {
     const systemProjectPath = "/system/internal-project";
     const systemProjectId = getProjectRouteId(systemProjectPath);
@@ -1019,6 +1592,25 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().loading).toBe(false));
     expect(ctx().pendingNewWorkspaceProject).toBe(systemProjectPath);
+  });
+
+  test("reloaded scratch draft route resolves without a configured _scratch project", async () => {
+    // Before the first scratch chat is ever created, no _scratch bucket exists
+    // in config, and reloads drop the in-memory route state, so the route ID
+    // must resolve statically or the draft page cannot remount.
+    const scratchRouteId = getProjectRouteId(SCRATCH_PROJECT_CONFIG_KEY);
+
+    createMockAPI({
+      locationPath: `/project?project=${encodeURIComponent(scratchRouteId)}`,
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY);
   });
 
   test("browser: launch-project opens project creation on true first launch", async () => {
@@ -1457,7 +2049,368 @@ describe("WorkspaceContext", () => {
       expect(state.pendingNewWorkspaceProject).toBeNull();
     });
   });
+
+  test("collects the settings keys of creation drafts the backend no longer lists (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const service = new DraftService(config);
+    await service.putListEntry({
+      projectPath,
+      draftId: "listed",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    const listedKey = getModelKey(getDraftScopeId(projectPath, "listed"));
+    // Deleted in another window: only its settings are left in this origin.
+    const orphanKey = getModelKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [listedKey]: JSON.stringify("m"), [orphanKey]: JSON.stringify("m") },
+      locationPath: "/settings",
+    });
+    currentClientMock.drafts = createDraftServiceClient(service);
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(localStorage.getItem(orphanKey)).toBeNull());
+      expect(localStorage.getItem(listedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
+  test("never collects the settings of the draft a cold start routes to (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc-route");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    // Routed but unlisted (e.g. its list write never landed).
+    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [routedKey]: JSON.stringify("m") },
+      locationPath: `/project?project=${encodeURIComponent(getProjectRouteId(projectPath))}&draft=routed`,
+    });
+    const service = new DraftService(config);
+    currentClientMock.drafts = createDraftServiceClient(service);
+    const getList = mock(() => service.getList({ strict: true }));
+    currentClientMock.drafts.getList = getList;
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(getList).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(localStorage.getItem(routedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
+  test.each([
+    { name: "project", linkedPath: "/alpha", subProjectPath: null },
+    { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },
+  ])(
+    "a new_chat deep link lists its draft even when localStorage is full ($name)",
+    async ({ linkedPath, subProjectPath }) => {
+      const projectPath = "/alpha";
+      createMockAPI({
+        projects: {
+          list: () =>
+            Promise.resolve([
+              [projectPath, { workspaces: [] }],
+              ["/alpha/sub", { workspaces: [], parentProjectPath: projectPath }],
+            ]),
+        },
+        pendingDeepLinks: [{ type: "new_chat", projectPath: linkedPath, prompt: "from the link" }],
+        // An explicit route, so only the deep link navigates.
+        locationPath: "/settings",
+      });
+      // A full origin: the draft list no longer depends on localStorage (#5225).
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: new QuotaLimitedStorage(0),
+      });
+      try {
+        const ctx = await setup();
+
+        await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(1));
+        const [draft] = ctx().workspaceDraftsByProject[projectPath];
+        expect(draft.subProjectPath).toBe(subProjectPath);
+        expect(ctx().pendingNewWorkspaceDraftId).toBe(draft.draftId);
+        expect(
+          getDraftStore().getText({ kind: "creation", projectPath, draftId: draft.draftId })
+        ).toBe("from the link");
+      } finally {
+        getDraftStore().forgetProject(projectPath);
+      }
+    }
+  );
+
+  test("keeps every creation draft listed across a restart when the list outgrows 32 KiB (#5225)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-list");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    // A long sub-project path makes each list entry large (#5225).
+    const subProjectPath = path.join(projectPath, "packages", "x".repeat(300));
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const projectList = () =>
+      Promise.resolve([
+        [projectPath, { workspaces: [] }],
+        [subProjectPath, { workspaces: [], parentProjectPath: projectPath }],
+      ] as Awaited<ReturnType<APIClient["projects"]["list"]>>);
+    const connect = () => {
+      currentClientMock.drafts = createDraftServiceClient(new DraftService(config));
+      getDraftStore().setClient(createTestApiClient(currentClientMock));
+    };
+    const count = 120;
+    createMockAPI({ projects: { list: projectList }, locationPath: "/settings" });
+    connect();
+    try {
+      const ctx = await setup();
+      await waitFor(() => expect(getDraftStore().isReady()).toBe(true));
+      const draftIds = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        act(() => ctx().createWorkspaceDraft(projectPath, subProjectPath));
+        const draftId = ctx().pendingNewWorkspaceDraftId;
+        expect(draftId === null || draftIds.has(draftId)).toBe(false);
+        draftIds.add(draftId!);
+        // Non-empty, so the next create does not reuse it.
+        const scope: DraftScope = { kind: "creation", projectPath, draftId: draftId! };
+        getDraftStore().setText(scope, `draft ${i}`);
+        await getDraftStore().flush(scope);
+      }
+      await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(count));
+
+      // Restart: a new window with what reached disk, a new backend process, a remount.
+      const persisted: Record<string, string> = {};
+      for (let index = 0; index < window.localStorage.length; index++) {
+        const key = window.localStorage.key(index)!;
+        persisted[key] = window.localStorage.getItem(key)!;
+      }
+      cleanup();
+      createMockAPI({ projects: { list: projectList }, localStorage: persisted });
+      connect();
+      const restarted = await setup();
+      await waitFor(
+        () =>
+          expect(
+            new Set(restarted().workspaceDraftsByProject[projectPath]?.map((d) => d.draftId))
+          ).toEqual(draftIds),
+        { timeout: 5_000 }
+      );
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  }, 30_000);
+
+  describe("reorderPinnedWorkspaces", () => {
+    // Three pinned chats in one project; pinnedAt ascending = a, b, c.
+    const T1 = "2026-01-01T00:00:00.000Z";
+    const T2 = "2026-01-01T00:00:01.000Z";
+    const T3 = "2026-01-01T00:00:02.000Z";
+    const pinnedWorkspaces = (): FrontendWorkspaceMetadata[] => [
+      createProjectWorkspaceMetadata("ws-a", "/alpha", { pinnedAt: T1 }),
+      createProjectWorkspaceMetadata("ws-b", "/alpha", { pinnedAt: T2 }),
+      createProjectWorkspaceMetadata("ws-c", "/alpha", { pinnedAt: T3 }),
+    ];
+    type ReorderResult = { success: true; data: undefined } | { success: false; error: string };
+    const createDeferred = () => {
+      let resolve!: (value: ReorderResult) => void;
+      const promise = new Promise<ReorderResult>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+    const pinnedAtById = (ctx: () => WorkspaceContext): Record<string, string | undefined> => ({
+      "ws-a": ctx().workspaceMetadata.get("ws-a")?.pinnedAt,
+      "ws-b": ctx().workspaceMetadata.get("ws-b")?.pinnedAt,
+      "ws-c": ctx().workspaceMetadata.get("ws-c")?.pinnedAt,
+    });
+
+    test("failed reorder reverts the optimistic pinnedAt values", async () => {
+      const deferred = createDeferred();
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve(pinnedWorkspaces()),
+          reorderPinned: () => deferred.promise,
+        },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(3));
+
+      let request!: Promise<{ success: boolean; error?: string }>;
+      act(() => {
+        request = ctx().reorderPinnedWorkspaces(["ws-b", "ws-a", "ws-c"]);
+      });
+      // Optimistic re-deal of the existing pool: b<a<c.
+      expect(pinnedAtById(ctx)).toEqual({ "ws-a": T2, "ws-b": T1, "ws-c": T3 });
+
+      deferred.resolve({ success: false, error: "boom" });
+      await act(async () => {
+        expect(await request).toEqual({ success: false, error: "boom" });
+      });
+
+      expect(pinnedAtById(ctx)).toEqual({ "ws-a": T1, "ws-b": T2, "ws-c": T3 });
+    });
+
+    test("stale reorder failure does not clobber a newer reorder's state", async () => {
+      const first = createDeferred();
+      const second = createDeferred();
+      let calls = 0;
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve(pinnedWorkspaces()),
+          reorderPinned: () => (calls++ === 0 ? first.promise : second.promise),
+        },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(3));
+
+      let request1!: Promise<{ success: boolean; error?: string }>;
+      let request2!: Promise<{ success: boolean; error?: string }>;
+      act(() => {
+        request1 = ctx().reorderPinnedWorkspaces(["ws-b", "ws-a", "ws-c"]);
+      });
+      act(() => {
+        request2 = ctx().reorderPinnedWorkspaces(["ws-c", "ws-b", "ws-a"]);
+      });
+      // Second reorder's optimistic re-deal on top of the first: c<b<a.
+      const afterSecond = pinnedAtById(ctx);
+      expect(afterSecond).toEqual({ "ws-a": T3, "ws-b": T2, "ws-c": T1 });
+
+      // Out-of-order completion: #2 succeeds, then the stale #1 fails. Its
+      // revert must not roll entries back underneath the newer reorder.
+      second.resolve({ success: true, data: undefined });
+      await act(async () => {
+        await request2;
+      });
+      first.resolve({ success: false, error: "boom" });
+      await act(async () => {
+        await request1;
+      });
+
+      expect(pinnedAtById(ctx)).toEqual(afterSecond);
+    });
+  });
+
+  describe("startup orphaned storage GC", () => {
+    const ACTIVE_ID = "a0a0a0a0a0";
+    const ORPHAN_ID = "deadbeef00";
+
+    test("removes keys of workspaces the backend does not know after a successful load", async () => {
+      resetWorkspaceStorageGcForTests();
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
+        localStorage: {
+          [getModelKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getModelKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
+        },
+      });
+
+      await setup();
+
+      await waitFor(() => expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull());
+      expect(localStorage.getItem(getModelKey(ACTIVE_ID))).not.toBeNull();
+    });
+
+    test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
+      resetWorkspaceStorageGcForTests();
+      let failLoad = true;
+      const { workspace: workspaceApi } = createMockAPI({
+        workspace: {
+          list: () =>
+            failLoad
+              ? Promise.reject(new Error("metadata unavailable"))
+              : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        localStorage: { [getModelKey(ORPHAN_ID)]: JSON.stringify("draft") },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().loading).toBe(false));
+      failLoad = false;
+      await act(() => ctx().refreshWorkspaceMetadata());
+      await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
+
+      expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
+      expect(localStorage.getItem(getModelKey(ORPHAN_ID))).not.toBeNull();
+    });
+  });
 });
+
+/** A drafts API backed by a real DraftService (real files), passing every call through. */
+function createDraftServiceClient(service: DraftService): TestApiOverrides<APIClient["drafts"]> {
+  return {
+    list: () => service.list(),
+    get: ({ scope }) => service.get(scope),
+    update: (input) => service.update(input),
+    delete: ({ scope }) => service.delete(scope),
+    importLegacy: (input) => service.importLegacy(input),
+    getList: () => service.getList({ strict: true }),
+    putListEntry: (input) => service.putListEntry(input),
+    importLegacyList: ({ entries }) => service.importLegacyList(entries),
+    subscribe: async (_input, opts) => {
+      const queue: DraftEvent[] = [];
+      let wake: (() => void) | null = null;
+      const listener = (event: DraftEvent) => {
+        queue.push(event);
+        wake?.();
+      };
+      service.on(DraftService.CHANGE_EVENT, listener);
+      queue.unshift(await service.getSnapshotEvent());
+      return (async function* () {
+        try {
+          while (!opts?.signal?.aborted) {
+            const next = queue.shift();
+            if (next) {
+              yield next;
+              continue;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        } finally {
+          service.off(DraftService.CHANGE_EVENT, listener);
+        }
+      })();
+    },
+  };
+}
 
 async function setup() {
   const contexts = await setupWithProjectContext();
@@ -1475,17 +2428,19 @@ async function setupWithProjectContext() {
   }
 
   render(
-    <RouterProvider>
-      <ProjectProvider>
-        <WorkspaceProvider>
-          <ContextCapture />
-        </WorkspaceProvider>
-      </ProjectProvider>
-    </RouterProvider>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <ContextCapture />
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
+    </APIProvider>
   );
 
   // Inject client immediately to handle race conditions where effects run before store update.
-  getWorkspaceStoreRaw().setClient(currentClientMock as APIClient);
+  getWorkspaceStoreRaw().setClient(createTestApiClient(currentClientMock));
   await waitFor(() => expect(workspaceRef.current).toBeTruthy());
   await waitFor(() => expect(projectRef.current).toBeTruthy());
 
@@ -1493,9 +2448,9 @@ async function setupWithProjectContext() {
 }
 
 interface MockAPIOptions {
-  workspace?: RecursivePartial<APIClient["workspace"]>;
-  projects?: RecursivePartial<APIClient["projects"]>;
-  server?: RecursivePartial<APIClient["server"]>;
+  workspace?: TestApiOverrides<APIClient["workspace"]>;
+  projects?: TestApiOverrides<APIClient["projects"]>;
+  server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
   locationHash?: string;
   locationPath?: string;
@@ -1564,6 +2519,10 @@ function createMockAPI(options: MockAPIOptions = {}) {
       options.workspace?.archive ??
         (() => Promise.resolve({ success: true as const, data: { kind: "archived" as const } }))
     ),
+    preflightArchive: mock(
+      options.workspace?.preflightArchive ??
+        (() => Promise.resolve({ success: true as const, data: { kind: "ready" as const } }))
+    ),
     unarchive: mock(
       options.workspace?.unarchive ??
         (() => Promise.resolve({ success: true as const, data: undefined }))
@@ -1576,7 +2535,20 @@ function createMockAPI(options: MockAPIOptions = {}) {
       options.workspace?.updateTitle ??
         (() => Promise.resolve({ success: true as const, data: undefined }))
     ),
+    setPinned: mock(
+      options.workspace?.setPinned ??
+        (() => Promise.resolve({ success: true as const, data: undefined }))
+    ),
+    reorderPinned: mock(
+      options.workspace?.reorderPinned ??
+        (() => Promise.resolve({ success: true as const, data: undefined }))
+    ),
     getInfo: mock(options.workspace?.getInfo ?? (() => Promise.resolve(null))),
+    // Never settles by default, so startup storage GC removes nothing unless a test opts in.
+    listKnownIdsForStorageGc: mock(
+      options.workspace?.listKnownIdsForStorageGc ??
+        (() => new Promise<{ workspaceIds: string[] }>(() => undefined))
+    ),
     // Async generators for subscriptions
     onMetadata: mock(
       options.workspace?.onMetadata ??

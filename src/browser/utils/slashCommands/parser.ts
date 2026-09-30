@@ -5,10 +5,20 @@
 import type { ParsedCommand, SlashCommandDefinition } from "./types";
 import { SLASH_COMMAND_DEFINITION_MAP } from "./registry";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
-import { normalizeModelInput } from "@/browser/utils/models/normalizeModelInput";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { parseThinkingInput, type ParsedThinkingInput } from "@/common/types/thinking";
 
-export { SLASH_COMMAND_DEFINITIONS } from "./registry";
+function tokenizeSlashCommandTokens(input: string): string[] {
+  return input.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+}
+
+function unquoteSlashCommandToken(token: string): string {
+  return token.replace(/^"(.*)"$/, "$1");
+}
+
+export function tokenizeSlashCommandArguments(input: string): string[] {
+  return tokenizeSlashCommandTokens(input).map(unquoteSlashCommandToken);
+}
 
 /**
  * Parse a raw command string into a structured command
@@ -23,7 +33,7 @@ export function parseCommand(input: string): ParsedCommand {
 
   // Remove leading slash and split by spaces (respecting quotes)
   // Parse tokens from the full input so newlines can act as whitespace between args.
-  const parts = (trimmed.substring(1).match(/(?:[^\s"]+|"[^"]*")+/g) ?? []) as string[];
+  const parts = tokenizeSlashCommandTokens(trimmed.substring(1));
   if (parts.length === 0) {
     return null;
   }
@@ -90,7 +100,7 @@ export function parseCommand(input: string): ParsedCommand {
     };
   }
 
-  const cleanRemainingTokens = remainingTokens.map((token) => token.replace(/^"(.*)"$/, "$1"));
+  const cleanRemainingTokens = remainingTokens.map(unquoteSlashCommandToken);
 
   // Calculate rawInput: everything after the command key, preserving newlines
   // For "/compact -t 5000\nContinue here", rawInput should be "-t 5000\nContinue here"

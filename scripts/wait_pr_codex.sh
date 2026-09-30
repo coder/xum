@@ -31,6 +31,8 @@ fi
 # Polling every 30s reduces GitHub API churn while still giving timely readiness updates.
 POLL_INTERVAL_SECS=30
 
+# Comment/review authors come back as this login, but a reaction's `user.login` is the
+# bot's User login with a "[bot]" suffix; the reaction matchers accept both.
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CHECK_CODEX_COMMENTS_SCRIPT="$SCRIPT_DIR/check_codex_comments.sh"
@@ -106,6 +108,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
       state
+      headRefOid
       comments(last: 100) {
         pageInfo {
           hasPreviousPage
@@ -130,6 +133,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
           comments(first: 1) {
             nodes {
               id
+              fullDatabaseId
               author { login }
               body
               createdAt
@@ -263,7 +267,8 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
     fi
 
     page_nodes=$(echo "$reactions_page" | jq -c '.data.repository.pullRequest.reactions.nodes // []')
-    all_reactions=$(jq -cn --argjson existing "$all_reactions" --argjson page "$page_nodes" '$existing + $page')
+    # Via stdin: accumulated pages can exceed Linux's per-argument limit (MAX_ARG_STRLEN).
+    all_reactions=$(printf '%s\n%s' "$all_reactions" "$page_nodes" | jq -cs '.[0] + .[1]')
 
     has_next=$(echo "$reactions_page" | jq -r '.data.repository.pullRequest.reactions.pageInfo.hasNextPage')
     end_cursor=$(echo "$reactions_page" | jq -r '.data.repository.pullRequest.reactions.pageInfo.endCursor // empty')
@@ -358,9 +363,19 @@ record_full_reactions_scan() {
   fi
 }
 
+# Sets check_output and check_rc (0 clean, 1 unresolved, 10 review still running).
+run_codex_comments_gate() {
+  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+    check_rc=0
+  else
+    check_rc=$?
+  fi
+}
+
 CHECK_CODEX_STATUS_ONCE() {
   local pr_data
   local pr_state
+  local pr_head
   local all_comments
   local all_threads
   local request_at
@@ -385,6 +400,11 @@ CHECK_CODEX_STATUS_ONCE() {
   fi
 
   pr_state=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.state // empty')
+  pr_head=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')
+  if ! [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$pr_head'" >&2
+    return 1
+  fi
 
   if [[ -z "$pr_state" ]]; then
     echo "❌ Unable to fetch PR state for #$PR_NUMBER in ${OWNER}/${REPO}." >&2
@@ -448,7 +468,7 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select(.user.login == $bot and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+  approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
     echo ""
@@ -458,7 +478,20 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  codex_response_count_comments=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select(.author.login == $bot and .createdAt > $request_at)] | length')
+  # Completed no-findings security envelopes for the current head are neither
+  # approval nor a failed review; they are excluded so the poller keeps waiting
+  # for the approval signal. Summary boards never count: whether a board blocks
+  # depends on every review thread (resolved advisories), and only the paginated
+  # gate below sees them all. Other comments, including account errors, count.
+  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" '
+    include "codex_comments";
+    [.[] | select(.author.login == $bot and .createdAt > $request_at)
+      | select(
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->"))
+            or ((.body | codex_without_help | startswith("Security review completed."))
+              and codex_comment_is_informational($bot; $head; []))) | not
+        )] | length
+  ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
   codex_response_count=$((codex_response_count_comments + codex_response_count_threads))
 
@@ -495,7 +528,7 @@ CHECK_CODEX_STATUS_ONCE() {
     all_thumbs_up_reactions=$(FETCH_ALL_THUMBS_UP_REACTIONS) || return 1
     now_epoch=$(date +%s)
     record_full_reactions_scan "$request_at" "$now_epoch" || return 1
-    approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select(.user.login == $bot and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+    approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
       echo ""
@@ -506,16 +539,26 @@ CHECK_CODEX_STATUS_ONCE() {
     fi
   fi
 
+  # No approval yet. The gate is the single source of truth for what blocks: it
+  # paginates every comment and thread, so an unresolved thread from before the
+  # request or a board pushed out of this script's 100-comment window still fails
+  # fast here instead of after the review ends. Gate 10 means Codex is still
+  # reviewing the current head and nothing else blocks.
+  run_codex_comments_gate
+  case "$check_rc" in
+    0) ;;
+    10)
+      return 10
+      ;;
+    *)
+      echo ""
+      echo "$check_output"
+      return 1
+      ;;
+  esac
+
   if [ "$codex_response_count" -eq 0 ]; then
     return 10
-  fi
-
-  # Codex responded to the latest @codex review request; defer to check_codex_comments.sh for
-  # unresolved comment/thread detection so we don't duplicate filtering logic here.
-  if ! check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
-    echo ""
-    echo "$check_output"
-    return 1
   fi
 
   echo ""

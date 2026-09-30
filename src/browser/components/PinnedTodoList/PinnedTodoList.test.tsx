@@ -31,12 +31,17 @@ function buildWorkspaceState(workspaceId: string, state: MockWorkspaceState): Wo
     name: workspaceId,
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,
     awaitingUserQuestion: false,
     loading: false,
+    isTranscriptCaughtUp: true,
+    transcriptReplayFailed: false,
     isHydratingTranscript: false,
+    isTranscriptStale: false,
+    isIncrementalCatchUp: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],
@@ -47,6 +52,8 @@ function buildWorkspaceState(workspaceId: string, state: MockWorkspaceState): Wo
     loadedSkills: [],
     skillLoadErrors: [],
     agentStatus: undefined,
+    activeWorkflowRunCount: 0,
+    activeBashMonitorCount: 0,
     lastAbortReason: null,
     pendingStreamStartTime: null,
     pendingStreamModel: null,
@@ -130,6 +137,18 @@ describe("PinnedTodoList", () => {
     const renderResult = renderPinnedTodoList("ws-expanded");
 
     expect(renderResult.getByText("Add tests")).toBeTruthy();
+  });
+
+  test("spins the HTML wrapper instead of the in-progress SVG", () => {
+    seedWorkspaceState("ws-composited-spinner", { todos: defaultTodos });
+
+    const renderResult = renderPinnedTodoList("ws-composited-spinner");
+    const spinner = renderResult.container.querySelector(".animate-spin");
+    const icon = spinner?.querySelector("svg");
+
+    expect(spinner?.tagName).toBe("SPAN");
+    expect(icon).toBeTruthy();
+    expect(icon?.classList.contains("animate-spin")).toBe(false);
   });
 
   test("renders nothing when there are no todos", () => {

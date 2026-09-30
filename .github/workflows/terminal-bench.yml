@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       model_name:
-        description: "Model to use (e.g., anthropic/claude-opus-4-7, openai/gpt-5.5)"
+        description: "Model to use (e.g., anthropic/claude-opus-5-5, openai/gpt-5.6-sol)"
         required: false
         type: string
       dataset:
@@ -59,6 +59,11 @@ on:
         required: false
         type: boolean
         default: false
+      allow_transient_agent_errors:
+        description: "Allow explicitly classified transient agent failures (full nightly only)"
+        required: false
+        type: boolean
+        default: false
     secrets:
       # Keep the runtime env name stable while routing benchmark spend to its own key.
       TERMINAL_BENCH_ANTHROPIC_API_KEY:
@@ -93,7 +98,7 @@ on:
         required: false
         type: string
       model_name:
-        description: "Model to use (e.g., anthropic/claude-opus-4-7, openai/gpt-5.5)"
+        description: "Model to use (e.g., anthropic/claude-opus-5-5, openai/gpt-5.6-sol)"
         required: false
         type: string
       mux_run_args:
@@ -140,7 +145,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Install uv
         run: |
@@ -171,26 +176,9 @@ jobs:
           if [ -z "$DAYTONA_API_KEY" ]; then
             exit 0
           fi
-          pip install --quiet daytona
-          python3 <<'PY' > /tmp/daytona-pre-existing.txt
-          from daytona import Daytona
-
-          def list_all_sandboxes(daytona):
-              # Daytona returns paginated results. Snapshot every page so cleanup
-              # can distinguish old sandboxes from ones this run created.
-              page = 1
-              while True:
-                  result = daytona.list(page=page)
-                  yield from result.items
-                  total_pages = result.total_pages or 1
-                  if page >= total_pages:
-                      break
-                  page += 1
-
-          d = Daytona()
-          ids = [sb.id for sb in list_all_sandboxes(d)]
-          print('\n'.join(ids))
-          PY
+          pip install --quiet 'daytona>=0.180.0,<2'
+          python3 -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
+          python3 scripts/daytona_sandbox_cleanup.py snapshot > /tmp/daytona-pre-existing.txt
           echo "Snapshot $(wc -l < /tmp/daytona-pre-existing.txt) pre-existing sandbox(es)"
 
       - name: Run Terminal-Bench
@@ -237,45 +225,9 @@ jobs:
             echo "No pre-run snapshot found, skipping cleanup to avoid deleting unrelated sandboxes"
             exit 0
           fi
-          pip install --quiet daytona
-          python3 <<'PY'
-          from daytona import Daytona
-
-          def list_all_sandboxes(daytona):
-              # Daytona returns paginated results. Cleanup must inspect every
-              # page so stopped sandboxes from high-concurrency runs do not leak.
-              page = 1
-              while True:
-                  result = daytona.list(page=page)
-                  yield from result.items
-                  total_pages = result.total_pages or 1
-                  if page >= total_pages:
-                      break
-                  page += 1
-
-          with open('/tmp/daytona-pre-existing.txt') as f:
-              pre_existing = {line.strip() for line in f if line.strip()}
-          d = Daytona()
-          # Only consider sandboxes created after our snapshot (not pre-existing)
-          # and only delete ones that are no longer running (safe for parallel jobs).
-          ACTIVE_STATES = {'started', 'creating', 'starting'}
-          candidates = [sb for sb in list_all_sandboxes(d) if sb.id not in pre_existing]
-          to_delete = [sb for sb in candidates if str(sb.state).lower() not in ACTIVE_STATES]
-          skipped = len(candidates) - len(to_delete)
-          if skipped:
-              print(f'Skipping {skipped} still-active sandbox(es)')
-          if not to_delete:
-              print('No stopped sandboxes to clean up')
-          else:
-              print(f'Cleaning up {len(to_delete)} stopped sandbox(es) from this run...')
-              for sb in to_delete:
-                  try:
-                      print(f'  Deleting {sb.id} (state={sb.state})...')
-                      d.delete(sb)
-                      print(f'  Deleted {sb.id}')
-                  except Exception as e:
-                      print(f'  Failed to delete {sb.id}: {e}')
-          PY
+          pip install --quiet 'daytona>=0.180.0,<2'
+          python3 -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
+          python3 scripts/daytona_sandbox_cleanup.py cleanup --pre-existing-file /tmp/daytona-pre-existing.txt
 
       - name: Print results summary
         if: always()
@@ -291,73 +243,22 @@ jobs:
           fi
 
       - name: Verify agent ran successfully
-        run: |
-          # Harbor writes to jobs/<timestamp>/result.json
-          RESULTS_FILE=$(find jobs -maxdepth 2 -name 'result.json' 2>/dev/null | head -1)
-          if [ -z "$RESULTS_FILE" ]; then
-            echo "❌ No result.json found - benchmark failed to produce results"
-            exit 1
-          fi
-          # Harbor has used both top-level stats.n_errors and stats.n_errored_trials;
-          # fall back to per-eval n_errors so schema drift cannot hide broken runs.
-          N_TRIALS=$(jq -r '.n_total_trials // .stats.n_trials // 0' "$RESULTS_FILE")
-          N_ERRORS=$(jq -r '.stats.n_errors // .stats.n_errored_trials // (reduce ((.stats.evals // {}) | to_entries[]) as $eval (0; . + ($eval.value.n_errors // 0)))' "$RESULTS_FILE")
-          # Get mean score from first eval entry (pass rate 0-1)
-          MEAN_SCORE=$(jq -r '[.stats.evals | to_entries[].value.metrics[0].mean] | add // 0' "$RESULTS_FILE")
-          echo "Trials: $N_TRIALS, Errors: $N_ERRORS, Mean score: $MEAN_SCORE"
-          if [ "$N_TRIALS" -eq 0 ]; then
-            echo "❌ No trials ran - benchmark configuration may be wrong"
-            exit 1
-          fi
-          # Count infrastructure/timeout errors separately from other errors
-          # These error types are expected and should not fail the workflow:
-          # - AgentTimeoutError: Agent exceeded task time limit (hard tasks)
-          # - VerifierTimeoutError: Verification timed out
-          # - AgentSetupTimeoutError: Agent install.sh timed out (slow network/packages)
-          # - EnvironmentStartTimeoutError: Daytona environment slow to start
-          # - DaytonaError: Daytona infrastructure issues (sandbox not started, no IP, etc.)
-          INFRA_PATTERN="(AgentTimeoutError|VerifierTimeoutError|AgentSetupTimeoutError|EnvironmentStartTimeoutError|DaytonaError)"
-          INFRA_ERRORS=$(find jobs -name 'exception.txt' -exec grep -lE "$INFRA_PATTERN" {} \; 2>/dev/null | wc -l | tr -d ' ')
-          OTHER_ERRORS=$((N_ERRORS - INFRA_ERRORS))
-          # Clamp to 0 in case exception.txt files exceed n_errors (defensive)
-          if [ "$OTHER_ERRORS" -lt 0 ]; then OTHER_ERRORS=0; fi
-          if [ "$OTHER_ERRORS" -gt 0 ]; then
-            echo "❌ $OTHER_ERRORS task(s) had non-infrastructure errors - agent execution failed"
-            echo "--- Exception details (excluding infra errors) ---"
-            find jobs -name 'exception.txt' -exec sh -c 'grep -qE "'"$INFRA_PATTERN"'" "$1" || { echo "=== $1 ===" && cat "$1"; }' _ {} \; 2>/dev/null || true
-            exit 1
-          fi
-          if [ "$INFRA_ERRORS" -gt 0 ]; then
-            echo "⏱️ $INFRA_ERRORS task(s) had infrastructure/timeout errors (expected for hard tasks or transient infra issues)"
-          fi
-          echo "✅ Agent ran $N_TRIALS trial(s) successfully (mean score: $MEAN_SCORE)"
-
-      - name: Set artifact name
-        if: always()
-        id: artifact-name
         env:
-          MODEL_NAME: ${{ inputs.model_name }}
-          DATASET: ${{ inputs.dataset }}
-          TASK_NAMES: ${{ inputs.task_names }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ALLOW_TRANSIENT_AGENT_ERRORS: ${{ inputs.allow_transient_agent_errors && '1' || '' }}
         run: |
-          # actions/upload-artifact@v7 requires artifact names to be unique per workflow run.
-          # Nightly workflows can run multiple jobs with the same model (e.g. Harbor smoke tests),
-          # so include dataset + task selection in the artifact name.
-          sanitize() { printf "%s" "$1" | tr ' :/@' '-' | tr -cd 'A-Za-z0-9._-'; }
-
-          SAFE_MODEL=$(sanitize "${MODEL_NAME:-no-model}")
-          SAFE_DATASET=$(sanitize "${DATASET:-unknown-dataset}")
-          if [ -n "${TASK_NAMES:-}" ]; then
-            SAFE_TASKS=$(sanitize "$TASK_NAMES")
-          else
-            SAFE_TASKS="all-tasks"
+          args=(--jobs-dir jobs)
+          if [ "$ALLOW_TRANSIENT_AGENT_ERRORS" = "1" ]; then
+            args+=(--allow-transient-agent-errors)
           fi
+          python3 scripts/check_tbench_results.py "${args[@]}"
 
-          ARTIFACT_NAME="terminal-bench-results-${SAFE_MODEL}-${SAFE_DATASET}-${SAFE_TASKS}-${RUN_ID}-a${RUN_ATTEMPT}"
-          echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          echo "Artifact name: $ARTIFACT_NAME"
+      # SECURITY: do not add an actions/upload-artifact step for jobs/ or
+      # benchmark.log. Agent stdout under jobs/ can capture provider API keys
+      # (Harbor serialises the run env as `env NAME=value ...` on the process
+      # argv, which task-side `ps` output copies into agent stdout), and
+      # artifacts on a public repo are downloadable by any authenticated
+      # GitHub user. Run output must stay on the runner; aggregate results go
+      # to BigQuery below.
 
       - name: Upload Terminal-Bench results to BigQuery
         if: always() && github.repository == 'coder/mux' && startsWith(inputs.dataset, 'terminal-bench@')
@@ -396,14 +297,3 @@ jobs:
           pip install --quiet google-cloud-bigquery
           python scripts/upload-harbor-results.py
           rm -f /tmp/gcp-sa.json
-
-      - name: Upload benchmark results
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: |
-            jobs/
-            benchmark.log
-          if-no-files-found: warn
-          retention-days: 30

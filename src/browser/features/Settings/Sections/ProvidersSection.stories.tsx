@@ -1,4 +1,4 @@
-import { CHROMATIC_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, waitFor, within } from "@storybook/test";
 import { ProvidersSection } from "./ProvidersSection.js";
@@ -8,6 +8,9 @@ const meta: Meta = {
   ...lightweightMeta,
   title: "Settings/Sections/ProvidersSection",
   component: ProvidersSection,
+  parameters: {
+    pixel: PIXEL_DISABLED,
+  },
 };
 
 export default meta;
@@ -83,7 +86,7 @@ export const ProvidersEnvSourced: Story = {
     </SettingsSectionStory>
   ),
   parameters: {
-    chromatic: CHROMATIC_DISABLED,
+    pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
@@ -97,6 +100,33 @@ export const ProvidersEnvSourced: Story = {
         throw new Error("Expected env source labels for OpenAI key and base URL");
       }
     });
+  },
+};
+
+export const XAIProcessingMode: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            xai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              serviceTier: "priority",
+            },
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const xaiButton = await canvas.findByRole("button", { name: /xAI/i });
+    await userEvent.click(xaiButton);
+    await canvas.findByText("fast (priority)");
   },
 };
 

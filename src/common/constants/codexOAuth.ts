@@ -8,6 +8,11 @@
  * UI can reference the same endpoints and model gating rules.
  */
 
+import {
+  resolveModelForMetadata,
+  type ProviderModelsConfig,
+} from "@/common/utils/providers/modelEntries";
+
 // NOTE: These endpoints + params follow the OpenCode Codex OAuth guide.
 // If OpenAI changes them, keep all updates centralized here.
 
@@ -27,6 +32,12 @@ export const CODEX_OAUTH_TOKEN_URL = `${CODEX_OAUTH_ORIGIN}/oauth/token`;
 // IMPORTANT: This is *not* the public OpenAI platform endpoint (api.openai.com).
 // Codex OAuth tokens are only valid against this ChatGPT backend.
 export const CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+
+// Marks error responses that the provider fetch wrapper rerouted to the Codex
+// backend. The reroute happens inside fetch, AFTER the SDK fixes the request
+// URL it reports on APICallError, so error consumers cannot infer the actual
+// endpoint from the URL alone.
+export const CODEX_OAUTH_ROUTED_HEADER = "x-xum-codex-oauth-routed";
 
 // We request offline_access to receive refresh tokens.
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access";
@@ -94,6 +105,25 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   "gpt-5.2",
   "gpt-5.4-mini",
   "gpt-5.5",
+  // GPT-5.6 family (July 9, 2026): available via both the public API and Codex.
+  // The bare alias is a servable model id (OpenAI routes it to Sol), so it must
+  // be allowed too or OAuth-only users selecting it fall to the API-key path.
+  "gpt-5.6",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  // GPT-6 Astra (September 3, 2026): served in Codex for ChatGPT subscribers and
+  // in the public API. Without this entry an OAuth-only user selecting Astra
+  // falls to the API-key path and fails with api_key_not_found.
+  "gpt-6-astra",
+  // GPT-6 Sol/Luna (September 22, 2026): listed in the Codex model catalog (see the
+  // context-window overrides below), so the promoted `gpt`/`sol`/`luna` aliases keep
+  // working for OAuth-only users.
+  "gpt-6-sol",
+  "gpt-6-luna",
+  // GPT-6.1 Sol (September 29, 2026): the Codex catalog's default model, so the
+  // promoted `gpt`/`sol` aliases keep working for OAuth-only users.
+  "gpt-6.1-sol",
   "gpt-5.2-codex",
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
@@ -119,9 +149,27 @@ export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
  * still use the public OpenAI limits.
  */
 const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
-  // User-reported routing limit: GPT-5.5's public API window is 1.05M, but the
-  // ChatGPT/Codex OAuth backend rejects prompts near that size and must compact at ~270K.
+  // The public API exposes a 1.05M window for these models, but the ChatGPT/Codex
+  // model catalog publishes smaller context windows.
+  // Keep auth-route caps separate so API-key requests retain the full public window.
   "gpt-5.5": 272_000,
+  // GPT-5.6 Sol/Terra/Luna: 272K default context_window (872K configurable max) in the
+  // pinned catalog below. The earlier 372K came from the July 2026 catalog, which
+  // openai/codex#39102 replaced. The bare alias routes to Sol.
+  "gpt-5.6": 272_000,
+  "gpt-5.6-sol": 272_000,
+  "gpt-5.6-terra": 272_000,
+  "gpt-5.6-luna": 272_000,
+  // GPT-6 Astra/Sol/Luna are each published at 272K (default context_window; the
+  // configurable max_context_window is 872K) in the pinned Codex catalog:
+  // https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
+  // Each entry is sourced from its own catalog row; do not copy one model's cap to another.
+  "gpt-6-astra": 272_000,
+  "gpt-6-sol": 272_000,
+  "gpt-6-luna": 272_000,
+  // GPT-6.1 Sol's own catalog row also publishes a 272K default context_window
+  // (872K configurable max).
+  "gpt-6.1-sol": 272_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {
@@ -140,6 +188,64 @@ export function isCodexOauthAllowedModelId(modelId: string): boolean {
 
 export function isCodexOauthRequiredModelId(modelId: string): boolean {
   return CODEX_OAUTH_REQUIRED_MODELS.has(normalizeCodexOauthModelId(modelId));
+}
+
+function normalizeOpenAIModelString(modelId: string): string | null {
+  const trimmedModelId = modelId.trim();
+  if (!trimmedModelId) {
+    return null;
+  }
+
+  if (trimmedModelId.startsWith("openai:")) {
+    return trimmedModelId.length > "openai:".length ? trimmedModelId : null;
+  }
+
+  if (trimmedModelId.startsWith("openai/")) {
+    return trimmedModelId.length > "openai/".length
+      ? `openai:${trimmedModelId.slice("openai/".length)}`
+      : null;
+  }
+
+  return trimmedModelId.includes(":") || trimmedModelId.includes("/")
+    ? null
+    : `openai:${trimmedModelId}`;
+}
+
+/**
+ * Resolve the OpenAI model whose capabilities a runtime model inherits.
+ *
+ * Custom OpenAI IDs may opt into Codex OAuth compatibility by mapping to a known
+ * OpenAI model. The runtime ID is still sent to OpenAI; only capability checks
+ * inherit from mappedToModel. Treat-as mappings also accept the bare and
+ * LiteLLM-style OpenAI IDs supported by metadata lookups.
+ */
+export function getCodexOauthCompatibilityModelId(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): string | null {
+  const runtimeModelId = normalizeOpenAIModelString(modelId);
+  if (runtimeModelId === null || !modelId.trim().startsWith("openai:")) {
+    return null;
+  }
+
+  const mappedModelId = resolveModelForMetadata(runtimeModelId, providersConfig);
+  return normalizeOpenAIModelString(mappedModelId) ?? runtimeModelId;
+}
+
+export function isCodexOauthAllowedModel(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): boolean {
+  const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
+  return compatibilityModelId !== null && isCodexOauthAllowedModelId(compatibilityModelId);
+}
+
+export function isCodexOauthRequiredModel(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): boolean {
+  const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
+  return compatibilityModelId !== null && isCodexOauthRequiredModelId(compatibilityModelId);
 }
 
 export function getCodexOauthContextWindowOverride(modelId: string): number | null {

@@ -1,6 +1,17 @@
-import { describe, it, expect, test } from "bun:test";
-import { isMac, matchesKeybind, KEYBINDS } from "./keybinds";
+import { afterEach, describe, it, expect, test } from "bun:test";
+import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
+
+// Many tests below swap in a stub `window` ({ api: { platform } }) without restoring it.
+// Bun shares globals across test files in a process, so the stub leaked into later files:
+// mermaid's module init saw `document` defined but a window without addEventListener,
+// threw, and every later importer of MarkdownComponents hit a TDZ ReferenceError.
+const originalWindow = globalThis.window;
+const originalNavigator = globalThis.navigator;
+afterEach(() => {
+  globalThis.window = originalWindow;
+  globalThis.navigator = originalNavigator;
+});
 
 // Helper to create a minimal keyboard event
 function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
@@ -14,6 +25,17 @@ function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
     ...overrides,
   } as KeyboardEvent;
 }
+
+describe("COPY_MARKDOWN keybind", () => {
+  test("accepts M without modifiers and rejects modified keys", () => {
+    expect(matchesKeybind(createEvent({ key: "m" }), KEYBINDS.COPY_MARKDOWN)).toBe(true);
+    for (const modifier of ["shiftKey", "ctrlKey", "metaKey", "altKey"]) {
+      expect(
+        matchesKeybind(createEvent({ key: "M", [modifier]: true }), KEYBINDS.COPY_MARKDOWN)
+      ).toBe(false);
+    }
+  });
+});
 
 describe("isMac", () => {
   it("falls back to navigator.platform when Electron API is missing", () => {
@@ -82,6 +104,47 @@ describe("CYCLE_AGENT keybind (Ctrl/Cmd+.)", () => {
     globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
     const event = createEvent({ key: ">", code: "Period", metaKey: true, shiftKey: true });
     expect(matchesKeybind(event, KEYBINDS.CYCLE_AGENT)).toBe(true);
+  });
+});
+
+describe("thinking adjustment keybinds (Ctrl/Cmd+Shift+[ and ])", () => {
+  it("INCREASE_THINKING matches Ctrl+Shift+] via the BracketRight code", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    // Shift turns "]" into "}", so matching must key off event.code, not event.key.
+    const event = createEvent({ key: "}", code: "BracketRight", ctrlKey: true, shiftKey: true });
+    expect(matchesKeybind(event, KEYBINDS.INCREASE_THINKING)).toBe(true);
+  });
+
+  it("DECREASE_THINKING matches Cmd+Shift+[ via the BracketLeft code on macOS", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    const event = createEvent({ key: "{", code: "BracketLeft", metaKey: true, shiftKey: true });
+    expect(matchesKeybind(event, KEYBINDS.DECREASE_THINKING)).toBe(true);
+  });
+
+  it("requires Shift (plain Ctrl+] does not increase)", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    const event = createEvent({ key: "]", code: "BracketRight", ctrlKey: true });
+    expect(matchesKeybind(event, KEYBINDS.INCREASE_THINKING)).toBe(false);
+  });
+
+  it("does not collide with NAVIGATE_BACK/FORWARD (which omit Shift)", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    // Ctrl+[ (history back) must not trigger a thinking decrease...
+    const back = createEvent({ key: "[", code: "BracketLeft", ctrlKey: true });
+    expect(matchesKeybind(back, KEYBINDS.NAVIGATE_BACK)).toBe(true);
+    expect(matchesKeybind(back, KEYBINDS.DECREASE_THINKING)).toBe(false);
+    // ...and Ctrl+Shift+[ (thinking decrease) must not trigger history back.
+    const decrease = createEvent({ key: "{", code: "BracketLeft", ctrlKey: true, shiftKey: true });
+    expect(matchesKeybind(decrease, KEYBINDS.DECREASE_THINKING)).toBe(true);
+    expect(matchesKeybind(decrease, KEYBINDS.NAVIGATE_BACK)).toBe(false);
+  });
+});
+
+describe("isKeybindDeprecated", () => {
+  it("flags the legacy TOGGLE_THINKING cycle but not the directional keybinds", () => {
+    expect(isKeybindDeprecated(KEYBINDS.TOGGLE_THINKING)).toBe(true);
+    expect(isKeybindDeprecated(KEYBINDS.INCREASE_THINKING)).toBe(false);
+    expect(isKeybindDeprecated(KEYBINDS.DECREASE_THINKING)).toBe(false);
   });
 });
 

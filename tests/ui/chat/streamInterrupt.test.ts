@@ -94,7 +94,6 @@ describe("Stream Interrupt UI (mock AI router)", () => {
       expect(retryButton).toBeUndefined();
 
       // Simulate workspace-switch catch-up hydration while interrupted history exists.
-      // eslint-disable-next-line react-hooks/rules-of-hooks -- plain singleton accessor, no React state.
       const storeRaw = useWorkspaceStoreRaw();
       const transientState = (
         storeRaw as unknown as {

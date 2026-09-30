@@ -33,6 +33,11 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
+      # Shared job gates, computed once instead of repeated in every job.
+      # tests: code or CI config changed, and this isn't the merge queue's post-merge
+      # push to main (the merge_group run already validated that exact commit).
+      tests: ${{ (steps.filter.outputs.src == 'true' || steps.filter.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+      linux-runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -52,12 +57,25 @@ jobs:
               - 'src/common/**'
               - 'tests/ipc/**'
               - 'tests/runtime/**'
+              # Shared Jest harness (setup.ts, testUtils.ts, __mocks__, fixtures), root-level
+              # suites (workerBudget.test.ts), tests/run, and Jest's own config: the
+              # integration job below runs Jest only when this filter (or browser) matches.
+              - 'tests/*'
+              - 'tests/__mocks__/**'
+              - 'tests/fixtures/**'
+              - 'tests/run/**'
+              - 'jest.config.js'
+              - 'babel.config.cjs'
+              - 'scripts/lib/worker_budget.js'
             browser:
               - 'src/browser/**'
               - 'tests/ui/**'
             config:
               - '.github/**'
-              - 'jest.config.cjs'
+              - 'scripts/**'
+              - 'packages/mux-compat/**'
+              - 'jest.config.js'
+              - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
               - 'bun.lock'
@@ -65,6 +83,10 @@ jobs:
               - 'vite*.ts'
               - 'Makefile'
               - 'electron-builder.yml'
+              # Pixel's default matrix and the Storybook config decide which snapshots exist,
+              # so the snapshot-budget step (Test / Storybook) must run when they change.
+              - 'pixel.jsonc'
+              - '.storybook/**'
             nix_deps:
               - 'package.json'
               - 'bun.lock'
@@ -73,14 +95,15 @@ jobs:
 
   static-check:
     name: Static Checks
+    needs: [changes]
     if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -165,41 +188,33 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test-unit:
-    name: Test / Unit
+    name: Test / Unit (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
+    timeout-minutes: 20
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The single-process suite was the pipeline's critical path; see scripts/test-unit-ci.sh.
+        # A manual test_filter runs unsharded.
+        shard: ${{ fromJSON(github.event.inputs.test_filter != '' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: make build-main
       # workflow_dispatch inputs are only triggerable by repo members, so direct
       # interpolation is acceptable and preserves shell quoting in the filter.
-      - run: | # zizmor: ignore[template-injection]
-          set -euo pipefail
-
-          if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            bun test --max-concurrency=1 --coverage --coverage-reporter=lcov ${{ github.event.inputs.test_filter }}
-            exit 0
-          fi
-
-          isolated_unit_tests=(
-            src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx
-            src/browser/features/Messages/InlineSkillMarkdown.test.tsx
-            src/browser/utils/commands/sources.test.ts
-          )
-          bun test --max-concurrency=1 "${isolated_unit_tests[@]}"
-
-          mapfile -d '' unit_files < <(
-            find src -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
-              ! -path 'src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx' \
-              ! -path 'src/browser/features/Messages/InlineSkillMarkdown.test.tsx' \
-              ! -path 'src/browser/utils/commands/sources.test.ts' \
-              -print0
-          )
-          bun test --max-concurrency=1 --coverage --coverage-reporter=lcov "${unit_files[@]}"
+      - if: github.event.inputs.test_filter != ''
+        run: bun test --max-concurrency=1 --coverage --coverage-reporter=lcov ${{ github.event.inputs.test_filter }} # zizmor: ignore[template-injection]
+      - if: github.event.inputs.test_filter == ''
+        run: make test-unit-ci
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -208,16 +223,27 @@ jobs:
           fail_ci_if_error: false
 
   test-integration:
-    name: Test / Integration
+    name: Test / Integration (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    timeout-minutes: 10
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    # Healthy runs finish in ~4-5 min, but jest's integration testTimeout is 10 minutes,
+    # so a single hung test used to collide with a 10-minute job cap: the runner killed
+    # the job ("exceeded the maximum execution time of 10m0s") and destroyed all logs,
+    # repeatedly kicking green PRs from the merge queue (e.g. runs 32632804824,
+    # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
+    # diagnostics and still bounds a wedged runner.
+    timeout-minutes: 20
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # jest --shard splits suites across runners; ~7.5 min in one job was on the critical path.
+        shard: ${{ fromJSON(github.event.inputs.test_filter != '' && '[1]' || '[1, 2, 3]') }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: make build-main
       # workflow_dispatch inputs are only triggerable by repo members, so direct
       # interpolation is acceptable and preserves shell quoting in the filter.
@@ -225,32 +251,44 @@ jobs:
         run: | # zizmor: ignore[template-injection]
           set -euo pipefail
 
+          # No --maxWorkers override: jest.config.js sizes the pool via
+          # workerBudgetFor("jest") (scripts/lib/worker_budget.js), which accounts for
+          # per-fork peak memory (~4.7GiB) and live cgroup usage. The old CLI
+          # --maxWorkers=100% took precedence over that budget and forked 16 workers
+          # on the 16-core/64GB runner (~75GiB peak), thrashing memory. Under that
+          # load, wall clock inflated ~10-20x: suites that normally finish in seconds
+          # passed at 100-135s while tests with tight explicit timeouts (30-45s) died,
+          # which is what made focus/sendModeDropdown/anthropicCacheStrategy flake in
+          # the merge queue.
+
           # Manual override (workflow_dispatch input)
           if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent ${{ github.event.inputs.test_filter }}
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" ${{ github.event.inputs.test_filter }}
             exit 0
           fi
-          
+
           # Skip if no relevant changes
           if [[ "$BACKEND" != "true" && "$BROWSER" != "true" ]]; then
             echo "No backend or browser changes - skipping integration tests"
             exit 0
           fi
-          
+
           # Backend changed: run ALL integration tests (includes tests/ui)
           if [[ "$BACKEND" == "true" ]]; then
             echo "Backend changes detected - running all integration tests"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" tests/
           else
             # Browser-only changes: run tests/ui
             echo "Browser changes detected - running tests/ui"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/ui/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" tests/ui/
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BACKEND: ${{ needs.changes.outputs.backend }}
           BROWSER: ${{ needs.changes.outputs.browser }}
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -261,14 +299,15 @@ jobs:
   test-storybook:
     name: Test / Storybook
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && github.event.inputs.test_filter == '' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
       - run: make storybook-build
       - run: |
           bun x http-server storybook-static -p 6006 &
@@ -282,37 +321,52 @@ jobs:
           done
           # Fail the step if Storybook never became reachable.
           curl -sf http://127.0.0.1:6006 >/dev/null
+      # Separate step so a budget overrun is not mixed up with interaction-test failures.
+      - run: make storybook-budget
       - run: make test-storybook
 
   test-e2e:
-    name: Test / E2E (${{ matrix.os }})
+    # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
+    name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && github.event.inputs.test_filter == '' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
     strategy:
       fail-fast: false
       matrix:
+        # Linux runs the full suite with one worker (shared display focus/clipboard), which
+        # took ~9 min serially; Playwright --shard spreads spec files across runners instead.
         include:
-          - os: linux
-            runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
-          - os: macos
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
+          - { os: linux, shard: 1/4 }
+          - { os: linux, shard: 2/4 }
+          - { os: linux, shard: 3/4 }
+          - { os: linux, shard: 4/4 }
+          - { os: macos }
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Install xvfb
         if: matrix.os == 'linux'
         run: |
+          if command -v Xvfb >/dev/null 2>&1 && command -v xvfb-run >/dev/null 2>&1; then
+            echo "Xvfb is already installed"
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y xvfb
+      # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
       - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
       - name: Run tests
         if: matrix.os == 'linux'
-        run: xvfb-run -a make test-e2e
+        # Native focus and clipboard are shared by every Electron app on this display.
+        run: xvfb-run -a make test-e2e PLAYWRIGHT_ARGS="--workers=1 --shard=$SHARD"
         env:
           ELECTRON_DISABLE_SANDBOX: 1
+          SHARD: ${{ matrix.shard }}
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -322,14 +376,14 @@ jobs:
   test-windows:
     name: Test / Windows
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true'
     timeout-minutes: 15
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
         with:
           skip-build-caches: true
       - name: Generate version.ts
@@ -341,7 +395,10 @@ jobs:
       - name: Run unit tests (Windows smoke)
         shell: pwsh
         run: |
-          bun test src/node/utils/paths.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts
+          bun test src/node/utils/paths.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
+      - name: Verify Windows plugin path aliases
+        shell: pwsh
+        run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
@@ -358,25 +415,30 @@ jobs:
   smoke-server:
     name: Smoke / Server
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
-      - run: npm pack
+      - run: make check-startup-imports-runtime
+      - name: Pack npm package
+        id: pack
+        run: echo "tarball=$(./scripts/pack-npm-package.sh)" >> "$GITHUB_OUTPUT"
       - env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           SERVER_PORT: 3001
           SERVER_HOST: localhost
           STARTUP_TIMEOUT: 30
-        run: |
-          # shellcheck disable=SC2012 # ls is fine here - known filename pattern in controlled directory
-          TARBALL=$(ls mux-*.tgz | head -1)
-          PACKAGE_TARBALL="$TARBALL" ./scripts/smoke-test.sh
+        run: ./scripts/smoke-test.sh
+      - name: Test legacy mux forwarding package
+        env:
+          CANONICAL_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: ./scripts/smoke-test-mux-compat.sh
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: failure()
         with:
@@ -387,9 +449,10 @@ jobs:
 
   smoke-docker:
     name: Smoke / Docker
+    needs: [changes]
     # Only run on merge queue (not every PR, not on merge-queue push to main)
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]')
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     permissions:
       contents: read
       id-token: write # Depot OIDC authentication
@@ -405,6 +468,12 @@ jobs:
           context: .
           load: true
           tags: mux-server:test
+          # The coder/shux -> coder/xum repo rename broke Depot's OIDC trust
+          # policy (matches owner/repo as a string), so `depot build` fails with
+          # "permission_denied: Invalid token" and blocks the merge queue. Fall
+          # back to plain buildx until the Depot project trust policy is updated
+          # for the new repo name; Depot acceleration resumes automatically then.
+          buildx-fallback: true
       - name: Test container
         run: |
           docker run -d --name mux-test -p 3000:3000 mux-server:test
@@ -423,14 +492,14 @@ jobs:
   build-linux:
     name: Build / Linux
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: bun run build
       - run: make dist-linux
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -441,18 +510,27 @@ jobs:
           archive: false
 
   build-macos:
-    name: Build / macOS
+    # One runner per arch: both arches packaging in parallel on one 3-core runner was a
+    # ~11 min critical-path job.
+    name: Build / macOS (${{ matrix.arch }})
     needs: [changes]
     if: ${{ needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
     runs-on: macos-15
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+      ARCH: ${{ matrix.arch }}
+      # PRs only need the DMG they upload; merge-queue and main runs keep the full target list.
+      MAC_TARGETS: ${{ github.event_name == 'pull_request' && 'dmg' || '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -462,20 +540,15 @@ jobs:
           AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
           AC_APIKEY_ID: ${{ secrets.AC_APIKEY_ID }}
           AC_APIKEY_ISSUER_ID: ${{ secrets.AC_APIKEY_ISSUER_ID }}
-      - name: Build macOS distributables
+      - name: Build macOS distributable
         # Retry for transient Apple timestamp-server failures during code signing.
-        run: ./scripts/retry.sh 3 30 make dist-mac
-      - name: Upload x64 artifact
+        run: ./scripts/retry.sh 3 30 make "dist-mac-$ARCH"
+      - name: Smoke test packaged macOS attach_file runtime
+        run: make check-mac-attach-file-runtime MAC_ARCH="$ARCH"
+      - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          path: release/*-x64.dmg
-          retention-days: 30
-          if-no-files-found: error
-          archive: false
-      - name: Upload arm64 artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          path: release/*-arm64.dmg
+          path: release/*-${{ matrix.arch }}-mac.dmg
           retention-days: 30
           if-no-files-found: error
           archive: false
@@ -494,7 +567,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |
@@ -535,14 +608,14 @@ jobs:
   build-vscode:
     name: Build / VS Code
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/build-vscode-extension
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -553,16 +626,21 @@ jobs:
 
   codex-comments:
     name: Codex Comments
+    needs: [changes]
     if: github.event_name == 'pull_request'
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Test PR readiness gates
+        run: make test-codex-comments test-pr-checks test-required-superseded
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }}
+        # Codex starts reviewing the same push that started this job, so give it
+        # time to finish. Reviews take a few minutes; the slowest test jobs take longer.
+        run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }} --wait-for-review 900
 
   # Single required check - configure branch protection to require only this job
   required:
@@ -586,11 +664,47 @@ jobs:
       - build-vscode
       - codex-comments
     runs-on: ubuntu-latest
+    # superseded: read this workflow's runs/jobs and check out the decision script.
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "Job results: $results"
-          for result in $results; do
+      # A cancelled duplicate run must not leave a red Required when another run for
+      # this PR will publish one (#4547). The script stands down only with proof and
+      # fails closed otherwise; see its header for the rules.
+      - if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/lib/required_superseded.sh
+          sparse-checkout-cone-mode: false
+      - id: superseded
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ./scripts/lib/required_superseded.sh; then
+            echo "value=true" >>"$GITHUB_OUTPUT"
+          fi
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          SUPERSEDED: ${{ steps.superseded.outputs.value }}
+        run: |
+          echo "Job results: $RESULTS"
+          if [[ "$SUPERSEDED" == "true" ]]; then
+            echo "⏭️ Superseded; a newer run for this commit reports Required"
+            exit 0
+          fi
+          for result in $RESULTS; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               echo "❌ CI failed"
               exit 1

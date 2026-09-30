@@ -21,6 +21,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 
 import { APIProvider, useAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
@@ -85,6 +86,11 @@ describeIntegration("Custom Models", () => {
 
     const cleanupDom = installDom();
 
+    // useProvidersConfig reads the shared ProvidersConfigStore, which gets its
+    // client from AppLoader in the real app. This harness bypasses AppLoader
+    // (see module doc comment), so wire the store manually.
+    getProvidersConfigStore().setClient(env.orpc);
+
     // Ensure starting from a clean slate.
     const reset = await env.orpc.providers.setModels({ provider: "anthropic", models: [] });
     if (!reset.success) {
@@ -130,6 +136,7 @@ describeIntegration("Custom Models", () => {
       view.unmount();
       cleanup();
       cleanupDom();
+      getProvidersConfigStore().setClient(null);
 
       // Best-effort cleanup so other tests don't inherit custom models.
       await env.orpc.providers.setModels({ provider: "anthropic", models: [] });

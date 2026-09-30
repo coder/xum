@@ -37,9 +37,9 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
 
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");
-        const costsTab = view.container.querySelector(
+        const costsTab = view.container.querySelector<HTMLElement>(
           '[role="tab"][aria-controls*="costs"]'
-        ) as HTMLElement | null;
+        );
         expect(costsTab).not.toBeNull();
         costsTab?.focus();
 
@@ -50,9 +50,7 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
 
         await waitFor(
           () => {
-            const reviewPanel = view.container.querySelector(
-              '[data-testid="review-panel"]'
-            ) as HTMLElement | null;
+            const reviewPanel = view.container.querySelector('[data-testid="review-panel"]');
             if (!reviewPanel) {
               throw new Error("Review panel not mounted");
             }
@@ -66,11 +64,14 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
               throw new Error("Review panel not focused");
             }
           },
-          { timeout: 10_000 }
+          { timeout: 30_000 }
         );
       } finally {
         await cleanupView(view, cleanupDom);
       }
     });
-  }, 30_000);
+    // 120s total (like undo.test.ts): CI runners under merge-queue load inflate wall
+    // clock enough that a 30s budget covering workspace setup + render was exceeded
+    // while sibling suites passed at 100s+ (merge-queue run 32715740782).
+  }, 120_000);
 });

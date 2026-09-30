@@ -1,13 +1,31 @@
-import { expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
+import { removeWorkspaceConfirmOptions } from "./removeWorkspaceConfirm";
+import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
-import { getModelKey } from "@/common/constants/storage";
+import {
+  getModelKey,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+} from "@/common/constants/storage";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import type { UpdateChannel } from "@/common/types/project";
+import {
+  consumePendingPluginsSectionIntent,
+  subscribePluginsSectionIntents,
+  type PluginsSectionIntent,
+} from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { CommandIds } from "@/browser/utils/commandIds";
+import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -34,6 +52,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const params: Parameters<typeof buildCoreSources>[0] = {
     userProjects,
     themePreference: "dark",
+    supportedUpdateChannels: ["stable", "nightly"],
     workspaceMetadata,
     selectedWorkspace: {
       projectPath: "/repo/a",
@@ -45,21 +64,30 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     streamingModels: new Map<string, string>(),
     getThinkingLevel: () => "off",
     onSetThinkingLevel: () => undefined,
+    getReasoningMode: () => "standard",
+    onToggleReasoningMode: () => undefined,
+    getFastMode: () => false,
+    onToggleFastMode: () => undefined,
+    getEffectiveComposerModel: () => "anthropic:claude-sonnet-4-5",
     onStartWorkspaceCreation: () => undefined,
+    onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
     multiProjectWorkspacesEnabled: true,
+    agentPluginsEnabled: false,
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),
+    onRemoveSubagent: () => Promise.resolve(),
     onUpdateTitle: () => Promise.resolve({ success: true }),
     onAddProject: () => undefined,
     onRemoveProject: () => undefined,
     onToggleSidebar: () => undefined,
     onNavigateWorkspace: () => undefined,
+    onMovePinnedChat: () => undefined,
     onOpenWorkspaceInTerminal: () => undefined,
     onToggleTheme: () => undefined,
     onSetTheme: () => undefined,
-    api: {
+    api: createTestApiClient({
       workspace: {
         resetContext: () => Promise.resolve({ success: true, data: "reset" }),
         truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -68,7 +96,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
       analytics: {
         rebuildDatabase: () => Promise.resolve({ success: true, workspacesIngested: 2 }),
       },
-    } as unknown as APIClient,
+    }),
     getBranchesForProject: () =>
       Promise.resolve({
         branches: ["main"],
@@ -88,15 +116,62 @@ interface ToastEventDetail {
 const getActions = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) =>
   mk(over).flatMap((source) => source());
 
-const workspaceApi = (workspace: Record<string, unknown>) =>
-  ({
+describe("Auto routing palette actions", () => {
+  const ids = [
+    CommandIds.toggleAutoRouting("model"),
+    CommandIds.toggleAutoRouting("thinkingLevel"),
+  ];
+
+  test("appear only while the experiment is on, for the workspace and the creation composer", () => {
+    const wired = {
+      getAutoRouting: () => false,
+      onSetAutoRouting: () => undefined,
+    };
+    const off = getActions({ ...wired, autoModelRoutingEnabled: false }).map((a) => a.id);
+    expect(off).not.toContain(ids[0]);
+    expect(off).not.toContain(ids[1]);
+
+    const on = getActions({ ...wired, autoModelRoutingEnabled: true }).map((a) => a.id);
+    expect(on).toContain(ids[0]);
+    expect(on).toContain(ids[1]);
+
+    const creation = getActions({
+      ...wired,
+      autoModelRoutingEnabled: true,
+      selectedWorkspace: null,
+      creationScopeId: "project:/repo/b",
+    }).map((a) => a.id);
+    expect(creation).toContain(ids[0]);
+    expect(creation).toContain(ids[1]);
+  });
+
+  test("each action flips its own dimension for the composer's scope", () => {
+    const onSetAutoRouting = mock(
+      (_scopeId: string, _dimension: "model" | "thinkingLevel", _active: boolean) => undefined
+    );
+    const actions = getActions({
+      autoModelRoutingEnabled: true,
+      getAutoRouting: (_scopeId, dimension) => dimension === "model",
+      onSetAutoRouting,
+    });
+    void actions.find((a) => a.id === ids[0])?.run();
+    void actions.find((a) => a.id === ids[1])?.run();
+    expect(onSetAutoRouting.mock.calls).toEqual([
+      ["w1", "model", false],
+      ["w1", "thinkingLevel", true],
+    ]);
+  });
+});
+
+const workspaceApi = (workspace: TestApiOverrides<APIClient["workspace"]>) =>
+  createTestApiClient({
     workspace: {
       resetContext: () => Promise.resolve({ success: true as const, data: "reset" as const }),
       truncateHistory: () => Promise.resolve({ success: true as const, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true as const, data: undefined }),
       ...workspace,
     },
-  }) as unknown as APIClient;
+  });
 
 const getResetContextAction = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const action = getActions(over).find(
@@ -131,11 +206,19 @@ const collectCommandEvents = () => {
   };
 };
 
-async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
+async function withTestWindow<T>(
+  fn: () => Promise<T> | T,
+  options: { transcriptCaughtUp?: boolean } = {}
+): Promise<T> {
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
   const originalCustomEvent = globalThis.CustomEvent;
+  // History-mutating chat actions read the transcript barrier from the singleton store at
+  // dispatch time; pin it instead of replaying an onChat subscription for the palette tests.
+  const barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockReturnValue(
+    options.transcriptCaughtUp ?? true
+  );
 
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
@@ -147,6 +230,7 @@ async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
   try {
     return await fn();
   } finally {
+    barrierSpy.mockRestore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
@@ -190,6 +274,52 @@ test("chat commands include separate reset context and clear history actions", a
     await Promise.resolve(clearAction.run());
     expect(truncateHistory).toHaveBeenCalledWith({ workspaceId: "w1", percentage: 1.0 });
   });
+});
+
+test("reset context and history truncation refuse while the transcript is not caught up", async () => {
+  await withTestWindow(
+    async () => {
+      const resetContext = mock(() =>
+        Promise.resolve({ success: true as const, data: "reset" as const })
+      );
+      const truncateHistory = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const actions = getActions({ api: workspaceApi({ resetContext, truncateHistory }) });
+      const guarded = actions.filter(
+        (action) =>
+          action.title === "Reset Context, Preserve History" ||
+          action.title === "Clear History" ||
+          action.title.startsWith("Truncate History to ")
+      );
+      expect(guarded.length).toBe(5);
+
+      for (const action of guarded) {
+        const events = collectCommandEvents();
+        try {
+          let thrown: unknown;
+          try {
+            await Promise.resolve(action.run());
+          } catch (error) {
+            thrown = error;
+          }
+          expect(thrown).toBeInstanceOf(Error);
+          expect(thrown instanceof Error ? thrown.message : undefined).toBe(
+            TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+          );
+          expect(events.receivedToasts).toEqual([
+            { type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE },
+          ]);
+          expect(events.clearEvents).toEqual([]);
+        } finally {
+          events.dispose();
+        }
+      }
+      expect(resetContext).not.toHaveBeenCalled();
+      expect(truncateHistory).not.toHaveBeenCalled();
+    },
+    { transcriptCaughtUp: false }
+  );
 });
 
 test("reset context command dispatches composer and toast outcomes", async () => {
@@ -285,6 +415,25 @@ test("buildCoreSources adds thinking effort command", () => {
   expect(thinkingAction?.subtitle).toContain("Medium");
 });
 
+test("thinking effort options use the visible effective model", async () => {
+  const actions = getActions({
+    selectedWorkspaceState: {
+      lifecycle: "active",
+      goal: null,
+      currentModel: "anthropic:claude-sonnet-4-5",
+    } as unknown as WorkspaceState,
+    getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+  });
+  const thinkingAction = actions.find((action) => action.id === "thinking:set-level");
+  const thinkingField = thinkingAction?.prompt?.fields.find((field) => field.type === "select");
+  if (thinkingField?.type !== "select") {
+    throw new Error("Expected thinking effort select field");
+  }
+  const options = await thinkingField.getOptions({});
+
+  expect(options.map((option) => option.id)).toEqual(["medium", "high", "xhigh", "max"]);
+});
+
 test("workspace switch commands include keywords for filtering", () => {
   const actions = getActions();
   const switchAction = actions.find((a) => a.id.startsWith("ws:switch:"));
@@ -366,6 +515,106 @@ test("selected-workspace create action targets the workspace sub-project", async
   expect(onStartWorkspaceCreation).toHaveBeenCalledWith("/repo/a/packages/api");
 });
 
+test("selected scratch workspace omits the generic create-workspace action", () => {
+  // A scratch chat's projectPath is its app-managed workdir, not a configured
+  // project, so the generic action would target the wrong project.
+  const workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>([
+    [
+      "ws-scratch",
+      {
+        id: "ws-scratch",
+        kind: "scratch",
+        name: "scratch-1",
+        projectName: "Scratch",
+        projectPath: "/home/user/.mux/scratch/ws-scratch",
+        namedWorkspacePath: "/home/user/.mux/scratch/ws-scratch",
+        runtimeConfig: { type: "local" },
+      },
+    ],
+  ]);
+  const actions = getActions({
+    workspaceMetadata,
+    selectedWorkspace: {
+      projectPath: "/home/user/.mux/scratch/ws-scratch",
+      projectName: "Scratch",
+      namedWorkspacePath: "/home/user/.mux/scratch/ws-scratch",
+      workspaceId: "ws-scratch",
+    },
+  });
+
+  expect(actions.find((action) => action.id === "ws:new")).toBeUndefined();
+  expect(actions.find((action) => action.id === "ws:new-scratch")).toBeDefined();
+});
+
+test("sub-agents get the confirmed sub-agent removal instead of the plain remove (#5106)", async () => {
+  const onRemoveSubagent = mock((_workspaceId: string, _title: string) => Promise.resolve());
+  const onRemoveWorkspace = mock(() => Promise.resolve({ success: true }));
+  const child: FrontendWorkspaceMetadata = {
+    id: "child",
+    name: "agent_exec_child",
+    title: "Child task",
+    parentWorkspaceId: "w1",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/agent_exec_child",
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["child", child]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: child.namedWorkspacePath,
+      workspaceId: "child",
+    },
+    onRemoveSubagent,
+    onRemoveWorkspace,
+  });
+
+  expect(actions.find((action) => action.id === CommandIds.workspaceRemove())).toBeUndefined();
+  await actions.find((action) => action.id === CommandIds.workspaceRemoveSubagent())?.run();
+  expect(onRemoveSubagent).toHaveBeenCalledWith("child", "Child task");
+
+  // Picking the sub-agent in the generic "Remove Workspace…" prompt takes the same path.
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "child" });
+  expect(onRemoveSubagent).toHaveBeenCalledTimes(2);
+  expect(onRemoveWorkspace).not.toHaveBeenCalled();
+});
+
+test("palette removal confirms with the workspace's runtime (#5204)", async () => {
+  const confirmDialog = mock((_options: ConfirmDialogOptions) => Promise.resolve(false));
+  const remote: FrontendWorkspaceMetadata = {
+    id: "remote",
+    name: "feature",
+    projectName: "a",
+    projectPath: "/repo/a",
+    namedWorkspacePath: "/repo/a/feature",
+    runtimeConfig: { type: "ssh", host: "build-box", srcBaseDir: "~/xum" },
+  };
+  const actions = getActions({
+    workspaceMetadata: new Map([["remote", remote]]),
+    selectedWorkspace: {
+      projectPath: "/repo/a",
+      projectName: "a",
+      namedWorkspacePath: remote.namedWorkspacePath,
+      workspaceId: "remote",
+    },
+    confirmDialog,
+  });
+
+  await actions.find((action) => action.id === CommandIds.workspaceRemove())?.run();
+  const removeAny = actions.find((action) => action.id === CommandIds.workspaceRemoveAny());
+  await removeAny?.prompt?.onSubmit({ workspaceId: "remote" });
+
+  const expected = removeWorkspaceConfirmOptions("", remote).description;
+  expect(expected).not.toBe(removeWorkspaceConfirmOptions("", { name: "feature" }).description);
+  expect(confirmDialog.mock.calls.map(([options]) => options.description)).toEqual([
+    expected,
+    expected,
+  ]);
+});
+
 test("buildCoreSources includes archive merged workspaces in project action", () => {
   const actions = getActions();
   const archiveAction = actions.find((a) => a.id === "ws:archive-merged-in-project");
@@ -427,6 +676,134 @@ test("multi-project workspace command hides itself when the experiment is disabl
   await multiProjectAction!.run();
 
   expect(onStartMultiProjectWorkspaceCreation).not.toHaveBeenCalled();
+});
+
+test("Login with Coder command opens providers expanded on Coder and starts the login", async () => {
+  // Regression: the command must reach the login operation (expand the Coder
+  // provider and start the OAuth flow via the one-shot hints consumed by
+  // ProvidersSection), not merely open the generic Providers section.
+  const onOpenSettings = mock();
+  const actions = getActions({ onOpenSettings });
+  const loginAction = actions.find((a) => a.title === "Settings: Login with Coder");
+
+  expect(loginAction).toBeDefined();
+  await loginAction!.run();
+
+  expect(onOpenSettings).toHaveBeenCalledWith("providers", {
+    expandProvider: "coder",
+    startCoderLogin: true,
+  });
+});
+
+test.each([
+  ["Electron", ["stable", "nightly"]],
+  ["server", ["stable", "nightly", "npm"]],
+  ["unknown", []],
+] satisfies Array<[string, UpdateChannel[]]>)(
+  "update channel actions follow %s capabilities",
+  (_runtime, supportedUpdateChannels) => {
+    const actions = getActions({ onOpenAbout: mock(), supportedUpdateChannels });
+    expect(actions.filter((a) => a.id.startsWith("update:channel:")).map((a) => a.id)).toEqual(
+      supportedUpdateChannels.map(CommandIds.updateChannel)
+    );
+  }
+);
+
+test.each(["stable", "nightly", "npm"] as const)(
+  "update commands persist %s before opening About and need an About opener",
+  async (channel) => {
+    const onOpenAbout = mock();
+    const install = mock(() => Promise.resolve());
+    let settleChannel!: () => void;
+    const setChannel = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          settleChannel = resolve;
+        })
+    );
+    const actions = getActions({
+      onOpenAbout,
+      api: createTestApiClient({ update: { install, setChannel } }),
+      supportedUpdateChannels: ["stable", "nightly", "npm"],
+    });
+    await actions.find((a) => a.title === "Install Update and Restart")!.run();
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(install).not.toHaveBeenCalledWith({ force: true });
+    expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    await actions.find((a) => a.id === CommandIds.updateInstallForce())!.run();
+    expect(install).toHaveBeenLastCalledWith({ force: true });
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    // About reads the channel when it opens, so the switch must persist before the dialog appears.
+    const switchAction = actions.find((a) => a.id === CommandIds.updateChannel(channel));
+    expect(switchAction).toBeDefined();
+    const switched = switchAction!.run();
+    expect(setChannel).toHaveBeenCalledWith({ channel });
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    settleChannel();
+    await switched;
+    expect(onOpenAbout).toHaveBeenCalledTimes(3);
+    expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
+  }
+);
+
+test("Login with Coder command hides itself when a custom provider shadows the coder id", () => {
+  // Regression: an upgraded install can carry a custom OpenAI-compatible
+  // provider named "coder". ProvidersSection hides the OAuth block for
+  // shadowed providers, so the login hint would either surface an invisible
+  // "Set the deployment URL first" error or inject built-in OAuth credentials
+  // into the custom provider's section. The command must follow the UI's
+  // shadow handling and hide itself.
+  const onOpenSettings = mock();
+  const shadowed = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { isCustom: true, baseUrl: "http://localhost:9000/v1" },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(shadowed).toBeDefined();
+  expect(shadowed?.visible?.()).toBe(false);
+
+  // Built-in Coder (no shadow): visible, including when no config exists yet.
+  const builtIn = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { coderOauthSet: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(builtIn?.visible?.()).toBe(true);
+
+  const noConfig = getActions({ onOpenSettings }).find(
+    (a) => a.title === "Settings: Login with Coder"
+  );
+  expect(noConfig?.visible?.()).toBe(true);
+});
+
+test("Disconnect Coder command revokes via RPC and is gated on a stored credential", async () => {
+  // Regression: Disconnect must be keyboard-reachable and must key its
+  // visibility off credential PRESENCE (coderOauthCredentialStored), not
+  // routability — a blob minted for a previously configured deployment URL
+  // must stay revocable.
+  const disconnect = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+  const actions = getActions({
+    api: createTestApiClient({ coderOauth: { disconnect } }),
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: true },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  });
+  const disconnectAction = actions.find((a) => a.title === "Settings: Disconnect Coder");
+
+  expect(disconnectAction).toBeDefined();
+  expect(disconnectAction?.visible?.()).toBe(true);
+  await disconnectAction!.run();
+  expect(disconnect).toHaveBeenCalledTimes(1);
+
+  // Without a stored credential there is nothing to revoke: hidden.
+  const hidden = getActions({
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Disconnect Coder");
+  expect(hidden?.visible?.()).toBe(false);
 });
 
 test("project commands exclude system projects from options", async () => {
@@ -498,6 +875,8 @@ const makeGoalSnapshot = (
   ...overrides,
 });
 
+type SetGoalResult = Awaited<ReturnType<APIClient["workspace"]["setGoal"]>>;
+
 const makeGoalRecord = (status: "active" | "paused" | "budget_limited" | "complete") => ({
   version: 1 as const,
   goalId: "00000000-0000-4000-8000-000000000001",
@@ -519,12 +898,17 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     name: "feat-x",
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,
     awaitingUserQuestion: false,
     loading: false,
+    isTranscriptCaughtUp: true,
+    transcriptReplayFailed: false,
     isHydratingTranscript: false,
+    isTranscriptStale: false,
+    isIncrementalCatchUp: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],
@@ -535,6 +919,8 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     loadedSkills: [],
     skillLoadErrors: [],
     agentStatus: undefined,
+    activeWorkflowRunCount: 0,
+    activeBashMonitorCount: 0,
     lastAbortReason: null,
     pendingStreamStartTime: null,
     pendingStreamModel: null,
@@ -651,28 +1037,30 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
       lifecycle: "active",
       goal: null,
     } as unknown as WorkspaceState,
-    api: {
+    api: createTestApiClient({
       config: {
         // Even with default budget settings, blank palette budget means no budget.
         getConfig: () =>
-          Promise.resolve({
-            goalDefaults: {
-              alwaysRequireExplicitBudget: true,
-              defaultBudgetCents: 800,
-              defaultTurnCap: 5,
-            },
-          }),
+          Promise.resolve(
+            createTestConfig({
+              goalDefaults: {
+                alwaysRequireExplicitBudget: true,
+                defaultBudgetCents: 800,
+                defaultTurnCap: 5,
+              },
+            })
+          ),
       },
       workspace: {
         getGoal: () => Promise.resolve({ goal: null }),
-        setGoal: (input: Record<string, unknown>) => {
+        setGoal: (input) => {
           setGoalCalls.push(input);
           return Promise.resolve({
             success: true,
             data: {
               version: 1,
               goalId: "11111111-1111-4111-8111-111111111111",
-              objective: input.objective,
+              objective: input.objective ?? "",
               status: "active",
               budgetCents: input.budgetCents ?? null,
               turnCap: input.turnCap ?? null,
@@ -688,7 +1076,7 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
           });
         },
       },
-    } as unknown as APIClient,
+    }),
   });
   const actions = sources.flatMap((s) => s());
   const setObjectiveAction = actions.find((action) => action.id === "goal:set-objective");
@@ -709,13 +1097,15 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
 });
 
 test("goal set objective prompt allows zero budget on unpriced model", async () => {
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
-      config: { getConfig: mock(() => Promise.resolve({})) },
+    api: createTestApiClient({
+      config: { getConfig: mock(() => Promise.resolve(createTestConfig())) },
       providers: { getConfig: mock(() => Promise.resolve({})) },
       workspace: { getGoal: mock(() => Promise.resolve({ goal: null })), setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: {
       ...makeWorkspaceState(null),
       currentModel: "custom:unpriced-model",
@@ -738,11 +1128,13 @@ test("goal set objective prompt allows zero budget on unpriced model", async () 
 
 test("goal set objective prompt submits objective and parsed budget", async () => {
   const getGoal = mock(() => Promise.resolve({ goal: null }));
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
+    api: createTestApiClient({
       workspace: { getGoal, setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: makeWorkspaceState(null),
   });
 
@@ -775,13 +1167,15 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
 
   try {
     const getGoal = mock(() => Promise.resolve({ goal: null }));
-    const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
+    const setGoal = mock(() =>
+      Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("active") })
+    );
     const state = makeWorkspaceState(null);
     state.currentModel = "openai:gpt-4o";
     const actions = getVisibleGoalActions({
-      api: {
+      api: createTestApiClient({
         workspace: { getGoal, setGoal },
-      } as unknown as APIClient,
+      }),
       selectedWorkspaceState: state,
     });
 
@@ -802,11 +1196,13 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
 
 test("goal mark complete prompt submits completion summary", async () => {
   const getGoal = mock(() => Promise.resolve({ goal: makeGoalRecord("active") }));
-  const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("complete") }));
+  const setGoal = mock(() =>
+    Promise.resolve<SetGoalResult>({ success: true, data: makeGoalRecord("complete") })
+  );
   const actions = getVisibleGoalActions({
-    api: {
+    api: createTestApiClient({
       workspace: { getGoal, setGoal },
-    } as unknown as APIClient,
+    }),
     selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("active")),
   });
 
@@ -836,18 +1232,18 @@ test("goal palette surfaces invalid transition messages without throwing", async
 
   try {
     const setGoal = mock(() =>
-      Promise.resolve({
+      Promise.resolve<SetGoalResult>({
         success: false,
         error: { type: "invalid_transition", message: "Cannot complete a missing goal." },
       })
     );
     const actions = getVisibleGoalActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           getGoal: mock(() => Promise.resolve({ goal: makeGoalRecord("active") })),
           setGoal,
         },
-      } as unknown as APIClient,
+      }),
       selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("active")),
     });
 
@@ -908,6 +1304,55 @@ test("buildCoreSources includes rebuild analytics database action with discovera
   expect(rebuildAction?.keywords).toContain("stats");
 });
 
+test("toggle keep screen awake command is only offered in the desktop app", () => {
+  const originalWindow = globalThis.window;
+  const hasToggle = () => getActions().some((a) => a.id === "settings:toggle-keep-screen-awake");
+  try {
+    const testWindow = new GlobalWindow();
+    globalThis.window = testWindow as unknown as Window & typeof globalThis;
+    // Browser mode: no preload bridge.
+    expect(hasToggle()).toBe(false);
+
+    globalThis.window.api = { platform: "linux", versions: {} };
+    expect(hasToggle()).toBe(true);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
+test("toggle keep screen awake command inverts the persisted config flag", async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+  globalThis.window.api = { platform: "linux", versions: {} };
+  try {
+    let keepScreenAwake = false;
+    const updateKeepScreenAwake = mock((input: { enabled: boolean }) => {
+      keepScreenAwake = input.enabled;
+      return Promise.resolve();
+    });
+    const actions = getActions({
+      api: createTestApiClient({
+        config: {
+          getConfig: () => Promise.resolve(createTestConfig({ keepScreenAwake })),
+          updateKeepScreenAwake,
+        },
+      }),
+    });
+    const toggleAction = actions.find((a) => a.id === "settings:toggle-keep-screen-awake");
+
+    expect(toggleAction).toBeDefined();
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: true });
+
+    // Reads the current backend value each time instead of tracking local state.
+    await toggleAction!.run();
+    expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: false });
+    expect(keepScreenAwake).toBe(false);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test("analytics rebuild command calls route and dispatches toast feedback", async () => {
   const rebuildDatabase = mock(() => Promise.resolve({ success: true, workspacesIngested: 4 }));
 
@@ -938,13 +1383,13 @@ test("analytics rebuild command calls route and dispatches toast feedback", asyn
 
   try {
     const actions = getActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
           interruptStream: () => Promise.resolve({ success: true, data: undefined }),
         },
         analytics: { rebuildDatabase },
-      } as unknown as APIClient,
+      }),
     });
     const rebuildAction = actions.find((a) => a.id === "analytics:rebuild-database");
 
@@ -983,13 +1428,13 @@ test("analytics rebuild command falls back to alert when chat input toast host i
 
   try {
     const actions = getActions({
-      api: {
+      api: createTestApiClient({
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
           interruptStream: () => Promise.resolve({ success: true, data: undefined }),
         },
         analytics: { rebuildDatabase },
-      } as unknown as APIClient,
+      }),
     });
     const rebuildAction = actions.find((a) => a.id === "analytics:rebuild-database");
 
@@ -1000,6 +1445,150 @@ test("analytics rebuild command falls back to alert when chat input toast host i
     expect(alertMock).toHaveBeenCalledWith(
       "Analytics database rebuilt successfully (1 workspace ingested)."
     );
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.CustomEvent = originalCustomEvent;
+  }
+});
+
+test("fast mode command is route-aware and keyboard accessible", async () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalCustomEvent = globalThis.CustomEvent;
+
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
+
+  try {
+    const onToggleFastMode = mock(() => undefined);
+    const directOpenAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "anthropic:claude-sonnet-4-5",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+      onToggleFastMode,
+    });
+    const fastAction = directOpenAIActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+
+    expect(fastAction?.shortcutHint).toBeDefined();
+    await fastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(1);
+
+    const directXAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "xai:grok-4.5",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "xai:grok-4.5",
+      providersConfig: {
+        xai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+      onToggleFastMode,
+    });
+    const xaiFastAction = directXAIActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(xaiFastAction?.shortcutHint).toBeDefined();
+    await xaiFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(2);
+
+    const creationScopeId = "project:/repo/a";
+    const creationActions = getActions({
+      selectedWorkspace: null,
+      selectedWorkspaceState: null,
+      creationScopeId,
+      getEffectiveComposerModel: (scopeId) =>
+        scopeId === creationScopeId ? "openai:gpt-5.6-sol" : "anthropic:claude-sonnet-4-5",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+      onToggleFastMode,
+    });
+    const creationFastAction = creationActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(creationFastAction?.shortcutHint).toBeDefined();
+    await creationFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(3);
+
+    const staleOpenAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-5.6-sol",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "anthropic:claude-sonnet-4-5",
+      providersConfig: {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "direct",
+    });
+    expect(staleOpenAIActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(
+      false
+    );
+
+    const gatewayXAIActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "xai:grok-4.5",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "xai:grok-4.5",
+      providersConfig: {
+        xai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "openrouter",
+    });
+    expect(gatewayXAIActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(
+      false
+    );
+
+    const unloadedActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-5.6-sol",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      providersConfig: null,
+      getRouteForModel: () => "direct",
+    });
+    expect(unloadedActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(false);
+
+    const gatewayActions = getActions({
+      selectedWorkspaceState: {
+        lifecycle: "active",
+        goal: null,
+        currentModel: "openai:gpt-6-astra",
+      } as unknown as WorkspaceState,
+      getEffectiveComposerModel: () => "openai:gpt-6-astra",
+      providersConfig: {
+        openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
+        openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      },
+      getRouteForModel: () => "openrouter",
+      onToggleFastMode,
+    });
+    const gatewayFastAction = gatewayActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(gatewayFastAction?.shortcutHint).toBeDefined();
+    await gatewayFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(4);
   } finally {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -1053,4 +1642,225 @@ test("workspace generate title command dispatches a title-generation request eve
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
   }
+});
+
+test("toggle flat chat list command flips the persisted sidebar setting", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+
+  try {
+    const toggle = () => {
+      const action = getActions().find((a) => a.id === "nav:toggle-flat-chat-list");
+      expect(action).toBeDefined();
+      void action!.run();
+    };
+
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    expect(getActions().find((a) => a.id === "nav:toggle-flat-chat-list")?.subtitle).toContain(
+      "Flat"
+    );
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("false");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
+test("toggle hide sub-agents command flips the persisted sidebar setting", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+
+  try {
+    const toggle = () => {
+      const action = getActions().find((a) => a.id === "nav:toggle-hide-subagents");
+      expect(action).toBeDefined();
+      void action!.run();
+    };
+
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("true");
+
+    const rebuilt = getActions().find((a) => a.id === "nav:toggle-hide-subagents");
+    expect(rebuilt?.subtitle).toContain("Hidden");
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("false");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
+test.each(["coder", "mux-gateway", "direct"])(
+  "Pro palette uses the effective %s route instead of stale settings routing",
+  async (route) =>
+    withTestWindow(() => {
+      const model = "coder:prod-openai/gpt-6-astra";
+      const resolveEffectiveRoute = mock((selection: string) => {
+        expect(selection).toBe(model);
+        return route;
+      });
+      const actions = getActions({
+        getEffectiveComposerModel: () => model,
+        providersConfig: {
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          },
+        },
+        getRouteForModel: () => "direct",
+        getEffectiveRouteForModel: resolveEffectiveRoute,
+      });
+      expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
+        route !== "mux-gateway"
+      );
+      expect(resolveEffectiveRoute).toHaveBeenCalled();
+    })
+);
+
+test("plugin component action is gated and only targets present managed installs without mutation", async () => {
+  const openSettings = mock(() => undefined);
+  expect(
+    mk({ onOpenSettings: openSettings })
+      .flatMap((source) => source())
+      .find((action) => action.id === CommandIds.pluginsManageComponents())
+  ).toBeUndefined();
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [
+        {
+          name: "managed",
+          location: "/plugins/managed",
+          managed: true,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+        {
+          name: "missing",
+          location: "/plugins/missing",
+          managed: true,
+          present: false,
+          skillCount: 0,
+          mcpServerCount: 0,
+        },
+        {
+          name: "unmanaged",
+          location: "/plugins/unmanaged",
+          managed: false,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+      ],
+    },
+  });
+  const mutation = mock(() =>
+    Promise.resolve({ success: false as const, error: "Must use the chooser" })
+  );
+  api.agentPlugins.setComponents = mutation;
+  const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsManageComponents());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt)
+    throw new Error("Expected component plugin picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({
+    type: "manage-components",
+    name: "managed",
+  });
+  const received: PluginsSectionIntent[] = [];
+  const unsubscribe = subscribePluginsSectionIntents((intent) => received.push(intent));
+  try {
+    await action.prompt.onSubmit({ pluginName: "managed" });
+    expect(received).toEqual([{ type: "manage-components", name: "managed" }]);
+    expect(consumePendingPluginsSectionIntent()).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+    expect(openSettings).toHaveBeenCalledWith("plugins");
+  } finally {
+    unsubscribe();
+  }
+});
+
+describe("Open Server Window palette action", () => {
+  const makeBridge = (result: OpenLocalServerResult) =>
+    ({
+      getState: () => Promise.resolve({ status: "disconnected" as const, serverUrl: null }),
+      connect: () => Promise.resolve(),
+      disconnect: () => Promise.resolve(),
+      onStateChanged: () => () => undefined,
+      openLocalServer: mock(() => Promise.resolve(result)),
+      onOpenServerWindowRequested: () => () => undefined,
+    }) satisfies RemoteConnectionApi;
+
+  test("is only offered in the desktop window, which has the remote connection bridge", () => {
+    const ids = (over: Partial<Parameters<typeof buildCoreSources>[0]>) =>
+      getActions({ onOpenSettings: mock(), ...over }).map((action) => action.id);
+    expect(ids({})).not.toContain(CommandIds.openServerWindow());
+    expect(ids({ remoteConnection: makeBridge({ status: "shown" }) })).toContain(
+      CommandIds.openServerWindow()
+    );
+  });
+
+  test("shows Remote Connection settings only when the server window could not be shown", async () => {
+    for (const [result, expectedSettingsCalls] of [
+      [{ status: "shown" }, 0],
+      [{ status: "unavailable" }, 1],
+    ] satisfies Array<[OpenLocalServerResult, number]>) {
+      const onOpenSettings = mock();
+      const remoteConnection = makeBridge(result);
+      const action = getActions({ onOpenSettings, remoteConnection }).find(
+        (candidate) => candidate.id === CommandIds.openServerWindow()
+      );
+      await action!.run();
+      expect(remoteConnection.openLocalServer).toHaveBeenCalledTimes(1);
+      expect(onOpenSettings).toHaveBeenCalledTimes(expectedSettingsCalls);
+      if (expectedSettingsCalls) expect(onOpenSettings).toHaveBeenCalledWith("remote-connection");
+    }
+  });
+});
+
+describe("Implement Latest Plan palette action (#4963)", () => {
+  test("asks the latest plan card to run, and says so when no card started it", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.chatRunLatestPlanAction()
+      );
+      expect(action).toBeDefined();
+      const events = collectCommandEvents();
+      try {
+        // No card handled the request (no plan, or its action is disabled).
+        await action!.run();
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["error"]);
+
+        // The selected workspace's card starts its action and marks the request handled.
+        const requests: string[] = [];
+        const card = (event: Event) => {
+          const { detail } = event as CustomEvent<{ workspaceId: string; handled: boolean }>;
+          requests.push(detail.workspaceId);
+          detail.handled = true;
+        };
+        window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        await action!.run();
+        window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, card);
+        expect(requests).toEqual(["w1"]);
+        expect(events.receivedToasts).toHaveLength(1);
+      } finally {
+        events.dispose();
+      }
+    });
+  });
 });

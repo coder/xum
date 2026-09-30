@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { captureAndStripDevToolsHeader } from "./devToolsHeaderCapture";
+import { captureAndStripDevToolsHeader, resolveDevToolsCaptureBody } from "./devToolsHeaderCapture";
 import { createWebSocketFetch as createOpenAIWebSocketFetch } from "@vercel/ai-sdk-openai-websocket-fetch";
 
 type WebSocketFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & {
@@ -108,7 +108,7 @@ export function createOpenAIWebSocketTransportFetch(
       : {};
   const transportFetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
     // The upstream package falls through to globalThis.fetch for non-WebSocket requests.
-    // Pre-filter here so Mux's existing fetch wrappers keep handling those HTTP paths.
+    // Pre-filter here so Xum's existing fetch wrappers keep handling those HTTP paths.
     if (!(await isStreamingResponsesRequest(input, init))) {
       return options.baseFetch(input, init);
     }
@@ -117,7 +117,7 @@ export function createOpenAIWebSocketTransportFetch(
     const headers = new Headers(
       init?.headers ?? (input instanceof Request ? input.headers : undefined)
     );
-    captureAndStripDevToolsHeader(headers);
+    captureAndStripDevToolsHeader(headers, await resolveDevToolsCaptureBody(headers, input, init));
     const response = await activeWebSocketFetch(input, { ...(init ?? {}), headers });
     if (closeRequested) {
       try {

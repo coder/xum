@@ -31,21 +31,26 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import {
+  RuntimeError,
+  WORKSPACE_REPO_MISSING_ERROR,
+  isRuntimeRetryableTransportError,
+} from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
-import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
+import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
   type SSHRuntimeConfig,
   getControlPath,
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
 } from "./sshConnectionPool";
-import { getOriginUrlForBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { syncRuntimeGitSubmodules } from "./submoduleSync";
@@ -58,6 +63,7 @@ import {
 import {
   buildRemoteProjectLayout,
   getRemoteWorkspacePath,
+  REMOTE_BASE_REPO_DIR,
   type RemoteProjectLayout,
 } from "./remoteProjectLayout";
 import { streamToString, shescape } from "./streamUtils";
@@ -65,10 +71,29 @@ import { streamToString, shescape } from "./streamUtils";
 /** Staging namespace for synced branch refs. Branches land here instead of
  *  refs/heads/* so they don't collide with branches checked out in worktrees. */
 const BUNDLE_REF_PREFIX = "refs/mux-bundle/";
+/**
+ * Canonical message thrown when an SSH operation is aborted. Several call sites
+ * compare against this exact value (e.g. `errorMsg === OPERATION_ABORTED_ERROR`),
+ * so the thrown and compared strings must stay identical — keep them as one const.
+ * Mirrors SSH_OPERATION_ABORTED_ERROR / SSH2_OPERATION_ABORTED_ERROR in the
+ * sibling connection-pool modules.
+ */
+const OPERATION_ABORTED_ERROR = "Operation aborted";
+/**
+ * The shared SSH base repo is a bare common git dir, not a checkout. Keep its
+ * HEAD branch-shaped but unborn until a real base commit is available, then
+ * detach HEAD at that commit. In both states, `git worktree list --porcelain`
+ * does not report a user branch checked out at `.mux-base.git`.
+ */
+const BASE_REPO_UNBORN_HEAD_REF = "refs/heads/__mux_internal_base_head";
+const BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET = ["core.bare", "core.worktree"] as const;
+type BaseRepoSharedConfigKey = (typeof BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET)[number];
 
 /** Small backoff for concurrent writers healing the same shared base repo config. */
 const BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS = [50, 100, 200];
 const BASE_REPO_HEALTH_PROBE_TIMEOUT_SECONDS = 10;
+const BASE_REPO_CONNECTIVITY_CHECK_TIMEOUT_SECONDS = 120;
+const BASE_REPO_MISSING_OBJECT_REPAIR_TIMEOUT_MS = 300_000;
 const BASE_REPO_PROMISOR_CLEANUP_TIMEOUT_SECONDS = 10;
 /**
  * Timeout for *spawning* remote detached gc, not for gc itself. The remote
@@ -131,6 +156,12 @@ function isUnresolvedDeltaPushFailure(errorMsg: string): boolean {
   return UNRESOLVED_DELTA_PUSH_PATTERNS.some((pattern) => errorMsg.includes(pattern));
 }
 
+function isMissingObjectCheckoutFailure(message: string): boolean {
+  return /unable to read sha1 file|Could not reset index file|missing (blob|tree|commit)|bad object|unable to read tree|object file .* is empty|loose object .* is corrupt/i.test(
+    message
+  );
+}
+
 const sharedProjectSyncTails = new Map<string, Promise<void>>();
 
 async function enqueueProjectSync(
@@ -160,7 +191,7 @@ async function enqueueProjectSync(
     ? Promise.race([
         waitForPrevious,
         new Promise<never>((_, reject) => {
-          onAbort = () => reject(new Error("Operation aborted"));
+          onAbort = () => reject(new Error(OPERATION_ABORTED_ERROR));
           if (abortSignal.aborted) {
             onAbort();
             return;
@@ -173,7 +204,7 @@ async function enqueueProjectSync(
   try {
     await waitForTurn;
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
     await fn();
   } finally {
@@ -186,6 +217,19 @@ async function enqueueProjectSync(
 
 function isGitConfigLockConflict(message: string): boolean {
   return /could not lock config file/i.test(message);
+}
+
+function buildBestEffortDetachBaseRepoHeadCommand(
+  baseRepoPathArg: string,
+  revisionShell: string
+): string {
+  return [
+    // Resolve only the ref value here, not `<rev>^{commit}`: missing-object
+    // repair still belongs to the following worktree checkout, which produces
+    // richer errors and already has a retry path.
+    `head_oid=$(git -C ${baseRepoPathArg} rev-parse --verify ${revisionShell} 2>/dev/null || true)`,
+    `if [ -n "$head_oid" ]; then git --git-dir=${baseRepoPathArg} update-ref --no-deref HEAD "$head_oid" 2>/dev/null || true; fi`,
+  ].join("\n");
 }
 
 function logSSHBackoffWait(initLogger: InitLogger, waitMs: number): void {
@@ -263,8 +307,17 @@ function createAbortController(
   };
 }
 async function waitForProcessExit(proc: ChildProcess): Promise<number> {
+  // Callers often consume stdout before awaiting the process. Tiny git helpers
+  // can close in that window, so make the helper safe even when subscribed late.
+  if (proc.exitCode !== null) {
+    return proc.exitCode;
+  }
+  if (proc.signalCode !== null) {
+    return 1;
+  }
+
   return new Promise((resolve, reject) => {
-    proc.on("close", (code) => resolve(code ?? 0));
+    proc.on("close", (code) => resolve(code ?? 1));
     proc.on("error", (err) => reject(err));
   });
 }
@@ -304,17 +357,6 @@ function isGitPushTransportFailure(exitCode: number | null, errorMsg: string): b
 }
 // Re-export SSHRuntimeConfig from connection pool (defined there to avoid circular deps)
 export type { SSHRuntimeConfig } from "./sshConnectionPool";
-
-/**
- * Compute the path to the shared bare base repo for a project on the remote.
- * Convention: <srcBaseDir>/<projectId>/.mux-base.git
- *
- * Exported for unit testing; runtime code should use the private
- * `SSHRuntime.getBaseRepoPath()` method instead.
- */
-export function computeBaseRepoPath(srcBaseDir: string, projectPath: string): string {
-  return buildRemoteProjectLayout(srcBaseDir, projectPath).baseRepoPath;
-}
 
 /**
  * Run `git show-ref --heads` against a local project and return the raw stdout
@@ -463,6 +505,9 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
  *
  * Extends RemoteRuntime for shared exec/file operations.
  */
+/** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
+const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -604,8 +649,8 @@ export class SSHRuntime extends RemoteRuntime {
    *   early-return path in `unpack()`. The same lesson was never applied
    *   to the promisor path added three years later.
    *
-   *   Mux never deliberately turns the shared base repo into a partial
-   *   clone, but legacy bare repos populated by earlier Mux versions, or
+   *   Xum never deliberately turns the shared base repo into a partial
+   *   clone, but legacy bare repos populated by earlier Xum versions, or
    *   by user-initiated `git fetch --filter` runs on the remote, can
    *   carry these keys. Stripping them makes `repo_has_promisor_remote()`
    *   return false, routing `check_connected()` through the slow rev-list
@@ -618,7 +663,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     // `git config --unset-all` exits 0 (removed) or 5 (key/section absent);
@@ -659,7 +704,7 @@ export class SSHRuntime extends RemoteRuntime {
     options: { waitForGc?: boolean } = {}
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     log.info(repairContext);
@@ -780,7 +825,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     try {
@@ -800,10 +845,209 @@ export class SSHRuntime extends RemoteRuntime {
       );
     } catch (healthError) {
       const healthErrorMsg = getErrorMessage(healthError);
-      if (abortSignal?.aborted || healthErrorMsg === "Operation aborted") {
+      if (abortSignal?.aborted || healthErrorMsg === OPERATION_ABORTED_ERROR) {
         throw healthError instanceof Error ? healthError : new Error(healthErrorMsg);
       }
       log.warn(`Shared base repository maintenance preflight failed: ${healthErrorMsg}`);
+    }
+  }
+
+  private async checkBaseRepoBundleConnectivity(
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ healthy: true } | { healthy: false; detail: string }> {
+    const result = await execBuffered(
+      this,
+      [
+        `set -- $(git -C ${baseRepoPathArg} for-each-ref --format='%(refname)' ${shescape.quote(BUNDLE_REF_PREFIX)})`,
+        'if [ "$#" -eq 0 ]; then echo "no synced bundle refs found" >&2; exit 1; fi',
+        `git -C ${baseRepoPathArg} fsck --connectivity-only --no-dangling "$@"`,
+      ].join("\n"),
+      {
+        cwd: "/tmp",
+        timeout: BASE_REPO_CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
+        abortSignal,
+      }
+    );
+
+    if (result.exitCode === 0) {
+      return { healthy: true };
+    }
+
+    const detail = [result.stderr, result.stdout].join("\n").trim() || `exit ${result.exitCode}`;
+    return {
+      healthy: false,
+      detail,
+    };
+  }
+
+  private async checkBaseRepoRevisionConnectivity(
+    baseRepoPathArg: string,
+    revision: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ healthy: true } | { healthy: false; detail: string }> {
+    const result = await execBuffered(
+      this,
+      `git -C ${baseRepoPathArg} fsck --connectivity-only --no-dangling ${shescape.quote(revision)}`,
+      {
+        cwd: "/tmp",
+        timeout: BASE_REPO_CONNECTIVITY_CHECK_TIMEOUT_SECONDS,
+        abortSignal,
+      }
+    );
+
+    if (result.exitCode === 0) {
+      return { healthy: true };
+    }
+
+    const detail = [result.stderr, result.stdout].join("\n").trim() || `exit ${result.exitCode}`;
+    return {
+      healthy: false,
+      detail,
+    };
+  }
+
+  private async repairBaseRepoMissingObjectsFromLocal(
+    projectPath: string,
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error(OPERATION_ABORTED_ERROR);
+    }
+
+    await this.transport.acquireConnection({
+      abortSignal,
+      onWait: (waitMs) => logSSHBackoffWait(initLogger, waitMs),
+    });
+
+    if (abortSignal?.aborted) {
+      throw new Error(OPERATION_ABORTED_ERROR);
+    }
+
+    initLogger.logStep("Repairing shared base repository object cache...");
+    const remoteAbortController = createAbortController(
+      BASE_REPO_MISSING_OBJECT_REPAIR_TIMEOUT_MS,
+      abortSignal
+    );
+
+    try {
+      const remoteStream = await this.exec(`git -C ${baseRepoPathArg} unpack-objects -r`, {
+        cwd: "/tmp",
+        abortSignal: remoteAbortController.signal,
+      });
+      const remoteStdoutPromise = streamToString(remoteStream.stdout);
+      const remoteStderrPromise = streamToString(remoteStream.stderr);
+
+      // A normal fetch/push can be a no-op when the remote already has the
+      // commit object but is missing blobs from the same tree. Stream a complete
+      // non-thin local pack and let `unpack-objects -r` add only the missing
+      // objects without deleting or recreating the shared gitdir used by siblings.
+      const gitProc = spawn("git", ["-C", projectPath, "pack-objects", "--all", "--stdout"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      let packStderr = "";
+      gitProc.stderr?.on("data", (data: Buffer) => {
+        const chunk = data.toString();
+        packStderr += chunk;
+        for (const line of chunk.split("\n").filter(Boolean)) {
+          initLogger.logStderr(line);
+        }
+      });
+      const gitExitCodePromise = waitForProcessExit(gitProc);
+
+      try {
+        await pipeReadableToWebWritable(gitProc.stdout, remoteStream.stdin, abortSignal);
+      } catch (error) {
+        gitProc.kill();
+        throw error;
+      }
+
+      const [gitExitCode, remoteExitCode, remoteStdout, remoteStderr] = await Promise.all([
+        gitExitCodePromise,
+        remoteStream.exitCode,
+        remoteStdoutPromise,
+        remoteStderrPromise,
+      ]);
+
+      if (remoteAbortController.didTimeout()) {
+        throw new Error(
+          `SSH command timed out after ${BASE_REPO_MISSING_OBJECT_REPAIR_TIMEOUT_MS}ms: git -C ${baseRepoPathArg} unpack-objects -r`
+        );
+      }
+
+      if (abortSignal?.aborted) {
+        throw new Error(OPERATION_ABORTED_ERROR);
+      }
+
+      if (gitExitCode !== 0) {
+        throw new Error(
+          `Failed to create repair pack: ${packStderr.trim() || `exit ${gitExitCode}`}`
+        );
+      }
+
+      if (remoteExitCode !== 0) {
+        const detail = (remoteStderr || remoteStdout).trim() || `exit ${remoteExitCode}`;
+        throw new Error(`Failed to unpack repair pack into shared base repository: ${detail}`);
+      }
+    } finally {
+      remoteAbortController.dispose();
+    }
+
+    initLogger.logStep("Shared base repository object cache repaired");
+  }
+
+  private async ensureBaseRepoSnapshotConnectivity(
+    projectPath: string,
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    const initialCheck = await this.checkBaseRepoBundleConnectivity(baseRepoPathArg, abortSignal);
+    if (initialCheck.healthy) {
+      return;
+    }
+
+    initLogger.logStep("Remote snapshot is missing objects; repairing shared base repository...");
+    log.warn("Remote snapshot failed connectivity check before reuse", {
+      detail: initialCheck.detail,
+    });
+
+    await this.repairBaseRepoMissingObjectsFromLocal(
+      projectPath,
+      baseRepoPathArg,
+      initLogger,
+      abortSignal
+    );
+
+    const repairedCheck = await this.checkBaseRepoBundleConnectivity(baseRepoPathArg, abortSignal);
+    if (!repairedCheck.healthy) {
+      throw new Error(
+        `Shared base repository is still missing objects after repair: ${repairedCheck.detail}`
+      );
+    }
+  }
+
+  private async cleanupFailedNewWorktreeCheckout(
+    baseRepoPathArg: string,
+    workspacePathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    const result = await execBuffered(
+      this,
+      `git -C ${baseRepoPathArg} worktree remove --force ${workspacePathArg} >/dev/null 2>&1 || rm -rf ${workspacePathArg}`,
+      {
+        cwd: "/tmp",
+        timeout: 30,
+        abortSignal,
+      }
+    );
+    if (result.exitCode !== 0) {
+      const detail = (result.stderr || result.stdout).trim() || `exit ${result.exitCode}`;
+      log.warn(`Failed to clean up partial SSH worktree checkout: ${detail}`);
     }
   }
 
@@ -814,7 +1058,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     try {
@@ -826,7 +1070,7 @@ export class SSHRuntime extends RemoteRuntime {
       );
     } catch (cleanupError) {
       const cleanupErrorMsg = getErrorMessage(cleanupError);
-      if (abortSignal?.aborted || cleanupErrorMsg === "Operation aborted") {
+      if (abortSignal?.aborted || cleanupErrorMsg === OPERATION_ABORTED_ERROR) {
         throw cleanupError instanceof Error ? cleanupError : new Error(cleanupErrorMsg);
       }
       log.warn(`Remote sync retry cleanup failed: ${cleanupErrorMsg}`);
@@ -864,6 +1108,15 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    // A probe that hit its own client-side deadline proved nothing about the
+    // file: a stalled link (docker pause, dead peer before keepalives notice)
+    // reaches the 5–10 s probe deadlines first (#4825). The callers of this
+    // hook are trivial non-login primitives (cat, stat, find, mv); resolvePath
+    // runs a slow `bash -lc` login shell and deliberately does not use it.
+    return exitCode === EXIT_CODE_TIMEOUT || this.transport.isConnectionFailure(exitCode, stderr);
+  }
+
   protected async spawnRemoteProcess(
     fullCommand: string,
     options: ExecOptions & { deadlineMs?: number }
@@ -890,6 +1143,23 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== Runtime interface implementations =====
 
   async resolvePath(filePath: string): Promise<string> {
+    // One bounded retry on a transport failure (#4830), as for reads and
+    // stats: each attempt is already capped at 10 s, so a persistent outage
+    // still fails fast. A login-shell timeout is not transport and never
+    // retries. If the retry fails too, callers see the first failure.
+    try {
+      return await this.resolvePathOnce(filePath);
+    } catch (error) {
+      if (!isRuntimeRetryableTransportError(error)) throw error;
+      log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
+      return this.resolvePathOnce(filePath).catch((retryError: unknown) => {
+        log.debug(`Retry of SSH path resolution of ${filePath} failed too`, retryError);
+        throw error;
+      });
+    }
+  }
+
+  protected override async resolvePathOnce(filePath: string): Promise<string> {
     // Expand ~ on the remote host.
     // Note: `p='~/x'; echo "$p"` does NOT expand ~ (tilde expansion happens before assignment).
     // We do explicit expansion using parameter substitution (no reliance on `realpath`, `readlink -f`, etc.).
@@ -931,6 +1201,11 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (result.exitCode !== 0) {
         const message = result.stderr || result.stdout || "Unknown error";
+        // An unreachable host says nothing about the path; callers must not
+        // skip the root as if it were absent (#4438).
+        if (this.transport.isConnectionFailure(result.exitCode, result.stderr)) {
+          throw new RuntimeError(`Failed to resolve SSH path: ${message}`, "network");
+        }
         throw new Error(`Failed to resolve SSH path: ${message}`);
       }
 
@@ -976,20 +1251,35 @@ export class SSHRuntime extends RemoteRuntime {
     const parentDirArg = expandTildeForSSH(path.posix.dirname(baseRepoPath));
 
     // STARTUP-PERF: This used to be 3-5 sequential SSH round-trips
-    // (test -d, mkdir, git init, unset core.bare, unset 3× promisor keys).
+    // (test -d, mkdir, git init, normalize base config, unset 3× promisor keys).
     // Each round-trip costs ~80-100ms even over a multiplexed control channel,
     // so on a cold SSH workspace this single batched command shaves ~500ms off
     // the critical path of `mux run --runtime ssh <host>`.
     //
-    // The script is split into two well-defined sections, each producing a
-    // status sentinel that the caller parses:
-    //
-    //   STATUS_CREATED=<existed|created>   — repo presence/creation outcome
-    //   STATUS_CORE_BARE=<unset|absent|locked|error>  — normalization result
+    // The script emits status sentinels that the caller parses for repo
+    // creation, shared config-key normalization, and base HEAD normalization.
     //
     // Promisor keys are idempotently neutered as a best-effort epilogue (no
     // sentinel needed; failures fall through harmlessly because subsequent
     // pushes can re-run the cleanup if a deadlock recurs).
+    const baseRepoUnbornHeadArg = shescape.quote(BASE_REPO_UNBORN_HEAD_REF);
+    const configUnsetCmds = BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET.map((key) => {
+      const statusName = key.replace(".", "_").toUpperCase();
+      const errorPath = `/tmp/.mux-${key.replace(".", "-")}-$$.err`;
+      return [
+        `git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>${errorPath}`,
+        "rc=$?",
+        'if [ "$rc" -eq 0 ]; then',
+        `  echo STATUS_${statusName}=unset`,
+        'elif [ "$rc" -eq 5 ]; then',
+        `  echo STATUS_${statusName}=absent`,
+        "else",
+        `  echo STATUS_${statusName}=error`,
+        `  cat ${errorPath} >&2 2>/dev/null || true`,
+        "fi",
+        `rm -f ${errorPath} 2>/dev/null || true`,
+      ].join("\n");
+    }).join("\n");
     const promisorUnsetCmds = BASE_REPO_PROMISOR_CONFIG_KEYS.map(
       (key) => `git -C ${baseRepoPathArg} config --unset-all ${key} 2>/dev/null || true`
     ).join("\n");
@@ -1010,29 +1300,30 @@ export class SSHRuntime extends RemoteRuntime {
       "  fi",
       "  echo STATUS_CREATED=created",
       "fi",
-      // 2. Normalize core.bare in the *local* config — see
-      //    normalizeBaseRepoSharedConfig() for full context.
-      //    Exit codes: 0 = removed, 5 = key absent.  Anything else needs the
-      //    retry/inspect dance, which the caller handles by re-running the
-      //    slow-path helper.
-      `git -C ${baseRepoPathArg} config --local --unset-all core.bare 2>/tmp/.mux-corebare.err`,
-      "rc=$?",
-      'if [ "$rc" -eq 0 ]; then',
-      "  echo STATUS_CORE_BARE=unset",
-      'elif [ "$rc" -eq 5 ]; then',
-      "  echo STATUS_CORE_BARE=absent",
+      // 2. Normalize shared config keys in the *local* config — see
+      //    normalizeBaseRepoSharedConfigKeys() for full context. Exit codes:
+      //    0 = removed, 5 = key absent. Anything else needs the retry/inspect
+      //    dance, which the caller handles by re-running the slow-path helper.
+      configUnsetCmds,
+      // 3. Keep the base repo's own HEAD off user branches so checkout-aware
+      //    tooling doesn't mistake `.mux-base.git` for a real worktree. This
+      //    symbolic ref is intentionally unborn; materialization detaches HEAD
+      //    at the chosen base commit once one is known.
+      `current_head=$(git --git-dir=${baseRepoPathArg} symbolic-ref HEAD 2>/dev/null || true)`,
+      `if [ "$current_head" = ${baseRepoUnbornHeadArg} ]; then`,
+      "  echo STATUS_BASE_HEAD=already",
+      `elif git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/tmp/.mux-base-head-$$.err; then`,
+      "  echo STATUS_BASE_HEAD=set",
       "else",
-      // Surface the stderr to the caller so the slow-path retry can decide
-      // whether this is a lock conflict (transient) or a real error.
-      "  echo STATUS_CORE_BARE=error",
-      "  cat /tmp/.mux-corebare.err >&2 2>/dev/null || true",
+      "  echo STATUS_BASE_HEAD=error",
+      "  cat /tmp/.mux-base-head-$$.err >&2 2>/dev/null || true",
       "fi",
-      "rm -f /tmp/.mux-corebare.err 2>/dev/null || true",
-      // 3. Idempotently strip partial-clone / promisor keys (always best-effort).
+      "rm -f /tmp/.mux-base-head-$$.err 2>/dev/null || true",
+      // 4. Idempotently strip partial-clone / promisor keys (always best-effort).
       //    See stripBaseRepoPromisorConfig() docstring for the upstream Git
       //    sideband-deadlock bug this guards against.
       promisorUnsetCmds,
-      // 4. Force receive-pack to use index-pack (with `--fix-thin`) instead of
+      // 5. Force receive-pack to use index-pack (with `--fix-thin`) instead of
       //    `unpack-objects` for incoming pushes, regardless of object count.
       //    This avoids the "unresolved deltas left after unpacking" /
       //    "unpacker error" failure mode where small thin pushes (below the
@@ -1058,42 +1349,82 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     const created = result.stdout.includes("STATUS_CREATED=created");
-    const coreBareStatus = /STATUS_CORE_BARE=(\w+)/.exec(result.stdout)?.[1];
+    const configStatuses = new Map(
+      BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET.map((key) => [
+        key,
+        new RegExp(`STATUS_${key.replace(".", "_").toUpperCase()}=(\\w+)`).exec(result.stdout)?.[1],
+      ])
+    );
+    const baseHeadStatus = /STATUS_BASE_HEAD=(\w+)/.exec(result.stdout)?.[1];
 
     if (created) {
       initLogger.logStep("Created shared base repository");
     }
 
-    if (coreBareStatus === "unset") {
+    let loggedConfigNormalization = false;
+    if ([...configStatuses.values()].some((status) => status === "unset")) {
       initLogger.logStep("Normalized shared base repository config for worktrees");
-    } else if (coreBareStatus === "error") {
+      loggedConfigNormalization = true;
+    }
+
+    const configErrorKeys = BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET.filter(
+      (key) => configStatuses.get(key) === "error"
+    );
+    if (configErrorKeys.length > 0) {
       // Fall back to the slow-path retry helper, which handles lock conflicts
-      // by re-trying with backoff and inspecting whether the key is still set.
-      const normalized = await this.normalizeBaseRepoSharedConfig(baseRepoPathArg, abortSignal);
-      if (normalized) {
+      // by re-trying with backoff and inspecting whether each key is still set.
+      const normalized = await this.normalizeBaseRepoSharedConfigKeys(
+        baseRepoPathArg,
+        configErrorKeys,
+        abortSignal
+      );
+      if (normalized && !loggedConfigNormalization) {
         initLogger.logStep("Normalized shared base repository config for worktrees");
       }
     }
-    // STATUS_CORE_BARE=absent: nothing to do.
+
+    if (baseHeadStatus === "set") {
+      initLogger.logStep("Neutralized shared base repository HEAD for worktrees");
+    } else if (baseHeadStatus === "error") {
+      throw new Error(
+        `Failed to normalize base repo HEAD: ${result.stderr.trim() || result.stdout.trim()}`
+      );
+    }
 
     return { baseRepoPathArg, freshlyCreated: created };
   }
 
   /**
-   * Keep the shared SSH base repo bare by layout instead of by sharing `core.bare`
-   * through the repo's common config. Linked worktrees consult that local config too,
-   * so leaving `core.bare=true` there leaks bare-repo metadata into normal workspace
-   * checkouts even though Git can infer the host repo is bare from its directory
-   * layout alone.
+   * Keep the shared SSH base repo bare by layout instead of by sharing checkout
+   * config through the repo's common config. Linked worktrees consult that local
+   * config too, so leaving keys like `core.bare` or `core.worktree` there leaks
+   * base-repo metadata into normal workspace checkouts.
    */
-  private async normalizeBaseRepoSharedConfig(
+  private async normalizeBaseRepoSharedConfigKeys(
     baseRepoPathArg: string,
+    keys: readonly BaseRepoSharedConfigKey[],
     abortSignal?: AbortSignal
   ): Promise<boolean> {
+    let normalized = false;
+    for (const key of keys) {
+      normalized =
+        (await this.normalizeBaseRepoSharedConfigKey(baseRepoPathArg, key, abortSignal)) ||
+        normalized;
+    }
+    return normalized;
+  }
+
+  private async normalizeBaseRepoSharedConfigKey(
+    baseRepoPathArg: string,
+    key: BaseRepoSharedConfigKey,
+    abortSignal?: AbortSignal
+  ): Promise<boolean> {
+    const keyArg = shescape.quote(key);
+
     for (let attempt = 0; attempt <= BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS.length; attempt++) {
       const unsetResult = await execBuffered(
         this,
-        `git -C ${baseRepoPathArg} config --local --unset-all core.bare`,
+        `git --git-dir=${baseRepoPathArg} config --local --unset-all ${keyArg}`,
         {
           cwd: "/tmp",
           timeout: 10,
@@ -1111,12 +1442,12 @@ export class SSHRuntime extends RemoteRuntime {
 
       const errorDetail = unsetResult.stderr || unsetResult.stdout;
       if (!isGitConfigLockConflict(errorDetail)) {
-        throw new Error(`Failed to normalize base repo config: ${errorDetail}`);
+        throw new Error(`Failed to normalize base repo config ${key}: ${errorDetail}`);
       }
 
       const inspectResult = await execBuffered(
         this,
-        `git -C ${baseRepoPathArg} config --local --get core.bare`,
+        `git --git-dir=${baseRepoPathArg} config --local --get ${keyArg}`,
         {
           cwd: "/tmp",
           timeout: 10,
@@ -1130,12 +1461,12 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (inspectResult.exitCode !== 0) {
         throw new Error(
-          `Failed to inspect base repo config after lock conflict: ${inspectResult.stderr || inspectResult.stdout}`
+          `Failed to inspect base repo config ${key} after lock conflict: ${inspectResult.stderr || inspectResult.stdout}`
         );
       }
 
       if (attempt === BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS.length) {
-        throw new Error(`Failed to normalize base repo config: ${errorDetail}`);
+        throw new Error(`Failed to normalize base repo config ${key}: ${errorDetail}`);
       }
 
       // Another initWorkspace may be healing the same shared base repo; if the
@@ -1515,6 +1846,16 @@ export class SSHRuntime extends RemoteRuntime {
       const isCommandMissing =
         verifyResult.exitCode === 127 || /command not found/i.test(stderr || stdout);
 
+      // A stall that hits the verify deadline is not a missing repository:
+      // keep it retryable instead of a permanent runtime_not_ready (#4825).
+      if (verifyResult.exitCode === EXIT_CODE_TIMEOUT) {
+        return {
+          ready: false,
+          error: "Failed to reach SSH host: repository check timed out",
+          errorType: "runtime_start_failed",
+        };
+      }
+
       if (this.transport.isConnectionFailure(verifyResult.exitCode, verifyResult.stderr)) {
         return {
           ready: false,
@@ -1640,7 +1981,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     // Snapshot markers stay deterministic, but the uploaded bundle itself must use
-    // a per-attempt temp path so concurrent Mux processes do not stream into the same file.
+    // a per-attempt temp path so concurrent Xum processes do not stream into the same file.
     const remoteBundlePath = path.posix.join(
       "~/.mux-bundles",
       layout.projectId,
@@ -1836,6 +2177,10 @@ export class SSHRuntime extends RemoteRuntime {
     // so it depends on the local `ssh` CLI being available. On OpenSSH runtimes,
     // the transport already depends on that binary and shares the same ControlPath.
     const runPush = async (pushArgs: string[]): Promise<void> => {
+      if (abortSignal?.aborted) {
+        throw new Error("Git push aborted");
+      }
+
       using pushProc = execFileAsync("git", pushArgs, {
         env: { GIT_SSH_COMMAND: gitSshCommand },
         onStderrData: (chunk) => {
@@ -1850,6 +2195,9 @@ export class SSHRuntime extends RemoteRuntime {
       const pushTimeout = setTimeout(() => pushProc[Symbol.dispose](), 300_000);
       const onAbort = () => pushProc[Symbol.dispose]();
       abortSignal?.addEventListener("abort", onAbort, { once: true });
+      if (abortSignal?.aborted) {
+        onAbort();
+      }
       try {
         await pushProc.result;
       } finally {
@@ -1945,7 +2293,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     const layout = this.getProjectLayout(projectPath);
@@ -1962,7 +2310,7 @@ export class SSHRuntime extends RemoteRuntime {
       let forceNoThinNextAttempt = false;
       for (let attempt = 1; attempt <= PROJECT_SYNC_MAX_ATTEMPTS; attempt++) {
         if (abortSignal?.aborted) {
-          throw new Error("Operation aborted");
+          throw new Error(OPERATION_ABORTED_ERROR);
         }
 
         try {
@@ -1972,7 +2320,7 @@ export class SSHRuntime extends RemoteRuntime {
           return;
         } catch (error) {
           const errorMsg = getErrorMessage(error);
-          if (abortSignal?.aborted || errorMsg === "Operation aborted") {
+          if (abortSignal?.aborted || errorMsg === OPERATION_ABORTED_ERROR) {
             throw error instanceof Error ? error : new Error(errorMsg);
           }
           if (
@@ -1996,7 +2344,7 @@ export class SSHRuntime extends RemoteRuntime {
             abortSignal
           );
           if (abortSignal?.aborted) {
-            throw new Error("Operation aborted");
+            throw new Error(OPERATION_ABORTED_ERROR);
           }
           initLogger.logStep(
             `Sync failed, retrying (attempt ${attempt + 1}/${PROJECT_SYNC_MAX_ATTEMPTS})...`
@@ -2015,7 +2363,7 @@ export class SSHRuntime extends RemoteRuntime {
     options: { forceNoThin?: boolean } = {}
   ): Promise<void> {
     if (abortSignal?.aborted) {
-      throw new Error("Operation aborted");
+      throw new Error(OPERATION_ABORTED_ERROR);
     }
 
     const currentSnapshotPath = layout.currentSnapshotPath;
@@ -2067,6 +2415,12 @@ export class SSHRuntime extends RemoteRuntime {
           : await this.resolveRemoteSyncRefManifest(baseRepoPathArg, abortSignal);
       if (localRefManifest != null && remoteRefManifest === localRefManifest) {
         await this.refreshBaseRepoOrigin(projectPath, baseRepoPathArg, initLogger, abortSignal);
+        await this.ensureBaseRepoSnapshotConnectivity(
+          projectPath,
+          baseRepoPathArg,
+          initLogger,
+          abortSignal
+        );
         initLogger.logStep("Reusing existing remote project snapshot");
         return;
       }
@@ -2189,18 +2543,18 @@ export class SSHRuntime extends RemoteRuntime {
     return runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
-      hookCheckPath: params.projectPath,
+      findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
       beforeHook: async () => {
         await this.prepareWorkspaceCheckout(params, nhp);
       },
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
+      runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
         // Expand tilde in hook path (quoted paths don't auto-expand on remote).
-        const hookPath = expandTildeForSSH(`${params.workspacePath}/.mux/init`);
+        const hookPath = expandTildeForSSH(`${params.workspacePath}/${hookRelativePath}`);
         await runInitHookOnRuntime(
           this,
           hookPath,
           params.workspacePath,
-          muxEnv,
+          xumEnv,
           initLogger,
           abortSignal
         );
@@ -2284,6 +2638,7 @@ export class SSHRuntime extends RemoteRuntime {
     }
     const snapshotDigest = crypto.createHash("sha256").update(headsOutput).digest("hex");
     const baseRepoPathArg = expandTildeForSSH(layout.baseRepoPath);
+    const baseRepoUnbornHeadArg = shescape.quote(BASE_REPO_UNBORN_HEAD_REF);
     const currentSnapshotPathArg = expandTildeForSSH(layout.currentSnapshotPath);
     const workspacePathArg = expandTildeForSSH(workspacePath);
     const workspaceParentArg = expandTildeForSSH(
@@ -2328,6 +2683,20 @@ export class SSHRuntime extends RemoteRuntime {
     //      when `fetchedOrigin` is false. The fetch runs on the SSH host, so
     //      its latency is upstream→datacenter (typically fast, and the same
     //      cost the slow path pays separately).
+    const warmBaseRepoNormalizationPreamble = [
+      ...BASE_REPO_SHARED_CONFIG_KEYS_TO_UNSET.map((key) =>
+        [
+          `git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>/dev/null`,
+          "cleanup_status=$?",
+          'if [ "$cleanup_status" -ne 0 ] && [ "$cleanup_status" -ne 5 ]; then echo WARM_MISS:base-config-normalization-failed; exit 0; fi',
+        ].join("\n")
+      ),
+      // If the lightweight warm-path hygiene cannot run, fall back to the slow
+      // path where ensureBaseRepo() has retry/error handling instead of risking
+      // materializing a worktree from still-poisoned shared config.
+      `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/dev/null || { echo WARM_MISS:base-head-normalization-failed; exit 0; }`,
+    ];
+
     const originPreamble = originUrlArg
       ? [
           `git -C ${baseRepoPathArg} remote set-url origin ${originUrlArg} 2>/dev/null || git -C ${baseRepoPathArg} remote add origin ${originUrlArg} >/dev/null 2>&1 || true`,
@@ -2347,6 +2716,8 @@ export class SSHRuntime extends RemoteRuntime {
       `read -r s < ${currentSnapshotPathArg} || true`,
       `[ "$s" = ${digestArg} ] || { echo WARM_MISS:snapshot-digest-drift; exit 0; }`,
       `test -e ${workspacePathArg} && { echo WARM_MISS:workspace-exists; exit 0; }`,
+      // Best-effort base-repo hygiene before the warm path reuses the shared gitdir.
+      ...warmBaseRepoNormalizationPreamble,
       // Optional origin fetch (preserves slow-path origin-freshness).
       ...originPreamble,
       // Choose the worktree base ref. Prefer freshly-fetched
@@ -2360,9 +2731,27 @@ export class SSHRuntime extends RemoteRuntime {
       `  git -C ${baseRepoPathArg} rev-parse --verify "$r" >/dev/null 2>&1 || r=$(git -C ${baseRepoPathArg} for-each-ref --count=1 --format='%(refname)' ${bundleRefFallbackPrefix})`,
       `  [ -n "$r" ] || { echo WARM_MISS:no-bundle-ref; exit 0; }`,
       "fi",
-      // Materialize.
+      // Materialize. Capture checkout failures so a missing-object cache can
+      // fall through to the repairing slow path instead of becoming an opaque
+      // `worktree-add-failed` miss. The path was proven absent above, so removing
+      // a partial checkout here cannot wipe a pre-existing workspace.
+      // Detach the base repo's own HEAD from user branches when the chosen ref
+      // has an object; if the cache is missing that object, worktree add below
+      // surfaces the existing repairable checkout error.
+      buildBestEffortDetachBaseRepoHeadCommand(baseRepoPathArg, '"$r"'),
       `mkdir -p ${workspaceParentArg}`,
-      `${nhp}git -C ${baseRepoPathArg} worktree add ${workspacePathArg} -B ${branchArg} "$r" >/dev/null 2>&1 || { echo WARM_MISS:worktree-add-failed; exit 0; }`,
+      `wt_output=$(${nhp}git -C ${baseRepoPathArg} worktree add ${workspacePathArg} -B ${branchArg} "$r" 2>&1 >/dev/null)`,
+      "wt_status=$?",
+      'if [ "$wt_status" -ne 0 ]; then',
+      '  case "$wt_output" in',
+      '    *"unable to read sha1 file"*|*"Could not reset index file"*|*"missing blob"*|*"missing tree"*|*"missing commit"*|*"bad object"*|*"unable to read tree"*) wt_reason=missing-objects ;;',
+      "    *) wt_reason=worktree-add-failed ;;",
+      "  esac",
+      `  git -C ${baseRepoPathArg} worktree remove --force ${workspacePathArg} >/dev/null 2>&1 || rm -rf ${workspacePathArg}`,
+      '  [ -z "$wt_output" ] || printf "%s\\n" "$wt_output" >&2',
+      '  echo "WARM_MISS:$wt_reason"',
+      "  exit 0",
+      "fi",
       // .gitmodules probe folded inline to skip a post-warm SSH RTT.
       `test -f ${workspacePathArg}/.gitmodules && echo GITMODULES=present || echo GITMODULES=missing`,
       "echo WARM_OK",
@@ -2437,6 +2826,7 @@ export class SSHRuntime extends RemoteRuntime {
     // another SSH workspace via worktree add or legacy cp), skip the expensive sync step.
     const workspacePathArg = expandTildeForSSH(workspacePath);
     let needsWorktreeCheckout = true;
+    let workspacePathExistedBeforeCheckout = false;
 
     try {
       const dirCheck = await execBuffered(this, `test -d ${workspacePathArg}`, {
@@ -2445,6 +2835,7 @@ export class SSHRuntime extends RemoteRuntime {
         abortSignal,
       });
       if (dirCheck.exitCode === 0) {
+        workspacePathExistedBeforeCheckout = true;
         const gitCheck = await execBuffered(
           this,
           `git -C ${workspacePathArg} rev-parse --is-inside-work-tree`,
@@ -2457,8 +2848,10 @@ export class SSHRuntime extends RemoteRuntime {
         needsWorktreeCheckout = gitCheck.exitCode !== 0;
       }
     } catch {
-      // Default to materializing the workspace on unexpected errors.
+      // Default to materializing the workspace on unexpected errors, but do not
+      // later delete the path because we failed to prove it was absent first.
       needsWorktreeCheckout = true;
+      workspacePathExistedBeforeCheckout = true;
     }
 
     if (needsWorktreeCheckout) {
@@ -2502,18 +2895,79 @@ export class SSHRuntime extends RemoteRuntime {
         abortSignal
       );
 
-      // git worktree add creates the directory and checks out the branch in one step.
-      // -B creates the branch or resets it to the start point if it already exists
-      // (e.g. orphaned from a previously deleted workspace). Git still prevents
-      // checking out a branch that's active in another worktree.
+      // `ensureBaseRepo()` keeps the bare repo HEAD on an unborn internal
+      // branch so Git porcelain stays happy even when there is no commit yet.
+      // Once we know the start point, detach HEAD at that commit when possible
+      // and let `worktree add -B` own branch creation/reset. Git still prevents
+      // resetting a branch that's active in another worktree.
       initLogger.logStep(`Creating worktree for branch: ${branchName}`);
-      const worktreeCmd = `${nhp}git -C ${baseRepoPathArg} worktree add ${workspacePathArg} -B ${shescape.quote(branchName)} ${shescape.quote(newBranchBase)}`;
+      const runWorktreeAdd = (baseRef: string) =>
+        execBuffered(
+          this,
+          [
+            buildBestEffortDetachBaseRepoHeadCommand(baseRepoPathArg, shescape.quote(baseRef)),
+            `${nhp}git -C ${baseRepoPathArg} worktree add ${workspacePathArg} -B ${shescape.quote(branchName)} ${shescape.quote(baseRef)}`,
+          ].join("\n"),
+          {
+            cwd: "/tmp",
+            timeout: 300,
+            abortSignal,
+          }
+        );
 
-      const worktreeResult = await execBuffered(this, worktreeCmd, {
-        cwd: "/tmp",
-        timeout: 300,
-        abortSignal,
-      });
+      let worktreeBase = newBranchBase;
+      let worktreeResult = await runWorktreeAdd(worktreeBase);
+
+      if (
+        worktreeResult.exitCode !== 0 &&
+        isMissingObjectCheckoutFailure(worktreeResult.stderr || worktreeResult.stdout)
+      ) {
+        initLogger.logStep("Shared base repository is missing checkout objects; repairing...");
+        if (!workspacePathExistedBeforeCheckout) {
+          await this.cleanupFailedNewWorktreeCheckout(
+            baseRepoPathArg,
+            workspacePathArg,
+            abortSignal
+          );
+        }
+
+        await this.repairBaseRepoMissingObjectsFromLocal(
+          projectPath,
+          baseRepoPathArg,
+          initLogger,
+          abortSignal
+        );
+
+        const repairedBaseCheck = await this.checkBaseRepoRevisionConnectivity(
+          baseRepoPathArg,
+          worktreeBase,
+          abortSignal
+        );
+        if (!repairedBaseCheck.healthy) {
+          if (worktreeBase === `origin/${trunkBranch}` && bundleTrunkRef != null) {
+            initLogger.logStderr(
+              `Note: origin/${trunkBranch} is still missing objects after repair; using local snapshot ${bundleTrunkRef}`
+            );
+            worktreeBase = bundleTrunkRef;
+            const fallbackCheck = await this.checkBaseRepoRevisionConnectivity(
+              baseRepoPathArg,
+              worktreeBase,
+              abortSignal
+            );
+            if (!fallbackCheck.healthy) {
+              throw new Error(
+                `Shared base repository is still missing objects after repair: ${fallbackCheck.detail}`
+              );
+            }
+          } else {
+            throw new Error(
+              `Shared base repository is still missing objects after repair: ${repairedBaseCheck.detail}`
+            );
+          }
+        }
+
+        worktreeResult = await runWorktreeAdd(worktreeBase);
+      }
 
       if (worktreeResult.exitCode !== 0) {
         throw new Error(
@@ -2756,7 +3210,8 @@ export class SSHRuntime extends RemoteRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Check if already aborted
     if (abortSignal?.aborted) {
@@ -2907,9 +3362,12 @@ export class SSHRuntime extends RemoteRuntime {
       if (isWorktree) {
         // Worktree: use `git worktree remove` against the actual common git dir for this
         // workspace so upgraded legacy SSH worktrees keep their original base repo metadata.
-        const baseRepoPathArg = expandTildeForSSH(
-          await this.resolveWorktreeBaseRepoPath(projectPath, deletedPath, abortSignal)
+        const baseRepoPath = await this.resolveWorktreeBaseRepoPath(
+          projectPath,
+          deletedPath,
+          abortSignal
         );
+        const baseRepoPathArg = expandTildeForSSH(baseRepoPath);
         const removeCmd = force
           ? `${nhp}git -C ${baseRepoPathArg} worktree remove --force ${this.quoteForRemote(deletedPath)}`
           : `${nhp}git -C ${baseRepoPathArg} worktree remove ${this.quoteForRemote(deletedPath)}`;
@@ -2947,11 +3405,33 @@ export class SSHRuntime extends RemoteRuntime {
         // that re-forking with the same workspace name can use the fast worktree
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
-        const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
-        if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
+        // keepBranch: the caller undoes a creation that reused this branch (#4819).
+        if (
+          branchToDelete &&
+          !PROTECTED_BRANCHES.includes(branchToDelete) &&
+          options?.keepBranch !== true
+        ) {
+          // HEAD neutralization migrates legacy *Xum-owned* base repos whose
+          // HEAD still points at a user branch (the Graphite-poisoning state)
+          // so `branch -D` keeps Git's native checked-out-branch guard instead
+          // of refusing because the bare repo "has the branch checked out".
+          // The resolved common git dir is workspace-derived, though: a
+          // hand-crafted or legacy worktree can resolve to a real checkout's
+          // `.git`, and rewriting that repo's HEAD would strand the user's
+          // checkout on the unborn internal branch. Managed base repos
+          // (canonical and legacy hashed layouts alike) are always named
+          // `.mux-base.git`, so scope the HEAD rewrite to them.
+          const isManagedBaseRepo = path.posix.basename(baseRepoPath) === REMOTE_BASE_REPO_DIR;
           await execBuffered(
             this,
-            `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(branchToDelete)} 2>/dev/null || true`,
+            [
+              ...(isManagedBaseRepo
+                ? [
+                    `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${shescape.quote(BASE_REPO_UNBORN_HEAD_REF)} 2>/dev/null || true`,
+                  ]
+                : []),
+              `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(branchToDelete)} 2>/dev/null || true`,
+            ].join("\n"),
             { cwd: "/tmp", timeout: 10 }
           ).catch(() => undefined);
         }
@@ -3059,6 +3539,19 @@ export class SSHRuntime extends RemoteRuntime {
         { cwd: "/tmp", timeout: 30 }
       ).catch(() => undefined);
       await removeStaging(reason);
+      // Callers run only after this fork's `worktree add -b` succeeded, and that refuses an
+      // existing branch, so the fork made `newWorkspaceName` and nothing has committed to it.
+      // Leaving it would make a retry of the name miss the fast path and the copy fallback check
+      // out the stale branch (#5125). This runs after the staging removal: `branch -D` refuses a
+      // branch any registered worktree still uses (even one whose dir is gone), so when the
+      // removal failed or another worktree took the branch, it is kept.
+      if (!PROTECTED_BRANCHES.includes(newWorkspaceName)) {
+        await execBuffered(
+          this,
+          `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(newWorkspaceName)} 2>/dev/null || true`,
+          { cwd: "/tmp", timeout: 10 }
+        ).catch(() => undefined);
+      }
     };
 
     // Hoisted outside the try block so the catch handler can reach them when
@@ -3114,13 +3607,16 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (hasBaseRepo.exitCode === 0) {
         initLogger.logStep("Creating worktree for forked workspace...");
-        // Use -b (not -B) so we fail instead of silently resetting an existing
-        // branch that another worktree might reference. initWorkspace uses -B
-        // because it owns the branch lifecycle; fork is creating a new name.
         // Stage the worktree under `stagingPath`; `git worktree move` will
         // rename it (and update the bare repo's gitdir back-reference) into
-        // `newWorkspacePath` once everything else has succeeded.
-        const worktreeCmd = `${nhp}git -C ${baseRepoPathArg} worktree add ${stagingPathArg} -b ${shescape.quote(newWorkspaceName)} ${shescape.quote(sourceBranch)}`;
+        // `newWorkspacePath` once everything else has succeeded. The base repo
+        // HEAD is neutralized first so `worktree add -b` keeps Git's normal
+        // active-branch and existing-branch guards.
+        const worktreeCmd = [
+          `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${shescape.quote(BASE_REPO_UNBORN_HEAD_REF)} 2>/dev/null || true`,
+          buildBestEffortDetachBaseRepoHeadCommand(baseRepoPathArg, shescape.quote(sourceBranch)),
+          `${nhp}git -C ${baseRepoPathArg} worktree add -b ${shescape.quote(newWorkspaceName)} ${stagingPathArg} ${shescape.quote(sourceBranch)}`,
+        ].join("\n");
         const worktreeResult = await execBuffered(this, worktreeCmd, {
           cwd: "/tmp",
           timeout: 60,
@@ -3187,6 +3683,18 @@ export class SSHRuntime extends RemoteRuntime {
           await execBuffered(
             this,
             `cd ${stagingPathArg} && for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'origin/HEAD'); do localname=\${branch#origin/}; git show-ref --verify --quiet refs/heads/$localname || git branch $localname $branch; done`,
+            { cwd: "/tmp", timeout: 30 }
+          );
+        } catch {
+          // Ignore - best-effort.
+        }
+
+        // Best-effort: record the inherited branches and stash before origin/* can go away, so the
+        // task_remove lossy check counts only the fork's own commits (#5105).
+        try {
+          await execBuffered(
+            this,
+            `cd ${stagingPathArg} && ${buildSourceRefSnapshotCommand(nhp)}`,
             { cwd: "/tmp", timeout: 30 }
           );
         } catch {
@@ -3334,7 +3842,15 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
-      return { success: true, workspacePath: newWorkspacePath, sourceBranch };
+      // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
+      // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
+      // delete the branch only when this is true (#5119).
+      return {
+        success: true,
+        workspacePath: newWorkspacePath,
+        sourceBranch,
+        createdBranch: usedWorktree,
+      };
     } catch (error) {
       // Catch-all cleanup so an aborted/thrown fork can never leave the
       // staging worktree registered in the bare repo with a dangling gitdir.

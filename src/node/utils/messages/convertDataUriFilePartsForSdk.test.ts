@@ -3,7 +3,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { convertDataUriFilePartsForSdk } from "./convertDataUriFilePartsForSdk";
 
 describe("convertDataUriFilePartsForSdk", () => {
-  it("converts base64 data URI file parts to raw base64 payloads", () => {
+  it("keeps base64 data URI file parts as canonical data URLs", () => {
     const base64 = Buffer.from("png-bytes", "utf8").toString("base64");
     const input: MuxMessage[] = [
       {
@@ -27,7 +27,9 @@ describe("convertDataUriFilePartsForSdk", () => {
     expect(filePart).toBeDefined();
     if (filePart?.type === "file") {
       expect(filePart.mediaType).toBe("image/png");
-      expect(filePart.url).toBe(base64);
+      // AI SDK 7 requires FileUIPart.url to parse as a real URL; raw base64 throws.
+      expect(filePart.url).toBe(`data:image/png;base64,${base64}`);
+      expect(() => new URL(filePart.url)).not.toThrow();
     }
   });
 
@@ -86,8 +88,8 @@ describe("convertDataUriFilePartsForSdk", () => {
     const convertedFileParts = converted[0].parts.filter((part) => part.type === "file");
 
     expect(convertedFileParts).toHaveLength(3);
-    expect(convertedFileParts[0].url).toBe(pngBase64);
-    expect(convertedFileParts[1].url).toBe(pdfBase64);
+    expect(convertedFileParts[0].url).toBe(`data:image/png;base64,${pngBase64}`);
+    expect(convertedFileParts[1].url).toBe(`data:application/pdf;base64,${pdfBase64}`);
     expect(convertedFileParts[2].url).toBe("https://example.com/photo.jpg");
   });
 
@@ -115,7 +117,8 @@ describe("convertDataUriFilePartsForSdk", () => {
     expect(filePart.type).toBe("file");
     if (filePart.type === "file") {
       expect(filePart.mediaType).toBe("image/svg+xml");
-      expect(filePart.url).toBe(Buffer.from(svg, "utf8").toString("base64"));
+      const svgBase64 = Buffer.from(svg, "utf8").toString("base64");
+      expect(filePart.url).toBe(`data:image/svg+xml;base64,${svgBase64}`);
     }
   });
 

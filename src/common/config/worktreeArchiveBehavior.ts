@@ -16,9 +16,3 @@ export function shouldDeleteWorktreeOnArchive(
 ): boolean {
   return behavior === "delete" || behavior === "snapshot";
 }
-
-export function usesWorktreeArchiveSnapshot(
-  behavior: WorktreeArchiveBehavior | undefined
-): boolean {
-  return behavior === "snapshot";
-}

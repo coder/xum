@@ -48,11 +48,13 @@ function parseDataUriToBase64(dataUri: string): ParsedDataUri {
 }
 
 /**
- * Rewrites user file-part data URIs into raw base64 payloads in `url`.
+ * Normalizes user file-part data URIs into canonical base64 `data:` URLs.
  *
- * convertToModelMessages() maps FileUIPart.url -> FilePart.data. If url remains a data:
- * URI string, downstream prompt prep can treat it as a URL and attempt to download it.
- * Converting to raw base64 keeps the payload inline and avoids URL download validation.
+ * AI SDK 7's convertToModelMessages() requires FileUIPart.url to parse as a real
+ * URL (`new URL(part.url)`), and it inlines `data:` URLs itself via splitDataUrl().
+ * However splitDataUrl() naively treats the payload after the comma as base64, so
+ * URL-encoded (non-base64) data URIs would be silently corrupted. Rebuilding the
+ * canonical `data:<mediaType>;base64,<payload>` form keeps both cases safe.
  */
 export function convertDataUriFilePartsForSdk(messages: MuxMessage[]): MuxMessage[] {
   let changedAnyMessage = false;
@@ -70,12 +72,14 @@ export function convertDataUriFilePartsForSdk(messages: MuxMessage[]): MuxMessag
       }
 
       const { mediaType, base64Data } = parseDataUriToBase64(part.url);
+      const effectiveMediaType = mediaType ?? part.mediaType;
+      assert(effectiveMediaType, "file part data URI requires a media type");
 
       changedMessage = true;
       return {
         ...part,
-        mediaType: mediaType ?? part.mediaType,
-        url: base64Data,
+        mediaType: effectiveMediaType,
+        url: `${DATA_URI_PREFIX}${effectiveMediaType};base64,${base64Data}`,
       };
     });
 

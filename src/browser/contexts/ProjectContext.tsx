@@ -15,14 +15,13 @@ import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  deleteWorkspaceStorage,
-  getDraftScopeId,
-} from "@/common/constants/storage";
+import { getDraftScopeId } from "@/common/constants/storage";
+import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
 import {
   normalizeProjectPathForComparison,
@@ -69,11 +68,20 @@ export interface ProjectContext {
   resolveProjectPath: (query: ProjectQuery) => string | null;
   /** Read project config from the full project map (includes system projects). */
   getProjectConfig: (projectPath: string) => ProjectConfig | undefined;
-  /** True while initial project list is loading */
+  /** True while the initial project list request is in flight. */
   loading: boolean;
+  /** True after at least one project list request completes successfully. */
+  loaded: boolean;
+  /** Last project list load failure, if the latest completed request failed. */
+  loadError: string | null;
   refreshProjects: () => Promise<void>;
   addProject: (normalizedPath: string, projectConfig: ProjectConfig) => void;
   removeProject: (path: string, options?: { force?: boolean }) => Promise<ProjectRemoveResult>;
+  /**
+   * Read-only removal preflight (no pruning/deletion side effects). Needed by
+   * the delete confirmation because projects.list excludes archived workspaces.
+   */
+  getRemovalBlockers: (path: string) => Promise<ProjectWorkspaceCounts>;
 
   // Project creation modal
   projectCreateInitialPath?: string;
@@ -92,6 +100,14 @@ export interface ProjectContext {
   updateSecrets: (projectPath: string, secrets: Secret[]) => Promise<void>;
   updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
   updateColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  updateCustomInstructions: (
+    projectPath: string,
+    customInstructions: string | null
+  ) => Promise<Result<void>>;
+  updateCodeWorkspaceSyncPath: (
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null
+  ) => Promise<Result<void>>;
 
   assignWorkspaceToSubProject: (
     projectPath: string,
@@ -136,6 +152,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [allProjectsInternal]
   );
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [projectCreateInitialPath, setProjectCreateInitialPath] = useState<string | undefined>();
   const [isProjectCreateModalOpen, setProjectCreateModalOpen] = useState(false);
   const [workspaceModalState, setWorkspaceModalState] = useState<WorkspaceModalState>({
@@ -149,48 +167,113 @@ export function ProjectProvider(props: { children: ReactNode }) {
   });
   const workspaceModalProjectRef = useRef<string | null>(null);
 
-  // Used to guard against refreshProjects() races.
-  //
-  // Example: the initial refresh (on mount) can start before a workspace fork, then
-  // resolve after a fork-triggered refresh. Without this guard, the stale response
-  // could overwrite the newer project list and make the forked workspace disappear
-  // from the sidebar again.
-  const projectsRefreshSeqRef = useRef(0);
-  const latestAppliedProjectsRefreshSeqRef = useRef(0);
+  const projectsRefreshRef = useRef<{
+    api: typeof api;
+    pending: boolean;
+    promise: Promise<void> | null;
+  }>({ api, pending: false, promise: null });
 
-  const refreshProjects = useCallback(async () => {
-    if (!api) return;
-
-    const refreshSeq = projectsRefreshSeqRef.current + 1;
-    projectsRefreshSeqRef.current = refreshSeq;
-
-    try {
-      const projectsList = await api.projects.list();
-
-      // Ignore out-of-date refreshes so an older response can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
-      }
-
-      latestAppliedProjectsRefreshSeqRef.current = refreshSeq;
-      setAllProjectsInternal(new Map(projectsList));
-    } catch (error) {
-      // Ignore out-of-date refreshes so an older error can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
-      }
-
-      // Keep the previous project list on error to avoid emptying the sidebar.
-      console.error("Failed to load projects:", error);
+  const refreshProjects = useCallback((): Promise<void> => {
+    const refresh = projectsRefreshRef.current;
+    if (refresh.api !== api) return Promise.resolve();
+    if (!api) {
+      setLoaded(false);
+      setLoadError("API not connected");
+      return Promise.resolve();
     }
+
+    // Cascade events share one request. Later invalidations require a trailing request.
+    refresh.pending = true;
+    refresh.promise ??= Promise.resolve().then(async () => {
+      try {
+        while (refresh.pending && refresh.api) {
+          refresh.pending = false;
+          const requestApi = refresh.api;
+          try {
+            const projectsList = await requestApi.projects.list();
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            setAllProjectsInternal(new Map(projectsList));
+            setLoaded(true);
+            setLoadError(null);
+          } catch (error) {
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            // Keep successful data when a later refresh fails.
+            console.error("Failed to load projects:", error);
+            setLoadError(getErrorMessage(error));
+          }
+        }
+      } finally {
+        refresh.promise = null;
+      }
+    });
+    // All callers await the trailing request, not only the response already in flight.
+    return refresh.promise;
   }, [api]);
 
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    // A disconnected transport must not block the replacement client.
+    const refresh: typeof projectsRefreshRef.current = { api, pending: false, promise: null };
+    projectsRefreshRef.current = refresh;
+    setLoading(true);
+
+    const initialRefresh = async () => {
       await refreshProjects();
-      setLoading(false);
+      if (!cancelled) {
+        setLoading(false);
+      }
+    };
+
+    const refreshPromise = initialRefresh();
+    refreshPromise.catch((error) => {
+      if (!cancelled) {
+        setLoadError(getErrorMessage(error));
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      refresh.api = null;
+      refresh.pending = false;
+    };
+  }, [api, refreshProjects]);
+
+  useEffect(() => {
+    const onConfigChanged = api?.config?.onConfigChanged;
+    if (onConfigChanged == null) {
+      return;
+    }
+
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+    let iterator: AsyncIterator<unknown> | null = null;
+
+    void (async () => {
+      try {
+        const subscribedIterator = await onConfigChanged(undefined, { signal });
+        if (signal.aborted) {
+          void subscribedIterator.return?.();
+          return;
+        }
+
+        iterator = subscribedIterator;
+        for await (const _ of subscribedIterator) {
+          if (signal.aborted) {
+            break;
+          }
+          void refreshProjects();
+        }
+      } catch {
+        // Subscription cancellation is expected during unmount/API reconnects.
+      }
     })();
-  }, [refreshProjects]);
+
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api, refreshProjects]);
 
   const addProject = useCallback((normalizedPath: string, projectConfig: ProjectConfig) => {
     setAllProjectsInternal((prev) => {
@@ -209,6 +292,9 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
       try {
+        const draftIds = (getDraftStore().getCreationDraftsByProject()[path] ?? []).map(
+          (draft) => draft.draftId
+        );
         const result = await api.projects.remove({
           projectPath: path,
           force: options?.force,
@@ -220,33 +306,13 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // Clean up any UI-only workspace drafts for this project.
-          const draftsValue = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
-          if (draftsValue && typeof draftsValue === "object") {
-            const record = draftsValue as Record<string, unknown>;
-            const drafts = record[path];
-            if (drafts !== undefined) {
-              if (Array.isArray(drafts)) {
-                for (const draft of drafts) {
-                  if (!draft || typeof draft !== "object") continue;
-                  const draftId = (draft as { draftId?: unknown }).draftId;
-                  if (typeof draftId === "string" && draftId.trim().length > 0) {
-                    deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-                  }
-                }
-              }
-
-              updatePersistedState<Record<string, unknown>>(
-                WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-                (prev) => {
-                  const next = prev && typeof prev === "object" ? { ...prev } : {};
-                  delete next[path];
-                  return next;
-                },
-                {}
-              );
-            }
+          // The backend deleted the project's creation drafts and delisted them. Clean up their
+          // localStorage settings (ids captured before the removal: its list event may already
+          // have emptied the list), then drop them from memory.
+          for (const draftId of draftIds) {
+            deleteWorkspaceStorage(getDraftScopeId(path, draftId));
           }
+          getDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };
@@ -275,6 +341,16 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
   const resolveProjectPath = useCallback(
     (query: ProjectQuery): string | null => {
+      // The scratch sentinel is not a configured project until the first
+      // scratch chat is created, so a reloaded scratch draft route cannot be
+      // resolved from projects.list; resolve it statically instead.
+      if (
+        query.value === SCRATCH_PROJECT_CONFIG_KEY ||
+        (query.type === "routeId" && query.value === getProjectRouteId(SCRATCH_PROJECT_CONFIG_KEY))
+      ) {
+        return SCRATCH_PROJECT_CONFIG_KEY;
+      }
+
       if (query.type === "path") {
         const platform = globalThis.window?.api?.platform;
         const normalizedTarget = normalizeProjectPathForComparison(query.value, platform);
@@ -473,6 +549,20 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [api, refreshProjects]
   );
 
+  const updateCustomInstructions = useCallback(
+    async (projectPath: string, customInstructions: string | null): Promise<Result<void>> => {
+      if (!api) return { success: false, error: "API not connected" };
+      try {
+        await api.projects.setCustomInstructions({ projectPath, customInstructions });
+        await refreshProjects();
+        return { success: true, data: undefined };
+      } catch (error) {
+        return { success: false, error: getErrorMessage(error) };
+      }
+    },
+    [api, refreshProjects]
+  );
+
   const assignWorkspaceToSubProject = useCallback(
     async (
       projectPath: string,
@@ -502,9 +592,19 @@ export function ProjectProvider(props: { children: ReactNode }) {
       resolveNewChatProjectPath,
       getProjectConfig,
       loading,
+      loaded,
+      loadError,
       refreshProjects,
       addProject,
       removeProject,
+      // Inline (not useCallback-wrapped): `api` is already a dependency of
+      // this provider value memo, mirroring the other inline actions below.
+      getRemovalBlockers: async (path: string): Promise<ProjectWorkspaceCounts> => {
+        if (!api) {
+          throw new Error("API not connected");
+        }
+        return api.projects.getRemovalBlockers({ projectPath: path });
+      },
       projectCreateInitialPath,
       isProjectCreateModalOpen,
       openProjectCreateModal: (options?: { initialPath?: string }) => {
@@ -523,6 +623,22 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateSecrets,
       updateDisplayName,
       updateColor,
+      updateCustomInstructions,
+      // Defined inline (not useCallback): the repo bans new manual useCallback
+      // memoization, and inlining keeps exhaustive-deps satisfied via `api`.
+      updateCodeWorkspaceSyncPath: async (
+        projectPath: string,
+        codeWorkspaceSyncPath: string | null
+      ): Promise<Result<void>> => {
+        if (!api) return { success: false, error: "API not connected" };
+        try {
+          await api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
+          await refreshProjects();
+          return { success: true, data: undefined };
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      },
       assignWorkspaceToSubProject,
     }),
     [
@@ -533,6 +649,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
       resolveNewChatProjectPath,
       getProjectConfig,
       loading,
+      loaded,
+      loadError,
       refreshProjects,
       addProject,
       removeProject,
@@ -546,6 +664,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateSecrets,
       updateDisplayName,
       updateColor,
+      updateCustomInstructions,
+      api,
       assignWorkspaceToSubProject,
     ]
   );

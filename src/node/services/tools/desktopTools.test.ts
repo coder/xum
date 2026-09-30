@@ -5,9 +5,10 @@ import { createDesktopTools } from "./desktopTools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 interface DesktopActionSuccessResult {

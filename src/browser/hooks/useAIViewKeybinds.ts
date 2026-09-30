@@ -6,11 +6,13 @@ import {
   KEYBINDS,
   isEditableElement,
   isBrowserViewportFocused,
+  isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
 } from "@/browser/utils/ui/keybinds";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
+import { stopStream } from "@/browser/utils/stopStream";
 import { useAPI } from "@/browser/contexts/API";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 
@@ -24,13 +26,19 @@ interface UseAIViewKeybindsParams {
   handleOpenTerminal: () => void;
   handleOpenInEditor: () => void;
   aggregator: StreamingMessageAggregator | undefined; // For compaction detection
-  setEditingMessage: (editing: EditingMessageState | undefined) => void;
+  /** Enters edit mode for the cancelled compaction request (the owner captures its edit fence). */
+  setEditingMessage: (editing: EditingMessageState) => void;
   vimEnabled: boolean; // For vim-aware interrupt keybind
+  // RESUME_STREAM keybind: continue an interrupted stream. Optional so the hook
+  // stays drop-in for callers/tests that don't surface a resume affordance.
+  canResumeInterruptedStream?: boolean; // Whether a resumable interrupted turn is shown
+  resumeInterruptedStream?: () => void; // Continue the interrupted stream
 }
 
 /**
  * Manages keyboard shortcuts for AIView:
  * - Esc (non-vim) or Ctrl+C (vim): Interrupt stream (Escape skips text inputs by default)
+ * - Shift+R: Resume an interrupted stream (when a resumable turn is shown)
  * - Ctrl+I: Focus chat input
  * - Shift+H: Load older transcript messages (when available)
  * - Shift+G: Jump to bottom
@@ -52,6 +60,8 @@ export function useAIViewKeybinds({
   aggregator,
   setEditingMessage,
   vimEnabled,
+  canResumeInterruptedStream = false,
+  resumeInterruptedStream,
 }: UseAIViewKeybindsParams): void {
   const { api } = useAPI();
 
@@ -73,6 +83,7 @@ export function useAIViewKeybinds({
       if (
         matchesKeybind(e, interruptKeybind) &&
         !isTerminalFocused(e.target) &&
+        !isDesktopViewportFocused(e.target) &&
         !browserViewportOwnsInterrupt
       ) {
         // If something else already claimed this key event, skip.
@@ -102,7 +113,6 @@ export function useAIViewKeybinds({
           if (api) {
             void cancelCompaction(api, workspaceId, aggregator, setEditingMessage);
           }
-          void api?.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
           return;
         }
 
@@ -111,14 +121,17 @@ export function useAIViewKeybinds({
         // Non-vim mode: Esc interrupts (except when typing in inputs, unless explicitly opted in)
         if (canInterrupt || showRetryBarrier) {
           e.preventDefault();
-          void api?.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
-          void api?.workspace.interruptStream({ workspaceId });
+          if (api) {
+            void stopStream(api, workspaceId, { disableAutoRetry: true });
+          }
           return;
         }
       }
     };
 
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      // Remote desktops own their keyboard, including chat/editor shortcuts.
+      if (isDesktopViewportFocused(e.target)) return;
       const dialogOpen = isDialogOpen();
 
       // Focus chat input works anywhere (even in input fields)
@@ -142,6 +155,19 @@ export function useAIViewKeybinds({
 
       // Don't handle other shortcuts if user is typing in an input field
       if (dialogOpen || isEditableElement(e.target)) {
+        return;
+      }
+
+      // Resume an interrupted stream. Like Shift+G/Shift+H, this is a
+      // transcript-scoped key: gated below the editable guard so Shift+R types
+      // normally while composing. Only acts when a resumable turn is shown.
+      if (
+        matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        canResumeInterruptedStream &&
+        resumeInterruptedStream
+      ) {
+        e.preventDefault();
+        resumeInterruptedStream();
         return;
       }
 
@@ -180,6 +206,8 @@ export function useAIViewKeybinds({
     aggregator,
     setEditingMessage,
     vimEnabled,
+    canResumeInterruptedStream,
+    resumeInterruptedStream,
     api,
   ]);
 }

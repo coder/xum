@@ -31,8 +31,10 @@ describe("Start Here (mock AI router)", () => {
       const startHereButton = await waitFor(
         () => {
           const buttons = Array.from(
-            app.view.container.querySelectorAll('button[aria-label="Start Here"]')
-          ) as HTMLButtonElement[];
+            app.view.container.querySelectorAll<HTMLButtonElement>(
+              'button[aria-label="Start Here"]'
+            )
+          );
           const enabled = buttons.find((b) => !b.disabled);
           if (!enabled) {
             throw new Error("Start Here button not found or disabled");
@@ -49,7 +51,7 @@ describe("Start Here (mock AI router)", () => {
           // StartHereModal renders via Radix Dialog which portals to document.body.
           // In happy-dom, Radix portals are unreliable, but the modal's OK button
           // uses the text "OK" and lives somewhere in the document.
-          const buttons = Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
+          const buttons = Array.from(document.querySelectorAll("button"));
           const ok = buttons.find((b) => b.textContent?.trim().startsWith("OK") && !b.disabled);
           if (!ok) {
             throw new Error("OK button not found in Start Here modal");

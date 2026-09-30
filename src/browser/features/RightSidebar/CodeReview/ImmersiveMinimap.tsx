@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import { clamp } from "@/common/utils/clamp";
 import {
@@ -15,6 +15,8 @@ interface ImmersiveMinimapProps {
   onSelectLineIndex: (lineIndex: number) => void;
   /** Diff line indices where review comments exist (drawn as yellow indicators) */
   commentLineIndices: ReadonlySet<number>;
+  /** Bump after parent-owned scroll positioning so the canvas reads fresh scrollTop before reveal. */
+  redrawNonce?: number;
 }
 
 const DEFAULT_ADD_COLOR = "rgba(34, 197, 94, 0.85)";
@@ -133,9 +135,11 @@ export const ImmersiveMinimap: React.FC<ImmersiveMinimapProps> = (props) => {
     }
   }, [lineCategories, props.activeLineIndex, props.commentLineIndices, props.scrollContainerRef]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Canvas pixels are visible layout state; redraw before paint so hydration
+    // swaps do not show one frame of the previous minimap/scroll thumb.
     redrawCanvas();
-  }, [redrawCanvas]);
+  }, [redrawCanvas, props.redrawNonce]);
 
   useEffect(() => {
     const scrollContainer = props.scrollContainerRef.current;
@@ -280,7 +284,7 @@ export const ImmersiveMinimap: React.FC<ImmersiveMinimapProps> = (props) => {
   }
 
   return (
-    <div className="w-6 shrink-0 bg-[var(--color-bg-dark)]" data-testid="immersive-minimap">
+    <div className="h-full w-6 shrink-0 bg-[var(--color-bg-dark)]" data-testid="immersive-minimap">
       <canvas
         ref={canvasRef}
         className="h-full w-full cursor-pointer"

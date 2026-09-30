@@ -12,7 +12,12 @@ import {
   ToolIcon,
   ErrorBox,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useToolExpansion,
+  getStatusDisplay,
+  unwrapResult,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 import { formatBytes } from "@/common/utils/formatBytes";
 
@@ -36,6 +41,18 @@ interface NormalizedResult {
 }
 
 /**
+ * Allowlist http/https for clickable hrefs. Blocks javascript:, data:, vbscript:, etc.
+ */
+function isSafeHref(url: string): boolean {
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extract domain from URL for compact display
  */
 function getDomain(url: string): string {
@@ -45,23 +62,6 @@ function getDomain(url: string): string {
   } catch {
     return url;
   }
-}
-
-/**
- * Unwrap JSON container from streamManager's stripEncryptedContent.
- * Results arrive as { type: "json", value: [...] } or direct object.
- */
-function unwrapResult(result: unknown): unknown {
-  if (
-    result !== null &&
-    typeof result === "object" &&
-    "type" in result &&
-    (result as { type: string }).type === "json" &&
-    "value" in result
-  ) {
-    return (result as { value: unknown }).value;
-  }
-  return result;
 }
 
 /**
@@ -144,14 +144,18 @@ export const WebFetchToolCall: React.FC<WebFetchToolCallProps> = ({
             <div className="bg-code-bg flex flex-wrap gap-4 rounded px-2 py-1.5 text-[11px] leading-[1.4]">
               <div className="flex min-w-0 gap-1.5">
                 <span className="text-secondary font-medium">URL:</span>
-                <a
-                  href={args.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-link font-monospace truncate hover:underline"
-                >
-                  {args.url}
-                </a>
+                {isSafeHref(args.url) ? (
+                  <a
+                    href={args.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-link font-monospace truncate hover:underline"
+                  >
+                    {args.url}
+                  </a>
+                ) : (
+                  <span className="font-monospace truncate">{args.url}</span>
+                )}
               </div>
               {normalized?.success && normalized.title && (
                 <div className="flex min-w-0 gap-1.5">

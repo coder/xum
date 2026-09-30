@@ -1,8 +1,11 @@
-# mux server Docker image
+# Xum server Docker image
 # Multi-stage build with esbuild bundling for minimal runtime image
 #
-# Build:   docker build -t mux-server .
-# Run:     docker run -p 3000:3000 -v ~/.mux:/root/.mux mux-server
+# Build:   docker build -t xum-server .
+# Run:     docker run -p 3000:3000 -v ~/.xum:/root/.mux xum-server
+#
+# /root/.mux remains the container volume target so existing images and compose
+# volumes can upgrade and downgrade against the same data.
 #
 # See docker-compose.yml for easier orchestration
 
@@ -17,7 +20,7 @@ WORKDIR /app
 ARG RELEASE_TAG
 
 # Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.2
+RUN npm install -g bun@1.3.12
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball
@@ -28,11 +31,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends git python3 mak
 # Copy package files first for better layer caching
 COPY package.json bun.lock bunfig.toml ./
 
-# Copy postinstall script (needed by bun install)
-COPY scripts/postinstall.sh scripts/
+# Copy dependency patches referenced by package.json patchedDependencies
+# (bun install fails without them).
+COPY patches/ patches/
 
 # Install dependencies and create Makefile sentinel so build targets don't reinstall.
-RUN bun install --frozen-lockfile && \
+# tsgo typechecks electron-importing sources, so the optional electron package must
+# install even though the server image never runs it. Its binary download can fail
+# transiently, and bun then silently drops the package instead of failing the install.
+# Skip the unused download.
+RUN ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
     touch node_modules/.installed
 
 # Copy build orchestration files used by Make targets.
@@ -42,9 +50,9 @@ COPY Makefile fmt.mk ./
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
-COPY scripts/gen_builtin_skills.ts scripts/
+COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/
 COPY docs/ docs/
-COPY index.html terminal.html vite.config.ts ./
+COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
 COPY static/ static/
 
@@ -74,7 +82,7 @@ FROM node:22-slim
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/coder/mux"
 LABEL org.opencontainers.image.version="${VERSION}"
-LABEL org.opencontainers.image.description="Mux server — parallel AI agent workflows"
+LABEL org.opencontainers.image.description="Xum server — parallel AI agent workflows"
 LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 WORKDIR /app
@@ -103,8 +111,9 @@ COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
 COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
-# - @1password/sdk + sdk-core: externalized; contains native WASM for secret resolution
-COPY --from=builder /app/node_modules/@1password ./node_modules/@1password
+
+# - resvg-wasm: public JS and wasm asset stay together for the isolated SVG decoder.
+COPY --from=builder /app/node_modules/@resvg/resvg-wasm ./node_modules/@resvg/resvg-wasm
 
 # Copy frontend/static assets from least to most volatile for better cache reuse.
 # Vite outputs JS/CSS/HTML directly to dist/ (assetsDir: ".").
@@ -113,15 +122,19 @@ COPY --from=builder /app/dist/*.html ./dist/
 COPY --from=builder /app/dist/*.css ./dist/
 COPY --from=builder /app/dist/*.js ./dist/
 
+# Copy TypeScript lib files used by the bundled PTC validator at server startup.
+COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib
+
 # Copy runtime bundles last (most volatile layer during backend iteration).
 COPY --from=builder /app/dist/runtime ./dist/runtime
 
-# Create mux data directory
+# Keep the established container data path for existing volumes and downgraded images.
 RUN mkdir -p /root/.mux
 
-# Default environment variables
+# XUM_ROOT is canonical; MUX_ROOT keeps older image entry points on the same volume.
 ENV NODE_ENV=production
-ENV MUX_HOME=/root/.mux
+ENV XUM_ROOT=/root/.mux
+ENV MUX_ROOT=/root/.mux
 
 # Expose server port
 EXPOSE 3000
@@ -130,7 +143,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD node -e "fetch('http://localhost:3000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
-# Run bundled mux server
+# Run bundled xum server
 # --host 0.0.0.0: bind to all interfaces (required for Docker networking)
 # --port 3000: default port (can be remapped via docker run -p)
 ENTRYPOINT ["node", "dist/runtime/server-bundle.js"]

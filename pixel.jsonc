@@ -1,0 +1,17 @@
+{
+	"platformAccessUrl": "https://pixel.coder.com",
+	"projectId": "019ed215-54ab-75d7-8c0e-048a28972836",
+	"storybook": {
+		"buildCommand": "bun x storybook build",
+		"outputDirectory": "storybook-static/"
+	},
+	// Default variant: chrome at laptop width (1200px) rendering the preview's
+	// default dark theme. Stories opt into more variants via parameters.pixel.matrix.
+	// Render at 2x density so text and rounded-border antialiasing are deterministic across
+	// otherwise identical headless Chromium captures.
+	"devicePixelRatio": 2,
+	"matrix": {
+		"browsers": ["chrome"],
+		"viewports": ["laptop"]
+	}
+}

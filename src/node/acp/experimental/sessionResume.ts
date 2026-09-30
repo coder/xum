@@ -27,12 +27,8 @@ export interface SessionResumeDependencies {
   sessionManager: SessionManager;
   negotiatedCapabilities: NegotiatedCapabilities | null;
   defaultAgentId: string;
-  /**
-   * Agent ID from prior ACP in-memory session state (set via
-   * session/set_config_option mode switches).  Takes precedence over
-   * workspace.agentId so that mode selections survive reconnect/reload.
-   */
-  existingSessionAgentId?: string;
+  // Keep the active draft together when reloading an existing ACP session.
+  existingSessionState?: Pick<ResumedSessionContext, "agentId" | "aiSettings">;
 }
 
 function resolveRuntimeMode(workspace: WorkspaceInfo): RuntimeMode {
@@ -61,7 +57,7 @@ function normalizePathCasingForComparison(value: string): string {
   return process.platform === "win32" ? value.toLowerCase() : value;
 }
 
-async function canonicalizePathForWorkspaceMatch(value: string): Promise<string> {
+export async function canonicalizePathForWorkspaceMatch(value: string): Promise<string> {
   const trimmed = value.trim();
   assert(trimmed.length > 0, "canonicalizePathForWorkspaceMatch: value must be non-empty");
 
@@ -94,15 +90,24 @@ export async function loadSessionFromWorkspace(
     throw new Error(`loadSessionFromWorkspace: workspace '${requestedSessionId}' was not found`);
   }
 
-  const [canonicalRequestedCwd, canonicalProjectPath, canonicalWorkspacePath] = await Promise.all([
+  const [
+    canonicalRequestedCwd,
+    canonicalProjectPath,
+    canonicalWorkspacePath,
+    canonicalSubProjectPath,
+  ] = await Promise.all([
     canonicalizePathForWorkspaceMatch(requestedCwd),
     canonicalizePathForWorkspaceMatch(workspace.projectPath),
     canonicalizePathForWorkspaceMatch(workspace.namedWorkspacePath),
+    workspace.subProjectPath != null
+      ? canonicalizePathForWorkspaceMatch(workspace.subProjectPath)
+      : Promise.resolve(null),
   ]);
 
   const cwdMatchesWorkspace =
     canonicalProjectPath === canonicalRequestedCwd ||
-    canonicalWorkspacePath === canonicalRequestedCwd;
+    canonicalWorkspacePath === canonicalRequestedCwd ||
+    canonicalSubProjectPath === canonicalRequestedCwd;
   assert(
     cwdMatchesWorkspace,
     `loadSessionFromWorkspace: workspace '${requestedSessionId}' is not in cwd '${requestedCwd}'`
@@ -118,16 +123,16 @@ export async function loadSessionFromWorkspace(
     deps.negotiatedCapabilities ?? undefined
   );
 
-  // Prefer the ACP session's prior agent selection (from set_config_option)
-  // over workspace.agentId so that mode switches survive reconnect/reload.
-  const agentId = deps.existingSessionAgentId ?? workspace.agentId ?? deps.defaultAgentId;
+  const agentId = deps.existingSessionState?.agentId ?? workspace.agentId ?? deps.defaultAgentId;
   const aiSettings =
+    deps.existingSessionState?.aiSettings ??
     workspace.aiSettingsByAgent?.[agentId] ??
     workspace.aiSettings ??
     (await resolveAgentAiSettings(deps.server.client, agentId, workspaceId));
 
   const configOptions = await buildConfigOptions(deps.server.client, workspaceId, {
     activeAgentId: agentId,
+    aiSettings,
   });
 
   return {

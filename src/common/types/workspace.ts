@@ -28,6 +28,12 @@ import type {
   WorkspaceMetadataSchema,
 } from "../orpc/schemas";
 
+import type {
+  WorkspaceRemoveResultSchema,
+  WorkspaceRemoveWarningSchema,
+  WorkspaceRemovalDescendantSchema,
+} from "../orpc/schemas/workspace";
+
 export type WorkspaceMetadata = z.infer<typeof WorkspaceMetadataSchema>;
 
 export type ProjectRef = z.infer<typeof ProjectRefSchema>;
@@ -45,3 +51,7 @@ export type GitStatus = z.infer<typeof GitStatusSchema>;
 export type FrontendWorkspaceMetadata = z.infer<typeof FrontendWorkspaceMetadataSchema>;
 
 export type WorkspaceActivitySnapshot = z.infer<typeof WorkspaceActivitySnapshotSchema>;
+
+export type WorkspaceRemoveResult = z.infer<typeof WorkspaceRemoveResultSchema>;
+export type WorkspaceRemovalDescendant = z.infer<typeof WorkspaceRemovalDescendantSchema>;
+export type WorkspaceRemoveWarning = z.infer<typeof WorkspaceRemoveWarningSchema>;

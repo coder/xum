@@ -12,7 +12,12 @@
  * Works identically for local and SSH runtimes.
  */
 
-import type { Runtime, BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+  ExecStream,
+} from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { log } from "./log";
@@ -25,18 +30,35 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { getErrorMessage } from "@/common/utils/errors";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 /**
  * Quote a path for shell commands.
  * On Windows, first converts to POSIX format, then shell-quotes.
  * On Unix, just shell-quotes (handles spaces, special chars).
  */
-function quotePathForShell(p: string): string {
+export function quotePathForShell(p: string): string {
   const posixPath = toPosixPath(p);
   return shellQuote(posixPath);
+}
+
+/**
+ * Whether this runtime's background spawn records live on the HOST filesystem at
+ * localBgWorkspaceDir with host-namespace PIDs. Only such records can be probed via local fs
+ * reads and process.kill (crash-orphan archive gating, restart-unique name allocation).
+ * DevcontainerRuntime extends LocalBaseRuntime but execs inside the container: its records
+ * live under the container-side tempDir() (host-visible only through the workspace bind
+ * mount) and its recorded PIDs are container-namespace, so it must be treated like a remote
+ * runtime everywhere a probe would otherwise trust host paths or host PID checks.
+ */
+export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
+  return runtime instanceof LocalBaseRuntime && !(runtime instanceof DevcontainerRuntime);
 }
 
 /**
@@ -45,6 +67,9 @@ function quotePathForShell(p: string): string {
  * NOTE: Local runtimes validate that cwd exists before spawning, so this must be a real directory.
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
+const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
+// Upper bound on waiting for a killed migrated process to report its exit.
+const MIGRATED_PROCESS_EXIT_JOIN_MS = 5_000;
 
 /** Helper to extract error message for logging */
 function errorMsg(error: unknown): string {
@@ -52,7 +77,7 @@ function errorMsg(error: unknown): string {
 }
 
 /** Subdirectory under temp for background process output */
-const BG_OUTPUT_SUBDIR = "mux-bashes";
+export const BG_OUTPUT_SUBDIR = "mux-bashes";
 
 /** Output filename for combined stdout/stderr */
 const OUTPUT_FILENAME = "output.log";
@@ -60,9 +85,25 @@ const OUTPUT_FILENAME = "output.log";
 /** Exit code filename */
 const EXIT_CODE_FILENAME = "exit_code";
 
+/** Per-process spawn-record filenames that survive an app crash (see localBgWorkspaceDir). */
+export const BG_META_FILENAME = "meta.json";
+export const BG_EXIT_CODE_FILENAME = EXIT_CODE_FILENAME;
+
+/**
+ * Local-filesystem directory holding this workspace's background spawn records (one
+ * subdirectory per process with meta.json, output.log, and the wrapper's exit_code trap
+ * file). Mirrors LocalBaseRuntime.tempDir(), which spawnProcess resolves when the process
+ * was spawned on a local runtime. Crash-orphan detection scans this layout because the
+ * records outlive the app while nohup/setsid children keep running.
+ */
+export function localBgWorkspaceDir(workspaceId: string): string {
+  const tempRoot = process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
+  return `${tempRoot}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+}
+
 /**
  * Compute paths for a background process output directory.
- * @param bgOutputDir Base directory (e.g., /tmp/mux-bashes or ~/.mux/sessions)
+ * @param bgOutputDir Base directory (e.g., /tmp/mux-bashes or ~/.xum/sessions)
  * @param workspaceId Workspace identifier
  * @param processId Process identifier
  */
@@ -91,6 +132,8 @@ export interface SpawnOptions {
   processId: string;
   /** Environment variables to inject */
   env?: Record<string, string>;
+  /** Host-namespace paths to translate before injecting as environment variables. */
+  pathEnv?: Record<string, string>;
 }
 
 /**
@@ -129,12 +172,18 @@ export async function spawnProcess(
   const quotePath = quotePathForShell;
 
   // Verify working directory exists
-  const cwdCheck = await execBuffered(runtime, `cd ${quotePath(options.cwd)}`, {
-    cwd: FALLBACK_CWD,
-    timeout: 10,
-  });
+  const cwdCheck = await execBuffered(
+    runtime,
+    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+    {
+      cwd: FALLBACK_CWD,
+      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+      timeout: 10,
+    }
+  );
   if (cwdCheck.exitCode !== 0) {
-    return { success: false, error: `Working directory does not exist: ${options.cwd}` };
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
   }
 
   // Compute output paths (unified output.log instead of separate stdout/stderr)
@@ -144,23 +193,60 @@ export async function spawnProcess(
     options.processId
   );
 
+  // A failed spawn must not leave a recordless process directory behind: the crash-orphan
+  // probe fails closed on directories without readable metadata or an exit marker.
+  const removeOutputDirBestEffort = async () => {
+    try {
+      await execBuffered(runtime, `rm -rf ${quotePath(outputDir)}`, {
+        cwd: FALLBACK_CWD,
+        timeout: 10,
+      });
+    } catch {
+      // Best-effort: a leftover directory only over-refuses model-driven archives.
+    }
+  };
+
   // Create output directory and empty file
   try {
     await runtime.ensureDir(outputDir);
     await writeFileString(runtime, outputPath, "");
+    // Process IDs are display-name based and only deduplicated within one app session, so a
+    // restart can reuse a previous session's directory. A stale exit_code from that prior
+    // process would be trusted as proof that the NEW process exited — both by getExitCode()
+    // and by crash-orphan archive gating — so it must be gone before the wrapper's trap owns
+    // the file again.
+    const rmResult = await execBuffered(runtime, `rm -f ${quotePath(exitCodePath)}`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    if (rmResult.exitCode !== 0) {
+      await removeOutputDirBestEffort();
+      return {
+        success: false,
+        error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
+      };
+    }
   } catch (error) {
+    await removeOutputDirBestEffort();
     return {
       success: false,
       error: `Failed to create output directory: ${errorMsg(error)}`,
     };
   }
 
-  // Build wrapper script (same for all runtimes now that paths are absolute)
-  // Note: buildWrapperScript handles quoting internally via shellQuote
+  // The outer spawn shell exports the translated pathEnv (and cwd var) before
+  // the wrapper runs; wrapper-level env exports would overwrite those
+  // translations, so pathEnv-owned keys are stripped from the wrapper env.
+  const wrapperEnv: Record<string, string> = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+  for (const key of [...Object.keys(options.pathEnv ?? {}), BACKGROUND_CWD_ENV]) {
+    delete wrapperEnv[key];
+  }
+
   const wrapperScript = buildWrapperScript({
     exitCodePath,
     cwd: options.cwd,
-    env: { ...options.env, ...NON_INTERACTIVE_ENV_VARS },
+    cwdEnvVar: BACKGROUND_CWD_ENV,
+    env: wrapperEnv,
     script,
   });
 
@@ -174,10 +260,12 @@ export async function spawnProcess(
     // No timeout - the spawn command backgrounds the process and returns immediately
     const result = await execBuffered(runtime, spawnCommand, {
       cwd: FALLBACK_CWD,
+      pathEnv: { ...options.pathEnv, [BACKGROUND_CWD_ENV]: options.cwd },
     });
 
     if (result.exitCode !== 0) {
       log.debug(`BackgroundProcessExecutor.spawnProcess: spawn command failed: ${result.stderr}`);
+      await removeOutputDirBestEffort();
       return {
         success: false,
         error: `Failed to spawn background process: ${result.stderr}`,
@@ -186,6 +274,14 @@ export async function spawnProcess(
 
     const pid = parsePid(result.stdout);
     if (!pid) {
+      // Ambiguous launch: the spawn command succeeded (exit 0), so the detached shell is
+      // likely running — only its PID echo was garbled (e.g. an SSH login banner prefixing
+      // the output). Unlike the clean failures above, do NOT remove the directory: the
+      // wrapper owns output.log/exit_code there, and on local runtimes a meta-less record
+      // without an exit marker keeps hasOrphanedRunningBackgroundProcesses fail closed
+      // until the trap writes the exit marker (self-healing). Deleting it would leave the
+      // command running with no durable trace for archive gating to see. (Remote records
+      // cannot feed the local probe; remote crash-orphan gating is tracked in #3944.)
       log.debug(`BackgroundProcessExecutor.spawnProcess: Invalid PID: ${result.stdout}`);
       return {
         success: false,
@@ -194,11 +290,31 @@ export async function spawnProcess(
     }
 
     log.debug(`BackgroundProcessExecutor.spawnProcess: Spawned with PID ${pid}`);
-    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath);
+    // Monitors poll this handle every 100ms on local runtimes. A shell probe there forks the
+    // (multi-GB) main process for each wc/tail/cat, which profiled as the main thread spending
+    // over half its time inside fork(); host-local records are plain files, so read them
+    // with fs and keep the local poll path spawn-free. Remote/devcontainer records are only
+    // reachable through runtime.exec.
+    const probe: SpawnRecordProbe = spawnRecordsAreHostLocal(runtime)
+      ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath)
+      : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath);
+    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath, probe);
     return { success: true, handle, pid, outputDir };
   } catch (error) {
     const errorMessage = errorMsg(error);
     log.debug(`BackgroundProcessExecutor.spawnProcess: Error: ${errorMessage}`);
+    // Post-dispatch ambiguity: a transport-level throw (an SSH/Coder channel or container
+    // exec error after the spawn command was sent) cannot prove the detached shell never
+    // started — a remote/container exec can reject after dispatch while the nohup job
+    // survives. Keep the directory as durable evidence: the wrapper's trap settles it with
+    // an exit marker if the job did run, and non-host crash-orphan gating (#3944, plus the
+    // devcontainer bind-mount scan) consumes exactly these records. Host-local exec throws
+    // happen before anything is dispatched (spawn syscall failures), so those directories
+    // are still removed — keeping one would permanently over-refuse archives with a record
+    // no process will ever settle.
+    if (spawnRecordsAreHostLocal(runtime)) {
+      await removeOutputDirBestEffort();
+    }
     return {
       success: false,
       error: `Failed to spawn background process: ${errorMessage}`,
@@ -207,11 +323,133 @@ export async function spawnProcess(
 }
 
 /**
+ * Strict reads of a spawn record's output.log and exit_code files, polled on every monitor
+ * tick. Every method throws on a missing/unreadable output file or an unreadable (including
+ * dangling-symlink) exit marker so the monitor's failure policy can retire the monitor
+ * instead of misreading the miss as "empty output" or "still running".
+ */
+interface SpawnRecordProbe {
+  /** Byte size of output.log. */
+  outputFileSize(): Promise<number>;
+  /** output.log contents from `offset` to (at least) `fileSize`, plus the offset read up to. */
+  readOutputFrom(offset: number, fileSize: number): Promise<{ content: string; newOffset: number }>;
+  /** Raw exit marker contents; "" when the marker does not exist yet (process still running). */
+  readExitCodeMarker(): Promise<string>;
+}
+
+/** Host-local records: plain Node fs calls, no child process per tick. */
+class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
+  constructor(
+    private readonly outputPath: string,
+    private readonly exitCodePath: string
+  ) {}
+
+  async outputFileSize(): Promise<number> {
+    return (await fs.stat(this.outputPath)).size;
+  }
+
+  async readOutputFrom(
+    offset: number,
+    fileSize: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const fd = await fs.open(this.outputPath, "r");
+    try {
+      const buffer = Buffer.alloc(fileSize - offset);
+      const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
+      return {
+        content: buffer.subarray(0, bytesRead).toString("utf-8"),
+        newOffset: offset + bytesRead,
+      };
+    } finally {
+      await fd.close();
+    }
+  }
+
+  async readExitCodeMarker(): Promise<string> {
+    // lstat does not follow symlinks: only a truly absent path means "still running". A
+    // dangling-symlink marker passes lstat and then fails readFile (which follows the link),
+    // surfacing as a probe failure exactly like the shell probe's `[ ! -L ]` guard.
+    try {
+      await fs.lstat(this.exitCodePath);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return "";
+      throw error;
+    }
+    return fs.readFile(this.exitCodePath, "utf-8");
+  }
+}
+
+/** Remote/container records: reachable only through runtime.exec shell commands. */
+class ShellSpawnRecordProbe implements SpawnRecordProbe {
+  constructor(
+    private readonly runtime: Runtime,
+    private readonly outputPath: string,
+    private readonly exitCodePath: string,
+    private readonly quotePath: (p: string) => string
+  ) {}
+
+  private assertProbeSucceeded(operation: string, exitCode: number): void {
+    if (exitCode !== 0) {
+      throw new Error(`${operation} exited with code ${exitCode}`);
+    }
+  }
+
+  async outputFileSize(): Promise<number> {
+    const filePath = this.quotePath(this.outputPath);
+    // No || fallback: a deleted or unreadable output file must fail the strict probe so the
+    // monitor's failure policy can retire it instead of parsing the miss as an empty file.
+    const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    this.assertProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
+    return parseInt(sizeResult.stdout.trim(), 10) || 0;
+  }
+
+  async readOutputFrom(
+    offset: number,
+    _fileSize: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const filePath = this.quotePath(this.outputPath);
+    // Read from offset to end of file using tail -c (faster than dd bs=1)
+    // tail -c +N means "start at byte N" (1-indexed)
+    const readResult = await execBuffered(
+      this.runtime,
+      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
+      { cwd: FALLBACK_CWD, timeout: 30 }
+    );
+    this.assertProbeSucceeded("readOutput tail probe", readResult.exitCode);
+    return {
+      content: readResult.stdout,
+      newOffset: offset + Buffer.byteLength(readResult.stdout),
+    };
+  }
+
+  async readExitCodeMarker(): Promise<string> {
+    const exitCodePath = this.quotePath(this.exitCodePath);
+    // Absent marker means still running (exit 0, empty). File operators other than -h/-L
+    // follow symlinks, so a dangling-symlink marker reads as absent to -e; require -L to
+    // also fail before declaring absence, letting cat surface the dangling link (like any
+    // other unreadable/replaced marker) as a probe failure instead of "running" forever.
+    const result = await execBuffered(
+      this.runtime,
+      `{ [ ! -e ${exitCodePath} ] && [ ! -L ${exitCodePath} ]; } || cat ${exitCodePath} 2>/dev/null`,
+      {
+        cwd: FALLBACK_CWD,
+        timeout: 10,
+      }
+    );
+    this.assertProbeSucceeded("getExitCode", result.exitCode);
+    return result.stdout;
+  }
+}
+
+/**
  * Unified handle to a background process.
- * Uses runtime.exec for all operations, working identically for local and SSH.
+ * Lifecycle operations (terminate, writeMeta) go through runtime.exec for every runtime;
+ * per-tick record reads go through the SpawnRecordProbe selected at spawn time.
  *
  * Output files (output.log, exit_code) are on the runtime's filesystem.
- * This handle provides lifecycle management via execBuffered commands.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
   private terminated = false;
@@ -220,8 +458,29 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly runtime: Runtime,
     private readonly pid: number,
     public readonly outputDir: string,
-    private readonly quotePath: (p: string) => string
+    private readonly quotePath: (p: string) => string,
+    private readonly probe: SpawnRecordProbe
   ) {}
+
+  private async probeForMonitor<T>(
+    probe: () => Promise<T>
+  ): Promise<BackgroundMonitorProbeResult<T>> {
+    try {
+      return { success: true, value: await probe() };
+    } catch (error) {
+      return { success: false, error: errorMsg(error) };
+    }
+  }
+
+  private async getExitCodeStrict(): Promise<number | null> {
+    const marker = await this.probe.readExitCodeMarker();
+    const parsed = parseExitCode(marker);
+    // A nonempty marker that fails to parse is a corrupted write, not a still-running process.
+    if (parsed == null && marker.trim().length > 0) {
+      throw new Error(`getExitCode marker is not a number: ${marker.trim().slice(0, 32)}`);
+    }
+    return parsed;
+  }
 
   /**
    * Get the exit code from the exit_code file.
@@ -229,17 +488,15 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    */
   async getExitCode(): Promise<number | null> {
     try {
-      const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
-      const result = await execBuffered(
-        this.runtime,
-        `cat ${exitCodePath} 2>/dev/null || echo ""`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-      return parseExitCode(result.stdout);
+      return await this.getExitCodeStrict();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getExitCode: Error: ${errorMsg(error)}`);
       return null;
     }
+  }
+
+  getExitCodeForMonitor(): Promise<BackgroundMonitorProbeResult<number | null>> {
+    return this.probeForMonitor(() => this.getExitCodeStrict());
   }
 
   /**
@@ -277,62 +534,58 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    * Write meta.json to the output directory.
    */
   async writeMeta(metaJson: string): Promise<void> {
-    try {
-      const metaPath = this.quotePath(`${this.outputDir}/meta.json`);
-      await execBuffered(this.runtime, `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`, {
+    // Persistence failures propagate: the initial spawn record is load-bearing for
+    // crash-orphan archive gating (BackgroundProcessManager.spawn aborts the spawn when it
+    // cannot be written); status-update callers wrap this in their own best-effort catch.
+    const metaPath = this.quotePath(`${this.outputDir}/${BG_META_FILENAME}`);
+    const result = await execBuffered(
+      this.runtime,
+      `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`,
+      {
         cwd: FALLBACK_CWD,
         timeout: 10,
-      });
-    } catch (error) {
-      log.debug(`RuntimeBackgroundHandle.writeMeta: Error: ${errorMsg(error)}`);
+      }
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(`writeMeta failed with exit code ${result.exitCode}: ${result.stderr}`);
     }
   }
 
   async getOutputFileSize(): Promise<number> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const sizeResult = await execBuffered(
-        this.runtime,
-        `wc -c < ${filePath} 2>/dev/null || echo 0`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-
-      return parseInt(sizeResult.stdout.trim(), 10) || 0;
+      return await this.probe.outputFileSize();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getOutputFileSize: Error: ${errorMsg(error)}`);
       return 0;
     }
   }
 
+  private async readOutputStrict(offset: number): Promise<{ content: string; newOffset: number }> {
+    const fileSize = await this.probe.outputFileSize();
+
+    if (offset >= fileSize) {
+      return { content: "", newOffset: offset };
+    }
+
+    return this.probe.readOutputFrom(offset, fileSize);
+  }
+
   /**
    * Read output from output.log at the given byte offset.
-   * Uses tail -c to read from offset - works on both Linux and macOS.
    */
   async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const fileSize = await this.getOutputFileSize();
-
-      if (offset >= fileSize) {
-        return { content: "", newOffset: offset };
-      }
-
-      // Read from offset to end of file using tail -c (faster than dd bs=1)
-      // tail -c +N means "start at byte N" (1-indexed)
-      const readResult = await execBuffered(
-        this.runtime,
-        `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
-        { cwd: FALLBACK_CWD, timeout: 30 }
-      );
-
-      return {
-        content: readResult.stdout,
-        newOffset: offset + Buffer.byteLength(readResult.stdout),
-      };
+      return await this.readOutputStrict(offset);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
       return { content: "", newOffset: offset };
     }
+  }
+
+  readOutputForMonitor(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>> {
+    return this.probeForMonitor(() => this.readOutputStrict(offset));
   }
 }
 
@@ -352,6 +605,8 @@ export interface MigrateOptions {
   existingOutput: string[];
   /** Human-readable name for the process */
   displayName?: string;
+  /** Kills the running process tree (the foreground exec's abort); see MigratedBackgroundHandle.terminate */
+  kill?: () => void;
 }
 
 /**
@@ -398,7 +653,7 @@ export async function migrateToBackground(
     await fs.writeFile(outputPath, options.existingOutput.join("\n") + "\n");
 
     // Create handle that will continue writing to file
-    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath);
+    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath, options.kill);
 
     // Start consuming remaining output in background
     handle.startConsuming();
@@ -428,7 +683,8 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   constructor(
     private readonly execStream: ExecStream,
     public readonly outputDir: string,
-    private readonly outputPath: string
+    private readonly outputPath: string,
+    private readonly kill?: () => void
   ) {}
 
   /**
@@ -513,8 +769,15 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async terminate(): Promise<void> {
-    // ExecStream doesn't expose a kill method directly
-    // Cancel the streams to stop reading (process continues but we stop tracking)
+    // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
+    // removal terminates processes before deleting the checkout (#4760), so kill the process
+    // and join its exit (bounded: a remote exec may never report one) before returning.
+    if (this.kill) {
+      this.kill();
+      await raceWithAbortAndTimeout(this.execStream.exitCode, {
+        timeoutMs: MIGRATED_PROCESS_EXIT_JOIN_MS,
+      }).catch(() => undefined);
+    }
     try {
       await this.execStream.stdout.cancel();
       await this.execStream.stderr.cancel();
@@ -541,8 +804,12 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async writeMeta(metaJson: string): Promise<void> {
+    // Swallowed on purpose (unlike RuntimeBackgroundHandle): registerMigratedProcess writes
+    // fire-and-forget (a rethrow would surface as an unhandled rejection), and a missing
+    // migrated record errs toward over-refusal, never under-refusal — the crash-orphan probe
+    // fails closed on markerless pid-0 records and on unreadable ones alike.
     try {
-      const metaPath = path.join(this.outputDir, "meta.json");
+      const metaPath = path.join(this.outputDir, BG_META_FILENAME);
       await fs.writeFile(metaPath, metaJson);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.writeMeta: ${errorMsg(error)}`);

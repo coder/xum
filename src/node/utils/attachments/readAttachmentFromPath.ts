@@ -52,48 +52,6 @@ const EXTENSION_TO_DISPLAY_MEDIA_TYPE: Record<string, string> = {
   mdown: MARKDOWN_MEDIA_TYPE,
 };
 
-// Markdown is intentionally display-only: agents should use file_read when they need
-// the contents, while attach_file gives users a quick preview/download affordance.
-const DISPLAY_ONLY_MARKDOWN_MEDIA_TYPES = new Set([MARKDOWN_MEDIA_TYPE, "text/x-markdown"]);
-
-const TEXT_EXTENSIONS_REQUIRING_FILE_READ = new Set([
-  "c",
-  "cpp",
-  "cs",
-  "csv",
-  "css",
-  "go",
-  "h",
-  "hpp",
-  "html",
-  "htm",
-  "java",
-  "js",
-  "json",
-  "jsx",
-  "log",
-  "md",
-  "mdx",
-  "mjs",
-  "py",
-  "rs",
-  "sh",
-  "toml",
-  "ts",
-  "tsx",
-  "txt",
-  "xml",
-  "yaml",
-  "yml",
-]);
-
-const TEXT_MEDIA_TYPES_REQUIRING_FILE_READ = new Set([
-  "application/json",
-  "application/javascript",
-  "application/xml",
-  "text/csv",
-]);
-
 function normalizeOptionalString(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed != null && trimmed.length > 0 ? trimmed : undefined;
@@ -191,35 +149,28 @@ function getFallbackFilename(
   return normalizeOptionalString(filename) ?? normalizeOptionalString(path.basename(resolvedPath));
 }
 
-interface DisplayMediaTypeCandidate {
-  mediaType: string;
-  requireBinaryContent: boolean;
-}
-
-function getDisplayFileMediaTypeCandidate(
+// Pick the media type for a display-only file. Images/SVG/PDF never reach here
+// (they become real model attachments); everything else is shown to the user for
+// preview/download. A caller override wins, then known audio/video/markdown
+// extensions keep their specific type, and anything else is classified as text or
+// binary by sniffing the bytes so the download and inline preview behave sensibly.
+function resolveDisplayMediaType(
   args: ReadAttachmentFromPathArgs,
-  resolvedPath: string
-): DisplayMediaTypeCandidate | null {
+  resolvedPath: string,
+  bytes: Buffer
+): string {
   const override = normalizeOptionalString(args.mediaType);
+  if (override != null) {
+    return normalizeAttachmentMediaType(override);
+  }
+
   const extension = path.extname(resolvedPath).slice(1).toLowerCase();
-  const rawMediaType = override ?? EXTENSION_TO_DISPLAY_MEDIA_TYPE[extension];
-
-  if (rawMediaType != null) {
-    const mediaType = normalizeAttachmentMediaType(rawMediaType);
-    if (DISPLAY_ONLY_MARKDOWN_MEDIA_TYPES.has(mediaType)) {
-      return { mediaType, requireBinaryContent: false };
-    }
-    if (mediaType.startsWith("text/") || TEXT_MEDIA_TYPES_REQUIRING_FILE_READ.has(mediaType)) {
-      return null;
-    }
-    return { mediaType, requireBinaryContent: false };
+  const mapped = EXTENSION_TO_DISPLAY_MEDIA_TYPE[extension];
+  if (mapped != null) {
+    return normalizeAttachmentMediaType(mapped);
   }
 
-  if (TEXT_EXTENSIONS_REQUIRING_FILE_READ.has(extension)) {
-    return null;
-  }
-
-  return { mediaType: "application/octet-stream", requireBinaryContent: true };
+  return isLikelyTextFile(bytes) ? "text/plain" : "application/octet-stream";
 }
 
 function isLikelyTextFile(bytes: Buffer): boolean {
@@ -280,26 +231,18 @@ export async function readAttachFileFromPath(
   });
 
   if (mediaType == null) {
-    const displayMediaTypeCandidate = getDisplayFileMediaTypeCandidate(args, resolvedPath);
-    if (displayMediaTypeCandidate == null) {
-      throw createUnsupportedAttachmentError(args, resolvedPath);
-    }
+    // Not an image/SVG/PDF, so it can't be a real model attachment. Show it to the
+    // user for preview/download instead of rejecting it; the size cap still applies.
     if (fileStat.size > MAX_ATTACH_FILE_SIZE_BYTES) {
-      throw new Error(
-        `${getErrorMessage(createUnsupportedAttachmentError(args, resolvedPath))}. Could not show file to user: ${buildTooLargeMessage(fileStat.size)}`
-      );
+      throw new Error(buildTooLargeMessage(fileStat.size));
     }
 
     const bytes = await readRegularFileBytes(args, resolvedPath, fileStat.size);
-    if (displayMediaTypeCandidate.requireBinaryContent && isLikelyTextFile(bytes)) {
-      throw createUnsupportedAttachmentError(args, resolvedPath);
-    }
-
     return {
       type: "display",
       file: createLoadedFile({
         data: bytes,
-        mediaType: displayMediaTypeCandidate.mediaType,
+        mediaType: resolveDisplayMediaType(args, resolvedPath, bytes),
         filename,
         resolvedPath,
       }),

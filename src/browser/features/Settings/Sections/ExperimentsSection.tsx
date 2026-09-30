@@ -1,14 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
-import {
-  useExperiment,
-  useExperimentValue,
-  useRemoteExperimentValue,
-} from "@/browser/contexts/ExperimentsContext";
+import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
 import {
   getExperimentList,
   getExperimentPlatformRestrictionLabel,
   EXPERIMENT_IDS,
+  EXPERIMENTS,
   isExperimentSupportedOnPlatform,
   type ExperimentId,
 } from "@/common/constants/experiments";
@@ -27,10 +24,23 @@ import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
-import { ImageGenerationExperimentConfig } from "./ImageGenerationExperimentConfig";
+import { AdvisorToolExperimentConfig } from "./AdvisorToolExperimentConfig";
+import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 import { HeartbeatDefaultsControls } from "./HeartbeatSection";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
+
+// Sub-experiments of Agent Memory: hidden from the flat list and rendered in a
+// nested panel under the parent toggle, since they are no-ops while memory is off.
+const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  EXPERIMENT_IDS.MEMORY_HOT_SET,
+  EXPERIMENT_IDS.MEMORY_INTUITION,
+  EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+];
+
+// Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
+// mode is a no-op while PTC is off (code_execution is never assembled).
+const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
 
 type SettingsConfig = Awaited<ReturnType<APIClient["config"]["getConfig"]>>;
 
@@ -45,7 +55,6 @@ interface ExperimentRowProps {
 
 function ExperimentRow(props: ExperimentRowProps) {
   const [enabled, setEnabled] = useExperiment(props.experimentId);
-  const remote = useRemoteExperimentValue(props.experimentId);
   const telemetry = useTelemetry();
   const { availabilityMessage, disabled = false, onToggle, experimentId } = props;
 
@@ -57,10 +66,10 @@ function ExperimentRow(props: ExperimentRowProps) {
 
       setEnabled(value);
       // Track the override for analytics
-      telemetry.experimentOverridden(experimentId, remote?.value ?? null, value);
+      telemetry.experimentOverridden(experimentId, value);
       onToggle?.(value);
     },
-    [disabled, setEnabled, telemetry, experimentId, remote?.value, onToggle]
+    [disabled, setEnabled, telemetry, experimentId, onToggle]
   );
 
   return (
@@ -107,9 +116,9 @@ export function PortableDesktopExperimentWarning() {
     setError(null);
 
     try {
-      // This warning lives on /settings/experiments, where selectedWorkspace is intentionally
-      // URL-derived and null. Probe the machine-level desktop prerequisite instead of a
-      // workspace-scoped capability so the warning still renders on settings routes.
+      // Settings can open with no workspace behind it (cold links, project pages). Probe the
+      // machine-level desktop prerequisite instead of a workspace-scoped capability so the
+      // warning renders regardless of the background page.
       const nextStatus = await api.desktop.getPrereqStatus();
       if (requestIdRef.current !== requestId) {
         return;
@@ -187,8 +196,8 @@ export function PortableDesktopExperimentWarning() {
             >
               {PORTABLE_DESKTOP_INSTALL_URL}
             </a>{" "}
-            to enable this feature. If you installed it into a location that mux can already see,
-            choose Check again. If you changed PATH after mux launched, restart mux to pick it up.
+            to enable this feature. If you installed it into a location that xum can already see,
+            choose Check again. If you changed PATH after xum launched, restart xum to pick it up.
           </div>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -209,7 +218,7 @@ export function PortableDesktopExperimentWarning() {
               }}
               disabled={loading || restarting}
             >
-              {restarting ? "Restarting…" : "Restart Mux"}
+              {restarting ? "Restarting…" : "Restart Xum"}
             </Button>
           </div>
           {error && <div className="text-[11px]">{error}</div>}
@@ -219,8 +228,32 @@ export function PortableDesktopExperimentWarning() {
   );
 }
 
-type BindHostMode = "localhost" | "all" | "custom";
+const TAILSCALE_BIND_HOST_MODE_PREFIX = "tailscale:";
+
+type BindHostMode =
+  | "localhost"
+  | "all"
+  | "custom"
+  | `${typeof TAILSCALE_BIND_HOST_MODE_PREFIX}${string}`;
 type PortMode = "random" | "fixed";
+
+function getTailscaleBindHostMode(address: string): BindHostMode {
+  return `${TAILSCALE_BIND_HOST_MODE_PREFIX}${address}`;
+}
+
+function getTailscaleBindHostAddress(mode: BindHostMode): string | null {
+  if (!mode.startsWith(TAILSCALE_BIND_HOST_MODE_PREFIX)) {
+    return null;
+  }
+
+  const address = mode.slice(TAILSCALE_BIND_HOST_MODE_PREFIX.length).trim();
+  return address ? address : null;
+}
+
+function formatTailscaleBindHostLabel(host: ApiServerStatus["tailscaleBindHosts"][number]): string {
+  const protocol = host.family === "IPv6" ? "IPv6" : "IPv4";
+  return `Tailscale ${host.interfaceName} (${host.address}, ${protocol})`;
+}
 
 function ConfigurableBindUrlControls() {
   const enabled = useExperimentValue(EXPERIMENT_IDS.CONFIGURABLE_BIND_URL);
@@ -249,8 +282,14 @@ function ConfigurableBindUrlControls() {
       setHostMode("all");
       setCustomHost("");
     } else {
-      setHostMode("custom");
-      setCustomHost(configuredHost);
+      const tailscaleHost = next.tailscaleBindHosts.find((host) => host.address === configuredHost);
+      if (tailscaleHost) {
+        setHostMode(getTailscaleBindHostMode(tailscaleHost.address));
+        setCustomHost("");
+      } else {
+        setHostMode("custom");
+        setCustomHost(configuredHost);
+      }
     }
 
     setServeWebUi(next.configuredServeWebUi);
@@ -314,10 +353,13 @@ function ConfigurableBindUrlControls() {
     setError(null);
 
     let bindHost: string | null;
+    const tailscaleBindHost = getTailscaleBindHostAddress(hostMode);
     if (hostMode === "localhost") {
       bindHost = null;
     } else if (hostMode === "all") {
       bindHost = "0.0.0.0";
+    } else if (tailscaleBindHost) {
+      bindHost = tailscaleBindHost;
     } else {
       const trimmed = customHost.trim();
       if (!trimmed) {
@@ -375,11 +417,12 @@ function ConfigurableBindUrlControls() {
   if (!api) {
     return (
       <div className="bg-background-secondary px-4 py-3">
-        <div className="text-muted text-xs">Connect to mux to configure this setting.</div>
+        <div className="text-muted text-xs">Connect to xum to configure this setting.</div>
       </div>
     );
   }
 
+  const tailscaleBindHosts = status?.tailscaleBindHosts ?? [];
   const encodedToken = status?.token ? encodeURIComponent(status.token) : null;
   const localWebUiUrl = status?.baseUrl ? `${status.baseUrl}/` : null;
   const localWebUiUrlWithToken =
@@ -394,7 +437,7 @@ function ConfigurableBindUrlControls() {
   return (
     <div className="bg-background-secondary space-y-4 px-4 py-3">
       <div className="text-warning text-xs">
-        Exposes mux’s API server to your LAN/VPN. Devices on your local network can connect if they
+        Exposes xum’s API server to your LAN/VPN. Devices on your local network can connect if they
         have the auth token. Traffic is unencrypted HTTP; enable only on trusted networks (Tailscale
         recommended).
       </div>
@@ -403,7 +446,7 @@ function ConfigurableBindUrlControls() {
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-foreground text-sm">Bind host</div>
-            <div className="text-muted text-xs">Where mux listens for HTTP + WS connections</div>
+            <div className="text-muted text-xs">Where xum listens for HTTP + WS connections</div>
           </div>
           <Select value={hostMode} onValueChange={(value) => setHostMode(value as BindHostMode)}>
             <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-64 cursor-pointer rounded-md border px-3 text-sm transition-colors">
@@ -412,6 +455,20 @@ function ConfigurableBindUrlControls() {
             <SelectContent>
               <SelectItem value="localhost">Localhost only (127.0.0.1)</SelectItem>
               <SelectItem value="all">All interfaces (0.0.0.0)</SelectItem>
+              {tailscaleBindHosts.length > 0 ? (
+                tailscaleBindHosts.map((host) => (
+                  <SelectItem
+                    key={`${host.family}:${host.address}`}
+                    value={getTailscaleBindHostMode(host.address)}
+                  >
+                    {formatTailscaleBindHostLabel(host)}
+                  </SelectItem>
+                ))
+              ) : (
+                <SelectItem value="tailscale-unavailable" disabled>
+                  {loading ? "Loading Tailscale devices…" : "Tailscale device not detected"}
+                </SelectItem>
+              )}
               <SelectItem value="custom">Custom…</SelectItem>
             </SelectContent>
           </Select>
@@ -436,7 +493,7 @@ function ConfigurableBindUrlControls() {
           <div>
             <div className="text-foreground text-sm">Port</div>
             <div className="text-muted text-xs">
-              Use a fixed port to avoid changing URLs each time mux restarts
+              Use a fixed port to avoid changing URLs each time xum restarts
             </div>
           </div>
           <Select value={portMode} onValueChange={(value) => setPortMode(value as PortMode)}>
@@ -467,15 +524,15 @@ function ConfigurableBindUrlControls() {
 
         <div className="flex items-center justify-between gap-4">
           <div>
-            <div className="text-foreground text-sm">Serve mux web UI</div>
+            <div className="text-foreground text-sm">Serve xum web UI</div>
             <div className="text-muted text-xs">
-              Serve the mux web interface at / (browser mode)
+              Serve the xum web interface at / (browser mode)
             </div>
           </div>
           <Switch
             checked={serveWebUi}
             onCheckedChange={(value) => setServeWebUi(value)}
-            aria-label="Toggle serving mux web UI"
+            aria-label="Toggle serving xum web UI"
           />
         </div>
 
@@ -584,7 +641,7 @@ function ConfigurableBindUrlControls() {
             </>
           ) : (
             <div className="text-muted text-xs">
-              Web UI serving is disabled (enable “Serve mux web UI” and Apply to access /).
+              Web UI serving is disabled (enable “Serve xum web UI” and Apply to access /).
             </div>
           )}
 
@@ -611,11 +668,36 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
   return <div className="bg-background-secondary px-4 py-3">{props.children}</div>;
 }
 
+// Renders a parent experiment's sub-experiment toggles as a nested list.
+// Extracted so the nested-config call sites mirror their siblings
+// (AdvisorToolExperimentConfig, HeartbeatDefaultsControls) instead of
+// inlining the map in the section render.
+function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
+  return (
+    <div className="divide-border-light divide-y">
+      {props.experimentIds.map((subId) => {
+        const subExp = EXPERIMENTS[subId];
+        return (
+          <ExperimentRow
+            key={subId}
+            experimentId={subId}
+            name={subExp.name}
+            description={subExp.description}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
-  const imageGenerationToolEnabled = useExperimentValue(EXPERIMENT_IDS.IMAGE_GENERATION_TOOL);
+  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+  const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const settingsConfigRequestRef = useRef<{
     api: APIClient;
     request: Promise<SettingsConfig>;
@@ -652,10 +734,16 @@ export function ExperimentsSection() {
     return request;
   }, [api]);
 
-  // Only show user-overridable experiments (non-overridable ones are hidden since users can't change them)
+  // Only show user-overridable experiments (non-overridable ones are hidden since users can't
+  // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
     () =>
-      allExperiments.filter((exp) => exp.showInSettings !== false && exp.userOverridable === true),
+      allExperiments.filter(
+        (exp) =>
+          exp.showInSettings !== false &&
+          !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id) &&
+          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id)
+      ),
     [allExperiments]
   );
 
@@ -700,14 +788,27 @@ export function ExperimentsSection() {
                     : undefined
                 }
               />
-              {exp.id === EXPERIMENT_IDS.IMAGE_GENERATION_TOOL && imageGenerationToolEnabled && (
-                <ImageGenerationExperimentConfig enabled={imageGenerationToolEnabled} />
+              {exp.id === EXPERIMENT_IDS.ADVISOR_TOOL && advisorToolEnabled && (
+                <AdvisorToolExperimentConfig />
+              )}
+              {exp.id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && autoModelRoutingEnabled && (
+                <AutoModelRoutingExperimentConfig />
               )}
               {exp.id === EXPERIMENT_IDS.WORKSPACE_HEARTBEATS && workspaceHeartbeatsEnabled && (
                 <ExperimentSettingsPanel>
                   <HeartbeatDefaultsControls
                     loadConfig={api ? loadExperimentSettingsConfig : undefined}
                   />
+                </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
+                </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}

@@ -42,11 +42,18 @@ export function SplashScreen(props: SplashScreenProps) {
 
   return (
     <Dialog open onOpenChange={(open) => !open && props.onDismiss()}>
-      <DialogContent maxWidth="500px" onInteractOutside={(e) => e.preventDefault()}>
+      {/* aria-describedby={undefined}: splash bodies are rich content, not a short description. */}
+      {/* Cap height and scroll the body (footer pinned) so tall steps keep Next/Skip clickable. */}
+      <DialogContent
+        maxWidth="500px"
+        aria-describedby={undefined}
+        className="max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]"
+        onInteractOutside={(e) => e.preventDefault()}
+      >
         <DialogHeader>
           <DialogTitle>{props.title}</DialogTitle>
         </DialogHeader>
-        {props.children}
+        <div className="min-h-0 overflow-y-auto">{props.children}</div>
         <DialogFooter className={props.footerClassName}>
           {props.footer ?? (
             <>

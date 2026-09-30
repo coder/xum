@@ -165,7 +165,7 @@ export const CompleteGoalToolCall: React.FC<CompleteGoalToolCallProps> = ({
                 <div className="text-secondary text-[10px] tracking-wide uppercase">Objective</div>
                 <div className="text-foreground">{goal.objective}</div>
               </div>
-              <dl className="grid grid-cols-2 gap-x-4 gap-y-1">
+              <dl className="grid grid-cols-1 gap-x-4 gap-y-1 @sm:grid-cols-2">
                 <GoalToolStat label="Final status" value={goalStatusLabel(goal.status)} />
                 <GoalToolStat
                   label="Cost"

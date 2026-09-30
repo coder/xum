@@ -15,7 +15,7 @@ import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceShellStatus } from "@/browser/stores/WorkspaceStore";
 import { useReviews } from "@/browser/hooks/useReviews";
 import type { ReviewNoteData } from "@/common/types/review";
 import { ConnectionStatusToast } from "../ConnectionStatusToast/ConnectionStatusToast";
@@ -176,24 +176,14 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     [addReview]
   );
 
-  const workspaceState = useWorkspaceState(props.workspaceId);
+  const workspaceShellStatus = useWorkspaceShellStatus(props.workspaceId);
   const [isReviewImmersive] = usePersistedState(getReviewImmersiveKey(props.workspaceId), false, {
     listener: true,
   });
   const backgroundBashError = useBackgroundBashError();
 
-  if (!workspaceState) {
-    return (
-      <WorkspacePlaceholder
-        title="Loading workspace..."
-        showAnimation
-        className={props.className}
-      />
-    );
-  }
-
   const shouldKeepChatPaneMountedDuringHydration =
-    workspaceState.isHydratingTranscript && !workspaceState.isStreamStarting;
+    workspaceShellStatus.isHydratingTranscript && !workspaceShellStatus.isStreamStarting;
 
   // User rationale: a just-created chat should keep showing its startup barrier instead of
   // flashing generic loading/catch-up placeholders before the first send reaches onChat.
@@ -202,8 +192,8 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // so swapping the whole shell here causes the vertical tear reproduced in both browser and
   // Electron repros when an unseen workspace is opened.
   if (
-    workspaceState.loading &&
-    !workspaceState.isStreamStarting &&
+    workspaceShellStatus.loading &&
+    !workspaceShellStatus.isStreamStarting &&
     !shouldKeepChatPaneMountedDuringHydration
   ) {
     return (
@@ -228,6 +218,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   return (
     <div
       ref={shellRef}
+      // Lets descendants (WorkspaceMenuBar's timeline gate) locate the shell that
+      // owns the right-sidebar container query without prop-drilling layout state.
+      data-workspace-shell=""
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
         props.className
@@ -239,7 +232,6 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
           per-workspace local UI state internally, and the composer remains keyed by workspaceId. */}
       <ChatPane
         workspaceId={props.workspaceId}
-        workspaceState={workspaceState}
         projectPath={props.projectPath}
         projectName={props.projectName}
         workspaceName={props.workspaceName}

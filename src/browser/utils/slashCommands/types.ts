@@ -11,6 +11,8 @@
 
 import type { ExperimentId } from "@/common/constants/experiments";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 
 export type ParsedCommand =
@@ -26,11 +28,14 @@ export type ParsedCommand =
   | { type: "model-help" }
   | { type: "clear"; mode: "hard" | "soft" }
   | { type: "compact"; maxOutputTokens?: number; continueMessage?: string; model?: string }
+  | { type: "dream" }
+  | { type: "refine"; apply?: boolean }
   | { type: "fork"; startMessage?: string }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }
   | { type: "plan-show" }
   | { type: "plan-open" }
+  | { type: "workflow-run"; scriptPath: string; argsText?: string }
   | { type: "debug-llm-request" }
   | { type: "unknown-command"; command: string; subcommand?: string }
   | { type: "command-unknown-flag"; command: string; flag: string; usage?: string }
@@ -45,9 +50,6 @@ export type ParsedCommand =
   | { type: "goal-resume" }
   | { type: "goal-complete"; summary?: string }
   | { type: "goal-clear" }
-  | { type: "side-question"; question: string }
-  | { type: "advisor-list" }
-  | { type: "advisor-init"; name: string }
   | null;
 
 export interface SuggestionsHandlerArgs {
@@ -96,11 +98,15 @@ export interface SlashSuggestion {
   id: string;
   display: string;
   description: string;
+  kind?: "command" | "skill" | "model";
   replacement: string;
 }
 
 export interface SlashSuggestionContext extends SlashCommandVisibilityContext {
   agentSkills?: AgentSkillDescriptor[];
+  mcpPrompts?: MCPPromptDescriptor[];
+  /** Agent Plugins: manifest-contributed commands (name -> expansion). */
+  pluginCommands?: PluginSlashCommandDescriptor[];
 }
 
 export interface SuggestionDefinition {

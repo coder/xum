@@ -1,5 +1,6 @@
-import type { APIClient } from "@/browser/contexts/API";
-import * as APIModule from "@/browser/contexts/API";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -8,16 +9,19 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import type { ProjectConfig } from "@/common/types/project";
 import {
   GLOBAL_SCOPE_ID,
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getInputKey,
-  getInputAttachmentsKey,
+  getAutoModelRoutingKey,
+  getAutoRoutingChoiceByAgentKey,
+  getAutoThinkingLevelKey,
   getModelKey,
-  getPendingScopeId,
+  getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 
 import {
   CODER_RUNTIME_PLACEHOLDER,
@@ -31,8 +35,40 @@ import type {
 } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { isInitialStagingLocked } from "@/browser/features/ChatInput/initialStagingLock";
 import { GlobalWindow } from "happy-dom";
+import type { PendingFileChatAttachment } from "./ChatAttachments";
+import type { WorkspaceCreatedOptions } from "./types";
 import { useCreationWorkspace, type CreationSendResult } from "./useCreationWorkspace";
+
+// Composer drafts live in the (singleton) draft store; each test starts from empty drafts.
+const workspaceDraft = () =>
+  getDraftStore().getView({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID });
+const pendingDraft = () => getDraftStore().getView(defaultCreationDraftScope(TEST_PROJECT_PATH));
+/** Draft texts the backend confirmed, by workspace id (the store's writes land here). */
+const savedWorkspaceDraftText = new Map<string, string>();
+const draftBackend = createTestApiClient({
+  drafts: {
+    subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+      Promise.resolve(
+        (async function* (): AsyncGenerator<DraftEvent> {
+          yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      ),
+    update: (input: DraftUpdateInput) => {
+      if (input.scope.kind === "workspace" && input.text !== undefined) {
+        savedWorkspaceDraftText.set(input.scope.workspaceId, input.text);
+      }
+      return Promise.resolve({ revision: Date.now() });
+    },
+    delete: () => Promise.resolve({ revision: Date.now() }),
+  },
+});
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
@@ -56,16 +92,17 @@ const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
 });
 
 const updatePersistedStateCalls: Array<[string, unknown]> = [];
-const updatePersistedStateMock = mock((key: string, value: unknown) => {
+const updatePersistedStateMock = mock((key: string, value: unknown): boolean => {
   updatePersistedStateCalls.push([key, value]);
   if (typeof window === "undefined" || !window.localStorage) {
-    return;
+    return false;
   }
   if (value === undefined || value === null) {
     window.localStorage.removeItem(key);
-    return;
+    return true;
   }
   window.localStorage.setItem(key, JSON.stringify(value));
+  return true;
 });
 
 const readPersistedStringMock = mock((key: string) => {
@@ -131,7 +168,6 @@ const useDraftWorkspaceSettingsMock = mock(
   }
 );
 
-const actualAPIModule = { ...APIModule };
 const actualDraftWorkspaceSettingsModule = { ...DraftWorkspaceSettingsModule };
 const actualProjectContextModule = { ...ProjectContextModule };
 const actualRouterContextModule = { ...RouterContextModule };
@@ -168,19 +204,6 @@ async function installUseCreationWorkspaceModuleMocks() {
       pendingSectionId: null,
       pendingDraftId: routerState.pendingDraftId,
     }),
-  }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => {
-      if (!currentORPCClient) {
-        return { api: null, status: "connecting" as const, error: null };
-      }
-      return {
-        api: currentORPCClient as APIClient,
-        status: "connected" as const,
-        error: null,
-      };
-    },
   }));
   await mock.module("@/browser/contexts/ProjectContext", () => ({
     ...actualProjectContextModule,
@@ -223,7 +246,6 @@ async function restoreUseCreationWorkspaceModuleMocks() {
     () => actualDraftWorkspaceSettingsModule
   );
   await mock.module("@/browser/contexts/RouterContext", () => actualRouterContextModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/contexts/ProjectContext", () => actualProjectContextModule);
 }
 
@@ -246,17 +268,34 @@ type WorkspaceGetGoalArgs = Parameters<APIClient["workspace"]["getGoal"]>[0];
 type WorkspaceGetGoalResult = Awaited<ReturnType<APIClient["workspace"]["getGoal"]>>;
 type WorkspaceSetGoalArgs = Parameters<APIClient["workspace"]["setGoal"]>[0];
 type WorkspaceSetGoalResult = Awaited<ReturnType<APIClient["workspace"]["setGoal"]>>;
+type WorkflowStartArgs = Parameters<APIClient["workflows"]["start"]>[0];
+type WorkflowStartResult = Awaited<ReturnType<APIClient["workflows"]["start"]>>;
+type WorkflowGetRunArgs = Parameters<APIClient["workflows"]["getRun"]>[0];
+type WorkflowGetRunResult = Awaited<ReturnType<APIClient["workflows"]["getRun"]>>;
+type WorkspaceCreateScratchArgs = Parameters<APIClient["workspace"]["createScratch"]>[0];
+type WorkspaceCreateScratchResult = Awaited<ReturnType<APIClient["workspace"]["createScratch"]>>;
 type WorkspaceCreateResult = Awaited<ReturnType<APIClient["workspace"]["create"]>>;
 type NameGenerationArgs = Parameters<APIClient["nameGeneration"]["generate"]>[0];
 type NameGenerationResult = Awaited<ReturnType<APIClient["nameGeneration"]["generate"]>>;
+type WorkspaceStageAttachmentArgs = Parameters<APIClient["workspace"]["stageAttachment"]>[0];
+type WorkspaceStageAttachmentResult = Awaited<
+  ReturnType<APIClient["workspace"]["stageAttachment"]>
+>;
 type MockOrpcProjectsClient = Pick<
   APIClient["projects"],
   "list" | "listBranches" | "runtimeAvailability" | "setTrust"
 >;
 type MockOrpcWorkspaceClient = Pick<
   APIClient["workspace"],
-  "sendMessage" | "create" | "updateAgentAISettings" | "getGoal" | "setGoal"
+  | "sendMessage"
+  | "create"
+  | "createScratch"
+  | "updateAgentAISettings"
+  | "getGoal"
+  | "setGoal"
+  | "stageAttachment"
 >;
+type MockOrpcWorkflowsClient = Pick<APIClient["workflows"], "start" | "getRun">;
 type MockOrpcNameGenerationClient = Pick<APIClient["nameGeneration"], "generate">;
 type WindowWithApi = Window & typeof globalThis;
 type WindowApi = WindowWithApi["api"];
@@ -276,6 +315,7 @@ const noopUnsubscribe = () => () => undefined;
 interface MockOrpcClient {
   projects: MockOrpcProjectsClient;
   workspace: MockOrpcWorkspaceClient;
+  workflows: MockOrpcWorkflowsClient;
   nameGeneration: MockOrpcNameGenerationClient;
 }
 interface SetupWindowOptions {
@@ -295,9 +335,21 @@ interface SetupWindowOptions {
   setGoal?: ReturnType<
     typeof mock<(args: WorkspaceSetGoalArgs) => Promise<WorkspaceSetGoalResult>>
   >;
+  workflowStart?: ReturnType<
+    typeof mock<(args: WorkflowStartArgs) => Promise<WorkflowStartResult>>
+  >;
+  workflowGetRun?: ReturnType<
+    typeof mock<(args: WorkflowGetRunArgs) => Promise<WorkflowGetRunResult>>
+  >;
+  createScratch?: ReturnType<
+    typeof mock<(args: WorkspaceCreateScratchArgs) => Promise<WorkspaceCreateScratchResult>>
+  >;
   create?: ReturnType<typeof mock<(args: WorkspaceCreateArgs) => Promise<WorkspaceCreateResult>>>;
   nameGeneration?: ReturnType<
     typeof mock<(args: NameGenerationArgs) => Promise<NameGenerationResult>>
+  >;
+  stageAttachment?: ReturnType<
+    typeof mock<(args: WorkspaceStageAttachmentArgs) => Promise<WorkspaceStageAttachmentResult>>
   >;
 }
 
@@ -306,10 +358,14 @@ const setupWindow = ({
   listBranches,
   sendMessage,
   create,
+  createScratch,
   updateAgentAISettings,
   getGoal,
   setGoal,
+  workflowStart,
+  workflowGetRun,
   nameGeneration,
+  stageAttachment,
 }: SetupWindowOptions = {}) => {
   // Sync the useProjectContext mock with the default trusted config.
   // Tests that need untrusted projects override mockProjectConfigMap directly.
@@ -368,6 +424,22 @@ const setupWindow = ({
       } as WorkspaceSetGoalResult);
     });
 
+  const workflowStartMock =
+    workflowStart ??
+    mock<(args: WorkflowStartArgs) => Promise<WorkflowStartResult>>(() => {
+      return Promise.resolve({
+        runId: "wfr_test",
+        status: "running",
+        result: null,
+      } as WorkflowStartResult);
+    });
+
+  const workflowGetRunMock =
+    workflowGetRun ??
+    mock<(args: WorkflowGetRunArgs) => Promise<WorkflowGetRunResult>>(() => {
+      return Promise.resolve(null as WorkflowGetRunResult);
+    });
+
   const createMock =
     create ??
     mock<(args: WorkspaceCreateArgs) => Promise<WorkspaceCreateResult>>(() => {
@@ -375,6 +447,15 @@ const setupWindow = ({
         success: true,
         metadata: TEST_METADATA,
       } as WorkspaceCreateResult);
+    });
+
+  const createScratchMock =
+    createScratch ??
+    mock<(args: WorkspaceCreateScratchArgs) => Promise<WorkspaceCreateScratchResult>>(() => {
+      return Promise.resolve({
+        success: true,
+        metadata: { ...TEST_METADATA, kind: "scratch" },
+      } as WorkspaceCreateScratchResult);
     });
 
   const updateAgentAISettingsMock =
@@ -400,6 +481,22 @@ const setupWindow = ({
       } as NameGenerationResult);
     });
 
+  const stageAttachmentMock =
+    stageAttachment ??
+    mock<(args: WorkspaceStageAttachmentArgs) => Promise<WorkspaceStageAttachmentResult>>(
+      (args) => {
+        return Promise.resolve({
+          success: true,
+          data: {
+            filename: args.filename,
+            mediaType: args.mediaType ?? "application/octet-stream",
+            sizeBytes: args.sizeBytes,
+            stagedPath: `.mux/user-attachments/uuid/${args.filename}`,
+          },
+        } as WorkspaceStageAttachmentResult);
+      }
+    );
+
   currentORPCClient = {
     projects: {
       list: () => listProjectsMock(),
@@ -417,10 +514,16 @@ const setupWindow = ({
     workspace: {
       sendMessage: (input: WorkspaceSendMessageArgs) => sendMessageMock(input),
       create: (input: WorkspaceCreateArgs) => createMock(input),
+      createScratch: (input: WorkspaceCreateScratchArgs) => createScratchMock(input),
       updateAgentAISettings: (input: WorkspaceUpdateAgentAISettingsArgs) =>
         updateAgentAISettingsMock(input),
       getGoal: (input: WorkspaceGetGoalArgs) => getGoalMock(input),
       setGoal: (input: WorkspaceSetGoalArgs) => setGoalMock(input),
+      stageAttachment: (input: WorkspaceStageAttachmentArgs) => stageAttachmentMock(input),
+    },
+    workflows: {
+      start: (input: WorkflowStartArgs) => workflowStartMock(input),
+      getRun: (input: WorkflowGetRunArgs) => workflowGetRunMock(input),
     },
     nameGeneration: {
       generate: (input: NameGenerationArgs) => nameGenerationMock(input),
@@ -457,6 +560,7 @@ const setupWindow = ({
     workspace: {
       list: rejectNotImplemented("workspace.list"),
       create: (args: WorkspaceCreateArgs) => createMock(args),
+      createScratch: (args: WorkspaceCreateScratchArgs) => createScratchMock(args),
       updateAgentAISettings: (args: WorkspaceUpdateAgentAISettingsArgs) =>
         updateAgentAISettingsMock(args),
       remove: rejectNotImplemented("workspace.remove"),
@@ -527,10 +631,13 @@ const setupWindow = ({
     workspaceApi: {
       sendMessage: sendMessageMock,
       create: createMock,
+      createScratch: createScratchMock,
       updateAgentAISettings: updateAgentAISettingsMock,
       getGoal: getGoalMock,
       setGoal: setGoalMock,
+      stageAttachment: stageAttachmentMock,
     },
+    workflowsApi: { start: workflowStartMock, getRun: workflowGetRunMock },
     nameGenerationApi: { generate: nameGenerationMock },
   };
 };
@@ -552,6 +659,7 @@ describe("useCreationWorkspace", () => {
   });
 
   beforeEach(async () => {
+    saveDomGlobals();
     await installUseCreationWorkspaceModuleMocks();
     restorePersistedStateMocks = installPersistedStateMocks();
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
@@ -563,21 +671,24 @@ describe("useCreationWorkspace", () => {
     routerState.currentWorkspaceId = null;
     routerState.currentProjectId = null;
     routerState.pendingDraftId = null;
+    getDraftStore().forgetWorkspace(TEST_WORKSPACE_ID);
+    getDraftStore().forgetProject(TEST_PROJECT_PATH);
+    savedWorkspaceDraftText.clear();
+    getDraftStore().setClient(draftBackend);
+    await getDraftStore().whenReady();
+    // The creation composer's draft; a created workspace must clear it.
+    getDraftStore().setText(defaultCreationDraftScope(TEST_PROJECT_PATH), "creation draft");
   });
 
   afterEach(async () => {
+    getDraftStore().setClient(null);
     cleanup();
     restorePersistedStateMocks?.();
     restorePersistedStateMocks = null;
     await restoreUseCreationWorkspaceModuleMocks();
     mock.restore();
     // Reset global window/document/localStorage between tests
-    // @ts-expect-error - test cleanup
-    globalThis.window = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.document = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.localStorage = undefined;
+    restoreDomGlobals();
   });
 
   test("loads branches when projectPath is provided", async () => {
@@ -633,6 +744,96 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(draftSettingsInvocations.length).toBeGreaterThan(0));
     expect(listBranchesMock.mock.calls.length).toBe(0);
     expect(getHook().branches).toEqual([]);
+  });
+
+  test("scratch creation skips project loading and uses createScratch", async () => {
+    const listBranchesMock = mock(() =>
+      Promise.reject(new Error("scratch creation should not load branches"))
+    );
+    const scratchMetadata: FrontendWorkspaceMetadata = {
+      ...TEST_METADATA,
+      kind: "scratch",
+      projectName: "Scratch",
+      projectPath: "/tmp/mux/scratch/ws-created",
+      namedWorkspacePath: "/tmp/mux/scratch/ws-created",
+      runtimeConfig: { type: "local" },
+    };
+    const createScratchMock = mock(
+      (_args: WorkspaceCreateScratchArgs): Promise<WorkspaceCreateScratchResult> =>
+        Promise.resolve({ success: true, metadata: scratchMetadata })
+    );
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.reject(new Error("regular create should not run"))
+    );
+    const { workspaceApi } = setupWindow({
+      listBranches: listBranchesMock,
+      create: createMock,
+      createScratch: createScratchMock,
+    });
+    const onWorkspaceCreated = mock(
+      (metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => metadata
+    );
+    const getHook = renderUseCreationWorkspace({
+      kind: "scratch",
+      projectPath: "_scratch",
+      onWorkspaceCreated,
+      message: "Inspect this idea",
+    });
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("Inspect this idea");
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(listBranchesMock).not.toHaveBeenCalled();
+    expect(workspaceApi.create).not.toHaveBeenCalled();
+    expect(workspaceApi.createScratch).toHaveBeenCalledTimes(1);
+    expect(workspaceApi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: scratchMetadata.id, message: "Inspect this idea" })
+    );
+    expect(onWorkspaceCreated).toHaveBeenCalledTimes(1);
+    expect(onWorkspaceCreated.mock.calls[0]?.[0]).toEqual(scratchMetadata);
+    expect(typeof onWorkspaceCreated.mock.calls[0]?.[1]?.pendingStreamModel).toBe("string");
+  });
+
+  test("scratch creation skips the devcontainer preflight for a devcontainer default runtime", async () => {
+    // Scratch never loads runtime availability, so the devcontainer preflight
+    // would otherwise block forever in the "loading" availability state.
+    draftSettingsState = createDraftSettingsHarness({
+      selectedRuntime: { mode: "devcontainer", configPath: "" },
+    });
+    const scratchMetadata: FrontendWorkspaceMetadata = {
+      ...TEST_METADATA,
+      kind: "scratch",
+      projectName: "Scratch",
+      projectPath: "/tmp/mux/scratch/ws-created",
+      namedWorkspacePath: "/tmp/mux/scratch/ws-created",
+      runtimeConfig: { type: "local" },
+    };
+    const createScratchMock = mock(
+      (_args: WorkspaceCreateScratchArgs): Promise<WorkspaceCreateScratchResult> =>
+        Promise.resolve({ success: true, metadata: scratchMetadata })
+    );
+    const { workspaceApi } = setupWindow({ createScratch: createScratchMock });
+    const onWorkspaceCreated = mock(
+      (metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => metadata
+    );
+    const getHook = renderUseCreationWorkspace({
+      kind: "scratch",
+      projectPath: "_scratch",
+      onWorkspaceCreated,
+      message: "Inspect this idea",
+    });
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("Inspect this idea");
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(workspaceApi.createScratch).toHaveBeenCalledTimes(1);
   });
 
   test("handleSend creates workspace and sends message on success", async () => {
@@ -712,6 +913,7 @@ describe("useCreationWorkspace", () => {
     expect(createRequest?.runtimeConfig).toEqual({
       type: "ssh",
       host: "example.com",
+      // SSH remotes keep the stable ~/mux layout; local Xum home is separate.
       srcBaseDir: "~/mux",
     });
 
@@ -728,12 +930,483 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(onWorkspaceCreated.mock.calls.length).toBe(1));
     expect(onWorkspaceCreated.mock.calls[0][0]).toEqual(TEST_METADATA);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
+  });
+
+  test("handleSend stages pending files after create and appends the attached-files notice", async () => {
+    const callOrder: string[] = [];
+    const createMock = mock((_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> => {
+      callOrder.push("create");
+      return Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult);
+    });
+    const lockObservedDuringStaging: boolean[] = [];
+    const stageAttachmentMock = mock(
+      (args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> => {
+        callOrder.push(`stage:${args.filename}`);
+        lockObservedDuringStaging.push(isInitialStagingLocked(TEST_WORKSPACE_ID));
+        return Promise.resolve({
+          success: true,
+          data: {
+            filename: args.filename,
+            mediaType: args.mediaType ?? "application/octet-stream",
+            sizeBytes: args.sizeBytes,
+            stagedPath: `.mux/user-attachments/uuid/${args.filename}`,
+          },
+        } as WorkspaceStageAttachmentResult);
+      }
+    );
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> => {
+        callOrder.push("send");
+        return Promise.resolve({ success: true as const, data: {} });
+      }
+    );
+    const { workspaceApi } = setupWindow({
+      create: createMock,
+      sendMessage: sendMessageMock,
+      stageAttachment: stageAttachmentMock,
+    });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => {
+        callOrder.push("navigate");
+        return metadata;
+      }),
+      message: "check these files",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const pendingFiles: PendingFileChatAttachment[] = [
+      {
+        kind: "pending-file",
+        id: "p1",
+        filename: "notes.md",
+        mediaType: "text/markdown",
+        sizeBytes: 8,
+        dataBase64: "bWFya2Rvd24=",
+      },
+      {
+        kind: "pending-file",
+        id: "p2",
+        filename: "data.bin",
+        mediaType: "application/octet-stream",
+        sizeBytes: 3,
+        dataBase64: "Ymlu",
+      },
+    ];
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend(
+        "check these files",
+        undefined,
+        undefined,
+        undefined,
+        pendingFiles
+      );
+    });
+
+    expect(result).toEqual({ success: true });
+    // Navigation must not wait on staging: stageAttachment blocks on runtime
+    // init, which can take minutes on deferred runtimes.
+    expect(callOrder).toEqual(["create", "navigate", "stage:notes.md", "stage:data.bin", "send"]);
+    // The composer lock is held during staging and released once the send is done.
+    expect(lockObservedDuringStaging).toEqual([true, true]);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    expect(workspaceApi.stageAttachment.mock.calls[0]?.[0]?.workspaceId).toBe(TEST_WORKSPACE_ID);
+
+    const sendRequest = workspaceApi.sendMessage.mock.calls[0]?.[0];
+    expect(sendRequest?.message).toContain("check these files");
+    expect(sendRequest?.message).toContain(".mux/user-attachments/uuid/notes.md");
+    expect(sendRequest?.message).toContain(".mux/user-attachments/uuid/data.bin");
+  });
+
+  test("handleSend fails closed when staging fails and transfers the draft to the workspace", async () => {
+    const stageAttachmentMock = mock(
+      (args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> => {
+        if (args.filename === "bad.bin") {
+          return Promise.resolve({
+            success: false,
+            error: "disk full",
+          } as WorkspaceStageAttachmentResult);
+        }
+        return Promise.resolve({
+          success: true,
+          data: {
+            filename: args.filename,
+            mediaType: args.mediaType ?? "application/octet-stream",
+            sizeBytes: args.sizeBytes,
+            stagedPath: `.mux/user-attachments/uuid/${args.filename}`,
+          },
+        } as WorkspaceStageAttachmentResult);
+      }
+    );
+    const onWorkspaceCreated = mock(
+      (metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => metadata
+    );
+    const clearPendingInitialSendSpy = spyOn(workspaceStore, "clearPendingInitialSendState");
+    const { workspaceApi } = setupWindow({ stageAttachment: stageAttachmentMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "review my files",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const good: PendingFileChatAttachment = {
+      kind: "pending-file",
+      id: "p1",
+      filename: "good.md",
+      mediaType: "text/markdown",
+      sizeBytes: 8,
+      dataBase64: "bWFya2Rvd24=",
+    };
+    const bad: PendingFileChatAttachment = {
+      kind: "pending-file",
+      id: "p2",
+      filename: "bad.bin",
+      mediaType: "application/octet-stream",
+      sizeBytes: 3,
+      dataBase64: "Ymlu",
+    };
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      // Simulates a slash-skill send: messageText is the rewritten skill text
+      // while muxMetadata.rawCommand preserves the original typed command.
+      result = await getHook().handleSend(
+        "review my files",
+        undefined,
+        {
+          muxMetadata: {
+            type: "agent-skill",
+            rawCommand: "/review my files",
+            commandPrefix: "/review",
+            skillName: "review",
+            scope: "project",
+          },
+          disableWorkspaceAgents: true,
+        },
+        undefined,
+        [good, bad]
+      );
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(0);
+
+    // The transferred draft restores the original slash command so a retry
+    // re-invokes the skill, and preserves the forced project-path discovery.
+    expect(workspaceDraft().text).toBe("/review my files");
+    expect(updatePersistedStateCalls).toContainEqual([
+      getPendingDraftSkillDiscoveryKey(TEST_WORKSPACE_ID),
+      true,
+    ]);
+    expect(workspaceDraft().attachments).toEqual([
+      {
+        kind: "staged",
+        id: "p1",
+        filename: "good.md",
+        mediaType: "text/markdown",
+        sizeBytes: 8,
+        stagedPath: ".mux/user-attachments/uuid/good.md",
+      },
+      bad,
+    ]);
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+    expect((errorWrite?.[1] as { raw: string }).raw).toContain("bad.bin: disk full");
+
+    // Navigation happens optimistically before staging; the pending-send
+    // barrier is cleared once staging fails.
+    expect(onWorkspaceCreated.mock.calls.length).toBe(1);
+    // The pending transcript row shows the typed command, not the rewritten skill text.
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      markPendingInitialSend: true,
+      pendingUserMessage: { content: "/review my files" },
+    });
+    expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
+    clearPendingInitialSendSpy.mockRestore();
+
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
+  });
+
+  test("handleSend transfers the staged draft when the first send fails after staging", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider exploded" },
+        })
+    );
+    const { workspaceApi } = setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "send my files",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const pendingFile: PendingFileChatAttachment = {
+      kind: "pending-file",
+      id: "p1",
+      filename: "notes.md",
+      mediaType: "text/markdown",
+      sizeBytes: 8,
+      dataBase64: "bWFya2Rvd24=",
+    };
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("send my files", undefined, undefined, undefined, [
+        pendingFile,
+      ]);
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+
+    // Staged files live in the new workspace; the draft must be transferred so
+    // the user can retry the send with the chips/notice intact.
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
+      {
+        kind: "staged",
+        id: "p1",
+        filename: "notes.md",
+        mediaType: "text/markdown",
+        sizeBytes: 8,
+        stagedPath: ".mux/user-attachments/uuid/notes.md",
+      },
+    ]);
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown", raw: "provider exploded" });
+  });
+
+  test("handleSend transfers the staged draft when the first send rejects after staging", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.reject(new Error("orpc disconnected"))
+    );
+    const { workspaceApi } = setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "send my files",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const pendingFile: PendingFileChatAttachment = {
+      kind: "pending-file",
+      id: "p1",
+      filename: "notes.md",
+      mediaType: "text/markdown",
+      sizeBytes: 8,
+      dataBase64: "bWFya2Rvd24=",
+    };
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("send my files", undefined, undefined, undefined, [
+        pendingFile,
+      ]);
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
+      {
+        kind: "staged",
+        id: "p1",
+        filename: "notes.md",
+        mediaType: "text/markdown",
+        sizeBytes: 8,
+        stagedPath: ".mux/user-attachments/uuid/notes.md",
+      },
+    ]);
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown", raw: "orpc disconnected" });
+  });
+
+  test("handleSend hands a text-only draft to the new workspace when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    const { workspaceApi } = setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("fix the login bug");
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+
+    // The user lands in the created workspace with nothing persisted; the text must be
+    // waiting in that composer so a model or provider fix can be followed by a plain resend.
+    expect(workspaceDraft().text).toBe("fix the login bug");
+    // The creation draft is already deleted: the hand-off is saved before handleSend returns
+    // (a hard close right after must not lose the prompt).
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("fix the login bug");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({
+      type: "unknown",
+      raw: "provider rejected the request",
+    });
+  });
+
+  test("handleSend leaves a draft typed in the new workspace alone when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+    // Text-only sends leave the new workspace composer unlocked while sendMessage waits on
+    // init, so the user may already have typed a follow-up there.
+    getDraftStore().setText({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID }, "also check CI");
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("fix the login bug");
+    });
+
+    expect(workspaceDraft().text).toBe("also check CI");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+  });
+
+  test("handleSend locks the new workspace composer while an image-bearing first send is in flight", async () => {
+    // Provider file parts are handed back to the workspace composer if the send fails, and that
+    // write replaces whatever attachments the composer holds, so the composer must be locked
+    // for the whole send exactly like a staged-files send.
+    const lockObservedDuringSend: boolean[] = [];
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> => {
+        lockObservedDuringSend.push(isInitialStagingLocked(TEST_WORKSPACE_ID));
+        return Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        });
+      }
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "describe this screenshot",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const imagePart = {
+      type: "file" as const,
+      mediaType: "image/png",
+      url: "data:image/png;base64,iVBORw0KGgo=",
+      filename: "shot.png",
+    };
+    await act(async () => {
+      await getHook().handleSend("describe this screenshot", [imagePart]);
+    });
+
+    expect(lockObservedDuringSend).toEqual([true]);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    expect(workspaceDraft().attachments).toMatchObject([{ kind: "provider", url: imagePart.url }]);
+  });
+
+  test("handleSend transfers large attachments whole (drafts are no longer capped)", async () => {
+    const stageAttachmentMock = mock(
+      (_args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> =>
+        Promise.resolve({ success: false, error: "disk full" } as WorkspaceStageAttachmentResult)
+    );
+    setupWindow({ stageAttachment: stageAttachmentMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "send my files",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const failedPendingFile: PendingFileChatAttachment = {
+      kind: "pending-file",
+      id: "p1",
+      filename: "small.bin",
+      mediaType: "application/octet-stream",
+      sizeBytes: 3,
+      dataBase64: "Ymlu",
+    };
+    // A provider attachment far above the old localStorage persistence cap.
+    const oversizedFilePart = {
+      type: "file" as const,
+      url: `data:application/pdf;base64,${"a".repeat(4_000_001)}`,
+      mediaType: "application/pdf",
+      filename: "big.pdf",
+    };
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend(
+        "send my files",
+        [oversizedFilePart],
+        undefined,
+        undefined,
+        [failedPendingFile]
+      );
+    });
+
+    expect(result).toEqual({ success: false });
+
+    // Both survive: the big attachment and the failed pending file the user can retry.
+    expect(workspaceDraft().attachments).toHaveLength(2);
+    expect(workspaceDraft().attachments).toContainEqual(failedPendingFile);
+    expect(
+      workspaceDraft().attachments.find((attachment) => attachment.kind === "provider")
+    ).toMatchObject({ url: oversizedFilePart.url });
   });
 
   test("handleSend creates workspace and applies initial goal command without sending chat text", async () => {
@@ -755,14 +1428,10 @@ describe("useCreationWorkspace", () => {
     const { workspaceApi } = setupWindow({ setGoal: setGoalMock, sendMessage: sendMessageMock });
 
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
@@ -788,7 +1457,7 @@ describe("useCreationWorkspace", () => {
     expect(workspaceApi.updateAgentAISettings).toHaveBeenCalledWith({
       workspaceId: TEST_WORKSPACE_ID,
       agentId: "exec",
-      aiSettings: { model: "gpt-4", thinkingLevel: "medium" },
+      aiSettings: { model: "gpt-4", thinkingLevel: "medium", reasoningMode: "standard" },
       persistSelectedAgentId: true,
     });
     expect(workspaceApi.getGoal.mock.calls.length).toBe(1);
@@ -799,11 +1468,104 @@ describe("useCreationWorkspace", () => {
       turnCap: null,
       expectedGoalId: null,
     });
+    // No user turn is queued, but the workspace still runs init, so the creation card is carried.
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-4-7",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: false,
+      pendingUserMessage: undefined,
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
+  });
+
+  test("handleSend sends workflow-looking creation prompts to the agent", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true, data: {} } as WorkspaceSendMessageResult)
+    );
+    const { workspaceApi, workflowsApi } = setupWindow({
+      sendMessage: sendMessageMock,
+    });
+
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      dynamicWorkflowsEnabled: true,
+      onWorkspaceCreated,
+      message: "/deep-research mux workflows",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("/deep-research mux workflows");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls.length).toBe(1);
+    expect(workflowsApi.start).not.toHaveBeenCalled();
+    expect(workflowsApi.getRun).not.toHaveBeenCalled();
+    expect(workspaceApi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: TEST_WORKSPACE_ID,
+        message: "/deep-research mux workflows",
+      })
+    );
+  });
+
+  test("handleSend uses a deterministic workspace name when AI name generation fails", async () => {
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "permission_denied", provider: "anthropic", raw: "Forbidden" },
+        } as NameGenerationResult)
+    );
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({
+          success: true,
+          metadata: TEST_METADATA,
+        } as WorkspaceCreateResult)
+    );
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true, data: {} } as WorkspaceSendMessageResult)
+    );
+    const { workspaceApi, nameGenerationApi } = setupWindow({
+      create: createMock,
+      sendMessage: sendMessageMock,
+      nameGeneration: nameGenerationMock,
+    });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "/security-scan",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("/security-scan");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls.length).toBe(1);
+    const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+    expect(createRequest?.branchName).toBe("security-scan");
+    expect(createRequest?.title).toBe("security-scan");
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
   });
 
   test("handleSend shows trust dialog for untrusted projects", async () => {
@@ -930,6 +1692,62 @@ describe("useCreationWorkspace", () => {
     expect(sendRequest?.options?.agentId).toBe("ask");
   });
 
+  test.each([true, false])(
+    "records only creation routing picks that differ from the agent's Auto default (experiment %p)",
+    async (autoRoutingEnabled) => {
+      setupWindow({
+        listBranches: mock(
+          (): Promise<BranchListResult> =>
+            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+        ),
+        sendMessage: mock(
+          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+            Promise.resolve({ success: true as const, data: {} })
+        ),
+        create: mock(
+          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+        ),
+      });
+
+      const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
+      persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
+      persistedPreferences[getAgentIdKey(projectScopeId)] = "exec";
+      persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+      // Model Auto came from the default; thinking Auto was picked in the creation composer.
+      persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
+      persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
+      draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+
+      const getHook = renderUseCreationWorkspace({
+        projectPath: TEST_PROJECT_PATH,
+        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+        message: "launch workspace",
+        autoRoutingEnabled,
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      await act(async () => {
+        await getHook().handleSend("launch workspace");
+      });
+
+      expect(updatePersistedStateCalls).toContainEqual([
+        getAutoModelRoutingKey(TEST_WORKSPACE_ID),
+        true,
+      ]);
+      expect(updatePersistedStateCalls).toContainEqual([
+        getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
+        true,
+      ]);
+      const recordedChoices = updatePersistedStateCalls
+        .filter(([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID))
+        .map(([, updater]) => (updater as (prev: unknown) => unknown)({}));
+      expect(recordedChoices).toEqual(
+        autoRoutingEnabled ? [{ exec: { thinkingLevel: true } }] : []
+      );
+    }
+  );
+
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
     const listBranchesMock = mock(
       (): Promise<BranchListResult> =>
@@ -986,12 +1804,8 @@ describe("useCreationWorkspace", () => {
     expect(handleSendResult).toEqual({ success: false, error: sendError });
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     const pendingErrorKey = getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID);
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
     expect(updatePersistedStateCalls).toContainEqual([pendingErrorKey, sendError]);
   });
   test("onWorkspaceCreated is called before sendMessage resolves (no blocking)", async () => {
@@ -1093,14 +1907,7 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "different-draft";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
         metadata,
         options,
       })
@@ -1126,6 +1933,49 @@ describe("useCreationWorkspace", () => {
       autoNavigate: false,
       pendingStreamModel: null,
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+    });
+  });
+
+  test("handleSend reuses the pending row ChatInput showed while resolving the send", async () => {
+    const onWorkspaceCreated = mock(
+      (_metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => undefined
+    );
+    setupWindow({
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+    });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "test message",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const draft = { content: "test message", fileParts: undefined, timestamp: 1_234 };
+    await act(async () => {
+      await getHook().handleSend("test message", undefined, undefined, undefined, undefined, draft);
+    });
+
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      pendingUserMessage: draft,
+      pendingCreationInit: { timestamp: 1_234 },
     });
   });
 
@@ -1168,14 +2018,10 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "draft-being-created";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
 
     const getHook = renderUseCreationWorkspace({
@@ -1196,8 +2042,22 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-4-7",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 
@@ -1344,6 +2204,7 @@ function createDraftSettingsHarness(
       const settings: DraftWorkspaceSettings = {
         model: "gpt-4",
         thinkingLevel: "medium",
+        reasoningMode: "standard",
         agentId: state.agentId,
         selectedRuntime: state.selectedRuntime,
         defaultRuntimeMode: state.defaultRuntimeMode,
@@ -1363,6 +2224,7 @@ function createDraftSettingsHarness(
 }
 
 interface HookOptions {
+  kind?: "scratch";
   projectPath: string;
   onWorkspaceCreated: (
     metadata: FrontendWorkspaceMetadata,
@@ -1372,6 +2234,8 @@ interface HookOptions {
       markPendingInitialSend?: boolean;
     }
   ) => void;
+  dynamicWorkflowsEnabled?: boolean;
+  autoRoutingEnabled?: boolean;
   message?: string;
   draftId?: string | null;
 }
@@ -1389,7 +2253,16 @@ function renderUseCreationWorkspace(options: HookOptions) {
     return null;
   }
 
-  render(<Harness {...options} />);
+  // Inject the client through the real provider; mocking the API module leaks
+  // process-wide into later suites.
+  if (!currentORPCClient) {
+    throw new Error("Tests must call setupWindow() before rendering the hook");
+  }
+  render(
+    <APIProvider client={createTestApiClient(currentORPCClient)}>
+      <Harness {...options} />
+    </APIProvider>
+  );
 
   return () => {
     if (!resultRef.current) {

@@ -1,0 +1,4 @@
+/* Empty stub for katex/dist/katex.min.css — the design IIFE bundle has no .ttf
+   loader, and the real katex styling reaches the bundle via the sb-reference
+   CSS fallback (vite already compiled katex's fonts there). Mapped in
+   tsconfig.ds.json. */

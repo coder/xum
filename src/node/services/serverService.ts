@@ -1,3 +1,4 @@
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { createOrpcServer, type OrpcServer, type OrpcServerOptions } from "@/node/orpc/server";
 import { ServerLockfile } from "./serverLockfile";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -5,6 +6,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { log } from "./log";
 import * as os from "os";
+import * as childProcess from "node:child_process";
 import { VERSION } from "@/version";
 import { buildMuxMdnsServiceOptions, MdnsAdvertiserService } from "./mdnsAdvertiserService";
 import type { AppRouter } from "@/node/orpc/router";
@@ -23,8 +25,8 @@ export interface ServerInfo {
 }
 
 export interface StartServerOptions {
-  /** Path to mux home directory (for lockfile) */
-  muxHome: string;
+  /** Path to xum home directory (for lockfile) */
+  xumHome: string;
   /** oRPC context with services */
   context: ORPCContext;
   /** Host/interface to bind to (default: "127.0.0.1") */
@@ -46,6 +48,14 @@ export interface StartServerOptions {
 }
 
 type NetworkInterfaces = NodeJS.Dict<os.NetworkInterfaceInfo[]>;
+
+export interface TailscaleBindHost {
+  interfaceName: string;
+  address: string;
+  family: "IPv4" | "IPv6";
+}
+
+const TAILSCALE_IP_COMMAND_TIMEOUT_MS = 1_000;
 
 function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase();
@@ -78,7 +88,7 @@ function buildHttpBaseUrl(host: string, port: number): string {
 }
 
 function resolveAllowHttpOriginEnvFlag(): boolean {
-  const raw = process.env.MUX_SERVER_ALLOW_HTTP_ORIGIN;
+  const raw = resolveXumEnvironmentValue("SERVER_ALLOW_HTTP_ORIGIN", process.env);
   if (!raw) {
     return false;
   }
@@ -122,6 +132,124 @@ function getNonInternalInterfaceAddresses(
   }
 
   return Array.from(new Set(addresses)).sort();
+}
+
+function parseIpv4Octets(address: string): [number, number, number, number] | null {
+  const parts = address.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+
+  if (parts.some((part) => !/^\d+$/.test(part))) {
+    return null;
+  }
+
+  const octets: [number, number, number, number] = [
+    Number.parseInt(parts[0] ?? "", 10),
+    Number.parseInt(parts[1] ?? "", 10),
+    Number.parseInt(parts[2] ?? "", 10),
+    Number.parseInt(parts[3] ?? "", 10),
+  ];
+  if (octets.some((octet) => octet < 0 || octet > 255)) {
+    return null;
+  }
+
+  return octets;
+}
+
+function isTailscaleIpv4Address(address: string): boolean {
+  const octets = parseIpv4Octets(address);
+  if (!octets) {
+    return false;
+  }
+
+  // Tailscale IPv4 addresses live in 100.64.0.0/10. This lets macOS utun devices show
+  // as a Tailscale choice even when the OS exposes only a generic interface name.
+  return octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+}
+
+function isTailscaleIpv6Address(address: string): boolean {
+  const normalized = address.toLowerCase();
+  return normalized === "fd7a:115c:a1e0::" || normalized.startsWith("fd7a:115c:a1e0:");
+}
+
+function isTailscaleInterfaceName(interfaceName: string): boolean {
+  return interfaceName.toLowerCase().includes("tailscale");
+}
+
+function isLinkLocalAddress(address: string, family: "IPv4" | "IPv6"): boolean {
+  if (family === "IPv4") {
+    return address.startsWith("169.254.");
+  }
+
+  return address.toLowerCase().startsWith("fe80:");
+}
+
+function getTailscaleCliAddresses(): ReadonlySet<string> {
+  try {
+    const output = childProcess.execFileSync("tailscale", ["ip"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TAILSCALE_IP_COMMAND_TIMEOUT_MS,
+    });
+
+    return new Set(
+      output
+        .split(/\s+/)
+        .map((address) => address.trim())
+        .filter((address) => isTailscaleIpv4Address(address) || isTailscaleIpv6Address(address))
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+export function getTailscaleBindHosts(
+  networkInterfaces: NetworkInterfaces = os.networkInterfaces(),
+  tailscaleAddresses: ReadonlySet<string> = getTailscaleCliAddresses()
+): TailscaleBindHost[] {
+  const hostsByAddress = new Map<string, TailscaleBindHost>();
+  const emptyInfos: os.NetworkInterfaceInfo[] = [];
+
+  for (const interfaceName of Object.keys(networkInterfaces)) {
+    const infos = networkInterfaces[interfaceName] ?? emptyInfos;
+    for (const info of infos) {
+      const family = info.family;
+      if (family !== "IPv4" && family !== "IPv6") {
+        continue;
+      }
+
+      const address = info.address.trim();
+      if (!address || info.internal || isLinkLocalAddress(address, family)) {
+        continue;
+      }
+
+      // A 100.64.0.0/10 address alone can be ordinary RFC6598 CGNAT, so only generic
+      // interface names become Tailscale choices when the Tailscale CLI proves the address.
+      if (!isTailscaleInterfaceName(interfaceName) && !tailscaleAddresses.has(address)) {
+        continue;
+      }
+
+      hostsByAddress.set(`${family}:${address}`, {
+        interfaceName,
+        address,
+        family,
+      });
+    }
+  }
+
+  return Array.from(hostsByAddress.values()).sort((a, b) => {
+    if (a.family !== b.family) {
+      return a.family === "IPv4" ? -1 : 1;
+    }
+
+    const addressComparison = a.address.localeCompare(b.address, undefined, { numeric: true });
+    if (addressComparison !== 0) {
+      return addressComparison;
+    }
+
+    return a.interfaceName.localeCompare(b.interfaceName, undefined, { numeric: true });
+  });
 }
 
 /**
@@ -169,6 +297,19 @@ export class ServerService {
   private serverInfo: ServerInfo | null = null;
   private readonly mdnsAdvertiser = new MdnsAdvertiserService();
   private sshHost: string | undefined = undefined;
+  private shuttingDown = false;
+
+  /**
+   * Process teardown has begun. The HTTP/WS server keeps accepting connections until stopServer()
+   * runs last, so the RPC layer consults this to refuse new procedure calls in the meantime.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
 
   /**
    * Set the launch project path
@@ -224,13 +365,13 @@ export class ServerService {
     }
 
     // Create lockfile instance for checking - don't store yet
-    const lockfile = new ServerLockfile(options.muxHome);
+    const lockfile = new ServerLockfile(options.xumHome);
 
     // Check for existing server (another process)
     const existing = await lockfile.read();
     if (existing) {
       throw new Error(
-        `Another mux server is already running at ${existing.baseUrl} (PID: ${existing.pid})`
+        `Another xum server is already running at ${existing.baseUrl} (PID: ${existing.pid})`
       );
     }
 
@@ -311,7 +452,7 @@ export class ServerService {
 
     // "auto" mode: only advertise when the bind host is reachable from other devices.
     if (mdnsAdvertisementEnabled !== false && !isLoopbackHost(bindHost)) {
-      const instanceName = options.context.config.getMdnsServiceName() ?? `mux-${os.hostname()}`;
+      const instanceName = options.context.config.getMdnsServiceName() ?? `xum-${os.hostname()}`;
       const serviceOptions = buildMuxMdnsServiceOptions({
         bindHost,
         port: server.port,
@@ -323,12 +464,12 @@ export class ServerService {
       try {
         await this.mdnsAdvertiser.start(serviceOptions);
       } catch (err) {
-        log.warn("Failed to advertise mux API server via mDNS:", err);
+        log.warn("Failed to advertise xum API server via mDNS:", err);
       }
     } else if (mdnsAdvertisementEnabled === true && isLoopbackHost(bindHost)) {
       log.warn(
         "mDNS advertisement requested, but the API server is loopback-only. " +
-          "Set apiServerBindHost to 0.0.0.0 (or a LAN IP) to enable LAN discovery."
+          "Set apiServerBindHost to 0.0.0.0 (or a LAN/Tailscale IP) to enable LAN discovery."
       );
     }
 
@@ -356,6 +497,11 @@ export class ServerService {
     this.serverInfo = null;
   }
 
+  /** Return Tailscale-backed local addresses users can bind the remote-access server to. */
+  getTailscaleBindHosts(): TailscaleBindHost[] {
+    return getTailscaleBindHosts();
+  }
+
   /**
    * Get information about the running server.
    * Returns null if no server is running in this process.
@@ -378,4 +524,117 @@ export class ServerService {
   getLockfilePath(): string | null {
     return this.lockfile?.getLockPath() ?? null;
   }
+}
+
+type ServerSettingsContext = ORPCContext;
+
+function getApiServerStatusSnapshot(context: ServerSettingsContext) {
+  const config = context.config.loadConfigOrDefault();
+  const info = context.serverService.getServerInfo();
+  return {
+    running: info !== null,
+    baseUrl: info?.baseUrl ?? null,
+    bindHost: info?.bindHost ?? null,
+    port: info?.port ?? null,
+    networkBaseUrls: info?.networkBaseUrls ?? [],
+    tailscaleBindHosts: context.serverService.getTailscaleBindHosts(),
+    token: info?.token ?? null,
+    configuredBindHost: config.apiServerBindHost ?? null,
+    configuredPort: config.apiServerPort ?? null,
+    configuredServeWebUi: config.apiServerServeWebUi === true,
+  };
+}
+
+export async function setServerSshHost(
+  context: ServerSettingsContext,
+  sshHost: string | null | undefined
+): Promise<void> {
+  // Write first (#4444): a rejected write must not leave the in-memory host ahead of disk.
+  await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+  context.serverService.setSshHost(sshHost ?? undefined);
+}
+
+export function getApiServerStatus(context: ServerSettingsContext) {
+  return getApiServerStatusSnapshot(context);
+}
+
+export async function setApiServerSettings(
+  context: ServerSettingsContext,
+  input: { bindHost?: string | null; serveWebUi?: boolean | null; port?: number | null }
+) {
+  const prevConfig = context.config.loadConfigOrDefault();
+  const prevBindHost = prevConfig.apiServerBindHost;
+  const prevServeWebUi = prevConfig.apiServerServeWebUi;
+  const prevPort = prevConfig.apiServerPort;
+  const wasRunning = context.serverService.isServerRunning();
+  const bindHost = input.bindHost?.trim() ? input.bindHost.trim() : undefined;
+  const serveWebUi =
+    input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
+  const port = input.port === null || input.port === 0 ? undefined : input.port;
+  // Best effort: a failed restore must not replace the error the caller needs to see (#4748).
+  const restorePreviousSettings = async (): Promise<void> => {
+    try {
+      await context.config.editConfig((config) => {
+        config.apiServerServeWebUi = prevServeWebUi;
+        config.apiServerBindHost = prevBindHost;
+        config.apiServerPort = prevPort;
+        return config;
+      });
+    } catch (restoreError) {
+      log.warn("Failed to restore previous API server settings", { error: restoreError });
+    }
+  };
+
+  // Write before stopping (#4748): a rejected write then leaves the running server untouched,
+  // instead of stopped while disk keeps the old settings. If the stop itself fails, put the
+  // previous settings back so disk matches the server that is still running.
+  await context.config.editConfig((config) => {
+    config.apiServerServeWebUi = serveWebUi;
+    config.apiServerBindHost = bindHost;
+    config.apiServerPort = port;
+    return config;
+  });
+  if (wasRunning) {
+    try {
+      await context.serverService.stopServer();
+    } catch (error) {
+      await restorePreviousSettings();
+      throw error;
+    }
+  }
+
+  if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
+    const authToken = context.serverService.getApiAuthToken();
+    if (!authToken) throw new Error("API server auth token not initialized");
+    const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
+    const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
+    try {
+      await context.serverService.startServer({
+        xumHome: context.config.rootDir,
+        context,
+        authToken,
+        serveStatic: serveWebUi === true,
+        host: bindHost ?? "127.0.0.1",
+        port: envPort ?? port ?? 0,
+      });
+    } catch (error) {
+      await restorePreviousSettings();
+      if (wasRunning) {
+        try {
+          await context.serverService.startServer({
+            xumHome: context.config.rootDir,
+            context,
+            serveStatic: prevServeWebUi === true,
+            authToken,
+            host: prevBindHost ?? "127.0.0.1",
+            port: envPort ?? prevPort ?? 0,
+          });
+        } catch {
+          // Best effort: preserve the original settings error.
+        }
+      }
+      throw error;
+    }
+  }
+  return getApiServerStatusSnapshot(context);
 }

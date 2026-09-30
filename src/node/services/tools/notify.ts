@@ -111,7 +111,7 @@ export const createNotifyTool: ToolFactory = (config) => {
   return tool({
     description: TOOL_DEFINITIONS.notify.description,
     inputSchema: TOOL_DEFINITIONS.notify.schema,
-    execute: async ({ title, message }): Promise<NotifyToolResult> => {
+    execute: async ({ title, message }, options): Promise<NotifyToolResult> => {
       // Validate title
       if (!title || title.trim().length === 0) {
         return {
@@ -133,6 +133,19 @@ export const createNotifyTool: ToolFactory = (config) => {
         truncatedMessage,
         config.workspaceId
       );
+
+      if (config.workspaceId != null && config.timelineService != null) {
+        config.timelineService.record(config.workspaceId, {
+          kind: "agent.notified",
+          source: { system: "agent", key: `notify:${options.toolCallId}` },
+          anchor: { toolCallId: options.toolCallId },
+          status: "completed",
+          data: {
+            title: truncatedTitle,
+            ...(truncatedMessage != null ? { digest: truncatedMessage } : {}),
+          },
+        });
+      }
 
       // If Electron notification succeeded, we're done
       if (result.success) {

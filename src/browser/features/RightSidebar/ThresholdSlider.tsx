@@ -2,13 +2,18 @@ import React, { useRef } from "react";
 import {
   AUTO_COMPACTION_THRESHOLD_MIN,
   AUTO_COMPACTION_THRESHOLD_MAX,
+  AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT,
 } from "@/common/constants/ui";
+import { getContextBudgetFinalPoint } from "@/common/utils/compaction/contextBudget";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 
 // ----- Types -----
 
 export interface AutoCompactionConfig {
   threshold: number;
+  rolloverEnabled?: boolean;
+  /** Context limit the usage meter uses; unknown keeps the stored slider value. */
+  modelContextLimit?: number | null;
   setThreshold: (threshold: number) => void;
   /**
    * Warning if the compaction model context window is smaller than the
@@ -57,13 +62,37 @@ const applyThreshold = (pct: number, setThreshold: (v: number) => void): void =>
   setThreshold(pct >= DISABLE_THRESHOLD ? 100 : Math.min(pct, AUTO_COMPACTION_THRESHOLD_MAX));
 };
 
-/** Get tooltip text based on threshold */
-const getTooltipText = (threshold: number): string => {
-  const isEnabled = threshold < DISABLE_THRESHOLD;
-  return isEnabled
-    ? `Auto-compact at ${threshold}% · Drag to adjust (per-model)`
-    : `Auto-compact disabled · Drag left to enable (per-model)`;
-};
+/**
+ * Threshold the display should advertise. In rollover mode the backend clamps the stored
+ * value to the effective minimum, so a stored 0% or 5% is evaluated (and shown) as 10%.
+ * It also clamps a high slider below the final prompt zone, so on a small window a stored
+ * 90% is evaluated (and shown) lower. Summarize mode keeps the stored value.
+ */
+export function getEffectiveThreshold(
+  config: Pick<AutoCompactionConfig, "threshold" | "rolloverEnabled" | "modelContextLimit">
+): number {
+  if (!config.rolloverEnabled) return config.threshold;
+  const threshold = Math.max(AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT, config.threshold);
+  const limit = config.modelContextLimit;
+  if (threshold >= DISABLE_THRESHOLD || limit == null || !Number.isFinite(limit) || limit <= 0) {
+    return threshold;
+  }
+  return Math.min(threshold, (getContextBudgetFinalPoint(limit) / limit) * 100);
+}
+
+/** Share the effective automatic policy label between the meter and its settings. */
+export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
+  if (config.rolloverEnabled) {
+    // The slider is the agent handoff target; only the usable hard ceiling forces a rollover.
+    // A clamped target is rarely a whole percent; round down so the label never overstates it.
+    return config.threshold < DISABLE_THRESHOLD
+      ? `Handoff target: ${Math.floor(getEffectiveThreshold(config) * 10) / 10}%`
+      : "Automatic rollover disabled";
+  }
+  return config.threshold < DISABLE_THRESHOLD
+    ? `Auto-compact at ${config.threshold}%`
+    : "Auto-compact disabled";
+}
 
 // ----- Main component -----
 
@@ -96,12 +125,19 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
 
     const apply = (pct: number) => applyThreshold(pct, config.setThreshold);
 
-    apply(calcPercent(e.clientX));
+    // The handle sits at the effective (possibly clamped) threshold, not the stored one, so a
+    // press alone must not persist: a stored 90% shown at 85.6% would otherwise save 85%.
+    // Persist only once the drag leaves the snap step it started in.
+    const startPercent = calcPercent(e.clientX);
+    let moved = false;
 
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== pointerId) return;
       ev.preventDefault();
-      apply(calcPercent(ev.clientX));
+      const pct = calcPercent(ev.clientX);
+      if (!moved && pct === startPercent) return;
+      moved = true;
+      apply(pct);
     };
 
     const onUp = (ev: PointerEvent) => {
@@ -117,8 +153,10 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
   };
 
   const isEnabled = config.threshold < DISABLE_THRESHOLD;
+  // Mark the value the backend evaluates, not a stored value below the effective minimum.
+  const markerPercent = getEffectiveThreshold(config);
   const color = isEnabled ? "var(--color-plan-mode)" : "var(--color-muted)";
-  const tooltipText = getTooltipText(config.threshold);
+  const tooltipText = `${getAutoCompactionLabel(config)} · ${isEnabled ? "Drag to adjust" : "Drag left to enable"} (per-model)`;
 
   // Container styles - covers the full bar area for drag handling
   // Uses pointer-events: none by default, only the indicator handle has pointer-events: auto
@@ -141,7 +179,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     pointerEvents: "auto",
     // Prevent page scrolling while dragging the slider on touch devices.
     touchAction: "none",
-    left: `calc(${config.threshold}% - ${DRAG_ZONE_SIZE}px)`,
+    left: `calc(${markerPercent}% - ${DRAG_ZONE_SIZE}px)`,
     width: DRAG_ZONE_SIZE * 2,
     top: 0,
     bottom: 0,
@@ -154,7 +192,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     display: "flex",
     alignItems: "center",
     flexDirection: "column",
-    left: `${config.threshold}%`,
+    left: `${markerPercent}%`,
     top: "50%",
     transform: "translate(-50%, -50%)",
   };

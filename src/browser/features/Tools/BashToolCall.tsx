@@ -16,13 +16,13 @@ import {
   ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
-import { useBashAutoExpand } from "./Shared/useBashAutoExpand";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { useBashToolLiveOutput, useLatestStreamingBashId } from "@/browser/stores/WorkspaceStore";
+import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { useForegroundBashToolCallIds } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { buildBashCollapsedSummary } from "./bashCollapsedSummary";
 import { useBashCollapsedSummaryMode } from "./BashCollapsedSummaryModeContext";
@@ -54,7 +54,10 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   status = "pending",
   startedAt,
 }) => {
-  const { expanded, setExpanded, toggleExpanded } = useToolExpansion();
+  // Bash uses the per-workspace sticky auto-expand preference like every other tool
+  // (via useToolExpansion), keyed by tool name. It no longer special-cases the latest
+  // streaming command; live output still renders below when the row is expanded.
+  const { expanded, toggleExpanded } = useToolExpansion();
   const [outputDialogOpen, setOutputDialogOpen] = useState(false);
   const bashCollapsedSummaryMode = useBashCollapsedSummaryMode();
 
@@ -64,24 +67,22 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     toolCallId &&
     (status === "executing" || (status === "completed" && !resultHasOutput))
   );
-  const shouldTrackLatestStreamingBash = Boolean(
-    workspaceId && toolCallId && (status === "executing" || expanded)
-  );
 
   const foregroundBashToolCallIds = useForegroundBashToolCallIds(
     status === "executing" ? workspaceId : undefined
   );
   const { sendToBackground } = useBackgroundBashActions();
+  // Hosts that cannot send a foreground bash to the background (the VS Code webview) hide the
+  // control instead of offering an action their bridge refuses.
+  const { uiSupport } = useChatHostContext();
+  const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
+  // Hosts without the output dialog (the VS Code webview) hide its button.
+  const canViewOutput = uiSupport.backgroundBashOutput === "supported";
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
     shouldTrackLiveBashState ? toolCallId : undefined
   );
-  const latestStreamingBashId = useLatestStreamingBashId(
-    shouldTrackLatestStreamingBash ? workspaceId : undefined
-  );
-  const isLatestStreamingBash = latestStreamingBashId === toolCallId;
-  const hasReplacementStreamingBash = latestStreamingBashId !== null && !isLatestStreamingBash;
 
   const outputRef = useRef<HTMLPreElement>(null);
   const outputPinnedRef = useRef(true);
@@ -93,17 +94,6 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
-
-  // Track whether user manually toggled expansion to avoid fighting with auto-expand.
-  const userToggledRef = useRef(false);
-  useBashAutoExpand({
-    isLatestStreamingBash,
-    hasReplacementStreamingBash,
-    status,
-    startedAt,
-    setExpanded,
-    userToggledRef,
-  });
 
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
@@ -138,7 +128,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     toolCallId && workspaceId && foregroundBashToolCallIds.has(toolCallId)
   );
   const handleSendToBackground =
-    toolCallId && workspaceId
+    canHostSendToBackground && toolCallId && workspaceId
       ? () => {
           sendToBackground(toolCallId);
         }
@@ -151,24 +141,16 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const completedHasOutput = typeof completedOutput === "string" && completedOutput.length > 0;
   const showCompletedOutputSection = !isBackgroundResult && (completedHasOutput || Boolean(note));
 
-  const handleToggle = () => {
-    userToggledRef.current = true;
-    toggleExpanded();
-  };
   return (
     <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={handleToggle}>
+      <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName="bash" />
         {bashCollapsedSummary.kind === "intent-command" ? (
-          // Two lines: intent (primary) on top, command (muted mono) below.
-          // The duration chip sits on the command row so it inherits the same
-          // line-height and stays vertically centered on the command, not
-          // floating between the two lines.
-          <span className="flex max-w-[28rem] min-w-0 flex-col leading-tight">
+          <span className="flex min-w-0 flex-1 flex-col leading-tight">
             <span className="text-text truncate">{bashCollapsedSummary.intent}</span>
             <span className="flex min-w-0 items-center gap-2">
-              <span className="text-muted font-monospace min-w-0 truncate text-[10px]">
+              <span className="text-muted font-monospace min-w-0 flex-1 truncate text-[10px]">
                 {bashCollapsedSummary.command}
               </span>
               {!isBackground && (
@@ -201,7 +183,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {bashCollapsedSummary.command}
           </span>
         )}
-        {isBackground && backgroundProcessId && workspaceId && (
+        {isBackground && backgroundProcessId && workspaceId && canViewOutput && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -234,11 +216,17 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             )}
           >
             timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
-            {result && ` • took ${formatDuration(result.wall_duration_ms)}`}
+            {/* Kernel-mode nested reloads reconstruct partial results without
+                wall_duration_ms/exitCode; skip those fields instead of
+                rendering "took —" and an empty exit-code pill. */}
+            {typeof result?.wall_duration_ms === "number" &&
+              ` • took ${formatDuration(result.wall_duration_ms)}`}
             {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
           </span>
         )}
-        {!isBackground && result && <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />}
+        {!isBackground && typeof result?.exitCode === "number" && (
+          <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
+        )}
         <StatusIndicator status={effectiveStatus}>
           {getStatusDisplay(effectiveStatus)}
         </StatusIndicator>
@@ -249,6 +237,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <TooltipTrigger asChild>
               <button
                 type="button"
+                aria-label="Send to background"
                 onClick={(e) => {
                   e.stopPropagation(); // Don't toggle expand
                   handleSendToBackground();
@@ -277,6 +266,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           workspaceId={workspaceId}
           processId={backgroundProcessId}
           displayName={args.display_name}
+          script={args.script}
         />
       )}
 

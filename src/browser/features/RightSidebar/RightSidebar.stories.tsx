@@ -19,7 +19,6 @@ import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
-import { TelemetryEnabledProvider } from "@/browser/contexts/TelemetryEnabledContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { TutorialProvider } from "@/browser/contexts/TutorialContext";
@@ -29,6 +28,8 @@ import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScr
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
@@ -68,12 +69,9 @@ const meta: Meta = {
         { name: "light", value: "#f5f6f8" },
       ],
     },
-    chromatic: {
-      delay: 500,
-      modes: {
-        dark: { theme: "dark", viewport: 1600 },
-        light: { theme: "light", viewport: 1600 },
-      },
+    pixel: {
+      // Wide variant: these stories need >=1600px, so use the 1900px desktop viewport.
+      matrix: { themes: ["dark", "light"], viewports: ["desktop"] },
     },
   },
 };
@@ -128,8 +126,15 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
   useEffect(() => {
     // App stories bypass AppLoader, so manually sync WorkspaceStore to the story client.
     workspaceStore.setClient(client);
+    // useProvidersConfig consumers read the shared store, which gets its
+    // client from AppLoader in the real app — wire it manually here too.
+    getProvidersConfigStore().setClient(client);
+    // Same for the review-state store: without a client the review panel never hydrates.
+    getReviewStateStore().setClient(client);
     return () => {
       workspaceStore.setClient(null);
+      getProvidersConfigStore().setClient(null);
+      getReviewStateStore().setClient(null);
     };
   }, [client, workspaceStore]);
 
@@ -146,42 +151,40 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
           <RouterProvider>
             <ProjectProvider>
               <WorkspaceProvider>
-                <TelemetryEnabledProvider>
-                  <TerminalRouterProvider>
-                    <ExperimentsProvider>
-                      <UILayoutsProvider>
-                        <TooltipProvider delayDuration={200}>
-                          <SettingsProvider>
-                            <AboutDialogProvider>
-                              <ProviderOptionsProvider>
-                                <SplashScreenProvider>
-                                  <TutorialProvider>
-                                    <CommandRegistryProvider>
-                                      <PowerModeProvider>
-                                        <ConfirmDialogProvider>
-                                          <AgentProvider
-                                            workspaceId={workspaceId}
-                                            projectPath={STORY_PROJECT_PATH}
-                                          >
-                                            <ThinkingProvider workspaceId={workspaceId}>
-                                              <BackgroundBashProvider workspaceId={workspaceId}>
-                                                {props.children}
-                                              </BackgroundBashProvider>
-                                            </ThinkingProvider>
-                                          </AgentProvider>
-                                        </ConfirmDialogProvider>
-                                      </PowerModeProvider>
-                                    </CommandRegistryProvider>
-                                  </TutorialProvider>
-                                </SplashScreenProvider>
-                              </ProviderOptionsProvider>
-                            </AboutDialogProvider>
-                          </SettingsProvider>
-                        </TooltipProvider>
-                      </UILayoutsProvider>
-                    </ExperimentsProvider>
-                  </TerminalRouterProvider>
-                </TelemetryEnabledProvider>
+                <TerminalRouterProvider>
+                  <ExperimentsProvider>
+                    <UILayoutsProvider>
+                      <TooltipProvider delayDuration={200}>
+                        <SettingsProvider>
+                          <AboutDialogProvider>
+                            <ProviderOptionsProvider>
+                              <SplashScreenProvider>
+                                <TutorialProvider>
+                                  <CommandRegistryProvider>
+                                    <PowerModeProvider>
+                                      <ConfirmDialogProvider>
+                                        <AgentProvider
+                                          workspaceId={workspaceId}
+                                          projectPath={STORY_PROJECT_PATH}
+                                        >
+                                          <ThinkingProvider workspaceId={workspaceId}>
+                                            <BackgroundBashProvider workspaceId={workspaceId}>
+                                              {props.children}
+                                            </BackgroundBashProvider>
+                                          </ThinkingProvider>
+                                        </AgentProvider>
+                                      </ConfirmDialogProvider>
+                                    </PowerModeProvider>
+                                  </CommandRegistryProvider>
+                                </TutorialProvider>
+                              </SplashScreenProvider>
+                            </ProviderOptionsProvider>
+                          </AboutDialogProvider>
+                        </SettingsProvider>
+                      </TooltipProvider>
+                    </UILayoutsProvider>
+                  </ExperimentsProvider>
+                </TerminalRouterProvider>
               </WorkspaceProvider>
             </ProjectProvider>
           </RouterProvider>
@@ -339,6 +342,72 @@ export const CostsTabWithCacheCreate: Story = {
       },
       { timeout: 15_000 }
     );
+  },
+};
+
+/**
+ * Costs tab with multiple models used in one session.
+ * The per-model breakdown table lists each model's tokens and cost.
+ */
+export const CostsTabMultiModel: Story = {
+  render: () => (
+    <RightSidebarStoryShell
+      setup={() => {
+        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
+        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
+        localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
+        localStorage.removeItem(getRightSidebarLayoutKey("ws-multi-model"));
+
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-multi-model",
+          workspaceName: "feature/multi-model",
+          projectName: "my-app",
+          messages: [
+            createUserMessage("msg-1", "Plan and implement the parser", { historySequence: 1 }),
+            createAssistantMessage("msg-2", "Done: plan reviewed and parser implemented.", {
+              historySequence: 2,
+            }),
+          ],
+          sessionUsage: {
+            byModel: {
+              "anthropic:claude-opus-4-6": {
+                input: { tokens: 12000, cost_usd: 0.18 },
+                cached: { tokens: 240000, cost_usd: 0.36 },
+                cacheCreate: { tokens: 80000, cost_usd: 1.5 },
+                output: { tokens: 9000, cost_usd: 0.675 },
+                reasoning: { tokens: 4000, cost_usd: 0.3 },
+                model: "anthropic:claude-opus-4-6",
+              },
+              "openai:gpt-5.2": {
+                input: { tokens: 30000, cost_usd: 0.0525 },
+                cached: { tokens: 50000, cost_usd: 0.021875 },
+                cacheCreate: { tokens: 0, cost_usd: 0 },
+                output: { tokens: 6000, cost_usd: 0.084 },
+                reasoning: { tokens: 8000, cost_usd: 0.112 },
+                model: "openai:gpt-5.2",
+              },
+            },
+            version: 1,
+          },
+        });
+        expandRightSidebar();
+        return client;
+      }}
+    >
+      <RightSidebarStoryContent workspaceId="ws-multi-model" />
+    </RightSidebarStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // Session usage is fetched async via WorkspaceStore; wait for the
+    // per-model breakdown rows to render.
+    await waitFor(() => {
+      const byModel = canvas.getByTestId("cost-by-model");
+      within(byModel).getByText("Opus 4.6");
+      within(byModel).getByText("GPT-5.2");
+    });
   },
 };
 
@@ -803,7 +872,6 @@ export const DiffPaddingAlignment: Story = {
     });
 
     // Visual verification: the padding strip should align with the diff gutter
-    // This is primarily a visual regression test for Chromatic
   },
 };
 
@@ -1189,11 +1257,11 @@ export const ReviewTabWithUntrackedFiles: Story = {
 };
 
 /**
- * Costs tab showing compaction model context warning.
- * When the compaction model (gpt-4o, 128k) has a smaller context window
- * than the auto-compact threshold (80% of 200k = 160k), a warning appears.
+ * Stats tab showing compaction model context warning in the always-visible
+ * context usage section. When the compaction model (gpt-4o, 128k) has a smaller
+ * context window than the auto-compact threshold (80% of 200k = 160k), a warning appears.
  */
-export const CostsTabCompactionModelWarning: Story = {
+export const CompactionModelWarning: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {

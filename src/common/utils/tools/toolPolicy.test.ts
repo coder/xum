@@ -1,4 +1,9 @@
-import { applyToolPolicy, applyToolPolicyToNames, type ToolPolicy } from "./toolPolicy";
+import {
+  applyToolPolicy,
+  applyToolPolicyToNames,
+  buildRequiredToolPatterns,
+  type ToolPolicy,
+} from "./toolPolicy";
 import { tool } from "ai";
 import { z } from "zod";
 
@@ -37,6 +42,19 @@ const mockTools = {
 };
 
 describe("applyToolPolicy", () => {
+  test("offers new_context only with memory and session_history", () => {
+    const budgetTools = {
+      new_context: mockTools.bash,
+      memory: mockTools.bash,
+      session_history: mockTools.bash,
+    };
+    expect(Object.keys(applyToolPolicy(budgetTools))).toContain("new_context");
+    for (const gate of ["memory", "session_history"]) {
+      const result = applyToolPolicy(budgetTools, [{ regex_match: gate, action: "disable" }]);
+      expect(Object.keys(result)).not.toContain("new_context");
+    }
+  });
+
   describe("default behavior", () => {
     test("allows all tools when no policy provided", () => {
       const result = applyToolPolicy(mockTools);
@@ -337,5 +355,33 @@ describe("applyToolPolicyToNames", () => {
     const policy: ToolPolicy = [{ regex_match: "file_.*", action: "disable" }];
 
     expect(applyToolPolicyToNames(orderedNames, policy)).toEqual(["web_search", "bash"]);
+  });
+});
+
+describe("buildRequiredToolPatterns", () => {
+  test("returns only require rules as full-match patterns", () => {
+    const policy: ToolPolicy = [
+      { regex_match: ".*", action: "disable" },
+      { regex_match: "agent_report", action: "require" },
+    ];
+
+    const patterns = buildRequiredToolPatterns(policy);
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].test("agent_report")).toBe(true);
+    // Anchored full match: partial-name hits must not count as required.
+    expect(patterns[0].test("agent_report_extra")).toBe(false);
+    expect(patterns[0].test("my_agent_report")).toBe(false);
+  });
+
+  test("normalizes pre-anchored patterns without double-anchoring", () => {
+    const policy: ToolPolicy = [{ regex_match: "^agent_report$", action: "require" }];
+
+    const patterns = buildRequiredToolPatterns(policy);
+    expect(patterns[0].test("agent_report")).toBe(true);
+  });
+
+  test("returns empty for undefined or require-free policies", () => {
+    expect(buildRequiredToolPatterns(undefined)).toEqual([]);
+    expect(buildRequiredToolPatterns([{ regex_match: "bash", action: "disable" }])).toEqual([]);
   });
 });

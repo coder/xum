@@ -104,17 +104,17 @@ describe("task_await executing visualization", () => {
       await setupWorkspaceView(view, createResult.metadata, workspaceId);
       await waitForWorkspaceChatToRender(view.container);
 
-      const toolName = await waitFor(
+      const taskAwaitSummary = await waitFor(
         () => {
-          const node = view?.queryByText("task_await");
+          const node = view?.queryByLabelText("Waiting for 2 tasks. Show task wait details");
           if (!node) {
-            throw new Error("task_await tool call has not hydrated yet");
+            throw new Error("task_await summary has not hydrated yet");
           }
           return node;
         },
         { timeout: 30_000 }
       );
-      toolName.click();
+      taskAwaitSummary.click();
 
       await waitFor(() => {
         expect(view?.queryAllByText("task-a")).toHaveLength(1);

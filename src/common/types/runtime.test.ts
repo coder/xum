@@ -1,5 +1,25 @@
 import { describe, it, expect } from "@jest/globals";
-import { parseRuntimeModeAndHost, buildRuntimeString, CODER_RUNTIME_PLACEHOLDER } from "./runtime";
+import {
+  buildRuntimeString,
+  CODER_RUNTIME_PLACEHOLDER,
+  parseRuntimeModeAndHost,
+  RUNTIME_MODE,
+  runtimeModeSupportsSharedTaskWorkspace,
+} from "./runtime";
+
+describe("runtimeModeSupportsSharedTaskWorkspace", () => {
+  it("is true only for worktree and ssh (runtimes whose fork creates a separate checkout)", () => {
+    expect(runtimeModeSupportsSharedTaskWorkspace(RUNTIME_MODE.WORKTREE)).toBe(true);
+    expect(runtimeModeSupportsSharedTaskWorkspace(RUNTIME_MODE.SSH)).toBe(true);
+  });
+
+  it("is false for local (already shares its dir) and container runtimes", () => {
+    expect(runtimeModeSupportsSharedTaskWorkspace(RUNTIME_MODE.LOCAL)).toBe(false);
+    expect(runtimeModeSupportsSharedTaskWorkspace(RUNTIME_MODE.DOCKER)).toBe(false);
+    expect(runtimeModeSupportsSharedTaskWorkspace(RUNTIME_MODE.DEVCONTAINER)).toBe(false);
+    expect(runtimeModeSupportsSharedTaskWorkspace(undefined)).toBe(false);
+  });
+});
 
 describe("parseRuntimeModeAndHost", () => {
   it("parses SSH mode with host", () => {

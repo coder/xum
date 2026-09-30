@@ -1,18 +1,16 @@
 import { readPersistedState } from "./usePersistedState";
 import {
+  EXPERIMENT_IDS,
   type ExperimentId,
-  EXPERIMENTS,
   getExperimentKey,
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
+import { hasLegacyPtcExclusiveOverride } from "@/browser/contexts/ExperimentsContext";
 
 // Re-export reactive hooks from context for convenience
 export {
-  useExperiment,
   useExperimentValue,
   useExperimentOverrideValue,
-  useSetExperiment,
-  useAllExperiments,
 } from "@/browser/contexts/ExperimentsContext";
 
 /**
@@ -23,29 +21,23 @@ export {
  * For reactive updates in React components, use useExperimentValue (UI gating) or
  * useExperimentOverrideValue (backend send options).
  *
- * IMPORTANT: For user-overridable experiments, returns `undefined` when no explicit
- * localStorage override exists. This signals to the backend to use the PostHog
- * assignment instead of treating the default value as a user choice.
- *
- * @param experimentId - The experiment to check
- * @returns Whether the experiment is enabled, or undefined if backend should decide
+ * For user-overridable experiments, returns `undefined` when no explicit localStorage
+ * override exists, so send options can distinguish "user chose off" from "user never chose".
  */
 export function isExperimentEnabled(experimentId: ExperimentId): boolean | undefined {
-  const experiment = EXPERIMENTS[experimentId];
   if (!isExperimentSupportedOnPlatform(experimentId, window.api?.platform)) {
     return false;
   }
 
-  const key = getExperimentKey(experimentId);
-
-  // For user-overridable experiments: only return a value if user explicitly set one.
-  // This allows the backend to use PostHog assignment when there's no override.
-  if (experiment.userOverridable) {
-    const stored = readPersistedState<unknown>(key, undefined);
-    return typeof stored === "boolean" ? stored : undefined;
+  // Upgrade alias — mirrors getExperimentOverrideSnapshot so one-time reads
+  // (send options) agree with the reactive hooks.
+  if (
+    experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING &&
+    hasLegacyPtcExclusiveOverride()
+  ) {
+    return true;
   }
 
-  // Non-overridable: always use default (these are local-only experiments)
-  const stored = readPersistedState<unknown>(key, experiment.enabledByDefault);
-  return typeof stored === "boolean" ? stored : experiment.enabledByDefault;
+  const stored = readPersistedState<unknown>(getExperimentKey(experimentId), undefined);
+  return typeof stored === "boolean" ? stored : undefined;
 }

@@ -2,11 +2,15 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
-import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
+import {
+  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import type { NameGenerationError } from "@/common/types/errors";
-import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
-import { getErrorMessage } from "@/common/utils/errors";
+import {
+  validateWorkspaceBranchName,
+  validateWorkspaceName,
+} from "@/common/utils/validation/workspaceValidation";
 
 /** Discriminated error type for workspace name operations */
 export type WorkspaceNameUIError =
@@ -15,16 +19,25 @@ export type WorkspaceNameUIError =
   | { kind: "transport"; message: string };
 
 /**
- * Build ordered candidate list for name generation.
- * Gateway routing is resolved automatically by createModel on the backend,
- * so candidates are sent as canonical model IDs.
+ * Caller fallbacks for name generation. The backend owns the precedence
+ * (configured name_workspace model + thinking first, then its built-in small
+ * models); the user's selected model is only a last resort after those.
  */
 function buildNameGenCandidates(userModel: string | undefined): string[] {
-  const candidates: string[] = [...NAME_GEN_PREFERRED_MODELS];
-  if (userModel && !candidates.includes(userModel)) {
-    candidates.push(userModel);
-  }
-  return candidates;
+  return userModel ? [userModel] : [];
+}
+
+function buildFallbackWorkspaceIdentity(message: string): WorkspaceIdentity {
+  const normalized = message
+    .trim()
+    .replace(/^\/+/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/-+$/g, "");
+  const name = normalized && !validateWorkspaceName(normalized).error ? normalized : "workspace";
+  return { name, title: name };
 }
 
 export interface UseWorkspaceNameOptions {
@@ -32,7 +45,7 @@ export interface UseWorkspaceNameOptions {
   message: string;
   /** Debounce delay in milliseconds (default: 500) */
   debounceMs?: number;
-  /** User's selected model to try after preferred models */
+  /** User's selected model to try after the configured and built-in naming models */
   userModel?: string;
   /**
    * Optional storage scope for persisting draft name-generation state.
@@ -84,6 +97,28 @@ const WorkspaceNamePersistedStateSchema = z.object({
 });
 
 export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
+
+/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
+function hashMessage(message: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < message.length; index++) {
+    hash ^= message.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+/**
+ * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
+ * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
+ * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
+ * edit past the prefix still counts as a change and regenerates the name.
+ */
+function toStoredMessage(message: string): string {
+  if (message.length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
+  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
+  return message.slice(0, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix;
+}
 
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
@@ -152,7 +187,6 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
 
-  // Debounce timer
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
   const pendingMessageRef = useRef<string>("");
@@ -215,8 +249,8 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
 
       try {
-        // Frontend sends canonical candidates; backend createModel resolves gateway routing.
-        // Backend tries candidates in order with retry on API errors.
+        // Backend prepends the configured naming model and built-in fallbacks, then
+        // tries candidates in order with retry on API errors (createModel resolves routing).
         const result = await api.nameGeneration.generate({
           message: forMessage,
           candidates,
@@ -237,24 +271,35 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           setStored((prev) => ({
             ...prev,
             generatedIdentity: identity,
-            lastGeneratedFor: forMessage,
+            lastGeneratedFor: toStoredMessage(forMessage),
           }));
 
           safeResolve(identity);
           return identity;
         }
 
-        setError({ kind: "generation", error: result.error });
-        safeResolve(null);
-        return null;
-      } catch (err) {
+        const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
+        setStored((prev) => ({
+          ...prev,
+          generatedIdentity: fallbackIdentity,
+          lastGeneratedFor: toStoredMessage(forMessage),
+        }));
+        setError(null);
+        safeResolve(fallbackIdentity);
+        return fallbackIdentity;
+      } catch {
         if (requestId !== requestIdRef.current) {
           return null;
         }
-        const errorMsg = getErrorMessage(err);
-        setError({ kind: "transport", message: errorMsg });
-        safeResolve(null);
-        return null;
+        const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
+        setStored((prev) => ({
+          ...prev,
+          generatedIdentity: fallbackIdentity,
+          lastGeneratedFor: toStoredMessage(forMessage),
+        }));
+        setError(null);
+        safeResolve(fallbackIdentity);
+        return fallbackIdentity;
       } finally {
         if (requestId === requestIdRef.current) {
           setIsGenerating(false);
@@ -271,7 +316,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === message) {
+    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -336,7 +381,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       setStored((prev) => ({ ...prev, manualName: newName }));
       // Validate in real-time as user types (skip empty - will show on submit)
       if (newName.trim()) {
-        const validation = validateWorkspaceName(newName);
+        const validation = validateWorkspaceBranchName(newName);
         setError(validation.error ? { kind: "validation", message: validation.error } : null);
       } else {
         setError(null);
@@ -381,7 +426,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     }
 
     // If we have an identity that was generated for the current message, use it
-    if (generatedIdentity && lastGeneratedFor === message) {
+    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) {
       return generatedIdentity;
     }
 

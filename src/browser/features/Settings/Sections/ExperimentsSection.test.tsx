@@ -1,37 +1,29 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import type { ReactNode } from "react";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
+
+// Snapshot values, not Bun's live module namespaces, before installing overrides.
+const actualExperiments = { ...ActualExperimentsModule };
+const actualTelemetry = { ...ActualTelemetryModule };
+
+afterAll(() => {
+  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
+});
 
 type PrereqStatus =
   | { available: true }
   | { available: false; reason: "binary_not_found" | "unsupported_platform" | "startup_failed" };
-
-interface MockApiClient {
-  desktop: {
-    getPrereqStatus: () => Promise<PrereqStatus>;
-  };
-  general: {
-    restartApp: () => Promise<{ supported: true } | { supported: false; message: string }>;
-  };
-  config?: {
-    getConfig: () => Promise<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>;
-    updateGoalDefaults: (input: { goalDefaults: unknown }) => Promise<void>;
-    updateHeartbeatDefaultPrompt: (input: { defaultPrompt?: string | null }) => Promise<void>;
-    updateHeartbeatDefaultIntervalMs: (input: { intervalMs?: number | null }) => Promise<void>;
-  };
-  server?: {
-    setApiServerSettings: (input: {
-      bindHost: string | null;
-      port: number | null;
-      serveWebUi: boolean | null;
-    }) => Promise<unknown>;
-    getApiServerStatus: () => Promise<unknown>;
-  };
-}
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -41,21 +33,18 @@ function createDeferred<T>() {
   return { promise, resolve };
 }
 
-let mockApi: MockApiClient;
+let mockApi: TestApiOverrides<APIClient>;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the current client through the real provider; mocking the API module leaks across
+// files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+  ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
@@ -63,10 +52,10 @@ void mock.module("@/browser/contexts/ExperimentsContext", () => ({
     },
   ],
   useExperimentValue: (experimentId: string) => experimentValues[experimentId] ?? experimentEnabled,
-  useRemoteExperimentValue: () => null,
 }));
 
 void mock.module("@/browser/hooks/useTelemetry", () => ({
+  ...actualTelemetry,
   useTelemetry: () => ({
     experimentOverridden: mock(() => undefined),
   }),
@@ -87,7 +76,7 @@ let originalSetInterval: typeof globalThis.setInterval;
 let originalClearInterval: typeof globalThis.clearInterval;
 
 function renderWarning() {
-  return render(<PortableDesktopExperimentWarning />);
+  return render(<PortableDesktopExperimentWarning />, { wrapper: ApiWrapper });
 }
 
 describe("PortableDesktopExperimentWarning", () => {
@@ -122,6 +111,18 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
     experimentValues = {};
+    const stoppedServerStatus = {
+      running: false,
+      baseUrl: null,
+      bindHost: null,
+      port: null,
+      token: null,
+      networkBaseUrls: [],
+      tailscaleBindHosts: [],
+      configuredBindHost: null,
+      configuredServeWebUi: false,
+      configuredPort: null,
+    };
     mockApi = {
       desktop: {
         getPrereqStatus: mock(() => Promise.resolve({ available: true as const })),
@@ -130,24 +131,14 @@ describe("PortableDesktopExperimentWarning", () => {
         restartApp: mock(() => Promise.resolve({ supported: true as const })),
       },
       config: {
-        getConfig: mock(() => Promise.resolve({})),
+        getConfig: mock(() => Promise.resolve(createTestConfig())),
         updateGoalDefaults: mock(() => Promise.resolve()),
         updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
         updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
       },
       server: {
-        setApiServerSettings: mock(() => Promise.resolve({})),
-        getApiServerStatus: mock(() =>
-          Promise.resolve({
-            running: false,
-            baseUrl: null,
-            token: null,
-            networkBaseUrls: [],
-            configuredBindHost: null,
-            configuredServeWebUi: false,
-            configuredPort: null,
-          })
-        ),
+        setApiServerSettings: mock(() => Promise.resolve(stoppedServerStatus)),
+        getApiServerStatus: mock(() => Promise.resolve(stoppedServerStatus)),
       },
     };
   });
@@ -167,6 +158,32 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.clearInterval = originalClearInterval;
   });
 
+  test.each([false, true])(
+    "hides compaction switches even when their stored flags are %s",
+    (enabled) => {
+      experimentEnabled = false;
+      experimentValues = {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      };
+      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+      expect(view.queryByLabelText("Toggle Continuous Compaction")).toBeNull();
+      expect(view.queryByLabelText("Toggle Token-budget context windows")).toBeNull();
+      for (const name of [
+        "Programmatic Tool Calling",
+        "Agent Memory",
+        "Multi-project workspaces",
+        "Workspace Heartbeats",
+      ]) {
+        expect(view.getByRole("switch", { name: `Toggle ${name}` })).toBeTruthy();
+      }
+      expect(experimentValues).toEqual({
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      });
+    }
+  );
+
   test("shows heartbeat defaults inline only when its experiment is enabled", async () => {
     // Goal defaults moved out of ExperimentsSection into the Goal tab
     // (`GoalDefaultsSection`); goals graduated to GA so it is no longer
@@ -176,7 +193,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
     expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
@@ -194,6 +211,46 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
   });
 
+  test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+    };
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.getByLabelText("Toggle Memory Intuition").getAttribute("aria-checked")).toBe(
+      "true"
+    );
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    expect(experimentValues[EXPERIMENT_IDS.MEMORY_INTUITION]).toBe(true);
+  });
+
+  test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
+    };
+
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+
+    // Hidden from the flat list and no nested panel while the parent is off.
+    expect(view.queryByLabelText("Toggle RLM Mode")).toBeNull();
+
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+    };
+    view.rerender(<ExperimentsSection />);
+
+    expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
+  });
+
   test("reloads experiment settings when inline controls remount", async () => {
     // Only the heartbeat panel still triggers an inline `getConfig`.
     experimentEnabled = false;
@@ -201,7 +258,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     await waitFor(() => {
       expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
@@ -231,11 +288,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
     };
 
-    const staleConfig = createDeferred<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>();
+    const staleConfig = createDeferred<TestClientConfig>();
     const staleGetConfig = mock(() => staleConfig.promise);
     mockApi = {
       ...mockApi,
@@ -247,17 +300,13 @@ describe("PortableDesktopExperimentWarning", () => {
       },
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     await waitFor(() => {
       expect(staleGetConfig).toHaveBeenCalledTimes(1);
     });
 
-    const freshConfig = createDeferred<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>();
+    const freshConfig = createDeferred<TestClientConfig>();
     const freshGetConfig = mock(() => freshConfig.promise);
     mockApi = {
       ...mockApi,
@@ -406,9 +455,9 @@ describe("PortableDesktopExperimentWarning", () => {
     await waitFor(() => {
       expect(getPrereqStatus).toHaveBeenCalledTimes(2);
     });
-    expect(view.getByRole("button", { name: "Restart Mux" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "Restart Xum" })).toBeTruthy();
 
-    fireEvent.click(view.getByRole("button", { name: "Restart Mux" }));
+    fireEvent.click(view.getByRole("button", { name: "Restart Xum" }));
 
     await waitFor(() => {
       expect(restartApp).toHaveBeenCalledTimes(1);
@@ -436,7 +485,7 @@ describe("PortableDesktopExperimentWarning", () => {
       expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
     });
 
-    fireEvent.click(view.getByRole("button", { name: "Restart Mux" }));
+    fireEvent.click(view.getByRole("button", { name: "Restart Xum" }));
 
     await waitFor(() => {
       expect(view.container.textContent).toContain("Restart is only available in the desktop app.");

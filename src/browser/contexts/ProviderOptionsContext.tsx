@@ -1,7 +1,12 @@
 import React, { createContext, useContext, useRef } from "react";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  PROVIDER_OPTIONS_ANTHROPIC_KEY,
+  PROVIDER_OPTIONS_GOOGLE_KEY,
+} from "@/common/constants/storage";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { supports1MContext } from "@/common/utils/ai/models";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 
 interface ProviderOptionsContextType {
@@ -50,9 +55,10 @@ function migrateGlobalToPerModel(
 }
 
 export function ProviderOptionsProvider({ children }: { children: React.ReactNode }) {
+  const { config: providersConfig } = useProvidersConfig();
   const [anthropicOptions, setAnthropicOptions] = usePersistedState<
     MuxProviderOptions["anthropic"]
-  >("provider_options_anthropic", {});
+  >(PROVIDER_OPTIONS_ANTHROPIC_KEY, {}, { listener: true });
 
   // One-time migration from global boolean to per-model set
   const didMigrate = useRef(false);
@@ -65,8 +71,9 @@ export function ProviderOptionsProvider({ children }: { children: React.ReactNod
   }
 
   const [googleOptions, setGoogleOptions] = usePersistedState<MuxProviderOptions["google"]>(
-    "provider_options_google",
-    {}
+    PROVIDER_OPTIONS_GOOGLE_KEY,
+    {},
+    { listener: true }
   );
 
   const models1M = anthropicOptions?.use1MContextModels ?? [];
@@ -76,7 +83,7 @@ export function ProviderOptionsProvider({ children }: { children: React.ReactNod
       return true;
     }
 
-    return supports1MContext(modelId) && anthropicOptions?.use1MContext === true;
+    return supports1MContext(modelId, providersConfig) && anthropicOptions?.use1MContext === true;
   };
 
   const toggle1MContext = (modelId: string): void => {

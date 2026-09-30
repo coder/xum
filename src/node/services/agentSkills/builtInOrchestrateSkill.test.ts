@@ -34,5 +34,8 @@ describe("built-in orchestrate skill", () => {
     expect(body).toMatch(/task_apply_git_patch/);
     expect(body).toMatch(/dry[\s_-]*run/i);
     expect(body).toMatch(/Max Task Nesting Depth/i);
+    // Long-horizon orchestration must route to durable workflows via the
+    // workflow-authoring skill (gate/fixup loops encoded in code, resumable runs).
+    expect(body).toMatch(/workflow-authoring/);
   });
 });

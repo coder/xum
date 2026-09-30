@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import {
   buildStreamErrorEventData,
   coerceStreamErrorTypeForMessage,
@@ -33,6 +34,17 @@ describe("buildStreamErrorEventData", () => {
     );
 
     expect(result.acpPromptId).toBe("acp-prompt-123");
+  });
+
+  test("an unsanitized task checkout refusal is a stream error the retry manager never retries", () => {
+    // A turn refused after its init wait (#4674) must not schedule auto-resumes.
+    const result = buildStreamErrorEventData({
+      type: "task_checkout_unsanitized",
+      message: "checkout could not be sanitized",
+    });
+
+    expect(isNonRetryableStreamError({ type: result.errorType ?? "unknown" })).toBe(true);
+    expect(result.error).toContain("checkout could not be sanitized");
   });
 });
 describe("createStreamErrorMessage", () => {
@@ -132,6 +144,22 @@ describe("formatSendMessageError", () => {
 
     expect(result.errorType).toBe("unknown");
     expect(result.message).toBe("Workspace is incompatible");
+  });
+
+  test("preserves a terminal budget block and classifies preflight refusals as local budget errors", () => {
+    const message = "The next user request cannot fit after rollover.";
+    expect(formatSendMessageError({ type: "context_budget_blocked", message })).toEqual({
+      message,
+      errorType: "context_budget_blocked",
+    });
+    expect(
+      formatSendMessageError({
+        type: "context_budget_exceeded",
+        model: "fallback-model",
+        estimate: 20000,
+        hardCeiling: 10000,
+      }).errorType
+    ).toBe("context_budget_blocked");
   });
 
   test("formats unknown errors", () => {

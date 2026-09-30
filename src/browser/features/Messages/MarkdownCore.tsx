@@ -1,5 +1,8 @@
 import React, { useMemo } from "react";
 import { Streamdown } from "streamdown";
+// Pinned to the exact version streamdown pins, so the repair applied here in static mode matches
+// what Streamdown's streaming mode applies. Bump both together.
+import remend from "remend";
 import type { Element, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
@@ -32,6 +35,12 @@ interface MarkdownCoreProps {
    * are intentional. Default: false.
    */
   preserveLineBreaks?: boolean;
+  /**
+   * Render in Streamdown's static mode, i.e. without transition-deferred block updates, even
+   * while repairing incomplete markdown. Static mode skips Streamdown's own repair, so it is
+   * applied here instead. Used while the transcript backfill starves React transitions.
+   */
+  renderSynchronously?: boolean;
 }
 
 // Plugin arrays are defined at module scope to maintain stable references.
@@ -59,30 +68,7 @@ const sanitizeSchema = {
   ...defaultSchema,
   tagNames: [
     ...(defaultSchema.tagNames ?? []),
-    // KaTeX MathML elements
-    "math",
-    "mrow",
-    "mi",
-    "mo",
-    "mn",
-    "msup",
-    "msub",
-    "mfrac",
-    "munder",
-    "mover",
-    "mtable",
-    "mtr",
-    "mtd",
-    "mspace",
-    "mtext",
-    "semantics",
-    "annotation",
-    "munderover",
-    "msqrt",
-    "mroot",
-    "mpadded",
-    "mphantom",
-    "menclose",
+    // MathML comes only from rehypeKatex after sanitization, never from raw HTML.
     // Collapsible sections (GitHub-style)
     "details",
     "summary",
@@ -93,13 +79,9 @@ const sanitizeSchema = {
   },
   attributes: {
     ...defaultSchema.attributes,
-    // KaTeX uses style for coloring and positioning
-    span: [...(defaultSchema.attributes?.span ?? []), "style"],
-    // MathML elements need various attributes
-    math: ["xmlns", "display"],
-    annotation: ["encoding"],
-    // Allow class on all elements for styling
-    "*": [...(defaultSchema.attributes?.["*"] ?? []), "className", "class"],
+    // SECURITY AUDIT: Raw CSS can conceal copied text. Only semantic Markdown classes are allowed.
+    // KaTeX adds its trusted classes and styles after sanitization.
+    code: [["className", /^language-./, "math-inline", "math-display"]],
   },
 };
 
@@ -175,10 +157,28 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   };
 };
 
+// Sanitization prefixes IDs. Keep generated footnote links paired with those safe IDs.
+const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
+  const visit = (node: Root | RootContent) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "a" &&
+      (node.properties.dataFootnoteRef != null || node.properties.dataFootnoteBackref != null) &&
+      typeof node.properties.href === "string" &&
+      node.properties.href.startsWith("#")
+    ) {
+      node.properties.href = "#" + defaultSchema.clobberPrefix + node.properties.href.slice(1);
+    }
+    if ("children" in node) node.children.forEach(visit);
+  };
+  visit(tree);
+};
+
 const REHYPE_PLUGINS: Pluggable[] = [
   rehypePreserveUnknownRawHtml,
   rehypeRaw, // Parse HTML elements first
   [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
+  rehypeFootnoteLinks,
   [
     harden, // Additional URL filtering for links and images
     {
@@ -190,7 +190,7 @@ const REHYPE_PLUGINS: Pluggable[] = [
       allowedProtocols: [INTERNAL_INLINE_SKILL_HREF_PREFIX],
       // rehype-harden requires a defaultOrigin when any allowlist is provided.
       // We use a stable placeholder origin so relative URLs can be resolved.
-      defaultOrigin: "https://mux.invalid",
+      defaultOrigin: "https://xum.invalid",
       allowDataImages: true,
     },
   ],
@@ -204,9 +204,21 @@ const REHYPE_PLUGINS: Pluggable[] = [
  * Memoized to prevent expensive re-parsing when content hasn't changed.
  */
 export const MarkdownCore = React.memo<MarkdownCoreProps>(
-  ({ content, children, parseIncompleteMarkdown = false, preserveLineBreaks = false }) => {
-    // Memoize the normalized content to avoid recalculating on every render
-    const normalizedContent = useMemo(() => normalizeMarkdown(content), [content]);
+  ({
+    content,
+    children,
+    parseIncompleteMarkdown = false,
+    preserveLineBreaks = false,
+    renderSynchronously = false,
+  }) => {
+    const repairInStaticMode = parseIncompleteMarkdown && renderSynchronously;
+    // Memoize the normalized content to avoid recalculating on every render.
+    // Streaming mode runs remend on the children it receives; do the same after normalizing so a
+    // synchronous render looks identical to the streaming one it stands in for.
+    const normalizedContent = useMemo(() => {
+      const normalized = normalizeMarkdown(content);
+      return repairInStaticMode ? remend(normalized) : normalized;
+    }, [content, repairInStaticMode]);
 
     return (
       <>
@@ -217,7 +229,7 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
           parseIncompleteMarkdown={parseIncompleteMarkdown}
           // Use "static" mode for completed content to bypass useTransition() deferral.
           // After ORPC migration, async event boundaries let React deprioritize transitions indefinitely.
-          mode={parseIncompleteMarkdown ? "streaming" : "static"}
+          mode={parseIncompleteMarkdown && !renderSynchronously ? "streaming" : "static"}
           className="space-y-2" // Reduce from default space-y-4 (16px) to space-y-2 (8px)
           controls={{ table: false, code: true, mermaid: true }} // Disable table copy/download, keep code/mermaid controls
         >

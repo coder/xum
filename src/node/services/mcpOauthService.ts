@@ -1,13 +1,20 @@
 import * as crypto from "crypto";
 import * as http from "http";
+import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import writeFileAtomic from "write-file-atomic";
-import { auth, type OAuthClientProvider } from "@ai-sdk/mcp";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import {
+  auth,
+  IssuerMismatchError,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/client";
 import type { Config } from "@/node/config";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { WindowService } from "@/node/services/windowService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { log } from "@/node/services/log";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -23,12 +30,21 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 const STORE_FILE_NAME = "mcp-oauth.json";
+// RFC 6749 §4.1.2.1 authorization-response error codes (safe to display).
+const RFC6749_AUTHORIZATION_ERROR_CODES = new Set([
+  "invalid_request",
+  "unauthorized_client",
+  "access_denied",
+  "unsupported_response_type",
+  "invalid_scope",
+  "server_error",
+  "temporarily_unavailable",
+]);
 
 interface McpOauthStoreFileV1 {
   version: 1;
@@ -100,8 +116,9 @@ interface OAuthFlowBase {
   scope?: string;
   resourceMetadataUrl?: URL;
 
-  /** PKCE verifier for this flow (set by @ai-sdk/mcp auth()). */
+  /** PKCE verifier for this flow (set by the MCP SDK auth()). */
   codeVerifier: string | null;
+  discoveryState: OAuthDiscoveryState | undefined;
 
   timeout: ReturnType<typeof setTimeout>;
   cleanupTimeout: ReturnType<typeof setTimeout> | null;
@@ -203,42 +220,210 @@ export function parseBearerWwwAuthenticate(header: string): BearerChallenge | nu
   };
 }
 
-async function probeServerForBearerChallenge(serverUrl: string): Promise<BearerChallenge | null> {
-  const requestUrl = sanitizeServerUrlForRequest(serverUrl);
+type BearerChallengeProbeTransport = OAuthFlowBase["transport"];
+
+interface BearerChallengeProbeRequest {
+  method: "GET" | "POST";
+  headers: Record<string, string>;
+  body?: string;
+}
+
+function getWwwAuthenticateHeader(response: Response): string | null {
+  return response.headers.get("www-authenticate") ?? response.headers.get("WWW-Authenticate");
+}
+
+function getBearerChallengeProbeRequests(
+  transport: BearerChallengeProbeTransport
+): BearerChallengeProbeRequest[] {
+  const sseRequest: BearerChallengeProbeRequest = {
+    method: "GET",
+    headers: {
+      Accept: "text/event-stream",
+    },
+  };
+
+  const httpRequest: BearerChallengeProbeRequest = {
+    method: "POST",
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    },
+    // Mirror the HTTP transport's verb so POST-only MCP endpoints still emit their
+    // Bearer challenge, but keep the payload tiny because we only need auth hints.
+    body: "{}",
+  };
+
+  // Prefer the configured transport's verb first, then fall back to the other
+  // remote verb so challenge discovery stays resilient across mixed deployments.
+  return transport === "sse" ? [sseRequest, httpRequest] : [httpRequest, sseRequest];
+}
+
+export async function probeServerForBearerChallenge(options: {
+  serverUrl: string;
+  transport: BearerChallengeProbeTransport;
+}): Promise<BearerChallenge | null> {
+  const requestUrl = sanitizeServerUrlForRequest(options.serverUrl);
   if (!requestUrl) {
     return null;
   }
 
-  // Best-effort probe: do a simple unauthenticated request and parse WWW-Authenticate.
-  //
-  // We intentionally avoid sending MCP-specific headers here because the probe is
-  // only used to extract OAuth hints (scope/resource_metadata) and must not be
-  // protocol-version coupled.
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), 5_000);
 
   try {
-    const response = await fetch(requestUrl, {
-      method: "GET",
-      headers: {
-        Accept: "text/event-stream",
-      },
-      redirect: "manual",
-      signal: abortController.signal,
-    });
+    for (const request of getBearerChallengeProbeRequests(options.transport)) {
+      try {
+        const response = await fetch(requestUrl, {
+          method: request.method,
+          headers: request.headers,
+          ...(request.body ? { body: request.body } : {}),
+          redirect: "manual",
+          signal: abortController.signal,
+        });
 
-    const header =
-      response.headers.get("www-authenticate") ?? response.headers.get("WWW-Authenticate");
-    if (!header) {
-      return null;
+        const header = getWwwAuthenticateHeader(response);
+        if (!header) {
+          continue;
+        }
+
+        const challenge = parseBearerWwwAuthenticate(header);
+        if (challenge) {
+          return challenge;
+        }
+      } catch {
+        if (abortController.signal.aborted) {
+          break;
+        }
+      }
     }
 
-    return parseBearerWwwAuthenticate(header);
-  } catch {
     return null;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Resolve the OAuth scope to request for an authorization flow.
+ *
+ * The Bearer challenge's `scope=` wins when present. Otherwise we fall back to
+ * the Protected Resource Metadata's `scopes_supported` (RFC 9728). The MCP SDK
+ * fetches this same metadata to locate the authorization server but ignores its
+ * advertised scopes, so without this a server that omits `scope=` from its 401
+ * (e.g. Carta) grants only identity scopes and every resource call then fails
+ * with a permission error.
+ *
+ * ponytail: re-fetches the PRM the SDK already fetched internally; the SDK does
+ * not expose it, and this is one extra GET during an interactive flow.
+ */
+export async function resolveOAuthScope(
+  challenge: BearerChallenge | null
+): Promise<string | undefined> {
+  if (challenge?.scope) {
+    return challenge.scope;
+  }
+  if (!challenge?.resourceMetadataUrl) {
+    return undefined;
+  }
+  const scopes = await fetchProtectedResourceScopes(challenge.resourceMetadataUrl);
+  return scopes.length > 0 ? scopes.join(" ") : undefined;
+}
+
+async function fetchProtectedResourceScopes(url: URL): Promise<string[]> {
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) {
+      return [];
+    }
+    const json: unknown = await response.json();
+    const scopes = isPlainObject(json) ? json.scopes_supported : undefined;
+    return Array.isArray(scopes) ? scopes.filter((s): s is string => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Parses the legacy @ai-sdk/mcp authorization-server binding fields
+ * (authorization_server / token_endpoint) from a stored credentials object.
+ *
+ * These MUST survive the store round-trip: the legacy @ai-sdk/mcp auth()
+ * refused to use a stored refresh_token without them and instead invalidated
+ * the tokens and demanded interactive re-login. The official SDK v2 ignores
+ * these fields (it stamps `issuer` instead — see MCPOAuthTokens.issuer), but
+ * we keep round-tripping them so downgrading Xum does not break token
+ * refresh after an app restart.
+ */
+function parseAuthorizationServerBinding(value: {
+  authorization_server?: unknown;
+  token_endpoint?: unknown;
+}): {
+  authorization_server?: string;
+  token_endpoint?: string;
+} {
+  // Defensive: only accept parseable http(s) URLs so a corrupted store value
+  // cannot make the SDK's normalizeUrl()/new URL() throw during auth(), and
+  // so SDK-invalid schemes (SafeUrlSchema rejects javascript:/data:/vbscript:)
+  // are dropped for self-healing instead of surfacing as a metadata mismatch.
+  // http(s)-only is stricter than SafeUrlSchema, which is fine: OAuth
+  // authorization servers and token endpoints are always fetched over http(s).
+  const asUrlString = (raw: unknown): string | undefined => {
+    if (typeof raw !== "string" || !URL.canParse(raw)) {
+      return undefined;
+    }
+    const protocol = new URL(raw).protocol;
+    return protocol === "http:" || protocol === "https:" ? raw : undefined;
+  };
+
+  const authorizationServer = asUrlString(value.authorization_server);
+  const tokenEndpoint = asUrlString(value.token_endpoint);
+
+  // The SDK requires both to consider the binding usable; keep the pair atomic.
+  if (!authorizationServer || !tokenEndpoint) {
+    return {};
+  }
+
+  return { authorization_server: authorizationServer, token_endpoint: tokenEndpoint };
+}
+
+interface AuthorizationServerBinding {
+  authorization_server: string;
+  token_endpoint: string;
+}
+
+// Discovery is where both legacy binding fields are available for downgrade-compatible saves (#3823).
+function deriveAuthorizationServerBinding(
+  state: OAuthDiscoveryState | undefined
+): AuthorizationServerBinding | undefined {
+  const tokenEndpoint = state?.authorizationServerMetadata?.token_endpoint;
+  if (!state?.authorizationServerUrl || !tokenEndpoint) {
+    return undefined;
+  }
+
+  return {
+    authorization_server: state.authorizationServerUrl,
+    token_endpoint: tokenEndpoint,
+  };
+}
+
+/**
+ * Parses the official SDK v2 issuer stamp (SEP-2352 credential/issuer binding)
+ * from a stored credentials object. Must survive the store round-trip:
+ * dropping it would reactivate the SDK's unstamped-credential warning on every
+ * request and defeat issuer binding. Same defensive http(s) validation as
+ * parseAuthorizationServerBinding; a corrupted value is dropped for
+ * self-healing (the SDK back-stamps on the next save).
+ */
+function parseIssuerStamp(value: Record<string, unknown>): { issuer?: string } {
+  const raw = value.issuer;
+  if (typeof raw !== "string" || !URL.canParse(raw)) {
+    return {};
+  }
+  const protocol = new URL(raw).protocol;
+  return protocol === "http:" || protocol === "https:" ? { issuer: raw } : {};
 }
 
 function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | null {
@@ -277,6 +462,8 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
           typeof clientInformationRaw.client_secret_expires_at === "number"
             ? clientInformationRaw.client_secret_expires_at
             : undefined,
+        ...parseAuthorizationServerBinding(clientInformationRaw),
+        ...parseIssuerStamp(clientInformationRaw),
       }
     : undefined;
 
@@ -295,6 +482,8 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
         scope: typeof tokensRaw.scope === "string" ? tokensRaw.scope : undefined,
         refresh_token:
           typeof tokensRaw.refresh_token === "string" ? tokensRaw.refresh_token : undefined,
+        ...parseAuthorizationServerBinding(tokensRaw),
+        ...parseIssuerStamp(tokensRaw),
       }
     : undefined;
 
@@ -447,6 +636,77 @@ export class McpOauthService {
     this.serverFlows.clear();
   }
 
+  async startDesktopFlowForApi(input: {
+    projectPath?: string;
+    serverName: string;
+    pendingServer?: MCPOAuthPendingServerConfig;
+  }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    return this.startDesktopFlow({
+      ...input,
+      projectPath: input.projectPath ?? this.config.rootDir,
+    });
+  }
+
+  async startServerFlowForApi(
+    input: {
+      projectPath?: string;
+      serverName: string;
+      pendingServer?: MCPOAuthPendingServerConfig;
+    },
+    headers?: IncomingHttpHeaders
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const projectPath = input.projectPath ?? this.config.rootDir;
+    const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
+    if (origin) {
+      try {
+        const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
+        return this.startServerFlow({ ...input, projectPath, redirectUri });
+      } catch {
+        // Fall back to Host header.
+      }
+    }
+
+    const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
+    const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
+    if (!host) {
+      return Err("Missing Host header");
+    }
+    const protoHeader = headers?.["x-forwarded-proto"];
+    const forwardedProto = typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
+    const proto = forwardedProto.length ? forwardedProto : "http";
+    const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
+    return this.startServerFlow({ ...input, projectPath, redirectUri });
+  }
+
+  async getProjectAuthStatus(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return { isLoggedIn: false, hasRefreshToken: false };
+    }
+    return this.getAuthStatus({ serverUrl: server.url });
+  }
+
+  async logoutProjectServer(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<Result<void, string>> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return Ok(undefined);
+    }
+    return this.logout({ serverUrl: server.url });
+  }
   async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
@@ -641,10 +901,12 @@ export class McpOauthService {
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
       const errorDescription = url.searchParams.get("error_description") ?? undefined;
+      const iss = url.searchParams.get("iss");
 
       void this.handleDesktopCallback({
         flowId,
         code,
+        iss,
         error,
         errorDescription,
         res,
@@ -670,8 +932,11 @@ export class McpOauthService {
     const redirectUri = `http://127.0.0.1:${address.port}/callback`;
 
     // Best-effort probe for OAuth hints (scope/resource_metadata). If it fails,
-    // @ai-sdk/mcp can still fall back to well-known discovery.
-    const challenge = await probeServerForBearerChallenge(serverUrlForDiscovery);
+    // the MCP SDK can still fall back to well-known discovery.
+    const challenge = await probeServerForBearerChallenge({
+      serverUrl: serverUrlForDiscovery,
+      transport,
+    });
 
     const flow: DesktopFlow = {
       flowId,
@@ -684,9 +949,10 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri,
-      scope: challenge?.scope,
+      scope: await resolveOAuthScope(challenge),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
+      discoveryState: undefined,
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -811,8 +1077,11 @@ export class McpOauthService {
       createDeferred<Result<void, string>>();
 
     // Best-effort probe for OAuth hints (scope/resource_metadata). If it fails,
-    // @ai-sdk/mcp can still fall back to well-known discovery.
-    const challenge = await probeServerForBearerChallenge(serverUrlForDiscovery);
+    // the MCP SDK can still fall back to well-known discovery.
+    const challenge = await probeServerForBearerChallenge({
+      serverUrl: serverUrlForDiscovery,
+      transport,
+    });
 
     const flow: ServerFlow = {
       flowId,
@@ -825,9 +1094,10 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri: redirectUri.toString(),
-      scope: challenge?.scope,
+      scope: await resolveOAuthScope(challenge),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
+      discoveryState: undefined,
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -919,6 +1189,7 @@ export class McpOauthService {
   async handleServerCallbackAndExchange(input: {
     state: string | null;
     code: string | null;
+    iss?: string | null;
     error: string | null;
     errorDescription?: string;
   }): Promise<Result<void, string>> {
@@ -940,6 +1211,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -988,9 +1260,17 @@ export class McpOauthService {
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
+          legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
         });
       },
+      saveDiscoveryState: (state) => {
+        flow.discoveryState = state;
+      },
+      // The SDK compares this redirect-leg issuer with callback discovery before
+      // sending the authorization code and PKCE verifier to the token endpoint.
+      discoveryState: () => Promise.resolve(flow.discoveryState),
       redirectToAuthorization: (authorizationUrl) => {
         flow.authorizeUrl = authorizationUrl.toString();
         return Promise.resolve();
@@ -1006,6 +1286,11 @@ export class McpOauthService {
         return Promise.resolve(flow.codeVerifier);
       },
       invalidateCredentials: async (scope) => {
+        // "discovery" (SDK v2) refers to cached AS metadata, which Xum does
+        // not persist; nothing to invalidate.
+        if (scope === "discovery") {
+          return;
+        }
         await this.invalidateStoredCredentials({
           serverUrl: flow.serverUrlForStoreKey,
           scope,
@@ -1020,7 +1305,7 @@ export class McpOauthService {
           response_types: ["code"],
           grant_types: ["authorization_code", "refresh_token"],
           token_endpoint_auth_method: "none",
-          client_name: "Mux",
+          client_name: "Xum",
           scope: flow.scope,
         };
       },
@@ -1031,12 +1316,14 @@ export class McpOauthService {
         return Promise.resolve(flow.clientInformation ?? undefined);
       },
       saveClientInformation: async (clientInformation) => {
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         const next = clientInformation as unknown as MCPOAuthClientInformation;
         flow.clientInformation = next;
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
           clientInformation: next,
+          legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
         });
       },
       state: () => Promise.resolve(flow.flowId),
@@ -1047,16 +1334,25 @@ export class McpOauthService {
     serverUrl: string;
     serverName?: string;
   }): OAuthClientProvider {
+    let discoveryState: OAuthDiscoveryState | undefined;
+
     return {
       tokens: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.tokens as unknown as MCPOAuthTokens | undefined;
       },
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: input.serverUrl,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
+          legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
+      },
+      saveDiscoveryState: (state) => {
+        // Cache only for downgrade-compatible writes; read-back would change SDK discovery behavior.
+        discoveryState = state;
       },
       redirectToAuthorization: async () => {
         // Avoid any user-visible side effects during background tool calls.
@@ -1073,6 +1369,11 @@ export class McpOauthService {
       },
       codeVerifier: () => Promise.reject(new Error("PKCE verifier is not available")),
       invalidateCredentials: async (scope) => {
+        // "discovery" (SDK v2) refers to cached AS metadata, which Xum does
+        // not persist; nothing to invalidate.
+        if (scope === "discovery") {
+          return;
+        }
         await this.invalidateStoredCredentials({
           serverUrl: input.serverUrl,
           scope,
@@ -1090,12 +1391,15 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.clientInformation as unknown as MCPOAuthClientInformation | undefined;
       },
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           clientInformation: clientInformation as unknown as MCPOAuthClientInformation,
+          legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
       },
     };
@@ -1104,6 +1408,7 @@ export class McpOauthService {
   private async handleDesktopCallback(input: {
     flowId: string;
     code: string | null;
+    iss: string | null;
     error: string | null;
     errorDescription?: string;
     res: http.ServerResponse;
@@ -1120,6 +1425,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -1133,7 +1439,7 @@ export class McpOauthService {
       renderOAuthCallbackHtml({
         title: result.success ? "Login complete" : "Login failed",
         message: result.success
-          ? "You can return to Mux. You may now close this tab."
+          ? "You can return to Xum. You may now close this tab."
           : result.error,
         success: result.success,
       })
@@ -1144,13 +1450,25 @@ export class McpOauthService {
 
   private async exchangeAuthorizationCode(
     flow: OAuthFlowBase,
-    input: { code: string | null; error: string | null; errorDescription?: string }
+    input: {
+      code: string | null;
+      iss?: string | null;
+      error: string | null;
+      errorDescription?: string;
+    }
   ): Promise<Result<void, string>> {
     if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`MCP OAuth error: ${message}`);
+      // Callback error fields are attacker-controllable in a mix-up attack and
+      // arrive before the SDK can check `iss`, so the SDK says not to display
+      // them. Show only a standard RFC 6749 error code; keep the rest in logs.
+      log.warn("[MCP OAuth] Authorization server returned an error", {
+        error: input.error,
+        errorDescription: input.errorDescription,
+      });
+      const code = RFC6749_AUTHORIZATION_ERROR_CODES.has(input.error)
+        ? input.error
+        : "unknown_error";
+      return Err(`MCP OAuth error: ${code}`);
     }
 
     if (!input.code) {
@@ -1163,6 +1481,10 @@ export class McpOauthService {
       const result = await auth(provider, {
         serverUrl: flow.serverUrlForDiscovery,
         authorizationCode: input.code,
+        // RFC 9207 mix-up defense: the SDK compares `iss` to the discovered
+        // issuer and requires it when the issuer advertises support. Forward it
+        // unmodified; null -> undefined because the SDK treats only undefined as absent.
+        iss: input.iss ?? undefined,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,
       });
@@ -1175,6 +1497,15 @@ export class McpOauthService {
 
       return Ok(undefined);
     } catch (error) {
+      // The received `iss` is attacker-controllable in a mix-up attack and the
+      // SDK says callers must not display it; keep it in logs only (the SDK
+      // JSON-encodes it in the message) and show just the trusted expected issuer.
+      if (error instanceof IssuerMismatchError && error.kind === "authorization_response") {
+        log.warn("[MCP OAuth] Authorization response issuer mismatch", { error: error.message });
+        return Err(
+          `Issuer mismatch in authorization response (RFC 9207): the response did not come from the expected authorization server ${JSON.stringify(error.expected)}`
+        );
+      }
       const message = getErrorMessage(error);
       return Err(message);
     }
@@ -1343,21 +1674,30 @@ export class McpOauthService {
     });
   }
 
-  private async saveTokens(input: { serverUrl: string; tokens: MCPOAuthTokens }): Promise<void> {
+  private async saveTokens(input: {
+    serverUrl: string;
+    tokens: MCPOAuthTokens;
+    legacyBinding?: AuthorizationServerBinding;
+  }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
       });
+      const serverMatches = normalizeServerUrlForComparison(creds.serverUrl) === input.serverUrl;
+      // Do not carry a legacy binding across defensive server URL replacement.
+      const legacyBinding =
+        input.legacyBinding ??
+        (serverMatches && creds.tokens ? parseAuthorizationServerBinding(creds.tokens) : undefined);
 
       // Defensive: Never keep tokens bound to a different URL.
-      if (normalizeServerUrlForComparison(creds.serverUrl) !== input.serverUrl) {
+      if (!serverMatches) {
         creds.clientInformation = undefined;
       }
 
       creds.serverUrl = input.serverUrl;
-      creds.tokens = input.tokens;
+      creds.tokens = { ...input.tokens, ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);
@@ -1367,6 +1707,7 @@ export class McpOauthService {
   private async saveClientInformation(input: {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
+    legacyBinding?: AuthorizationServerBinding;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
       const store = await this.ensureStoreLoadedLocked();
@@ -1374,9 +1715,16 @@ export class McpOauthService {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
       });
+      const serverMatches = normalizeServerUrlForComparison(creds.serverUrl) === input.serverUrl;
+      // Do not carry a legacy binding across defensive server URL replacement.
+      const legacyBinding =
+        input.legacyBinding ??
+        (serverMatches && creds.clientInformation
+          ? parseAuthorizationServerBinding(creds.clientInformation)
+          : undefined);
 
       // Defensive: Never keep client info bound to a different URL.
-      if (normalizeServerUrlForComparison(creds.serverUrl) !== input.serverUrl) {
+      if (!serverMatches) {
         creds.tokens = undefined;
       }
 
@@ -1389,7 +1737,7 @@ export class McpOauthService {
       }
 
       creds.serverUrl = input.serverUrl;
-      creds.clientInformation = input.clientInformation;
+      creds.clientInformation = { ...input.clientInformation, ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);
@@ -1455,7 +1803,7 @@ export class McpOauthService {
   }
 
   private async persistStoreLocked(store: McpOauthStoreFile): Promise<void> {
-    // Ensure ~/.mux exists.
+    // Ensure ~/.xum exists.
     await fsPromises.mkdir(this.config.rootDir, { recursive: true });
 
     await writeFileAtomic(this.storeFilePath, JSON.stringify(store, null, 2), {

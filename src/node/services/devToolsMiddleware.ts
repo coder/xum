@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type {
-  LanguageModelV3,
-  LanguageModelV3CallOptions,
-  LanguageModelV3GenerateResult,
-  LanguageModelV3Middleware,
-  LanguageModelV3StreamPart,
-  LanguageModelV3StreamResult,
-  LanguageModelV3Usage,
+  LanguageModelV4,
+  LanguageModelV4CallOptions,
+  LanguageModelV4GenerateResult,
+  LanguageModelV4Middleware,
+  LanguageModelV4StreamPart,
+  LanguageModelV4StreamResult,
+  LanguageModelV4Usage,
 } from "@ai-sdk/provider";
 import type {
   DevToolsStep,
@@ -21,6 +21,9 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  closeCapturedRequestBody,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
@@ -120,7 +123,7 @@ function createEmptyStep(
   runId: string,
   stepNumber: number,
   type: DevToolsStep["type"],
-  model: LanguageModelV3,
+  model: LanguageModelV4,
   input: DevToolsStepInput | null
 ): DevToolsStep {
   return {
@@ -145,7 +148,7 @@ function createEmptyStep(
   };
 }
 
-function extractGenerateToolCalls(result: LanguageModelV3GenerateResult): unknown[] | undefined {
+function extractGenerateToolCalls(result: LanguageModelV4GenerateResult): unknown[] | undefined {
   const toolCallsFromContent = result.content
     .filter((part) => part.type === "tool-call")
     .map((part) => ({
@@ -168,7 +171,7 @@ function extractGenerateToolCalls(result: LanguageModelV3GenerateResult): unknow
 }
 
 function extractInput(
-  params: LanguageModelV3CallOptions | null | undefined
+  params: LanguageModelV4CallOptions | null | undefined
 ): DevToolsStepInput | null {
   if (!params) {
     return null;
@@ -184,7 +187,7 @@ function extractInput(
   };
 }
 
-function extractGenerateOutput(result: LanguageModelV3GenerateResult): DevToolsStepOutput {
+function extractGenerateOutput(result: LanguageModelV4GenerateResult): DevToolsStepOutput {
   return {
     content: result.content ?? undefined,
     finishReason: extractFinishReason(result.finishReason),
@@ -193,7 +196,7 @@ function extractGenerateOutput(result: LanguageModelV3GenerateResult): DevToolsS
 }
 
 export function extractUsage(
-  usage: LanguageModelV3Usage | Record<string, unknown> | null | undefined
+  usage: LanguageModelV4Usage | Record<string, unknown> | null | undefined
 ): DevToolsUsage | null {
   if (!usage || !isRecord(usage)) {
     return null;
@@ -241,7 +244,7 @@ export function extractUsage(
 export function createDevToolsMiddleware(
   workspaceId: string,
   service: DevToolsService
-): LanguageModelV3Middleware {
+): LanguageModelV4Middleware {
   assert(workspaceId.trim().length > 0, "createDevToolsMiddleware requires a workspaceId");
   assert(service, "createDevToolsMiddleware requires a DevToolsService");
 
@@ -276,7 +279,7 @@ export function createDevToolsMiddleware(
         log.warn("DevTools: failed to create run", {
           workspaceId,
           runId,
-          error,
+          error: getErrorMessage(error),
         });
       }
     })();
@@ -288,7 +291,7 @@ export function createDevToolsMiddleware(
     }
   }
 
-  function extractRunMetadataId(params: LanguageModelV3CallOptions): string | undefined {
+  function extractRunMetadataId(params: LanguageModelV4CallOptions): string | undefined {
     const rawMetadataId = params.headers?.[DEVTOOLS_RUN_METADATA_ID_HEADER];
     if (typeof rawMetadataId !== "string") {
       return undefined;
@@ -300,8 +303,8 @@ export function createDevToolsMiddleware(
 
   async function createStep(
     stepType: DevToolsStep["type"],
-    params: LanguageModelV3CallOptions,
-    model: LanguageModelV3
+    params: LanguageModelV4CallOptions,
+    model: LanguageModelV4
   ): Promise<{ stepId: string; startedAtMs: number } | null> {
     try {
       const runMetadataId = extractRunMetadataId(params);
@@ -325,13 +328,13 @@ export function createDevToolsMiddleware(
         workspaceId,
         runId,
         stepType,
-        error,
+        error: getErrorMessage(error),
       });
       return null;
     }
   }
 
-  function injectStepIdHeader(params: LanguageModelV3CallOptions, stepId: string): void {
+  function injectStepIdHeader(params: LanguageModelV4CallOptions, stepId: string): void {
     assert(stepId.trim().length > 0, "injectStepIdHeader requires a non-empty stepId");
 
     const headers = new Headers();
@@ -348,7 +351,7 @@ export function createDevToolsMiddleware(
   }
 
   return {
-    specificationVersion: "v3",
+    specificationVersion: "v4",
 
     wrapGenerate: async ({ doGenerate, params, model }) => {
       if (!service.enabled) {
@@ -385,13 +388,14 @@ export function createDevToolsMiddleware(
           log.warn("DevTools: failed to persist step finalization", {
             workspaceId,
             stepId,
-            error,
+            error: getErrorMessage(error),
           });
         }
       };
 
       const abortHandler = (): void => {
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        closeCapturedRequestBody(stepId);
         void finalizeStep({
           output: null,
           usage: null,
@@ -415,6 +419,7 @@ export function createDevToolsMiddleware(
       try {
         const result = await doGenerate();
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
 
         await finalizeStep({
           output: extractGenerateOutput(result),
@@ -440,7 +445,8 @@ export function createDevToolsMiddleware(
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // No result means no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
@@ -466,6 +472,7 @@ export function createDevToolsMiddleware(
       injectStepIdHeader(params, stepId);
 
       let finalized = false;
+      let doStreamSettled = false;
       let capturedRequestHeaders: Record<string, string> | null = null;
       let rawRequest: unknown = null;
       let responseHeaders: Record<string, string> | null = null;
@@ -536,12 +543,20 @@ export function createDevToolsMiddleware(
           log.warn("DevTools: failed to persist step finalization", {
             workspaceId,
             stepId,
-            error,
+            error: getErrorMessage(error),
           });
         }
       };
 
       const abortHandler = (): void => {
+        // Before doStream() settles, a fetch that ignores the abort may never settle it, so
+        // drop the body and refuse later captures. Once it settled, the paths below already
+        // cleaned up; a closed mark here would never be cleared.
+        if (doStreamSettled) {
+          discardCapturedRequestBody(stepId);
+        } else {
+          closeCapturedRequestBody(stepId);
+        }
         void finalizeStep({
           output: buildOutput(),
           usage,
@@ -562,17 +577,21 @@ export function createDevToolsMiddleware(
         }
       }
 
-      let streamResult: LanguageModelV3StreamResult;
+      let streamResult: LanguageModelV4StreamResult;
       try {
         streamResult = await doStream();
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
       } catch (error) {
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         await finalizeStep({
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // A pre-stream rejection has no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
@@ -589,7 +608,7 @@ export function createDevToolsMiddleware(
           : null;
       const reader = stream.getReader();
 
-      const collectChunk = (chunk: LanguageModelV3StreamPart): boolean => {
+      const collectChunk = (chunk: LanguageModelV4StreamPart): boolean => {
         if (chunk.type === "raw") {
           rawChunks.push(chunk.rawValue);
           return userRequestedRawChunks;
@@ -656,7 +675,7 @@ export function createDevToolsMiddleware(
         return true;
       };
 
-      const trackedStream = new ReadableStream<LanguageModelV3StreamPart>({
+      const trackedStream = new ReadableStream<LanguageModelV4StreamPart>({
         async pull(controller): Promise<void> {
           try {
             for (;;) {

@@ -17,6 +17,7 @@ import {
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
 import { AgentCostChart } from "./AgentCostChart";
@@ -30,6 +31,12 @@ import { SummaryCards } from "./SummaryCards";
 import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
+import { buildTimeFilterPredicate } from "./sqlTimeFilter";
+import {
+  ANALYTICS_TIME_RANGE_KEY,
+  ANALYTICS_TIMING_METRIC_KEY,
+  ANALYTICS_TIME_ZONE_MODE_KEY,
+} from "@/common/constants/storage";
 
 interface AnalyticsDashboardProps {
   leftSidebarCollapsed: boolean;
@@ -38,12 +45,12 @@ interface AnalyticsDashboardProps {
 
 type TimeRange = "7d" | "30d" | "90d" | "all";
 type TimingMetric = "ttft" | "duration" | "tps";
+type TimeZoneMode = "local" | "utc";
 
 const VALID_TIME_RANGES = new Set<string>(["7d", "30d", "90d", "all"]);
 const VALID_TIMING_METRICS = new Set<string>(["ttft", "duration", "tps"]);
 
-const ANALYTICS_TIME_RANGE_STORAGE_KEY = "analytics:timeRange";
-const ANALYTICS_TIMING_METRIC_STORAGE_KEY = "analytics:timingMetric";
+const VALID_TIME_ZONE_MODES = new Set<string>(["local", "utc"]);
 
 /** Coerce a persisted value to a known TimeRange, falling back to "30d" if stale/corrupted. */
 function normalizeTimeRange(value: unknown): TimeRange {
@@ -57,32 +64,69 @@ function normalizeTimingMetric(value: unknown): TimingMetric {
     : "duration";
 }
 
-/** Build a UTC-aligned date boundary N days before today. Using UTC avoids
- *  the backend's `toISOString().slice(0,10)` conversion silently shifting the
- *  day in positive-offset timezones. */
-function utcDaysAgo(days: number): Date {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - days));
+/** Build a calendar-date boundary for the selected timezone. */
+function getDateKeyInTimeZone(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = new Map(parts.map((part) => [part.type, part.value]));
+  const year = values.get("year");
+  const month = values.get("month");
+  const day = values.get("day");
+  if (year == null || month == null || day == null) {
+    throw new Error(`Unable to format date for timezone ${timeZone}`);
+  }
+
+  return `${year}-${month}-${day}`;
 }
 
-function computeDateRange(timeRange: TimeRange): {
+function dateFromDateKey(dateKey: string): Date {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function daysAgoInTimeZone(days: number, timeZone: string): Date {
+  const dateKey = getDateKeyInTimeZone(new Date(), timeZone);
+  const date = dateFromDateKey(dateKey);
+  date.setUTCDate(date.getUTCDate() - days);
+  return date;
+}
+
+function computeDateRange(
+  timeRange: TimeRange,
+  timeZone: string
+): {
   from: Date | null;
   to: Date | null;
   granularity: "hour" | "day" | "week";
 } {
   switch (timeRange) {
     case "7d":
-      return { from: utcDaysAgo(6), to: null, granularity: "day" };
+      return { from: daysAgoInTimeZone(6, timeZone), to: null, granularity: "day" };
     case "30d":
-      return { from: utcDaysAgo(29), to: null, granularity: "day" };
+      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
     case "90d":
-      return { from: utcDaysAgo(89), to: null, granularity: "week" };
+      return { from: daysAgoInTimeZone(89, timeZone), to: null, granularity: "week" };
     case "all":
       return { from: null, to: null, granularity: "week" };
     default:
       // Self-heal: unknown persisted value → safe default.
-      return { from: utcDaysAgo(29), to: null, granularity: "day" };
+      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
   }
+}
+
+/** Coerce a persisted value to a supported timezone mode. */
+function normalizeTimeZoneMode(value: unknown): TimeZoneMode {
+  return typeof value === "string" && VALID_TIME_ZONE_MODES.has(value)
+    ? (value as TimeZoneMode)
+    : "local";
+}
+
+function getBrowserTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
 export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
@@ -91,20 +135,31 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [rawTimeRange, setTimeRange] = usePersistedState<TimeRange>(
-    ANALYTICS_TIME_RANGE_STORAGE_KEY,
+    ANALYTICS_TIME_RANGE_KEY,
     "30d"
   );
   const [rawTimingMetric, setTimingMetric] = usePersistedState<TimingMetric>(
-    ANALYTICS_TIMING_METRIC_STORAGE_KEY,
+    ANALYTICS_TIMING_METRIC_KEY,
     "duration"
+  );
+  const [rawTimeZoneMode, setTimeZoneMode] = usePersistedState<TimeZoneMode>(
+    ANALYTICS_TIME_ZONE_MODE_KEY,
+    "local"
   );
 
   // Coerce persisted values to known enums — stale/corrupted localStorage
   // entries self-heal to defaults instead of crashing the dashboard.
   const timeRange = normalizeTimeRange(rawTimeRange);
   const timingMetric = normalizeTimingMetric(rawTimingMetric);
+  const timeZoneMode = normalizeTimeZoneMode(rawTimeZoneMode);
+  const timeZone = timeZoneMode === "utc" ? "UTC" : getBrowserTimeZone();
 
-  const dateRange = computeDateRange(timeRange);
+  const dateRange = computeDateRange(timeRange, "UTC");
+  const spendDateRange = computeDateRange(timeRange, timeZone);
+  // SQL predicate substituted for the time-filter placeholder in saved panels
+  // and the SQL explorer, so user-authored queries can opt into the header's
+  // date-range selection.
+  const timeFilterSql = buildTimeFilterPredicate(dateRange.from, dateRange.to);
 
   const summary = useAnalyticsSummary(projectPath, {
     from: dateRange.from,
@@ -112,9 +167,10 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
   });
   const spendOverTime = useAnalyticsSpendOverTime({
     projectPath,
-    granularity: dateRange.granularity,
-    from: dateRange.from,
-    to: dateRange.to,
+    granularity: spendDateRange.granularity,
+    from: spendDateRange.from,
+    to: spendDateRange.to,
+    timeZone,
   });
   const spendByProject = useAnalyticsSpendByProject({
     from: dateRange.from,
@@ -204,7 +260,9 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
               onClick={props.onToggleLeftSidebarCollapsed}
               title="Open sidebar"
               aria-label="Open sidebar"
-              className="text-muted hover:text-foreground hidden h-6 w-6 md:inline-flex"
+              // The left sidebar is fully off-canvas on narrow viewports, so this route must
+              // expose the shared mobile menu control instead of hiding its only opener.
+              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 md:inline-flex"
             >
               <Menu className="h-4 w-4" />
             </Button>
@@ -255,6 +313,18 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
             ))}
           </select>
 
+          <div className="flex shrink-0 items-center gap-1">
+            <span className="text-muted text-xs">Timezone</span>
+            <ToggleGroup
+              options={[
+                { value: "local", label: "Local" },
+                { value: "utc", label: "UTC" },
+              ]}
+              value={timeZoneMode}
+              onChange={setTimeZoneMode}
+            />
+          </div>
+
           <div className="border-border-medium bg-background ml-auto flex shrink-0 items-center gap-1 rounded-md border p-1">
             {(
               [
@@ -285,7 +355,8 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
             data={spendOverTime.data}
             loading={spendOverTime.loading}
             error={spendOverTime.error}
-            granularity={dateRange.granularity}
+            granularity={spendDateRange.granularity}
+            timeZoneMode={timeZoneMode}
           />
           <ModelBreakdown spendByProject={spendByProject} spendByModel={spendByModel} />
           <TokensByModelChart
@@ -321,13 +392,14 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
                 <SavedQueryPanel
                   key={query.id}
                   query={query}
+                  timeFilterSql={timeFilterSql}
                   onDelete={removeSavedQuery}
                   onUpdate={updateSavedQuery}
                 />
               ))}
             </div>
           )}
-          <SqlExplorer onSaveQuery={saveQuery} />
+          <SqlExplorer onSaveQuery={saveQuery} timeFilterSql={timeFilterSql} />
         </div>
       </div>
     </div>

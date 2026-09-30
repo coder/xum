@@ -7,11 +7,14 @@
  * - exec: execute commands inside the container
  * - down: stop and remove the container
  */
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
+import type { ChildProcess, SpawnOptions } from "child_process";
+import * as path from "path";
 import type { BindMount } from "./credentialForwarding";
 import type { InitLogger } from "./Runtime";
 import { LineBuffer } from "./initHook";
 import { redactDevcontainerArgsForLog } from "./devcontainerLogRedaction";
+import { forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 
@@ -151,20 +154,6 @@ export interface DevcontainerUpOptions {
   timeoutMs?: number;
 }
 
-/** devcontainer exec options */
-export interface DevcontainerExecOptions {
-  workspaceFolder: string;
-  configPath?: string;
-  command: string;
-  /** Working directory inside container */
-  cwd?: string;
-  /** Environment variables to pass */
-  env?: Record<string, string>;
-  abortSignal?: AbortSignal;
-  /** Timeout in milliseconds */
-  timeoutMs?: number;
-}
-
 const DEFAULT_UP_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_STDERR_BUFFER_LENGTH = 8_000; // 8KB cap for error summaries
 const DEFAULT_CLEANUP_TIMEOUT_MS = 60_000; // 1 minute
@@ -187,15 +176,185 @@ async function removeDevcontainerContainer(containerId: string): Promise<void> {
 }
 const VERSION_CHECK_TIMEOUT_MS = 10_000; // 10 seconds
 
+const WINDOWS_LOOKUP_TIMEOUT_MS = 5_000;
+const WINDOWS_LOOKUP_NEGATIVE_CACHE_MS = 30_000;
+// CreateProcess can run these directly; Node >= 20.12 refuses .cmd/.bat
+// without a shell (CVE-2024-27980), so those need the cmd.exe wrapper below.
+const WINDOWS_DIRECT_EXECUTABLE_REGEXP = /\.(?:com|exe)$/i;
+const WINDOWS_CMD_SHIM_REGEXP = /\.(?:cmd|bat)$/i;
+
+/** Injectable seam so tests can exercise the win32/posix branches on any host. */
+export interface DevcontainerSpawnDeps {
+  platform: NodeJS.Platform;
+  /** Bounded PATH lookup returning candidate lines (where.exe output), or null on failure. */
+  lookupCommand: (command: string) => string[] | null;
+  spawn: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+  /**
+   * Successful win32 resolutions are cached for the process lifetime; misses
+   * are cached for a bounded TTL so a missing CLI cannot block the main
+   * process with a synchronous where.exe run on every availability check.
+   */
+  commandCache: { resolved?: string; missedAtMs?: number };
+  now: () => number;
+}
+
+const defaultSpawnDeps: DevcontainerSpawnDeps = {
+  platform: process.platform,
+  lookupCommand: (command) => {
+    try {
+      const result = spawnSync("where.exe", [command], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        timeout: WINDOWS_LOOKUP_TIMEOUT_MS,
+      });
+      if (result.status !== 0 || typeof result.stdout !== "string") {
+        return null;
+      }
+      return result.stdout.split(/\r?\n/);
+    } catch {
+      return null;
+    }
+  },
+  spawn,
+  commandCache: {},
+  now: Date.now,
+};
+
+// Vendored from cross-spawn@7.0.6 (MIT), based on https://qntm.org/cmd.
+// cross-spawn itself only double-escapes for `node_modules\.bin\*.cmd` paths,
+// which misses global npm shims (e.g. %APPDATA%\npm\devcontainer.cmd), so we
+// apply its escape algorithm ourselves with double escaping always on.
+const CMD_META_CHARS_REGEXP = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeCmdCommand(command: string): string {
+  return command.replace(CMD_META_CHARS_REGEXP, "^$1");
+}
+
+function escapeCmdShimArgument(arg: string): string {
+  // Double up backslashes preceding a double quote (or the closing quote
+  // added below), escape the quote itself, then quote the whole argument.
+  arg = arg.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  arg = arg.replace(/(?=(\\+?)?)\1$/, "$1$1");
+  arg = `"${arg}"`;
+  // Escape cmd.exe metacharacters twice: once for the cmd.exe we spawn, and
+  // once more because npm cmd-shims re-expand %* through a second cmd parse.
+  arg = arg.replace(CMD_META_CHARS_REGEXP, "^$1");
+  arg = arg.replace(CMD_META_CHARS_REGEXP, "^$1");
+  return arg;
+}
+
+function resolveWindowsDevcontainerCommand(deps: DevcontainerSpawnDeps): string | null {
+  if (deps.commandCache.resolved !== undefined) {
+    return deps.commandCache.resolved;
+  }
+  if (
+    deps.commandCache.missedAtMs !== undefined &&
+    deps.now() - deps.commandCache.missedAtMs < WINDOWS_LOOKUP_NEGATIVE_CACHE_MS
+  ) {
+    return null;
+  }
+  // where.exe lists PATH-order candidates; npm also installs an extensionless
+  // POSIX shim and a .ps1, neither of which CreateProcess can run, so pick the
+  // first spawnable entry.
+  const resolved =
+    (deps.lookupCommand("devcontainer") ?? [])
+      .map((line) => line.trim())
+      .find(
+        (line) => WINDOWS_DIRECT_EXECUTABLE_REGEXP.test(line) || WINDOWS_CMD_SHIM_REGEXP.test(line)
+      ) ?? null;
+  if (resolved !== null) {
+    deps.commandCache.resolved = resolved;
+    deps.commandCache.missedAtMs = undefined;
+  } else {
+    deps.commandCache.missedAtMs = deps.now();
+  }
+  return resolved;
+}
+
+/**
+ * Terminate a spawned devcontainer process. On Windows the CLI runs beneath
+ * the cmd.exe shim wrapper and ChildProcess.kill only signals the direct
+ * child, so kill the full tree; on POSIX the CLI is the direct child and
+ * keeps its graceful SIGTERM.
+ */
+export function terminateDevcontainerProc(
+  proc: Pick<ChildProcess, "pid" | "kill">,
+  deps: { platform: NodeJS.Platform; killTree: (pid: number) => void } = {
+    platform: process.platform,
+    killTree: killProcessTree,
+  }
+): void {
+  if (deps.platform === "win32" && proc.pid !== undefined) {
+    deps.killTree(proc.pid);
+    return;
+  }
+  proc.kill("SIGTERM");
+}
+
+/**
+ * Spawn the devcontainer CLI portably.
+ *
+ * On Windows, npm installs the CLI as `devcontainer.cmd`/`devcontainer.ps1`
+ * shims. Node's spawn does not consult PATHEXT, so the bare name fails even
+ * when the CLI is on PATH. We resolve the real entry via where.exe, spawn
+ * .exe/.com directly, and wrap .cmd/.bat shims in `cmd.exe /d /s /c` with
+ * fully escaped arguments instead of a blanket `shell: true` (the exec site
+ * passes arbitrary `bash -c` payloads that cmd.exe would reinterpret).
+ */
+export function spawnDevcontainer(
+  args: string[],
+  options: SpawnOptions,
+  deps: DevcontainerSpawnDeps = defaultSpawnDeps
+): ChildProcess {
+  if (deps.platform !== "win32") {
+    return deps.spawn("devcontainer", args, options);
+  }
+  const resolved = resolveWindowsDevcontainerCommand(deps);
+  if (resolved === null) {
+    // Keep the status-quo failure surface: callers report the CLI as missing.
+    return deps.spawn("devcontainer", args, options);
+  }
+  if (WINDOWS_CMD_SHIM_REGEXP.test(resolved)) {
+    const shellCommand = [
+      escapeCmdCommand(path.normalize(resolved)),
+      ...args.map(escapeCmdShimArgument),
+    ].join(" ");
+    return deps.spawn(process.env.comspec ?? "cmd.exe", ["/d", "/s", "/c", `"${shellCommand}"`], {
+      ...options,
+      // The command line is pre-escaped; tell Node not to re-quote it.
+      windowsVerbatimArguments: true,
+    });
+  }
+  return deps.spawn(resolved, args, options);
+}
+
 /**
  * Check if devcontainer CLI is installed and get version.
  */
 export async function checkDevcontainerCliVersion(): Promise<DevcontainerCliInfo | null> {
   return new Promise((resolve) => {
-    const proc = spawn("devcontainer", ["--version"], {
+    // Explicit timer instead of the spawn-level timeout: Node's built-in kill
+    // signals only the direct child (the cmd.exe wrapper on Windows), and a
+    // surviving CLI descendant would hold the stdio pipes open so "close"
+    // never fires. Settle immediately and force-close the pipes instead.
+    const proc = spawnDevcontainer(["--version"], {
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: VERSION_CHECK_TIMEOUT_MS,
     });
+
+    let settled = false;
+    const settle = (result: DevcontainerCliInfo | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(result);
+    };
+
+    const timeoutId = setTimeout(() => {
+      terminateDevcontainerProc(proc);
+      forceCloseStdio(proc);
+      settle(null);
+    }, VERSION_CHECK_TIMEOUT_MS);
 
     let stdout = "";
     proc.stdout?.on("data", (data: Buffer) => {
@@ -203,14 +362,14 @@ export async function checkDevcontainerCliVersion(): Promise<DevcontainerCliInfo
     });
 
     proc.on("error", () => {
-      resolve(null);
+      settle(null);
     });
 
     proc.on("close", (code) => {
       if (code === 0 && stdout.trim()) {
-        resolve({ available: true, version: stdout.trim() });
+        settle({ available: true, version: stdout.trim() });
       } else {
-        resolve(null);
+        settle(null);
       }
     });
   });
@@ -259,9 +418,16 @@ export async function devcontainerUp(
     initLogger.logStep(`Running: devcontainer ${logArgs.join(" ")}`);
 
     return new Promise((resolve, reject) => {
-      const proc = spawn("devcontainer", args, {
+      if (abortSignal?.aborted) {
+        reject(new Error("devcontainer up aborted"));
+        return;
+      }
+
+      // Timeout is enforced by the explicit timer below, not the spawn-level
+      // option: Node's built-in timeout signals only the direct child, which
+      // on Windows is the cmd.exe wrapper rather than the CLI itself.
+      const proc = spawnDevcontainer(args, {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: timeoutMs,
         cwd: workspaceFolder,
       });
 
@@ -324,17 +490,20 @@ export async function devcontainerUp(
       });
 
       const abortHandler = () => {
-        proc.kill("SIGTERM");
+        terminateDevcontainerProc(proc);
         settleError(new Error("devcontainer up aborted"));
       };
 
       if (timeoutMs && timeoutMs > 0) {
         timeoutId = setTimeout(() => {
-          proc.kill("SIGTERM");
+          terminateDevcontainerProc(proc);
           settleError(new Error(`devcontainer up timed out after ${timeoutMs}ms`));
         }, timeoutMs);
       }
-      abortSignal?.addEventListener("abort", abortHandler);
+      abortSignal?.addEventListener("abort", abortHandler, { once: true });
+      if (abortSignal?.aborted) {
+        abortHandler();
+      }
 
       const finalizeError = async (message: string, result?: DevcontainerUpResultLine | null) => {
         if (result && shouldCleanupDevcontainer(result)) {
@@ -414,146 +583,6 @@ export async function devcontainerUp(
   return runUp(baseArgs);
 }
 
-/**
- * Execute a command inside the devcontainer.
- * Returns stdout as a string.
- */
-export async function devcontainerExec(
-  options: DevcontainerExecOptions
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const { workspaceFolder, configPath, command, cwd, env, abortSignal, timeoutMs } = options;
-
-  const args = ["exec", "--workspace-folder", workspaceFolder];
-
-  if (configPath) {
-    args.push("--config", configPath);
-  }
-
-  // Add environment variables
-  if (env) {
-    for (const [key, value] of Object.entries(env)) {
-      args.push("--remote-env", `${key}=${value}`);
-    }
-  }
-
-  // Build the command with cd if cwd specified
-  let fullCommand = command;
-  if (cwd) {
-    // Use bash -c to handle cd + command
-    fullCommand = `cd ${JSON.stringify(cwd)} && ${command}`;
-  }
-
-  // The command goes after --
-  args.push("--", "bash", "-c", fullCommand);
-
-  return new Promise((resolve, reject) => {
-    const proc = spawn("devcontainer", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: timeoutMs,
-      cwd: workspaceFolder,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-    const abortHandler = () => {
-      proc.kill("SIGTERM");
-      settleReject(new Error("devcontainer exec aborted"));
-    };
-
-    const clearAbortHandler = () => {
-      abortSignal?.removeEventListener("abort", abortHandler);
-    };
-
-    const settleResolve = (exitCode: number) => {
-      if (settled) return;
-      settled = true;
-      if (timeoutId) clearTimeout(timeoutId);
-      clearAbortHandler();
-      resolve({ stdout, stderr, exitCode });
-    };
-
-    const settleReject = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      if (timeoutId) clearTimeout(timeoutId);
-      clearAbortHandler();
-      reject(error);
-    };
-
-    proc.stdout?.on("data", (data: Buffer) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    abortSignal?.addEventListener("abort", abortHandler);
-
-    if (timeoutMs && timeoutMs > 0) {
-      timeoutId = setTimeout(() => {
-        proc.kill("SIGTERM");
-        settleReject(new Error(`devcontainer exec timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    }
-
-    proc.on("error", (err) => {
-      settleReject(new Error(`devcontainer exec failed: ${getErrorMessage(err)}`));
-    });
-
-    proc.on("close", (code) => {
-      settleResolve(code ?? -1);
-    });
-  });
-}
-
-/**
- * Get the container ID for a devcontainer workspace.
- * Returns null if no container exists.
- */
-export async function getDevcontainerContainerId(
-  workspaceFolder: string,
-  _configPath?: string,
-  timeoutMs = 10_000
-): Promise<string | null> {
-  // The devcontainer CLI labels containers with the workspace folder path
-  // We can use `devcontainer read-configuration` or docker labels to find it
-  // For now, use docker ps with label filter
-  const labelValue = workspaceFolder;
-
-  return new Promise((resolve) => {
-    const proc = spawn(
-      "docker",
-      ["ps", "-q", "--filter", `label=devcontainer.local_folder=${labelValue}`],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: timeoutMs,
-      }
-    );
-
-    let stdout = "";
-    proc.stdout?.on("data", (data: Buffer) => {
-      stdout += data.toString();
-    });
-
-    proc.on("error", () => {
-      resolve(null);
-    });
-
-    proc.on("close", (code) => {
-      if (code === 0 && stdout.trim()) {
-        // Return first container ID (there should only be one)
-        resolve(stdout.trim().split("\n")[0]);
-      } else {
-        resolve(null);
-      }
-    });
-  });
-}
-
 export type DevcontainerProbeResult =
   | { kind: "found"; containerId: string }
   | { kind: "absent" }
@@ -564,16 +593,31 @@ export type DevcontainerStopResult =
   | { kind: "absent" }
   | { kind: "error"; message: string };
 
-export async function probeDevcontainerStatus(
-  workspacePath: string,
+export async function probeDevcontainerStatuses(
+  workspacePaths: string[],
   timeoutMs = 10_000
-): Promise<DevcontainerProbeResult> {
-  const labelValue = workspacePath;
+): Promise<Record<string, DevcontainerProbeResult>> {
+  const results: Record<string, DevcontainerProbeResult> = {};
+  for (const workspacePath of workspacePaths) {
+    results[workspacePath] = { kind: "absent" };
+  }
 
-  return new Promise((resolve) => {
+  if (workspacePaths.length === 0) {
+    return results;
+  }
+
+  const requestedPaths = new Set(workspacePaths);
+
+  return await new Promise((resolve) => {
     const proc = spawn(
       "docker",
-      ["ps", "-q", "--filter", `label=devcontainer.local_folder=${labelValue}`],
+      [
+        "ps",
+        "--filter",
+        "label=devcontainer.local_folder",
+        "--format",
+        '{{.ID}}\t{{.Label "devcontainer.local_folder"}}',
+      ],
       {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: timeoutMs,
@@ -589,29 +633,36 @@ export async function probeDevcontainerStatus(
       stderr += data.toString();
     });
 
+    const resolveAllError = (message: string) => {
+      for (const workspacePath of workspacePaths) {
+        results[workspacePath] = { kind: "error", message };
+      }
+      resolve(results);
+    };
+
     proc.on("error", (error) => {
-      resolve({ kind: "error", message: getErrorMessage(error) });
+      resolveAllError(getErrorMessage(error));
     });
 
     proc.on("close", (code, signal) => {
-      const containerId = stdout.trim().split("\n")[0];
-      if (code === 0 && containerId) {
-        resolve({ kind: "found", containerId });
-        return;
-      }
-      if (code === 0) {
-        resolve({ kind: "absent" });
+      if (code !== 0) {
+        const stderrMessage = stderr.trim();
+        const exitMessage = signal
+          ? `docker ps exited with signal ${signal}`
+          : `docker ps exited with code ${code ?? "null"}`;
+        resolveAllError(stderrMessage ? `${exitMessage}: ${stderrMessage}` : exitMessage);
         return;
       }
 
-      const stderrMessage = stderr.trim();
-      const exitMessage = signal
-        ? `docker ps exited with signal ${signal}`
-        : `docker ps exited with code ${code ?? "null"}`;
-      resolve({
-        kind: "error",
-        message: stderrMessage ? `${exitMessage}: ${stderrMessage}` : exitMessage,
-      });
+      for (const line of stdout.split("\n")) {
+        const [containerId, workspacePath] = line.split("\t");
+        if (!containerId || !workspacePath || !requestedPaths.has(workspacePath)) {
+          continue;
+        }
+        results[workspacePath] = { kind: "found", containerId };
+      }
+
+      resolve(results);
     });
   });
 }
@@ -659,13 +710,28 @@ export async function getDevcontainerContainerName(
   });
 }
 
-export async function stopDevcontainer(workspacePath: string): Promise<DevcontainerStopResult> {
+/**
+ * Remove the containers labeled with a workspace's host path. By default only running ones match
+ * ("Stop runtime", rename). `includeStopped` also matches stopped ones, for deletion (#5124): a
+ * stopped container still holds the workspace's files, including its plan, and a later workspace
+ * at the same path would reuse it.
+ */
+export async function stopDevcontainer(
+  workspacePath: string,
+  options?: { includeStopped?: boolean }
+): Promise<DevcontainerStopResult> {
   const labelValue = workspacePath;
 
   return new Promise((resolve) => {
     const proc = spawn(
       "docker",
-      ["ps", "-q", "--filter", `label=devcontainer.local_folder=${labelValue}`],
+      [
+        "ps",
+        ...(options?.includeStopped === true ? ["-a"] : []),
+        "-q",
+        "--filter",
+        `label=devcontainer.local_folder=${labelValue}`,
+      ],
       {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 10_000,
@@ -698,13 +764,18 @@ export async function stopDevcontainer(workspacePath: string): Promise<Devcontai
         return;
       }
 
-      const containerId = stdout.trim().split("\n")[0];
-      if (!containerId) {
+      // Every match is removed: with stopped containers included, a stale stopped one and the
+      // running one can share the label, and removing only the first would leave the other.
+      const containerIds = stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      if (containerIds.length === 0) {
         resolve({ kind: "absent" });
         return;
       }
 
-      const removeProc = spawn("docker", ["rm", "-f", containerId], {
+      const removeProc = spawn("docker", ["rm", "-f", ...containerIds], {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: DEFAULT_CLEANUP_TIMEOUT_MS,
       });
@@ -747,7 +818,7 @@ export async function stopDevcontainer(workspacePath: string): Promise<Devcontai
 export async function devcontainerDown(
   workspaceFolder: string,
   _configPath?: string,
-  _timeoutMs = 60_000
-): Promise<void> {
-  await stopDevcontainer(workspaceFolder);
+  options?: { includeStopped?: boolean }
+): Promise<DevcontainerStopResult> {
+  return stopDevcontainer(workspaceFolder, options);
 }

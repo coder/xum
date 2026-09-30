@@ -25,11 +25,6 @@ import sharp from "sharp";
 
 import { prepareDemoProject } from "../tests/e2e/utils/demoProject";
 
-interface WorkspaceSeed {
-  workspaceId: string;
-  marker: string;
-}
-
 interface SwitchFrameSample {
   frame: number;
   timestamp: number;

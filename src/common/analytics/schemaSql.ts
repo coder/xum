@@ -27,7 +27,23 @@ CREATE TABLE IF NOT EXISTS events (
   output_tps DOUBLE,
   response_index INTEGER,
   is_sub_agent BOOLEAN DEFAULT false,
-  tool_name TEXT
+  tool_name TEXT,
+  requested_model VARCHAR,
+  refused_models_json VARCHAR
+)
+`;
+
+/**
+ * Small key/value side table for ingest bookkeeping that is not per-workspace.
+ * Currently stores the pricing-table fingerprint: event costs are computed at
+ * ingest time, so when the bundled pricing tables change (e.g. a new model's
+ * pricing lands in an app upgrade), previously ingested rows keep stale $0
+ * costs until a full rebuild reprices them.
+ */
+export const CREATE_INGEST_META_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS ingest_meta (
+  key VARCHAR PRIMARY KEY,
+  value VARCHAR NOT NULL
 )
 `;
 

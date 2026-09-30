@@ -9,6 +9,7 @@ import {
   extractHookOutput,
   extractHookDuration,
 } from "../Tools/Shared/HookOutputDisplay";
+import { ToolNameProvider } from "./ToolNameContext";
 
 interface ToolMessageProps {
   message: DisplayedMessage & { type: "tool" };
@@ -36,7 +37,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   const { toolName, args, result, status, toolCallId } = message;
 
   // Get the component from the registry (validates args, falls back to GenericToolCall)
-  const ToolComponent = getToolComponent(toolName, args);
+  const ToolComponent = getToolComponent(toolName, args, result);
 
   // Compute tool-specific extras
   const groupPosition =
@@ -47,31 +48,43 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   // Extract hook output if present (only shown when hook produced output)
   const hookOutput = extractHookOutput(result);
   const hookDuration = extractHookDuration(result);
-
   return (
     <div className={className}>
-      <ToolComponent
-        // Base props (all tools)
-        args={args}
-        result={result ?? null}
-        status={status}
-        toolName={toolName}
-        // Identity props (used by bash for live output, ask_user_question for caching)
-        workspaceId={workspaceId}
-        toolCallId={toolCallId}
-        // Bash-specific
-        startedAt={message.timestamp}
-        // FileEdit-specific
-        onReviewNote={onReviewNote}
-        // ProposePlan-specific
-        isLatest={isLatestProposePlan}
-        // BashOutput-specific
-        groupPosition={groupPosition}
-        // Task-specific
-        taskReportLinking={taskReportLinking}
-        // CodeExecution-specific
-        nestedCalls={message.nestedCalls}
-      />
+      {/* ToolNameProvider lets useStickyExpand key the auto-expand preference by tool name. */}
+      <ToolNameProvider toolName={toolName}>
+        <ToolComponent
+          // Base props (all tools)
+          args={args}
+          result={result ?? null}
+          status={status}
+          toolName={toolName}
+          // Identity props (used by bash for live output, ask_user_question for caching)
+          workspaceId={workspaceId}
+          toolCallId={toolCallId}
+          // Workflow-specific
+          workflowRunHint={message.workflowRun}
+          // Elapsed timers (bash/advisor/task_await): start when execute() actually
+          // began running, not when the model emitted the call — parallel tool calls
+          // run sequentially, so queued calls must not accumulate elapsed time.
+          startedAt={message.executionStartedAt}
+          // Freshness lower bound (task/workflow discovery): when the model emitted the
+          // call. Unlike executionStartedAt this survives history replay of parts that
+          // predate execution-start tracking.
+          toolCallTimestamp={message.timestamp}
+          // FileEdit-specific
+          onReviewNote={onReviewNote}
+          // ProposePlan-specific
+          isLatest={isLatestProposePlan}
+          // BashOutput-specific
+          groupPosition={groupPosition}
+          // Task-specific
+          taskReportLinking={taskReportLinking}
+          // CodeExecution-specific
+          nestedCalls={message.nestedCalls}
+          // MCP tools (GenericToolCall): frozen per-call server identity
+          mcpServer={message.mcpServer}
+        />
+      </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}
     </div>
   );

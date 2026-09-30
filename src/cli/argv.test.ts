@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  CLI_GLOBAL_FLAGS,
   detectCliEnvironment,
   getParseOptions,
   getSubcommand,
@@ -8,19 +7,6 @@ import {
   isCommandAvailable,
   isElectronLaunchArg,
 } from "./argv";
-
-describe("CLI_GLOBAL_FLAGS", () => {
-  test("contains expected help and version flags", () => {
-    expect(CLI_GLOBAL_FLAGS).toContain("--help");
-    expect(CLI_GLOBAL_FLAGS).toContain("-h");
-    expect(CLI_GLOBAL_FLAGS).toContain("--version");
-    expect(CLI_GLOBAL_FLAGS).toContain("-v");
-  });
-
-  test("has exactly 4 flags", () => {
-    expect(CLI_GLOBAL_FLAGS).toHaveLength(4);
-  });
-});
 
 describe("detectCliEnvironment", () => {
   test("bun/node: firstArgIndex=2", () => {
@@ -111,7 +97,7 @@ describe("getArgsAfterSplice", () => {
 
   test("packaged electron: returns args after firstArgIndex", () => {
     const env = detectCliEnvironment({ electron: "33.0.0" }, undefined);
-    // Simulates: ./mux api --help -> after splice -> ./mux --help
+    // Simulates: ./xum api --help -> after splice -> ./mux --help
     const argvAfterSplice = ["./mux", "--help"];
     expect(getArgsAfterSplice(argvAfterSplice, env)).toEqual(["--help"]);
   });
@@ -147,8 +133,9 @@ describe("isElectronLaunchArg", () => {
     expect(isElectronLaunchArg("--enable-logging", env)).toBe(true);
   });
 
-  test("returns true for mux:// deep links in packaged mode", () => {
+  test("returns true for canonical and legacy deep links in packaged mode", () => {
     const env = detectCliEnvironment({ electron: "33.0.0" }, undefined);
+    expect(isElectronLaunchArg("xum://chat/new?foo=bar", env)).toBe(true);
     expect(isElectronLaunchArg("mux://chat/new?foo=bar", env)).toBe(true);
   });
 
@@ -196,19 +183,22 @@ describe("isElectronLaunchArg", () => {
 });
 
 describe("isCommandAvailable", () => {
-  test("run is available in bun/node", () => {
+  test("run and workflow are available in bun/node", () => {
     const env = detectCliEnvironment({}, undefined);
     expect(isCommandAvailable("run", env)).toBe(true);
+    expect(isCommandAvailable("workflow", env)).toBe(true);
   });
 
-  test("run is NOT available in electron dev", () => {
+  test("run and workflow are NOT available in electron dev", () => {
     const env = detectCliEnvironment({ electron: "33.0.0" }, true);
     expect(isCommandAvailable("run", env)).toBe(false);
+    expect(isCommandAvailable("workflow", env)).toBe(false);
   });
 
-  test("run is NOT available in packaged electron", () => {
+  test("run and workflow are NOT available in packaged electron", () => {
     const env = detectCliEnvironment({ electron: "33.0.0" }, undefined);
     expect(isCommandAvailable("run", env)).toBe(false);
+    expect(isCommandAvailable("workflow", env)).toBe(false);
   });
 
   test("server is available everywhere", () => {

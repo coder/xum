@@ -1,6 +1,7 @@
+import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { afterEach, describe, expect, test, spyOn } from "bun:test";
+import { afterEach, describe, expect, jest, test, spyOn } from "bun:test";
 import {
   appendOpenSSHHostKeyPolicyArgs,
   getControlPath,
@@ -8,6 +9,9 @@ import {
   SSHConnectionPool,
   type SSHRuntimeConfig,
 } from "./sshConnectionPool";
+
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("sshConnectionPool", () => {
   describe("getControlPath", () => {
@@ -258,34 +262,6 @@ describe("SSHConnectionPool", () => {
       expect(backoffMs).toBeGreaterThan(7_500); // 10 * 0.8 - some tolerance
       expect(backoffMs).toBeLessThanOrEqual(12_500); // 10 * 1.2 + some tolerance
     });
-
-    test("resetBackoff clears backoff state after failed probe", async () => {
-      const pool = new SSHConnectionPool();
-      const config: SSHRuntimeConfig = {
-        host: "nonexistent.invalid.host.test",
-        srcBaseDir: "/work",
-      };
-
-      // Trigger a failure via acquireConnection (will fail to connect)
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        pool.acquireConnection(config, { timeoutMs: 1000, maxWaitMs: 0 })
-      ).rejects.toThrow();
-
-      // Verify we're now in backoff
-      const healthBefore = pool.getConnectionHealth(config);
-      expect(healthBefore?.status).toBe("unhealthy");
-      expect(healthBefore?.backoffUntil).toBeDefined();
-
-      // Reset backoff
-      pool.resetBackoff(config);
-      const healthAfter = pool.getConnectionHealth(config);
-
-      expect(healthAfter).toBeDefined();
-      expect(healthAfter!.status).toBe("unknown");
-      expect(healthAfter!.consecutiveFailures).toBe(0);
-      expect(healthAfter!.backoffUntil).toBeUndefined();
-    });
   });
 
   describe("acquireConnection", () => {
@@ -309,36 +285,55 @@ describe("SSHConnectionPool", () => {
     });
 
     test("waits through backoff (bounded) instead of throwing", async () => {
-      const pool = new SSHConnectionPool();
-      const config: SSHRuntimeConfig = {
-        host: "test.example.com",
-        srcBaseDir: "/work",
-      };
+      // Fake timers also fake Date, so the backoff deadline and the real default
+      // sleep advance together without slowing the test down.
+      fakeTimers.useFakeTimers();
+      try {
+        const pool = new SSHConnectionPool();
+        const config: SSHRuntimeConfig = {
+          host: "test.example.com",
+          srcBaseDir: "/work",
+        };
 
-      // Put host into backoff without doing a real probe.
-      pool.reportFailure(config, "Connection refused");
-      expect(pool.getConnectionHealth(config)?.backoffUntil).toBeDefined();
+        // Put host into backoff without doing a real probe.
+        pool.reportFailure(config, "Connection refused");
+        expect(pool.getConnectionHealth(config)?.backoffUntil).toBeDefined();
 
-      const sleepCalls: number[] = [];
-      const onWaitCalls: number[] = [];
+        const onWaitCalls: number[] = [];
+        let settled = false;
+        const acquire = pool
+          .acquireConnection(config, {
+            onWait: (ms) => {
+              onWaitCalls.push(ms);
+            },
+          })
+          .then(() => {
+            settled = true;
+          });
 
-      await pool.acquireConnection(config, {
-        onWait: (ms) => {
-          onWaitCalls.push(ms);
-        },
-        sleep: (ms) => {
-          sleepCalls.push(ms);
-          // Simulate time passing / recovery.
-          pool.markHealthy(config);
-          return Promise.resolve();
-        },
-      });
+        expect(onWaitCalls.length).toBe(1);
+        const waitMs = onWaitCalls[0];
+        expect(waitMs).toBeGreaterThan(0);
 
-      expect(sleepCalls.length).toBe(1);
-      expect(onWaitCalls.length).toBe(1);
-      expect(sleepCalls[0]).toBeGreaterThan(0);
-      expect(onWaitCalls[0]).toBe(sleepCalls[0]);
-      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+        // Simulate recovery while the caller is waiting.
+        pool.markHealthy(config);
+
+        // The caller keeps waiting for the whole reported backoff...
+        fakeTimers.advanceTimersByTime(waitMs - 1);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        // ...and resumes once it elapses.
+        fakeTimers.advanceTimersByTime(1);
+        await acquire;
+
+        expect(settled).toBe(true);
+        expect(onWaitCalls.length).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+      } finally {
+        fakeTimers.useRealTimers();
+      }
     });
     test("throws immediately when in backoff", async () => {
       const pool = new SSHConnectionPool();
@@ -370,6 +365,36 @@ describe("SSHConnectionPool", () => {
 
       expect(path1).toBe(path2);
       expect(path1).toBe(getControlPath(config));
+    });
+
+    test("does not record backoff when a probe is aborted", async () => {
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = {
+        host: "abort.example.com",
+        srcBaseDir: "/work",
+      };
+      const abortController = new AbortController();
+      // The shared probe ignores the caller's abort (#5112) and ends later, on its own.
+      let failProbe!: () => void;
+      const spy = spyOn(
+        pool as unknown as { probeConnection: () => Promise<void> },
+        "probeConnection"
+      ).mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => (failProbe = () => reject(new Error("x"))))
+      );
+
+      const acquired = pool.acquireConnection(config, {
+        timeoutMs: 1000,
+        maxWaitMs: 0,
+        abortSignal: abortController.signal,
+      });
+      abortController.abort();
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(acquired).rejects.toThrow("Operation aborted");
+
+      expect(pool.getConnectionHealth(config)).toBeUndefined();
+      failProbe();
+      spy.mockRestore();
     });
 
     test("records backoff when probe rejects without recording it (safety net)", async () => {
@@ -566,28 +591,33 @@ describe("SSHConnectionPool", () => {
         }
       );
 
-      const firstAcquire = pool.acquireConnection(config, {
-        controlPath: "/tmp/mux-control-a",
-        timeoutMs: 30,
-        maxWaitMs: 30,
-      });
-      await firstProbeStarted;
+      // try/finally: a leaked Date.now spy freezes time process-wide and breaks
+      // downstream suites (e.g. WorkflowService crash-recovery retries).
+      try {
+        const firstAcquire = pool.acquireConnection(config, {
+          controlPath: "/tmp/mux-control-a",
+          timeoutMs: 30,
+          maxWaitMs: 30,
+        });
+        await firstProbeStarted;
 
-      const secondAcquire = pool.acquireConnection(config, {
-        controlPath: "/tmp/mux-control-b",
-        timeoutMs: 30,
-        maxWaitMs: 30,
-      });
-      releaseFirstProbe();
+        const secondAcquire = pool.acquireConnection(config, {
+          controlPath: "/tmp/mux-control-b",
+          timeoutMs: 30,
+          maxWaitMs: 30,
+        });
+        releaseFirstProbe();
 
-      await Promise.all([firstAcquire, secondAcquire]);
+        await Promise.all([firstAcquire, secondAcquire]);
 
-      expect(probeCalls).toEqual([
-        { controlPath: "/tmp/mux-control-a", timeoutMs: 30 },
-        { controlPath: "/tmp/mux-control-b", timeoutMs: 5 },
-      ]);
-      probeSpy.mockRestore();
-      nowSpy.mockRestore();
+        expect(probeCalls).toEqual([
+          { controlPath: "/tmp/mux-control-a", timeoutMs: 30 },
+          { controlPath: "/tmp/mux-control-b", timeoutMs: 5 },
+        ]);
+      } finally {
+        probeSpy.mockRestore();
+        nowSpy.mockRestore();
+      }
     });
 
     test("callers waking from backoff share single probe (herd only released on success)", async () => {
@@ -596,45 +626,229 @@ describe("SSHConnectionPool", () => {
         host: "test.example.com",
         srcBaseDir: "/work",
       };
-
-      // Put connection in backoff
-      pool.reportFailure(config, "Initial failure");
-      expect(pool.getConnectionHealth(config)?.consecutiveFailures).toBe(1);
+      const privatePool = pool as unknown as {
+        probeConnection: (
+          config: SSHRuntimeConfig,
+          timeoutMs: number,
+          key: string,
+          controlPath: string
+        ) => Promise<void>;
+        markHealthyByKey: (key: string) => void;
+      };
 
       let probeCount = 0;
-      const sleepResolvers: Array<() => void> = [];
-
-      // Start 3 waiters - they'll all sleep through backoff
-      const waiters = [1, 2, 3].map(() =>
-        pool.acquireConnection(config, {
-          sleep: () =>
-            new Promise<void>((resolve) => {
-              sleepResolvers.push(() => {
-                // When sleep resolves, simulate recovery (mark healthy)
-                // This happens during the first probe - all waiters share it
-                if (probeCount === 0) {
-                  probeCount++;
-                  pool.markHealthy(config);
-                }
-                resolve();
-              });
-            }),
-        })
+      let releaseProbe!: () => void;
+      const probeReleased = new Promise<void>((resolve) => {
+        releaseProbe = resolve;
+      });
+      const probeSpy = spyOn(privatePool, "probeConnection").mockImplementation(
+        async (_config, _timeoutMs, key) => {
+          probeCount++;
+          // Hold the probe open until every woken caller has had a chance to run.
+          await probeReleased;
+          privatePool.markHealthyByKey(key);
+        }
       );
 
-      // Let all sleepers proceed
-      await Promise.resolve(); // Let all acquireConnection calls reach sleep
-      expect(sleepResolvers.length).toBe(3);
+      fakeTimers.useFakeTimers();
+      try {
+        // Put connection in backoff
+        pool.reportFailure(config, "Initial failure");
+        expect(pool.getConnectionHealth(config)?.consecutiveFailures).toBe(1);
 
-      // Wake them all up "simultaneously"
-      sleepResolvers.forEach((resolve) => resolve());
+        // Start 3 waiters - they'll all sleep through backoff
+        const waitMs: number[] = [];
+        const waiters = [1, 2, 3].map(() =>
+          pool.acquireConnection(config, {
+            onWait: (ms) => {
+              waitMs.push(ms);
+            },
+          })
+        );
+        expect(waitMs.length).toBe(3);
+        expect(probeCount).toBe(0);
 
-      // All should succeed
-      await Promise.all(waiters);
+        // Wake them all up simultaneously when the backoff expires.
+        fakeTimers.advanceTimersByTime(Math.max(...waitMs));
+        for (let i = 0; i < 20; i++) {
+          await Promise.resolve();
+        }
+        expect(probeCount).toBe(1);
 
-      // Only one "probe" (markHealthy) should have happened
-      expect(probeCount).toBe(1);
-      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+        // Herd is only released once the shared probe succeeds.
+        releaseProbe();
+        await Promise.all(waiters);
+
+        // The woken herd shares one probe instead of each caller probing.
+        expect(probeCount).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+      } finally {
+        probeSpy.mockRestore();
+        fakeTimers.useRealTimers();
+      }
     });
   });
 });
+
+// #5063: after a permanent failure (rejected key, failed host-key check) the wait loop must not
+// probe again through its backoff: every probe repeats a login that cannot succeed, and servers
+// count failed logins. A PATH-shimmed `ssh` stands in for OpenSSH and counts its invocations.
+describe.skipIf(process.platform === "win32")(
+  "SSHConnectionPool wait loop vs permanent failures",
+  () => {
+    let restore: (() => Promise<void>) | undefined;
+    afterEach(async () => {
+      await restore?.();
+      restore = undefined;
+    });
+
+    /** Put an `ssh` on PATH that fails with `stderr` and exit code 255; returns its call count. */
+    async function shimSsh(stderr: string, exitCode = 255): Promise<() => Promise<number>> {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
+      const calls = path.join(dir, "calls");
+      await fs.writeFile(
+        path.join(dir, "ssh"),
+        `#!/bin/sh\necho call >> '${calls}'\nprintf '%s\\n' '${stderr}' >&2\nexit ${exitCode}\n`,
+        { mode: 0o755 }
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
+      restore = async () => {
+        process.env.PATH = originalPath;
+        await fs.rm(dir, { recursive: true, force: true });
+      };
+      return async () =>
+        (await fs.readFile(calls, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+    }
+
+    function acquire(pool: SSHConnectionPool, config: SSHRuntimeConfig, maxWaitMs: number) {
+      const waits: number[] = [];
+      const result = pool
+        .acquireConnection(config, { timeoutMs: 5_000, maxWaitMs, onWait: (ms) => waits.push(ms) })
+        .then(
+          () => new Error("acquisition unexpectedly succeeded"),
+          (error: unknown) => error
+        );
+      return { waits, result };
+    }
+
+    test.each(["alice@shim.test: Permission denied (publickey).", "Host key verification failed."])(
+      "%s fails at once instead of probing again through the backoff",
+      async (stderr) => {
+        const calls = await shimSsh(stderr);
+        const pool = new SSHConnectionPool();
+        const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+
+        // The second caller shares the first one's probe.
+        const first = acquire(pool, config, 5_000);
+        const joined = acquire(pool, config, 5_000);
+        for (const attempt of [first, joined]) {
+          expect(String(await attempt.result)).toContain(stderr);
+          expect(attempt.waits).toEqual([]);
+        }
+        expect(await calls()).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("unhealthy");
+
+        // The next caller waits out the backoff, then probes once and stops on its failure.
+        // (The recorded last error alone is not trusted: exec failures report into it too.)
+        const next = acquire(pool, config, 5_000);
+        expect(String(await next.result)).toContain(stderr);
+        expect(next.waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
+        expect(await calls()).toBe(2);
+      }
+    );
+
+    // Exec failures report into the same health record: a remote command that itself runs
+    // `ssh` and is refused must not make the pool treat the workspace host as refusing logins.
+    test("a permanent-looking error reported by an exec still waits and probes", async () => {
+      const calls = await shimSsh("", 0);
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+      pool.reportFailure(config, "git@example.com: Permission denied (publickey).");
+
+      const { waits, result } = acquire(pool, config, 5_000);
+      // The helper maps a successful acquisition to this marker error.
+      expect(String(await result)).toContain("unexpectedly succeeded");
+      expect(waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
+      expect(await calls()).toBe(1);
+    });
+
+    // #5112: the caller that starts the shared probe must not take it down for everyone when it
+    // aborts. maxWaitMs 0 makes a joiner fail on the first error; a budget lets it retry, which
+    // on the old code started a second probe (a second login) instead of keeping the first.
+    for (const joinerMaxWaitMs of [0, 30_000]) {
+      test(`a joiner (maxWaitMs ${joinerMaxWaitMs}) keeps the probe when its starter aborts`, async () => {
+        // The shim holds the probe open until the test creates the release file.
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
+        const callsFile = path.join(dir, "calls");
+        const release = path.join(dir, "release");
+        await fs.writeFile(
+          path.join(dir, "ssh"),
+          `#!/bin/sh\necho call >> '${callsFile}'\nwhile [ ! -e '${release}' ]; do sleep 0.05; done\necho ok\n`,
+          { mode: 0o755 }
+        );
+        const originalPath = process.env.PATH;
+        process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
+        restore = async () => {
+          process.env.PATH = originalPath;
+          await fs.rm(dir, { recursive: true, force: true });
+        };
+        const calls = async () =>
+          (await fs.readFile(callsFile, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+        const settle = (promise: Promise<void>): Promise<Error | undefined> =>
+          promise.then(
+            () => undefined,
+            (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+          );
+
+        const pool = new SSHConnectionPool();
+        const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+        const starterAbort = new AbortController();
+        const starter = settle(
+          pool.acquireConnection(config, {
+            timeoutMs: 20_000,
+            maxWaitMs: 20_000,
+            abortSignal: starterAbort.signal,
+          })
+        );
+        // Both calls reach the shared probe synchronously: the starter spawns it, the joiner
+        // finds it in flight.
+        const joiner = settle(
+          pool.acquireConnection(config, { timeoutMs: 20_000, maxWaitMs: joinerMaxWaitMs })
+        );
+        try {
+          // Abort only once the shim runs, so a killed first probe still counts as a call.
+          while ((await calls()) === 0) {
+            // Each read yields to the event loop; the loop ends when the shim logs its call.
+          }
+          const abortedAt = Date.now();
+          starterAbort.abort();
+          // The starter's own wait still ends at its abort, long before the probe finishes.
+          expect((await starter)?.message).toContain("Operation aborted");
+          expect(Date.now() - abortedAt).toBeLessThan(3_000);
+          // Cancelling is not a host failure.
+          expect(pool.getConnectionHealth(config)).toBeUndefined();
+
+          await fs.writeFile(release, "");
+          expect(await joiner).toBeUndefined();
+          expect(await calls()).toBe(1); // the joiner got the original probe, not a new one
+          expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+        } finally {
+          await fs.writeFile(release, "");
+          await Promise.all([starter, joiner]);
+        }
+      }, 30_000);
+    }
+
+    test("a transient failure still waits through the backoff", async () => {
+      const calls = await shimSsh("ssh: connect to host shim.test port 22: Connection refused");
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+
+      const { waits, result } = acquire(pool, config, 2_500);
+      expect(String(await result)).toContain("Connection refused");
+      expect(waits.length).toBeGreaterThan(0);
+      expect(await calls()).toBeGreaterThan(1);
+    });
+  }
+);

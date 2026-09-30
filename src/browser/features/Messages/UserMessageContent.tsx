@@ -2,6 +2,10 @@ import React from "react";
 import { FileText } from "lucide-react";
 import type { InlineSkillSnapshotMap, ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { FilePart } from "@/common/orpc/schemas";
+import {
+  parseStagedAttachmentNotice,
+  type DisplayStagedAttachment,
+} from "@/browser/features/ChatInput/stagedAttachments";
 import { ReviewBlockFromData } from "../Shared/ReviewBlock";
 import {
   HoverCard,
@@ -10,6 +14,7 @@ import {
   HoverCardTrigger,
 } from "@/browser/components/HoverCard/HoverCard";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { downloadBlob } from "@/browser/utils/downloadFile";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
@@ -25,6 +30,7 @@ interface UserMessageContentProps {
   inlineSkillSnapshots?: InlineSkillSnapshotMap;
   reviews?: ReviewNoteDataForDisplay[];
   fileParts?: FilePart[];
+  onDownloadStagedAttachment?: (attachment: DisplayStagedAttachment) => void;
   /** Controls styling: "sent" for full styling, "queued" for muted preview */
   variant: "sent" | "queued";
 }
@@ -36,13 +42,14 @@ const markdownStyles: Record<UserMessageContentProps["variant"], React.CSSProper
     wordBreak: "break-word",
   },
   queued: {
-    color: "var(--color-subtle)",
-    fontFamily: "var(--font-monospace)",
-    fontSize: "12px",
-    lineHeight: "16px",
+    // Queued follow-ups are still user-authored prose, so keep them readable instead of
+    // styling the preview like subdued terminal output.
+    color: "var(--color-text-light)",
+    fontFamily: "inherit",
+    fontSize: "13px",
+    lineHeight: "18px",
     overflowWrap: "break-word",
     wordBreak: "break-word",
-    opacity: 0.9,
   },
 };
 
@@ -98,13 +105,15 @@ const imageStyles = {
 export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => {
   const reviews = props.reviews ?? [];
   const fileParts = props.fileParts ?? [];
+  const parsedStagedNotice = parseStagedAttachmentNotice(props.content);
+  const stagedAttachments = parsedStagedNotice.attachments;
 
   const hasReviews = reviews.length > 0;
 
-  // Strip review tags from text when displaying alongside review blocks
+  // Strip model-only attachment/review tags from text when displaying alongside rich UI blocks.
   const textContent = hasReviews
-    ? props.content.replace(/<review>[\s\S]*?<\/review>\s*/g, "").trim()
-    : props.content;
+    ? parsedStagedNotice.text.replace(/<review>[\s\S]*?<\/review>\s*/g, "").trim()
+    : parsedStagedNotice.text;
 
   // Check if content starts with the command prefix
   const shouldHighlightPrefix =
@@ -144,7 +153,13 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
     const badge = snapshotMarkdown ? (
       <HoverCard openDelay={150}>
         <HoverCardTrigger asChild>
-          <AgentSkillBadge className="cursor-help">{shouldHighlightPrefix}</AgentSkillBadge>
+          <AgentSkillBadge
+            as="button"
+            aria-label={`Show skill preview for ${shouldHighlightPrefix}`}
+            className="cursor-help"
+          >
+            {shouldHighlightPrefix}
+          </AgentSkillBadge>
         </HoverCardTrigger>
         {/* Keep skill preview above chat chrome and fully opaque while hovering. */}
         <HoverCardPortal>
@@ -228,24 +243,19 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
 
                   event.preventDefault();
 
-                  const blobUrl = URL.createObjectURL(blob);
-
                   if (isDesktopMode()) {
                     // In desktop mode, new windows are routed via shell.openExternal.
                     // blob: URLs are tied to this renderer and won't resolve externally,
                     // so download the file in-app instead.
-                    const link = document.createElement("a");
-                    link.href = blobUrl;
-                    link.download =
+                    void downloadBlob(
+                      blob,
                       part.filename ??
-                      (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment");
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                        (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment")
+                    );
                     return;
                   }
 
+                  const blobUrl = URL.createObjectURL(blob);
                   window.open(blobUrl, "_blank", "noopener,noreferrer");
 
                   // Keep the blob URL alive long enough for the new tab to load.
@@ -257,6 +267,28 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
               </a>
             );
           })}
+        </div>
+      )}
+      {stagedAttachments.length > 0 && (
+        <div className={imageContainerStyles[props.variant]}>
+          {stagedAttachments.map((attachment) => (
+            <button
+              key={attachment.stagedPath}
+              type="button"
+              aria-label={`Download ${attachment.filename}`}
+              disabled={!props.onDownloadStagedAttachment}
+              className={`${fileAttachmentStyles[props.variant]} ${
+                props.onDownloadStagedAttachment
+                  ? "cursor-pointer hover:bg-[var(--color-hover)]"
+                  : "cursor-default opacity-70"
+              }`}
+              onClick={() => props.onDownloadStagedAttachment?.(attachment)}
+            >
+              <FileText className="h-4 w-4 shrink-0" />
+              <span className="truncate">{attachment.filename}</span>
+              <span className="text-[var(--color-text-muted)]">{attachment.sizeLabel}</span>
+            </button>
+          ))}
         </div>
       )}
     </>

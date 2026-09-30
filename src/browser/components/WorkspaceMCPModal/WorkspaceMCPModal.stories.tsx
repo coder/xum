@@ -12,6 +12,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 
@@ -48,7 +49,10 @@ const POSTHOG_TOOLS = [
   "experiment-create",
 ];
 
-const PROJECT_MCP_CACHE_KEY = getMCPTestResultsKey(PROJECT_PATH);
+// The modal scopes its tool test cache by workspace (agent-plugins experiment:
+// plugin server keys are stable across worktrees, but tool lists follow each
+// workspace's checkout), so stories must seed the workspace-scoped key.
+const PROJECT_MCP_CACHE_KEY = getMCPTestResultsKey(PROJECT_PATH, WORKSPACE_ID);
 
 interface WorkspaceMCPStoryOptions {
   servers?: Record<string, MCPServerInfo>;
@@ -194,9 +198,6 @@ const meta: Meta<typeof WorkspaceMCPModal> = {
   component: WorkspaceMCPModal,
   parameters: {
     layout: "fullscreen",
-    chromatic: {
-      delay: 500,
-    },
   },
 };
 
@@ -225,12 +226,42 @@ export const WorkspaceMCPNoOverrides: Story = {
   },
 };
 
+// #4297: a server disabled only in the global MCP settings must not be
+// attributed to the project layer.
+export const WorkspaceMCPGlobalDisabledServer: Story = {
+  // Behavioral contract only: WorkspaceMCPProjectDisabledServer already snapshots
+  // this layout, and the Pixel budget has no headroom for a copy-only variant.
+  parameters: { pixel: { exclude: true } },
+  render: () =>
+    renderWorkspaceMCPModal({
+      servers: {
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "global",
+        },
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+
+    await expect(modal.findByText("(disabled globally)")).resolves.toBeInTheDocument();
+    await expect(modal.queryByText(/disabled at project level/i)).not.toBeInTheDocument();
+  },
+};
+
 export const WorkspaceMCPProjectDisabledServer: Story = {
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
         mux: { transport: "stdio", command: "npx -y @anthropics/mux-server", disabled: false },
-        posthog: { transport: "stdio", command: "npx -y posthog-mcp-server", disabled: true },
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "project",
+        },
       },
       testResults: {
         mux: MOCK_TOOLS,
@@ -251,7 +282,12 @@ export const WorkspaceMCPEnabledOverride: Story = {
     renderWorkspaceMCPModal({
       servers: {
         mux: { transport: "stdio", command: "npx -y @anthropics/mux-server", disabled: false },
-        posthog: { transport: "stdio", command: "npx -y posthog-mcp-server", disabled: true },
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "project",
+        },
       },
       workspaceOverrides: {
         enabledServers: ["posthog"],
@@ -328,6 +364,48 @@ export const WorkspaceMCPWithToolAllowlist: Story = {
   },
 };
 
+// #4718: dialog help text must meet WCAG AA (4.5:1). Light is the failing
+// theme for the old token. Disabled rows are dimmed on purpose (WCAG exempts
+// inactive controls), so only enabled rows are measured.
+export const WorkspaceMCPHelpTextContrastLight: Story = {
+  globals: { theme: "light" },
+  // Behavioral contract only: the Pixel budget has no headroom, and the
+  // neighboring stories already snapshot this layout.
+  parameters: { pixel: { exclude: true } },
+  render: () =>
+    renderWorkspaceMCPModal({
+      servers: {
+        "plugin:abc123:echo": {
+          transport: "stdio",
+          command: "bunx echo-mcp",
+          disabled: false,
+          plugin: {
+            pluginName: "hello-plugin",
+            serverName: "echo",
+            sourceScope: "global",
+            sourceLocation: ".xum/plugins/hello-plugin",
+          },
+        },
+        posthog: { transport: "stdio", command: "npx -y posthog-mcp-server", disabled: false },
+      },
+      workspaceOverrides: { toolAllowlist: { posthog: ["docs-search"] } },
+      testResults: { posthog: POSTHOG_TOOLS },
+      preCacheTools: true,
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const helpTexts = [
+      await modal.findByText(/Customize which MCP servers/),
+      await modal.findByText(/^Agent Plugin \(/),
+      await modal.findByText(/1 of 14 tools enabled/),
+      await modal.findByText("Select tools to expose:"),
+    ];
+    for (const helpText of helpTexts) {
+      await expect(textContrast(helpText)).toBeGreaterThanOrEqual(4.5);
+    }
+  },
+};
+
 export const ToolSelectorInteraction: Story = {
   render: () =>
     renderWorkspaceMCPModal({
@@ -394,5 +472,60 @@ export const ToggleServerEnabled: Story = {
     await waitFor(() => {
       return expect(posthogSwitch).toHaveAttribute("aria-checked", "false");
     });
+  },
+};
+
+/**
+ * Agent Plugin provenance with worst-case long names must not overflow the
+ * dialog horizontally — especially at the phone viewport, where an unbroken
+ * token would push the Fetch Tools button past the dialog edge. The play
+ * contract asserts no horizontal overflow at any viewport (the long fixture
+ * name overflows even the desktop max-w-2xl dialog without the min-w-0 fix);
+ * the Pixel phone variant guards the narrow rendering visually.
+ */
+export const WorkspaceMCPPluginServersNarrow: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    ...meta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () =>
+    renderWorkspaceMCPModal({
+      servers: {
+        "plugin:abc123:everything": {
+          transport: "stdio",
+          command: "bunx",
+          disabled: true,
+          plugin: {
+            // No hyphens: hyphenated names wrap naturally, but the name grammar
+            // also allows unbroken alphanumeric/dot tokens, which only wrap when
+            // the layout allows shrinking (min-w-0) and breaking (break-words).
+            pluginName: "extremelylongpluginnamethatkeepsgoingandgoingforawhile0123456789",
+            serverName: "verylongmcpservernamewithmanytokensandthensome",
+            sourceScope: "project",
+            sourceLocation:
+              ".agents/plugins/extremelylongpluginnamethatkeepsgoingandgoingforawhile0123456789",
+          },
+        },
+        mux: { transport: "stdio", command: "npx -y @anthropics/mux-server", disabled: false },
+      },
+      testResults: { mux: MOCK_TOOLS },
+      preCacheTools: true,
+    }),
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const modal = within(dialog);
+
+    await expect(
+      modal.findByText(/\.agents\/plugins\/extremelylongpluginname/)
+    ).resolves.toBeInTheDocument();
+
+    // No horizontal overflow: long unbroken provenance must wrap/break inside
+    // the dialog instead of widening its scrollable content.
+    await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
   },
 };

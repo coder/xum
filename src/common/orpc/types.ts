@@ -4,7 +4,6 @@ import type {
   OnChatCursorSchema,
   OnChatHistoryCursorSchema,
   OnChatModeSchema,
-  OnChatStreamCursorSchema,
 } from "./schemas/stream";
 
 import type {
@@ -13,12 +12,15 @@ import type {
   StreamEndEvent,
   StreamAbortEvent,
   ToolCallStartEvent,
+  ToolCallExecutionStartEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
   AdvisorOutputEvent,
+  AdvisorReasoningOutputEvent,
   AdvisorPhaseEvent,
   BashOutputEvent,
   TaskCreatedEvent,
+  WorkflowRunAttachedEvent,
   ReasoningDeltaEvent,
   ReasoningEndEvent,
   UsageDeltaEvent,
@@ -28,28 +30,37 @@ import type {
 
 export type BranchListResult = z.infer<typeof schemas.BranchListResultSchema>;
 export type SendMessageOptions = z.infer<typeof schemas.SendMessageOptionsSchema>;
+export type HistoryEditPrecondition = z.infer<typeof schemas.HistoryEditPreconditionSchema>;
 
 // Provider types (single source of truth - derived from schemas)
 export type AWSCredentialStatus = z.infer<typeof schemas.AWSCredentialStatusSchema>;
 export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema>;
+export type ProviderModelDiscoveryResult = z.infer<
+  typeof schemas.ProviderModelDiscoveryResultSchema
+>;
 export type ProviderConfigInfo = z.infer<typeof schemas.ProviderConfigInfoSchema>;
 export type ProvidersConfigMap = z.infer<typeof schemas.ProvidersConfigMapSchema>;
 export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderMutationErrorSchema>;
-export type AddCustomOpenAICompatibleProviderInput = z.infer<
-  typeof schemas.providers.addCustomOpenAICompatibleProvider.input
->;
+export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
+/** One held input's display data (see HeldInputsChangedEventSchema). */
+export type HeldInput = Extract<
+  WorkspaceChatMessage,
+  { type: "held-inputs-changed" }
+>["heldInputs"][number];
+export type AcpPromptCorrelation = z.infer<typeof schemas.AcpPromptCorrelationSchema>;
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
-export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;
-export type OnChatStreamCursor = z.infer<typeof OnChatStreamCursorSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
+export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;
 export type OnChatMode = z.infer<typeof OnChatModeSchema>;
+export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReasonSchema>;
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;
 export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema>;
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
+export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
 export type DesktopPrereqStatus = z.infer<typeof schemas.desktop.getPrereqStatus.output>;
 export type ChatMuxMessage = z.infer<typeof schemas.ChatMuxMessageSchema>;
 export type WorkspaceStatsSnapshot = z.infer<typeof schemas.WorkspaceStatsSnapshotSchema>;
@@ -69,8 +80,6 @@ export type PolicyStatus = z.infer<typeof schemas.PolicyStatusSchema>;
 export type PolicySource = z.infer<typeof schemas.PolicySourceSchema>;
 export type EffectivePolicy = z.infer<typeof schemas.EffectivePolicySchema>;
 export type PolicyRuntimeId = z.infer<typeof schemas.PolicyRuntimeIdSchema>;
-export type ExperimentValue = z.infer<typeof schemas.ExperimentValueSchema>;
-
 // Type guards for common chat message variants
 export function isCaughtUpMessage(msg: WorkspaceChatMessage): msg is CaughtUpMessage {
   return (msg as { type?: string }).type === "caught-up";
@@ -104,6 +113,12 @@ export function isToolCallStart(msg: WorkspaceChatMessage): msg is ToolCallStart
   return (msg as { type?: string }).type === "tool-call-start";
 }
 
+export function isToolCallExecutionStart(
+  msg: WorkspaceChatMessage
+): msg is ToolCallExecutionStartEvent {
+  return (msg as { type?: string }).type === "tool-call-execution-start";
+}
+
 export function isToolCallDelta(msg: WorkspaceChatMessage): msg is ToolCallDeltaEvent {
   return (msg as { type?: string }).type === "tool-call-delta";
 }
@@ -116,8 +131,20 @@ export function isAdvisorOutputEvent(msg: WorkspaceChatMessage): msg is AdvisorO
   return (msg as { type?: string }).type === "advisor-output";
 }
 
+export function isAdvisorReasoningOutputEvent(
+  msg: WorkspaceChatMessage
+): msg is AdvisorReasoningOutputEvent {
+  return (msg as { type?: string }).type === "advisor-reasoning-output";
+}
+
 export function isTaskCreatedEvent(msg: WorkspaceChatMessage): msg is TaskCreatedEvent {
   return (msg as { type?: string }).type === "task-created";
+}
+
+export function isWorkflowRunAttachedEvent(
+  msg: WorkspaceChatMessage
+): msg is WorkflowRunAttachedEvent {
+  return (msg as { type?: string }).type === "workflow-run-attached";
 }
 
 export function isAdvisorPhaseEvent(msg: WorkspaceChatMessage): msg is AdvisorPhaseEvent {
@@ -155,6 +182,12 @@ export function isInitOutput(
   return (msg as { type?: string }).type === "init-output";
 }
 
+export function isInitProgress(
+  msg: WorkspaceChatMessage
+): msg is Extract<WorkspaceInitEvent, { type: "init-progress" }> {
+  return msg.type === "init-progress";
+}
+
 export function isInitEnd(
   msg: WorkspaceChatMessage
 ): msg is Extract<WorkspaceInitEvent, { type: "init-end" }> {
@@ -175,6 +208,12 @@ export function isRestoreToInput(
   msg: WorkspaceChatMessage
 ): msg is Extract<WorkspaceChatMessage, { type: "restore-to-input" }> {
   return (msg as { type?: string }).type === "restore-to-input";
+}
+
+export function isHeldInputsChanged(
+  msg: WorkspaceChatMessage
+): msg is Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }> {
+  return (msg as { type?: string }).type === "held-inputs-changed";
 }
 
 export function isStreamLifecycle(msg: WorkspaceChatMessage): msg is StreamLifecycleEvent {

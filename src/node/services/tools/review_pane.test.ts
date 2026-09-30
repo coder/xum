@@ -22,7 +22,7 @@ type UpdateExecArgs = Parameters<
 async function runUpdate(
   tool: ReturnType<typeof createReviewPaneUpdateTool>,
   args: UpdateExecArgs,
-  options: ToolExecutionOptions = mockToolCallOptions
+  options: ToolExecutionOptions<unknown> = mockToolCallOptions
 ): Promise<ReviewPaneUpdateToolResult | { success: false; error: string }> {
   return (await tool.execute!(args, options)) as
     | ReviewPaneUpdateToolResult
@@ -31,7 +31,7 @@ async function runUpdate(
 
 async function runGet(
   tool: ReturnType<typeof createReviewPaneGetTool>,
-  options: ToolExecutionOptions = mockToolCallOptions
+  options: ToolExecutionOptions<unknown> = mockToolCallOptions
 ): Promise<ReviewPaneGetToolResult> {
   return (await tool.execute!({}, options)) as ReviewPaneGetToolResult;
 }
@@ -67,6 +67,104 @@ describe("applyReviewPaneUpdate", () => {
     });
     expect(result.hunks).toHaveLength(1);
     expect(result.hunks[0]?.comment).toBe("refined");
+  });
+
+  it("normalizes execution-relative paths before deduping", () => {
+    const current: AssistedReviewHunk[] = [{ path: "packages/api/src/foo.ts", comment: "old" }];
+    const result = applyReviewPaneUpdate(
+      current,
+      {
+        operation: "add",
+        hunks: [{ path: "src/foo.ts", comment: "new" }],
+      },
+      {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      }
+    );
+
+    expect(result.hunks).toEqual([{ path: "packages/api/src/foo.ts", comment: "new" }]);
+  });
+
+  it("keeps incoming canonical paths distinct from ambiguous fallback pins", () => {
+    const current: AssistedReviewHunk[] = [{ path: "src/foo.ts", comment: "root" }];
+    const result = applyReviewPaneUpdate(
+      current,
+      {
+        operation: "add",
+        hunks: [{ path: "packages/api/src/foo.ts", comment: "scoped" }],
+      },
+      {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      }
+    );
+
+    expect(result.hunks).toEqual([
+      { path: "src/foo.ts", comment: "root" },
+      { path: "packages/api/src/foo.ts", comment: "scoped" },
+    ]);
+  });
+
+  it("prefers exact dedupe keys over fallback keys", () => {
+    const current: AssistedReviewHunk[] = [
+      { path: "packages/api/src/foo.ts", comment: "scoped" },
+      { path: "src/foo.ts", comment: "root" },
+    ];
+    const result = applyReviewPaneUpdate(
+      current,
+      {
+        operation: "add",
+        hunks: [{ path: "packages/api/src/foo.ts", comment: "refined scoped" }],
+      },
+      {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      }
+    );
+
+    expect(result.hunks).toEqual([
+      { path: "packages/api/src/foo.ts", comment: "refined scoped" },
+      { path: "src/foo.ts", comment: "root" },
+    ]);
+  });
+
+  it("does not fallback-dedupe hunks added earlier in the same update", () => {
+    const result = applyReviewPaneUpdate(
+      [],
+      {
+        operation: "add",
+        hunks: [
+          { path: "packages/api/src/foo.ts", comment: "scoped" },
+          { path: "src/foo.ts", comment: "root" },
+        ],
+      },
+      {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      }
+    );
+
+    expect(result.hunks).toEqual([
+      { path: "packages/api/src/foo.ts", comment: "scoped" },
+      { path: "src/foo.ts", comment: "root" },
+    ]);
+  });
+
+  it("keeps project-relative paths outside the execution root canonical", () => {
+    const result = applyReviewPaneUpdate(
+      [],
+      {
+        operation: "replace",
+        hunks: [{ path: "README.md" }, { path: "packages/shared.ts" }],
+      },
+      {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      }
+    );
+
+    expect(result.hunks.map((h) => h.path)).toEqual(["README.md", "packages/shared.ts"]);
   });
 
   it("returns rejected entries for malformed filters", () => {

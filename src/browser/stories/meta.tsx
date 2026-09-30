@@ -12,35 +12,28 @@ import { AppLoader } from "../components/AppLoader/AppLoader";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { SELECTED_WORKSPACE_KEY, UI_THEME_KEY } from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  SELECTED_WORKSPACE_KEY,
+  SIDEBAR_AGE_GROUPING_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
+  UI_THEME_KEY,
+} from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // META CONFIG
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CHROMATIC POLICIES
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /**
- * App-level stories default to single dark mode to minimize Chromatic snapshots.
- * Use CHROMATIC_SMOKE_MODES for explicit dual-theme smoke coverage.
- */
-export const CHROMATIC_SINGLE_MODE = {
-  "dark-desktop": { theme: "dark" },
-} as const;
-
-/**
- * Dual-theme smoke mode — use on one "Smoke" story per retained file
+ * Stories snapshot once by default (dark theme, laptop viewport from
+ * pixel.jsonc). Use PIXEL_DUAL_THEME on one "Smoke" story per retained file
  * to verify both themes render correctly.
  */
-export const CHROMATIC_SMOKE_MODES = {
-  "dark-desktop": { theme: "dark" },
-  "light-desktop": { theme: "light" },
-} as const;
+export const PIXEL_DUAL_THEME = { themes: ["dark", "light"] } as const;
 
-/** Disable snapshots entirely for docs-only or non-visual stories. */
-export const CHROMATIC_DISABLED = { disableSnapshot: true } as const;
+export const PIXEL_DISABLED = { exclude: true } as const;
 
 export const appMeta: Meta<typeof AppLoader> = {
   title: "App",
@@ -54,7 +47,6 @@ export const appMeta: Meta<typeof AppLoader> = {
         { name: "light", value: "#f5f6f8" },
       ],
     },
-    chromatic: { delay: 500, modes: CHROMATIC_SINGLE_MODE },
   },
 };
 
@@ -71,7 +63,6 @@ export const StoryUiShell: FC<{ children: ReactNode }> = (props) => {
 export const lightweightMeta: Meta = {
   parameters: {
     layout: "fullscreen",
-    chromatic: { delay: 200 },
   },
   decorators: [
     (Story) => (
@@ -93,11 +84,34 @@ interface AppWithMocksProps {
 /** Wrapper that runs setup once and passes the client to AppLoader */
 
 function resetStorybookPersistedStateForStory(): void {
-  // Storybook/Chromatic can preserve localStorage across story captures.
+  // Storybook can preserve localStorage across story renders on one origin.
   // Reset persisted state so each story starts from a known route + theme.
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
     localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
+    // Stories that disable sidebar age grouping must not leak the setting
+    // into later stories via the shared localStorage origin.
+    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
+    // The flat chat list story persists sidebarFlatMode; clear it via the
+    // persisted-state helper so a mounted sidebar's subscribed snapshot
+    // observes the reset instead of keeping the flat layout.
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, undefined);
+    // Terminal badge stories seed an enabled badge config; clear it so other
+    // stories with terminals don't render order-dependent badge overlays.
+    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
+    // The timeline dialog story enables the timeline experiment; clear it so
+    // other stories' right-sidebar layouts don't gain an order-dependent tab.
+    // Cleared via the persisted-state helper so mounted experiment subscribers
+    // observe the reset instead of holding a stale snapshot.
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), undefined);
+    // Context-policy stories must not change subsequent stories' automatic behavior.
+    for (const id of [
+      EXPERIMENT_IDS.TOKEN_BUDGET,
+      EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+      EXPERIMENT_IDS.RLM,
+    ]) {
+      updatePersistedState(getExperimentKey(id), undefined);
+    }
   }
 }
 function getStorybookRenderKey(): string | null {

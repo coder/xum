@@ -14,6 +14,11 @@ interface PositionedMenuProps {
   children: React.ReactNode;
   /** Tailwind width class (default: "w-[180px]") */
   className?: string;
+  /**
+   * Keyboard handler for menu-scoped shortcuts. Attached to the popover
+   * content, which receives focus when the menu opens.
+   */
+  onKeyDown?: (e: React.KeyboardEvent) => void;
 }
 
 /**
@@ -24,6 +29,24 @@ interface PositionedMenuProps {
  */
 export function PositionedMenu(props: PositionedMenuProps) {
   const [isPlaced, setIsPlaced] = React.useState(false);
+
+  // Anchor via a Radix virtual ref measured in viewport coordinates instead of
+  // a `position: fixed` <span>. Fixed-position elements resolve against the
+  // nearest transformed ancestor, so a span rendered inside e.g. DialogContent
+  // (centered with translate(-50%,-50%)) landed offset from the cursor. A
+  // virtual rect is consumed by Floating UI directly in viewport space and is
+  // immune to the caller's ancestor transforms.
+  const positionRef = React.useRef(props.position);
+  positionRef.current = props.position;
+  const virtualAnchorRef = React.useRef({
+    getBoundingClientRect: () =>
+      DOMRect.fromRect({
+        x: positionRef.current?.x ?? 0,
+        y: positionRef.current?.y ?? 0,
+        width: 0,
+        height: 0,
+      }),
+  });
 
   // Keep content invisible for one animation frame after opening/repositioning.
   // This gives Radix/Floating UI time to compute final placement and avoids a
@@ -46,19 +69,7 @@ export function PositionedMenu(props: PositionedMenuProps) {
 
   return (
     <Popover open={props.open} onOpenChange={props.onOpenChange}>
-      {props.position && (
-        <PopoverAnchor asChild>
-          <span
-            style={{
-              position: "fixed",
-              left: props.position.x,
-              top: props.position.y,
-              width: 0,
-              height: 0,
-            }}
-          />
-        </PopoverAnchor>
-      )}
+      {props.position && <PopoverAnchor virtualRef={virtualAnchorRef} />}
       <PopoverContent
         align="start"
         side="right"
@@ -66,6 +77,7 @@ export function PositionedMenu(props: PositionedMenuProps) {
         className={cn("min-w-0! bg-surface-primary p-1", props.className ?? "w-[180px]")}
         style={{ visibility: !props.open || isPlaced ? "visible" : "hidden" }}
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={props.onKeyDown}
       >
         {props.children}
       </PopoverContent>
@@ -115,7 +127,9 @@ export function PositionedMenuItem(props: PositionedMenuItemProps) {
         <span className="h-3 w-3 shrink-0 [&_svg]:h-3 [&_svg]:w-3">{props.icon}</span>
         {props.label}
         {props.shortcut && (
-          <span className="text-muted ml-auto text-[10px]">({props.shortcut})</span>
+          <span className="text-muted ml-auto hidden text-[10px] sm:inline">
+            ({props.shortcut})
+          </span>
         )}
       </span>
     </button>

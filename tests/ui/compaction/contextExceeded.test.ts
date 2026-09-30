@@ -17,7 +17,6 @@ import {
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
-import type { APIClient } from "@/browser/contexts/API";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { setupProviders } from "../../ipc/setup";
 
@@ -32,15 +31,11 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
     await cleanupSharedRepo();
   });
 
-  test("auto-compacts when a higher-context model is available", async () => {
+  test("shows manual compaction when no higher-context model is available", async () => {
     await withSharedWorkspace("openai", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      await setupProviders(env, { xai: { apiKey: "dummy" } });
-      const expectedCompactionCommand = "/compact -m xai:grok-4-1-fast";
-
-      const apiClient = env.orpc as unknown as APIClient;
-      const view = renderApp({ apiClient, metadata });
+      const view = renderApp({ apiClient: env.orpc, metadata });
 
       try {
         await setupWorkspaceView(view, metadata, workspaceId);
@@ -68,13 +63,12 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
           },
         });
 
-        // Auto-compaction should trigger automatically when context_exceeded occurs
-        // and a higher-context model suggestion is available.
-        // We assert on the rendered /compact command (from muxMetadata.rawCommand).
+        // GPT-5.6 already has the largest curated context window, so removing
+        // legacy Grok models should leave the explicit manual recovery action.
         await waitFor(
           () => {
-            if (!view.container.textContent?.includes(expectedCompactionCommand)) {
-              throw new Error(`Expected auto-compaction command: ${expectedCompactionCommand}`);
+            if (!view.container.textContent?.includes("Insert /compact")) {
+              throw new Error("Expected manual compaction action");
             }
           },
           { timeout: 30_000 }
@@ -96,8 +90,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
 
       const expectedCompactionCommand = `/compact -m ${KNOWN_MODELS.HAIKU.id}`;
 
-      const apiClient = env.orpc as unknown as APIClient;
-      const view = renderApp({ apiClient, metadata });
+      const view = renderApp({ apiClient: env.orpc, metadata });
 
       try {
         await setupWorkspaceView(view, metadata, workspaceId);

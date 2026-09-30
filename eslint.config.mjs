@@ -7,6 +7,265 @@ import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import tailwindcss from "eslint-plugin-tailwindcss";
 import tseslint from "typescript-eslint";
+import ts from "typescript";
+import path from "node:path";
+
+/**
+ * Shared helpers for the rules ported from anti-slop
+ * (https://github.com/dmmulroy/anti-slop). The common theme: values whose
+ * types are syntactically evident (literals, typed bindings) must not flow
+ * into explicitly broad types (`unknown`, `object`, `Record<string, ...>`)
+ * that discard that evidence — push type information into the compiler
+ * instead of re-deriving it at runtime or re-asserting it later.
+ *
+ * Differences from upstream (which targets oxlint's ESTree): typescript-eslint
+ * does not emit ParenthesizedExpression/TSParenthesizedType nodes, and the
+ * module-level type-alias/interface environment resolution is omitted — it
+ * only adds catches (alias-of-Record etc.), so skipping it cannot introduce
+ * false positives. An AST census (2026-08) showed the omission has zero
+ * effect here: only 4 broad aliases existed repo-wide (UnknownRecord,
+ * LogFields, JsonRecord, MetaRecord), every assertion through them sat on
+ * un-evident values (JSON.parse/fetch results) where the rules stay silent
+ * by design, and upstream's resolution is file-local anyway so cross-file
+ * aliases would remain invisible even with the full port. Revisit only if
+ * broad local aliases become common.
+ */
+
+/**
+ * Unwrap only the transparent wrappers (non-null, satisfies) while keeping
+ * assertions intact — for walks that must see assertion nodes themselves.
+ */
+function unwrapPassthroughWrappers(expression) {
+  let current = expression;
+  while (current.type === "TSNonNullExpression" || current.type === "TSSatisfiesExpression") {
+    current = current.expression;
+  }
+  return current;
+}
+
+/** Unwrap assertion-like wrappers to reach the underlying value expression. */
+function unwrapAssertions(expression) {
+  let current = expression;
+  while (
+    current.type === "TSAsExpression" ||
+    current.type === "TSTypeAssertion" ||
+    current.type === "TSNonNullExpression" ||
+    current.type === "TSSatisfiesExpression"
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+/** Expressions whose type is syntactically established at the use site. */
+function isKnownEvidenceExpression(expression) {
+  const current = unwrapAssertions(expression);
+  return (
+    current.type === "ObjectExpression" ||
+    current.type === "ArrayExpression" ||
+    current.type === "ArrowFunctionExpression" ||
+    current.type === "ClassExpression" ||
+    current.type === "FunctionExpression" ||
+    current.type === "NewExpression" ||
+    current.type === "Literal" ||
+    current.type === "TemplateLiteral" ||
+    current.type === "UnaryExpression"
+  );
+}
+
+function isEmptyObjectExpression(expression) {
+  const current = unwrapAssertions(expression);
+  return current.type === "ObjectExpression" && current.properties.length === 0;
+}
+
+function resolveVariable(sourceCode, identifier) {
+  let scope = sourceCode.getScope(identifier);
+  while (scope !== null) {
+    const variable = scope.set.get(identifier.name);
+    if (variable !== undefined) {
+      return variable;
+    }
+    scope = scope.upper;
+  }
+  return null;
+}
+
+function variableDeclarator(variable) {
+  if (variable.defs.length !== 1) {
+    return null;
+  }
+  const definition = variable.defs[0];
+  return definition.type === "Variable" && definition.node.type === "VariableDeclarator"
+    ? definition.node
+    : null;
+}
+
+/** A `const` binding that is never reassigned after initialization. */
+function isStableConstVariable(variable, declarator) {
+  return (
+    declarator.parent.type === "VariableDeclaration" &&
+    declarator.parent.kind === "const" &&
+    variable.references.every((reference) => reference.init || !reference.isWrite())
+  );
+}
+
+/** True when the expression's type is syntactically known, tracing through stable consts. */
+function hasKnownEvidence(sourceCode, expression, visitedVariables = new Set()) {
+  if (isKnownEvidenceExpression(expression)) {
+    return true;
+  }
+  const unwrapped = unwrapAssertions(expression);
+  if (unwrapped.type !== "Identifier") {
+    return false;
+  }
+  const variable = resolveVariable(sourceCode, unwrapped);
+  if (variable === null || visitedVariables.has(variable)) {
+    return false;
+  }
+  const declarator = variableDeclarator(variable);
+  if (
+    declarator === null ||
+    declarator.init === null ||
+    !isStableConstVariable(variable, declarator)
+  ) {
+    return false;
+  }
+  visitedVariables.add(variable);
+  return hasKnownEvidence(sourceCode, declarator.init, visitedVariables);
+}
+
+const TRANSPARENT_TYPE_WRAPPERS = new Set(["Readonly", "Partial", "Required", "NonNullable"]);
+
+function typeReferenceName(type) {
+  return type.type === "TSTypeReference" && type.typeName.type === "Identifier"
+    ? type.typeName.name
+    : null;
+}
+
+function typeArgumentsOf(typeReference) {
+  // typescript-eslint v8 uses typeArguments; older versions used typeParameters.
+  return (typeReference.typeArguments ?? typeReference.typeParameters)?.params ?? [];
+}
+
+function unwrapReadonlyOperator(type) {
+  let current = type;
+  while (current.type === "TSTypeOperator" && current.operator === "readonly") {
+    current = current.typeAnnotation;
+  }
+  return current;
+}
+
+/**
+ * Classify explicitly broad target types that discard evidence when a known
+ * value flows into them. Returns a human-readable kind or null.
+ */
+function classifyWideningTarget(type) {
+  const unwrapped = unwrapReadonlyOperator(type);
+  if (unwrapped.type === "TSUnknownKeyword") {
+    return "unknown";
+  }
+  if (unwrapped.type === "TSObjectKeyword") {
+    return "object";
+  }
+  if (unwrapped.type === "TSTypeLiteral") {
+    // Upstream also classifies non-empty literals without an index signature
+    // ("anonymous object"), but inline object annotations are idiomatic here
+    // (296 prod sites) and the assertion case is already restricted by
+    // @typescript-eslint/consistent-type-assertions, so we treat them as safe.
+    return unwrapped.members.some((member) => member.type === "TSIndexSignature")
+      ? "open dictionary"
+      : null;
+  }
+  if (unwrapped.type === "TSMappedType") {
+    return "open dictionary";
+  }
+  const name = typeReferenceName(unwrapped);
+  if (name === null) {
+    return null;
+  }
+  if (TRANSPARENT_TYPE_WRAPPERS.has(name)) {
+    const [inner] = typeArgumentsOf(unwrapped);
+    return inner === undefined ? null : classifyWideningTarget(inner);
+  }
+  return name === "Record" ? "open dictionary" : null;
+}
+
+function isBroadRecordKeyType(type) {
+  if (
+    type.type === "TSStringKeyword" ||
+    type.type === "TSNumberKeyword" ||
+    type.type === "TSSymbolKeyword"
+  ) {
+    return true;
+  }
+  if (type.type === "TSUnionType") {
+    return type.types.every(isBroadRecordKeyType);
+  }
+  return typeReferenceName(type) === "PropertyKey";
+}
+
+function isUnknownOrAnyType(type) {
+  return type.type === "TSUnknownKeyword" || type.type === "TSAnyKeyword";
+}
+
+/** `Record<broad-key, unknown|any>` or an index-signature-only literal of the same shape. */
+function isBroadRecordType(type) {
+  const unwrapped = unwrapReadonlyOperator(type);
+  const name = typeReferenceName(unwrapped);
+  if (name === "Readonly") {
+    const [inner] = typeArgumentsOf(unwrapped);
+    return inner !== undefined && isBroadRecordType(inner);
+  }
+  if (name === "Record") {
+    const parameters = typeArgumentsOf(unwrapped);
+    return (
+      parameters.length === 2 &&
+      isBroadRecordKeyType(parameters[0]) &&
+      isUnknownOrAnyType(parameters[1])
+    );
+  }
+  if (unwrapped.type !== "TSTypeLiteral" || unwrapped.members.length !== 1) {
+    return false;
+  }
+  const [member] = unwrapped.members;
+  return (
+    member.type === "TSIndexSignature" &&
+    member.parameters.length === 1 &&
+    isBroadRecordKeyType(member.parameters[0].typeAnnotation.typeAnnotation) &&
+    isUnknownOrAnyType(member.typeAnnotation.typeAnnotation)
+  );
+}
+
+/** Broad-type kinds used by no-widen-then-assert. */
+function broadTypeKind(type) {
+  const unwrapped = unwrapReadonlyOperator(type);
+  if (unwrapped.type === "TSUnknownKeyword" || unwrapped.type === "TSAnyKeyword") {
+    return "top";
+  }
+  if (unwrapped.type === "TSObjectKeyword") {
+    return "object";
+  }
+  return isBroadRecordType(unwrapped) ? "record" : null;
+}
+
+const FUNCTION_BOUNDARY_TYPES = new Set([
+  "ArrowFunctionExpression",
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "TSDeclareFunction",
+  "TSEmptyBodyFunctionExpression",
+]);
+
+function functionBoundary(node) {
+  let current = node.parent;
+  while (current != null && current.type !== "Program") {
+    if (FUNCTION_BOUNDARY_TYPES.has(current.type)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
 
 /**
  * Custom ESLint plugin for safe Node.js patterns
@@ -14,6 +273,95 @@ import tseslint from "typescript-eslint";
  */
 const localPlugin = {
   rules: {
+    "no-required-member-typeof-guard": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            'Disallow `typeof x.member === "function"` guards on members the type declares as required methods',
+        },
+        messages: {
+          required:
+            "`{{member}}` is a required method of `{{owner}}`, so this typeof guard can only fire for an incomplete test double. Complete the double (or make the member optional in the interface if it really is optional).",
+        },
+      },
+      create(context) {
+        // Production code gets real instances through DI; a typeof guard on a member the type
+        // requires is dead there and hides wiring bugs by silently skipping work. Such guards
+        // kept reappearing to tolerate partial test doubles (#4531, #4557).
+        const services = context.sourceCode.parserServices;
+        if (services?.program == null || services.esTreeNodeToTSNodeMap == null) {
+          return {};
+        }
+        const checker = services.program.getTypeChecker();
+        const isAlwaysCallable = (type) => {
+          const parts = type.isUnion() ? type.types : [type];
+          return parts.every(
+            (part) =>
+              (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) ===
+                0 && part.getCallSignatures().length > 0
+          );
+        };
+        return {
+          BinaryExpression(node) {
+            if (!["===", "!==", "==", "!="].includes(node.operator)) return;
+            const typeofSide = node.left.type === "UnaryExpression" ? node.left : node.right;
+            const literalSide = typeofSide === node.left ? node.right : node.left;
+            if (typeofSide.type !== "UnaryExpression" || typeofSide.operator !== "typeof") return;
+            if (literalSide.type !== "Literal" || literalSide.value !== "function") return;
+            const member = typeofSide.argument;
+            if (
+              member.type !== "MemberExpression" ||
+              member.computed ||
+              member.optional ||
+              member.property.type !== "Identifier"
+            ) {
+              return;
+            }
+            // Only injected dependencies (`this.<dep>[.<dep>...].<method>`): feature detection on
+            // runtime/library objects (timers, fetch, streams) stays legitimate.
+            // Also covers the widening-cast alias `const maybe = this.<dep> as Dep & { m?: ... }`.
+            const isThisRooted = (expression) => {
+              let current = expression;
+              while (current.type === "MemberExpression" && !current.computed) {
+                current = current.object;
+              }
+              return current.type === "ThisExpression" && expression.type !== "ThisExpression";
+            };
+            let receiverRooted = isThisRooted(member.object);
+            if (!receiverRooted && member.object.type === "Identifier") {
+              const variable = context.sourceCode
+                .getScope(node)
+                .references.concat(context.sourceCode.getScope(node).through)
+                .find((reference) => reference.identifier === member.object)?.resolved;
+              const init = variable?.defs[0]?.node?.init;
+              receiverRooted = init?.type === "TSAsExpression" && isThisRooted(init.expression);
+            }
+            if (!receiverRooted) return;
+            const objectType = checker.getTypeAtLocation(
+              services.esTreeNodeToTSNodeMap.get(member.object)
+            );
+            // Untyped or loose receivers (any/unknown/index signatures) make the check meaningful.
+            if (objectType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return;
+            const symbol = checker.getPropertyOfType(objectType, member.property.name);
+            if (symbol == null || (symbol.flags & ts.SymbolFlags.Optional) !== 0) return;
+            const memberType = checker.getTypeOfSymbolAtLocation(
+              symbol,
+              services.esTreeNodeToTSNodeMap.get(member.property)
+            );
+            if (!isAlwaysCallable(memberType)) return;
+            context.report({
+              node,
+              messageId: "required",
+              data: {
+                member: member.property.name,
+                owner: checker.typeToString(objectType),
+              },
+            });
+          },
+        };
+      },
+    },
     "no-unsafe-child-process": {
       meta: {
         type: "problem",
@@ -192,6 +540,713 @@ const localPlugin = {
         };
       },
     },
+    "no-clear-dom-global": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow clearing DOM globals (globalThis.window = undefined) in tests",
+        },
+        messages: {
+          clear:
+            "Clearing globalThis.{{name}} leaks into every later test file in the same bun process: tests/ui/dom installs the DOM globals only once per process (#5084). Call saveDomGlobals() from tests/ui/domGlobals in beforeEach, before replacing them, and restoreDomGlobals() in afterEach.",
+        },
+      },
+      create(context) {
+        // Must match DOM_GLOBAL_KEYS in tests/ui/domGlobals.ts (scripts/noClearDomGlobal.test.ts
+        // checks that every key there is reported).
+        const DOM_GLOBALS = new Set([
+          "window",
+          "document",
+          "navigator",
+          "localStorage",
+          "CustomEvent",
+          "DocumentFragment",
+          "Element",
+          "HTMLInputElement",
+          "HTMLElement",
+          "NodeFilter",
+          "Node",
+          "Image",
+          "requestAnimationFrame",
+          "cancelAnimationFrame",
+          "getComputedStyle",
+          "ResizeObserver",
+          "IntersectionObserver",
+          "MutationObserver",
+        ]);
+        const unwrap = (node) => {
+          while (
+            node.type === "TSAsExpression" ||
+            node.type === "TSTypeAssertion" ||
+            node.type === "TSNonNullExpression" ||
+            node.type === "TSSatisfiesExpression"
+          ) {
+            node = node.expression;
+          }
+          return node;
+        };
+        // Returns the DOM global name for `globalThis.X` / `(globalThis as T).X` / `global["X"]`.
+        const domGlobalName = (member) => {
+          if (member.type !== "MemberExpression") {
+            return null;
+          }
+          const object = unwrap(member.object);
+          if (object.type !== "Identifier" || !["globalThis", "global"].includes(object.name)) {
+            return null;
+          }
+          const name = member.computed
+            ? member.property.type === "Literal"
+              ? member.property.value
+              : null
+            : member.property.name;
+          return DOM_GLOBALS.has(name) ? name : null;
+        };
+        // `delete globalThis.X` is not reported: tests also use it to put back a global that
+        // was absent before (`if (original) { restore } else { delete }`), and telling the
+        // two apart needs flow analysis.
+        const isUndefined = (node) => {
+          node = unwrap(node);
+          return (
+            (node.type === "Identifier" && node.name === "undefined") ||
+            (node.type === "UnaryExpression" && node.operator === "void")
+          );
+        };
+        return {
+          AssignmentExpression(node) {
+            const name = domGlobalName(node.left);
+            if (node.operator === "=" && name != null && isUndefined(node.right)) {
+              context.report({ node, messageId: "clear", data: { name } });
+            }
+          },
+        };
+      },
+    },
+    "require-module-mock-restore": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Require every bun `mock.module` registration in a test to be restored after the suite",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative test path -> specifiers whose mock may stay unrestored.
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          unrestored:
+            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module. Restores that may not run (conditional, in helpers passed as values, in `afterEach` of an all-skipped suite) or come from a mutated list do not count.',
+          dynamicSpecifier:
+            "mock.module needs a statically known specifier (a string literal, a `const` string, or a loop over a `const` array of them) so its restore can be verified.",
+        },
+      },
+      create(context) {
+        // bun registers mock.module process-wide and never unregisters it, so a mock silently
+        // replaces the module for every test file that runs later in the same shard, whether it
+        // was registered at file scope, from a hook, a test body or a helper. That made
+        // unrelated suites fail only for certain CI shard orders (#4524, #3359, #4639).
+        //
+        // A registration is a restore when it runs only from teardown: inside an
+        // `afterAll`/`afterEach` callback, or inside a same-file function whose every use is a
+        // call from teardown code (or its registration as the hook callback itself). A helper
+        // that setup code also calls is an installer. `restoreModulesAfterSuite` entries are
+        // restores too. A restore covers installs in the `describe` block (or file) its hook
+        // runs in, including nested blocks; load-time installs run before every test, so any
+        // restore that runs covers them. Skipped suites and never-called helpers do not run.
+        // This is a flow-insensitive lint heuristic for the repo's idioms, not a proof, so it
+        // errs in one direction (#4660): installs over-approximate and restores
+        // under-approximate (a restore that may not run, or may not cover a specifier, counts
+        // as none).
+        const allowed = new Set(
+          context.options[0]?.allow?.[
+            path.relative(context.cwd, context.filename).split(path.sep).join("/")
+          ] ?? []
+        );
+        const RESTORE_HOOKS = new Set(["afterAll", "afterEach"]);
+        const { sourceCode } = context;
+        const mockCalls = [];
+        const restoreListCalls = [];
+        const allCalls = [];
+        const exitStatements = [];
+
+        const isFunctionNode = (node) =>
+          node?.type === "ArrowFunctionExpression" ||
+          node?.type === "FunctionExpression" ||
+          node?.type === "FunctionDeclaration";
+        const isMockModuleCall = (node) =>
+          node.callee.type === "MemberExpression" &&
+          !node.callee.computed &&
+          node.callee.object.type === "Identifier" &&
+          node.callee.object.name === "mock" &&
+          node.callee.property.type === "Identifier" &&
+          node.callee.property.name === "module";
+        const unwrapTypeAssertions = (node) => {
+          let current = node;
+          while (current?.type === "TSAsExpression" || current?.type === "TSSatisfiesExpression") {
+            current = current.expression;
+          }
+          return current;
+        };
+        const findVariable = (identifier) => {
+          for (let scope = sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (variable) {
+              return variable;
+            }
+          }
+          return null;
+        };
+        // Only the real helper registers an afterAll; a local look-alike does not.
+        const isRestoreListHelper = (callee) => {
+          const def = callee.type === "Identifier" ? findVariable(callee)?.defs[0] : null;
+          return (
+            callee.name === "restoreModulesAfterSuite" &&
+            def?.type === "ImportBinding" &&
+            String(def.parent.source.value).endsWith("/moduleMocks")
+          );
+        };
+        // A loop leaves the elements alone when it destructures each one
+        // (`for (const [p, real] of entries)`) or never reaches into or hands off its variable
+        // except to mock.module; `for (const entry of entries) entry[0] = "b"` rewrites the list.
+        const loopKeepsElements = (loop) => {
+          const declarator =
+            loop.left.type === "VariableDeclaration" ? loop.left.declarations[0] : null;
+          if (declarator?.id.type === "ArrayPattern") {
+            return declarator.id.elements.every((e) => e == null || e.type === "Identifier");
+          }
+          return (
+            declarator?.id.type === "Identifier" &&
+            sourceCode.getDeclaredVariables(declarator)[0].references.every(({ identifier }) => {
+              const parent = identifier.parent;
+              return parent.type === "CallExpression" || parent.type === "NewExpression"
+                ? isMockModuleCall(parent) && parent.arguments[0] === identifier
+                : !(parent.type === "MemberExpression" && parent.object === identifier);
+            })
+          );
+        };
+        // A `const` array still holds its literal elements only when every use reads it
+        // whole: looping over it, spreading it into a copy, or handing it to
+        // restoreModulesAfterSuite. Any other use (`entries.length = 0`, `.push`, passing it
+        // elsewhere, exporting it) may change what it holds by the time it is read.
+        const isSealedArray = (variable) =>
+          variable.defs[0].parent.parent?.type !== "ExportNamedDeclaration" &&
+          variable.references.every((reference) => {
+            if (reference.init) {
+              return true;
+            }
+            let node = reference.identifier;
+            while (
+              node.parent.type === "TSAsExpression" ||
+              node.parent.type === "TSSatisfiesExpression" ||
+              node.parent.type === "TSNonNullExpression"
+            ) {
+              node = node.parent;
+            }
+            const parent = node.parent;
+            return (
+              (parent.type === "ForOfStatement" &&
+                parent.right === node &&
+                loopKeepsElements(parent)) ||
+              (parent.type === "SpreadElement" && parent.parent.type === "ArrayExpression") ||
+              (parent.type === "CallExpression" &&
+                parent.arguments[0] === node &&
+                isRestoreListHelper(parent.callee))
+            );
+          });
+        // Element nodes of a statically known array: an array literal (spreads of other known
+        // arrays included) or a sealed `const` bound to one.
+        const resolveArrayElements = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Identifier") {
+            const variable = findVariable(node);
+            const def = variable?.defs[0];
+            return def?.type === "Variable" &&
+              def.parent.kind === "const" &&
+              isSealedArray(variable)
+              ? resolveArrayElements(def.node.init, depth + 1)
+              : null;
+          }
+          if (node.type !== "ArrayExpression") {
+            return null;
+          }
+          const elements = [];
+          for (const element of node.elements) {
+            if (element?.type === "SpreadElement") {
+              const spread = resolveArrayElements(element.argument, depth + 1);
+              if (spread == null) {
+                return null;
+              }
+              elements.push(...spread);
+            } else if (element != null) {
+              elements.push(element);
+            }
+          }
+          return elements;
+        };
+        // Every specifier string an expression can evaluate to, or null when not static. Covers
+        // literals, `const` strings, and loop variables over known arrays (`for (const p of
+        // PATHS)`, `for (const [p, exports] of realModules)`), so looped installs and restores
+        // stay checkable.
+        const resolveSpecifiers = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Literal") {
+            return typeof node.value === "string" ? [node.value] : null;
+          }
+          if (node.type === "TemplateLiteral") {
+            return node.expressions.length === 0 ? [node.quasis[0].value.cooked] : null;
+          }
+          if (node.type !== "Identifier") {
+            return null;
+          }
+          const def = findVariable(node)?.defs[0];
+          if (def?.type !== "Variable") {
+            return null;
+          }
+          const declarator = def.node;
+          const declaration = def.parent;
+          if (
+            declaration.parent?.type === "ForOfStatement" &&
+            declaration.parent.left === declaration
+          ) {
+            const elements = resolveArrayElements(declaration.parent.right, depth + 1);
+            if (elements == null) {
+              return null;
+            }
+            let pick;
+            if (declarator.id.type === "Identifier") {
+              pick = (element) => element;
+            } else if (
+              declarator.id.type === "ArrayPattern" &&
+              declarator.id.elements[0]?.type === "Identifier" &&
+              declarator.id.elements[0].name === node.name
+            ) {
+              pick = (element) => (element.type === "ArrayExpression" ? element.elements[0] : null);
+            } else {
+              return null;
+            }
+            const specifiers = [];
+            for (const element of elements) {
+              const resolved = resolveSpecifiers(pick(element), depth + 1);
+              if (resolved == null) {
+                return null;
+              }
+              specifiers.push(...resolved);
+            }
+            return specifiers;
+          }
+          return declaration.kind === "const" && declarator.id.type === "Identifier"
+            ? resolveSpecifiers(declarator.init, depth + 1)
+            : null;
+        };
+        const getCalleeRootName = (callee) => {
+          let current = callee;
+          while (current.type === "MemberExpression" || current.type === "CallExpression") {
+            current = current.type === "MemberExpression" ? current.object : current.callee;
+          }
+          return current.type === "Identifier" ? current.name : null;
+        };
+        const SUITE_CALLS = new Set(["describe", "xdescribe"]);
+        const HOOK_CALLS = new Set(["beforeAll", "beforeEach", "afterAll", "afterEach"]);
+        const TEST_CALLS = new Set(["test", "it", "xtest", "xit"]);
+        // Whether the callee chain uses one of `names`, e.g. `test.skip.each(rows)(...)`.
+        const calleeUses = (call, names) => {
+          for (
+            let callee = call.callee;
+            callee.type === "MemberExpression" || callee.type === "CallExpression";
+            callee = callee.type === "MemberExpression" ? callee.object : callee.callee
+          ) {
+            if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              callee.property.type === "Identifier" &&
+              names.has(callee.property.name)
+            ) {
+              return true;
+            }
+          }
+          return false;
+        };
+        const SKIP_MODIFIERS = new Set(["skip", "todo"]);
+        const CONDITIONAL_MODIFIERS = new Set(["if", "skipIf", "todoIf"]);
+        // `describe.skip(...)`, `test.todo(...)`, `xit(...)`: the callback never runs.
+        const isSkippedCall = (call) =>
+          getCalleeRootName(call.callee)?.startsWith("x") || calleeUses(call, SKIP_MODIFIERS);
+        const isFunctionContext = (node) => isFunctionNode(node) || node.type === "Program";
+        const enclosingContext = (node) =>
+          sourceCode.getAncestors(node).findLast((ancestor) => isFunctionContext(ancestor));
+        // The function a variable names: `function f() {}` or `const f = () => {}`.
+        const functionOfVariable = (variable) => {
+          const def = variable?.defs[0];
+          if (def?.type === "FunctionName") {
+            return def.node;
+          }
+          return def?.type === "Variable" && isFunctionNode(def.node.init) ? def.node.init : null;
+        };
+        const variableOfFunction = (fn) => {
+          const id =
+            fn.type === "FunctionDeclaration"
+              ? fn.id
+              : fn.parent?.type === "VariableDeclarator"
+                ? fn.parent.id
+                : null;
+          return id?.type === "Identifier" ? findVariable(id) : null;
+        };
+        const suiteIsWithin = (inner, outer) =>
+          outer === null ||
+          (inner !== null && outer.range[0] <= inner.range[0] && inner.range[1] <= outer.range[1]);
+        const LOOPS = new Set([
+          "ForStatement",
+          "ForInStatement",
+          "ForOfStatement",
+          "WhileStatement",
+          "DoWhileStatement",
+        ]);
+        // Whether `node` can be skipped while its enclosing function runs: it sits in a branch
+        // (`if (p === "a") mock.module(p, ...)` in a loop), a return/throw precedes it, or a
+        // return/throw/break/continue sits in a loop around it.
+        const runsConditionally = (node) => {
+          const fn = enclosingContext(node);
+          const loops = [];
+          for (let child = node; child !== fn; child = child.parent) {
+            const parent = child.parent;
+            if (
+              (parent.type === "IfStatement" && parent.test !== child) ||
+              (parent.type === "ConditionalExpression" && parent.test !== child) ||
+              (parent.type === "LogicalExpression" && parent.right === child) ||
+              (parent.type === "SwitchCase" && parent.test !== child) ||
+              parent.type === "CatchClause"
+            ) {
+              return true;
+            }
+            if (LOOPS.has(parent.type)) {
+              loops.push(parent);
+            }
+          }
+          return exitStatements.some(
+            (exit) =>
+              enclosingContext(exit) === fn &&
+              (loops.some((loop) => suiteIsWithin(exit, loop)) ||
+                ((exit.type === "ReturnStatement" || exit.type === "ThrowStatement") &&
+                  exit.range[0] < node.range[0]))
+          );
+        };
+
+        // Whether bun surely skips every test of `suite` (a describe callback, or null for the
+        // file), so its `afterEach` hooks never run: its body registers at least one test and
+        // every test it registers is skip/todo (or `.each([])`), counting inline nested suites.
+        // Anything the rule cannot see (other calls that may register tests, describe callbacks
+        // passed by name, aliased test functions) means tests may run.
+        const isEmptyEach = (call) =>
+          (call.callee.type === "MemberExpression" &&
+            !call.callee.computed &&
+            call.callee.property.name === "each" &&
+            call.arguments[0]?.type === "ArrayExpression" &&
+            call.arguments[0].elements.length === 0) ||
+          (call.callee.type === "CallExpression" && isEmptyEach(call.callee));
+        const allTestsSkipped = (suite) => {
+          const body = suite ?? sourceCode.ast;
+          let sawTest = false;
+          for (const call of allCalls) {
+            if (enclosingContext(call) !== body) {
+              continue;
+            }
+            const root = getCalleeRootName(call.callee);
+            if (TEST_CALLS.has(root)) {
+              if (!isSkippedCall(call) && !isEmptyEach(call)) {
+                return false;
+              }
+              sawTest = true;
+            } else if (SUITE_CALLS.has(root)) {
+              const callback = call.arguments.find((argument) => isFunctionNode(argument));
+              if (!isSkippedCall(call) && (callback == null || !allTestsSkipped(callback))) {
+                return false;
+              }
+            } else if (!HOOK_CALLS.has(root) && root !== "mock") {
+              return false;
+            }
+          }
+          return sawTest;
+        };
+
+        // Where a function (or the Program) runs:
+        // - suites: the `describe` callbacks (null = the whole file) whose tests execute it; empty
+        //   when it never runs (skipped suites, dead helpers). Hooks registered here join them;
+        // - atLoad: it runs while the file evaluates, before any test;
+        // - scoped: the suites whose hooks or tests run it (installs there need a restore in
+        //   that suite or an enclosing one);
+        // - teardown: it runs only from `afterAll`/`afterEach`;
+        // - sure: the suites it surely runs in, so restores there count. Conditional call
+        //   sites, values passed around, and `afterEach` of an all-skipped suite add none.
+        // Named helpers take the union over their call sites, resolved by binding, so a helper
+        // that setup code also calls is not teardown and its installs belong to every suite and
+        // context that calls it. Restoring once suffices, so any sure site makes it sure.
+        const contextInfo = new Map();
+        const NEVER = {
+          suites: new Set(),
+          atLoad: false,
+          scoped: new Set(),
+          teardown: false,
+          sure: new Set(),
+        };
+        const infoOf = (fn) => {
+          const known = contextInfo.get(fn);
+          if (known) {
+            return known;
+          }
+          contextInfo.set(fn, NEVER); // cycle guard
+          const info = computeInfo(fn);
+          contextInfo.set(fn, info);
+          return info;
+        };
+        const sureAt = (node, info) => (runsConditionally(node) ? new Set() : info.sure);
+        // `fn` registered as the callback of a describe/hook/test `call`.
+        const callbackInfo = (call, fn) => {
+          const owner = getCalleeRootName(call.callee);
+          const outer = infoOf(enclosingContext(call));
+          if (isSkippedCall(call) || outer.suites.size === 0) {
+            return NEVER;
+          }
+          const sure = calleeUses(call, CONDITIONAL_MODIFIERS) ? new Set() : sureAt(call, outer);
+          if (SUITE_CALLS.has(owner)) {
+            return {
+              ...NEVER,
+              suites: new Set([fn]),
+              atLoad: true,
+              sure: new Set(sure.size ? [fn] : []),
+            };
+          }
+          return {
+            ...NEVER,
+            suites: outer.suites,
+            scoped: outer.suites,
+            teardown: RESTORE_HOOKS.has(owner),
+            sure: new Set(
+              [...sure].filter((suite) => owner !== "afterEach" || !allTestsSkipped(suite))
+            ),
+          };
+        };
+        const isCallbackOf = (call, node) =>
+          call?.type === "CallExpression" &&
+          call.arguments.includes(node) &&
+          [SUITE_CALLS, HOOK_CALLS, TEST_CALLS].some((calls) =>
+            calls.has(getCalleeRootName(call.callee))
+          );
+        const computeInfo = (fn) => {
+          if (fn.type === "Program") {
+            return { ...NEVER, suites: new Set([null]), atLoad: true, sure: new Set([null]) };
+          }
+          if (isCallbackOf(fn.parent, fn)) {
+            return callbackInfo(fn.parent, fn);
+          }
+          const variable = variableOfFunction(fn);
+          const reads = variable?.references.filter((reference) => reference.isRead()) ?? [];
+          if (reads.length === 0) {
+            // Anonymous callbacks and IIFEs run wherever their enclosing code runs; an unused
+            // named function never runs.
+            if (variable) {
+              return NEVER;
+            }
+            const enclosing = infoOf(enclosingContext(fn));
+            return { ...enclosing, sure: sureAt(fn, enclosing) };
+          }
+          const info = {
+            ...NEVER,
+            suites: new Set(),
+            scoped: new Set(),
+            teardown: true,
+            sure: new Set(),
+          };
+          for (const reference of reads) {
+            const identifier = reference.identifier;
+            const parent = identifier.parent;
+            let site;
+            if (parent.type === "CallExpression" && parent.callee === identifier) {
+              const caller = infoOf(enclosingContext(parent));
+              site = { ...caller, sure: sureAt(parent, caller) };
+            } else if (isCallbackOf(parent, identifier)) {
+              // `beforeEach(install)` / `afterEach(restore)` / `describe("x", suiteBody)`.
+              site = callbackInfo(parent, fn);
+            } else if (infoOf(enclosingContext(identifier)).suites.size === 0) {
+              site = NEVER; // referenced only from code that never runs
+            } else {
+              // Stored or passed to another API: it may run anywhere, even after a suite's
+              // restore, so only a file-scope restore covers its installs.
+              site = { ...NEVER, suites: new Set([null]), scoped: new Set([null]) };
+            }
+            site.suites.forEach((suite) => info.suites.add(suite));
+            site.scoped.forEach((suite) => info.scoped.add(suite));
+            site.sure.forEach((suite) => info.sure.add(suite));
+            info.atLoad ||= site.atLoad;
+            info.teardown &&= site.teardown;
+          }
+          return info;
+        };
+
+        return {
+          CallExpression(node) {
+            allCalls.push(node);
+            if (
+              node.callee.type === "Identifier" &&
+              node.callee.name === "restoreModulesAfterSuite"
+            ) {
+              if (isRestoreListHelper(node.callee)) {
+                restoreListCalls.push(node);
+              }
+              return;
+            }
+            if (isMockModuleCall(node)) {
+              mockCalls.push(node);
+            }
+          },
+          "ReturnStatement, ThrowStatement, BreakStatement, ContinueStatement"(node) {
+            exitStatements.push(node);
+          },
+          "Program:exit"() {
+            const restores = [];
+            for (const node of restoreListCalls) {
+              const specifiers = new Set();
+              for (const entry of resolveArrayElements(node.arguments[0]) ?? []) {
+                if (entry.type === "ArrayExpression") {
+                  (resolveSpecifiers(entry.elements[0]) ?? []).forEach((s) => specifiers.add(s));
+                }
+              }
+              // It registers an `afterAll` in each suite its call surely runs in.
+              restores.push({ specifiers, suites: sureAt(node, infoOf(enclosingContext(node))) });
+            }
+            const installs = [];
+            for (const node of mockCalls) {
+              const info = infoOf(enclosingContext(node));
+              const specifiers = resolveSpecifiers(node.arguments[0]);
+              if (info.teardown) {
+                restores.push({
+                  specifiers: new Set(specifiers ?? []),
+                  suites: sureAt(node, info),
+                });
+              } else if (info.suites.size === 0) {
+                // Never runs (skipped suite, uncalled helper): nothing to restore or resolve.
+              } else if (specifiers == null) {
+                context.report({ node, messageId: "dynamicSpecifier" });
+              } else {
+                installs.push({ node, specifiers, info });
+              }
+            }
+            for (const { node, specifiers, info } of installs) {
+              for (const specifier of specifiers) {
+                const matching = restores.filter(
+                  (restore) => restore.specifiers.has(specifier) && restore.suites.size > 0
+                );
+                // A load-time install precedes every test, so any restore that runs covers it.
+                // Each suite whose hooks or tests install needs a restore in it or an enclosing
+                // suite. A helper called from both contexts must satisfy both.
+                const covered =
+                  (!info.atLoad || matching.length > 0) &&
+                  [...info.scoped].every((suite) =>
+                    matching.some((restore) =>
+                      [...restore.suites].some((outer) => suiteIsWithin(suite, outer))
+                    )
+                  );
+                if (!covered && !allowed.has(specifier)) {
+                  context.report({ node, messageId: "unrestored", data: { specifier } });
+                }
+              }
+            }
+          },
+        };
+      },
+    },
+    "no-direct-web-storage": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow direct localStorage/sessionStorage access outside the persisted-state helpers",
+        },
+        messages: {
+          direct:
+            "Do not access {{name}} directly. Use the persisted-state helpers in src/browser/hooks/usePersistedState.ts: every write must go through the shared write path, which evicts caches on quota errors and enforces the key registry.",
+        },
+      },
+      create(context) {
+        // localStorage is one ~5 MB origin quota shared by every feature. Direct access bypassed
+        // the key registry and filled the quota (drafts stopped persisting), so all access goes
+        // through usePersistedState.ts. A local variable or parameter named `storage` is fine.
+        const STORAGE_GLOBALS = new Set(["localStorage", "sessionStorage"]);
+        const GLOBAL_OBJECTS = new Set(["window", "globalThis", "self"]);
+        const report = (node, name) =>
+          context.report({ node, messageId: "direct", data: { name } });
+        const memberName = (node) => {
+          if (!node.computed && node.property.type === "Identifier") return node.property.name;
+          if (node.computed && node.property.type === "Literal") return node.property.value;
+          return null;
+        };
+        // `const { localStorage } = window` reads the property without a MemberExpression, and the
+        // new binding has a declaration, so the reference check below would not see it.
+        // `window as Window`, `window!` and `window satisfies ...` still name the global object.
+        const checkDestructuring = (pattern, rawSource) => {
+          const source = rawSource ? unwrapAssertions(rawSource) : rawSource;
+          if (pattern.type !== "ObjectPattern" || source?.type !== "Identifier") return;
+          if (!GLOBAL_OBJECTS.has(source.name)) return;
+          for (const property of pattern.properties) {
+            if (property.type !== "Property") continue;
+            const name =
+              !property.computed && property.key.type === "Identifier"
+                ? property.key.name
+                : property.key.type === "Literal"
+                  ? property.key.value
+                  : null;
+            if (STORAGE_GLOBALS.has(name)) report(property, `${source.name}.${name}`);
+          }
+        };
+        return {
+          MemberExpression(node) {
+            const name = memberName(node);
+            const object = unwrapAssertions(node.object);
+            if (
+              STORAGE_GLOBALS.has(name) &&
+              object.type === "Identifier" &&
+              GLOBAL_OBJECTS.has(object.name)
+            ) {
+              report(node, `${object.name}.${name}`);
+            }
+          },
+          VariableDeclarator(node) {
+            checkDestructuring(node.id, node.init);
+          },
+          AssignmentExpression(node) {
+            checkDestructuring(node.left, node.right);
+          },
+          "Program:exit"(program) {
+            const globalScope = context.sourceCode.getScope(program);
+            // Bare references resolve to no declaration (or to an implicit/configured global).
+            const references = [...globalScope.through];
+            for (const variable of globalScope.variables) {
+              if (STORAGE_GLOBALS.has(variable.name) && variable.defs.length === 0) {
+                references.push(...variable.references);
+              }
+            }
+            for (const reference of references) {
+              if (STORAGE_GLOBALS.has(reference.identifier.name)) {
+                report(reference.identifier, reference.identifier.name);
+              }
+            }
+          },
+        };
+      },
+    },
     "no-native-interactive-tooltips": {
       meta: {
         type: "problem",
@@ -226,9 +1281,7 @@ const localPlugin = {
           }
 
           if (expression.type === "TemplateLiteral" && expression.expressions.length === 0) {
-            return expression.quasis
-              .map((quasi) => quasi.value.cooked ?? quasi.value.raw)
-              .join("");
+            return expression.quasis.map((quasi) => quasi.value.cooked ?? quasi.value.raw).join("");
           }
 
           return null;
@@ -271,9 +1324,7 @@ const localPlugin = {
 
           const staticValue = getStaticString(expression);
           if (staticValue !== null) {
-            return (
-              staticValue.includes("\n") || staticValue.length > MAX_NATIVE_TOOLTIP_LENGTH
-            );
+            return staticValue.includes("\n") || staticValue.length > MAX_NATIVE_TOOLTIP_LENGTH;
           }
 
           return true;
@@ -337,6 +1388,670 @@ const localPlugin = {
         };
       },
     },
+    // Casting an API double to APIClient in tests hides typos and wrong return types: the
+    // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
+    // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
+    // type-checks the partial double instead.
+    "no-cast-to-api-client": {
+      meta: {
+        type: "problem",
+        docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
+        messages: {
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
+        },
+      },
+      create(context) {
+        // Whether a type name refers to APIClient, including an aliased import
+        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
+        const isApiClientName = (identifier, depth = 0) => {
+          if (identifier.name === "APIClient") {
+            return true;
+          }
+          if (depth > 5) {
+            return false;
+          }
+          for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (!variable) {
+              continue;
+            }
+            const def = variable.defs[0];
+            if (def?.type === "ImportBinding") {
+              return (
+                def.node.type === "ImportSpecifier" &&
+                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
+              );
+            }
+            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            return (
+              aliased?.type === "TSTypeReference" &&
+              aliased.typeName.type === "Identifier" &&
+              isApiClientName(aliased.typeName, depth + 1)
+            );
+          }
+          return false;
+        };
+        return {
+          // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
+          // (one report per chain, since the inner `as unknown` does not target APIClient).
+          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
+            node
+          ) {
+            if (isApiClientName(node.typeAnnotation.typeName)) {
+              context.report({ node, messageId: "cast" });
+            }
+          },
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // Chained assertions like `x as unknown as T` fabricate type evidence:
+    // the detour through `unknown` bypasses TypeScript's assertion overlap
+    // check, so any value can be relabeled as any type. Fix the source type,
+    // or validate untrusted input at the boundary (type guard / zod) instead.
+    // Chains made only of `as const` are allowed.
+    "no-chained-type-assertions": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow chained type assertions (e.g. `x as unknown as T`)",
+        },
+        messages: {
+          chained:
+            "Chained type assertions discard type evidence. Keep the original precise type, fix the source type, or parse/validate untrusted input at its boundary before narrowing.",
+        },
+      },
+      create(context) {
+        const isAssertion = (node) =>
+          node.type === "TSAsExpression" || node.type === "TSTypeAssertion";
+        const isConstAssertion = (node) =>
+          node.typeAnnotation.type === "TSTypeReference" &&
+          node.typeAnnotation.typeName.type === "Identifier" &&
+          node.typeAnnotation.typeName.name === "const";
+        // Non-null and satisfies wrappers are transparent links in a chain:
+        // `(x as unknown)! as T` fabricates evidence exactly like
+        // `x as unknown as T`, so traverse them in both walk directions.
+        const isPassthrough = (node) =>
+          node.type === "TSNonNullExpression" || node.type === "TSSatisfiesExpression";
+        const unwrapPassthrough = (node) => {
+          let current = node;
+          while (isPassthrough(current)) {
+            current = current.expression;
+          }
+          return current;
+        };
+        const check = (node) => {
+          // Report once, from the outermost assertion of a chain.
+          let child = node;
+          let parent = node.parent;
+          while (isPassthrough(parent) && parent.expression === child) {
+            child = parent;
+            parent = parent.parent;
+          }
+          if (isAssertion(parent) && parent.expression === child) {
+            return;
+          }
+          let assertionCount = 0;
+          let hasNonConstAssertion = false;
+          let current = node;
+          while (isAssertion(current)) {
+            assertionCount += 1;
+            hasNonConstAssertion ||= !isConstAssertion(current);
+            current = unwrapPassthrough(current.expression);
+          }
+          if (assertionCount > 1 && hasNonConstAssertion) {
+            context.report({ node, messageId: "chained" });
+          }
+        };
+        return {
+          TSAsExpression: check,
+          TSTypeAssertion: check,
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // `...(cond ? { x } : {})` hides property omission behind an empty-object
+    // spread; the compiler sees `x` as merely optional instead of knowing when
+    // it is present. Only fires inside object literals (JSX spread attributes
+    // are exempt).
+    "no-conditional-empty-object-spread": {
+      meta: {
+        type: "suggestion",
+        docs: {
+          description:
+            "Disallow object spreads that conditionally spread an empty object to omit fields",
+        },
+        messages: {
+          avoid:
+            "Conditional empty-object spread hides property omission. Build the object in separate statements and add the property only when present.",
+        },
+      },
+      create(context) {
+        const isEmptyObjectExpression = (node) =>
+          node.type === "ObjectExpression" && node.properties.length === 0;
+        return {
+          SpreadElement(node) {
+            if (node.parent.type !== "ObjectExpression") {
+              return;
+            }
+            const argument = node.argument;
+            if (
+              argument.type === "ConditionalExpression" &&
+              (isEmptyObjectExpression(argument.consequent) ||
+                isEmptyObjectExpression(argument.alternate))
+            ) {
+              context.report({ node, messageId: "avoid" });
+            }
+          },
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // When a value's type is syntactically known (a literal, or a stable const
+    // tracing back to one), annotating or asserting it as `unknown`, `object`,
+    // or `Record<...>` throws away evidence the compiler already had. Keep
+    // inference, validate with `satisfies`, or use a named owner type.
+    // Empty object literals flowing into dictionary types are exempt
+    // (accumulator pattern: `const acc: Record<string, X> = {}`).
+    "no-known-value-widening": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow explicitly widening syntactically known values to broad types that discard type evidence",
+        },
+        messages: {
+          widening:
+            "The explicit {{target}} type on {{subject}} discards known type evidence. Keep inference, validate with `satisfies`, or use a named owner type.",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // When false, only assertion-position widening (`x as unknown`,
+              // `{...} as Record<string, unknown>`) is checked; annotation
+              // flows (bindings, returns, class properties) are left alone.
+              checkAnnotations: { type: "boolean" },
+            },
+            additionalProperties: false,
+          },
+        ],
+      },
+      create(context) {
+        const sourceCode = context.sourceCode;
+        const checkAnnotations = context.options[0]?.checkAnnotations ?? true;
+
+        const reportFlow = (expression, targetKind, subject) => {
+          if (targetKind === null) {
+            return;
+          }
+          if (targetKind === "open dictionary" && isEmptyObjectExpression(expression)) {
+            return;
+          }
+          if (!hasKnownEvidence(sourceCode, expression)) {
+            return;
+          }
+          context.report({
+            node: expression,
+            messageId: "widening",
+            data: { target: targetKind, subject },
+          });
+        };
+
+        const annotationTarget = (annotation) =>
+          annotation == null || !checkAnnotations
+            ? null
+            : classifyWideningTarget(annotation.typeAnnotation);
+
+        const checkAssertion = (node) => {
+          // Skip inner assertions of chains; no-chained-type-assertions owns those.
+          if (node.parent.type === "TSAsExpression" || node.parent.type === "TSTypeAssertion") {
+            return;
+          }
+          reportFlow(node.expression, classifyWideningTarget(node.typeAnnotation), "assertion");
+        };
+
+        return {
+          VariableDeclarator(node) {
+            if (node.init === null || node.id.type !== "Identifier") {
+              return;
+            }
+            reportFlow(
+              node.init,
+              annotationTarget(node.id.typeAnnotation),
+              `binding \`${node.id.name}\``
+            );
+          },
+          PropertyDefinition(node) {
+            if (node.value === null) {
+              return;
+            }
+            reportFlow(node.value, annotationTarget(node.typeAnnotation), "class property");
+          },
+          AssignmentExpression(node) {
+            if (node.operator !== "=" || node.left.type !== "Identifier") {
+              return;
+            }
+            const variable = resolveVariable(sourceCode, node.left);
+            if (variable === null) {
+              return;
+            }
+            const declarator = variableDeclarator(variable);
+            if (declarator === null || declarator.id.type !== "Identifier") {
+              return;
+            }
+            reportFlow(
+              node.right,
+              annotationTarget(declarator.id.typeAnnotation),
+              `binding \`${declarator.id.name}\``
+            );
+          },
+          ReturnStatement(node) {
+            if (node.argument === null) {
+              return;
+            }
+            const owner = functionBoundary(node);
+            reportFlow(node.argument, annotationTarget(owner?.returnType), "the return value");
+          },
+          ArrowFunctionExpression(node) {
+            if (node.body.type === "BlockStatement") {
+              return;
+            }
+            reportFlow(node.body, annotationTarget(node.returnType), "the return value");
+          },
+          TSAsExpression: checkAssertion,
+          TSTypeAssertion: checkAssertion,
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // Closes the two-step evasion of no-chained-type-assertions: widening a
+    // known value into a broad const binding (`const tmp: unknown = value`)
+    // and later asserting the binding back to a narrower type (`tmp as Foo`)
+    // is the same evidence-fabrication as `value as unknown as Foo`.
+    "no-widen-then-assert": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow widening a known value into a broad const binding and later asserting it back to a narrower type",
+        },
+        messages: {
+          widenThenAssert:
+            "Binding `{{name}}` discards type evidence and later recreates it with an assertion. Keep the precise type from initialization through use; parse boundary input once.",
+        },
+      },
+      create(context) {
+        const sourceCode = context.sourceCode;
+
+        // Like hasKnownEvidence, but returns the source-type annotation when
+        // one exists (typed params/bindings count) and stays within the same
+        // function boundary. Returns { type } on evidence, null otherwise.
+        const knownValueEvidence = (expression, boundary, visitedVariables) => {
+          // See through `!`/`satisfies` so a wrapped assertion like
+          // `(value as Foo)!` is still recognized as the evidence assertion.
+          const withoutPassthroughs = unwrapPassthroughWrappers(expression);
+          if (
+            withoutPassthroughs.type === "TSAsExpression" ||
+            withoutPassthroughs.type === "TSTypeAssertion"
+          ) {
+            // An assertion to a broad type destroys evidence; a narrower one is evidence.
+            return broadTypeKind(withoutPassthroughs.typeAnnotation) === null
+              ? { type: withoutPassthroughs.typeAnnotation }
+              : null;
+          }
+          const unwrapped = unwrapAssertions(expression);
+          if (isKnownEvidenceExpression(unwrapped)) {
+            return { type: null };
+          }
+          if (unwrapped.type !== "Identifier") {
+            return null;
+          }
+          const variable = resolveVariable(sourceCode, unwrapped);
+          if (variable === null || visitedVariables.has(variable)) {
+            return null;
+          }
+          const annotatedIdentifier = variable.identifiers.find(
+            (identifier) => identifier.typeAnnotation != null
+          );
+          if (annotatedIdentifier !== undefined) {
+            const annotation = annotatedIdentifier.typeAnnotation.typeAnnotation;
+            if (
+              functionBoundary(annotatedIdentifier) !== boundary ||
+              broadTypeKind(annotation) !== null
+            ) {
+              return null;
+            }
+            return { type: annotation };
+          }
+          // Destructured parameters carry their annotation on the pattern,
+          // not the identifier: `({ value }: { value: Foo })`. Resolve the
+          // member type from an inline literal annotation; named type
+          // references stay unresolvable (conservative: miss, never
+          // false-positive).
+          for (const identifier of variable.identifiers) {
+            // Walk outward through (possibly nested) object patterns,
+            // collecting the member path innermost-first, until we reach the
+            // pattern that carries the annotation:
+            //   { nested: { value } }: { nested: { value: Foo } }
+            // yields path [value, nested] anchored at the outer annotation.
+            // Array patterns and computed keys abort (conservative).
+            const path = [];
+            let node = identifier;
+            let annotation = null;
+            let annotatedPattern = null;
+            for (;;) {
+              let holder = node.parent;
+              if (holder.type === "AssignmentPattern" && holder.left === node) {
+                node = holder;
+                holder = node.parent;
+              }
+              if (
+                holder.type !== "Property" ||
+                holder.parent.type !== "ObjectPattern" ||
+                holder.key.type !== "Identifier" ||
+                holder.computed
+              ) {
+                break;
+              }
+              path.push(holder.key.name);
+              node = holder.parent;
+              const patternAnnotation = node.typeAnnotation?.typeAnnotation;
+              if (patternAnnotation != null) {
+                annotation = patternAnnotation;
+                annotatedPattern = node;
+                break;
+              }
+            }
+            if (annotation === null || functionBoundary(annotatedPattern) !== boundary) {
+              continue;
+            }
+            // Resolve the path outermost-first through inline type literals;
+            // named type references stay unresolvable (conservative).
+            let memberType = annotation;
+            for (let i = path.length - 1; i >= 0; i -= 1) {
+              if (memberType.type !== "TSTypeLiteral") {
+                memberType = null;
+                break;
+              }
+              const keyName = path[i];
+              const member = memberType.members.find(
+                (candidate) =>
+                  candidate.type === "TSPropertySignature" &&
+                  candidate.key.type === "Identifier" &&
+                  candidate.key.name === keyName &&
+                  candidate.typeAnnotation != null
+              );
+              if (member === undefined) {
+                memberType = null;
+                break;
+              }
+              memberType = member.typeAnnotation.typeAnnotation;
+            }
+            if (memberType === null) {
+              continue;
+            }
+            return broadTypeKind(memberType) === null ? { type: memberType } : null;
+          }
+          const declarator = variableDeclarator(variable);
+          if (
+            declarator === null ||
+            declarator.init === null ||
+            !isStableConstVariable(variable, declarator) ||
+            functionBoundary(declarator) !== boundary
+          ) {
+            return null;
+          }
+          return knownValueEvidence(
+            declarator.init,
+            boundary,
+            new Set([...visitedVariables, variable])
+          );
+        };
+
+        // A stable const whose declared annotation (or initializer assertion)
+        // erases known evidence into a broad type.
+        const widenedBinding = (variable) => {
+          const declarator = variableDeclarator(variable);
+          if (
+            declarator === null ||
+            declarator.id.type !== "Identifier" ||
+            declarator.init === null ||
+            !isStableConstVariable(variable, declarator)
+          ) {
+            return null;
+          }
+          const boundary = functionBoundary(declarator);
+          const declaredType = declarator.id.typeAnnotation?.typeAnnotation;
+          // `const tmp = (value as unknown)!` widens exactly like
+          // `const tmp = value as unknown`; see through transparent wrappers.
+          const init = unwrapPassthroughWrappers(declarator.init);
+          const initAssertion =
+            init.type === "TSAsExpression" || init.type === "TSTypeAssertion" ? init : null;
+          const initBroadKind =
+            initAssertion === null ? null : broadTypeKind(initAssertion.typeAnnotation);
+          const declaredBroadKind = declaredType === undefined ? null : broadTypeKind(declaredType);
+          const broadKind = declaredBroadKind ?? initBroadKind;
+          if (broadKind === null) {
+            return null;
+          }
+          const originalExpression =
+            initAssertion !== null && initBroadKind !== null ? initAssertion.expression : init;
+          const evidence = knownValueEvidence(originalExpression, boundary, new Set([variable]));
+          if (evidence === null) {
+            return null;
+          }
+          return { broadKind, evidence, declaredAt: declarator.range[1], boundary };
+        };
+
+        const normalizedTypeText = (type) =>
+          sourceCode.text.slice(type.range[0], type.range[1]).replace(/\s+/gu, "");
+
+        const isDefinitelyObjectType = (type) => {
+          const unwrapped = unwrapReadonlyOperator(type);
+          switch (unwrapped.type) {
+            case "TSArrayType":
+            case "TSConstructorType":
+            case "TSFunctionType":
+            case "TSMappedType":
+            case "TSObjectKeyword":
+            case "TSTupleType":
+              return true;
+            case "TSTypeLiteral":
+              return unwrapped.members.length > 0;
+            case "TSIntersectionType":
+              return unwrapped.types.every(isDefinitelyObjectType);
+            default:
+              return false;
+          }
+        };
+
+        const isDefinitelyNarrowerRecordType = (type) => {
+          const unwrapped = unwrapReadonlyOperator(type);
+          if (unwrapped.type === "TSTypeLiteral") {
+            return unwrapped.members.some((member) => member.type !== "TSIndexSignature");
+          }
+          const name = typeReferenceName(unwrapped);
+          if (name === "Readonly") {
+            const [inner] = typeArgumentsOf(unwrapped);
+            return inner !== undefined && isDefinitelyNarrowerRecordType(inner);
+          }
+          if (name !== "Record") {
+            return false;
+          }
+          const parameters = typeArgumentsOf(unwrapped);
+          return parameters.length === 2 && !isUnknownOrAnyType(parameters[1]);
+        };
+
+        const assertionIsNarrower = (broadKind, evidence, assertedType) => {
+          if (broadTypeKind(assertedType) !== null) {
+            return false;
+          }
+          if (broadKind === "top") {
+            return true;
+          }
+          if (
+            evidence.type !== null &&
+            normalizedTypeText(evidence.type) === normalizedTypeText(assertedType)
+          ) {
+            return true;
+          }
+          if (broadKind === "object") {
+            return isDefinitelyObjectType(assertedType);
+          }
+          return isDefinitelyNarrowerRecordType(assertedType);
+        };
+
+        const checkAssertion = (node) => {
+          const expression = unwrapAssertions(node.expression);
+          if (expression.type !== "Identifier") {
+            return;
+          }
+          const variable = resolveVariable(sourceCode, expression);
+          if (variable === null) {
+            return;
+          }
+          const widened = widenedBinding(variable);
+          if (
+            widened === null ||
+            node.range[0] <= widened.declaredAt ||
+            functionBoundary(node) !== widened.boundary ||
+            !assertionIsNarrower(widened.broadKind, widened.evidence, node.typeAnnotation)
+          ) {
+            return;
+          }
+          context.report({
+            node,
+            messageId: "widenThenAssert",
+            data: { name: expression.name },
+          });
+        };
+
+        return {
+          TSAsExpression: checkAssertion,
+          TSTypeAssertion: checkAssertion,
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // `type Foo = unknown` conceals the top type behind a name, so call sites
+    // look typed while carrying no information. Keep `unknown` visible at the
+    // parsing boundary or use the parsed owner type.
+    "no-unknown-type-aliases": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow type aliases that resolve to bare `unknown`",
+        },
+        messages: {
+          unknownAlias:
+            "Type alias `{{alias}}` hides `unknown`. Keep `unknown` explicit at the parsing boundary; otherwise use the parsed owner type.",
+        },
+      },
+      create(context) {
+        // Visit every alias declaration (module, function, block, namespace
+        // scope), not just Program.body, then evaluate once at Program:exit
+        // so transitive chains resolve regardless of declaration order.
+        const AMBIGUOUS = Symbol("ambiguous");
+        const aliasesByName = new Map();
+        const allAliases = [];
+        return {
+          TSTypeAliasDeclaration(node) {
+            allAliases.push(node);
+            // Name-based resolution is scope-insensitive; treat duplicate
+            // names as unresolvable rather than guessing which shadows which.
+            aliasesByName.set(node.id.name, aliasesByName.has(node.id.name) ? AMBIGUOUS : node);
+          },
+          "Program:exit"() {
+            const resolvesToUnknown = (type, visited) => {
+              if (type.type === "TSUnknownKeyword") {
+                return true;
+              }
+              const name = typeReferenceName(type);
+              if (name === null || visited.has(name) || typeArgumentsOf(type).length > 0) {
+                return false;
+              }
+              const alias = aliasesByName.get(name);
+              if (alias === undefined || alias === AMBIGUOUS || alias.typeParameters != null) {
+                return false;
+              }
+              return resolvesToUnknown(alias.typeAnnotation, new Set([...visited, name]));
+            };
+            for (const alias of allAliases) {
+              if (resolvesToUnknown(alias.typeAnnotation, new Set([alias.id.name]))) {
+                context.report({
+                  node: alias.id,
+                  messageId: "unknownAlias",
+                  data: { alias: alias.id.name },
+                });
+              }
+            }
+          },
+        };
+      },
+    },
+    // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
+    // The bare `object` type carries almost no information (no property is
+    // accessible) while still excluding primitives, so it is neither a safe
+    // boundary type (`unknown` is) nor a useful contract (a named type is).
+    "no-object-parameters": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow the broad `object` type on function parameters",
+        },
+        messages: {
+          objectParameter:
+            "Parameter `{{parameter}}` uses the broad `object` type. Accept a named owner type, or `unknown` plus parsing at the boundary.",
+        },
+      },
+      create(context) {
+        const parameterAnnotation = (parameter) => {
+          if (parameter.type === "TSParameterProperty") {
+            return parameterAnnotation(parameter.parameter);
+          }
+          if (parameter.type === "AssignmentPattern") {
+            return parameter.left.typeAnnotation;
+          }
+          return parameter.typeAnnotation;
+        };
+        const isObjectType = (type) => {
+          if (type.type === "TSObjectKeyword") {
+            return true;
+          }
+          if (type.type === "TSUnionType") {
+            return type.types.some(isObjectType);
+          }
+          return false;
+        };
+        const checkParameters = (node) => {
+          for (const parameter of node.params) {
+            const annotation = parameterAnnotation(parameter);
+            if (annotation != null && isObjectType(annotation.typeAnnotation)) {
+              context.report({
+                node: parameter,
+                messageId: "objectParameter",
+                data: {
+                  parameter: parameter.type === "Identifier" ? parameter.name : "(destructured)",
+                },
+              });
+            }
+          }
+        };
+        return {
+          ArrowFunctionExpression: checkParameters,
+          FunctionDeclaration: checkParameters,
+          FunctionExpression: checkParameters,
+          TSDeclareFunction: checkParameters,
+          TSEmptyBodyFunctionExpression: checkParameters,
+          TSMethodSignature: checkParameters,
+          TSFunctionType: checkParameters,
+          TSCallSignatureDeclaration: checkParameters,
+          TSConstructSignatureDeclaration: checkParameters,
+          TSConstructorType: checkParameters,
+        };
+      },
+    },
   },
 };
 
@@ -391,6 +2106,13 @@ export default defineConfig([
       "react-hooks": reactHooks,
       tailwindcss,
       local: localPlugin,
+    },
+    linterOptions: {
+      // Grandfathered anti-slop violations are marked with per-site
+      // eslint-disable-next-line directives. Erroring on unused directives
+      // makes that a true shrink-only ratchet: fixing a site forces removal
+      // of its directive, and the directive cannot silently outlive the code.
+      reportUnusedDisableDirectives: "error",
     },
     settings: {
       react: {
@@ -465,6 +2187,18 @@ export default defineConfig([
       // Highlight unnecessary assertions to keep code idiomatic
       "@typescript-eslint/no-unnecessary-type-assertion": "error",
 
+      // Switches over union types must handle every member (or declare an
+      // explicit default). Pairs with the Record<Enum, Value> mapping rule:
+      // adding a union member then surfaces every switch that needs updating.
+      "@typescript-eslint/switch-exhaustiveness-check": [
+        "error",
+        {
+          // A default case counts as handling the rest; without this the rule
+          // would force enumerating members that intentionally share one path.
+          considerDefaultExhaustiveForUnions: true,
+        },
+      ],
+
       // Encourage readonly where possible to surface unintended mutations
       "@typescript-eslint/prefer-readonly": [
         "error",
@@ -499,6 +2233,30 @@ export default defineConfig([
       "local/no-cross-boundary-imports": "error",
 
       "local/no-native-interactive-tooltips": "error",
+
+      // Anti-slop ports (see localPlugin). Chained assertions are banned in
+      // production code; test/story/mock files are exempt (casting partial
+      // doubles through `unknown` is the standard mock idiom). Pre-existing
+      // violations carry per-site eslint-disable-next-line directives so new
+      // violations fail lint even in files that contain grandfathered ones.
+      "local/no-chained-type-assertions": "error",
+      // Implemented but not enforced: 629 existing occurrences across 145
+      // files use `...(cond ? { x } : {})` deliberately to omit keys
+      // (omitted-vs-undefined matters for JSON serialization and spread
+      // merging). Flip to "error" only after a codebase-wide cleanup.
+      "local/no-conditional-empty-object-spread": "off",
+      // Assertion-position widening of known values (`{...} as Record<string,
+      // unknown>`, `literal as unknown`) is never necessary — an annotation or
+      // `satisfies` always works and, unlike an assertion, cannot mask typos.
+      // Annotation flows stay unchecked (checkAnnotations: false): 247 prod
+      // sites include semantically required open dictionaries (arbitrary-key
+      // tables like `Record<string, LucideIcon>` need the index signature at
+      // call sites), the `Record<Enum, Value>` exhaustive-mapping pattern this
+      // repo mandates, and legit `unknown`-returning boundary parsers.
+      "local/no-known-value-widening": ["error", { checkAnnotations: false }],
+      "local/no-widen-then-assert": "error",
+      "local/no-unknown-type-aliases": "error",
+      "local/no-object-parameters": "error",
 
       // Allow console for this app (it's a dev tool)
       "no-console": "off",
@@ -581,10 +2339,39 @@ export default defineConfig([
     },
   },
   {
+    // Web storage goes through the persisted-state helpers (see local/no-direct-web-storage).
+    // Tests, stories and story utilities seed and inspect storage directly.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      "src/browser/hooks/usePersistedState.ts",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-direct-web-storage": "error",
+    },
+  },
+  {
+    // Backend production code: required-member typeof guards only exist to tolerate partial
+    // test doubles; tests must complete the doubles instead (see the rule's docs).
+    files: ["src/node/services/**/*.ts"],
+    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    rules: {
+      "local/no-required-member-typeof-guard": "error",
+    },
+  },
+  {
     // Temporarily allow sync fs methods in files with existing usage
     // TODO: Gradually migrate these to async operations
     files: [
-      "src/node/config.ts",
+      "src/node/config/index.ts",
+      "src/node/config/**/*.ts",
       "src/cli/debug/**/*.ts",
       "src/node/git.ts",
       "src/desktop/main.ts",
@@ -648,6 +2435,16 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
+          // Lives here, not in the src/** block above: this later block replaces that block's
+          // no-restricted-imports options for every file it matches.
+          paths: [
+            {
+              name: "ai-tokenizer/encoding",
+              allowTypeImports: true,
+              message:
+                "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
+            },
+          ],
           patterns: [
             {
               group: ["shiki"],
@@ -737,8 +2534,177 @@ export default defineConfig([
     },
   },
   {
+    // Workflow/action/runtime and script helper sources are plain JS evaluated outside the TS
+    // program (QuickJS, skill assets, generated child-process wrappers, or local tooling), so
+    // type-aware rules cannot apply. Lint them with core untyped rules so typos and dead helpers
+    // fail loudly instead of becoming silent globals.
+    files: [
+      "src/node/builtinSkills/**/*.js",
+      "src/node/builtinWorkflowActions/**/*.js",
+      "src/node/workflowRuntime/*.js",
+      "scripts/lib/*.js",
+    ],
+    extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        exports: "writable",
+        module: "writable",
+        require: "readonly",
+        globalThis: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        mux: "readonly",
+      },
+    },
+    rules: {
+      "@typescript-eslint/no-empty-function": "off",
+      "@typescript-eslint/no-require-imports": "off",
+      "@typescript-eslint/no-unused-vars": "off",
+      "@typescript-eslint/prefer-for-of": "off",
+      "no-empty": ["error", { allowEmptyCatch: true }],
+      "no-undef": "error",
+      "no-unused-vars": "error",
+    },
+  },
+  {
+    files: ["src/node/builtinWorkflowActions/**/_shared.js"],
+    rules: {
+      "no-unused-vars": "off",
+    },
+  },
+  {
+    files: ["src/node/builtinWorkflowActions/**/*.js"],
+    ignores: ["src/node/builtinWorkflowActions/**/_shared.js"],
+    languageOptions: {
+      globals: {
+        boundedCharBudget: "readonly",
+        boundedCommentBodyCaptureBytes: "readonly",
+        boundedIssueViewBodyCaptureBytes: "readonly",
+        boundedIssueListBodyCaptureBytes: "readonly",
+        boundedLimit: "readonly",
+        captureGit: "readonly",
+        excludedLabelSearchQuery: "readonly",
+        findComment: "readonly",
+        getIssueView: "readonly",
+        inputObject: "readonly",
+        issueListBodyJq: "readonly",
+        isMatchingMarker: "readonly",
+        listComments: "readonly",
+        markerStatus: "readonly",
+        normalizeIssue: "readonly",
+        optionalString: "readonly",
+        parseNameStatus: "readonly",
+        parseStatusLine: "readonly",
+        readStatus: "readonly",
+        repositoryFromInput: "readonly",
+        requiredIssueNumber: "readonly",
+        requiredRepository: "readonly",
+        requiredString: "readonly",
+        resolveBase: "readonly",
+        resolveMergeBase: "readonly",
+        runGit: "readonly",
+        splitRepository: "readonly",
+        stringList: "readonly",
+        truncateText: "readonly",
+        tryResolveBase: "readonly",
+        tryGit: "readonly",
+      },
+    },
+  },
+  {
+    // Test/story/mock files and shared test support (harnesses/utils named
+    // per repo convention: *.testHarness.ts, test[A-Z]*.ts): casting partial
+    // doubles through `unknown` is the standard mocking idiom, so the
+    // chained-assertion ban is production-only.
+    files: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "**/*.testHarness.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-chained-type-assertions": "off",
+      "local/no-known-value-widening": "off",
+      "local/no-widen-then-assert": "off",
+      "local/no-object-parameters": "off",
+    },
+  },
+  {
+    // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
+    // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
+    files: ["tests/**/*.{ts,tsx}"],
+    // Registered so repo-wide test rules (e.g. local/no-cast-to-api-client on
+    // **/*.test.ts) resolve here too.
+    plugins: {
+      local: localPlugin,
+    },
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Harness doubles implement async interfaces with synchronous or empty bodies
+      // (`async () => {}` stubs for services, windows, and IPC handlers).
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+      // Same options as src/: a leading underscore marks an intentionally unused binding
+      // (mock signatures, destructured tuple slots). The base default flags those too.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
+    rules: {
+      "local/no-cast-to-api-client": "error",
+      "local/no-clear-dom-global": "error",
+      "local/require-module-mock-restore": [
+        "error",
+        {
+          allow: {
+            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
+            // .../util/browser.js is unsupported`), so there are no real exports to restore and
+            // no later suite can observe the stub.
+            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
+          },
+        },
+      ],
+    },
     languageOptions: {
       globals: {
         describe: "readonly",

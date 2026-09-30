@@ -5,7 +5,7 @@ import type {
   WorkspaceChatMessage,
   WorkspaceInitEvent,
 } from "@/common/orpc/types";
-import { isInitStart, isInitOutput, isInitEnd } from "@/common/orpc/types";
+import { isInitStart, isInitOutput, isInitProgress, isInitEnd } from "@/common/orpc/types";
 
 // Re-export StreamCollector utilities for backwards compatibility
 export {
@@ -33,8 +33,6 @@ import { INTEGRATION_TEST_MODEL, shouldRunIntegrationTests } from "../testUtils"
 import type { ToolPolicy } from "../../src/common/utils/tools/toolPolicy";
 import type { WorkspaceSendMessageOutput } from "@/common/orpc/schemas";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { HistoryService } from "../../src/node/services/historyService";
-import { createMuxMessage } from "../../src/common/types/message";
 
 const execAsync = promisify(exec);
 import { ORPCError } from "@orpc/client";
@@ -44,7 +42,6 @@ import { ValidationError } from "@orpc/server";
 export const INIT_HOOK_WAIT_MS = 1500; // Wait for async init hook completion (local runtime)
 export const SSH_INIT_WAIT_MS = 15000; // SSH init includes bundle sync + base repo setup + worktree add + hook
 export const HAIKU_MODEL = "anthropic:claude-haiku-4-5"; // Fast model for tests
-export const GPT_5_MINI_MODEL = "openai:gpt-5-mini"; // Fastest model for performance-critical tests
 export const TEST_TIMEOUT_LOCAL_MS = 25000; // Recommended timeout for local runtime tests
 export const TEST_TIMEOUT_SSH_MS = 120000; // Recommended timeout for SSH runtime tests (init + operations can take 60-90s under concurrent load)
 export const STREAM_TIMEOUT_LOCAL_MS = 15000; // Stream timeout for local runtime
@@ -122,7 +119,7 @@ type SendMessageOptionsWithAgentFallback = Omit<SendMessageOptions, "agentId"> &
 };
 
 type SendMessageWithModelOptions = Omit<SendMessageOptionsWithAgentFallback, "model"> & {
-  fileParts?: Array<{ url: string; mediaType: string }>;
+  fileParts?: { url: string; mediaType: string }[];
 };
 
 const DEFAULT_MODEL_ID = INTEGRATION_TEST_MODEL;
@@ -158,7 +155,7 @@ export async function sendMessage(
     });
   } catch (error) {
     // Normalize ORPC input validation or transport errors into Result shape expected by tests.
-    let raw: string = "";
+    let raw = "";
 
     if (
       error instanceof ORPCError &&
@@ -257,8 +254,8 @@ export async function createWorkspaceWithInit(
   projectPath: string,
   branchName: string,
   runtimeConfig?: RuntimeConfig,
-  waitForInit: boolean = false,
-  isSSH: boolean = false
+  waitForInit = false,
+  isSSH = false
 ): Promise<{ workspaceId: string; workspacePath: string; cleanup: () => Promise<void> }> {
   const trunkBranch = await detectDefaultTrunkBranch(projectPath);
 
@@ -287,7 +284,7 @@ export async function createWorkspaceWithInit(
     collector.start();
     try {
       await collector.waitForEvent("init-end", initTimeout);
-    } catch (err) {
+    } catch {
       // Init hook might not exist or might have already completed before we started waiting
       // This is not necessarily an error - just log it
       console.log(
@@ -361,53 +358,6 @@ export async function sendMessageAndWait(
 export { StreamCollector as EventCollector } from "./streamCollector";
 
 /**
- * Create an event collector for a workspace.
- *
- * MIGRATION NOTE: Tests should migrate to using StreamCollector directly:
- *   const collector = createStreamCollector(env.orpc, workspaceId);
- *   collector.start();
- *   ... test code ...
- *   collector.stop();
- *
- * This function exists for backwards compatibility during migration.
- * It detects whether the first argument is an ORPC client or sentEvents array.
- */
-export function createEventCollector(
-  firstArg: OrpcTestClient | Array<{ channel: string; data: unknown }>,
-  workspaceId: string
-) {
-  const { createStreamCollector } = require("./streamCollector");
-
-  // Check if firstArg is an OrpcTestClient (has workspace.onChat method)
-  if (firstArg && typeof firstArg === "object" && "workspace" in firstArg) {
-    return createStreamCollector(firstArg as OrpcTestClient, workspaceId);
-  }
-
-  // Legacy signature - throw helpful error directing to new pattern
-  throw new Error(
-    `createEventCollector(sentEvents, workspaceId) is deprecated.\n` +
-      `Use the new pattern:\n` +
-      `  const collector = createStreamCollector(env.orpc, workspaceId);\n` +
-      `  collector.start();\n` +
-      `  ... test code ...\n` +
-      `  collector.stop();`
-  );
-}
-
-/**
- * Assert that a result has a specific error type
- */
-export function assertError(
-  result: Result<void, SendMessageError>,
-  expectedErrorType: string
-): void {
-  expect(result.success).toBe(false);
-  if (!result.success) {
-    expect(result.error.type).toBe(expectedErrorType);
-  }
-}
-
-/**
  * Poll for a condition with exponential backoff
  * More robust than fixed sleeps for async operations
  */
@@ -429,21 +379,6 @@ export async function waitFor(
   }
 
   return false;
-}
-
-/**
- * Wait for a file to exist with retry logic
- * Useful for checking file operations that may take time
- */
-export async function waitForFileExists(filePath: string, timeoutMs = 5000): Promise<boolean> {
-  return waitFor(async () => {
-    try {
-      await fs.access(filePath);
-      return true;
-    } catch {
-      return false;
-    }
-  }, timeoutMs);
 }
 
 /**
@@ -472,8 +407,8 @@ export async function waitForInitComplete(
     const initEvents = collector
       .getEvents()
       .filter(
-        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitEnd(msg)
-      ) as WorkspaceInitEvent[];
+        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
+      );
 
     // Check if init succeeded (exitCode === 0)
     const exitCode = (initEndEvent as { exitCode?: number }).exitCode;
@@ -527,11 +462,16 @@ export async function waitForInitEnd(
     return collector
       .getEvents()
       .filter(
-        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitEnd(msg)
-      ) as WorkspaceInitEvent[];
+        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
+      );
   } finally {
     collector.stop();
   }
+}
+
+interface ChatHistoryEntry {
+  role: string;
+  parts: { type: string; [key: string]: unknown }[];
 }
 
 /**
@@ -540,13 +480,13 @@ export async function waitForInitEnd(
 export async function readChatHistory(
   tempDir: string,
   workspaceId: string
-): Promise<Array<{ role: string; parts: Array<{ type: string; [key: string]: unknown }> }>> {
+): Promise<ChatHistoryEntry[]> {
   const historyPath = path.join(tempDir, "sessions", workspaceId, "chat.jsonl");
   const historyContent = await fs.readFile(historyPath, "utf-8");
   return historyContent
     .trim()
     .split("\n")
-    .map((line: string) => JSON.parse(line));
+    .map((line: string) => JSON.parse(line) as ChatHistoryEntry);
 }
 
 /**
@@ -581,8 +521,6 @@ export async function waitForFileNotExists(filePath: string, timeoutMs = 5000): 
  * Create a temporary git repository for testing
  */
 export async function createTempGitRepo(): Promise<string> {
-  // eslint-disable-next-line local/no-unsafe-child-process
-
   // Use mkdtemp to avoid race conditions and ensure unique directory
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-repo-"));
 
@@ -620,21 +558,40 @@ export async function addFakeOrigin(repoPath: string): Promise<void> {
 }
 
 /**
- * Add a git submodule to a repository
+ * Add a git submodule to a repository.
  * @param repoPath - Path to the repository to add the submodule to
- * @param submoduleUrl - URL of the submodule repository (defaults to leftpad)
+ * @param submoduleUrl - URL of the submodule repository; defaults to a local fixture repo
  * @param submoduleName - Name/path for the submodule
  */
 export async function addSubmodule(
   repoPath: string,
-  submoduleUrl: string = "https://github.com/left-pad/left-pad.git",
-  submoduleName: string = "vendor/left-pad"
+  submoduleUrl?: string,
+  submoduleName = "vendor/left-pad"
 ): Promise<void> {
-  await execAsync(`git submodule add "${submoduleUrl}" "${submoduleName}"`, { cwd: repoPath });
+  const resolvedSubmoduleUrl = submoduleUrl ?? (await createLocalSubmoduleRepo());
+  await execAsync(
+    `git -c protocol.file.allow=always submodule add "${resolvedSubmoduleUrl}" "${submoduleName}"`,
+    { cwd: repoPath }
+  );
   // Use -c to ensure no GPG signing in case repo config doesn't have it set
   await execAsync(`git -c commit.gpgsign=false commit -m "Add submodule ${submoduleName}"`, {
     cwd: repoPath,
   });
+}
+
+async function createLocalSubmoduleRepo(): Promise<string> {
+  const submoduleRepoPath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-submodule-"));
+  await execAsync("git init -b main", { cwd: submoduleRepoPath });
+  await execAsync(
+    `git config user.email "test@example.com" && git config user.name "Test User" && git config commit.gpgsign false`,
+    { cwd: submoduleRepoPath }
+  );
+  await fs.writeFile(path.join(submoduleRepoPath, "README.md"), "# Test submodule\n");
+  await execAsync("git add README.md", { cwd: submoduleRepoPath });
+  await execAsync('git -c commit.gpgsign=false commit -m "Initial submodule commit"', {
+    cwd: submoduleRepoPath,
+  });
+  return submoduleRepoPath;
 }
 
 /**
@@ -660,54 +617,11 @@ export async function cleanupTempGitRepo(repoPath: string): Promise<void> {
 }
 
 /**
- * Build large conversation history to test context limits
- *
- * This is a test-only utility that uses HistoryService directly to quickly
- * populate history without making API calls. Real application code should
- * NEVER bypass IPC like this.
- *
- * @param workspaceId - Workspace to populate
- * @param config - Config instance for HistoryService
- * @param options - Configuration for history size
- * @returns Promise that resolves when history is built
- */
-export async function buildLargeHistory(
-  workspaceId: string,
-  config: { getSessionDir: (id: string) => string },
-  options: {
-    messageSize?: number;
-    messageCount?: number;
-    textPrefix?: string;
-  } = {}
-): Promise<void> {
-  // HistoryService only needs getSessionDir.
-  const historyService = new HistoryService(config);
-
-  const messageSize = options.messageSize ?? 50_000;
-  const messageCount = options.messageCount ?? 80;
-  const textPrefix = options.textPrefix ?? "";
-
-  const largeText = textPrefix + "A".repeat(messageSize);
-
-  // Build conversation history with alternating user/assistant messages
-  for (let i = 0; i < messageCount; i++) {
-    const isUser = i % 2 === 0;
-    const role = isUser ? "user" : "assistant";
-    const message = createMuxMessage(`history-msg-${i}`, role, largeText, {});
-
-    const result = await historyService.appendToHistory(workspaceId, message);
-    if (!result.success) {
-      throw new Error(`Failed to append message ${i} to history: ${result.error}`);
-    }
-  }
-}
-
-/**
  * Configure test retries for flaky integration tests in CI.
  * Only enables retries in CI environment to avoid masking real bugs locally.
  * Call at module level (before describe blocks).
  */
-export function configureTestRetries(count: number = 2): void {
+export function configureTestRetries(count = 2): void {
   if (process.env.CI && typeof jest !== "undefined" && jest.retryTimes) {
     jest.retryTimes(count, { logErrorsBeforeRetry: true });
   }

@@ -1,4 +1,4 @@
-import type { RuntimeConfig, RuntimeAvailabilityStatus } from "@/common/types/runtime";
+import type { RuntimeConfig } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
 
@@ -18,7 +18,7 @@ import type { Result } from "@/common/types/result";
  *
  * srcBaseDir (base directory for all workspaces):
  *   - Where mux stores ALL workspace directories
- *   - Local: ~/.mux/src (tilde expanded to full path by LocalRuntime)
+ *   - Local: ~/.xum/src (tilde expanded to full path by LocalRuntime)
  *   - SSH: /home/user/workspace (tilde paths are allowed and are resolved before use)
  *
  * Workspace Path Computation:
@@ -31,7 +31,7 @@ import type { Result } from "@/common/types/result";
  *     Example: "feature-123" or "main"
  *
  * Full Example (Local):
- *   srcBaseDir:    ~/.mux/src (expanded to /home/user/.mux/src)
+ *   srcBaseDir:    ~/.xum/src (expanded to /home/user/.mux/src)
  *   projectPath:   /Users/me/git/my-project (local git repo)
  *   projectName:   my-project (extracted)
  *   workspaceName: feature-123
@@ -53,6 +53,8 @@ export interface ExecOptions {
   cwd: string;
   /** Environment variables to inject */
   env?: Record<string, string>;
+  /** Host-namespace paths to translate before exposing them as environment variables. */
+  pathEnv?: Record<string, string>;
   /**
    * Timeout in seconds.
    *
@@ -68,6 +70,10 @@ export interface ExecOptions {
   /** Force PTY allocation (SSH only - adds -t flag) */
   forcePTY?: boolean;
 }
+
+export type BackgroundMonitorProbeResult<T> =
+  | { success: true; value: T }
+  | { success: false; error: string };
 
 /**
  * Handle to a background process.
@@ -86,6 +92,9 @@ export interface BackgroundHandle {
    * Async because SSH needs to read remote exit_code file.
    */
   getExitCode(): Promise<number | null>;
+
+  /** Strict exit-code probe used only by monitor polling. */
+  getExitCodeForMonitor?(): Promise<BackgroundMonitorProbeResult<number | null>>;
 
   /**
    * Terminate the process (SIGTERM → wait → SIGKILL).
@@ -114,6 +123,11 @@ export interface BackgroundHandle {
    * Works on both local and SSH runtimes by using runtime.exec() internally.
    */
   readOutput(offset: number): Promise<{ content: string; newOffset: number }>;
+
+  /** Strict output probe used only by monitor polling. */
+  readOutputForMonitor?(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>>;
 }
 
 /**
@@ -145,12 +159,37 @@ export interface FileStat {
 }
 
 /**
+ * Optional constraints for Runtime.readFile. Absent ⇒ every runtime reads exactly as before
+ * (FIFOs, devices and sockets stream with their native semantics).
+ */
+export interface ReadFileOptions {
+  /**
+   * Refuse anything that is not a regular file (or a symlink to one) with a `file_io`
+   * RuntimeError whose message contains "not a regular file".
+   *
+   * Why: a plain open() of a FIFO with no writer blocks in the kernel; in Node that parks a
+   * libuv threadpool worker, and a handful of such reads (plan-file readers all hit the same
+   * path) exhaust the pool so unrelated fs/DNS/zlib work stalls process-wide. An abort signal
+   * cannot settle a kernel-blocked open — only a nonblocking acquisition can. The check is done
+   * on the ACQUIRED descriptor (fstat / `/dev/fd/N`), never as a stat-then-open pre-check, so a
+   * path swapped between check and read cannot change what is streamed.
+   *
+   * Acquisition: on POSIX, local runtimes open with O_NONBLOCK, so a FIFO cannot block it.
+   * Exec-backed runtimes open inside the exec's shell after an advisory precheck: a path replaced
+   * by a writer-less FIFO between precheck and open can still block that shell, as the plain
+   * `cat` did for any FIFO (cleanup bounds: see buildRegularFileReadCommand).
+   */
+  requireRegularFile?: boolean;
+}
+
+/**
  * Logger for streaming workspace initialization events to frontend.
  * Used to report progress during workspace creation and init hook execution.
  */
 export interface InitLogger {
   /** Log a creation step (e.g., "Creating worktree", "Syncing files") */
   logStep(message: string): void;
+  logProgress?(label: string, percent: number): void;
   /** Log stdout line from init hook */
   logStdout(line: string): void;
   /** Log stderr line from init hook */
@@ -190,6 +229,27 @@ export interface WorkspaceCreationParams {
   env?: Record<string, string>;
   /** Whether the project is trusted — when false, git hooks are disabled */
   trusted?: boolean;
+  /**
+   * Return once the checkout is reserved and leave populating its files to
+   * materializeWorkspace(), so that work streams to a workspace that is already announced.
+   * Runtimes whose creation never populates files ignore this.
+   */
+  deferMaterialization?: boolean;
+}
+
+/** Creation-time decisions materializeWorkspace() needs to finish a deferred checkout. */
+export interface PendingMaterialization {
+  /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
+  fastForwardFromOrigin: boolean;
+}
+
+/** Init params for materializeWorkspace(), plus how far a cancellation may reach. */
+export interface WorkspaceMaterializeParams extends WorkspaceInitParams {
+  /**
+   * When given, the only signal the file checkout honours; abortSignal still cancels every
+   * later phase, so an owner that keeps a cancelled checkout gets whole files.
+   */
+  checkoutAbortSignal?: AbortSignal;
 }
 
 /**
@@ -200,6 +260,10 @@ export interface WorkspaceCreationResult {
   /** Absolute path to workspace (local path for LocalRuntime, remote path for SSHRuntime) */
   workspacePath?: string;
   error?: string;
+  /** Set when deferMaterialization left populating the checkout to materializeWorkspace(). */
+  pendingMaterialization?: PendingMaterialization;
+  /** This creation made the branch, so undoing the creation may delete it (#4745). */
+  createdBranch?: boolean;
 }
 
 /**
@@ -222,7 +286,7 @@ export interface WorkspaceInitParams {
   env?: Record<string, string>;
 
   /**
-   * When true, skip running the project's .mux/init hook.
+   * When true, skip running the project's .xum/init hook.
    *
    * NOTE: This skips only hook execution, not runtime provisioning.
    */
@@ -238,12 +302,6 @@ export interface WorkspaceInitResult {
   success: boolean;
   error?: string;
 }
-
-/**
- * Runtime interface - minimal, low-level abstraction for tool execution environments.
- *
- * All methods return streaming primitives for memory efficiency.
- * Use helpers in utils/runtime/ for convenience wrappers (e.g., readFileString, execBuffered).
 
 /**
  * Parameters for forking an existing workspace
@@ -275,6 +333,8 @@ export interface WorkspaceForkResult {
   workspacePath?: string;
   /** Branch that was forked from */
   sourceBranch?: string;
+  /** This fork made the new branch, so undoing the fork may delete it (#4775). */
+  createdBranch?: boolean;
   /** Error message (if failed) */
   error?: string;
   /** Runtime config for the forked workspace (if different from source) */
@@ -367,7 +427,8 @@ export interface Runtime {
    */
   readonly createFlags?: RuntimeCreateFlags;
   /**
-   * Execute a bash command with streaming I/O
+   * Execute a bash command with streaming I/O.
+   * cwd and pathEnv values are host-namespace paths translated by the adapter.
    * @param command The bash script to execute
    * @param options Execution options (cwd, env, timeout, etc.)
    * @returns Promise that resolves to streaming handles for stdin/stdout/stderr and completion promises
@@ -376,16 +437,21 @@ export interface Runtime {
   exec(command: string, options: ExecOptions): Promise<ExecStream>;
 
   /**
-   * Read file contents as a stream
+   * Read file contents as a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
+   * @param options Optional read constraints (see ReadFileOptions)
    * @returns Readable stream of file contents
    * @throws RuntimeError if file cannot be read
    */
-  readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
+  readFile(
+    path: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array>;
 
   /**
-   * Write file contents atomically from a stream
+   * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Writable stream for file contents
@@ -394,7 +460,7 @@ export interface Runtime {
   writeFile(path: string, abortSignal?: AbortSignal): WritableStream<Uint8Array>;
 
   /**
-   * Get file statistics
+   * Get file statistics. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file/directory
    * @param abortSignal Optional abort signal for cancellation
    * @returns File statistics
@@ -403,12 +469,12 @@ export interface Runtime {
   stat(path: string, abortSignal?: AbortSignal): Promise<FileStat>;
 
   /**
-   * Ensure a directory exists (mkdir -p semantics).
+   * Ensure a directory exists (mkdir -p semantics). Adapters canonicalize tilde and relative paths.
    *
    * This intentionally lives on the Runtime abstraction so local runtimes can use
    * Node fs APIs (Windows-safe) while remote runtimes can use shell commands.
    */
-  ensureDir(path: string): Promise<void>;
+  ensureDir(path: string, abortSignal?: AbortSignal): Promise<void>;
 
   /**
    * Resolve a path to its absolute, canonical form (expanding tildes, resolving symlinks, etc.).
@@ -465,7 +531,7 @@ export interface Runtime {
 
   /**
    * Create a workspace for this runtime (fast, returns immediately)
-   * - LocalRuntime: Creates git worktree
+   * - LocalRuntime: Creates git worktree (populating it can be deferred to materializeWorkspace)
    * - SSHRuntime: Creates remote directory only
    * Does NOT run init hook or sync files.
    * @param params Workspace creation parameters
@@ -515,6 +581,17 @@ export interface Runtime {
   ): Promise<Result<void, string>>;
 
   /**
+   * Release what finalizeConfig/validateBeforePersist prepared for a creation that is rolled
+   * back before init, so postCreateSetup never consumes it.
+   *
+   * Use cases:
+   * - Coder: dispose the provisioning session (a short-lived deployment token) (#5113)
+   *
+   * Best-effort: must not throw.
+   */
+  releaseCreationSetup?(): Promise<void>;
+
+  /**
    * Optional long-running setup that runs after mux persists workspace metadata.
    * Used for provisioning steps that must happen before initWorkspace but after
    * the workspace is registered (e.g., creating Coder workspaces, pulling Docker images).
@@ -528,6 +605,15 @@ export interface Runtime {
    * @param params Same as initWorkspace params
    */
   postCreateSetup?(params: WorkspaceInitParams): Promise<void>;
+
+  /**
+   * Populate a checkout reserved by createWorkspace({ deferMaterialization: true }).
+   * Streams progress via initLogger; throws on failure and leaves the checkout registered.
+   */
+  materializeWorkspace?(
+    params: WorkspaceMaterializeParams,
+    pending: PendingMaterialization
+  ): Promise<void>;
 
   /**
    * Initialize workspace asynchronously (may be slow, streams progress)
@@ -548,6 +634,8 @@ export interface Runtime {
    * @param oldName Current workspace name
    * @param newName New workspace name
    * @param abortSignal Optional abort signal for cancellation
+   * @param options.renameBranch Undoing an earlier rename (#4779): rename the tracked branch back
+   *   exactly when that rename reported `branchRenamed`, instead of re-deriving it from names.
    * @returns Promise resolving to Result with old/new paths on success, or error message
    */
   renameWorkspace(
@@ -555,9 +643,11 @@ export interface Runtime {
     oldName: string,
     newName: string,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   >;
 
   /**
@@ -581,8 +671,22 @@ export interface Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }>;
+    trusted?: boolean,
+    /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
+    options?: { keepBranch?: boolean }
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | {
+        success: false;
+        error: string;
+        /**
+         * Set by a runtime that deletes several things (MultiProjectRuntime, and a devcontainer's
+         * container plus worktree): the disposable ones it could not delete, so a rollback can
+         * name them (#4936, #5120).
+         */
+        leftoverPaths?: string[];
+      }
+  >;
 
   /**
    * Ensure the runtime is ready for operations.
@@ -597,6 +701,9 @@ export interface Runtime {
    * @returns Result indicating ready or failure with error type for retry decisions
    */
   ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult>;
+
+  /** Check availability without starting runtimes whose SSH connection can start them. */
+  isRunningWithoutStart?(abortSignal: AbortSignal): Promise<boolean>;
 
   /**
    * Fork an existing workspace to create a new one.
@@ -621,10 +728,10 @@ export interface Runtime {
   /**
    * Get the mux home directory for this runtime.
    * Used for storing plan files and other mux-specific data.
-   * - LocalRuntime/SSHRuntime: ~/.mux (tilde expanded by runtime)
+   * - LocalRuntime/SSHRuntime: ~/.xum (tilde expanded by runtime)
    * - DockerRuntime: /var/mux (world-readable, avoids /root permission issues)
    */
-  getMuxHome(): string;
+  getXumHome(): string;
 
   /**
    * Env vars that should be forwarded into container processes.
@@ -632,24 +739,132 @@ export interface Runtime {
    * Returns empty record for runtimes that don't need env forwarding (local, ssh).
    */
   getContainerEnv?(): Record<string, string>;
+
+  /**
+   * Whether a failed exec's exit came from the transport itself (host
+   * unreachable) rather than the command, e.g. OpenSSH exit 255. Callers that
+   * build their own exec probes use it so an unreachable host never reads as
+   * "absent" (#4438). Runtimes without such a transport omit it.
+   */
+  isTransportFailureExit?(exitCode: number, stderr: string): boolean;
 }
 
 /**
- * Result of checking if a runtime type is available for a project.
- * Re-exported for backward compatibility with existing imports.
- */
-export type RuntimeAvailability = RuntimeAvailabilityStatus;
-
-/**
- * Error thrown by runtime implementations
+ * Error thrown by runtime implementations.
+ *
+ * `type: "network"` means a transport failure: the remote host could not be
+ * reached or the channel failed, so the state of the file or command is
+ * unknown. Callers must never read it as "file missing" (#4438).
  */
 export class RuntimeError extends Error {
   constructor(
     message: string,
     public readonly type: "exec" | "file_io" | "network" | "unknown",
-    public readonly cause?: Error
+    cause?: unknown
   ) {
-    super(message);
+    // The wrapped original error travels through the NATIVE Error options bag
+    // and is typed `unknown` (matching Error.cause), NOT an `Error`-typed
+    // parameter property: wrap sites catch errors from Node builtins, which
+    // under jest's vm sandbox come from another realm where `instanceof
+    // Error` is false — an Error-typed cause forces wrap sites into
+    // `err instanceof Error ? err : undefined` filters that silently drop
+    // the fs error (and its ENOENT/EACCES code) that unwrapping checks need.
+    super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
+}
+
+/**
+ * True when a runtime operation failed in transport (see RuntimeError), so a
+ * fallback chain must stop instead of treating the target as absent.
+ *
+ * Callers that own an abort signal still check it first, as they already do
+ * for missing-candidate fallbacks: an abort can race a real transport failure.
+ */
+export function isRuntimeTransportError(error: unknown): error is RuntimeError {
+  return error instanceof RuntimeError && error.type === "network";
+}
+
+/**
+ * SSH failures that repeating the connection cannot fix: the server rejected every key or
+ * password, or the host key did not verify. OpenSSH prints these on the pool probe's stderr,
+ * and the pools repeat the text after "Last error:" while in backoff, so a substring match
+ * covers both. Deliberately narrow (#5034): anything unrecognized stays retryable.
+ */
+const PERMANENT_SSH_FAILURE_TEXTS = [
+  "Permission denied (", // OpenSSH: "user@host: Permission denied (publickey,password)."
+  "Too many authentication failures",
+  "Host key verification failed",
+  "REMOTE HOST IDENTIFICATION HAS CHANGED",
+  "All configured authentication methods failed", // ssh2
+  "SSH2 authentication failed", // SSH2ConnectionPool after the last key
+] as const;
+
+/**
+ * True for an SSH failure that another attempt cannot fix: a rejected key or password, or a
+ * failed host-key check. Both SSH pools stop their backoff wait loop on it (#5063).
+ */
+export function isPermanentSSHFailure(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
+    // ssh2 tags authentication errors with a level (see SSH2ConnectionPool's isAuthFailure).
+    if ((current as { level?: unknown }).level === "client-authentication") return true;
+    const { message } = current;
+    if (PERMANENT_SSH_FAILURE_TEXTS.some((text) => message.includes(text))) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+/**
+ * A transport failure that one more attempt may get past (a reset, a refused channel, a backoff
+ * refusal). The bounded read retry (#4830) uses this; fallback callers keep using
+ * isRuntimeTransportError, since a permanent failure still means the host is unreachable.
+ */
+export function isRuntimeRetryableTransportError(error: unknown): error is RuntimeError {
+  return isRuntimeTransportError(error) && !isPermanentSSHFailure(error);
+}
+
+const ABSENT_PATH_CODES: ReadonlySet<unknown> = new Set(["ENOENT", "ENOTDIR"]);
+
+function errorCode(value: unknown): unknown {
+  return value != null && typeof value === "object" && "code" in value ? value.code : undefined;
+}
+
+/**
+ * True when a runtime read or stat failed because the path positively does not
+ * exist (ENOENT/ENOTDIR). Local runtimes carry the fs error as `cause`;
+ * exec-backed runtimes attach the same code when the tool's own diagnostic says
+ * so (see execFileIO).
+ */
+export function isRuntimePathAbsentError(error: unknown): boolean {
+  if (ABSENT_PATH_CODES.has(errorCode(error))) return true;
+  // No `instanceof Error` check: fs errors can come from another realm (see RuntimeError).
+  const cause = error != null && typeof error === "object" && "cause" in error ? error.cause : null;
+  return ABSENT_PATH_CODES.has(errorCode(cause));
+}
+
+/**
+ * True when a runtime read failed for any reason other than positively
+ * identified absence: transport, permission denied, I/O error, not a regular
+ * file. A fallback chain that picks the next file when one is "missing" must
+ * stop on it instead of silently serving a lower-priority file (#4827).
+ * Errors that are not RuntimeErrors (parse and validation errors) are out of
+ * scope and keep their callers' fallback.
+ *
+ * Callers that own an abort signal check it first: an aborted read also fails.
+ */
+export function isRuntimeReadFailure(error: unknown): error is RuntimeError {
+  if (isRuntimeTransportError(error)) return true;
+  return (
+    error instanceof RuntimeError && error.type === "file_io" && !isRuntimePathAbsentError(error)
+  );
+}
+
+/**
+ * Caller-facing text for a transport failure that ends an operation early. It
+ * says the host was unreachable and the operation can be retried, so a model or
+ * user does not read it as a missing agent or a bad argument.
+ */
+export function formatRuntimeUnreachableError(operation: string, error: RuntimeError): string {
+  return `${operation}: the workspace runtime is unreachable (${error.message.trim()}); retry once it is reachable`;
 }

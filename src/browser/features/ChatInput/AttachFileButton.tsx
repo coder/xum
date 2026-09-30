@@ -1,15 +1,7 @@
-/**
- * Attach file button - floats inside the chat input textarea next to the voice input button.
- * Opens a native file picker for images, SVGs, and PDFs.
- */
-
 import React, { useRef } from "react";
 import { Paperclip } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-
-/** Accept filter for the file picker: images, SVGs, and PDFs */
-const FILE_ACCEPT = "image/*,.svg,.pdf";
 
 interface AttachFileButtonProps {
   onFiles: (files: File[]) => void;
@@ -45,6 +37,7 @@ export const AttachFileButton: React.FC<AttachFileButtonProps> = (props) => {
             aria-label="Attach file"
             className={cn(
               "inline-flex items-center justify-center rounded p-0.5 transition-colors duration-150",
+              "focus-visible:ring-accent focus-visible:ring-1",
               "disabled:cursor-not-allowed disabled:opacity-40",
               "text-muted/50 hover:text-muted"
             )}
@@ -53,14 +46,14 @@ export const AttachFileButton: React.FC<AttachFileButtonProps> = (props) => {
           </button>
         </TooltipTrigger>
         <TooltipContent>
-          <strong>Attach file</strong> — images, SVGs, PDFs
+          <strong>Attach any file</strong>. Images and PDFs attach directly. Other files are saved
+          to the workspace.
         </TooltipContent>
       </Tooltip>
-      {/* Hidden file input — kept outside Tooltip to avoid stray DOM children */}
+      {/* Kept outside Tooltip to avoid stray DOM children. */}
       <input
         ref={inputRef}
         type="file"
-        accept={FILE_ACCEPT}
         multiple
         className="hidden"
         onChange={handleChange}

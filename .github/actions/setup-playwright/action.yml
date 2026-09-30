@@ -21,10 +21,15 @@ runs:
       id: cache-playwright
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
-        path: ~/.cache/ms-playwright
-        key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}-${{ inputs.browsers }}
+        # Playwright uses OS-specific browser cache roots; include each default so
+        # macOS saves the cache instead of redownloading browsers on every run.
+        path: |
+          ~/.cache/ms-playwright
+          ~/Library/Caches/ms-playwright
+          ~/AppData/Local/ms-playwright
+        key: ${{ runner.os }}-${{ runner.arch }}-playwright-${{ steps.playwright-version.outputs.version }}-${{ inputs.browsers }}
         restore-keys: |
-          ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}-
+          ${{ runner.os }}-${{ runner.arch }}-playwright-${{ steps.playwright-version.outputs.version }}-
 
     - name: Install Playwright browsers
       if: steps.cache-playwright.outputs.cache-hit != 'true'

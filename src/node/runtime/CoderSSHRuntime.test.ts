@@ -87,6 +87,31 @@ function createSSHCoderConfig(coder: {
   };
 }
 
+describe("CoderSSHRuntime cleanup availability", () => {
+  // The control-plane fake avoids a real Coder deployment. The probe must never open SSH or start a workspace.
+  it.each(["running", "stopped", "starting", "stopping", "deleting", "deleted"] as const)(
+    "permits cleanup only when the workspace is running (%s)",
+    async (status) => {
+      const getWorkspaceStatus = mock(() => Promise.resolve({ kind: "ok" as const, status }));
+      const createWorkspace = mock(() => asyncLines([]));
+      const service = createMockCoderService({ getWorkspaceStatus, createWorkspace });
+      const runtime = createRuntime({ workspaceName: "mux-cleanup" }, service);
+      const signal = new AbortController().signal;
+      expect(await runtime.isRunningWithoutStart(signal)).toBe(status === "running");
+      expect(getWorkspaceStatus).toHaveBeenCalledWith("mux-cleanup", { signal });
+      expect(createWorkspace).not.toHaveBeenCalled();
+    }
+  );
+
+  it("skips cleanup when the control plane cannot find the workspace", async () => {
+    const service = createMockCoderService({
+      getWorkspaceStatus: mock(() => Promise.resolve({ kind: "not_found" as const })),
+    });
+    const runtime = createRuntime({ workspaceName: "mux-missing" }, service);
+    expect(await runtime.isRunningWithoutStart(new AbortController().signal)).toBe(false);
+  });
+});
+
 function asyncLines(lines: string[], error?: Error): AsyncGenerator<string, void, unknown> {
   return (async function* (): AsyncGenerator<string, void, unknown> {
     await Promise.resolve();
@@ -455,6 +480,23 @@ describe("CoderSSHRuntime.deleteWorkspace", () => {
     expect(result.success).toBe(true);
     expect(sshDeleteSpy).not.toHaveBeenCalled();
     expect(deleteWorkspaceEventually).not.toHaveBeenCalled();
+  });
+
+  it("passes abort signal to the Coder status check during delete", async () => {
+    const getWorkspaceStatus = mock(() => Promise.resolve({ kind: "not_found" as const }));
+    const coderService = createMockCoderService({ getWorkspaceStatus });
+    const runtime = createRuntime(
+      { existingWorkspace: false, workspaceName: "my-ws" },
+      coderService
+    );
+    const abortController = new AbortController();
+
+    await runtime.deleteWorkspace("/project", "ws", false, abortController.signal);
+
+    expect(getWorkspaceStatus).toHaveBeenCalledWith(
+      "my-ws",
+      expect.objectContaining({ signal: abortController.signal })
+    );
   });
 
   it("proceeds with SSH cleanup when status check fails with API error", async () => {

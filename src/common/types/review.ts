@@ -82,8 +82,17 @@ export type ReviewSortOrder = "file-order" | "last-edit";
  * Filter options for review panel
  */
 export interface ReviewFilters {
-  /** Whether to show hunks marked as read */
+  /** Whether to show hunks marked as read (used outside of Assisted mode). */
   showReadHunks: boolean;
+  /**
+   * Whether to show read hunks while {@link assistedOnly} is on. Tracked
+   * separately so the "Read:" toggle in Assisted mode is a worklist
+   * affordance ("hide done") without overwriting the user's general
+   * review preference. Defaults to false so marking an assisted pin
+   * as read actually clears it from the view — the user's most-asked
+   * fix once Assisted shipped.
+   */
+  assistedShowReadHunks: boolean;
   /** File path filter (regex or glob pattern) */
   filePathFilter?: string;
   /** Base reference to diff against (e.g., "HEAD", "main", "origin/main") */
@@ -112,6 +121,16 @@ export interface AssistedReviewHunk {
   range?: { start: number; end: number };
   /** Optional agent comment explaining why this area needs review. */
   comment?: string;
+  /**
+   * Frontend-only: timestamp (ms since epoch) when this pin was first
+   * observed during this client's lifetime — i.e., when `review_pane_update`
+   * introduced the path:range key. Used to render a transient "new" badge
+   * on freshly-added pins so the user can tell incremental adds apart from
+   * carried-over entries.
+   *
+   * Not persisted to disk; recomputed from the transcript on every load.
+   */
+  addedAt?: number;
 }
 
 /**
@@ -269,20 +288,19 @@ export function parseReviewLineRange(lineRange: string): ParsedReviewLineRange |
 /**
  * Normalize a plan file path for cross-platform matching.
  *
- * Converts Windows separators and strips absolute mux-home prefixes so callers can
- * compare only the stable ".mux/plans/..." suffix.
+ * Converts Windows separators and strips canonical or legacy home prefixes. The
+ * normalized `.mux/plans/...` suffix is intentionally retained as a serialized
+ * compatibility shape for older review transcripts.
  *
- * Accepts any absolute path containing `/.mux/plans/`, `/.mux-<suffix>/plans/`,
- * or `/var/mux/plans/`. Also accepts tilde-prefixed paths like
- * `~/.mux/plans/...` and
- * `~/.mux-<suffix>/plans/...` from legacy transcripts.
+ * Accepts `/.xum/plans/`, legacy `/.mux/plans/`, suffixed development homes,
+ * Docker `/var/mux/plans/`, and their tilde-prefixed equivalents.
  */
 export function normalizePlanFilePath(filePath: string): string | null {
   if (!filePath) return null;
 
   const normalized = filePath.replace(/\\/g, "/");
 
-  const tildeMatch = /^~\/\.mux(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
+  const tildeMatch = /^~\/\.(?:xum|mux)(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
   if (tildeMatch?.[1]) {
     return `.mux/plans/${tildeMatch[1]}`;
   }
@@ -298,9 +316,9 @@ export function normalizePlanFilePath(filePath: string): string | null {
   const isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized);
   if (!isAbsolute) return null;
 
-  const muxHomeMatch = /\/\.mux(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
-  if (muxHomeMatch?.[1]) {
-    return `.mux/plans/${muxHomeMatch[1]}`;
+  const xumHomeMatch = /\/\.(?:xum|mux)(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
+  if (xumHomeMatch?.[1]) {
+    return `.mux/plans/${xumHomeMatch[1]}`;
   }
 
   const dockerMatch = /\/var\/mux\/plans\/(.+)/.exec(normalized);

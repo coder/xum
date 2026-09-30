@@ -2,59 +2,18 @@ import { SUPPORTED_PROVIDERS, type ProviderName } from "@/common/constants/provi
 import { RUNTIME_MODE, type ParsedRuntime, type RuntimeMode } from "@/common/types/runtime";
 import type { EffectivePolicy, PolicyRuntimeId } from "@/common/orpc/types";
 import {
-  getCustomOpenAICompatibleProviderIds,
+  getCustomProviderIds,
   type ProvidersConfigWithProviderType,
 } from "@/common/utils/providers/customProviders";
 
-/**
- * Parse a model string into provider and modelId.
- * Returns null if the string doesn't match the expected "provider:modelId" format.
- */
-export function parseModelString(
-  modelString: string
-): { provider: string; modelId: string } | null {
-  const colonIndex = modelString.indexOf(":");
-  if (colonIndex <= 0 || colonIndex === modelString.length - 1) {
-    return null;
-  }
-
-  return {
-    provider: modelString.slice(0, colonIndex),
-    modelId: modelString.slice(colonIndex + 1),
-  };
-}
-
-/**
- * Check if a model is allowed by the effective policy.
- * Returns true if no policy is set, or if the model's provider is in the allowlist
- * and either no model restrictions exist or the model is in the allowed list.
- */
-export function isModelAllowedByPolicy(
-  policy: EffectivePolicy | null,
-  modelString: string
-): boolean {
-  const providerAccess = policy?.providerAccess;
-  if (providerAccess == null) {
-    return true;
-  }
-
-  const parsed = parseModelString(modelString);
-  if (!parsed) {
-    return true;
-  }
-
-  const providerPolicy = providerAccess.find((p) => p.id === parsed.provider);
-  if (!providerPolicy) {
-    return false;
-  }
-
-  const allowedModels = providerPolicy.allowedModels ?? null;
-  if (allowedModels === null) {
-    return true;
-  }
-
-  return allowedModels.includes(parsed.modelId);
-}
+// Model-string/policy predicates moved to @/common so the selectable-models
+// pipeline (shared with the backend models_list tool) can use them; re-exported
+// here to keep existing browser importers unchanged.
+export {
+  isGatewayModelAccessibleForUi,
+  isModelAllowedByPolicy,
+  parseModelString,
+} from "@/common/utils/policy/modelPolicy";
 
 export function getAllowedProvidersForUi(policy: EffectivePolicy | null): ProviderName[];
 export function getAllowedProvidersForUi(
@@ -65,9 +24,7 @@ export function getAllowedProvidersForUi(
   policy: EffectivePolicy | null,
   providersConfig?: ProvidersConfigWithProviderType | null
 ): string[] {
-  const customProviders = providersConfig
-    ? getCustomOpenAICompatibleProviderIds(providersConfig)
-    : [];
+  const customProviders = providersConfig ? getCustomProviderIds(providersConfig) : [];
   const access = policy?.providerAccess;
   if (access == null) {
     return Array.from(new Set([...SUPPORTED_PROVIDERS, ...customProviders]));

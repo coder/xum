@@ -10,6 +10,7 @@ import React, {
 } from "react";
 import { readPersistedString, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { UI_THEME_KEY } from "@/common/constants/storage";
+import { CHROME_COLORS } from "@/common/constants/chromeColors";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 
 export type ThemeMode = "light" | "dark" | "flexoki-light" | "flexoki-dark";
@@ -60,12 +61,7 @@ interface ThemeContextValue {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
-const THEME_COLORS: Record<ThemeMode, string> = {
-  dark: "#1e1e1e",
-  light: "#f5f6f8",
-  "flexoki-light": "#fffcf0",
-  "flexoki-dark": "#100f0f",
-};
+const THEME_COLORS: Record<ThemeMode, string> = CHROME_COLORS;
 
 // Keep hrefs relative so a server-injected <base> preserves path-app prefixes.
 const FAVICON_BY_SCHEME: Record<"light" | "dark", string> = {
@@ -121,7 +117,7 @@ function applyThemeToDocument(theme: ThemeMode) {
 
   const body = document.body;
   if (body) {
-    body.style.backgroundColor = "var(--color-background)";
+    body.style.backgroundColor = "var(--color-surface-primary)";
   }
 
   applyThemeFavicon(theme);

@@ -6,9 +6,10 @@ import type { SkillsCatalogSearchToolResult } from "@/common/types/tools";
 import { createSkillsCatalogSearchTool } from "./skills_catalog_search";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 let fetchSpy: { mockRestore: () => void } | null = null;

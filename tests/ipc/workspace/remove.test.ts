@@ -189,8 +189,8 @@ describeIntegration("Workspace deletion integration tests", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests. This allows tests to run concurrently.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run tests for both local and SSH runtimes
@@ -285,7 +285,7 @@ describeIntegration("Workspace deletion integration tests", () => {
 
           const sleepSeconds = 5;
           const tempGitRepo = await createTempGitRepoWithInitHook(
-            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > \"${markerPath}\"`
+            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > "${markerPath}"`
           );
 
           try {
@@ -529,9 +529,6 @@ describeIntegration("Workspace deletion integration tests", () => {
             const tempGitRepo = await createTempGitRepo();
 
             try {
-              // Add a real submodule to the main repo
-              await addSubmodule(tempGitRepo);
-
               const branchName = generateBranchName("delete-submodule-clean");
               const { workspaceId, workspacePath } = await createWorkspaceWithInit(
                 env,
@@ -542,9 +539,7 @@ describeIntegration("Workspace deletion integration tests", () => {
                 false // not SSH
               );
 
-              // Initialize submodule in the worktree
-              using initProc = execAsync(`cd "${workspacePath}" && git submodule update --init`);
-              await initProc.result;
+              await addSubmodule(workspacePath);
 
               // Verify submodule is initialized
               const submoduleExists = await fs
@@ -581,9 +576,6 @@ describeIntegration("Workspace deletion integration tests", () => {
             const tempGitRepo = await createTempGitRepo();
 
             try {
-              // Add a real submodule to the main repo
-              await addSubmodule(tempGitRepo);
-
               const branchName = generateBranchName("delete-submodule-dirty");
               const { workspaceId, workspacePath } = await createWorkspaceWithInit(
                 env,
@@ -594,9 +586,7 @@ describeIntegration("Workspace deletion integration tests", () => {
                 false // not SSH
               );
 
-              // Initialize submodule in the worktree
-              using initProc = execAsync(`cd "${workspacePath}" && git submodule update --init`);
-              await initProc.result;
+              await addSubmodule(workspacePath);
 
               // Make worktree dirty
               await fs.appendFile(path.join(workspacePath, "README.md"), "\nmodified");

@@ -14,8 +14,6 @@ import type {
   SuggestionDefinition,
 } from "./types";
 
-export type { SlashSuggestion } from "./types";
-
 const COMMAND_DEFINITIONS = getSlashCommandDefinitions();
 
 function filterAndMapSuggestions<T extends SuggestionDefinition>(
@@ -62,22 +60,66 @@ function buildTopLevelSuggestions(
   // The skill build callback below hardcodes the trailing space, so we omit
   // `appendSpace` here — leaving it set would be a no-op and falsely suggest
   // the build path consults it.
-  const skillDefinitions: SuggestionDefinition[] = (context.agentSkills ?? [])
+  // user-invocable: false skills are hidden from user-facing invocation surfaces
+  // (this covers both the chat slash menu and the command palette skill list).
+  const skillDefinitions: Array<SuggestionDefinition & { argumentHint?: string }> = (
+    context.agentSkills ?? []
+  )
+    .filter((skill) => skill.userInvocable !== false)
     .filter((skill) => !SLASH_COMMAND_DEFINITION_MAP.has(skill.name))
     .map((skill) => ({
       key: skill.name,
       description: `${skill.description} (${formatScopeLabel(skill.scope)})`,
+      argumentHint: skill.argumentHint,
     }));
 
   const skillSuggestions = filterAndMapSuggestions(skillDefinitions, partial, (definition) => {
     const replacement = `/${definition.key} `;
     return {
       id: `skill:${definition.key}`,
-      display: `/${definition.key}`,
+      // Skills with an argument-hint show it next to the name (e.g.
+      // "/fix-issue [issue-number]") so users learn the expected arguments in
+      // the invocation UI itself; matching/replacement still use only the name.
+      display:
+        definition.argumentHint === undefined
+          ? `/${definition.key}`
+          : `/${definition.key} ${definition.argumentHint}`,
       description: definition.description,
+      kind: "skill",
       replacement,
     };
   });
+
+  // Agent Plugins: manifest-contributed commands are pure data-driven entries
+  // whose replacement IS the expansion text (no parser/send-path involvement).
+  // Built-in command keys and skill names take precedence on collision.
+  const claimedSkillNames = new Set(skillDefinitions.map((definition) => definition.key));
+  const pluginCommandSuggestions = (context.pluginCommands ?? [])
+    .filter(
+      (command) =>
+        !SLASH_COMMAND_DEFINITION_MAP.has(command.name) && !claimedSkillNames.has(command.name)
+    )
+    .filter((command) => matchesNameBySegmentPrefix(command.name, partial))
+    .map((command) => ({
+      id: `plugin-command:${command.name}`,
+      display: `/${command.name}`,
+      description: `${command.description ?? "Plugin command"} (plugin:${command.pluginName})`,
+      replacement: command.expansion,
+    }));
+
+  const promptSuggestions = (context.mcpPrompts ?? [])
+    .filter((prompt) => matchesNameBySegmentPrefix(prompt.commandKey, partial))
+    .map((prompt) => {
+      const argumentHint = (prompt.arguments ?? [])
+        .map((argument) => `[${argument.name}${argument.required ? "" : "?"}]`)
+        .join(" ");
+      return {
+        id: `mcp-prompt:${prompt.commandKey}`,
+        display: `/${prompt.commandKey}${argumentHint ? ` ${argumentHint}` : ""}`,
+        description: `${prompt.description ?? "MCP prompt"} (${prompt.serverName})`,
+        replacement: `/${prompt.commandKey} `,
+      };
+    });
 
   // Model alias one-shot suggestions (e.g., /haiku, /sonnet, /opus+high).
   // The build callback below hardcodes the trailing space, so `appendSpace`
@@ -100,7 +142,13 @@ function buildTopLevelSuggestions(
     })
   );
 
-  return [...commandSuggestions, ...skillSuggestions, ...modelAliasSuggestions];
+  return [
+    ...commandSuggestions,
+    ...skillSuggestions,
+    ...pluginCommandSuggestions,
+    ...promptSuggestions,
+    ...modelAliasSuggestions,
+  ];
 }
 
 function buildSubcommandSuggestions(

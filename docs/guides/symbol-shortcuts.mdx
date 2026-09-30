@@ -1,0 +1,43 @@
+---
+title: Symbol Shortcuts
+description: Insert math and trading symbols in the Xum chat input with LaTeX-style backslash commands
+---
+
+Type a LaTeX-style backslash command in the chat input to insert a Unicode symbol. `\alpha` becomes α, `\leq` becomes ≤, `\subseteq` becomes ⊆, and `\euro` becomes €. This covers math, set theory, logic, arrows, and currency/trading notation without leaving the keyboard.
+
+## Usage
+
+Type `\` to open an autocomplete menu that filters as you type. Accept the highlighted entry with **Tab** or **Enter**, navigate with the arrow keys, and dismiss with **Esc**.
+
+Greek letters follow the case of the command: `\alpha` inserts α, while `\Alpha` inserts Α.
+
+## Conversion timing
+
+Unambiguous commands convert the moment you finish typing the name — `\alpha` turns into α without needing Tab.
+
+When a name is a prefix of another command, Xum keeps the menu open instead of guessing. For example `\in` is a prefix of `\int` and `\infty`, so typing `\in` does **not** convert on its own. Accept it explicitly to disambiguate:
+
+- Press **Tab** or **Enter** to take the highlighted entry (an exact name match is always preselected, so `\in` + Tab gives ∈).
+- Or type a space or punctuation after the name (`\in ` becomes `∈ `).
+
+## Escaping
+
+Prefix the command with a second backslash to insert it literally. `\\alpha` stays as `\alpha` and does not convert. Commands are also left untouched inside inline code spans and fenced code blocks.
+
+## Available symbols
+
+Matching is case-sensitive. Names mirror their LaTeX equivalents where one exists.
+
+{/* The full list lives in `src/browser/features/ChatInput/symbolShortcuts.ts` (the `SYMBOLS` table). This is an illustrative subset; keep it in sync when symbols are added or renamed. */}
+
+| Category              | Examples                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Greek                 | `\alpha` α, `\beta` β, `\pi` π, `\Sigma` Σ, `\Omega` Ω                                                                               |
+| Relations & operators | `\times` ×, `\div` ÷, `\pm` ±, `\neq` ≠, `\leq` ≤, `\geq` ≥, `\approx` ≈, `\equiv` ≡, `\infty` ∞, `\sqrt` √, `\degree` °             |
+| Set theory            | `\in` ∈, `\notin` ∉, `\subset` ⊂, `\subseteq` ⊆, `\cup` ∪, `\cap` ∩, `\emptyset` ∅, `\forall` ∀, `\exists` ∃, `\R` ℝ, `\Z` ℤ, `\N` ℕ |
+| Logic                 | `\land` ∧, `\lor` ∨, `\neg` ¬, `\implies` ⟹, `\iff` ⟺, `\therefore` ∴                                                                |
+| Arrows                | `\to` →, `\gets` ←, `\leftrightarrow` ↔, `\Rightarrow` ⇒, `\uparrow` ↑, `\downarrow` ↓, `\mapsto` ↦                                  |
+| Currency & trading    | `\euro` €, `\pound` £, `\yen` ¥, `\cent` ¢, `\bitcoin` ₿, `\permille` ‰, `\bps` ‱, `\trademark` ™                                    |
+| Big operators         | `\sum` ∑, `\prod` ∏, `\int` ∫, `\oint` ∮, `\bigcup` ⋃, `\bigcap` ⋂                                                                   |
+
+Open the `\` menu and browse to see the full list.

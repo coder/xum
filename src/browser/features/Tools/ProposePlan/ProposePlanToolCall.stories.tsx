@@ -1,12 +1,22 @@
+import { isPixel } from "@coder/pixel-storybook/storyapi";
+import { userEvent, waitFor, within } from "@storybook/test";
+
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createProposePlanTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAgentIdKey } from "@/common/constants/storage";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/ProposePlan" };
 export default meta;
+
+// The full sticky ToC needs at least 1600px, so the story pins Pixel's 1900px
+// desktop viewport instead of the default 1200px laptop width.
+const PLAN_TOC_MIN_WIDTH = 1600;
+const PLAN_TOC_PIXEL_MATRIX = { viewports: ["desktop"] } as const;
 
 /**
  * Story showing a propose_plan tool call with Plan UI.
@@ -175,6 +185,221 @@ export const ProposePlanMobile: AppStory = {
         story:
           "Renders ProposePlan at an iPhone-sized viewport to verify that Implement / Continue in Auto " +
           "appear as shortcut icons in the left action row (preventing right-side overflow on small screens).",
+      },
+    },
+  },
+};
+
+/**
+ * #4980: the admin policy allows only Anthropic, and Exec defaults to an OpenAI model.
+ * Implement refuses before switching agents and shows why in the card.
+ */
+export const ProposePlanImplementBlockedByPolicy: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(getAgentIdKey("ws-plan-policy"), "plan");
+
+        return setupSimpleChatStory({
+          workspaceId: "ws-plan-policy",
+          agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+          policyResponse: {
+            source: "governor",
+            status: { state: "enforced" },
+            policy: {
+              policyFormatVersion: "0.1",
+              providerAccess: [{ id: "anthropic", allowedModels: null }],
+              mcp: { allowUserDefined: { stdio: true, remote: true } },
+              runtimes: null,
+            },
+          },
+          messages: [
+            createUserMessage("msg-1", "Plan the auth refactor", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 300000,
+            }),
+            createAssistantMessage("msg-2", "Here is the plan.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 290000,
+              toolCalls: [
+                createProposePlanTool(
+                  "call-plan-1",
+                  "# Auth Refactor\n\n1. Extract JWT utilities\n2. Add refresh tokens"
+                ),
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const implement = await canvas.findByRole("button", { name: "Implement" });
+    // Explicit timeouts: see ProposePlanWithTableOfContents. Implement enables once the
+    // transcript replay caught up; the mock answers policy.get before that.
+    await waitFor(
+      () => {
+        if ((implement as HTMLButtonElement).disabled) throw new Error("Implement still disabled");
+      },
+      { timeout: 5000 }
+    );
+    await userEvent.click(implement);
+    await waitFor(
+      () => {
+        const alerts = canvas.queryAllByRole("alert");
+        if (!alerts.some((alert) => alert.textContent?.includes("openai:gpt-5.2"))) {
+          throw new Error("Expected the policy refusal in the plan card");
+        }
+      },
+      { timeout: 5000 }
+    );
+  },
+  parameters: {
+    // Play-only: the Pixel snapshot budget is at its cap.
+    pixel: PIXEL_DISABLED,
+    docs: {
+      description: {
+        story:
+          "Admin policy excludes the Exec agent's model: Implement stays in plan mode " +
+          "and the card says why (#4980).",
+      },
+    },
+  },
+};
+
+/**
+ * Wide-viewport story that exercises the sticky plan TOC.
+ *
+ * The TOC lives in an absolutely-positioned `<aside>` outside the centered
+ * `max-w-4xl` transcript column, and is gated by a container query on the
+ * transcript scrollport. At desktop (1280px) viewport the gate stays closed;
+ * the `wide` viewport (1600px) gives the scrollport enough room to reveal
+ * the TOC alongside the plan.
+ */
+export const ProposePlanWithTableOfContents: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-plan-toc",
+          messages: [
+            createUserMessage("msg-1", "Plan a multi-section refactor with deep structure.", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 300000,
+            }),
+            createAssistantMessage("msg-2", "Here is the plan with a navigable outline:", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 290000,
+              toolCalls: [
+                createProposePlanTool(
+                  "call-plan-toc",
+                  `# Authentication Module Refactor
+
+## Overview
+
+Refactor the auth system to improve security, maintainability, and observability.
+
+## Tasks
+
+### Extract JWT utilities
+
+Move token generation and validation to a dedicated module.
+
+### Add refresh token support
+
+Implement secure refresh token rotation.
+
+### Improve password hashing
+
+Upgrade to Argon2id with proper salt rounds.
+
+### Add rate limiting
+
+Implement per-IP and per-user rate limits.
+
+## Implementation Order
+
+\`\`\`mermaid
+graph TD
+    A[Extract JWT utils] --> B[Add refresh tokens]
+    B --> C[Improve hashing]
+    C --> D[Add rate limiting]
+\`\`\`
+
+## Rollout
+
+### Staging soak
+
+Two-week staging soak with synthetic traffic.
+
+### Production cutover
+
+Blue/green cutover with automatic rollback on auth-error spikes.
+
+## Success Criteria
+
+- All existing tests pass
+- New tests for refresh token flow
+- Security audit passes
+- Performance benchmarks maintained`
+                ),
+              ],
+            }),
+          ],
+        })
+      }
+    />
+  ),
+  globals: {
+    viewport: { value: "wide", isRotated: false },
+  },
+  play: async ({ canvasElement }) => {
+    const shouldAssertFullToc = isPixel() || window.innerWidth >= PLAN_TOC_MIN_WIDTH;
+    if (!shouldAssertFullToc) {
+      return;
+    }
+
+    const canvas = within(canvasElement);
+    const toc = await canvas.findByTestId("plan-toc-nav");
+    // Explicit timeout: preview.tsx's configure({ asyncUtilTimeout }) targets the
+    // storybook/test module, not this @storybook/test import, so waitFor would
+    // otherwise give up after 1s while the container query settles on loaded CI runners.
+    await waitFor(
+      () => {
+        // Fail if the pinned viewport no longer reveals the full sticky ToC.
+        if (window.getComputedStyle(toc).display === "none" || toc.getClientRects().length === 0) {
+          // The reveal is a pure CSS container query, so include the widths that
+          // drive it: a failure here is a sizing regression, not a timing race.
+          const transcript = document.querySelector('[style*="container"], .plan-toc-aware')
+            ? [...document.querySelectorAll<HTMLElement>("*")].find((el) =>
+                getComputedStyle(el).containerName.includes("transcript")
+              )
+            : undefined;
+          throw new Error(
+            "Expected the full plan TOC to be visible in the wide Storybook story " +
+              `(innerWidth=${window.innerWidth}, innerHeight=${window.innerHeight}, ` +
+              `transcriptContainerWidth=${transcript?.offsetWidth ?? "not-found"})`
+          );
+        }
+      },
+      { timeout: 10_000 }
+    );
+  },
+  parameters: {
+    viewport: { defaultViewport: "wide" },
+    pixel: {
+      matrix: PLAN_TOC_PIXEL_MATRIX,
+    },
+    docs: {
+      description: {
+        story:
+          "Wide-viewport rendering of a multi-section plan. The sticky " +
+          '"Contents" navigation appears in the left gutter beside the plan ' +
+          "card, anchored to the plan's vertical bounds via `position: sticky` " +
+          "inside an absolutely-positioned `<aside>`. " +
+          "Visibility is purely CSS-driven (container query + visibility class) " +
+          "so toggling the plan tool expanded/collapsed produces no layout jank.",
       },
     },
   },

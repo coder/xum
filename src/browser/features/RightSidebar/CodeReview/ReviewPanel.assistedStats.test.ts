@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AssistedReviewHunk, DiffHunk } from "@/common/types/review";
+import { normalizeAssistedReviewHunks } from "@/common/utils/review/assistedReview";
 import {
-  buildReviewDiffPathFilter,
   buildReviewDiffPathFilterSpecs,
   countUnreadAssistedHunks,
   getEffectiveReviewFrontendFilters,
   getEffectiveReviewIncludeUncommitted,
+  getReviewPanelPathContext,
 } from "./ReviewPanel";
 
 function hunk(overrides: Partial<DiffHunk>): DiffHunk {
@@ -50,9 +51,53 @@ describe("countUnreadAssistedHunks", () => {
   });
 });
 
-describe("buildReviewDiffPathFilter", () => {
+describe("getReviewPanelPathContext", () => {
+  test("keeps primary project-relative pins while matching cwd-relative fallbacks", () => {
+    const pathContext = getReviewPanelPathContext({
+      workspaceMetadata: {
+        projectPath: "/repo/app",
+        subProjectPath: "/repo/app/packages/api",
+      },
+      projectPath: "/repo/app",
+    });
+    expect(pathContext).toEqual({
+      projectPath: "/repo/app",
+      executionRootPath: "/repo/app/packages/api",
+    });
+    const assisted = normalizeAssistedReviewHunks(
+      [
+        { path: "src/agent.ts", range: { start: 2, end: 4 }, comment: "ambiguous" },
+        { path: "packages/api/src/already-rooted.ts", comment: "project-relative" },
+      ],
+      pathContext
+    );
+
+    expect(assisted).toEqual([
+      { path: "src/agent.ts", range: { start: 2, end: 4 }, comment: "ambiguous" },
+      { path: "packages/api/src/already-rooted.ts", comment: "project-relative" },
+    ]);
+    expect(
+      countUnreadAssistedHunks(
+        [hunk({ id: "match", filePath: "packages/api/src/agent.ts", newStart: 3 })],
+        assisted,
+        () => false,
+        pathContext
+      )
+    ).toBe(1);
+  });
+});
+
+describe("buildReviewDiffPathFilterSpecs single-project", () => {
+  function singleProjectPathFilter(
+    params: Omit<Parameters<typeof buildReviewDiffPathFilterSpecs>[0], "projectPath">
+  ): string {
+    const specs = buildReviewDiffPathFilterSpecs({ ...params, projectPath: "/repo" });
+    expect(specs).toHaveLength(1);
+    return specs[0].pathFilter;
+  }
+
   test("assisted mode fetches agent-pinned files instead of the stale selected file", () => {
-    const pathFilter = buildReviewDiffPathFilter({
+    const pathFilter = singleProjectPathFilter({
       isImmersive: false,
       assistedOnly: true,
       assistedHunks: [
@@ -62,21 +107,19 @@ describe("buildReviewDiffPathFilter", () => {
       selectedFilePath: "src/user-selected.ts",
       selectedDiffPath: "src/user-selected.ts",
       workspaceMetadata: null,
-      repoRootProjectPath: "/repo",
     });
 
     expect(pathFilter).toBe(" -- 'src/agent.ts'");
   });
 
   test("non-assisted mode preserves the selected file pathspec", () => {
-    const pathFilter = buildReviewDiffPathFilter({
+    const pathFilter = singleProjectPathFilter({
       isImmersive: false,
       assistedOnly: false,
       assistedHunks: [{ path: "src/agent.ts" }],
       selectedFilePath: "src/user-selected.ts",
       selectedDiffPath: "src/user-selected.ts",
       workspaceMetadata: null,
-      repoRootProjectPath: "/repo",
     });
 
     expect(pathFilter).toBe(" -- 'src/user-selected.ts'");
@@ -113,6 +156,30 @@ describe("buildReviewDiffPathFilterSpecs", () => {
         repoRootProjectPath: "/repo/project-a",
         pathFilter: " -- 'src/main.ts'",
         selectedFilePath: "src/main.ts",
+      },
+    ]);
+  });
+
+  test("assisted mode fetches primary paths plus execution-root fallbacks", () => {
+    const specs = buildReviewDiffPathFilterSpecs({
+      isImmersive: false,
+      assistedOnly: true,
+      assistedHunks: [{ path: "src/agent.ts" }, { path: "README.md" }],
+      selectedFilePath: null,
+      selectedDiffPath: "",
+      workspaceMetadata: null,
+      projectPath: "/repo/app",
+      pathContext: {
+        projectPath: "/repo/app",
+        executionRootPath: "/repo/app/packages/api",
+      },
+    });
+
+    expect(specs).toEqual([
+      {
+        repoRootProjectPath: "/repo/app",
+        pathFilter: " -- 'src/agent.ts' 'packages/api/src/agent.ts' 'README.md'",
+        selectedFilePath: "src/agent.ts",
       },
     ]);
   });
@@ -154,21 +221,50 @@ describe("getEffectiveReviewIncludeUncommitted", () => {
 });
 
 describe("getEffectiveReviewFrontendFilters", () => {
-  test("assisted mode bypasses user filters that could hide accepted pins", () => {
+  test("assisted mode honors the user search term", () => {
+    // Previously the assisted-only branch wiped the search term so a pin
+    // couldn't be hidden by stale state. That clobbered legitimate
+    // narrowing — we now leave the user's query alone in both modes.
     expect(
       getEffectiveReviewFrontendFilters({
         assistedOnly: true,
         showReadHunks: false,
-        searchTerm: "does-not-match",
+        assistedShowReadHunks: false,
+        searchTerm: "needle",
+      })
+    ).toEqual({ showReadHunks: false, searchTerm: "needle" });
+  });
+
+  test("assisted mode uses assistedShowReadHunks for the read filter", () => {
+    // Marking a pin as read should clear it from the worklist by default,
+    // so the assisted-scoped flag drives this decision instead of the
+    // global "showReadHunks" preference. The user's general preference is
+    // intentionally ignored here.
+    expect(
+      getEffectiveReviewFrontendFilters({
+        assistedOnly: true,
+        showReadHunks: true, // user prefers showing read globally
+        assistedShowReadHunks: false, // worklist default: hide read pins
+        searchTerm: "",
+      })
+    ).toEqual({ showReadHunks: false, searchTerm: "" });
+
+    expect(
+      getEffectiveReviewFrontendFilters({
+        assistedOnly: true,
+        showReadHunks: false, // user prefers hiding read globally
+        assistedShowReadHunks: true, // explicit "show read" in worklist mode
+        searchTerm: "",
       })
     ).toEqual({ showReadHunks: true, searchTerm: "" });
   });
 
-  test("non-assisted mode keeps user filters", () => {
+  test("non-assisted mode keeps user filters and ignores assistedShowReadHunks", () => {
     expect(
       getEffectiveReviewFrontendFilters({
         assistedOnly: false,
         showReadHunks: false,
+        assistedShowReadHunks: true, // ignored outside Assisted mode
         searchTerm: "needle",
       })
     ).toEqual({ showReadHunks: false, searchTerm: "needle" });

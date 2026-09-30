@@ -797,36 +797,6 @@ export function deleteCharUnderCursor(
 }
 
 /**
- * Delete entire line (like 'dd').
- */
-export function deleteLine(
-  text: string,
-  cursor: number,
-  _yankBuffer: string
-): { text: string; cursor: number; yankBuffer: string } {
-  const { lineStart, lineEnd } = getLineBounds(text, cursor);
-  const isLastLine = lineEnd === text.length;
-  const to = isLastLine ? lineEnd : lineEnd + 1;
-  const removed = text.slice(lineStart, to);
-  const newText = text.slice(0, lineStart) + text.slice(to);
-  return {
-    text: newText,
-    cursor: lineStart,
-    yankBuffer: removed,
-  };
-}
-
-/**
- * Yank entire line (like 'yy').
- */
-export function yankLine(text: string, cursor: number): string {
-  const { lineStart, lineEnd } = getLineBounds(text, cursor);
-  const isLastLine = lineEnd === text.length;
-  const to = isLastLine ? lineEnd : lineEnd + 1;
-  return text.slice(lineStart, to);
-}
-
-/**
  * Paste yankBuffer after cursor (like 'p').
  */
 export function pasteAfter(
@@ -891,18 +861,6 @@ export function changeRange(
   _yankBuffer: string
 ): { text: string; cursor: number; yankBuffer: string } {
   return deleteRange(text, from, to, true, _yankBuffer);
-}
-
-/**
- * Handle change entire line (cc).
- */
-export function changeLine(
-  text: string,
-  cursor: number,
-  yankBuffer: string
-): { text: string; cursor: number; yankBuffer: string } {
-  const { lineStart, lineEnd } = getLineBounds(text, cursor);
-  return changeRange(text, lineStart, lineEnd, yankBuffer);
 }
 
 /**
@@ -1280,7 +1238,6 @@ function handleNormalModeKey(state: VimState, key: string, modifiers: KeyModifie
 
   const count = nextState.count ?? 1;
 
-  // Handle navigation
   const navResult = tryHandleNavigation(nextState, key, count);
   if (navResult) return navResult;
 
@@ -2751,43 +2708,4 @@ function tryHandleOperator(state: VimState, key: string, now: number): VimKeyRes
   }
 
   return null;
-}
-
-/**
- * Format pending command text for display in the mode indicator.
- * Returns an empty string if no pending command.
- *
- * Examples:
- * - "d", "c", "ci", "di"
- * - "g", "5g"
- */
-export function formatPendingCommand(
-  pending: VimState["pending"],
-  count: VimState["count"]
-): string {
-  const countText = count == null ? "" : String(count);
-
-  if (!pending) return countText;
-
-  switch (pending.kind) {
-    case "op": {
-      const opCountText = pending.count === 1 ? "" : String(pending.count);
-      const args = pending.args?.join("") ?? "";
-      return `${opCountText}${pending.op}${args}${countText}`;
-    }
-
-    case "g": {
-      const prefixCountText = pending.count === 1 ? "" : String(pending.count);
-      return `${prefixCountText}g${countText}`;
-    }
-
-    case "find": {
-      const findCountText = pending.count === 1 ? "" : String(pending.count);
-      const opText = pending.op ?? "";
-      return `${opText}${findCountText}${pending.variant}${countText}`;
-    }
-    default:
-      assert(false, `Unexpected Vim pending kind: ${String((pending as { kind?: unknown }).kind)}`);
-      return countText;
-  }
 }

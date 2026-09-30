@@ -47,9 +47,11 @@ function TooltipRow({
   const { copied, copyToClipboard } = useCopyToClipboard();
 
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex min-w-0 items-center gap-1.5">
       <span className="text-muted shrink-0 text-xs">{label}</span>
-      <span className="font-mono text-xs whitespace-nowrap">{value}</span>
+      <span className="min-w-0 truncate font-mono text-xs" title={value}>
+        {value}
+      </span>
       {copyable && (
         <button
           onClick={(e) => {
@@ -131,7 +133,7 @@ export function RuntimeBadge({
           <Icon />
         </span>
       </TooltipTrigger>
-      <TooltipContent side={tooltipSide} align="start" className="max-w-[500px]">
+      <TooltipContent side={tooltipSide} align="start" className="max-w-[min(90vw,500px)]">
         <div className="flex flex-col gap-1">
           <div className="text-xs font-medium">{info.label}</div>
           {workspaceName && <TooltipRow label="Name" value={workspaceName} />}

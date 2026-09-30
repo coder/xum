@@ -2,8 +2,11 @@ import React from "react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { ProviderIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
-import { getModelName, getModelProvider, normalizeToCanonical } from "@/common/utils/ai/models";
+import {
+  formatModelStringForDisplay,
+  getModelProvider,
+  normalizeToCanonical,
+} from "@/common/utils/ai/models";
 
 interface ModelDisplayProps {
   modelString: string;
@@ -44,7 +47,7 @@ function getRouteDisplayName(
 export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
   const canonicalModel = normalizeToCanonical(props.modelString);
   const originProvider = getModelProvider(canonicalModel);
-  const displayName = formatModelDisplayName(getModelName(canonicalModel));
+  const displayName = formatModelStringForDisplay(canonicalModel);
   const resolvedRouteProvider = resolveRouteProvider(
     props.routeProvider,
     props.routedThroughGateway

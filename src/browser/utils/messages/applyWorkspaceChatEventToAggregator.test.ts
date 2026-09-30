@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { dismissChatError, peekChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import type {
   ReasoningDeltaEvent,
@@ -12,6 +12,7 @@ import type {
   StreamStartEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
+  ToolCallExecutionStartEvent,
   ToolCallStartEvent,
   UsageDeltaEvent,
 } from "@/common/types/stream";
@@ -49,6 +50,10 @@ class StubAggregator implements WorkspaceChatEventAggregator {
   }
   handleToolCallStart(data: ToolCallStartEvent): void {
     this.calls.push(`handleToolCallStart:${data.toolCallId}`);
+  }
+
+  handleToolCallExecutionStart(data: ToolCallExecutionStartEvent): void {
+    this.calls.push(`handleToolCallExecutionStart:${data.toolCallId}`);
   }
 
   handleToolCallDelta(data: ToolCallDeltaEvent): void {
@@ -89,40 +94,6 @@ class StubAggregator implements WorkspaceChatEventAggregator {
 }
 
 describe("applyWorkspaceChatEventToAggregator", () => {
-  function withDispatchSpy<T>(run: (dispatched: Event[]) => T): T {
-    const originalWindow = globalThis.window;
-    const originalCustomEvent = globalThis.CustomEvent;
-    const dispatched: Event[] = [];
-
-    // CI bun environment may lack CustomEvent (it was previously provided by happy-dom).
-    // createCustomEvent() in src/common/constants/events.ts uses `new CustomEvent(...)`.
-    if (typeof globalThis.CustomEvent === "undefined") {
-      // Minimal polyfill: only needs to carry .type and .detail for our assertions.
-      globalThis.CustomEvent = class CustomEvent extends Event {
-        detail: unknown;
-
-        constructor(type: string, init?: CustomEventInit) {
-          super(type, init);
-          this.detail = init?.detail;
-        }
-      } as typeof globalThis.CustomEvent;
-    }
-
-    globalThis.window = {
-      dispatchEvent: (event: Event) => {
-        dispatched.push(event);
-        return true;
-      },
-    } as unknown as Window & typeof globalThis;
-
-    try {
-      return run(dispatched);
-    } finally {
-      globalThis.window = originalWindow;
-      globalThis.CustomEvent = originalCustomEvent;
-    }
-  }
-
   test("stream-start routes to handleStreamStart", () => {
     const aggregator = new StubAggregator();
 
@@ -192,29 +163,23 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     expect(hint).toBe("immediate");
     expect(aggregator.calls).toEqual(["handleRuntimeStatus:starting:ssh"]);
   });
-  test("goal-budget-limited child events dispatch a toast without mutating messages", () => {
-    withDispatchSpy((dispatched) => {
-      const aggregator = new StubAggregator();
-      const event: WorkspaceChatMessage = {
-        type: "goal-budget-limited",
-        workspaceId: "parent-1",
-        goalId: "goal-1",
-        causedByChild: true,
-        childWorkspaceId: "child-1",
-        message: "Child workspace exceeded the parent's goal budget.",
-      };
+  test("goal-budget-limited child events publish a chat error without mutating messages", () => {
+    const aggregator = new StubAggregator();
+    const event: WorkspaceChatMessage = {
+      type: "goal-budget-limited",
+      workspaceId: "parent-1",
+      goalId: "goal-1",
+      causedByChild: true,
+      childWorkspaceId: "child-1",
+      message: "Child workspace exceeded the parent's goal budget.",
+    };
 
-      const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
+    const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
 
-      expect(hint).toBe("ignored");
-      expect(aggregator.calls).toEqual([]);
-      expect(dispatched).toHaveLength(1);
-      expect(dispatched[0]?.type).toBe(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST);
-      expect((dispatched[0] as CustomEvent).detail).toEqual({
-        workspaceId: "parent-1",
-        message: "Child workspace exceeded the parent's goal budget.",
-      });
-    });
+    expect(hint).toBe("ignored");
+    expect(aggregator.calls).toEqual([]);
+    expect(peekChatError("parent-1")).toBe("Child workspace exceeded the parent's goal budget.");
+    dismissChatError("parent-1", "Child workspace exceeded the parent's goal budget.");
   });
 
   test("stream-abort clears token state before calling handleStreamAbort", () => {
@@ -271,74 +236,6 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     expect(aggregator.calls).toEqual(["handleToolCallDelta:tool-1"]);
   });
 
-  test("tool-call-end dispatches AGENTS_REFRESH_REQUESTED for successful propose_plan", () => {
-    const aggregator = new StubAggregator();
-
-    const event: WorkspaceChatMessage = {
-      type: "tool-call-end",
-      workspaceId: "ws-1",
-      messageId: "msg-1",
-      toolCallId: "tool-1",
-      toolName: "propose_plan",
-      result: { success: true, planPath: "~/.mux/plans/demo/ws-1.md" },
-      timestamp: 1,
-    };
-
-    withDispatchSpy((dispatched) => {
-      const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
-
-      expect(hint).toBe("immediate");
-      expect(aggregator.calls).toEqual(["handleToolCallEnd:tool-1"]);
-      expect(dispatched).toHaveLength(1);
-      expect(dispatched[0]?.type).toBe(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED);
-    });
-  });
-
-  test("tool-call-end does not dispatch AGENTS_REFRESH_REQUESTED for replayed/failed/non-plan events", () => {
-    const aggregator = new StubAggregator();
-
-    const replayedProposePlan: WorkspaceChatMessage = {
-      type: "tool-call-end",
-      workspaceId: "ws-1",
-      messageId: "msg-1",
-      toolCallId: "tool-replay",
-      toolName: "propose_plan",
-      result: { success: true, planPath: "~/.mux/plans/demo/ws-1.md" },
-      timestamp: 1,
-      replay: true,
-    };
-
-    const failedProposePlan: WorkspaceChatMessage = {
-      type: "tool-call-end",
-      workspaceId: "ws-1",
-      messageId: "msg-2",
-      toolCallId: "tool-failed",
-      toolName: "propose_plan",
-      result: { success: false, error: "Plan file missing" },
-      timestamp: 2,
-    };
-
-    const nonPlanTool: WorkspaceChatMessage = {
-      type: "tool-call-end",
-      workspaceId: "ws-1",
-      messageId: "msg-3",
-      toolCallId: "tool-bash",
-      toolName: "bash",
-      result: { success: true },
-      timestamp: 3,
-    };
-
-    withDispatchSpy((dispatched) => {
-      expect(applyWorkspaceChatEventToAggregator(aggregator, replayedProposePlan)).toBe(
-        "immediate"
-      );
-      expect(applyWorkspaceChatEventToAggregator(aggregator, failedProposePlan)).toBe("immediate");
-      expect(applyWorkspaceChatEventToAggregator(aggregator, nonPlanTool)).toBe("immediate");
-
-      expect(dispatched).toHaveLength(0);
-    });
-  });
-
   test("message routes to handleMessage", () => {
     const aggregator = new StubAggregator();
 
@@ -392,6 +289,7 @@ describe("applyWorkspaceChatEventToAggregator", () => {
   test("throws when aggregator is missing", () => {
     const event: WorkspaceChatMessage = {
       type: "caught-up",
+      historyReplayStatus: "complete",
     };
 
     expect(() =>

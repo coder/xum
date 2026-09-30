@@ -36,7 +36,9 @@ describe("Transcript-only workspace UI", () => {
       workspaces: [metadata],
       onChat: (workspaceId, emit) => {
         if (workspaceId !== metadata.id) {
-          queueMicrotask(() => emit({ type: "caught-up", hasOlderHistory: false }));
+          queueMicrotask(() =>
+            emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false })
+          );
           return undefined;
         }
         return staticChatHandler(emit);

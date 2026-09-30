@@ -24,26 +24,6 @@ const CONTEXT_METER_DATA: TokenMeterData = {
   ],
 };
 
-const HOVER_SUMMARY_DATA: TokenMeterData = {
-  totalTokens: 130500,
-  maxTokens: 200000,
-  totalPercentage: 65.25,
-  segments: [
-    {
-      type: "input",
-      tokens: 128000,
-      percentage: 64,
-      color: TOKEN_COMPONENT_COLORS.input,
-    },
-    {
-      type: "output",
-      tokens: 2500,
-      percentage: 1.25,
-      color: TOKEN_COMPONENT_COLORS.output,
-    },
-  ],
-};
-
 const meta = {
   ...lightweightMeta,
   title: "App/Chat/Components/ContextUsageIndicator",
@@ -87,15 +67,10 @@ export const ContextMeterWithIdleCompaction: Story = {
   },
 };
 
-/**
- * Context meter hover summary tooltip.
- *
- * Captures the non-interactive one-line tooltip shown on hover so the quick
- * compaction stats remain visible even after controls moved to click-to-open.
- */
-export const ContextMeterHoverSummaryTooltip: Story = {
+/** The compact meter opens compaction settings directly without an overlapping hover tooltip. */
+export const ContextMeterOpensSettings: Story = {
   args: {
-    data: HOVER_SUMMARY_DATA,
+    data: CONTEXT_METER_DATA,
     autoCompaction: { threshold: 80, setThreshold: fn() },
     idleCompaction: { hours: 4, setHours: fn() },
   },
@@ -106,41 +81,13 @@ export const ContextMeterHoverSummaryTooltip: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    const contextButton = await canvas.findByRole("button", { name: /context usage/i });
 
-    const contextButton = await waitFor(
-      () => canvas.getByRole("button", { name: /context usage/i }),
-      { interval: 50, timeout: 10000 }
-    );
+    await userEvent.click(contextButton);
 
-    await userEvent.hover(contextButton);
-
-    await waitFor(
-      () => {
-        const tooltip = document.querySelector('[role="tooltip"]');
-        if (!(tooltip instanceof HTMLElement)) {
-          throw new Error("Compaction hover summary tooltip not visible");
-        }
-
-        const text = tooltip.textContent ?? "";
-        if (!text.includes("Context ")) {
-          throw new Error("Expected context usage summary in tooltip");
-        }
-        if (!text.includes("Auto ")) {
-          throw new Error("Expected auto-compaction summary in tooltip");
-        }
-        if (!text.includes("Idle 4h")) {
-          throw new Error("Expected idle compaction summary in tooltip");
-        }
-      },
-      { interval: 50, timeout: 5000 }
-    );
-  },
-  parameters: {
-    docs: {
-      description: {
-        story:
-          "Captures the context usage hover summary tooltip with one-line stats for context, auto-compaction threshold, and idle timer.",
-      },
-    },
+    await waitFor(() => {
+      const dialog = within(document.body).getByRole("dialog");
+      within(dialog).getByText("Compaction Settings");
+    });
   },
 };

@@ -4,7 +4,7 @@ import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
   formatCompactionCommandLine,
   getFollowUpContentText,
@@ -21,8 +21,12 @@ import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   buildAgentSkillMetadata,
+  buildMcpPromptUserText,
+  withAgentSkillRefs,
+  withMcpPromptRefs,
   type CompactionFollowUpInput,
   type DisplayedMessage,
+  type MuxMessageMetadata,
 } from "@/common/types/message";
 
 interface CompactAndRetryState {
@@ -51,20 +55,53 @@ function findTriggerUserMessage(
  * Build follow-up content from a user message source.
  * Preserves skill metadata if the original message was a skill invocation.
  */
-function buildFollowUpFromSource(
+export function buildFollowUpFromSource(
   source: Extract<DisplayedMessage, { type: "user" }>
 ): CompactionFollowUpInput {
-  return {
-    text: source.content,
-    fileParts: source.fileParts,
-    reviews: source.reviews,
-    muxMetadata: source.agentSkill
+  const slashMcpPromptRef = source.mcpPromptRefs?.find((ref) => ref.source === "slash");
+  const skillMetadata =
+    source.agentSkill && source.agentSkill.skillName !== slashMcpPromptRef?.commandKey
       ? buildAgentSkillMetadata({
           rawCommand: source.content,
           skillName: source.agentSkill.skillName,
           scope: source.agentSkill.scope,
+          arguments: source.agentSkill.arguments,
         })
-      : undefined,
+      : undefined;
+
+  // MCP slash messages display raw commands but send transformed text. Rebuild
+  // provider content and preserve slash metadata so retried rows remain editable
+  // as their original invocation.
+  let text = source.content;
+  let promptMetadata: MuxMessageMetadata | undefined;
+  // Trim only for command detection/extraction (the parser accepted the
+  // original send from a trimmed view); rawCommand keeps source.content
+  // verbatim so the retried row displays exactly like the original.
+  const trimmedContent = source.content.trimStart();
+  if (slashMcpPromptRef && trimmedContent.startsWith("/")) {
+    const argumentText = trimmedContent.replace(/^\/\S+/, "").trimStart();
+    text = buildMcpPromptUserText(
+      slashMcpPromptRef.serverName,
+      slashMcpPromptRef.promptName,
+      argumentText
+    );
+    promptMetadata = {
+      type: "normal",
+      rawCommand: source.content,
+      commandPrefix: `/${slashMcpPromptRef.commandKey}`,
+    };
+  }
+
+  return {
+    text,
+    fileParts: source.fileParts,
+    reviews: source.reviews,
+    // Inline skill refs must survive alongside prompt refs; withAgentSkillRefs
+    // dedupes against the slash ref that buildAgentSkillMetadata already added.
+    muxMetadata: withAgentSkillRefs(
+      withMcpPromptRefs(skillMetadata ?? promptMetadata, source.mcpPromptRefs ?? []),
+      source.agentSkillRefs ?? []
+    ),
   };
 }
 
@@ -235,6 +272,13 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         return;
       }
 
+      // The edit fence is captured at the user's click; a `history-changed` refusal falls
+      // through the existing failure path (command inserted into the composer), no auto-retry.
+      const historyEditPrecondition = workspaceStore.captureHistoryEditPrecondition(
+        props.workspaceId,
+        source.id
+      );
+
       // For compaction recovery (retrying a failed /compact), preserve the original settings.
       // The nested follow-up content is already in the correct format.
       if (source.compactionRequest) {
@@ -249,6 +293,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
           maxOutputTokens,
           followUpContent: nestedFollowUp,
           editMessageId: source.id,
+          historyEditPrecondition,
         });
 
         if (!result.success) {
@@ -281,6 +326,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         model: compactionSuggestion.modelId,
         followUpContent,
         editMessageId: source.id,
+        historyEditPrecondition,
       });
 
       if (!result.success) {
@@ -321,6 +367,11 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         model: compactionSuggestion?.modelId,
         followUpContent,
         editMessageId: triggerUserMessage.id,
+        // Captured at the trigger; a `history-changed` refusal just reports false (no retry).
+        historyEditPrecondition: workspaceStore.captureHistoryEditPrecondition(
+          props.workspaceId,
+          triggerUserMessage.id
+        ),
       });
 
       if (!result.success) {

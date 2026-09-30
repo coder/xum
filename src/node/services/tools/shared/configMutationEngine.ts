@@ -7,12 +7,6 @@ import {
 } from "@/node/services/tools/shared/configToolUtils";
 import type * as z from "zod";
 
-export {
-  ConfigOperationSchema,
-  ConfigOperationsSchema,
-  type ConfigOperation,
-} from "@/common/config/schemas/configOperations";
-
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
 // Prevent sparse-array OOM: reject indices that would create unreasonably large arrays.

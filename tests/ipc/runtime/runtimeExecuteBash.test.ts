@@ -127,8 +127,8 @@ describeIntegration("Runtime Bash Execution", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests. This allows tests to run concurrently.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run tests for both local and SSH runtimes
@@ -396,7 +396,7 @@ describeIntegration("Runtime Bash Execution", () => {
               const events = await sendMessageAndWait(
                 env,
                 workspaceId,
-                'Use the bash tool with args: { script: "for i in {1..1000}; do echo \"terminal bench line $i\" >> testfile.txt; done && grep -n \"terminal bench\" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
+                'Use the bash tool with args: { script: "for i in {1..1000}; do echo "terminal bench line $i" >> testfile.txt; done && grep -n "terminal bench" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
                 HAIKU_MODEL,
                 BASH_ONLY,
                 streamTimeoutMs

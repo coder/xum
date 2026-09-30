@@ -28,7 +28,6 @@ interface RefreshButtonProps {
 const TRIGGER_LABELS: Record<RefreshTrigger, string> = {
   manual: "manual click",
   scheduled: "tool completion",
-  priority: "tool completion (priority)",
   focus: "window focus",
   visibility: "tab visible",
   unpaused: "interaction ended",

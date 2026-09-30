@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { getModelKey } from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
+  getModelKey,
+} from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { normalizeModelPreference } from "./buildSendMessageOptions";
 
 let cleanupDom: (() => void) | null = null;
@@ -18,6 +25,66 @@ describe("getSendOptionsFromStorage", () => {
     window.localStorage.clear();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test.each([true, false])(
+    "captures the latest memoryIntuition override %s before host persistence",
+    (enabled) => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), enabled);
+      const options = getSendOptionsFromStorage("ws-intuition");
+      expect(options.experiments?.memoryIntuition).toBe(enabled);
+      expect(
+        SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).experiments
+          ?.memoryIntuition
+      ).toBe(enabled);
+    }
+  );
+
+  test.each([
+    { experiment: true, selected: true, expected: true },
+    { experiment: false, selected: true, expected: undefined },
+    { experiment: true, selected: false, expected: undefined },
+  ])(
+    "carries the Auto flag only while the experiment is on and Auto is selected (%j)",
+    ({ experiment, selected, expected }) => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), experiment);
+      updatePersistedState(getAutoModelRoutingKey("ws-auto"), selected);
+      const options = getSendOptionsFromStorage("ws-auto");
+      expect(options.autoModelRouting).toBe(expected);
+      expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).model).toBe(
+        options.model
+      );
+    }
+  );
+
+  test.each([
+    { experiment: true, model: true, thinking: false },
+    { experiment: true, model: false, thinking: true },
+    { experiment: false, model: true, thinking: true },
+  ])("routes the model and thinking dimensions independently (%j)", (input) => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), input.experiment);
+    updatePersistedState(getAutoModelRoutingKey("ws-dims"), input.model);
+    updatePersistedState(getAutoThinkingLevelKey("ws-dims"), input.thinking);
+    const options = getSendOptionsFromStorage("ws-dims");
+    expect(options.autoModelRouting).toBe(input.experiment && input.model ? true : undefined);
+    expect(options.autoThinkingLevel).toBe(input.experiment && input.thinking ? true : undefined);
+    expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).thinkingLevel).toBe(
+      options.thinkingLevel
+    );
+  });
+
+  test.each([true, false])("preserves explicit continuous compaction overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), enabled);
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBe(enabled);
+  });
+
+  test.each([true, false])("preserves explicit token-budget overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.tokenBudget).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), enabled);
+    const options = getSendOptionsFromStorage("ws-1");
+    expect(options.experiments?.tokenBudget).toBe(enabled);
+    expect(SendMessageOptionsSchema.parse(options).experiments?.tokenBudget).toBe(enabled);
   });
 
   test("preserves explicit gateway-scoped stored model preferences", () => {

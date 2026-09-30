@@ -14,7 +14,6 @@ const BUILT_INS: AgentDefinitionDescriptor[] = [
     scope: "built-in",
     name: "Exec",
     uiSelectable: true,
-    uiRoutable: true,
     subagentRunnable: false,
   },
   {
@@ -22,7 +21,6 @@ const BUILT_INS: AgentDefinitionDescriptor[] = [
     scope: "built-in",
     name: "Plan",
     uiSelectable: true,
-    uiRoutable: true,
     subagentRunnable: false,
     base: "plan",
   },
@@ -33,7 +31,6 @@ const HIDDEN_AGENT: AgentDefinitionDescriptor = {
   scope: "built-in",
   name: "Explore",
   uiSelectable: false,
-  uiRoutable: false,
   subagentRunnable: true,
   base: "exec",
 };
@@ -43,7 +40,6 @@ const CUSTOM_AGENT: AgentDefinitionDescriptor = {
   name: "Review",
   description: "Review changes",
   uiSelectable: true,
-  uiRoutable: true,
   subagentRunnable: false,
 };
 
@@ -77,6 +73,7 @@ describe("AgentModePicker", () => {
     loaded?: boolean;
     currentAgent?: AgentDefinitionDescriptor;
     locked?: boolean;
+    disabled?: boolean;
     showAgentId?: boolean;
   }) {
     const [agentId, setAgentId] = React.useState(props.initialAgentId ?? "exec");
@@ -97,7 +94,7 @@ describe("AgentModePicker", () => {
       <AgentProvider value={contextValue}>
         <TooltipProvider>
           {props.showAgentId ? <div data-testid="agentId">{agentId}</div> : null}
-          <AgentModePicker />
+          <AgentModePicker disabled={props.disabled} />
         </TooltipProvider>
       </AgentProvider>
     );
@@ -128,6 +125,20 @@ describe("AgentModePicker", () => {
 
     fireEvent.click(triggerButton);
     expect(queryAllByTestId("agent-option").length).toBe(0);
+  });
+
+  test("disabling an open picker closes it for good", async () => {
+    const view = renderPicker();
+    fireEvent.click(view.getByLabelText("Select agent"));
+    await waitFor(() => expect(view.getAllByTestId("agent-option").length).toBe(3));
+
+    view.rerender(<Harness disabled />);
+    expect(view.queryAllByTestId("agent-option").length).toBe(0);
+
+    // Re-enabling must not bring back the menu that was open before.
+    view.rerender(<Harness />);
+    expect(view.queryAllByTestId("agent-option").length).toBe(0);
+    expect(view.getByLabelText("Select agent").getAttribute("aria-expanded")).toBe("false");
   });
 
   test("uiSelectable false without lock flag does not disable the picker", async () => {
@@ -165,6 +176,30 @@ describe("AgentModePicker", () => {
     });
   });
 
+  test("numbered guest shortcuts do not select a host agent", async () => {
+    const view = renderPicker({ showAgentId: true });
+    fireEvent.click(view.getByLabelText("Select agent"));
+    await waitFor(() => expect(view.getAllByTestId("agent-option").length).toBe(3));
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "3",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByTestId("agentId").textContent).toBe("exec");
+    expect(view.getAllByTestId("agent-option").length).toBe(3);
+
+    fireEvent.keyDown(document.body, { key: "3", ctrlKey: true });
+    expect(view.getByTestId("agentId").textContent).toBe("review");
+  });
+
   test("does not render auto agent affordances", async () => {
     const { getByLabelText, queryByLabelText, queryByText } = renderPicker();
     const autoSelectLabel = ["Auto-select", "agent"].join(" ");
@@ -173,7 +208,7 @@ describe("AgentModePicker", () => {
 
     await waitFor(() => {
       expect(queryByLabelText(autoSelectLabel)).toBeNull();
-      expect(queryByText("Mux chooses the best agent")).toBeNull();
+      expect(queryByText("Xum chooses the best agent")).toBeNull();
     });
   });
 });

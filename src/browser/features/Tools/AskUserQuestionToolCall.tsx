@@ -192,6 +192,9 @@ function AutoResizeTextarea(props: {
   return (
     <textarea
       ref={textareaRef}
+      // Keep the empty natural height at one line (textareas default to rows=2) so
+      // useAutoResizeTextarea can leave empty drafts to CSS sizing without measuring.
+      rows={1}
       placeholder={props.placeholder}
       value={props.value}
       onChange={(e) => props.onChange(e.target.value)}
@@ -222,7 +225,12 @@ export function AskUserQuestionToolCall(props: {
 }): JSX.Element {
   const { api } = useAPI();
 
-  const { expanded, toggleExpanded } = useToolExpansion(props.status === "executing");
+  // A live, blocking question must never be hidden behind a collapsed "tools"
+  // preference, so force it open while executing. forceExpanded only overrides the
+  // initial seed; once answered the row follows the sticky preference like any tool.
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: props.status === "executing",
+  });
   const statusDisplay = getStatusDisplay(props.status);
 
   const argsAnswers = props.args.answers ?? {};

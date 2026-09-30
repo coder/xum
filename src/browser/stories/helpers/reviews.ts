@@ -1,48 +1,14 @@
 import type { ReviewSortOrder } from "@/common/types/review";
-import type { HunkFirstSeenState } from "@/browser/hooks/useHunkFirstSeen";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import type { Review, ReviewsState, ReviewState } from "@/common/types/review";
-import {
-  getReviewsKey,
-  getReviewStateKey,
-  getHunkFirstSeenKey,
-  REVIEW_SORT_ORDER_KEY,
-} from "@/common/constants/storage";
+import type { Review } from "@/common/types/review";
+import { REVIEW_SORT_ORDER_KEY } from "@/common/constants/storage";
+import { seedMockReviewState } from "@/browser/stories/mocks/reviewState";
 
-/** Set reviews for a workspace */
-export function setReviews(workspaceId: string, reviews: Review[]): void {
-  const state: ReviewsState = {
-    workspaceId,
-    reviews: Object.fromEntries(reviews.map((r) => [r.id, r])),
-    lastUpdated: Date.now(),
-  };
-  updatePersistedState(getReviewsKey(workspaceId), state);
-}
-
-/** Mark specific hunks as reviewed for a workspace */
-export function setReadHunks(workspaceId: string, hunkIds: string[]): void {
-  const timestamp = Date.now();
-  const state: ReviewState = {
-    workspaceId,
-    readState: Object.fromEntries(
-      hunkIds.map((hunkId) => [
-        hunkId,
-        {
-          hunkId,
-          isRead: true,
-          timestamp,
-        },
-      ])
-    ),
-    lastUpdated: timestamp,
-  };
-  updatePersistedState(getReviewStateKey(workspaceId), state);
-}
-
-/** Set hunk first-seen timestamps for a workspace (for storybook) */
+/**
+ * Set hunk first-seen timestamps for a workspace (for storybook). Seeds the mock backend's
+ * review state, so call it before creating the story's mock client.
+ */
 export function setHunkFirstSeen(workspaceId: string, firstSeen: Record<string, number>): void {
-  const state: HunkFirstSeenState = { firstSeen };
-  updatePersistedState(getHunkFirstSeenKey(workspaceId), state);
+  seedMockReviewState(workspaceId, { firstSeen });
 }
 
 /** Set the review panel sort order (global) */

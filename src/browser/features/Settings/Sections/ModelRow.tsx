@@ -14,7 +14,15 @@ import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIco
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { cn } from "@/common/lib/utils";
 import type { AvailableRoute } from "@/common/routing";
-import { getModelStats, type ModelStats } from "@/common/utils/tokens/modelStats";
+import { getModelStatsResolved, type ModelStats } from "@/common/utils/tokens/modelStats";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  getAvailableThinkingLevels,
+  getThinkingPolicyForModel,
+  hasExplicitThinkingPolicy,
+  resolveMinimumThinkingLevel,
+} from "@/common/utils/thinking/policy";
 
 /** Format tokens as human-readable string (e.g. 200000 -> "200k") */
 function formatTokenCount(tokens: number): string {
@@ -207,14 +215,25 @@ export interface ModelRowProps {
   onRemove?: () => void;
   /** Set/clear explicit route override (null = auto) */
   onSetRouteOverride?: (route: string | null) => void;
+  /** Explicit per-model minimum thinking override (null/undefined = built-in default floor) */
+  minThinkingLevel?: ThinkingLevel | null;
+  /** Set/clear the per-model minimum thinking override (null = use default) */
+  onSetMinThinkingLevel?: (level: ThinkingLevel | null) => void;
   /** Toggle 1M context for this model (only shown when defined, i.e. model supports it) */
   onToggle1MContext?: () => void;
   /** Toggle visibility in model selector */
   onToggleVisibility?: () => void;
+  /**
+   * Providers config for metadata-aware identity resolution. Coder gateway
+   * rows (coder:<instance>/<model>) derive pricing/context/thinking data from
+   * the instance's TYPE, which arbitrary instance names cannot convey.
+   */
+  providersConfig?: ProvidersConfigMap | null;
 }
 
 export function ModelRow(props: ModelRowProps) {
-  const stats = getModelStats(props.mappedToModel ?? props.fullId);
+  const providersConfig = props.providersConfig ?? null;
+  const stats = getModelStatsResolved(props.mappedToModel ?? props.fullId, providersConfig);
 
   const contextBaseTokens = props.customContextWindowTokens ?? stats?.max_input_tokens ?? null;
   const mappedProvider = props.mappedToModel ? props.mappedToModel.split(":")[0] || null : null;
@@ -235,11 +254,27 @@ export function ModelRow(props: ModelRowProps) {
   const routeSelectValue =
     props.resolvedRoute && !props.resolvedRoute.isAuto ? props.resolvedRoute.route : "auto";
 
+  // Per-model minimum thinking: only models Xum explicitly recognizes as reasoning models
+  // (with more than one level to choose from) expose a floor control. Unrecognized /
+  // non-reasoning models and single-level models (e.g. gpt-5-pro) keep the legacy behavior
+  // with no selector. The dropdown lists the model's full capability so users can pick any
+  // floor, including off/low.
+  const thinkingCapability = getThinkingPolicyForModel(props.fullId, providersConfig);
+  const supportsMinThinking =
+    hasExplicitThinkingPolicy(props.fullId, providersConfig) && thinkingCapability.length > 1;
+  // The selected value is the effective floor shown as a plain level (no "Default" wording).
+  // It's always one of the capability options since available levels are a capability subset.
+  const minThinkingFloorLevel = getAvailableThinkingLevels(
+    props.fullId,
+    resolveMinimumThinkingLevel(props.fullId, props.minThinkingLevel, providersConfig),
+    providersConfig
+  )[0];
+
   // Editing mode - render as a full-width row
   if (props.isEditing) {
     return (
       <tr className="border-border-medium border-b">
-        <td colSpan={4} className="px-2 py-1.5 md:px-3">
+        <td colSpan={5} className="px-2 py-1.5 md:px-3">
           <div>
             <div className="flex items-center gap-2">
               <ProviderWithIcon
@@ -408,6 +443,29 @@ export function ModelRow(props: ModelRowProps) {
           </Select>
         ) : (
           <span className="text-muted block text-xs">{routeDisplayName}</span>
+        )}
+      </td>
+
+      {/* Min Thinking */}
+      <td className="w-28 py-1.5 pr-2 md:w-32">
+        {supportsMinThinking && props.onSetMinThinkingLevel ? (
+          <Select
+            value={minThinkingFloorLevel}
+            onValueChange={(value) => props.onSetMinThinkingLevel?.(value as ThinkingLevel)}
+          >
+            <SelectTrigger className="h-7 min-w-0 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {thinkingCapability.map((level) => (
+                <SelectItem key={level} value={level}>
+                  {getThinkingOptionLabel(level, props.fullId)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          <span className="text-muted block text-xs">—</span>
         )}
       </td>
 

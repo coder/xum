@@ -1,20 +1,14 @@
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
-import { isCodexOauthRequiredModelId } from "@/common/constants/codexOAuth";
 
 interface Props {
-  activeModel: string;
+  requiresCodexOauth: boolean;
   codexOauthSet: boolean | null;
   onOpenProviders: () => void;
 }
 
-// Keep warning criteria coupled to the shared OAuth-required model set so UI
-// copy stays accurate when model gating changes.
 export function CodexOauthWarningBanner(props: Props) {
-  const shouldShowWarning =
-    props.activeModel.startsWith("openai:") &&
-    isCodexOauthRequiredModelId(props.activeModel) &&
-    props.codexOauthSet === false;
+  const shouldShowWarning = props.requiresCodexOauth && props.codexOauthSet === false;
 
   if (!shouldShowWarning) {
     return null;

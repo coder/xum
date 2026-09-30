@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { readPersistedState, usePersistedState } from "./usePersistedState";
+import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -29,7 +30,7 @@ import {
   getProjectScopeId,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -41,6 +42,7 @@ export interface DraftWorkspaceSettings {
   // Model & AI settings (synced with global state)
   model: string;
   thinkingLevel: ThinkingLevel;
+  reasoningMode: OpenAIReasoningMode;
   agentId: string;
 
   // Workspace creation settings (project-specific)
@@ -227,6 +229,7 @@ export function useDraftWorkspaceSettings(
 } {
   // Global AI settings (read-only from global state)
   const [thinkingLevel] = useThinkingLevel();
+  const [reasoningMode] = useReasoningMode();
 
   const projectScopeId = getProjectScopeId(projectPath);
   const { userProjects } = useProjectContext();
@@ -373,6 +376,7 @@ export function useDraftWorkspaceSettings(
       : defaultRuntimeMode;
 
   const setLastRuntimeConfig = useCallback(
+    // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
       setLastRuntimeConfigs((prev) => {
         const existing = prev[mode];
@@ -508,14 +512,6 @@ export function useDraftWorkspaceSettings(
     lastDevcontainerShareCredentials,
   ]);
 
-  const rememberedRuntimeValues: RememberedRuntimeValues = {
-    ssh: lastSsh,
-    dockerImage: lastDockerImage,
-    dockerShareCredentials: lastShareCredentials,
-    devcontainerConfigPath: lastDevcontainerConfigPath,
-    devcontainerShareCredentials: lastDevcontainerShareCredentials,
-  };
-
   // Initialize trunk branch from backend recommendation or first branch
   useEffect(() => {
     if (branches.length > 0 && (!trunkBranch || !branches.includes(trunkBranch))) {
@@ -524,13 +520,21 @@ export function useDraftWorkspaceSettings(
     }
   }, [branches, recommendedTrunk, trunkBranch, setTrunkBranch]);
 
+  const lastSshHost = lastSsh.host;
+  const lastSshCoder = lastSsh.coder;
+
   // Setter for selected runtime (also persists host/image/coder for future mode switches)
   const setSelectedRuntime = (runtime: ParsedRuntime) => {
-    const mergedRuntime = mergeRememberedRuntimeConfig(
-      runtime,
-      selectedRuntime.mode,
-      rememberedRuntimeValues
-    );
+    // Construct remembered values only when the user changes runtimes. Keeping
+    // this object off the render path lets React Compiler retain the setter
+    // identity while unrelated ChatInput draft text changes.
+    const mergedRuntime = mergeRememberedRuntimeConfig(runtime, selectedRuntime.mode, {
+      ssh: { host: lastSshHost, coder: lastSshCoder },
+      dockerImage: lastDockerImage,
+      dockerShareCredentials: lastShareCredentials,
+      devcontainerConfigPath: lastDevcontainerConfigPath,
+      devcontainerShareCredentials: lastDevcontainerShareCredentials,
+    });
 
     setSelectedRuntimeState(mergedRuntime);
 
@@ -608,6 +612,7 @@ export function useDraftWorkspaceSettings(
     settings: {
       model,
       thinkingLevel,
+      reasoningMode,
       agentId,
       selectedRuntime,
       defaultRuntimeMode: defaultRuntimeChoice,

@@ -19,16 +19,16 @@ export const ServerLockDataSchema = z.object({
 export type ServerLockData = z.infer<typeof ServerLockDataSchema>;
 
 /**
- * Manages the server lockfile at ~/.mux/server.lock
+ * Manages the server lockfile at ~/.xum/server.lock
  *
- * The lockfile enables CLI tools to discover a running mux server
- * (either Electron app or standalone mux server) and connect to it.
+ * The lockfile enables CLI tools to discover a running xum server
+ * (either Electron app or standalone xum server) and connect to it.
  */
 export class ServerLockfile {
   private readonly lockPath: string;
 
-  constructor(muxHome: string) {
-    this.lockPath = path.join(muxHome, "server.lock");
+  constructor(xumHome: string) {
+    this.lockPath = path.join(xumHome, "server.lock");
   }
 
   /**
@@ -85,9 +85,8 @@ export class ServerLockfile {
    */
   async read(): Promise<ServerLockData | null> {
     try {
-      await fs.access(this.lockPath);
-      const content = await fs.readFile(this.lockPath, "utf-8");
-      const data = ServerLockDataSchema.parse(JSON.parse(content));
+      const data = await this.readData();
+      if (!data) return null;
 
       // Validate PID is still alive
       if (!this.isProcessAlive(data.pid)) {
@@ -97,6 +96,25 @@ export class ServerLockfile {
       }
 
       return data;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Read a live lockfile without ever deleting it.
+   * On-demand discovery (the desktop "Open Server Window" action) uses this so it cannot race a
+   * starting xum server that is replacing a stale lock.
+   */
+  async peek(): Promise<ServerLockData | null> {
+    const data = await this.readData();
+    return data && this.isProcessAlive(data.pid) ? data : null;
+  }
+
+  private async readData(): Promise<ServerLockData | null> {
+    try {
+      const content = await fs.readFile(this.lockPath, "utf-8");
+      return ServerLockDataSchema.parse(JSON.parse(content));
     } catch {
       return null;
     }

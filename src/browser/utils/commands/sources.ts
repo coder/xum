@@ -1,16 +1,43 @@
 import { THEME_OPTIONS, type ThemePreference } from "@/browser/contexts/ThemeContext";
+import type { OpenSettingsOptions } from "@/browser/contexts/SettingsContext";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
-import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
+import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
+import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import {
+  THINKING_LEVELS,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
+import {
+  enforceThinkingPolicy,
+  getAvailableThinkingLevels,
+  resolveMinimumThinkingLevel,
+} from "@/common/utils/thinking/policy";
 import assert from "@/common/utils/assert";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
+  normalizeTerminalBadgeConfig,
+  type TerminalBadgeConfig,
+} from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
+import { stopStream } from "@/browser/utils/stopStream";
+import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -39,12 +66,16 @@ import {
 } from "@/browser/utils/rightSidebarTabFocus";
 
 import type { ProjectConfig } from "@/node/config";
+import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type { UpdateChannel } from "@/common/types/project";
 import { isGoalPendingPersistence, type GoalSetError, type GoalStatus } from "@/common/types/goal";
 import { GOAL_OBJECTIVE_PLACEHOLDER } from "@/constants/goals";
+import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
 import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
@@ -55,9 +86,14 @@ import {
   UNPRICED_CURRENT_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import { openServerWindow } from "@/browser/utils/openServerWindow";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 export interface BuildSourcesParams {
   api: APIClient | null;
+  supportedUpdateChannels: readonly UpdateChannel[];
   userProjects: Map<string, ProjectConfig>;
   /** Map of workspace ID to workspace metadata (keyed by metadata.id, not path) */
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
@@ -71,14 +107,40 @@ export interface BuildSourcesParams {
     namedWorkspacePath: string;
     workspaceId: string;
   } | null;
+  /** Project-scoped preference ID used while a creation composer is active. */
+  creationScopeId?: string | null;
   streamingModels?: Map<string, string>;
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
+  getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
+  onToggleReasoningMode: (workspaceId: string) => void;
+  getFastMode: () => boolean;
+  onToggleFastMode: () => void | Promise<void>;
+  /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
+  autoModelRoutingEnabled?: boolean;
+  /** Composer Auto flag for one dimension, keyed by workspace or creation scope. */
+  getAutoRouting?: (scopeId: string, dimension: AutoRoutingDimension) => boolean;
+  onSetAutoRouting?: (scopeId: string, dimension: AutoRoutingDimension, active: boolean) => void;
+  /** Effective model currently displayed by the workspace or creation composer. */
+  getEffectiveComposerModel: (scopeId: string) => string;
+  /** Providers config for route-aware provider-option availability. */
+  providersConfig?: ProvidersConfigMap | null;
+  /** Settings-resolved route for a canonical model ("direct" = no gateway). */
+  getRouteForModel?: (canonicalModel: string) => string;
+  getEffectiveRouteForModel?: (modelString: string) => string;
+  /**
+   * Explicit per-model minimum thinking override (undefined → built-in default floor).
+   * Used to hide off/low from the "Set Thinking Effort" picker, matching the selector.
+   */
+  getMinThinkingOverride?: (modelString: string) => ThinkingLevel | null | undefined;
 
+  onStartScratchCreation: () => void;
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
+  /** agent-plugins experiment: gates the Settings → Plugins palette entry. */
+  agentPluginsEnabled: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -88,6 +150,8 @@ export interface BuildSourcesParams {
     workspaceId: string;
   }) => void;
   onRemoveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /** #5106: confirmation listing unpreserved work, then user-confirmed sub-agent removal. */
+  onRemoveSubagent: (workspaceId: string, title: string) => Promise<void>;
   onUpdateTitle: (
     workspaceId: string,
     newName: string
@@ -96,10 +160,14 @@ export interface BuildSourcesParams {
   onRemoveProject: (path: string) => void;
   onToggleSidebar: () => void;
   onNavigateWorkspace: (dir: "next" | "prev") => void;
+  onMovePinnedChat: (direction: PinnedMoveDirection) => void;
   onOpenWorkspaceInTerminal: (workspaceId: string, runtimeConfig?: RuntimeConfig) => void;
   onToggleTheme: () => void;
   onSetTheme: (theme: ThemePreference) => void;
-  onOpenSettings?: (section?: string) => void;
+  onOpenSettings?: (section?: string, options?: OpenSettingsOptions) => void;
+  onOpenAbout?: () => void;
+  /** Desktop-only bridge (window.api.remoteConnection); absent in browser mode and server windows. */
+  remoteConnection?: RemoteConnectionApi;
 
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
@@ -176,6 +244,9 @@ const getAnalyticsRebuildDatabase = (
   const rebuildDatabase = (candidate as AnalyticsRebuildNamespace).rebuildDatabase;
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
+
+const NO_RUNNABLE_PLAN_MESSAGE =
+  "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
@@ -338,8 +409,20 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
   actions.push(() => {
     const list: CommandAction[] = [];
 
+    list.push({
+      id: CommandIds.workspaceNewScratch(),
+      title: "New Scratch Chat",
+      subtitle: "Start a chat without selecting a project",
+      section: section.workspaces,
+      shortcutHint: formatKeybind(KEYBINDS.NEW_SCRATCH_CHAT),
+      run: p.onStartScratchCreation,
+    });
+
     const selected = p.selectedWorkspace;
-    if (selected) {
+    // For scratch chats, selected.projectPath is the app-managed workdir (not
+    // a configured project), so the generic action would create a workspace in
+    // an unrelated project; New Scratch Chat above already covers creation.
+    if (selected && p.workspaceMetadata.get(selected.workspaceId)?.kind !== "scratch") {
       list.push(createWorkspaceForSelectedProjectAction(selected));
     }
 
@@ -384,26 +467,62 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
         },
       });
-      list.push({
-        id: CommandIds.workspaceRemove(),
-        title: "Remove Current Workspace…",
-        subtitle: workspaceDisplayName,
-        section: section.workspaces,
-        run: async () => {
-          const branchName =
-            selectedMeta?.name ??
-            selected.namedWorkspacePath.split("/").pop() ??
-            selected.namedWorkspacePath;
-          const ok = await p.confirmDialog({
-            title: "Remove current workspace?",
-            description: `This will delete the worktree and local branch "${branchName}".`,
-            warning: "This cannot be undone.",
-            confirmLabel: "Remove",
-            confirmVariant: "destructive",
-          });
-          if (ok) await p.onRemoveWorkspace(selected.workspaceId);
-        },
-      });
+      // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
+      // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
+      if (selectedMeta?.parentWorkspaceId != null) {
+        list.push({
+          id: CommandIds.workspaceRemoveSubagent(),
+          title: "Remove Current Sub-agent…",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: () =>
+            p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
+        });
+      } else {
+        list.push({
+          id: CommandIds.workspaceRemove(),
+          title: "Remove Current Workspace…",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: async () => {
+            const branchName =
+              selectedMeta?.name ??
+              selected.namedWorkspacePath.split("/").pop() ??
+              selected.namedWorkspacePath;
+            const ok = await p.confirmDialog(
+              removeWorkspaceConfirmOptions("Remove current workspace?", {
+                name: branchName,
+                runtimeConfig: selectedMeta?.runtimeConfig,
+                projects: selectedMeta?.projects,
+                kind: selectedMeta?.kind,
+              })
+            );
+            if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          },
+        });
+      }
+      // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
+      if (selectedMeta?.delegatedCreationInterrupted === true) {
+        list.push({
+          id: CommandIds.workspaceKeepInterruptedDelegated(),
+          title: "Keep Workspace After Interrupted Setup",
+          subtitle: workspaceDisplayName,
+          section: section.workspaces,
+          run: async () => {
+            if (!p.api) return;
+            const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
+              workspaceId: selected.workspaceId,
+            });
+            if (!result.success) {
+              showCommandFeedbackToast({
+                type: "error",
+                title: "Could not keep the workspace",
+                message: result.error,
+              });
+            }
+          },
+        });
+      }
       list.push({
         id: CommandIds.workspaceEditTitle(),
         title: "Edit Current Workspace Title…",
@@ -449,6 +568,44 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           );
         },
       });
+      // Only live root chats are pinnable (sub-agents follow their pinned parent).
+      if (selectedMeta && isWorkspacePinnable(selectedMeta)) {
+        const pinned = isWorkspacePinned(selectedMeta);
+        list.push({
+          id: CommandIds.workspaceTogglePinned(),
+          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          subtitle: workspaceDisplayName,
+          shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
+          section: section.workspaces,
+          run: async () => {
+            if (!p.api) return;
+            await p.api.workspace.setPinned({
+              workspaceId: selected.workspaceId,
+              pinned: !pinned,
+            });
+          },
+        });
+        if (pinned) {
+          // Edge positions are handled inside the move handler (no-op), so the
+          // commands stay listed whenever the chat is pinned.
+          list.push({
+            id: CommandIds.workspaceMovePinnedUp(),
+            title: "Move Pinned Chat Up",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("up"),
+          });
+          list.push({
+            id: CommandIds.workspaceMovePinnedDown(),
+            title: "Move Pinned Chat Down",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("down"),
+          });
+        }
+      }
     }
 
     if (p.workspaceMetadata.size > 0) {
@@ -571,15 +728,21 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             const meta = Array.from(p.workspaceMetadata.values()).find(
               (m) => m.id === vals.workspaceId
             );
+            if (meta?.parentWorkspaceId != null) {
+              // Sub-agents get the confirmation that lists their unpreserved work (#5106).
+              await p.onRemoveSubagent(meta.id, meta.title ?? meta.name);
+              return;
+            }
             const workspaceName = meta ? `${meta.projectName}/${meta.name}` : vals.workspaceId;
             const branchName = meta?.name ?? workspaceName.split("/").pop() ?? workspaceName;
-            const ok = await p.confirmDialog({
-              title: `Remove workspace ${workspaceName}?`,
-              description: `This will delete the worktree and local branch "${branchName}".`,
-              warning: "This cannot be undone.",
-              confirmLabel: "Remove",
-              confirmVariant: "destructive",
-            });
+            const ok = await p.confirmDialog(
+              removeWorkspaceConfirmOptions(`Remove workspace ${workspaceName}?`, {
+                name: branchName,
+                runtimeConfig: meta?.runtimeConfig,
+                projects: meta?.projects,
+                kind: meta?.kind,
+              })
+            );
             if (ok) {
               await p.onRemoveWorkspace(vals.workspaceId);
             }
@@ -615,11 +778,55 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         shortcutHint: formatKeybind(KEYBINDS.TOGGLE_SIDEBAR),
         run: () => p.onToggleSidebar(),
       },
+      {
+        id: CommandIds.navToggleHideSubAgents(),
+        title: "Toggle Hide Sub-Agents in Sidebar",
+        subtitle: `Current: ${readPersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, false) ? "Hidden" : "Shown"}`,
+        section: section.navigation,
+        keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
+        run: () => {
+          updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+        },
+      },
+      {
+        id: CommandIds.navToggleFlatChatList(),
+        title: "Toggle Flat Chat List",
+        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        section: section.navigation,
+        keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
+        run: () => {
+          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
+        },
+      },
+      {
+        id: CommandIds.navToggleTerminalBadge(),
+        title: "Toggle Terminal Badge",
+        subtitle: `Current: ${
+          normalizeTerminalBadgeConfig(
+            readPersistedState(TERMINAL_BADGE_CONFIG_KEY, DEFAULT_TERMINAL_BADGE_CONFIG)
+          ).enabled
+            ? "Shown"
+            : "Hidden"
+        }`,
+        section: section.navigation,
+        keywords: ["terminal", "badge", "watermark", "overlay", "workspace", "tab"],
+        run: () => {
+          updatePersistedState<TerminalBadgeConfig>(
+            TERMINAL_BADGE_CONFIG_KEY,
+            (prev) => {
+              const config = normalizeTerminalBadgeConfig(prev);
+              return { ...config, enabled: !config.enabled };
+            },
+            DEFAULT_TERMINAL_BADGE_CONFIG
+          );
+        },
+      },
     ];
 
     // Right sidebar layout commands require a selected workspace (layout is per-workspace)
     const wsId = p.selectedWorkspace?.workspaceId;
     if (wsId) {
+      const canReviewDiffs = hasWorkspaceRepository(p.workspaceMetadata.get(wsId));
       list.push(
         // Generic per-tab "Hide/Show <Name>" commands are only for optional tabs.
         // Default-layout tabs (Stats/Review/Instructions) are auto-restored by
@@ -688,7 +895,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 // Terminal is appended manually because it lives outside the static registry.
                 getOptions: () => [
                   ...getOrderedBaseTabIds()
-                    .filter((tabId) => getTabConfig(tabId).featureFlag == null)
+                    .filter(
+                      (tabId) =>
+                        getTabConfig(tabId).featureFlag == null &&
+                        (canReviewDiffs || tabId !== "review")
+                    )
                     .map((tabId) => {
                       const config = getTabConfig(tabId);
                       return {
@@ -704,6 +915,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             onSubmit: (vals) => {
               const tool = vals.tool;
               if (!isTabType(tool)) return;
+
+              if (tool === "review" && !canReviewDiffs) return;
 
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
@@ -1011,6 +1224,15 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const list: CommandAction[] = [];
     if (p.selectedWorkspace) {
       const id = p.selectedWorkspace.workspaceId;
+      // Reset/truncate rewrite history based on what the user currently sees, so both refuse
+      // through the palette's normal error path until the transcript is a verified copy.
+      const assertTranscriptMutationAllowed = () => {
+        if (isTranscriptMutationAllowed(id)) {
+          return;
+        }
+        showCommandFeedbackToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+        throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      };
       list.push({
         id: CommandIds.chatResetContext(),
         title: "Reset Context, Preserve History",
@@ -1018,6 +1240,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["context reset", "soft clear", "preserve history", "reset chat"],
         run: async () => {
           assert(p.api, "Reset Context palette action requires a connected backend");
+          assertTranscriptMutationAllowed();
           const result = await p.api.workspace.resetContext({ workspaceId: id });
           if (!result.success) {
             showCommandFeedbackToast({ type: "error", message: result.error });
@@ -1034,22 +1257,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
         },
       });
+      // Truncation failures — including partial ones where history was
+      // deleted but durable cleanup (e.g. sandbox kernel invalidation)
+      // failed — must surface instead of silently resolving as success
+      // (mirrors the Reset Context action above).
+      const runTruncate = async (percentage: number) => {
+        assertTranscriptMutationAllowed();
+        const result = await p.api?.workspace.truncateHistory({ workspaceId: id, percentage });
+        if (result && !result.success) {
+          showCommandFeedbackToast({ type: "error", message: result.error });
+          throw new Error(result.error);
+        }
+      };
       list.push({
         id: CommandIds.chatClear(),
         title: "Clear History",
         section: section.chat,
-        run: async () => {
-          await p.api?.workspace.truncateHistory({ workspaceId: id, percentage: 1.0 });
-        },
+        run: () => runTruncate(1.0),
       });
       for (const pct of [0.75, 0.5, 0.25]) {
         list.push({
           id: CommandIds.chatTruncate(pct),
           title: `Truncate History to ${Math.round((1 - pct) * 100)}%`,
           section: section.chat,
-          run: async () => {
-            await p.api?.workspace.truncateHistory({ workspaceId: id, percentage: pct });
-          },
+          run: () => runTruncate(pct),
         });
       }
       list.push({
@@ -1063,8 +1294,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (p.selectedWorkspaceState?.awaitingUserQuestion) {
             return;
           }
-          await p.api?.workspace.setAutoRetryEnabled?.({ workspaceId: id, enabled: false });
-          await p.api?.workspace.interruptStream({ workspaceId: id });
+          if (!p.api) {
+            return;
+          }
+          await stopStream(p.api, id, { disableAutoRetry: true });
         },
       });
       list.push({
@@ -1087,6 +1320,26 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         run: () => {
           // Dispatch custom event; ChatInput listens for it
           window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT));
+        },
+      });
+      list.push({
+        id: CommandIds.chatRunLatestPlanAction(),
+        title: "Implement Latest Plan",
+        subtitle: "Continue in Auto when in Auto mode",
+        section: section.chat,
+        keywords: ["plan", "implement", "continue in auto", "propose_plan"],
+        shortcutHint: formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION),
+        run: () => {
+          // The latest plan card runs its enabled primary action and marks the request handled
+          // (#4963); listeners run synchronously inside dispatchEvent.
+          const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+          }
         },
       });
       list.push({
@@ -1137,6 +1390,63 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ];
 
     const selectedWorkspace = p.selectedWorkspace;
+    const providerOptionScopeId = selectedWorkspace?.workspaceId ?? p.creationScopeId;
+    const providerOptionGateModel = providerOptionScopeId
+      ? p.getEffectiveComposerModel(providerOptionScopeId)
+      : undefined;
+    const currentModelString = providerOptionGateModel ?? p.selectedWorkspaceState?.currentModel;
+    const providerOptionRoute = providerOptionGateModel
+      ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
+      : undefined;
+    const fastModeAction: CommandAction | null =
+      p.providersConfig != null &&
+      getFastModeProvider(providerOptionGateModel ?? "", {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+      }) != null
+        ? {
+            id: CommandIds.toggleFastMode(),
+            title: "Toggle Fast Mode",
+            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            section: section.mode,
+            shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
+            run: p.onToggleFastMode,
+          }
+        : null;
+    // The picker rows are the only pointer path to Auto; the model-cycle and thinking-step
+    // shortcuts pick concrete values and so can only leave it.
+    const getAutoRouting = p.getAutoRouting;
+    const onSetAutoRouting = p.onSetAutoRouting;
+    const autoRoutingActions: CommandAction[] =
+      p.autoModelRoutingEnabled === true &&
+      providerOptionScopeId != null &&
+      getAutoRouting != null &&
+      onSetAutoRouting != null
+        ? (
+            [
+              { dimension: "model", title: "Toggle Auto Model Routing", what: "the model" },
+              {
+                dimension: "thinkingLevel",
+                title: "Toggle Auto Thinking Effort",
+                what: "the thinking effort",
+              },
+            ] as const
+          ).map(({ dimension, title, what }) => {
+            const active = getAutoRouting(providerOptionScopeId, dimension);
+            return {
+              id: CommandIds.toggleAutoRouting(dimension),
+              title,
+              subtitle: active
+                ? `Current: Auto (the evaluation model picks ${what} for each prompt)`
+                : "Current: manual",
+              section: section.mode,
+              run: () => {
+                onSetAutoRouting(providerOptionScopeId, dimension, !active);
+              },
+            };
+          })
+        : [];
+
     if (selectedWorkspace) {
       const { workspaceId } = selectedWorkspace;
       const levelDescriptions: Record<ThinkingLevel, string> = {
@@ -1147,15 +1457,31 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         xhigh: "Max — deepest possible reasoning",
         max: "Max — deepest possible reasoning",
       };
-      const currentLevel = p.getThinkingLevel(workspaceId);
+      // Display the floored level so it matches the selector (e.g. a stored "off" with a
+      // medium floor reads as "medium").
+      const rawCurrentLevel = p.getThinkingLevel(workspaceId);
+      // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
+      // resolve to the target's ladder, matching the selector and send path.
+      const currentLevel = currentModelString
+        ? enforceThinkingPolicy(
+            currentModelString,
+            rawCurrentLevel,
+            resolveMinimumThinkingLevel(
+              currentModelString,
+              p.getMinThinkingOverride?.(currentModelString),
+              p.providersConfig
+            ),
+            p.providersConfig
+          )
+        : rawCurrentLevel;
 
       list.push({
         id: CommandIds.thinkingSetLevel(),
         title: "Set Thinking Effort…",
         subtitle: `Current: ${levelDescriptions[currentLevel] ?? currentLevel}`,
         section: section.mode,
-        // No shortcutHint: TOGGLE_THINKING (⌘⇧T) cycles to next level directly,
-        // but this action opens a level selection prompt — different behavior.
+        // No shortcutHint: INCREASE_THINKING / DECREASE_THINKING (⌘⇧] / ⌘⇧[) step
+        // the level directly, but this action opens a level selection prompt — different behavior.
         run: () => undefined,
         prompt: {
           title: "Select Thinking Effort",
@@ -1166,11 +1492,19 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Thinking effort",
               placeholder: "Choose effort level…",
               getOptions: () => {
-                // Filter thinking levels by the active model's policy
-                // so users only see levels valid for the current model
-                const modelString = p.selectedWorkspaceState?.currentModel;
-                const allowedLevels = modelString
-                  ? getThinkingPolicyForModel(modelString)
+                // Filter thinking levels by the active model's policy AND its minimum
+                // floor, so users only see levels valid for the current model (matching
+                // the selector — off/low hidden unless the model's minimum is lowered).
+                const allowedLevels = currentModelString
+                  ? getAvailableThinkingLevels(
+                      currentModelString,
+                      resolveMinimumThinkingLevel(
+                        currentModelString,
+                        p.getMinThinkingOverride?.(currentModelString),
+                        p.providersConfig
+                      ),
+                      p.providersConfig
+                    )
                   : THINKING_LEVELS;
                 return allowedLevels.map((level) => ({
                   id: level,
@@ -1194,6 +1528,47 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         },
       });
+
+      list.push(...autoRoutingActions);
+      if (fastModeAction) {
+        list.push(fastModeAction);
+      }
+
+      // Pro reasoning mode is only meaningful for models that support it
+      // on routes that deliver the native provider option (direct OpenAI or
+      // Coder OpenAI instances) with the Responses wire format; hide the action
+      // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
+      // that is the model the NEXT send will use — and only fall back to the
+      // activity snapshot's currentModel (last streamed model, stale after a
+      // model switch) when no selection exists. The mobile layout hides the
+      // Pro row and relies on this palette action being reachable before the
+      // first send with the newly selected model.
+      const proGateModelString = providerOptionGateModel;
+      const currentModelRoute = providerOptionRoute;
+      if (
+        openaiProModeAvailable(proGateModelString ?? "", {
+          providersConfig: p.providersConfig,
+          resolvedRouteProvider: currentModelRoute,
+          effectiveRouteProvider: proGateModelString
+            ? p.getEffectiveRouteForModel?.(proGateModelString)
+            : undefined,
+        })
+      ) {
+        const proActive = p.getReasoningMode(workspaceId) === "pro";
+        list.push({
+          id: CommandIds.toggleProReasoning(),
+          title: "Toggle Pro Reasoning Mode",
+          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId);
+          },
+        });
+      }
+    } else {
+      // Creation composers use their project-scoped preferences before a workspace exists.
+      list.push(...autoRoutingActions);
+      if (fastModeAction) list.push(fastModeAction);
     }
 
     return list;
@@ -1214,6 +1589,65 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
+  // command starts the operation and opens the dialog.
+  if (p.onOpenAbout) {
+    const openAbout = p.onOpenAbout;
+    const updateCommand = (operation: (api: APIClient) => Promise<unknown>) => () => {
+      if (p.api) void operation(p.api).catch(console.error);
+      openAbout();
+    };
+    actions.push(() => [
+      {
+        id: CommandIds.aboutOpen(),
+        title: "About",
+        section: section.help,
+        keywords: ["version", "update", "release"],
+        run: () => openAbout(),
+      },
+      {
+        id: CommandIds.updateCheck(),
+        title: "Check for Updates",
+        section: section.help,
+        keywords: ["update", "upgrade", "version"],
+        run: updateCommand((api) => api.update.check({ source: "manual" })),
+      },
+      {
+        id: CommandIds.updateDownload(),
+        title: "Download Update",
+        section: section.help,
+        keywords: ["update", "upgrade"],
+        run: updateCommand((api) => api.update.download()),
+      },
+      {
+        id: CommandIds.updateInstall(),
+        title: "Install Update and Restart",
+        section: section.help,
+        keywords: ["update", "upgrade", "restart"],
+        run: updateCommand((api) => api.update.install()),
+      },
+      {
+        id: CommandIds.updateInstallForce(),
+        title: "Install Update and Restart Anyway",
+        subtitle: "Interrupts active work",
+        section: section.help,
+        keywords: ["update", "upgrade", "restart", "force"],
+        run: updateCommand((api) => api.update.install({ force: true })),
+      },
+      ...p.supportedUpdateChannels.map((channel) => ({
+        id: CommandIds.updateChannel(channel),
+        title: `Update Channel: ${UPDATE_CHANNEL_LABELS[channel]}`,
+        section: section.help,
+        keywords: ["update", "channel", channel],
+        // The dialog reads the channel once when it opens, so the change must land first.
+        run: async () => {
+          if (p.api) await p.api.update.setChannel({ channel }).catch(console.error);
+          openAbout();
+        },
+      })),
+    ]);
+  }
 
   // Projects
   actions.push(() => {
@@ -1365,9 +1799,32 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
   ]);
 
+  // Keyboard route for the Settings → General → System switch. Like that switch, it only
+  // exists in the Electron app (window.api is set by the preload), where the blocker runs.
+  actions.push(() =>
+    typeof window === "undefined" || !window.api
+      ? []
+      : [
+          {
+            id: CommandIds.settingsToggleKeepScreenAwake(),
+            title: "Toggle Keep Screen Awake",
+            subtitle: "Prevent display sleep while agents are working",
+            section: section.settings,
+            keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
+            run: async () => {
+              if (!p.api) return;
+              // The flag lives in config.json (not localStorage), so read the current value first.
+              const cfg = await p.api.config.getConfig();
+              await p.api.config.updateKeepScreenAwake({ enabled: !cfg.keepScreenAwake });
+            },
+          },
+        ]
+  );
+
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
+    const remoteConnection = p.remoteConnection;
     actions.push(() => [
       {
         id: CommandIds.settingsOpen(),
@@ -1393,8 +1850,448 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["model", "custom", "add"],
         run: () => openSettings("models"),
       },
+      {
+        id: CommandIds.settingsOpenSection("providers-coder-login"),
+        title: "Settings: Login with Coder",
+        subtitle: "Connect to a Coder deployment (AI Gateway)",
+        section: section.settings,
+        keywords: ["coder", "login", "oauth", "aibridge", "deployment", "connect"],
+        // Hidden when a custom OpenAI-compatible provider shadows the "coder"
+        // id (an upgraded install may carry one): ProvidersSection hides the
+        // OAuth block for shadowed providers, so the login hint would either
+        // surface an invisible "Set the deployment URL first" error or —
+        // if the custom section happens to have a deploymentUrl — inject
+        // built-in OAuth credentials into the custom provider's section.
+        visible: () => p.providersConfig?.coder?.isCustom !== true,
+        // Expands the Coder provider and starts the OAuth login (one-shot
+        // hints consumed by ProvidersSection) instead of only opening the
+        // generic Providers list.
+        run: () => openSettings("providers", { expandProvider: "coder", startCoderLogin: true }),
+      },
+      ...(remoteConnection
+        ? [
+            {
+              id: CommandIds.openServerWindow(),
+              title: "Open Server Window",
+              subtitle: "Open a window connected to the running xum server",
+              section: section.settings,
+              keywords: ["server", "remote", "connect", "window", "xum server"],
+              shortcutHint: formatKeybind(KEYBINDS.OPEN_SERVER_WINDOW),
+              run: () => openServerWindow(remoteConnection, openSettings),
+            },
+          ]
+        : []),
+      ...(p.agentPluginsEnabled
+        ? ([
+            {
+              id: CommandIds.settingsOpenSection("plugins"),
+              title: "Settings: Plugins",
+              subtitle: "Install and manage Agent Plugins",
+              section: section.settings,
+              keywords: ["plugin", "install", "agent", "skill", "mcp", "update"],
+              run: () => openSettings("plugins"),
+            },
+            {
+              id: CommandIds.pluginsInstall(),
+              title: "Install Agent Plugin…",
+              subtitle: "Paste a git URL or owner/repo",
+              section: section.settings,
+              keywords: ["plugin", "install", "add", "git", "clone"],
+              run: () => {
+                // Open the section with the add-plugin form already expanded.
+                publishPluginsSectionIntent({ type: "open-add-panel" });
+                openSettings("plugins");
+              },
+            },
+            {
+              id: CommandIds.pluginsManageComponents(),
+              title: "Manage Plugin Components…",
+              subtitle: "Choose which installed skills and MCP servers are imported",
+              section: section.settings,
+              keywords: [
+                "plugin",
+                "manage",
+                "add",
+                "remove",
+                "import",
+                "skill",
+                "mcp",
+                "components",
+              ],
+              run: () => undefined,
+              prompt: {
+                title: "Manage Plugin Components",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Installed managed plugin",
+                    placeholder: "Search installed plugins…",
+                    getOptions: async () => {
+                      const result = await p.api?.agentPlugins.list();
+                      return result?.success
+                        ? result.data
+                            .filter((item) => item.managed && item.present)
+                            .map((item) => ({
+                              id: item.name,
+                              label: item.name,
+                              keywords: [item.name, item.location],
+                            }))
+                        : [];
+                    },
+                  },
+                ],
+                onSubmit: (values) => {
+                  publishPluginsSectionIntent({
+                    type: "manage-components",
+                    name: values.pluginName,
+                  });
+                  openSettings("plugins");
+                },
+              },
+            },
+            {
+              id: CommandIds.pluginsUninstall(),
+              title: "Uninstall Agent Plugin…",
+              section: section.settings,
+              keywords: ["plugin", "uninstall", "remove", "delete"],
+              run: () => undefined,
+              prompt: {
+                title: "Uninstall Agent Plugin",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Managed plugin",
+                    placeholder: "Search installed plugins…",
+                    getOptions: async () => {
+                      const result = await p.api?.agentPlugins.list();
+                      if (!result?.success) {
+                        return [];
+                      }
+                      return result.data
+                        .filter((item) => item.managed)
+                        .map((item) => ({
+                          id: item.name,
+                          label: item.version ? `${item.name} (v${item.version})` : item.name,
+                          keywords: [item.name, item.location],
+                        }));
+                    },
+                  },
+                ],
+                onSubmit: (values) => {
+                  // Route through the section's confirmation flow (plugin-data
+                  // checkbox, explicit destructive button) — the palette never
+                  // uninstalls directly.
+                  publishPluginsSectionIntent({
+                    type: "confirm-uninstall",
+                    name: values.pluginName,
+                  });
+                  openSettings("plugins");
+                },
+              },
+            },
+            {
+              id: CommandIds.pluginsCheckUpdates(),
+              title: "Check for Plugin Updates",
+              section: section.settings,
+              keywords: ["plugin", "update", "check", "outdated"],
+              run: async () => {
+                const result = await p.api?.agentPlugins.checkUpdates();
+                if (!result) return;
+                if (!result.success) {
+                  showCommandFeedbackToast({ type: "error", message: result.error });
+                  return;
+                }
+                const updatable = result.data.filter(
+                  (check) => check.status === "update-available" || check.status === "tag-moved"
+                );
+                // Per-plugin failures ride inside a successful result; an
+                // unreachable remote is an unknown state, not "up to date" —
+                // and it stays in the summary even when updates were found.
+                const failed = result.data.filter((check) => check.status === "error");
+                const summary: string[] = [];
+                if (updatable.length > 0) {
+                  summary.push(
+                    `Updates available: ${updatable.map((check) => check.name).join(", ")}`
+                  );
+                }
+                if (failed.length > 0) {
+                  summary.push(
+                    `Update check failed for ${failed.map((check) => check.name).join(", ")}`
+                  );
+                }
+                // A mounted section keeps its own stale updateChecks map;
+                // tell it to re-query so badges match the toast.
+                publishPluginsSectionIntent({ type: "refresh" });
+                if (summary.length === 0) {
+                  showCommandFeedbackToast({
+                    type: "success",
+                    message: "All plugins are up to date.",
+                  });
+                  return;
+                }
+                showCommandFeedbackToast({
+                  type: failed.length > 0 ? "error" : "success",
+                  message: summary.join(". "),
+                });
+                openSettings("plugins");
+              },
+            },
+            {
+              id: CommandIds.pluginsUpdateAll(),
+              title: "Update All Plugins",
+              subtitle: "Apply pending plugin updates",
+              section: section.settings,
+              keywords: ["plugin", "update", "upgrade", "all"],
+              run: async () => {
+                const api = p.api;
+                if (!api) return;
+                const checks = await api.agentPlugins.checkUpdates();
+                if (!checks.success) {
+                  showCommandFeedbackToast({ type: "error", message: checks.error });
+                  return;
+                }
+                // Moved tags are excluded from the bulk apply: tags are
+                // supposed to be immutable, so a moved tag warrants the
+                // section's per-plugin review — but it must never read as
+                // "up to date", so it stays in the summary below.
+                const updatable = checks.data.filter(
+                  (check) => check.status === "update-available"
+                );
+                const tagMoved = checks.data
+                  .filter((check) => check.status === "tag-moved")
+                  .map((check) => check.name);
+                // Unreachable remotes are an unknown state, never "up to date" —
+                // and they must stay visible even when other updates succeed.
+                const checkFailures = checks.data
+                  .filter((check) => check.status === "error")
+                  .map((check) => check.name);
+
+                const updateFailures: string[] = [];
+                const updatedNames: string[] = [];
+                for (const check of updatable) {
+                  const result = await api.agentPlugins.update({ name: check.name });
+                  if (result.success) {
+                    updatedNames.push(check.name);
+                  } else {
+                    updateFailures.push(`${check.name}: ${result.error}`);
+                  }
+                }
+                // A mounted section only re-queries from its own handlers, so
+                // tell it the state changed under it. This runs even when no
+                // branch update applied: the fresh check may have discovered
+                // moved tags or per-plugin errors the section should show.
+                publishPluginsSectionIntent({ type: "refresh" });
+                if (updatedNames.length > 0) {
+                  // Mounted composers cache contributed slash-command/skill
+                  // descriptors; an update can change them without a remount.
+                  publishAgentPluginsMutated();
+                }
+
+                const summary: string[] = [];
+                if (updatedNames.length > 0) {
+                  summary.push(`Updated ${updatedNames.join(", ")}`);
+                }
+                if (updateFailures.length > 0) {
+                  summary.push(`Update failed — ${updateFailures.join("; ")}`);
+                }
+                if (tagMoved.length > 0) {
+                  summary.push(
+                    `Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`
+                  );
+                }
+                if (checkFailures.length > 0) {
+                  summary.push(`Update check failed for ${checkFailures.join(", ")}`);
+                }
+                if (summary.length === 0) {
+                  showCommandFeedbackToast({
+                    type: "success",
+                    message: "All plugins are up to date.",
+                  });
+                  return;
+                }
+                showCommandFeedbackToast({
+                  // Anything unexpected taints the toast: a partial success or
+                  // a moved tag must not read as a verified all-clear.
+                  type:
+                    updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
+                      ? "error"
+                      : "success",
+                  message: summary.join(". "),
+                });
+                if (tagMoved.length > 0 || checkFailures.length > 0) {
+                  openSettings("plugins");
+                }
+              },
+            },
+            {
+              id: CommandIds.pluginsUpdateOne(),
+              title: "Update Agent Plugin…",
+              subtitle: "Apply one plugin's pending update",
+              section: section.settings,
+              keywords: ["plugin", "update", "upgrade", "single", "one"],
+              run: () => undefined,
+              prompt: {
+                title: "Update Agent Plugin",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Plugin with a pending update",
+                    placeholder: "Search updatable plugins…",
+                    getOptions: async () => {
+                      const checks = await p.api?.agentPlugins.checkUpdates();
+                      if (!checks?.success) {
+                        return [];
+                      }
+                      // Moved tags are updatable here BY DESIGN: bulk update
+                      // excludes them so they get per-plugin review, and this
+                      // selector (with its warning label) is that reviewed,
+                      // keyboard-accessible path.
+                      return checks.data
+                        .filter(
+                          (check) =>
+                            check.status === "update-available" || check.status === "tag-moved"
+                        )
+                        .map((check) => ({
+                          id: check.name,
+                          label:
+                            check.status === "tag-moved"
+                              ? `${check.name} — tag moved (review: tags should be immutable)`
+                              : `${check.name} — update available`,
+                          keywords: [check.name, check.status],
+                        }));
+                    },
+                  },
+                ],
+                onSubmit: async (values) => {
+                  const api = p.api;
+                  if (!api) return;
+                  // Review before applying: an update that changes the
+                  // plugin's capability surface needs the user's consent,
+                  // which only the section's inline review can collect.
+                  const preview = await api.agentPlugins.previewUpdate({
+                    name: values.pluginName,
+                  });
+                  if (!preview.success) {
+                    showCommandFeedbackToast({ type: "error", message: preview.error });
+                    return;
+                  }
+                  if (preview.data.changes.length > 0) {
+                    publishPluginsSectionIntent({ type: "review-update", review: preview.data });
+                    openSettings("plugins");
+                    return;
+                  }
+                  const result = await api.agentPlugins.update({ name: values.pluginName });
+                  // A mounted section keeps its own stale updateChecks map;
+                  // tell it to re-query so badges match the toast.
+                  publishPluginsSectionIntent({ type: "refresh" });
+                  if (result.success) {
+                    // Mounted composers cache contributed slash-command/skill
+                    // descriptors; an update can change them without a remount.
+                    publishAgentPluginsMutated();
+                  }
+                  showCommandFeedbackToast(
+                    result.success
+                      ? { type: "success", message: `Updated ${values.pluginName}.` }
+                      : { type: "error", message: result.error }
+                  );
+                },
+              },
+            },
+          ] satisfies CommandAction[])
+        : []),
     ]);
   }
+
+  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
+  // not gated on onOpenSettings like the section-opening commands above.
+  actions.push(() => [
+    {
+      id: CommandIds.coderDisconnect(),
+      title: "Settings: Disconnect Coder",
+      subtitle: "Revoke the stored Coder OAuth credential",
+      section: section.settings,
+      keywords: ["coder", "logout", "disconnect", "oauth", "revoke", "sign out"],
+      // Gated on credential PRESENCE (not routability): a blob minted for a
+      // previously configured deployment URL must stay revocable — the
+      // backend revokes against the blob's own issuer.
+      visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
+      run: async () => {
+        if (!p.api) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Disconnect Failed",
+            message: "Xum API not connected.",
+          });
+          return;
+        }
+        try {
+          const result = await p.api.coderOauth.disconnect();
+          if (!result.success) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Coder Disconnect Failed",
+              message: result.error,
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            type: "success",
+            message: "Coder account disconnected.",
+          });
+        } catch (error) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Disconnect Failed",
+            message: getErrorMessage(error),
+          });
+        }
+      },
+    },
+    {
+      id: CommandIds.coderRefreshModels(),
+      title: "Settings: Refresh Coder Models",
+      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      section: section.settings,
+      keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
+      // Gated on routability (not mere credential presence): discovery needs a
+      // credential that is valid for the currently effective deployment.
+      visible: () => p.providersConfig?.coder?.coderOauthSet === true,
+      run: async () => {
+        if (!p.api) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Model Refresh Failed",
+            message: "Xum API not connected.",
+          });
+          return;
+        }
+        try {
+          const result = await p.api.coderOauth.refreshModels();
+          if (!result.success) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Coder Model Refresh Failed",
+              message: result.error,
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            type: "success",
+            message: "Coder model catalog refreshed.",
+          });
+        } catch (error) {
+          showCommandFeedbackToast({
+            type: "error",
+            title: "Coder Model Refresh Failed",
+            message: getErrorMessage(error),
+          });
+        }
+      },
+    },
+  ]);
 
   return actions;
 }

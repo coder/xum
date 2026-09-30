@@ -26,6 +26,16 @@ describe("getWorkspaceSidebarKey", () => {
     expect(getWorkspaceSidebarKey(running)).not.toBe(getWorkspaceSidebarKey(reported));
   });
 
+  // Pinning may not change sidebar row order (new pins append at the bottom of
+  // the pinned block), so the key itself must change or the sidebar never
+  // re-renders and the pin appears to do nothing.
+  test("changes when pinnedAt changes", () => {
+    const unpinned = createWorkspaceMeta();
+    const pinned = createWorkspaceMeta({ pinnedAt: "2026-01-01T00:00:00.000Z" });
+
+    expect(getWorkspaceSidebarKey(unpinned)).not.toBe(getWorkspaceSidebarKey(pinned));
+  });
+
   test("changes when heartbeat enabled changes", () => {
     const disabled = createWorkspaceMeta({
       heartbeat: {

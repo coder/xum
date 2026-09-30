@@ -5,47 +5,21 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TUTORIAL_STATE_KEY, WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { TUTORIAL_STATE_KEY } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// TYPES
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export type EventCollector = { getEvents(): unknown[] };
-
-type ToolCallEndEvent = { type: "tool-call-end"; toolName: string };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// EVENT HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function isToolCallEndEvent(event: unknown): event is ToolCallEndEvent {
-  if (typeof event !== "object" || event === null) return false;
-  const record = event as { type?: unknown; toolName?: unknown };
-  return record.type === "tool-call-end" && typeof record.toolName === "string";
-}
-
 /**
- * Wait for a tool-call-end event with the specified tool name.
+ * Open Settings from the titlebar button and scope queries to the Settings dialog. The page
+ * behind the modal stays mounted, so broader queries can match background content too.
  */
-export async function waitForToolCallEnd(
-  collector: EventCollector,
-  toolName: string,
-  timeoutMs: number = 10_000
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const match = collector
-      .getEvents()
-      .find((event) => isToolCallEndEvent(event) && event.toolName === toolName);
-    if (match) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`Timed out waiting for tool-call-end: ${toolName}`);
+export async function openSettingsDialog(container: HTMLElement) {
+  fireEvent.click(await within(container).findByTestId("settings-button"));
+  const body = container.ownerDocument.body;
+  return within(await within(body).findByRole("dialog", { name: "Settings" }, { timeout: 10000 }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -64,7 +38,7 @@ export function getRefreshIconClass(refreshButton: HTMLElement): string {
  */
 export async function waitForRefreshButtonIdle(
   refreshButton: HTMLElement,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -84,7 +58,7 @@ export async function waitForRefreshButtonIdle(
 export async function assertRefreshButtonHasLastRefreshInfo(
   refreshButton: HTMLElement,
   expectedTrigger: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -179,7 +153,7 @@ export async function openProjectCreationView(
     () => {
       const el = view.container.querySelector(
         `[data-project-path="${projectPath}"][aria-controls]`
-      ) as HTMLElement | null;
+      );
       if (!el) throw new Error("Project not found in sidebar");
       return el;
     },
@@ -282,17 +256,23 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const parsedDrafts = readPersistedState<Record<string, { draftId: string }[]>>(
-    WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-    {}
-  );
-  const draftsForProject = parsedDrafts[projectPath] ?? [];
+  const draftsForProject = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
+}
+
+/** Delete every listed creation draft of a project (the list lives on the backend). */
+export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
+  await getDraftStore().whenReady();
+  await Promise.all(
+    getWorkspaceDraftIds(projectPath).map((draftId) =>
+      getDraftStore().deleteDraft({ kind: "creation", projectPath, draftId })
+    )
+  );
 }
 
 export async function waitForLatestDraftId(
   projectPath: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<string> {
   return waitFor(
     () => {
@@ -336,7 +316,7 @@ export function disableTutorial(): void {
 export function setupTestDom(options?: { enableTutorial?: boolean }): () => void {
   // Import here to avoid circular dependency issues
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { installDom } = require("./dom");
+  const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
   if (!options?.enableTutorial) {
@@ -379,7 +359,7 @@ export function getGitStatusFromElement(element: HTMLElement): Partial<GitStatus
 export async function waitForGitStatusElement(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 30_000
+  timeoutMs = 30_000
 ): Promise<HTMLElement> {
   const store = useGitStatusStoreRaw();
 
@@ -428,7 +408,7 @@ async function waitForGitStatus(
 export function waitForDirtyStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !!s.dirty, "dirty status", timeoutMs);
 }
@@ -439,7 +419,7 @@ export function waitForDirtyStatus(
 export function waitForCleanStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !s.dirty, "clean status", timeoutMs);
 }
@@ -451,7 +431,7 @@ export function waitForAheadStatus(
   container: HTMLElement,
   workspaceId: string,
   minAhead: number,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -469,7 +449,7 @@ export function waitForBranchStatus(
   container: HTMLElement,
   workspaceId: string,
   expectedBranch: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -488,7 +468,7 @@ export function waitForIdleGitStatus(
   workspaceId: string,
   predicate: (status: GitStatus) => boolean,
   description: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   const store = useGitStatusStoreRaw();
 

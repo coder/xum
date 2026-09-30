@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
 import { handleLayoutSlotHotkeys } from "./layoutSlotHotkeys";
@@ -49,6 +50,7 @@ function createLayoutPresetsWithSlot1(): LayoutPresetsConfig {
 
 describe("handleLayoutSlotHotkeys", () => {
   beforeEach(() => {
+    saveDomGlobals();
     const happyWindow = new GlobalWindow();
     globalThis.window = happyWindow as unknown as Window & typeof globalThis;
     globalThis.document = happyWindow.document as unknown as Document;
@@ -56,9 +58,7 @@ describe("handleLayoutSlotHotkeys", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement = undefined;
+    restoreDomGlobals();
   });
 
   test("handles slot hotkey even when focus is in a textarea", () => {
@@ -107,29 +107,32 @@ describe("handleLayoutSlotHotkeys", () => {
     expect(applySlotToWorkspace.mock.calls.length).toBe(0);
   });
 
-  test("does not handle slot hotkey when a browser viewport is focused", () => {
-    const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());
+  test.each(["data-browser-viewport", "data-desktop-viewport"])(
+    "does not handle slot hotkey inside %s",
+    (viewportAttribute) => {
+      const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());
 
-    const browserViewport = document.createElement("div");
-    browserViewport.setAttribute("data-browser-viewport", "true");
+      const browserViewport = document.createElement("div");
+      browserViewport.setAttribute(viewportAttribute, "true");
 
-    const textarea = document.createElement("textarea");
-    browserViewport.appendChild(textarea);
+      const textarea = document.createElement("textarea");
+      browserViewport.appendChild(textarea);
 
-    const handled = handleLayoutSlotHotkeys(
-      createEvent({ key: "1", ctrlKey: true, altKey: true, target: textarea }),
-      {
-        isCommandPaletteOpen: false,
-        isSettingsOpen: false,
-        selectedWorkspaceId: "ws",
-        layoutPresets: createLayoutPresetsWithSlot1(),
-        applySlotToWorkspace,
-      }
-    );
+      const handled = handleLayoutSlotHotkeys(
+        createEvent({ key: "1", ctrlKey: true, altKey: true, target: textarea }),
+        {
+          isCommandPaletteOpen: false,
+          isSettingsOpen: false,
+          selectedWorkspaceId: "ws",
+          layoutPresets: createLayoutPresetsWithSlot1(),
+          applySlotToWorkspace,
+        }
+      );
 
-    expect(handled).toBe(false);
-    expect(applySlotToWorkspace.mock.calls.length).toBe(0);
-  });
+      expect(handled).toBe(false);
+      expect(applySlotToWorkspace.mock.calls.length).toBe(0);
+    }
+  );
 
   test("does not handle slot hotkey when AltGr is active", () => {
     const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());

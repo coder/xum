@@ -1,3 +1,4 @@
+import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
@@ -11,8 +12,9 @@ import {
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createTestHistoryService } from "./testHistoryService";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+import { existsSync } from "fs";
 import * as fs from "fs/promises";
-import * as path from "path";
 
 function createUsage(input: number, output: number): ChatUsageDisplay {
   return {
@@ -327,7 +329,10 @@ describe("SessionUsageService", () => {
         runtimeConfig: { type: "local" },
       });
 
-      const usagePath = path.join(config.getSessionDir(parentWorkspaceId), "session-usage.json");
+      const usagePath = path.join(
+        path.join(config.sessionsDir, parentWorkspaceId),
+        "session-usage.json"
+      );
       await fs.mkdir(path.dirname(usagePath), { recursive: true });
       await fs.writeFile(
         usagePath,
@@ -431,6 +436,235 @@ describe("SessionUsageService", () => {
     });
   });
 
+  describe("recordHeadlessUsage", () => {
+    it("refuses writes for a removed workspace (r62)", async () => {
+      // A foreign backend's dream/harvest run survives the remover's
+      // process-local cancellation; its late usage write must not recreate
+      // the deleted session directory.
+      const workspaceId = "removed-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
+      expect(
+        await fs.access(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
+    it("accumulates into byModel without replacing lastRequest", async () => {
+      const workspaceId = "test-workspace";
+      const agentModel = "anthropic:claude-sonnet-4-20250514";
+      const statusModel = "anthropic:claude-haiku-4-5";
+
+      // Normal agent turn establishes lastRequest.
+      await service.recordUsage(workspaceId, agentModel, createUsage(100, 50));
+
+      // Background status or memory calls must add spend but keep the user's
+      // actual last agent request visible in the Costs tab.
+      await service.recordHeadlessUsage(workspaceId, statusModel, {
+        inputTokens: 40,
+        outputTokens: 10,
+        totalTokens: 50,
+      });
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.byModel[statusModel]?.input.tokens).toBe(40);
+      expect(result?.byModel[statusModel]?.output.tokens).toBe(10);
+      expect(result?.lastRequest?.model).toBe(agentModel);
+      expect(result?.lastRequest?.usage.input.tokens).toBe(100);
+    });
+
+    it("prices costsIncluded (subscription-covered) usage at $0", async () => {
+      const workspaceId = "test-workspace";
+      const model = "openai:gpt-5.2";
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        { costsIncluded: true }
+      );
+
+      expect(recorded?.usage.costsIncluded).toBe(true);
+      expect(recorded?.usage.input.tokens).toBe(1000);
+      expect(getTotalCost(recorded!.usage)).toBe(0);
+    });
+
+    it("appends to the headless-usage sidecar only when an analyticsSource is given", async () => {
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
+
+      // No analytics source means no sidecar entry.
+      await service.recordHeadlessUsage(workspaceId, model, {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+      });
+      expect(existsSync(sidecarPath)).toBe(false);
+
+      await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+      const lines = (await fs.readFile(sidecarPath, "utf-8")).trim().split("\n");
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]) as Record<string, unknown>;
+      expect(record.source).toBe("workspace_status");
+      expect(record.model).toBe(model);
+      expect((record.usage as Record<string, unknown>).inputTokens).toBe(40);
+    });
+
+    it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(sessionDir, { recursive: true });
+      // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
+      // not block the sidecar — headless spend has no chat-row fallback.
+      await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{not json");
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      // Sidecar callers key their analytics-ingest trigger off the return.
+      expect(recorded?.model).toBe(model);
+      const sidecarPath = path.join(sessionDir, "headless-usage.jsonl");
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      expect(record.source).toBe("workspace_status");
+
+      // Without a sidecar, a failed ledger write must not report success.
+      const ledgerOnlyRecorded = await service.recordHeadlessUsage(workspaceId, model, {
+        inputTokens: 40,
+        outputTokens: 10,
+        totalTokens: 50,
+      });
+      expect(ledgerOnlyRecorded).toBeUndefined();
+    });
+
+    it("writes the sidecar before the ledger so a sidecar failure leaves no ledger-only spend", async () => {
+      // Ordering contract: the sidecar is the ETL's only replay source, so a
+      // crash between the two writes must strand the LEDGER (self-heals via
+      // rebuild), never the sidecar. Behavioral proxy: an unwritable sidecar
+      // (directory at the path) must abort BEFORE the ledger update.
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(path.join(sessionDir, "headless-usage.jsonl"), { recursive: true });
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      expect(recorded).toBeUndefined();
+      // Ledger untouched: no session-usage.json was created.
+      expect(existsSync(path.join(sessionDir, "session-usage.json"))).toBe(false);
+    });
+
+    it("resolves mappedToModel aliases for pricing and stamps metadataModel in the sidecar", async () => {
+      const workspaceId = "test-workspace";
+      const mappedService = new SessionUsageService(config, historyService, () => ({
+        mycustom: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "my-alias", mappedToModel: "anthropic:claude-sonnet-4-20250514" }],
+        },
+      }));
+
+      const recorded = await mappedService.recordHeadlessUsage(
+        workspaceId,
+        "mycustom:my-alias",
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      // Priced via the mapped model — the raw custom ID has no pricing entry
+      // and would leave cost_usd undefined.
+      expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
+
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      // model keeps the raw ID for attribution; metadataModel carries the
+      // resolved alias target for ETL pricing.
+      expect(record.model).toBe("mycustom:my-alias");
+      expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
+    });
+
+    it("uses the caller-pinned metadataModel for coder models over live re-resolution", async () => {
+      // Dropped-partial sidecar writes happen after the turn's Coder instance
+      // may have been removed/retagged by a catalog refresh: the default
+      // service config knows nothing about this instance, so live resolution
+      // would persist the raw (unpriceable) coder ID.
+      const workspaceId = "test-workspace";
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "coder:prod-anthropic/claude-sonnet-4-20250514",
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        {
+          analyticsSource: "aborted_stream",
+          skipSessionLedger: true,
+          metadataModel: "anthropic:claude-sonnet-4-20250514",
+        }
+      );
+
+      // Priced via the pinned identity — the raw coder ID has no pricing
+      // entry and would leave cost_usd undefined.
+      expect(recorded?.model).toBe("anthropic:claude-sonnet-4-20250514");
+      expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
+
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      expect(record.model).toBe("anthropic:claude-sonnet-4-20250514");
+      expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
+    });
+  });
+
   describe("resetSessionUsage", () => {
     it("should replace existing usage with an explicit empty ledger", async () => {
       const workspaceId = "test-workspace";
@@ -520,7 +754,7 @@ describe("SessionUsageService", () => {
       );
 
       // Delete session-usage.json but keep session dir (appendToHistory created it)
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
@@ -544,7 +778,7 @@ describe("SessionUsageService", () => {
       );
 
       // Overwrite session-usage.json with corrupted JSON
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{ invalid json");
 
       const result = await service.getSessionUsage(workspaceId);
@@ -623,6 +857,87 @@ describe("SessionUsageService", () => {
         getTotalCost(expectedMergedUsage) ?? 0,
         12
       );
+    });
+
+    it("keys recovered Coder usage by the persisted metadata model", async () => {
+      // Recovery runs AFTER mutable instance metadata may have changed: here
+      // the custom instance is gone from providers config entirely, so
+      // re-resolving the raw coder: model would produce an unresolvable raw
+      // key that repricing later strips. The persisted record-time
+      // metadataModel must key the bucket instead — for the assistant usage
+      // AND the tool usage.
+      const workspaceId = "coder-metadata-model-rebuild";
+      const rawModel = "coder:prod-anthropic/claude-opus-4-5";
+      const metadataModel = "anthropic:claude-opus-4-5";
+      const toolUsage = {
+        toolName: "advisor",
+        toolCallId: "tool-call-coder-1",
+        timestamp: Date.now(),
+        model: rawModel,
+        metadataModel,
+        usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 },
+      };
+      const assistantMessage = createMuxMessage("msg-coder-rebuild", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model: rawModel,
+        metadataModel,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      });
+      Object.assign((assistantMessage.metadata ??= {}), {
+        toolModelUsages: [toolUsage],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result).toBeDefined();
+      expect(Object.keys(result?.byModel ?? {})).toEqual([metadataModel]);
+      expect(result?.byModel[metadataModel]?.input.tokens).toBe(130);
+      expect(result?.lastRequest?.model).toBe(metadataModel);
+    });
+
+    it("skips zero-usage refusal markers but keeps billed refusal usage during rebuild", async () => {
+      // Zero-usage model_fallback_refusal entries are analytics-only markers:
+      // the live path never records them in the session ledger, so a rebuild
+      // must not surface 0-token/$0 Costs rows for models that only refused.
+      const workspaceId = "tool-usage-rebuild-skips-zero-refusals";
+      const answeringModel = "anthropic:claude-opus-4-5";
+      const refusedZeroModel = "anthropic:claude-sonnet-4-20250514";
+      const refusedBilledModel = "openai:gpt-5.2";
+      const assistantMessage = createMuxMessage("msg-zero-refusal", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model: answeringModel,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      });
+      Object.assign((assistantMessage.metadata ??= {}), {
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedZeroModel,
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedBilledModel,
+            usage: { inputTokens: 40, outputTokens: 0, totalTokens: 40 },
+          },
+        ],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result).toBeDefined();
+      const models = Object.keys(result?.byModel ?? {});
+      // Billed refusal usage still merges (live path records it too)…
+      expect(models).toContain(normalizeToCanonical(answeringModel));
+      expect(models).toContain(normalizeToCanonical(refusedBilledModel));
+      // …but the zero-usage marker leaves no ledger entry.
+      expect(models).not.toContain(normalizeToCanonical(refusedZeroModel));
     });
 
     it("should skip malformed tool model usage entries during rebuild", async () => {
@@ -718,7 +1033,7 @@ describe("SessionUsageService", () => {
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
       });
 
-      // Add historicalUsage - this field was removed from MuxMetadata type
+      // Add historicalUsage - this field was removed from XumMetadata type
       // but may still exist in persisted data from before the change
       (compactionSummary.metadata as Record<string, unknown>).historicalUsage = createUsage(
         5000,
@@ -737,7 +1052,7 @@ describe("SessionUsageService", () => {
       await historyService.appendToHistory(workspaceId, postCompactionMsg);
 
       // Delete session-usage.json to trigger rebuild from messages
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);

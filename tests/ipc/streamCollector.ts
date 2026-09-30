@@ -39,11 +39,11 @@ export class StreamCollector {
   private stopped = false;
   private subscriptionReady = false;
   private subscriptionReadyResolve: (() => void) | null = null;
-  private waiters: Array<{
+  private waiters: {
     eventType: string;
     resolve: (event: WorkspaceChatMessage | null) => void;
     timer: ReturnType<typeof setTimeout>;
-  }> = [];
+  }[] = [];
 
   constructor(
     private client: OrpcTestClient,
@@ -74,7 +74,7 @@ export class StreamCollector {
    * after the event subscription is set up and history replay is complete.
    * Call this after start() and before sending messages to avoid race conditions.
    */
-  async waitForSubscription(timeoutMs: number = 5000): Promise<void> {
+  async waitForSubscription(timeoutMs = 5000): Promise<void> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
     }
@@ -222,10 +222,7 @@ export class StreamCollector {
    * Wait for a specific event type.
    * Returns the event if found, or null on timeout.
    */
-  async waitForEvent(
-    eventType: string,
-    timeoutMs: number = 30000
-  ): Promise<WorkspaceChatMessage | null> {
+  async waitForEvent(eventType: string, timeoutMs = 30000): Promise<WorkspaceChatMessage | null> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
     }
@@ -262,7 +259,7 @@ export class StreamCollector {
   async waitForEventN(
     eventType: string,
     n: number,
-    timeoutMs: number = 30000
+    timeoutMs = 30000
   ): Promise<WorkspaceChatMessage | null> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
@@ -381,7 +378,7 @@ export class StreamCollector {
    */
   getStreamContent(): string {
     return this.getDeltas()
-      .map((e) => ("delta" in e ? (e as { delta?: string }).delta || "" : ""))
+      .map((e) => ("delta" in e ? ((e as { delta?: string }).delta ?? "") : ""))
       .join("");
   }
 
@@ -399,8 +396,7 @@ export class StreamCollector {
 
     // Log all events with details
     this.events.forEach((event, idx) => {
-      const timestamp =
-        "timestamp" in event ? new Date(event.timestamp as number).toISOString() : "no-ts";
+      const timestamp = "timestamp" in event ? new Date(event.timestamp).toISOString() : "no-ts";
       const type = "type" in event ? (event as { type: string }).type : "no-type";
 
       console.error(`  [${idx}] ${timestamp} - ${type}`);
@@ -490,6 +486,53 @@ export function createStreamCollector(
 }
 
 /**
+ * Helper: Resume stream and wait for successful completion
+ * Uses StreamCollector for ORPC-native event handling
+ */
+export async function resumeAndWaitForSuccess(
+  workspaceId: string,
+  client: OrpcTestClient,
+  model: string,
+  timeoutMs = 15000,
+  options?: {
+    toolPolicy?: { regex_match: string; action: "enable" | "disable" | "require" }[];
+  }
+): Promise<void> {
+  const collector = createStreamCollector(client, workspaceId);
+  collector.start();
+
+  try {
+    // Finish replay before resuming so the previous stream's error cannot be
+    // mistaken for a failure of the new attempt. Live errors remain checked below.
+    await collector.waitForSubscription(5000);
+    collector.clear();
+    const resumeResult = await client.workspace.resumeStream({
+      workspaceId,
+      options: { model, agentId: "exec", toolPolicy: options?.toolPolicy },
+    });
+
+    if (!resumeResult.success) {
+      throw new Error(`Resume failed: ${JSON.stringify(resumeResult.error)}`);
+    }
+
+    // Wait for stream-end event after resume
+    const streamEnd = await collector.waitForEvent("stream-end", timeoutMs);
+
+    if (!streamEnd) {
+      throw new Error("Stream did not complete after resume");
+    }
+
+    // Check for errors
+    const hasError = collector.hasError();
+    if (hasError) {
+      throw new Error("Resumed stream encountered an error");
+    }
+  } finally {
+    collector.stop();
+  }
+}
+
+/**
  * Assert that a stream completed successfully.
  * Provides helpful error messages when assertions fail.
  */
@@ -567,7 +610,7 @@ export async function withStreamCollection<T>(
 export async function waitForStreamSuccess(
   client: OrpcTestClient,
   workspaceId: string,
-  timeoutMs: number = 30000
+  timeoutMs = 30000
 ): Promise<StreamCollector> {
   const collector = createStreamCollector(client, workspaceId);
   collector.start();
@@ -588,7 +631,7 @@ export function extractTextFromEvents(events: WorkspaceChatMessage[]): string {
     })
     .map((e: unknown) => {
       const typed = e as { delta?: string };
-      return typed.delta || "";
+      return typed.delta ?? "";
     })
     .join("");
 }

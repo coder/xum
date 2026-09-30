@@ -9,22 +9,34 @@ import type {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  getAutoRoutingKey,
+  recordAutoRoutingChoiceForAgent,
+  setWorkspaceModelWithOrigin,
+  type AutoRoutingDimension,
+} from "@/browser/utils/modelChange";
+import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getInputKey,
-  getInputAttachmentsKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
   getDraftScopeId,
+  getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   GLOBAL_SCOPE_ID,
@@ -39,21 +51,40 @@ import { ConfirmationModal } from "@/browser/components/ConfirmationModal/Confir
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
-import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { processSlashCommand, type SlashCommandContext } from "@/browser/utils/chatCommands";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import type {
+  ChatAttachment,
+  PendingFileChatAttachment,
+} from "@/browser/features/ChatInput/ChatAttachments";
 import {
-  useWorkspaceName,
-  type WorkspaceNameState,
-  type WorkspaceIdentity,
-} from "@/browser/hooks/useWorkspaceName";
+  formatPendingFileStagingError,
+  replacePendingFilesWithStaged,
+  stagePendingFiles,
+} from "@/browser/features/ChatInput/pendingFileAttachments";
+import { filePartsToChatAttachments } from "@/browser/features/ChatInput/utils";
+import {
+  lockInitialStaging,
+  unlockInitialStaging,
+} from "@/browser/features/ChatInput/initialStagingLock";
+import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import type { MuxMessageMetadata } from "@/common/types/message";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
+import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import {
+  processSlashCommand,
+  type CommandAction,
+  type SlashCommandEnv,
+} from "@/browser/utils/chatCommands";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
   getModelCapabilities,
   getModelCapabilitiesResolved,
 } from "@/common/utils/ai/modelCapabilities";
-import { normalizeModelInput } from "@/browser/utils/models/normalizeModelInput";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { resolveDevcontainerSelection } from "@/browser/utils/devcontainerSelection";
 import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -64,6 +95,7 @@ export type CreationSendResult = { success: true } | { success: false; error?: S
 export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }>;
 
 interface UseCreationWorkspaceOptions {
+  kind?: "scratch";
   projectPath: string;
   onWorkspaceCreated: (
     metadata: FrontendWorkspaceMetadata,
@@ -75,11 +107,20 @@ interface UseCreationWorkspaceOptions {
   subProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
   draftId?: string | null;
+  /** Dynamic workflows gate used when an initial creation command starts a workflow. */
+  dynamicWorkflowsEnabled?: boolean;
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
+  autoRoutingEnabled?: boolean;
 }
 
-function syncCreationPreferences(projectPath: string, workspaceId: string): void {
+function syncCreationPreferences(
+  projectPath: string,
+  workspaceId: string,
+  agentBaseById: ReadonlyMap<string, string | undefined> | undefined,
+  autoRoutingEnabled: boolean
+): void {
   const projectScopeId = getProjectScopeId(projectPath);
 
   // Sync model from project scope to workspace scope
@@ -88,7 +129,6 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
   if (projectModel) {
     setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
   }
-
   const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);
   const globalDefaultAgentId = readPersistedState<string>(
     getAgentIdKey(GLOBAL_SCOPE_ID),
@@ -100,6 +140,32 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
       : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId);
   updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
 
+  // Preserve only creation choices that differ from configured defaults; recording
+  // defaults would prevent later Settings changes from taking effect.
+  const configuredDefaults = resolveConfiguredAiDefaults(
+    effectiveAgentId,
+    readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}),
+    agentBaseById
+  );
+  const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
+  for (const [dimension, configuredAuto] of [
+    ["model", configuredDefaults.autoModelRouting === true],
+    ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
+  ] as const) {
+    const creationAuto =
+      readPersistedState<boolean>(getAutoRoutingKey(projectScopeId, dimension), false) === true;
+    if (creationAuto) {
+      updatePersistedState(getAutoRoutingKey(workspaceId, dimension), true);
+    }
+    if (creationAuto !== configuredAuto) {
+      routingChoice[dimension] = creationAuto;
+    }
+  }
+  // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
+  if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
+    recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
+  }
+
   const projectThinkingLevel = readPersistedState<ThinkingLevel | null>(
     getThinkingLevelKey(projectScopeId),
     null
@@ -108,16 +174,36 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
     updatePersistedState(getThinkingLevelKey(workspaceId), projectThinkingLevel);
   }
 
+  // Mirror thinkingLevel: carry the creation-time pro reasoning-mode choice into
+  // the new workspace's scope so it survives the project→workspace transition.
+  // Coerced so a corrupt persisted value is dropped instead of copied forward.
+  const projectReasoningMode = coerceOpenAIReasoningMode(
+    readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(projectScopeId), null)
+  );
+  if (projectReasoningMode != null) {
+    updatePersistedState(getReasoningModeKey(workspaceId), projectReasoningMode);
+  }
+
   if (projectModel) {
     const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
 
-    updatePersistedState<Partial<Record<string, { model: string; thinkingLevel: ThinkingLevel }>>>(
+    type AgentSettingsCache = Partial<
+      Record<
+        string,
+        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+      >
+    >;
+    updatePersistedState<AgentSettingsCache>(
       getWorkspaceAISettingsByAgentKey(workspaceId),
       (prev) => {
-        const record = prev && typeof prev === "object" ? prev : {};
+        const record: AgentSettingsCache = prev && typeof prev === "object" ? prev : {};
         return {
-          ...(record as Partial<Record<string, { model: string; thinkingLevel: ThinkingLevel }>>),
-          [effectiveAgentId]: { model: projectModel, thinkingLevel: effectiveThinking },
+          ...record,
+          [effectiveAgentId]: {
+            model: projectModel,
+            thinkingLevel: effectiveThinking,
+            ...(projectReasoningMode != null ? { reasoningMode: projectReasoningMode } : {}),
+          },
         };
       },
       {}
@@ -178,12 +264,12 @@ interface UseCreationWorkspaceReturn {
     message: string,
     fileParts?: FilePart[],
     optionsOverride?: Partial<SendMessageOptions>,
-    initialSlashCommand?: CreationInitialSlashCommand
+    initialSlashCommand?: CreationInitialSlashCommand,
+    pendingFiles?: PendingFileChatAttachment[],
+    pendingUserMessageDraft?: PendingInitialUserMessage
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** The confirmed identity being used for creation (null until generation resolves) */
-  creatingWithIdentity: WorkspaceIdentity | null;
   /** Reload branches (e.g., after git init) */
   reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
@@ -200,6 +286,39 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
+function isWorkspaceDraftEmpty(workspaceId: string): boolean {
+  const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
+  return draft.text.trim().length === 0 && draft.attachmentCount === 0;
+}
+
+// Move a failed creation send's draft into the new workspace's draft so the
+// retry happens there instead of creating a duplicate workspace. The creation
+// draft is already deleted, so this waits until the backend confirmed the
+// hand-off (a hard close right after must not lose the prompt). A failed save
+// is logged: the text still shows in the composer, and the store retries it.
+async function transferDraftToWorkspace(
+  workspaceId: string,
+  text: string,
+  attachments: ChatAttachment[],
+  forceProjectSkillDiscovery: boolean
+): Promise<void> {
+  if (forceProjectSkillDiscovery) {
+    // The original send resolved its slash skill against the project path;
+    // carry that choice so the retry cannot resolve a different skill from
+    // the new worktree.
+    updatePersistedState(getPendingDraftSkillDiscoveryKey(workspaceId), true);
+  }
+  const scope = { kind: "workspace" as const, workspaceId };
+  getDraftStore().setText(scope, text);
+  // A text-only send never touches the attachments: the mounted composer is
+  // unlocked during such a send, and a write here (even of "nothing") would
+  // replace attachments the user added there meanwhile.
+  if (attachments.length > 0) getDraftStore().setAttachments(scope, attachments);
+  await getDraftStore()
+    .flush(scope)
+    .catch((error: unknown) => console.warn("Failed to save the transferred draft:", error));
+}
+
 /**
  * Hook for managing workspace creation state and logic
  * Handles:
@@ -209,12 +328,16 @@ export type RuntimeAvailabilityState =
  * - Message sending with workspace creation
  */
 export function useCreationWorkspace({
+  kind,
   projectPath,
   onWorkspaceCreated,
   message,
   subProjectPath,
   draftId,
+  dynamicWorkflowsEnabled = false,
   userModel,
+  agentBaseById,
+  autoRoutingEnabled = false,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
@@ -232,6 +355,9 @@ export function useCreationWorkspace({
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
+  // Read through a ref so a per-render agent map does not destabilize handleSend.
+  const agentBaseByIdRef = useRef(agentBaseById);
+  agentBaseByIdRef.current = agentBaseById;
   const { api } = useAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
@@ -246,8 +372,6 @@ export function useCreationWorkspace({
      * so onConfirm trusts the correct project even if the user navigates. */
     projectPath: string;
   } | null>(null);
-  // The confirmed identity being used for workspace creation (set after waitForGeneration resolves)
-  const [creatingWithIdentity, setCreatingWithIdentity] = useState<WorkspaceIdentity | null>(null);
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
@@ -274,7 +398,7 @@ export function useCreationWorkspace({
   const projectScopeId = getProjectScopeId(projectPath);
 
   // Workspace name generation with debounce
-  // Backend tries cheap models first, then user's model, then any available
+  // Backend tries the configured naming model first, then cheap models, then user's model
   const workspaceNameState = useWorkspaceName({
     message,
     debounceMs: 500,
@@ -288,7 +412,7 @@ export function useCreationWorkspace({
   // Load branches - used on mount and after git init
   // Returns a cleanup function to track mounted state
   const loadBranches = useCallback(async () => {
-    if (!projectPath.length || !api) return;
+    if (kind === "scratch" || !projectPath.length || !api) return;
     setBranchesLoaded(false);
     try {
       const result = await api.projects.listBranches({ projectPath });
@@ -299,10 +423,14 @@ export function useCreationWorkspace({
     } finally {
       setBranchesLoaded(true);
     }
-  }, [projectPath, api]);
+  }, [kind, projectPath, api]);
 
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
+    if (kind === "scratch") {
+      setBranchesLoaded(true);
+      return;
+    }
     if (!projectPath.length || !api) return;
     let mounted = true;
     setBranchesLoaded(false);
@@ -336,7 +464,7 @@ export function useCreationWorkspace({
     return () => {
       mounted = false;
     };
-  }, [projectPath, api]);
+  }, [kind, projectPath, api]);
 
   // Cleanup: resolve trust prompt on unmount so handleSend doesn't wedge
   useEffect(() => {
@@ -352,16 +480,26 @@ export function useCreationWorkspace({
       messageText: string,
       fileParts?: FilePart[],
       optionsOverride?: Partial<SendMessageOptions>,
-      initialSlashCommand?: CreationInitialSlashCommand
+      initialSlashCommand?: CreationInitialSlashCommand,
+      pendingFiles?: PendingFileChatAttachment[],
+      pendingUserMessageDraft?: PendingInitialUserMessage
     ): Promise<CreationSendResult> => {
-      if (!messageText.trim() || isSending || !api) {
+      const pendingFilesToStage = pendingFiles ?? [];
+      // File-only sends are valid; the attached-files notice or provider file
+      // parts carry the content.
+      const hasSendableAttachments = pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0;
+      if ((!messageText.trim() && !hasSendableAttachments) || isSending || !api) {
         return { success: false };
       }
 
       // Build runtime config early (used later for workspace creation)
       let runtimeSelection = settings.selectedRuntime;
 
-      if (runtimeSelection.mode === RUNTIME_MODE.DEVCONTAINER) {
+      // Scratch chats always run on the local runtime and never load runtime
+      // availability, so the devcontainer preflight below would block creation
+      // forever (availability stays "loading") for users whose default runtime
+      // is Dev Container. createScratch() ignores runtimeConfig entirely.
+      if (kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.DEVCONTAINER) {
         const devcontainerSelection = resolveDevcontainerSelection({
           selectedRuntime: runtimeSelection,
           availabilityState: runtimeAvailabilityState,
@@ -388,16 +526,31 @@ export function useCreationWorkspace({
 
       const runtimeConfig: RuntimeConfig | undefined = buildRuntimeConfig(runtimeSelection);
 
+      // SendMessageOptions.muxMetadata is a black box (z.any); the creation
+      // caller only ever passes XumMessageMetadata built in ChatInput.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
+      const overrideRawCommand =
+        overrideMuxMetadata &&
+        "rawCommand" in overrideMuxMetadata &&
+        typeof overrideMuxMetadata.rawCommand === "string"
+          ? overrideMuxMetadata.rawCommand
+          : null;
+      // Transcript row the new workspace shows from the moment it opens until the backend
+      // persists the first message. ChatInput passes the row it captured at Send (typed command
+      // for skill sends, attached-files summary for attachment-only sends); the fallback covers
+      // callers that do not.
+      const pendingUserMessage: PendingInitialUserMessage | null =
+        initialSlashCommand == null
+          ? (pendingUserMessageDraft ?? {
+              content: overrideRawCommand ?? (messageText.trim() ? messageText : message),
+              fileParts,
+              timestamp: Date.now(),
+            })
+          : null;
+
       setIsSending(true);
       setToast(null);
-      // If user provided a manual name, show it immediately in the overlay
-      // instead of "Generating name…". Auto-generated names still show the
-      // loading text until generation resolves.
-      setCreatingWithIdentity(
-        !workspaceNameState.autoGenerate && workspaceNameState.name.trim()
-          ? { name: workspaceNameState.name.trim(), title: workspaceNameState.name.trim() }
-          : null
-      );
 
       let createdWorkspaceId: string | null = null;
 
@@ -409,9 +562,6 @@ export function useCreationWorkspace({
           setIsSending(false);
           return { success: false };
         }
-
-        // Set the confirmed identity for splash UI display
-        setCreatingWithIdentity(identity);
 
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
@@ -481,7 +631,7 @@ export function useCreationWorkspace({
 
         // Gate: untrusted projects must be confirmed before workspace creation.
         // Skip while projects are still loading — the backend gate catches untrusted projects.
-        if (!projectsLoading && !getProjectConfig(projectPath)?.trusted) {
+        if (kind !== "scratch" && !projectsLoading && !getProjectConfig(projectPath)?.trusted) {
           const userConfirmed = await new Promise<boolean>((resolve) => {
             setTrustPrompt({ resolve, projectPath });
           });
@@ -494,15 +644,17 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
-        // Create the workspace with the generated name and title
-        const createResult = await api.workspace.create({
-          projectPath,
-          branchName: identity.name,
-          trunkBranch: settings.trunkBranch,
-          title: createTitle,
-          runtimeConfig,
-          subProjectPath: subProjectPath ?? undefined,
-        });
+        const createResult =
+          kind === "scratch"
+            ? await api.workspace.createScratch({ title: createTitle })
+            : await api.workspace.create({
+                projectPath,
+                branchName: identity.name,
+                trunkBranch: settings.trunkBranch,
+                title: createTitle,
+                runtimeConfig,
+                subProjectPath: subProjectPath ?? undefined,
+              });
 
         if (!createResult.success) {
           setToast({
@@ -528,22 +680,17 @@ export function useCreationWorkspace({
             aiSettings: {
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
+              reasoningMode: settings.reasoningMode,
             },
             persistSelectedAgentId: true,
           })
           .catch(() => null);
 
         const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
-        const pendingScopeId = projectPath
-          ? isDraftScope
-            ? getDraftScopeId(projectPath, draftId)
-            : getPendingScopeId(projectPath)
-          : null;
-
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
-          if (!pendingScopeId) {
+          if (!projectPath) {
             return;
           }
 
@@ -552,12 +699,25 @@ export function useCreationWorkspace({
             return;
           }
 
-          updatePersistedState(getInputKey(pendingScopeId), "");
-          updatePersistedState(getInputAttachmentsKey(pendingScopeId), undefined);
+          getDraftStore()
+            .deleteDraft(
+              getComposerDraftScope({
+                variant: "creation",
+                workspaceId: null,
+                creationProjectPath: projectPath,
+                pendingDraftId: draftId ?? undefined,
+              })
+            )
+            .catch(() => undefined);
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id);
+        syncCreationPreferences(
+          projectPath,
+          metadata.id,
+          agentBaseByIdRef.current,
+          autoRoutingEnabled
+        );
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).
@@ -570,10 +730,34 @@ export function useCreationWorkspace({
             return latestRoute.pendingDraftId === draftId;
           })();
 
+        // Navigate before staging: stageAttachment waits for runtime init, which
+        // can take minutes on deferred runtimes (Coder/SSH/devcontainer). The
+        // optimistic pending-send state is cleared below if staging fails.
+        // Lock the mounted composer for that window so a user send cannot
+        // leapfrog the initial message; the finally below unlocks on all paths.
+        // Any attachment-bearing send locks, not only staged files: a failed
+        // send hands its attachments to that composer, and the write would
+        // replace attachments the user added there meanwhile (oversized ones
+        // live only in component state, so no persisted check can see them).
+        if (pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0) {
+          lockInitialStaging(metadata.id);
+        }
         onWorkspaceCreated(metadata, {
           autoNavigate: shouldAutoNavigate,
           pendingStreamModel: shouldAutoNavigate ? baseModel : null,
           markPendingInitialSend: initialSlashCommand == null,
+          pendingUserMessage: pendingUserMessage ?? undefined,
+          // Scratch chats never run init, so nothing would replace a stand-in card there.
+          pendingCreationInit:
+            kind === "scratch"
+              ? undefined
+              : {
+                  workspaceName: metadata.name,
+                  nameGenerated: workspaceNameState.autoGenerate,
+                  kind,
+                  hookPath: projectPath,
+                  timestamp: pendingUserMessage?.timestamp ?? Date.now(),
+                },
         });
 
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
@@ -585,39 +769,83 @@ export function useCreationWorkspace({
         // during the initial send can't resurrect the draft entry in the sidebar.
         clearPendingDraft();
 
+        // Stage pending files now that the worktree exists on disk, before the
+        // first send so the attached-files notice can reference real staged paths.
+        const stagingOutcome =
+          pendingFilesToStage.length > 0
+            ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
+            : { staged: [], failures: [] };
+        const stagingFailed = stagingOutcome.failures.length > 0;
+
+        if (stagingFailed) {
+          workspaceStore.clearPendingInitialSendState(metadata.id);
+          // Fail closed: a partial notice would misrepresent the workspace
+          // contents. Transfer the draft (staged results kept, failed files
+          // still pending) so the user can retry from the workspace composer.
+          // For slash-skill sends messageText is the rewritten skill text;
+          // restore the original typed command from rawCommand so the retry
+          // re-invokes the skill.
+          await transferDraftToWorkspace(
+            metadata.id,
+            overrideRawCommand ?? messageText,
+            [
+              ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
+              ...replacePendingFilesWithStaged(pendingFilesToStage, stagingOutcome.staged),
+            ],
+            optionsOverride?.disableWorkspaceAgents === true
+          );
+          updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
+            type: "unknown",
+            raw: formatPendingFileStagingError(stagingOutcome.failures),
+          } satisfies SendMessageError);
+          setIsSending(false);
+          return { success: false };
+        }
+
         if (initialSlashCommand) {
           await initialAiSettingsPersisted;
-          const commandContext: SlashCommandContext = {
+          const commandEnv: SlashCommandEnv = {
             api,
             workspaceId: metadata.id,
             variant: "workspace",
-            projectPath,
+            projectPath: metadata.projectPath,
+            rawInput: messageText,
+            dynamicWorkflowsEnabled,
             sendMessageOptions,
-            setInput: () => undefined,
-            setAttachments: () => undefined,
-            setSendingState: () => undefined,
-            setToast,
-            setPreferredModel: () => undefined,
-            setVimEnabled: () => undefined,
-            resetInputHeight: () => undefined,
           };
-          const commandResult = await processSlashCommand(initialSlashCommand, commandContext);
+          // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
+          const applyCommandActions = (actions: CommandAction[]) => {
+            for (const action of actions) {
+              if (action.type === "show-toast") setToast(action.toast);
+            }
+          };
+          let commandResult = await processSlashCommand(initialSlashCommand, commandEnv);
+          while (commandResult.kind === "phase") {
+            applyCommandActions(commandResult.actions);
+            commandResult = await commandResult.continue();
+          }
+          applyCommandActions(commandResult.actions);
+          if (commandResult.backgroundTask) {
+            void commandResult.backgroundTask().then(applyCommandActions);
+          }
           setIsSending(false);
 
-          if (!commandResult.clearInput) {
+          if (commandResult.inputDisposition !== "consume") {
             workspaceStore.clearPendingInitialSendState(metadata.id);
             return { success: false };
           }
 
-          const openGoalTab = () => {
-            window.dispatchEvent(
-              createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: metadata.id })
-            );
-          };
-          if (typeof window.requestAnimationFrame === "function") {
-            window.requestAnimationFrame(openGoalTab);
-          } else {
-            openGoalTab();
+          if (initialSlashCommand.type === "goal-set") {
+            const openGoalTab = () => {
+              window.dispatchEvent(
+                createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: metadata.id })
+              );
+            };
+            if (typeof window.requestAnimationFrame === "function") {
+              window.requestAnimationFrame(openGoalTab);
+            } else {
+              openGoalTab();
+            }
           }
           return { success: true };
         }
@@ -632,22 +860,58 @@ export function useCreationWorkspace({
           .filter((part) => typeof part === "string" && part.trim().length > 0)
           .join("\n\n");
 
-        const sendResult = await api.workspace.sendMessage({
-          workspaceId: metadata.id,
-          message: messageText,
-          options: {
-            ...sendMessageOptions,
-            ...optionsOverride,
-            additionalSystemInstructions: additionalSystemInstructions.length
-              ? additionalSystemInstructions
-              : undefined,
-            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
-          },
-        });
+        // Skill metadata was built before staging, so its rawCommand (preferred
+        // over message text for transcript display) lacks the notice; patch it
+        // so the displayed message keeps the staged attachment chips.
+        const muxMetadataWithNotice =
+          stagingOutcome.staged.length > 0 && overrideMuxMetadata && overrideRawCommand !== null
+            ? {
+                ...overrideMuxMetadata,
+                rawCommand: appendStagedAttachmentNotice(overrideRawCommand, stagingOutcome.staged),
+              }
+            : overrideMuxMetadata;
+
+        // A transport-level rejection (e.g. oRPC disconnect) must flow through
+        // the same failure branch as success:false: the outer catch would skip
+        // the staged-draft transfer and the creation draft is already cleared.
+        const sendResult = await api.workspace
+          .sendMessage({
+            workspaceId: metadata.id,
+            message: appendStagedAttachmentNotice(messageText, stagingOutcome.staged),
+            options: {
+              ...sendMessageOptions,
+              ...optionsOverride,
+              ...(muxMetadataWithNotice ? { muxMetadata: muxMetadataWithNotice } : {}),
+              additionalSystemInstructions: additionalSystemInstructions.length
+                ? additionalSystemInstructions
+                : undefined,
+              fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+            },
+          })
+          .catch((sendErr: unknown): { success: false; error: SendMessageError } => ({
+            success: false,
+            error: { type: "unknown", raw: getErrorMessage(sendErr) },
+          }));
 
         if (!sendResult.success) {
           if (createdWorkspaceId) {
             workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+          }
+          // The workspace exists but holds no message, and the creation draft was already
+          // cleared: hand the draft to the workspace composer (with any staged files) so the
+          // user can fix the model or provider and resend from the chat they landed in. Only
+          // attachment-bearing sends lock that composer, so a text-only send that waited on
+          // init may already hold something the user typed there; never overwrite that.
+          if (isWorkspaceDraftEmpty(metadata.id)) {
+            await transferDraftToWorkspace(
+              metadata.id,
+              overrideRawCommand ?? messageText,
+              [
+                ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
+                ...stagingOutcome.staged,
+              ],
+              optionsOverride?.disableWorkspaceAgents === true
+            );
           }
           if (sendResult.error) {
             // Persist the failure so the workspace view can surface a toast after navigation.
@@ -669,9 +933,14 @@ export function useCreationWorkspace({
         });
         setIsSending(false);
         return { success: false };
+      } finally {
+        if (createdWorkspaceId) {
+          unlockInitialStaging(createdWorkspaceId);
+        }
       }
     },
     [
+      kind,
       api,
       isSending,
       projectPath,
@@ -685,11 +954,14 @@ export function useCreationWorkspace({
       settings.agentId,
       settings.model,
       settings.thinkingLevel,
+      settings.reasoningMode,
       settings.trunkBranch,
       waitForGeneration,
       workspaceNameState.autoGenerate,
-      workspaceNameState.name,
+      message,
       subProjectPath,
+      dynamicWorkflowsEnabled,
+      autoRoutingEnabled,
       draftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,
@@ -704,7 +976,7 @@ export function useCreationWorkspace({
         description:
           "Creating a workspace will execute repository scripts. Only trust projects from sources you trust.",
         warning:
-          "This includes .mux/init, .mux/tool_env, .mux/tool_pre, .mux/tool_post, and git hooks.",
+          "This includes .xum/init, .xum/tool_env, .xum/tool_pre, .xum/tool_post, and git hooks.",
         confirmLabel: "Trust and continue",
         cancelLabel: "Don't create",
         onConfirm: async () => {
@@ -756,8 +1028,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // The confirmed identity being used for creation (null until generation resolves)
-    creatingWithIdentity,
     // Reload branches (e.g., after git init)
     reloadBranches: loadBranches,
     // Runtime availability state for each mode

@@ -11,8 +11,18 @@ VERSION_FILE="src/version.ts"
 TMP_FILE=$(mktemp)
 trap 'rm -f "$TMP_FILE"' EXIT
 
-GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# XUM_GIT_COMMIT overrides the commit stamp (e.g. Nix builds where .git is
+# unavailable in the sandbox but the revision is known to the flake). Keep the
+# old MUX_GIT_COMMIT alias for release jobs that have not migrated yet.
+# Namespaced deliberately: plain GIT_COMMIT is exported ambiently by some CI
+# systems (Jenkins) and could pair a stale commit with HEAD's describe.
+GIT_COMMIT="${XUM_GIT_COMMIT:-${MUX_GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")}}"
+# Reproducible builds: prefer SOURCE_DATE_EPOCH (Nix, reproducible-builds.org),
+# then the HEAD commit time, then the wall clock (tarball builds without git).
+BUILD_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date -u +%s)}"
+# BSD/macOS form first: -j never sets the clock, and GNU date rejects -j and falls through.
+TIMESTAMP=$(date -u -j -f %s "$BUILD_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+  || date -u -d "@$BUILD_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
 
 if [ -n "${RELEASE_TAG:-}" ]; then
   # CI release: use the authoritative tag, never dirty
@@ -28,18 +38,6 @@ else
       echo "⚠️  Git checkout is dirty; version will be stamped with '-dirty'."
       echo "Tracked dirty files:"
       git diff-index --name-only HEAD -- | sed 's/^/  - /'
-    fi
-  fi
-
-  # Keep dev builds stable when git metadata is unchanged so `make start` can
-  # attach to an already-running Vite server without triggering avoidable HMR.
-  if [ -f "$VERSION_FILE" ]; then
-    EXISTING_GIT_COMMIT=$(sed -n 's/^  git_commit: "\(.*\)",$/\1/p' "$VERSION_FILE")
-    EXISTING_GIT_DESCRIBE=$(sed -n 's/^  git_describe: "\(.*\)",$/\1/p' "$VERSION_FILE")
-    EXISTING_BUILD_TIME=$(sed -n 's/^  buildTime: "\(.*\)",$/\1/p' "$VERSION_FILE")
-
-    if [ "$EXISTING_GIT_COMMIT" = "$GIT_COMMIT" ] && [ "$EXISTING_GIT_DESCRIBE" = "$GIT_DESCRIBE" ] && [ -n "$EXISTING_BUILD_TIME" ]; then
-      TIMESTAMP="$EXISTING_BUILD_TIME"
     fi
   fi
 fi

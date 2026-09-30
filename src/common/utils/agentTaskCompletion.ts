@@ -1,5 +1,12 @@
 export interface AgentTaskCompletionCandidate {
-  taskStatus?: "queued" | "running" | "awaiting_report" | "interrupted" | "reported" | null;
+  taskStatus?:
+    | "queued"
+    | "starting"
+    | "running"
+    | "awaiting_report"
+    | "interrupted"
+    | "reported"
+    | null;
   reportedAt?: string | null;
 }
 

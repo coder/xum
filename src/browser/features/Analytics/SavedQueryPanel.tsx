@@ -13,9 +13,13 @@ import type { SavedQuery } from "@/common/types/savedQueries";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ChartTypePicker } from "./ChartTypePicker";
 import { SavedQuerySqlDialog } from "./SavedQuerySqlDialog";
+import { substituteTimeFilter } from "./sqlTimeFilter";
 
 interface SavedQueryPanelProps {
   query: SavedQuery;
+  /** Predicate for the dashboard's date-range selection, substituted for the
+   *  time-filter placeholder before the saved SQL is executed. */
+  timeFilterSql: string;
   onDelete: (id: string) => Promise<void> | void;
   onUpdate: (input: {
     id: string;
@@ -158,18 +162,23 @@ export function SavedQueryPanel(props: SavedQueryPanelProps) {
   const saveSqlDisabled =
     savingSql || normalizedDraftSql.length === 0 || normalizedDraftSql === normalizedSavedSql;
 
+  // SQL actually executed for this panel: the saved SQL with the dashboard's
+  // active date-range predicate substituted in. Using the resolved string as
+  // the effect dependency means only panels that use the placeholder re-run
+  // when the header range changes.
+  const resolvedSql = substituteTimeFilter(props.query.sql, props.timeFilterSql).trim();
+
   useEffect(() => {
     executeQueryRef.current = executeQuery;
   }, [executeQuery]);
 
   useEffect(() => {
-    const normalizedSql = props.query.sql.trim();
-    if (!normalizedSql) {
+    if (!resolvedSql) {
       return;
     }
 
-    void executeQueryRef.current(normalizedSql);
-  }, [props.query.sql]);
+    void executeQueryRef.current(resolvedSql);
+  }, [resolvedSql]);
 
   const inferredChartType = data ? inferChartType(data.columns, data.rows) : "table";
   const explicitChartType = normalizeChartType(props.query.chartType);
@@ -197,12 +206,11 @@ export function SavedQueryPanel(props: SavedQueryPanelProps) {
       return;
     }
 
-    const normalizedSql = props.query.sql.trim();
-    if (!normalizedSql) {
+    if (!resolvedSql) {
       return;
     }
 
-    void executeQuery(normalizedSql);
+    void executeQuery(resolvedSql);
   };
 
   const handleDelete = async () => {

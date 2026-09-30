@@ -17,7 +17,7 @@ import { groupDiffLines } from "@/browser/utils/highlighting/diffChunking";
 import { useTheme, type ThemeMode } from "@/browser/contexts/ThemeContext";
 import {
   escapeHtml,
-  highlightDiffChunk,
+  highlightDiffChunks,
   type HighlightedChunk,
 } from "@/browser/utils/highlighting/highlightDiffChunk";
 import { LRUCache } from "lru-cache";
@@ -421,12 +421,10 @@ interface DiffRendererProps {
 
 /**
  * Module-level cache for fully-highlighted diff results.
- * Key: `${content.length}:${oldStart}:${newStart}:${language}:${themeMode}`
- * (Using content.length instead of full content as a fast differentiator - collisions are rare
- * and just cause re-highlighting, not incorrect rendering)
+ * Key: `${contentHash}:${content.length}:${oldStart}:${newStart}:${language}:${themeMode}`
  *
- * This allows synchronous cache hits, eliminating the "Processing" flash when
- * re-rendering the same diff content (e.g., scrolling back to a previously-viewed message).
+ * This allows synchronous cache hits, avoiding visible plain-text-to-token-color
+ * swaps when immersive review preloads a full-file overlay before rendering it.
  */
 const highlightedDiffCache = new LRUCache<string, HighlightedChunk[]>({
   max: 10000, // High limit - rely on maxSize for eviction
@@ -438,6 +436,8 @@ const highlightedDiffCache = new LRUCache<string, HighlightedChunk[]>({
       0
     ),
 });
+
+const highlightedDiffInFlight = new Map<string, Promise<HighlightedChunk[]>>();
 
 // Fast string hash (djb2 algorithm) - O(n) but very low constant factor
 function hashString(str: string): number {
@@ -480,6 +480,77 @@ function createPlainTextChunks(
   }));
 }
 
+interface HighlightedDiffRequest {
+  content: string;
+  language: string;
+  oldStart: number;
+  newStart: number;
+  themeMode: ThemeMode;
+}
+
+async function loadHighlightedDiff(request: HighlightedDiffRequest): Promise<HighlightedChunk[]> {
+  const cacheKey = getDiffCacheKey(
+    request.content,
+    request.language,
+    request.oldStart,
+    request.newStart,
+    request.themeMode
+  );
+  const cached = highlightedDiffCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const inFlight = highlightedDiffInFlight.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const highlightPromise = (async () => {
+    const lines = splitDiffLines(request.content);
+    const diffChunks = groupDiffLines(lines, request.oldStart, request.newStart);
+    const highlighted = await highlightDiffChunks(diffChunks, request.language, request.themeMode);
+    highlightedDiffCache.set(cacheKey, highlighted);
+    return highlighted;
+  })();
+
+  highlightedDiffInFlight.set(cacheKey, highlightPromise);
+  try {
+    return await highlightPromise;
+  } finally {
+    if (highlightedDiffInFlight.get(cacheKey) === highlightPromise) {
+      highlightedDiffInFlight.delete(cacheKey);
+    }
+  }
+}
+
+export async function preloadHighlightedDiff(options: {
+  content: string;
+  filePath: string | null;
+  oldStart?: number;
+  newStart?: number;
+  themeMode: ThemeMode;
+}): Promise<void> {
+  const language = options.filePath ? getLanguageFromPath(options.filePath) : "text";
+  await loadHighlightedDiff({
+    content: options.content,
+    language,
+    oldStart: options.oldStart ?? 1,
+    newStart: options.newStart ?? 1,
+    themeMode: options.themeMode,
+  });
+}
+
+interface HighlightedDiffState {
+  cacheKey: string;
+  chunks: HighlightedChunk[];
+  isSettled: boolean;
+}
+
+function isPlainTextLanguage(language: string): boolean {
+  return language === "text" || language === "plaintext";
+}
+
 /**
  * Hook to highlight diff content. Returns plain-text immediately, then upgrades
  * to syntax-highlighted when ready. Never returns null (no loading flash).
@@ -490,52 +561,83 @@ function useHighlightedDiff(
   oldStart: number,
   newStart: number,
   themeMode: ThemeMode
-): HighlightedChunk[] {
-  const cacheKey = getDiffCacheKey(content, language, oldStart, newStart, themeMode);
+): HighlightedDiffState {
+  const cacheKey = useMemo(
+    () => getDiffCacheKey(content, language, oldStart, newStart, themeMode),
+    [content, language, oldStart, newStart, themeMode]
+  );
   const cachedResult = highlightedDiffCache.get(cacheKey);
+  const isPlainText = isPlainTextLanguage(language);
 
-  // Sync fallback: plain-text chunks for instant render
+  // Sync fallback: plain-text chunks for instant render. Cache hits return the
+  // preloaded highlighted chunks directly so tooltip/selection state inside the
+  // renderer does not rebuild a throwaway full-file fallback on every local render.
   const plainText = useMemo(
-    () => createPlainTextChunks(content, oldStart, newStart),
-    [content, oldStart, newStart]
+    () => cachedResult ?? createPlainTextChunks(content, oldStart, newStart),
+    [cachedResult, content, oldStart, newStart]
   );
 
-  const [chunks, setChunks] = useState<HighlightedChunk[]>(cachedResult ?? plainText);
-  const hasRealHighlightRef = React.useRef(false);
+  const [state, setState] = useState<HighlightedDiffState>(() => ({
+    cacheKey,
+    chunks: cachedResult ?? plainText,
+    isSettled: cachedResult != null || isPlainText,
+  }));
 
   useEffect(() => {
+    const setHighlightedState = (nextState: HighlightedDiffState) => {
+      setState((currentState) => {
+        if (
+          currentState.cacheKey === nextState.cacheKey &&
+          currentState.chunks === nextState.chunks &&
+          currentState.isSettled === nextState.isSettled
+        ) {
+          return currentState;
+        }
+        return nextState;
+      });
+    };
+
     const cached = highlightedDiffCache.get(cacheKey);
     if (cached) {
-      setChunks(cached);
-      if (language !== "text") hasRealHighlightRef.current = true;
+      setHighlightedState({ cacheKey, chunks: cached, isSettled: true });
       return;
     }
 
-    // Keep syntax-highlighted version when toggling to language="text"
-    if (language === "text" && hasRealHighlightRef.current) return;
+    if (isPlainText) {
+      setHighlightedState({ cacheKey, chunks: plainText, isSettled: true });
+      return;
+    }
 
-    // Show plain-text immediately, then upgrade async
-    setChunks(plainText);
+    // Show plain text immediately unless a caller preloaded this diff into the cache.
+    setHighlightedState({ cacheKey, chunks: plainText, isSettled: false });
 
     let cancelled = false;
-    void (async () => {
-      const lines = splitDiffLines(content);
-      const diffChunks = groupDiffLines(lines, oldStart, newStart);
-      const highlighted = await Promise.all(
-        diffChunks.map((chunk) => highlightDiffChunk(chunk, language, themeMode))
-      );
-      if (!cancelled) {
-        highlightedDiffCache.set(cacheKey, highlighted);
-        setChunks(highlighted);
-        if (language !== "text") hasRealHighlightRef.current = true;
-      }
-    })();
+    loadHighlightedDiff({ content, language, oldStart, newStart, themeMode })
+      .then((highlighted) => {
+        if (!cancelled) {
+          setHighlightedState({ cacheKey, chunks: highlighted, isSettled: true });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setHighlightedState({ cacheKey, chunks: plainText, isSettled: true });
+        }
+      });
+
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, content, language, oldStart, newStart, themeMode, plainText]);
+  }, [cacheKey, content, isPlainText, language, oldStart, newStart, themeMode, plainText]);
 
-  return cachedResult ?? chunks;
+  if (cachedResult) {
+    return { cacheKey, chunks: cachedResult, isSettled: true };
+  }
+
+  if (state.cacheKey === cacheKey) {
+    return state;
+  }
+
+  return { cacheKey, chunks: plainText, isSettled: isPlainText };
 }
 
 /**
@@ -565,10 +667,11 @@ export const DiffRenderer: React.FC<DiffRendererProps> = ({
     [filePath]
   );
 
-  const highlightedChunks = useHighlightedDiff(content, language, oldStart, newStart, theme);
+  const highlightedDiff = useHighlightedDiff(content, language, oldStart, newStart, theme);
+  const highlightedChunks = highlightedDiff.chunks;
 
   const lineNumberWidths = React.useMemo(() => {
-    if (!showLineNumbers || !highlightedChunks) {
+    if (!showLineNumbers) {
       return { oldWidthCh: 2, newWidthCh: 2 };
     }
     // Flatten chunks and map HighlightedLine property names to common interface
@@ -640,6 +743,8 @@ interface SelectableDiffRendererProps extends Omit<DiffRendererProps, "filePath"
   searchConfig?: SearchHighlightConfig;
   /** Enable syntax highlighting (default: true). Set to false to skip highlighting for off-screen hunks */
   enableHighlighting?: boolean;
+  /** Callback when the current diff has finished syntax highlighting or fallback. */
+  onHighlightSettledChange?: (isSettled: boolean) => void;
   /** Callback when review note composition state changes (selection active/inactive) */
   onComposingChange?: (isComposing: boolean) => void;
   /** Action callbacks for inline review notes (edit, check, delete, etc.) */
@@ -717,28 +822,6 @@ const ReviewNoteInput: React.FC<ReviewNoteInputProps> = React.memo(
   }) => {
     const { showOld, showNew } = getLineNumberModeFlags(lineNumberMode);
     const textareaRef = React.useRef<HTMLTextAreaElement>(null);
-    const resizeFrameRef = React.useRef<number | null>(null);
-
-    const resizeTextarea = React.useCallback(() => {
-      const textarea = textareaRef.current;
-      if (!textarea) {
-        return;
-      }
-
-      textarea.style.height = "auto";
-      textarea.style.height = `${textarea.scrollHeight}px`;
-    }, []);
-
-    const scheduleTextareaResize = React.useCallback(() => {
-      if (resizeFrameRef.current !== null) {
-        cancelAnimationFrame(resizeFrameRef.current);
-      }
-
-      resizeFrameRef.current = window.requestAnimationFrame(() => {
-        resizeFrameRef.current = null;
-        resizeTextarea();
-      });
-    }, [resizeTextarea]);
 
     // Keep the composer uncontrolled so typing does not trigger per-key React re-renders
     // through immersive diff overlays. Parent-initiated prefill changes are synced here.
@@ -749,21 +832,11 @@ const ReviewNoteInput: React.FC<ReviewNoteInputProps> = React.memo(
       }
 
       textarea.value = initialNoteText ?? "";
-      scheduleTextareaResize();
-    }, [initialNoteText, scheduleTextareaResize]);
+    }, [initialNoteText]);
 
     // Auto-focus on mount.
     React.useEffect(() => {
       textareaRef.current?.focus();
-      scheduleTextareaResize();
-    }, [scheduleTextareaResize]);
-
-    React.useEffect(() => {
-      return () => {
-        if (resizeFrameRef.current !== null) {
-          cancelAnimationFrame(resizeFrameRef.current);
-        }
-      };
     }, []);
 
     const handleSubmit = () => {
@@ -881,15 +954,18 @@ const ReviewNoteInput: React.FC<ReviewNoteInputProps> = React.memo(
               className="w-[3px] shrink-0"
               style={{ background: "var(--color-review-accent)" }}
             />
+            {/* Avoid JS autosize here. Reading scrollHeight on every input forces layout across
+                large immersive diffs, which can make each typed character feel delayed. */}
             <textarea
               ref={textareaRef}
-              className="text-primary placeholder:text-muted/70 min-w-0 flex-1 resize-none overflow-y-hidden bg-transparent px-2 py-1.5 text-[12px] leading-[1.5] transition-colors focus:outline-none"
+              className="text-primary placeholder:text-muted/70 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-[12px] leading-[1.5] transition-colors focus:outline-none"
               style={{
-                minHeight: "calc(12px * 1.5 * 2 + 12px)",
+                minHeight: "calc(12px * 1.5 * 3 + 12px)",
+                maxHeight: "12rem",
               }}
               placeholder="Add a review note… (Enter to submit, Shift+Enter for newline, Esc to cancel)"
               defaultValue={initialNoteText ?? ""}
-              onInput={scheduleTextareaResize}
+              rows={3}
               onClick={(e) => e.stopPropagation()}
               onKeyDown={(e) => {
                 stopKeyboardPropagation(e);
@@ -1013,6 +1089,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
     onLineClick,
     searchConfig,
     enableHighlighting = true,
+    onHighlightSettledChange,
     onComposingChange,
     reviewActions,
     activeLineIndex,
@@ -1244,13 +1321,18 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
     );
 
     // Only highlight if enabled (for viewport optimization)
-    const highlightedChunks = useHighlightedDiff(
+    const highlightedDiff = useHighlightedDiff(
       content,
       enableHighlighting ? language : "text",
       oldStart,
       newStart,
       theme
     );
+    const highlightedChunks = highlightedDiff.chunks;
+
+    React.useEffect(() => {
+      onHighlightSettledChange?.(highlightedDiff.isSettled);
+    }, [highlightedDiff.isSettled, onHighlightSettledChange]);
 
     // Parse raw lines once for use in lineData
     const rawLines = React.useMemo(() => splitDiffLines(content), [content]);

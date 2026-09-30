@@ -7,6 +7,7 @@
  * - Singleflighting concurrent connection attempts
  */
 
+import { assert } from "@/common/utils/assert";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -20,6 +21,13 @@ import { attachStreamErrorHandler } from "@/node/utils/streamErrors";
 import type { SSHConnectionConfig, ConnectionHealth } from "./sshConnectionPool";
 import { resolveSSHConfig, type ResolvedSSHConfig } from "./sshConfigParser";
 import type { SshPromptService } from "@/node/services/sshPromptService";
+import {
+  DEFAULT_SSH_MAX_WAIT_MS,
+  SSH_BACKOFF_SCHEDULE_SECONDS,
+  type BaseSshAcquireConnectionOptions,
+  withSshBackoffJitter,
+} from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 let sshPromptService: SshPromptService | undefined;
 
@@ -30,13 +38,8 @@ export function setSshPromptService(svc: SshPromptService): void {
 // ConnectionStatus and ConnectionHealth are shared with the OpenSSH pool —
 // imported from sshConnectionPool.ts to avoid duplication.
 
-/**
- * Backoff schedule in seconds: 1s → 2s → 4s → 7s → 10s (cap)
- */
-const BACKOFF_SCHEDULE = [1, 2, 4, 7, 10];
-
+const SSH2_OPERATION_ABORTED_ERROR = "Operation aborted";
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
-const DEFAULT_MAX_WAIT_MS = 2 * 60 * 1000;
 
 /**
  * Close idle connections after 60 seconds (matches ControlPersist=60).
@@ -44,45 +47,45 @@ const DEFAULT_MAX_WAIT_MS = 2 * 60 * 1000;
  */
 const IDLE_TIMEOUT_MS = 60 * 1000;
 
-export interface AcquireConnectionOptions {
-  /** Timeout for the connection attempt. */
-  timeoutMs?: number;
-
-  /**
-   * Max time to wait (ms) for a host to become healthy (waits + retries).
-   *
-   * - Omit to use the default (waits through backoff).
-   * - Set to 0 to fail fast.
-   */
-  maxWaitMs?: number;
-
-  /** Optional abort signal to cancel any waiting. */
-  abortSignal?: AbortSignal;
-
-  /**
-   * Called when acquireConnection is waiting due to backoff.
-   */
-  onWait?: (waitMs: number) => void;
-
-  /**
-   * Test seam.
-   *
-   * If provided, this is used for sleeping between wait cycles.
-   */
-  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
-}
-
 interface SSH2ConnectionEntry {
   client: Client;
   resolvedConfig: ResolvedSSHConfig;
   proxyProcess?: ChildProcess;
   lastActivityAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** Exec/shell channels still open on this connection (see trackChannel). */
+  openChannels: number;
 }
 
-function withJitter(seconds: number): number {
-  const jitterFactor = 0.8 + Math.random() * 0.4;
-  return seconds * jitterFactor;
+/**
+ * Wait for `promise` until it settles, `abortSignal` fires, or `timeout` elapses. Giving up
+ * only stops this caller's wait; the promise itself keeps running for anyone else awaiting it.
+ */
+function waitForAbortable<T>(
+  promise: Promise<T>,
+  abortSignal?: AbortSignal,
+  timeout?: { ms: number; error: Error }
+): Promise<T> {
+  if (abortSignal?.aborted) return Promise.reject(new Error(SSH2_OPERATION_ABORTED_ERROR));
+  if (!abortSignal && !timeout) return promise;
+
+  return new Promise<T>((resolve, reject) => {
+    const finish = (settle: () => void) => {
+      abortSignal?.removeEventListener("abort", onAbort);
+      clearTimeout(timer);
+      settle();
+    };
+    const timer = timeout
+      ? setTimeout(() => finish(() => reject(timeout.error)), timeout.ms)
+      : undefined;
+    const onAbort = () => finish(() => reject(new Error(SSH2_OPERATION_ABORTED_ERROR)));
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) =>
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))))
+    );
+  });
 }
 
 function getAgentConfig(): string | undefined {
@@ -159,34 +162,63 @@ function sanitizeProxyCommand(
   });
 }
 
-function getProxyShellArgs(command: string): { command: string; args: string[] } {
-  if (process.platform === "win32") {
+/**
+ * Build the shell invocation for a ProxyCommand string. Exported for tests.
+ *
+ * On Windows the command must reach cmd.exe verbatim. Without
+ * windowsVerbatimArguments, Node escapes the /c payload with MSVCRT rules
+ * (embedded `"` becomes `\"`), which cmd.exe does not understand. Mux's own
+ * ProxyCommand double-quotes every argument, so cmd.exe got a mangled
+ * command line, exited instantly, and the connection died with a bare
+ * "Premature close" (#3110). Mirror Node's `shell: true` handling instead:
+ * `cmd.exe /d /s /c "<command>"` passed verbatim, where /s strips the outer
+ * quotes so cmd.exe sees the original command byte-for-byte.
+ */
+export function getProxyShellArgs(
+  command: string,
+  platform: NodeJS.Platform = process.platform
+): { command: string; args: string[]; windowsVerbatimArguments: boolean } {
+  if (platform === "win32") {
     return {
       command: process.env.COMSPEC ?? "cmd.exe",
-      args: ["/d", "/s", "/c", command],
+      args: ["/d", "/s", "/c", `"${command}"`],
+      windowsVerbatimArguments: true,
     };
   }
 
-  return { command: "/bin/sh", args: ["-c", command] };
+  return { command: "/bin/sh", args: ["-c", command], windowsVerbatimArguments: false };
 }
 
-function spawnProxyCommand(
-  command: string,
-  tokens: { host: string; port: number; user: string }
-): {
+/** Bound the retained stderr so a chatty proxy can't grow memory unbounded. */
+const MAX_PROXY_STDERR_TAIL_CHARS = 2048;
+
+interface ProxyCommandHandle {
   sock: Duplex;
   process: ChildProcess;
-} {
-  const substituted = sanitizeProxyCommand(command, tokens);
-  const { command: shell, args } = getProxyShellArgs(substituted);
+  /** After the proxy process terminates, describes how (exit status + stderr tail). */
+  describeExit: () => string | undefined;
+}
 
-  const proc = spawn(shell, args, {
+/** Exported for tests. */
+export function spawnProxyCommand(
+  command: string,
+  tokens: { host: string; port: number; user: string }
+): ProxyCommandHandle {
+  const substituted = sanitizeProxyCommand(command, tokens);
+  const shell = getProxyShellArgs(substituted);
+
+  const proc = spawn(shell.command, shell.args, {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: shell.windowsVerbatimArguments,
   });
 
-  proc.stderr?.on("data", () => {
-    // Drain stderr to avoid blocking proxy process.
+  // Retain a bounded stderr tail (also keeps stderr drained so the proxy
+  // process can't block on a full pipe). A dying proxy can then explain
+  // itself in the connection error instead of a bare "Premature close".
+  let stderrTail = "";
+  proc.stderr?.on("data", (chunk: Buffer | string) => {
+    stderrTail = (stderrTail + String(chunk)).slice(-MAX_PROXY_STDERR_TAIL_CHARS);
   });
 
   if (!proc.stdin || !proc.stdout) {
@@ -195,7 +227,17 @@ function spawnProxyCommand(
 
   const sock = Duplex.from({ writable: proc.stdin, readable: proc.stdout });
 
-  return { sock, process: proc };
+  const describeExit = () => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      return undefined;
+    }
+    const exit =
+      proc.signalCode !== null ? `signal ${proc.signalCode}` : `code ${proc.exitCode ?? "unknown"}`;
+    const stderr = stderrTail.trim();
+    return `ProxyCommand exited with ${exit}${stderr ? `: ${stderr}` : ""}`;
+  };
+
+  return { sock, process: proc, describeExit };
 }
 
 /** Extract a message string from an error for `.includes()` matching.
@@ -267,21 +309,21 @@ export class SSH2ConnectionPool {
   private health = new Map<string, ConnectionHealth>();
   private inflight = new Map<string, Promise<SSH2ConnectionEntry>>();
   private connections = new Map<string, SSH2ConnectionEntry>();
+  private idleTimeoutMs = IDLE_TIMEOUT_MS;
 
   async acquireConnection(
     config: SSHConnectionConfig,
-    options: AcquireConnectionOptions = {}
+    options: BaseSshAcquireConnectionOptions = {}
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     const timeoutMs = options.timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    const sleep = options.sleep ?? sleepWithAbort;
-    const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+    const maxWaitMs = options.maxWaitMs ?? DEFAULT_SSH_MAX_WAIT_MS;
     const shouldWait = maxWaitMs > 0;
     const startTime = Date.now();
 
     while (true) {
       if (options.abortSignal?.aborted) {
-        throw new Error("Operation aborted");
+        throw new Error(SSH2_OPERATION_ABORTED_ERROR);
       }
 
       const existing = this.connections.get(key);
@@ -314,13 +356,29 @@ export class SSH2ConnectionPool {
 
         const waitMs = Math.min(remainingMs, budgetMs);
         options.onWait?.(waitMs);
-        await sleep(waitMs, options.abortSignal);
+        await sleepWithAbort(waitMs, options.abortSignal);
         continue;
+      }
+
+      // Waiting on a connect counts against the budget too, whether this caller starts it or
+      // joins it (#5033): only this caller's wait ends at its budget, not the connect, which
+      // keeps going for waiters with more time. The OpenSSH pool bounds shared probes the same way.
+      // maxWaitMs 0 means "do not wait through backoff", so those callers wait for the connect.
+      const budgetMs = maxWaitMs - (Date.now() - startTime);
+      const budgetExceeded = new Error(
+        `SSH connection to ${config.host} did not become ready within ${maxWaitMs}ms`
+      );
+      if (shouldWait && budgetMs <= 0) {
+        throw budgetExceeded;
       }
 
       let inflight = this.inflight.get(key);
       if (!inflight) {
-        inflight = this.connect(config, timeoutMs, options.abortSignal);
+        // The connect is shared, so it takes no caller's abort signal: one caller aborting
+        // must not fail every waiter (#5101). Each caller races only its own wait against its
+        // abort and budget below. A connect nobody waits for any more still finishes (bounded
+        // by readyTimeout) and is cached, then closes after the idle timeout like any other.
+        inflight = this.connect(config, timeoutMs);
         this.inflight.set(key, inflight);
         // Attach no-op catch to prevent unhandled rejection when singleflighted
         // promise rejects before any caller awaits it. Actual errors are
@@ -330,10 +388,15 @@ export class SSH2ConnectionPool {
       }
 
       try {
-        const entry = await inflight;
+        const entry = await waitForAbortable(
+          inflight,
+          options.abortSignal,
+          shouldWait ? { ms: budgetMs, error: budgetExceeded } : undefined
+        );
         return entry;
       } catch (error) {
-        if (!shouldWait) {
+        // connect() already recorded the failure and its backoff; a permanent one ends the wait.
+        if (!shouldWait || error === budgetExceeded || isPermanentSSHFailure(error)) {
           throw error;
         }
 
@@ -362,8 +425,8 @@ export class SSH2ConnectionPool {
     const now = new Date();
     const current = this.health.get(key);
     const failures = (current?.consecutiveFailures ?? 0) + 1;
-    const backoffIndex = Math.min(failures - 1, BACKOFF_SCHEDULE.length - 1);
-    const backoffSeconds = withJitter(BACKOFF_SCHEDULE[backoffIndex]);
+    const backoffIndex = Math.min(failures - 1, SSH_BACKOFF_SCHEDULE_SECONDS.length - 1);
+    const backoffSeconds = withSshBackoffJitter(SSH_BACKOFF_SCHEDULE_SECONDS[backoffIndex]);
 
     this.health.set(key, {
       status: "unhealthy",
@@ -379,9 +442,14 @@ export class SSH2ConnectionPool {
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.
    */
-  clearAllHealth(): void {
+  clearAllHealthForTests(): void {
     this.health.clear();
     this.inflight.clear();
+  }
+
+  /** Shorten the idle window in tests (undefined restores the default). */
+  setIdleTimeoutMsForTests(ms: number | undefined): void {
+    this.idleTimeoutMs = ms ?? IDLE_TIMEOUT_MS;
   }
 
   /**
@@ -396,10 +464,30 @@ export class SSH2ConnectionPool {
       clearTimeout(entry.idleTimer);
     }
 
-    // Set new idle timer
     entry.idleTimer = setTimeout(() => {
       this.closeIdleConnection(key, entry);
-    }, IDLE_TIMEOUT_MS);
+    }, this.idleTimeoutMs);
+  }
+
+  /**
+   * Keep `entry`'s connection open while `channel` runs. The idle timer only
+   * counts acquires, so without this a command or terminal that outlived the
+   * idle window was cut off mid-run (#4876). The idle window restarts when the
+   * last open channel closes.
+   */
+  trackChannel(
+    config: SSHConnectionConfig,
+    entry: SSH2ConnectionEntry,
+    channel: Pick<NodeJS.EventEmitter, "once">
+  ): void {
+    entry.openChannels++;
+    channel.once("close", () => {
+      entry.openChannels--;
+      assert(entry.openChannels >= 0, "SSH2 open channel count went negative");
+      if (entry.openChannels === 0) {
+        this.touchConnection(entry, makeConnectionKey(config));
+      }
+    });
   }
 
   /**
@@ -408,6 +496,12 @@ export class SSH2ConnectionPool {
   private closeIdleConnection(key: string, entry: SSH2ConnectionEntry): void {
     // Verify this is still the active connection for this key
     if (this.connections.get(key) !== entry) {
+      return;
+    }
+
+    // Busy, not idle: re-arm instead of killing running channels (#4876).
+    if (entry.openChannels > 0) {
+      this.touchConnection(entry, key);
       return;
     }
 
@@ -430,8 +524,7 @@ export class SSH2ConnectionPool {
 
   private async connect(
     config: SSHConnectionConfig,
-    timeoutMs: number,
-    abortSignal?: AbortSignal
+    timeoutMs: number
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     try {
@@ -477,20 +570,25 @@ export class SSH2ConnectionPool {
           privateKey: Buffer | undefined,
           reportAuthFailure: boolean
         ): Promise<SSH2ConnectionEntry> => {
-          const proxy = resolvedConfigWithIdentities.proxyCommand
-            ? spawnProxyCommand(resolvedConfigWithIdentities.proxyCommand, proxyTokens)
-            : undefined;
-
           // Lazy-load ssh2 to avoid loading the native sshcrypto.node module at
           // startup. Bun doesn't support the libuv functions the NAPI module calls,
           // so eagerly importing ssh2 crashes the headless CLI in sandboxes.
+          // Import before spawning the proxy so everything from spawn to
+          // handler attachment below runs synchronously; an instantly-dying
+          // proxy can otherwise emit "error"/"close" during the await with no
+          // listeners attached.
           const { Client: SSH2Client } = await import("ssh2");
+
+          const proxy = resolvedConfigWithIdentities.proxyCommand
+            ? spawnProxyCommand(resolvedConfigWithIdentities.proxyCommand, proxyTokens)
+            : undefined;
           const client = new SSH2Client();
           const entry: SSH2ConnectionEntry = {
             client,
             resolvedConfig: resolvedConfigWithIdentities,
             proxyProcess: proxy?.process,
             lastActivityAt: Date.now(),
+            openChannels: 0,
           };
 
           const cleanupProxy = () => {
@@ -504,6 +602,17 @@ export class SSH2ConnectionPool {
               proxy.sock.destroy();
             }
             cleanupProxy();
+          };
+
+          // When the proxy process has died, a raw ssh2 error like "Premature
+          // close" hides the actual cause; append the proxy's exit status and
+          // stderr so the user sees why the proxy exited.
+          const withProxyExitContext = (err: Error): Error => {
+            const proxyExit = proxy?.describeExit();
+            if (proxyExit && !err.message.includes(proxyExit)) {
+              err.message = `${err.message} (${proxyExit})`;
+            }
+            return err;
           };
 
           if (proxy) {
@@ -545,7 +654,7 @@ export class SSH2ConnectionPool {
               clearTimeout(entry.idleTimer);
             }
             if (!isAuthFailure(err) || reportAuthFailure) {
-              this.reportFailure(config, getErrorMessage(err));
+              this.reportFailure(config, getErrorMessage(withProxyExitContext(err)));
             }
             this.connections.delete(key);
             cleanupProxy();
@@ -559,25 +668,33 @@ export class SSH2ConnectionPool {
 
             const onError = (err: Error) => {
               cleanup();
-              reject(err);
+              reject(withProxyExitContext(err));
             };
 
-            const onAbort = () => {
+            // Fail fast with the proxy's exit status + stderr when the proxy
+            // process dies before the handshake completes, instead of waiting
+            // for a readyTimeout or a bare stream error.
+            const onProxyClose = () => {
               cleanup();
               client.end();
-              cleanupProxy();
-              reject(new Error("Operation aborted"));
+              cleanupProxySocket();
+              reject(
+                new Error(
+                  proxy?.describeExit() ??
+                    "ProxyCommand exited before the SSH connection was established"
+                )
+              );
             };
 
             const cleanup = () => {
               client.off("ready", onReady);
               client.off("error", onError);
-              abortSignal?.removeEventListener("abort", onAbort);
+              proxy?.process.off("close", onProxyClose);
             };
 
             client.on("ready", onReady);
             client.on("error", onError);
-            abortSignal?.addEventListener("abort", onAbort, { once: true });
+            proxy?.process.once("close", onProxyClose);
 
             const connectOptions = {
               host: resolvedConfig.hostName,
@@ -598,16 +715,11 @@ export class SSH2ConnectionPool {
             client.connect(connectOptions);
           });
 
-          if (abortSignal?.aborted) {
-            client.end();
-            throw new Error("Operation aborted");
-          }
-
           this.markHealthy(config);
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);
-          }, IDLE_TIMEOUT_MS);
+          }, this.idleTimeoutMs);
           return entry;
         };
 

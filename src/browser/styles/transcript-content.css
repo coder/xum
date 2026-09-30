@@ -1,0 +1,578 @@
+/* Shared by src/browser/styles/globals.css (desktop) and vscode/src/webview/webview.css (VS Code webview). */
+/* Markdown Content Styles */
+.markdown-content {
+  font-family: var(--font-primary);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--color-foreground);
+  white-space: normal;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  margin: 1.2em 0 0.6em 0;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.markdown-content h1 {
+  font-size: 20px;
+}
+.markdown-content h2 {
+  font-size: 18px;
+}
+.markdown-content h3 {
+  font-size: 16px;
+}
+.markdown-content h4 {
+  font-size: 14px;
+}
+.markdown-content h5,
+.markdown-content h6 {
+  font-size: 13px;
+}
+
+/* Compact reports live inside tool chrome. Override the transcript-sized markdown defaults
+   on the renderer itself so task and agent report variants cannot jump to 14–20px text. */
+.markdown-content.compact-report-markdown {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.markdown-content.compact-report-markdown h1 {
+  font-size: 14px;
+}
+
+.markdown-content.compact-report-markdown h2 {
+  font-size: 13px;
+}
+
+.markdown-content.compact-report-markdown h3 {
+  font-size: 12px;
+}
+
+.markdown-content.compact-report-markdown h4,
+.markdown-content.compact-report-markdown h5,
+.markdown-content.compact-report-markdown h6 {
+  font-size: 11px;
+}
+
+.markdown-content.compact-report-markdown code {
+  font-size: 11px;
+}
+
+/* Remove default margins on first and last elements */
+.markdown-content > :first-child {
+  margin-top: 0;
+}
+
+.markdown-content > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  margin: 0.8em 0;
+  padding-left: 20px;
+}
+
+.markdown-content ul {
+  list-style-type: disc;
+}
+
+.markdown-content ol {
+  list-style-type: decimal;
+}
+
+
+.markdown-content.user-message-markdown ul,
+.markdown-content.user-message-markdown ol {
+  margin: 0;
+}
+
+.markdown-content.user-message-markdown li {
+  padding-bottom: 0;
+}
+.markdown-content li {
+  margin: 0;
+  padding: 0 0 4px 0;
+  display: list-item;
+}
+
+
+.markdown-content code {
+  background: rgba(0, 0, 0, 0);
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: #d19a66;
+}
+
+.markdown-content pre {
+  background: var(--color-code-bg);
+  padding: 12px;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 1em 0;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.markdown-content pre code {
+  background: none;
+  padding: 0;
+  margin: 0;
+  color: var(--color-foreground);
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid var(--color-muted);
+  background: color-mix(in srgb, var(--color-border) 15%, transparent);
+  padding: 6px 12px;
+  margin: 1em 0;
+  color: var(--color-muted-foreground);
+  border-radius: 0 4px 4px 0;
+}
+
+.markdown-content strong {
+  font-weight: 600;
+}
+
+.markdown-content em {
+  font-style: italic;
+}
+
+.markdown-content hr {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 1.4em 0;
+}
+
+.markdown-content a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.markdown-content a:hover {
+  text-decoration: underline;
+}
+
+.markdown-content table {
+  border-collapse: collapse;
+  width: fit-content;
+  max-width: 100%;
+  margin: 1em 0;
+}
+
+.markdown-content table th,
+.markdown-content table td {
+  border: 1px solid var(--color-border);
+  padding: 6px 12px;
+  text-align: left;
+}
+
+.markdown-content table th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+}
+
+.markdown-content table tr:nth-of-type(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.markdown-content img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Task lists */
+.markdown-content input[type="checkbox"] {
+  margin-right: 6px;
+}
+
+/* Strikethrough */
+.markdown-content del {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+/* Mermaid diagrams */
+.markdown-content .mermaid-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: auto;
+  max-width: 100%;
+}
+
+.markdown-content .mermaid-container svg {
+  min-width: min-content;
+  max-width: none;
+  max-height: var(--diagram-max-height, 300px);
+  height: auto;
+  /* Electron is Chromium-only; zoom affects layout/scrollbars, unlike transform. */
+  zoom: var(--diagram-zoom, 1);
+}
+
+/* Mermaid in modal - allow larger sizing */
+.markdown-content .mermaid-modal svg {
+  max-width: none;
+  width: auto;
+  max-height: 80vh;
+}
+
+/* Zoom wrapper for mermaid */
+.markdown-content .react-transform-wrapper {
+  position: relative;
+  width: 100%;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  margin: 1em 0;
+}
+
+.markdown-content .react-transform-component {
+  width: 100%;
+  height: 100%;
+}
+
+/* KaTeX math rendering */
+.markdown-content .katex {
+  font-size: 1.1em;
+}
+
+.markdown-content .katex-display {
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.markdown-content .katex-display > .katex {
+  text-align: center;
+}
+
+/* Math inline */
+.markdown-content p .katex,
+.markdown-content li .katex {
+  display: inline;
+}
+
+/* Search highlighting */
+mark.search-highlight,
+span.search-highlight {
+  background: rgba(255, 215, 0, 0.3);
+  color: inherit;
+  padding: 0;
+  border-radius: 2px;
+}
+
+.timeline-reveal-highlight {
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 55%, transparent);
+  border-radius: 0.375rem;
+}
+
+/* Shiki code highlighting */
+.shiki,
+.shiki pre {
+  background: var(--color-code-bg) !important;
+}
+
+/* Code block wrapper with copy button */
+.code-block-wrapper {
+  position: relative;
+  margin: 0.75em 0;
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Code block with line numbers - each line is a grid row */
+.code-block-container {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  background: var(--color-code-bg);
+  border-radius: 4px;
+  padding: 6px 40px 6px 0; /* Right padding for copy button */
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Extra right padding when we show multiple code block action buttons (Run + Copy) */
+.code-block-runnable .code-block-container {
+  padding-right: 80px;
+}
+
+.line-number {
+  background: var(--color-line-number-bg);
+  padding: 0 8px 0 6px;
+  text-align: right;
+  color: var(--color-line-number-text);
+  user-select: none;
+  border-right: 1px solid var(--color-line-number-border);
+}
+
+.code-line {
+  padding: 0 8px;
+  white-space: pre-wrap;
+}
+
+.code-line code {
+  background: transparent;
+  padding: 0;
+}
+
+/* Reusable copy button styles - reuses line-number colors for theme consistency */
+.copy-button {
+  padding: 6px 8px;
+  background: var(--color-line-number-bg);
+  border: 1px solid var(--color-line-number-border);
+  border-radius: 4px;
+  color: var(--color-line-number-text);
+  cursor: pointer;
+  transition:
+    color 0.2s,
+    background 0.2s,
+    border-color 0.2s;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.copy-button:hover {
+  background: var(--color-code-bg);
+  color: var(--color-foreground);
+  border-color: var(--color-foreground);
+}
+
+.copy-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.copy-feedback {
+  font-size: 11px;
+  color: var(--color-foreground);
+}
+
+/* Code block specific positioning */
+.code-copy-button {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+
+.code-run-button {
+  position: absolute;
+  bottom: 8px;
+  right: 44px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.code-block-wrapper:hover .code-run-button {
+  opacity: 1;
+}
+.code-block-wrapper:hover .code-copy-button {
+  opacity: 1;
+}
+
+/* Single-line code block: inline copy button at top-right */
+
+.code-block-single-line .code-run-button {
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+  padding: 2px 4px;
+}
+.code-block-single-line .code-copy-button {
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+  padding: 2px 4px;
+}
+
+
+.code-block-single-line .code-run-button .copy-icon {
+  width: 12px;
+  height: 12px;
+}
+.code-block-single-line .code-copy-button .copy-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* Markdown code blocks (fallback for non-highlighted blocks) */
+pre code {
+  display: block;
+  background: var(--color-code-bg);
+  margin: 1em 0;
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.dir-rtl {
+  direction: rtl;
+}
+
+/* GPU-accelerated shimmer for CompactionBackground - runs on compositor thread */
+@keyframes shimmer-slide {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(53.33%);
+  }
+}
+
+/*
+ * Text shimmer with stationary glyphs and compositor-friendly motion.
+ * The wrapper and duplicate text use inverse transforms, so only the static
+ * feathered mask moves across the label while the glyphs remain registered.
+ */
+.shimmer-text {
+  --shimmer-color: var(--color-muted-foreground);
+  --shimmer-dark: color-mix(in srgb, var(--shimmer-color) 25%, black);
+  position: relative;
+  display: inline-block;
+  contain: paint;
+  color: var(--shimmer-color);
+  text-decoration: inherit;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.shimmer-text-sweep {
+  position: absolute;
+  inset: 0;
+  color: var(--shimmer-dark);
+  pointer-events: none;
+  user-select: none;
+  mask-image: linear-gradient(90deg, transparent 5%, black 50%, transparent 95%);
+  mask-repeat: no-repeat;
+  mask-size: 100% 100%;
+  -webkit-mask-image: linear-gradient(90deg, transparent 5%, black 50%, transparent 95%);
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  animation: shimmer-text-window var(--shimmer-duration, 1.4s) linear infinite;
+}
+
+.shimmer-text-sweep-copy {
+  display: block;
+  width: 100%;
+  white-space: nowrap;
+  animation: shimmer-text-copy var(--shimmer-duration, 1.4s) linear infinite;
+}
+
+@keyframes shimmer-text-window {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes shimmer-text-copy {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(-100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text-sweep {
+    display: none;
+  }
+}
+
+/* Disable shimmer effect while keeping the same accessible text structure. */
+.shimmer-text.no-shimmer {
+  color: inherit;
+}
+
+.shimmer-text.no-shimmer .shimmer-text-sweep {
+  display: none;
+}
+
+@keyframes toastSlideIn {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes toastFadeOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes toastSlideOut {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(20px);
+    opacity: 0;
+  }
+}
+
+@keyframes ellipsis {
+  0% {
+    content: "";
+  }
+  25% {
+    content: ".";
+  }
+  50% {
+    content: "..";
+  }
+  75% {
+    content: "...";
+  }
+}
+
+@keyframes gradient-move {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+/* Semantic numeric typography — use on incrementing counters (costs, timers, token counts).
+   counter-nums: tabular figures only.  counter-nums-mono: tabular + monospace. */
+@utility counter-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@utility counter-nums-mono {
+  font-family: var(--font-monospace);
+  font-variant-numeric: tabular-nums;
+}

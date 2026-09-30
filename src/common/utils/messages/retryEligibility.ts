@@ -1,6 +1,7 @@
 import type { DisplayedMessage } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
 import type { RuntimeStatusEvent, StreamAbortReasonSnapshot } from "@/common/types/stream";
+import { isCompletedSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 
 /**
  * Debug flag to force all errors to be retryable.
@@ -34,16 +35,38 @@ function isForceAllRetryableEnabled(): boolean {
  * Error types that should NOT be auto-retried because they require user action
  * These errors won't resolve on their own - the user must fix the underlying issue
  */
-const NON_RETRYABLE_STREAM_ERRORS = [
+const PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS = [
   "authentication", // Bad API key - user must fix credentials
   "quota", // Billing/usage limits - user must upgrade or wait for reset
+] as const satisfies readonly StreamErrorType[];
+
+const PROVIDER_CONFIG_FIXABLE_SEND_ERRORS = [
+  "api_key_not_found",
+  "oauth_not_connected",
+  "provider_disabled",
+] as const;
+
+const NON_RETRYABLE_STREAM_ERRORS = [
+  ...PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS,
   "model_not_found", // Invalid model - user must select different model
   "context_exceeded", // Message too long - user must reduce context
+  "context_budget_blocked", // Local preflight failed; retrying unchanged cannot fit
   "aborted", // User cancelled - should not auto-retry
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
+  "model_refusal", // Provider declined to answer - retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
+  "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
+const PROVIDER_CONFIG_FIXABLE_ERROR_SET = new Set<string>([
+  ...PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS,
+  ...PROVIDER_CONFIG_FIXABLE_SEND_ERRORS,
+]);
+
+export function isProviderConfigFixableError(type: string): boolean {
+  return PROVIDER_CONFIG_FIXABLE_ERROR_SET.has(type);
+}
 
 /**
  * Check if a SendMessageError (from resumeStream failures) is non-retryable
@@ -54,16 +77,21 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     return false;
   }
 
+  if (PROVIDER_CONFIG_FIXABLE_ERROR_SET.has(error.type)) {
+    return true;
+  }
+
   switch (error.type) {
-    case "api_key_not_found": // Missing API key - user must configure
-    case "oauth_not_connected": // Missing OAuth connection - user must connect/sign in
-    case "provider_disabled": // Provider disabled in settings - user must re-enable
     case "provider_not_supported": // Unsupported provider - user must switch
     case "model_not_available": // Model missing from fetched provider catalog - user must refresh or switch
     case "invalid_model_string": // Bad model format - user must fix
     case "incompatible_workspace": // Workspace from newer mux version - user must upgrade
     case "runtime_not_ready": // Container doesn't exist - user must recreate workspace
     case "policy_denied": // Policy blocks won't resolve automatically
+    case "task_checkout_unsanitized": // Permanent until the task is removed (#4674)
+    case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
+    case "context_budget_blocked":
+    case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":
@@ -95,18 +123,26 @@ function shouldSuppressAutoRetry(
   return lastAbortReason?.reason === "user" || lastAbortReason?.reason === "startup";
 }
 
+/**
+ * True when a turn was interrupted before its first token: the transcript tail is
+ * the user message (no assistant/tool row yet) and the abort was user/startup
+ * (RetryBarrier suppressed). shouldShowInterruptedBarrier never marks a user
+ * message, so callers use this to still offer "continue" on the interrupted tail.
+ */
+export function isPreTokenInterruptedUserTurn(
+  tail: DisplayedMessage | undefined,
+  lastAbortReason: StreamAbortReasonSnapshot | null | undefined
+): boolean {
+  return (
+    tail?.type === "user" && !tail.contextBudgetRejected && shouldSuppressAutoRetry(lastAbortReason)
+  );
+}
+
 function isDecorativeTranscriptMessage(message: DisplayedMessage): boolean {
   return (
     message.type === "history-hidden" ||
     message.type === "workspace-init" ||
     message.type === "compaction-boundary"
-  );
-}
-
-function isSideQuestionTranscriptMessage(message: DisplayedMessage): boolean {
-  return (
-    (message.type === "user" && message.isSideQuestion === true) ||
-    (message.type === "assistant" && message.isSideAnswer === true)
   );
 }
 
@@ -122,17 +158,26 @@ export function getLastNonDecorativeMessage(
   return undefined;
 }
 
-/**
- * Latest transcript row that belongs to the main-agent retry lifecycle.
- * Decorative rows and /btw side-branch rows are persisted in the transcript but
- * must not become the retry candidate for the main agent.
- */
+/** Latest transcript row that belongs to the retry lifecycle. */
+function isDisplayOnlyCompletedSubagentReport(message: DisplayedMessage): boolean {
+  return (
+    message.type === "user" &&
+    !message.contextBudgetRejected &&
+    message.isSynthetic === true &&
+    message.isUiVisible === true &&
+    isCompletedSubagentReportEnvelope(message.content)
+  );
+}
+
 export function getLastMainRetryCandidateMessage(
   messages: DisplayedMessage[]
 ): DisplayedMessage | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const candidate = messages[i];
-    if (isDecorativeTranscriptMessage(candidate) || isSideQuestionTranscriptMessage(candidate)) {
+    if (
+      isDecorativeTranscriptMessage(candidate) ||
+      isDisplayOnlyCompletedSubagentReport(candidate)
+    ) {
       continue;
     }
     return candidate;
@@ -170,13 +215,9 @@ function computeHasInterruptedStream(
     if (elapsed < PENDING_STREAM_START_GRACE_PERIOD_MS) return false;
   }
 
-  // /btw rows are persisted into the transcript, but they are a read-only side
-  // branch that intentionally bypasses the main agent stream lifecycle. Ignore
-  // them when deciding whether the main agent has an interrupted stream: an idle
-  // /btw should not flash RetryBarrier, but a partial main-agent response before
-  // the aside must still be retryable after a reload/crash.
   const lastMessage = getLastMainRetryCandidateMessage(messages);
   if (!lastMessage) return false;
+  if (lastMessage.type === "user" && lastMessage.contextBudgetRejected) return false;
 
   // Don't show retry barrier if workspace init is still running AND no error has occurred yet.
   // The backend waits for init to complete before starting the stream.
@@ -214,9 +255,12 @@ function computeHasInterruptedStream(
     return false;
   }
 
-  // Don't show retry barrier for runtime_not_ready - requires workspace recreation.
-  // StreamErrorMessage already shows a distinct "Runtime Unavailable" UI for this case.
-  if (lastMessage.type === "stream-error" && lastMessage.errorType === "runtime_not_ready") {
+  // These terminal failures require a new request or workspace, not replaying the same turn.
+  if (
+    lastMessage.type === "stream-error" &&
+    (lastMessage.errorType === "runtime_not_ready" ||
+      lastMessage.errorType === "context_budget_blocked")
+  ) {
     return false;
   }
 
@@ -272,35 +316,4 @@ export function getInterruptionContext(
 
   // Other interrupted states (partial messages, user messages) are auto-retryable
   return { hasInterruptedStream: true, isEligibleForAutoRetry: true };
-}
-
-export function hasInterruptedStream(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .hasInterruptedStream;
-}
-
-/**
- * Check if messages are eligible for automatic retry
- *
- * Used by retry status consumers to determine if a stream interruption is auto-retry eligible.
- * Returns false for errors that require user action (authentication, quota, etc.),
- * but still allows manual retry via RetryBarrier UI.
- *
- * This separates auto-retry logic from manual retry UI:
- * - Manual retry: Always available for any error (hasInterruptedStream)
- * - Auto retry: Only for transient errors that might resolve on their own
- */
-export function isEligibleForAutoRetry(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .isEligibleForAutoRetry;
 }

@@ -8,9 +8,10 @@ import type { ToolExecutionOptions } from "ai";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { getTestDeps } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 function createTestTool(cwd: string) {

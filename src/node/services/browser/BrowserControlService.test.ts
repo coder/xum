@@ -7,6 +7,7 @@ import {
   type BrowserControlAction,
   type BrowserControlParams,
 } from "./BrowserControlService";
+import type { SendAgentBrowserDaemonCommandFn } from "./agentBrowserCommandClient";
 
 const WORKSPACE_ID = "workspace-1";
 const SESSION_NAME = "session-a";
@@ -73,6 +74,7 @@ function createService(options?: {
   ) => Promise<ReturnType<typeof createAttachableSession> | null>;
   resolveSessionEnvFn?: (workspaceId: string) => Promise<NodeJS.ProcessEnv>;
   spawnFn?: SpawnFn;
+  sendDaemonCommandFn?: SendAgentBrowserDaemonCommandFn;
   timeoutMs?: number;
 }): BrowserControlService {
   return new BrowserControlService({
@@ -87,6 +89,7 @@ function createService(options?: {
       options?.resolveSessionEnvFn ??
       mock(() => Promise.resolve({ AGENT_BROWSER_SOCKET_DIR: "/tmp/socket" })),
     spawnFn: options?.spawnFn,
+    sendDaemonCommandFn: options?.sendDaemonCommandFn,
     timeoutMs: options?.timeoutMs,
   });
 }
@@ -184,6 +187,68 @@ describe("BrowserControlService", () => {
         windowsHide: true,
       });
     }
+  });
+
+  test("executeControl sends explicit file URLs directly to the daemon", async () => {
+    const spawnFn = mock(() => new MockChildProcess() as unknown as ChildProcess);
+    const resolveSessionEnvFn = mock(() => Promise.resolve({ TEST_ENV: "1" }));
+    const daemonCommandCalls: Array<Parameters<SendAgentBrowserDaemonCommandFn>[0]> = [];
+    const sendDaemonCommandFn = mock((options: Parameters<SendAgentBrowserDaemonCommandFn>[0]) => {
+      daemonCommandCalls.push(options);
+      return Promise.resolve({ success: true });
+    });
+    const service = createService({
+      spawnFn,
+      resolveSessionEnvFn,
+      sendDaemonCommandFn,
+    });
+
+    expect(
+      await service.executeControl({
+        workspaceId: WORKSPACE_ID,
+        sessionName: SESSION_NAME,
+        action: "open",
+        url: "file:///Users/me/report.html",
+      })
+    ).toEqual({ success: true });
+
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(resolveSessionEnvFn).toHaveBeenCalledWith(WORKSPACE_ID);
+    expect(sendDaemonCommandFn).toHaveBeenCalledTimes(1);
+    expect(daemonCommandCalls).toHaveLength(1);
+    expect(daemonCommandCalls[0]).toMatchObject({
+      env: { TEST_ENV: "1" },
+      sessionName: SESSION_NAME,
+      timeoutMs: 15_000,
+      command: {
+        action: "navigate",
+        url: "file:///Users/me/report.html",
+      },
+    });
+    expect(typeof daemonCommandCalls[0]?.command.id).toBe("string");
+  });
+
+  test("executeControl does not fall back to the CLI when file URL daemon navigation fails", async () => {
+    const spawnFn = mock(() => new MockChildProcess() as unknown as ChildProcess);
+    const sendDaemonCommandFn = mock(() =>
+      Promise.resolve({ success: false, error: "daemon rejected navigation" })
+    );
+    const service = createService({
+      spawnFn,
+      sendDaemonCommandFn,
+    });
+
+    expect(
+      await service.executeControl({
+        workspaceId: WORKSPACE_ID,
+        sessionName: SESSION_NAME,
+        action: "open",
+        url: "file:///Users/me/report.html",
+      })
+    ).toEqual({ success: false, error: "daemon rejected navigation" });
+
+    expect(sendDaemonCommandFn).toHaveBeenCalledTimes(1);
+    expect(spawnFn).not.toHaveBeenCalled();
   });
 
   test('executeControl requires a non-empty URL for "open"', async () => {
@@ -316,6 +381,307 @@ describe("BrowserControlService", () => {
       url: "https://example.com/current",
     });
     expect(spawnCalls[0]?.args).toEqual(["--session", SESSION_NAME, "get", "url"]);
+  });
+
+  test("listTabs parses tab metadata from the CLI", async () => {
+    const child = new MockChildProcess();
+    const { spawnCalls, spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const getSessionConnection = mock(() => Promise.resolve(createAttachableSession()));
+    const service = createService({ getSessionConnection, spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+      allowOtherWorkspaceSession: true,
+    });
+    await waitForSpawn();
+    child.writeStdout(
+      JSON.stringify({
+        success: true,
+        data: {
+          tabs: [
+            {
+              active: false,
+              label: null,
+              tabId: "t1",
+              title: "First",
+              type: "page",
+              url: "about:blank",
+            },
+            {
+              active: true,
+              label: "docs",
+              tabId: "t2",
+              title: "Docs",
+              type: "webview",
+              url: "https://docs.example.com/",
+            },
+          ],
+        },
+        error: null,
+      })
+    );
+    child.close();
+
+    expect(await resultPromise).toEqual({
+      tabs: [
+        {
+          active: false,
+          label: null,
+          tabId: "t1",
+          title: "First",
+          type: "page",
+          url: "about:blank",
+        },
+        {
+          active: true,
+          label: "docs",
+          tabId: "t2",
+          title: "Docs",
+          type: "webview",
+          url: "https://docs.example.com/",
+        },
+      ],
+    });
+    expect(getSessionConnection).toHaveBeenCalledWith(WORKSPACE_ID, SESSION_NAME, {
+      allowOtherWorkspaceSession: true,
+    });
+    expect(spawnCalls[0]?.args).toEqual(["--json", "--session", SESSION_NAME, "tab"]);
+  });
+
+  test("listTabs surfaces structured JSON errors from the CLI", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout(
+      JSON.stringify({
+        success: false,
+        data: null,
+        error: "tab list failed",
+      })
+    );
+    child.close();
+
+    expect(await resultPromise).toEqual({ tabs: [], error: "tab list failed" });
+  });
+
+  test("listTabs reports structured CLI failures without details", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout(JSON.stringify({ success: false, data: null, error: "" }));
+    child.close();
+
+    expect(await resultPromise).toEqual({ tabs: [], error: "failed without details" });
+  });
+
+  test("listTabs reports invalid JSON from the CLI", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout("not-json");
+    child.close();
+
+    expect(await resultPromise).toEqual({ tabs: [], error: "invalid JSON" });
+  });
+
+  test("listTabs reports unexpected CLI payloads", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout(JSON.stringify({ success: true, data: {} }));
+    child.close();
+
+    expect(await resultPromise).toEqual({ tabs: [], error: "unexpected JSON payload" });
+  });
+
+  test("listTabs filters non-page targets and malformed entries", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout(
+      JSON.stringify({
+        success: true,
+        data: {
+          tabs: [
+            null,
+            {
+              active: true,
+              label: null,
+              tabId: "t1",
+              title: "First",
+              type: "page",
+              url: "about:blank",
+            },
+            {
+              active: false,
+              label: null,
+              tabId: "malformed-page",
+              type: "page",
+              url: "https://example.com/malformed",
+            },
+            {
+              active: false,
+              label: null,
+              tabId: "worker-1",
+              title: "Worker",
+              type: "service_worker",
+              url: "https://example.com/worker.js",
+            },
+          ],
+        },
+      })
+    );
+    child.close();
+
+    expect(await resultPromise).toEqual({
+      tabs: [
+        {
+          active: true,
+          label: null,
+          tabId: "t1",
+          title: "First",
+          type: "page",
+          url: "about:blank",
+        },
+      ],
+    });
+  });
+
+  test("listTabs reports when every page tab entry is malformed", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const resultPromise = service.listTabs({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+    });
+    await waitForSpawn();
+    child.writeStdout(
+      JSON.stringify({
+        success: true,
+        data: {
+          tabs: [
+            {
+              active: true,
+              label: null,
+              tabId: "t1",
+              type: "page",
+              url: "about:blank",
+            },
+          ],
+        },
+      })
+    );
+    child.close();
+
+    expect(await resultPromise).toEqual({ tabs: [], error: "all tab entries failed validation" });
+  });
+
+  test("selectTab switches the active browser tab", async () => {
+    const child = new MockChildProcess();
+    const { spawnCalls, spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const service = createService({ spawnFn });
+
+    const executionPromise = service.selectTab({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+      tabRef: " t2 ",
+    });
+    await waitForSpawn();
+    child.close();
+
+    expect(await executionPromise).toEqual({ success: true });
+    expect(spawnCalls[0]?.args).toEqual(["--session", SESSION_NAME, "tab", "t2"]);
+  });
+
+  test("selectTab rejects flag-like tab refs before spawning the CLI", async () => {
+    const spawnFn = mock(() => new MockChildProcess() as unknown as ChildProcess);
+    const service = createService({ spawnFn });
+
+    expect(
+      await service.selectTab({
+        workspaceId: WORKSPACE_ID,
+        sessionName: SESSION_NAME,
+        tabRef: " --help ",
+      })
+    ).toEqual({ success: false, error: "Browser tab ref must not start with '-'" });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  test("selectTab validates the session before spawning the CLI", async () => {
+    const spawnFn = mock(() => new MockChildProcess() as unknown as ChildProcess);
+    const service = createService({
+      getSessionConnection: mock(() => Promise.resolve(null)),
+      spawnFn,
+    });
+
+    expect(
+      await service.selectTab({
+        workspaceId: WORKSPACE_ID,
+        sessionName: SESSION_NAME,
+        tabRef: "t2",
+      })
+    ).toEqual({
+      success: false,
+      error: `Session "${SESSION_NAME}" not found for workspace "${WORKSPACE_ID}"`,
+    });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  test("selectTab validates explicitly allowed other sessions with matching scope", async () => {
+    const child = new MockChildProcess();
+    const { spawnFn, waitForSpawn } = createSpawnHarness(child);
+    const getSessionConnection = mock(() => Promise.resolve(createAttachableSession()));
+    const service = createService({
+      getSessionConnection,
+      spawnFn,
+    });
+
+    const executionPromise = service.selectTab({
+      workspaceId: WORKSPACE_ID,
+      sessionName: SESSION_NAME,
+      tabRef: "t2",
+      allowOtherWorkspaceSession: true,
+    });
+    await waitForSpawn();
+    child.close();
+
+    expect(await executionPromise).toEqual({ success: true });
+    expect(getSessionConnection).toHaveBeenCalledWith(WORKSPACE_ID, SESSION_NAME, {
+      allowOtherWorkspaceSession: true,
+    });
   });
 
   test("executeControl returns timeout errors", async () => {

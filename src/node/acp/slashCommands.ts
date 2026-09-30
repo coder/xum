@@ -2,18 +2,17 @@ import assert from "node:assert/strict";
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
-import {
-  getExplicitGatewayPrefix,
-  isValidModelFormat,
-  normalizeToCanonical,
-  resolveModelAlias,
-} from "@/common/utils/ai/models";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import minimist from "minimist";
 
 const CLEAR_COMMAND_NAME = "clear";
 const COMPACT_COMMAND_NAME = "compact";
 const FORK_COMMAND_NAME = "fork";
 const NEW_COMMAND_NAME = "new";
+// Held inputs (#4944) are listed in a numbered notice (StreamTranslator); these act by number.
+export const SEND_HELD_COMMAND_NAME = "send-held";
+export const DISCARD_HELD_COMMAND_NAME = "discard-held";
+const HELD_INPUT_COMMAND_HINT = "[number]";
 
 const COMPACT_USAGE = `/compact ${SLASH_COMMAND_HINTS.compact}`;
 
@@ -45,6 +44,16 @@ const SERVER_COMMAND_DEFINITIONS: readonly ServerCommandDefinition[] = [
       "Create a new workspace in the current project from its trunk branch. Optionally include a start message.",
     inputHint: SLASH_COMMAND_HINTS.new,
   },
+  {
+    name: SEND_HELD_COMMAND_NAME,
+    description: "Send an unsent message that Xum kept (for example after a cancel).",
+    inputHint: HELD_INPUT_COMMAND_HINT,
+  },
+  {
+    name: DISCARD_HELD_COMMAND_NAME,
+    description: "Discard an unsent message that Xum kept (for example after a cancel).",
+    inputHint: HELD_INPUT_COMMAND_HINT,
+  },
 ] as const;
 
 const RESERVED_COMMAND_NAMES = new Set<string>(
@@ -68,12 +77,16 @@ export type ParsedAcpSlashCommand =
     }
   | { kind: "fork"; startMessage?: string }
   | { kind: "new"; startMessage?: string }
+  /** `number` is 1-based, as listed in the held-input notice; omitted means "the only one". */
+  | { kind: "send-held" | "discard-held"; number?: number }
   | {
       kind: "skill";
       descriptor: AgentSkillDescriptor;
       rawCommand: string;
       commandPrefix: string;
       formattedMessage: string;
+      /** Trimmed text after the slash command (e.g. "123 high" for "/fix-issue 123 high"). */
+      argumentText: string;
     }
   | { kind: "invalid"; message: string };
 
@@ -89,7 +102,11 @@ export function buildAcpAvailableCommands(skills: AgentSkillDescriptor[]): Avail
   const seenNames = new Set(commands.map((command) => command.name));
 
   for (const skill of skills) {
-    if (skill.advertise === false) {
+    // Filter on user-invocability, not `advertise`: `advertise` controls the MODEL-facing
+    // index, and skills with advertise:false / disable-model-invocation:true are exactly
+    // the ones users are meant to invoke manually, so they must stay in the user's
+    // command list. Only `user-invocable: false` hides a skill from users.
+    if (skill.userInvocable === false) {
       continue;
     }
 
@@ -100,7 +117,7 @@ export function buildAcpAvailableCommands(skills: AgentSkillDescriptor[]): Avail
     commands.push({
       name: skill.name,
       description: `${skill.description} (${formatSkillScope(skill.scope)})`,
-      input: { hint: "Describe how to apply this skill" },
+      input: { hint: skill.argumentHint ?? "Describe how to apply this skill" },
     });
     seenNames.add(skill.name);
   }
@@ -113,6 +130,11 @@ export function mapSkillsByName(skills: AgentSkillDescriptor[]): Map<string, Age
 
   const byName = new Map<string, AgentSkillDescriptor>();
   for (const skill of skills) {
+    // This map backs user-typed /skill-name resolution (parseAcpSlashCommand), so
+    // user-invocable: false skills must be treated as nonexistent here.
+    if (skill.userInvocable === false) {
+      continue;
+    }
     byName.set(skill.name, skill);
   }
 
@@ -164,6 +186,10 @@ export function parseAcpSlashCommand(
 
   if (commandName === NEW_COMMAND_NAME) {
     return parseNewCommand(rawInput);
+  }
+
+  if (commandName === SEND_HELD_COMMAND_NAME || commandName === DISCARD_HELD_COMMAND_NAME) {
+    return parseHeldInputCommand(commandName, remainingTokens);
   }
 
   return parseSkillCommand(trimmed, commandName, skillsByName);
@@ -288,6 +314,18 @@ function parseNewCommand(rawInput: string): ParsedAcpSlashCommand {
   };
 }
 
+function parseHeldInputCommand(
+  kind: typeof SEND_HELD_COMMAND_NAME | typeof DISCARD_HELD_COMMAND_NAME,
+  tokens: string[]
+): ParsedAcpSlashCommand {
+  if (tokens.length === 0) return { kind };
+  const number = tokens.length === 1 && /^[1-9]\d*$/.test(tokens[0]) ? Number(tokens[0]) : NaN;
+  if (!Number.isSafeInteger(number)) {
+    return { kind: "invalid", message: `Usage: /${kind} ${HELD_INPUT_COMMAND_HINT}` };
+  }
+  return { kind, number };
+}
+
 function parseSkillCommand(
   trimmedInput: string,
   commandName: string,
@@ -311,33 +349,14 @@ function parseSkillCommand(
     rawCommand: trimmedInput,
     commandPrefix,
     formattedMessage: formatSkillInvocationText(commandName, afterPrefix.trimStart()),
+    argumentText: afterPrefix.trim(),
   };
 }
 
 function normalizeModelForCommand(modelInput: string): string | null {
-  const trimmed = modelInput.trim();
-  if (trimmed.length === 0) {
-    return null;
-  }
-
-  const resolved = resolveModelAlias(trimmed);
-  // Explicit gateway scoping is user intent — preserve it for the backend to honor.
-  const normalized = getExplicitGatewayPrefix(resolved)
-    ? resolved.trim()
-    : normalizeToCanonical(resolved).trim();
-
-  if (!isValidModelFormat(normalized)) {
-    return null;
-  }
-
-  // Keep ACP slash commands aligned with the rest of model input handling by rejecting
-  // malformed provider::model strings that happen to satisfy the first-colon check.
-  const separatorIndex = normalized.indexOf(":");
-  if (normalized.slice(separatorIndex + 1).startsWith(":")) {
-    return null;
-  }
-
-  return normalized;
+  // Share the single model-input parser (alias resolution + gateway preservation +
+  // format validation) used by the UI and the task tool instead of duplicating it.
+  return normalizeModelInput(modelInput).model;
 }
 
 function parseMultilineCommand(rawInput: string): ParsedMultilineCommand {

@@ -1,51 +1,53 @@
-import type { MutableRefObject, ReactNode } from "react";
+import type { ReactNode } from "react";
 
-export interface LayoutStackItem {
+export type LayoutStackLaneKind = "transcript-tail" | "composer-decoration";
+
+interface LayoutStackItemInit {
   key: string;
   node: ReactNode;
 }
 
-interface ReservedLayoutStackHeightProps {
-  workspaceId: string;
-  isHydrating: boolean;
-  stackHeightByWorkspaceId: Map<string, number>;
-  fallbackStackHeightPx: number;
+export interface LayoutStackItem<
+  Lane extends LayoutStackLaneKind = LayoutStackLaneKind,
+> extends LayoutStackItemInit {
+  readonly layoutLane: Lane;
 }
 
-export function getReservedLayoutStackHeightPx(
-  props: ReservedLayoutStackHeightProps
-): number | null {
-  if (!props.isHydrating) {
-    return null;
-  }
+export type TranscriptTailStackItem = LayoutStackItem<"transcript-tail">;
+export type ChatInputDecorationStackItem = LayoutStackItem<"composer-decoration"> & {
+  /**
+   * Render even before async decoration data is ready, for synchronous chat state
+   * that must stay visible during hydration.
+   */
+  readonly revealBeforeReady?: boolean;
+};
 
-  const reservedStackHeight =
-    props.stackHeightByWorkspaceId.get(props.workspaceId) ?? props.fallbackStackHeightPx;
-  return reservedStackHeight > 0 ? reservedStackHeight : null;
+function createLayoutStackItem<Lane extends LayoutStackLaneKind>(
+  layoutLane: Lane,
+  item: LayoutStackItemInit
+): LayoutStackItem<Lane> {
+  return { ...item, layoutLane };
 }
 
-export function measureLayoutStackHeightPx(
-  content: HTMLElement,
-  observedHeightPx?: number | null
-): number {
-  return Math.max(0, Math.round(observedHeightPx ?? content.getBoundingClientRect().height));
+// Choosing a factory is the layout contract: transcript-tail items may move the
+// scrollport bottom, while composer decorations live in the stable chrome above
+// the textarea. Making that choice explicit keeps persistent warnings from being
+// accidentally appended inside the transcript again.
+export function createTranscriptTailStackItem(item: LayoutStackItemInit): TranscriptTailStackItem {
+  return createLayoutStackItem("transcript-tail", item);
 }
 
-export function rememberLayoutStackHeight(
-  workspaceId: string,
-  heightPx: number,
-  stackHeightByWorkspaceId: Map<string, number>,
-  lastMeasuredStackHeightRef: MutableRefObject<number>
-): void {
-  lastMeasuredStackHeightRef.current = heightPx;
-  stackHeightByWorkspaceId.set(workspaceId, heightPx);
+export function createChatInputDecorationStackItem(
+  item: LayoutStackItemInit & { revealBeforeReady?: boolean }
+): ChatInputDecorationStackItem {
+  return createLayoutStackItem("composer-decoration", item);
 }
 
-export function clearLayoutStackHeight(
-  workspaceId: string,
-  stackHeightByWorkspaceId: Map<string, number>,
-  lastMeasuredStackHeightRef: MutableRefObject<number>
-): void {
-  lastMeasuredStackHeightRef.current = 0;
-  stackHeightByWorkspaceId.set(workspaceId, 0);
+export function selectVisibleChatInputDecorations(
+  items: readonly ChatInputDecorationStackItem[],
+  revealDeferredDecorations: boolean
+): readonly ChatInputDecorationStackItem[] {
+  return revealDeferredDecorations
+    ? items
+    : items.filter((item) => item.revealBeforeReady === true);
 }

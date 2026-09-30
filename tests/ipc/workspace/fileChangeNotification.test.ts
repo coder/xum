@@ -31,7 +31,7 @@ import { detectDefaultTrunkBranch } from "../../../src/node/git";
 import { getApiKey, validateApiKeys } from "../../testUtils";
 import { getPlanFilePath } from "../../../src/common/utils/planStorage";
 import { log } from "../../../src/node/services/log";
-import { getMuxHome } from "../../../src/common/constants/paths";
+import { getXumHome } from "../../../src/common/constants/paths";
 
 // Skip tests if integration tests are disabled or API keys are missing
 const runTests = shouldRunIntegrationTests();
@@ -113,7 +113,7 @@ describeIntegration("File Change Notification Integration", () => {
 
       // 4. Record the file state (simulates what propose_plan does)
       const { mtimeMs: originalMtime } = await stat(planPath);
-      session.recordFileState(planPath, {
+      await session.recordFileState(planPath, {
         content: originalContent,
         timestamp: originalMtime,
       });
@@ -152,7 +152,7 @@ describeIntegration("File Change Notification Integration", () => {
 
       // 7. Check the debug log file for the injected message
       // The messages with file changes are logged to ~/.mux/debug_obj/${workspaceId}/2a_redacted_messages.json
-      const debugObjDir = join(getMuxHome(), "debug_obj", workspaceId);
+      const debugObjDir = join(getXumHome(), "debug_obj", workspaceId);
       const debugFiles = await readdir(debugObjDir).catch(() => [] as string[]);
 
       // Find the redacted messages file
@@ -162,11 +162,11 @@ describeIntegration("File Change Notification Integration", () => {
       if (redactedFile) {
         const redactedPath = join(debugObjDir, redactedFile);
         const content = await readFile(redactedPath, "utf-8");
-        const messages = JSON.parse(content) as Array<{
+        const messages = JSON.parse(content) as {
           role: string;
-          parts?: Array<{ type: string; text?: string }>;
+          parts?: { type: string; text?: string }[];
           metadata?: { synthetic?: boolean };
-        }>;
+        }[];
 
         // Find the synthetic file change message
         const fileChangeMessage = messages.find(
@@ -227,7 +227,7 @@ describeIntegration("File Change Notification Integration", () => {
 
       // 4. Record the file state
       const { mtimeMs: originalMtime } = await stat(planPath);
-      session.recordFileState(planPath, {
+      await session.recordFileState(planPath, {
         content: originalContent,
         timestamp: originalMtime,
       });
@@ -257,7 +257,7 @@ describeIntegration("File Change Notification Integration", () => {
       collector.stop();
 
       // 7. Check the debug log file - should NOT have file change notification
-      const debugObjDir = join(getMuxHome(), "debug_obj", workspaceId);
+      const debugObjDir = join(getXumHome(), "debug_obj", workspaceId);
       const debugFiles = await readdir(debugObjDir).catch(() => [] as string[]);
 
       const redactedFile = debugFiles.find((f) => f.includes("2a_redacted_messages"));
@@ -266,11 +266,11 @@ describeIntegration("File Change Notification Integration", () => {
       if (redactedFile) {
         const redactedPath = join(debugObjDir, redactedFile);
         const content = await readFile(redactedPath, "utf-8");
-        const messages = JSON.parse(content) as Array<{
+        const messages = JSON.parse(content) as {
           role: string;
-          parts?: Array<{ type: string; text?: string }>;
+          parts?: { type: string; text?: string }[];
           metadata?: { synthetic?: boolean };
-        }>;
+        }[];
 
         // Should NOT find a file change message
         const fileChangeMessage = messages.find(

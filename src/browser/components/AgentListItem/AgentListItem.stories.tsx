@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { useEffect } from "react";
 import { AgentListItem } from "@/browser/components/AgentListItem/AgentListItem";
 import { APIProvider } from "@/browser/contexts/API";
-import { TelemetryEnabledProvider } from "@/browser/contexts/TelemetryEnabledContext";
+import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { TitleEditProvider } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { DndProvider } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
@@ -88,7 +88,7 @@ function StoryScaffold(props: {
   const api = createMockORPCClient({
     workspaceActivitySnapshots: props.workspaceActivitySnapshots,
     onChat: (workspaceId, emit) => {
-      emit({ type: "caught-up", hasOlderHistory: false });
+      emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
       if (workspaceId === "ws-active") {
         emit({
           type: "stream-start",
@@ -181,7 +181,7 @@ function StoryScaffold(props: {
 
   return (
     <APIProvider client={api}>
-      <TelemetryEnabledProvider>
+      <ProjectProvider>
         <TitleEditProvider onUpdateTitle={() => Promise.resolve({ success: true })}>
           <TooltipProvider>
             <DndProvider backend={HTML5Backend}>
@@ -191,77 +191,96 @@ function StoryScaffold(props: {
             </DndProvider>
           </TooltipProvider>
         </TitleEditProvider>
-      </TelemetryEnabledProvider>
+      </ProjectProvider>
     </APIProvider>
   );
 }
 
-function renderFigmaStates() {
+// Labeled wrapper so each gallery permutation stays visually distinct and
+// identifiable to reviewers even though many states now share one snapshot.
+function GallerySection(props: { label: string; children: ReactNode }) {
   return (
-    <StoryScaffold>
-      <AgentListItem
-        metadata={STORY_WORKSPACES[0]}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        isSelected
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-      <AgentListItem
-        metadata={STORY_WORKSPACES[1]}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        isSelected={false}
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-      <AgentListItem
-        metadata={STORY_WORKSPACES[2]}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        isSelected={false}
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-      <AgentListItem
-        metadata={STORY_WORKSPACES[3]}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        isSelected={false}
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-      <AgentListItem
-        metadata={STORY_WORKSPACES[4]}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        isSelected={false}
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-      <AgentListItem
-        variant="draft"
-        draft={{
-          draftId: "draft-state",
-          draftNumber: 1,
-          title: "Draft agent workflow",
-          promptPreview: "",
-          onOpen: () => undefined,
-          onDelete: () => undefined,
-        }}
-        projectPath={PROJECT_PATH}
-        isSelected={false}
-      />
+    <div className="space-y-1">
+      <div className="text-xs font-medium opacity-60">{props.label}</div>
+      {props.children}
+    </div>
+  );
+}
+
+// Shared row factory so gallery permutations don't duplicate the long prop list.
+function WorkspaceRow(props: {
+  workspace: (typeof STORY_WORKSPACES)[number];
+  isSelected?: boolean;
+  isArchiving?: boolean;
+  rowRenderMeta?: AgentRowRenderMeta;
+  completedChildrenExpanded?: boolean;
+  onToggleCompletedChildren?: (workspaceId: string) => void;
+}) {
+  return (
+    <AgentListItem
+      metadata={props.workspace}
+      projectPath={PROJECT_PATH}
+      projectName={PROJECT_NAME}
+      depth={props.rowRenderMeta?.depth}
+      rowRenderMeta={props.rowRenderMeta}
+      completedChildrenExpanded={props.completedChildrenExpanded}
+      onToggleCompletedChildren={props.onToggleCompletedChildren}
+      isSelected={props.isSelected ?? false}
+      isArchiving={props.isArchiving === true}
+      onSelectWorkspace={() => undefined}
+      onForkWorkspace={() => Promise.resolve()}
+      onArchiveWorkspace={() => Promise.resolve()}
+      onCancelCreation={() => Promise.resolve()}
+    />
+  );
+}
+
+function DraftRow() {
+  return (
+    <AgentListItem
+      variant="draft"
+      draft={{
+        draftId: "draft-state",
+        draftNumber: 1,
+        title: "Draft agent workflow",
+        promptPreview: "",
+        onOpen: () => undefined,
+        onDelete: () => undefined,
+      }}
+      projectPath={PROJECT_PATH}
+      isSelected={false}
+    />
+  );
+}
+
+// Gallery merging the primary single-workspace visual states (formerly the
+// FigmaStates, Selected, Active, ErrorState, Archiving, Question, and Draft
+// stories) into one snapshot. Status text/emoji is per-workspace (driven by the
+// persisted status state set in StoryScaffold), so each row shows its own state.
+function renderStatesGallery() {
+  return (
+    <StoryScaffold activeWorkspaceId="ws-active">
+      <GallerySection label="Selected">
+        <WorkspaceRow workspace={STORY_WORKSPACES[0]} isSelected />
+      </GallerySection>
+      <GallerySection label="Active (streaming)">
+        <WorkspaceRow workspace={STORY_WORKSPACES[1]} />
+      </GallerySection>
+      <GallerySection label="Idle">
+        <WorkspaceRow workspace={STORY_WORKSPACES[2]} />
+      </GallerySection>
+      <GallerySection label="Error">
+        <WorkspaceRow workspace={STORY_WORKSPACES[3]} />
+      </GallerySection>
+      <GallerySection label="Archiving">
+        <WorkspaceRow workspace={STORY_WORKSPACES[3]} isArchiving />
+      </GallerySection>
+      <GallerySection label="Question">
+        <WorkspaceRow workspace={STORY_WORKSPACES[4]} />
+      </GallerySection>
+      <GallerySection label="Draft">
+        <DraftRow />
+      </GallerySection>
     </StoryScaffold>
   );
 }
@@ -296,26 +315,6 @@ function renderIdleState(isUnread: boolean) {
   return renderSingleWorkspaceState(2);
 }
 
-function renderDraftState() {
-  return (
-    <StoryScaffold>
-      <AgentListItem
-        variant="draft"
-        draft={{
-          draftId: "draft-state",
-          draftNumber: 1,
-          title: "Draft agent workflow",
-          promptPreview: "",
-          onOpen: () => undefined,
-          onDelete: () => undefined,
-        }}
-        projectPath={PROJECT_PATH}
-        isSelected={false}
-      />
-    </StoryScaffold>
-  );
-}
-
 const SUB_AGENT_ROW_META_BASE = {
   depth: 1,
   rowKind: "subagent",
@@ -341,39 +340,6 @@ function createSubAgentRowRenderMeta(
     connectorPosition,
     ...overrides,
   };
-}
-
-function renderWorkspaceWithRowMeta(options: {
-  workspaceIndex: number;
-  rowRenderMeta: AgentRowRenderMeta;
-  isSelected?: boolean;
-  completedChildrenExpanded?: boolean;
-  onToggleCompletedChildren?: (workspaceId: string) => void;
-  activeWorkspaceId?: string;
-  metadataOverride?: Partial<(typeof STORY_WORKSPACES)[number]>;
-}) {
-  const workspace = {
-    ...STORY_WORKSPACES[options.workspaceIndex],
-    ...options.metadataOverride,
-  };
-  return (
-    <StoryScaffold activeWorkspaceId={options.activeWorkspaceId}>
-      <AgentListItem
-        metadata={workspace}
-        projectPath={PROJECT_PATH}
-        projectName={PROJECT_NAME}
-        depth={options.rowRenderMeta.depth}
-        rowRenderMeta={options.rowRenderMeta}
-        completedChildrenExpanded={options.completedChildrenExpanded}
-        onToggleCompletedChildren={options.onToggleCompletedChildren}
-        isSelected={options.isSelected ?? false}
-        onSelectWorkspace={() => undefined}
-        onForkWorkspace={() => Promise.resolve()}
-        onArchiveWorkspace={() => Promise.resolve()}
-        onCancelCreation={() => Promise.resolve()}
-      />
-    </StoryScaffold>
-  );
 }
 
 const NESTED_CONNECTOR_PARENT_ROW_META = {
@@ -493,21 +459,84 @@ function renderAppSidebarThreeActiveSubAgents() {
   );
 }
 
-export const FigmaStates: Story = {
+function renderWorkflowOnlyActivity() {
+  const workflowWorkspace = createWorkspace({
+    id: "ws-workflow-only",
+    name: "workflow-only",
+    title: "Workflow-only run",
+    projectName: PROJECT_NAME,
+    projectPath: PROJECT_PATH,
+    createdAt: new Date(NOW - 6_000).toISOString(),
+  });
+
+  return (
+    <StoryScaffold
+      workspaces={[workflowWorkspace]}
+      workspaceActivitySnapshots={{
+        [workflowWorkspace.id]: {
+          recency: NOW,
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          activeWorkflowRunCount: 1,
+        },
+      }}
+    >
+      <WorkspaceRow workspace={workflowWorkspace} />
+    </StoryScaffold>
+  );
+}
+
+// Idle workspace parked on an armed background bash monitor: pulsing
+// backgrounded-blue "waiting" dot + "Watching background bash" caption.
+function renderBashMonitorWaiting() {
+  const monitorWorkspace = createWorkspace({
+    id: "ws-bash-monitor",
+    name: "bash-monitor",
+    title: "Waiting on background bash monitor",
+    projectName: PROJECT_NAME,
+    projectPath: PROJECT_PATH,
+    createdAt: new Date(NOW - 6_000).toISOString(),
+  });
+
+  return (
+    <StoryScaffold
+      workspaces={[monitorWorkspace]}
+      workspaceActivitySnapshots={{
+        [monitorWorkspace.id]: {
+          recency: NOW,
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          activeBashMonitorCount: 1,
+        },
+      }}
+    >
+      <WorkspaceRow workspace={monitorWorkspace} />
+    </StoryScaffold>
+  );
+}
+
+// Composite gallery covering the primary single-workspace states. Replaces the
+// former FigmaStates, Selected, Active, ErrorState, Archiving, Question, and
+// Draft stories — one snapshot, all states preserved and labeled.
+export const WorkflowOnlyActivity: Story = {
   args: undefined as never,
-  render: renderFigmaStates,
+  render: renderWorkflowOnlyActivity,
 };
 
-export const Selected: Story = {
+export const BashMonitorWaiting: Story = {
   args: undefined as never,
-  render: () => renderSingleWorkspaceState(0),
+  render: renderBashMonitorWaiting,
 };
 
-export const Active: Story = {
+export const States: Story = {
   args: undefined as never,
-  render: () => renderSingleWorkspaceState(1),
+  render: renderStatesGallery,
 };
 
+// Idle seen vs unread are kept as separate stories: both drive the same
+// ws-idle last-read persisted key, so they cannot coexist in one scaffold.
 export const IdleSeen: Story = {
   args: undefined as never,
   render: () => renderIdleState(false),
@@ -516,26 +545,6 @@ export const IdleSeen: Story = {
 export const IdleNotSeen: Story = {
   args: undefined as never,
   render: () => renderIdleState(true),
-};
-
-export const ErrorState: Story = {
-  args: undefined as never,
-  render: () => renderSingleWorkspaceState(3),
-};
-
-export const Archiving: Story = {
-  args: undefined as never,
-  render: () => renderSingleWorkspaceState(3, { isArchiving: true }),
-};
-
-export const Question: Story = {
-  args: undefined as never,
-  render: () => renderSingleWorkspaceState(4),
-};
-
-export const Draft: Story = {
-  args: undefined as never,
-  render: renderDraftState,
 };
 
 const PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN = {
@@ -552,118 +561,123 @@ const PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN = {
 
 const noopToggleCompletedChildren = () => undefined;
 
-export const SubAgentMiddle: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Middle",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("middle"),
-    }),
-};
+// Composite gallery for sub-agent row permutations. Replaces the eleven former
+// SubAgent* / Parent* stories with one labeled snapshot. activeWorkspaceId is
+// "ws-active": rows backed by ws-active (which has persisted status state) show
+// status text, matching the former "...With Status Text" variants, while
+// ws-idle rows show none — exactly as before. The single AppSidebar story stays
+// separate because it uses a distinct workspace set.
+function renderSubAgentGallery() {
+  // ws-idle (index 2) used as a generic sub-agent row with no status text.
+  const idle = STORY_WORKSPACES[2];
+  // ws-active (index 1) carries persisted status state, so its rows render the
+  // status-text treatment from the former "...With Status Text" stories.
+  const active = STORY_WORKSPACES[1];
+  // Own ws-idle's last-read state. IdleSeen/IdleNotSeen write the same persisted
+  // key, so without pinning it here the idle rows inherit whichever sibling story
+  // rendered last and flip between "idle" (primary title) and "seen" (tertiary
+  // title), causing a non-deterministic snapshot diff. Pin to unread (matching the
+  // workspace's "idle" semantics) so the gallery is stable regardless of order.
+  const idleCreatedAtMs = Date.parse(idle.createdAt ?? new Date(NOW).toISOString());
+  updatePersistedState(getWorkspaceLastReadKey(idle.id), idleCreatedAtMs - 60_000);
+  return (
+    // storybook-static-subagent-connectors freezes the active sub-agent connector
+    // animation for this gallery (see globals.css) so snapshots don't race the
+    // infinite stroke-dashoffset/translate animation to a random frame.
+    <StoryScaffold
+      activeWorkspaceId="ws-active"
+      rowContainerClassName="storybook-static-subagent-connectors space-y-1"
+    >
+      <GallerySection label="Middle">
+        <WorkspaceRow workspace={idle} rowRenderMeta={createSubAgentRowRenderMeta("middle")} />
+      </GallerySection>
+      <GallerySection label="Running">
+        <WorkspaceRow
+          workspace={{ ...idle, taskStatus: "running" }}
+          rowRenderMeta={createSubAgentRowRenderMeta("middle", {
+            connectorStartsAtParent: true,
+            sharedTrunkActiveThroughRow: true,
+            sharedTrunkActiveBelowRow: true,
+          })}
+        />
+      </GallerySection>
+      <GallerySection label="Last">
+        <WorkspaceRow workspace={idle} rowRenderMeta={createSubAgentRowRenderMeta("last")} />
+      </GallerySection>
+      <GallerySection label="Single">
+        <WorkspaceRow workspace={idle} rowRenderMeta={createSubAgentRowRenderMeta("single")} />
+      </GallerySection>
+      <GallerySection label="Middle Selected">
+        <WorkspaceRow
+          workspace={idle}
+          rowRenderMeta={createSubAgentRowRenderMeta("middle")}
+          isSelected
+        />
+      </GallerySection>
+      <GallerySection label="With Status Text">
+        <WorkspaceRow workspace={active} rowRenderMeta={createSubAgentRowRenderMeta("middle")} />
+      </GallerySection>
+      <GallerySection label="Middle Selected With Status Text">
+        <WorkspaceRow
+          workspace={active}
+          rowRenderMeta={createSubAgentRowRenderMeta("middle")}
+          isSelected
+        />
+      </GallerySection>
+      <GallerySection label="Last With Status Text">
+        <WorkspaceRow workspace={active} rowRenderMeta={createSubAgentRowRenderMeta("last")} />
+      </GallerySection>
+      <GallerySection label="Last Selected">
+        <WorkspaceRow
+          workspace={idle}
+          rowRenderMeta={createSubAgentRowRenderMeta("last")}
+          isSelected
+        />
+      </GallerySection>
+      <GallerySection label="Last Selected With Status Text">
+        <WorkspaceRow
+          workspace={active}
+          rowRenderMeta={createSubAgentRowRenderMeta("last")}
+          isSelected
+        />
+      </GallerySection>
+      <GallerySection label="Parent With Completed Children Collapsed">
+        <WorkspaceRow
+          workspace={idle}
+          rowRenderMeta={PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN}
+          completedChildrenExpanded={false}
+          onToggleCompletedChildren={noopToggleCompletedChildren}
+        />
+      </GallerySection>
+      <GallerySection label="Parent With Completed Children Expanded">
+        <WorkspaceRow
+          workspace={idle}
+          rowRenderMeta={PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN}
+          completedChildrenExpanded={true}
+          onToggleCompletedChildren={noopToggleCompletedChildren}
+        />
+      </GallerySection>
+    </StoryScaffold>
+  );
+}
 
-export const SubAgentRunning: Story = {
+export const SubAgentStates: Story = {
   args: undefined as never,
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("middle", {
-        connectorStartsAtParent: true,
-        sharedTrunkActiveThroughRow: true,
-        sharedTrunkActiveBelowRow: true,
-      }),
-      metadataOverride: {
-        taskStatus: "running",
-      },
-    }),
-};
-
-export const SubAgentLast: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Last",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("last"),
-    }),
-};
-
-export const SubAgentSingle: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Single",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("single"),
-    }),
-};
-
-export const SubAgentMiddleSelected: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Middle Selected",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("middle"),
-      isSelected: true,
-    }),
-};
-
-export const SubAgentWithStatusText: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent With Status Text",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 1,
-      rowRenderMeta: createSubAgentRowRenderMeta("middle"),
-      activeWorkspaceId: "ws-active",
-    }),
-};
-
-export const SubAgentMiddleSelectedWithStatusText: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Middle Selected With Status Text",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 1,
-      rowRenderMeta: createSubAgentRowRenderMeta("middle"),
-      isSelected: true,
-      activeWorkspaceId: "ws-active",
-    }),
-};
-
-export const SubAgentLastWithStatusText: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Last With Status Text",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 1,
-      rowRenderMeta: createSubAgentRowRenderMeta("last"),
-      activeWorkspaceId: "ws-active",
-    }),
-};
-
-export const SubAgentLastSelected: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Last Selected",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: createSubAgentRowRenderMeta("last"),
-      isSelected: true,
-    }),
-};
-
-export const SubAgentLastSelectedWithStatusText: Story = {
-  args: undefined as never,
-  name: "SubAgent States/SubAgent Last Selected With Status Text",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 1,
-      rowRenderMeta: createSubAgentRowRenderMeta("last"),
-      isSelected: true,
-      activeWorkspaceId: "ws-active",
-    }),
+  name: "SubAgent States/Gallery",
+  render: renderSubAgentGallery,
+  // ws-active streams asynchronously: the scaffold's onChat emits stream-start
+  // through a fire-and-forget store subscription (ensureActiveOnChatSubscription
+  // → void runOnChatSubscription), which flips its rows to the "active" visual
+  // state (success-colored status dot). With no play() the snapshot races that
+  // async transition and captures the dot as active-or-not at random. Wait for
+  // the settled signal so every snapshot captures the same frame.
+  play: async ({ canvasElement }) => {
+    await waitFor(() => {
+      if (!canvasElement.querySelector(".workspace-status-dot-active")) {
+        throw new Error("ws-active streaming status dot has not settled yet");
+      }
+    });
+  },
 };
 
 export const AppSidebarThreeActiveSubAgents: Story = {
@@ -672,29 +686,6 @@ export const AppSidebarThreeActiveSubAgents: Story = {
   render: renderAppSidebarThreeActiveSubAgents,
 };
 
-export const ParentWithCompletedChildrenCollapsed: Story = {
-  args: undefined as never,
-  name: "SubAgent States/Parent With Completed Children Collapsed",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN,
-      completedChildrenExpanded: false,
-      onToggleCompletedChildren: noopToggleCompletedChildren,
-    }),
-};
-
-export const ParentWithCompletedChildrenExpanded: Story = {
-  args: undefined as never,
-  name: "SubAgent States/Parent With Completed Children Expanded",
-  render: () =>
-    renderWorkspaceWithRowMeta({
-      workspaceIndex: 2,
-      rowRenderMeta: PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN,
-      completedChildrenExpanded: true,
-      onToggleCompletedChildren: noopToggleCompletedChildren,
-    }),
-};
 export const ClickKebabButton: Story = {
   args: undefined as never,
   render: () => renderSingleWorkspaceState(1),

@@ -1,0 +1,243 @@
+import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { appMeta, AppWithMocks, type AppStory } from "./meta";
+import { expandLeftSidebar } from "./helpers/uiState";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
+import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
+import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
+
+export default { ...appMeta, title: "App/PluginImports" };
+
+const preview: AgentPluginInstallPreview = {
+  source: {
+    type: "git",
+    url: "https://github.com/example/review-tools.git",
+    ref: "main",
+    refType: "branch",
+  },
+  lockedSha: "a".repeat(40),
+  manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
+  targetPath: "~/.xum/plugins/review-tools",
+  skills: [
+    { name: "review", description: "Review a change" },
+    { name: "research", description: "Research a topic" },
+  ],
+  mcpServers: [
+    {
+      serverName: "reference",
+      transport: "stdio",
+      summary: "node ${PLUGIN_ROOT}/servers/reference.js --read-only",
+    },
+  ],
+  agents: ["reviewer.md"],
+  workflows: ["review.js"],
+  slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  hook: { path: "hooks.js", toolGrants: ["file_read"] },
+  warnings: [],
+};
+
+function setupPluginSettings(installed = false, conflict = false) {
+  expandLeftSidebar();
+  const client = setupSettingsStory({ experiments: { [EXPERIMENT_IDS.AGENT_PLUGINS]: true } });
+  let entry: AgentPluginInstallEntry = {
+    name: preview.manifest.name,
+    scope: "global",
+    source: preview.source,
+    lockedSha: preview.lockedSha,
+    installedAt: "2026-09-01T00:00:00.000Z",
+    importedComponents: { skills: ["review"], mcpServers: [] },
+  };
+  // The full app mounts its composer before Settings, including plugin command discovery.
+  client.workspace.plugins = {
+    slashCommands: { list: () => Promise.resolve([]) },
+    composition: {
+      get: () =>
+        Promise.resolve({
+          agentPluginsEnabled: true,
+          plugins: [],
+          diagnostics: [],
+          skills: [],
+          agents: [],
+          workflows: [],
+          mcpServers: [],
+          slashCommands: [],
+          hooks: [],
+        }),
+    },
+  };
+  client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
+  client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
+  client.agentPlugins.list = () =>
+    Promise.resolve({
+      success: true,
+      data: installed
+        ? [
+            {
+              ...entry,
+              managed: true,
+              present: true,
+              location: preview.targetPath,
+              skillCount: 2,
+              mcpServerCount: 1,
+              importedSkillCount: entry.importedComponents?.skills.length ?? 2,
+              importedMcpServerCount: entry.importedComponents?.mcpServers.length ?? 1,
+            },
+          ]
+        : [],
+    });
+  client.agentPlugins.getComponents = () =>
+    Promise.resolve({
+      success: true,
+      data: {
+        ...preview,
+        contentHash: "fixture-content-hash",
+        importedComponents: entry.importedComponents,
+      },
+    });
+  client.agentPlugins.install = (input) => {
+    installed = true;
+    entry = { ...entry, importedComponents: input.importedComponents ?? undefined };
+    return Promise.resolve({ success: true, data: entry });
+  };
+  client.agentPlugins.setComponents = (input) => {
+    if (conflict) {
+      conflict = false;
+      entry = { ...entry, importedComponents: { skills: ["review"], mcpServers: ["reference"] } };
+      return Promise.resolve({ success: false, error: "Selection changed in another window" });
+    }
+    entry = { ...entry, importedComponents: input.importedComponents };
+    return Promise.resolve({ success: true, data: entry });
+  };
+  return client;
+}
+
+async function openPlugins(canvasElement: HTMLElement) {
+  const canvas = within(await openSettingsDialog(canvasElement));
+  await userEvent.click(await canvas.findByRole("button", { name: "Plugins" }));
+  return canvas;
+}
+
+async function checkPhoneBounds() {
+  // CI's test-runner ignores viewport globals; only check narrow bounds when actually pinned.
+  if (window.innerWidth >= 768) return;
+  await waitFor(() =>
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth)
+  );
+  for (const group of within(getSettingsDialog()).getAllByRole("group")) {
+    await expect(group.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+  }
+}
+
+export const PreviewDesktop: AppStory = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["desktop"] } } },
+  render: () => <AppWithMocks setup={setupPluginSettings} />,
+  play: async ({ canvasElement }) => {
+    const canvas = await openPlugins(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Add plugin" }));
+    await userEvent.type(canvas.getByLabelText("Git URL or owner/repo"), "example/review-tools");
+    await userEvent.click(canvas.getByRole("button", { name: "Preview" }));
+    for (const label of ["Skills", "MCP servers"]) {
+      const group = within(await canvas.findByRole("group", { name: label }));
+      await userEvent.click(group.getByRole("button", { name: "Clear" }));
+      for (const checkbox of group.getAllByRole("checkbox"))
+        await expect(checkbox).not.toBeChecked();
+    }
+    await expect(canvas.getByRole("button", { name: "Install" })).toBeEnabled();
+    await checkPhoneBounds();
+    canvas.getByRole("group", { name: "Skills" }).scrollIntoView({ block: "start" });
+  },
+};
+
+export const PreviewPhone: AppStory = {
+  ...PreviewDesktop,
+  play: async (context) => {
+    await expect(context.parameters.pixel.matrix.viewports).toContain("phone");
+    await PreviewDesktop.play?.(context);
+  },
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+};
+
+export const ManageComponentsDesktop: AppStory = {
+  ...PreviewDesktop,
+  render: () => <AppWithMocks setup={() => setupPluginSettings(true)} />,
+  play: async ({ canvasElement }) => {
+    const canvas = await openPlugins(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Manage components for review-tools" })
+    );
+    await expect(await canvas.findByRole("checkbox", { name: "review" })).toBeEnabled();
+    await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    await userEvent.click(canvas.getByRole("checkbox", { name: "review" }));
+    await userEvent.click(canvas.getByRole("checkbox", { name: "research" }));
+    await userEvent.click(canvas.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(canvas.getByRole("button", { name: "Done" })).toBeEnabled());
+    await expect(canvas.getByRole("checkbox", { name: "review" })).not.toBeChecked();
+    await expect(canvas.getByRole("checkbox", { name: "research" })).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Done" }));
+    await userEvent.click(
+      canvas.getByRole("button", { name: "Manage components for review-tools" })
+    );
+    await expect(await canvas.findByRole("checkbox", { name: "review" })).not.toBeChecked();
+    await expect(canvas.getByRole("checkbox", { name: "research" })).toBeChecked();
+    await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    await checkPhoneBounds();
+  },
+};
+
+export const ManageComponentsPhone: AppStory = {
+  ...ManageComponentsDesktop,
+  play: async (context) => {
+    await expect(context.parameters.pixel.matrix.viewports).toContain("phone");
+    await ManageComponentsDesktop.play?.(context);
+  },
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+};
+
+export const EmptySelection: AppStory = {
+  ...ManageComponentsDesktop,
+  play: async ({ canvasElement }) => {
+    const canvas = await openPlugins(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Manage components for review-tools" })
+    );
+    const group = within(await canvas.findByRole("group", { name: "Skills" }));
+    await userEvent.click(group.getByRole("button", { name: "Clear" }));
+    await expect(canvas.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    await userEvent.click(canvas.getByRole("button", { name: "Save changes" }));
+    await canvas.findByText(/0 of 2 skills imported/);
+    await waitFor(() => expect(canvas.getByRole("button", { name: "Done" })).toBeEnabled());
+    for (const checkbox of canvas.getAllByRole("checkbox"))
+      await expect(checkbox).not.toBeChecked();
+    await expect(
+      canvas.getByRole("button", { name: "Manage components for review-tools" })
+    ).toBeEnabled();
+    await checkPhoneBounds();
+  },
+};
+
+export const SelectionConflict: AppStory = {
+  ...ManageComponentsDesktop,
+  render: () => <AppWithMocks setup={() => setupPluginSettings(true, true)} />,
+  play: async ({ canvasElement }) => {
+    const canvas = await openPlugins(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Manage components for review-tools" })
+    );
+    await userEvent.click(await canvas.findByRole("checkbox", { name: "research" }));
+    await userEvent.click(canvas.getByRole("button", { name: "Save changes" }));
+    await canvas.findByRole("alert");
+    await waitFor(() => expect(canvas.getByRole("checkbox", { name: "reference" })).toBeChecked());
+    await expect(canvas.getByRole("checkbox", { name: "research" })).not.toBeChecked();
+    await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    await userEvent.click(canvas.getByRole("checkbox", { name: "research" }));
+    await userEvent.click(canvas.getByRole("button", { name: "Save changes" }));
+    await canvas.findByText(/2 of 2 skills imported/);
+    await waitFor(() => expect(canvas.getByRole("button", { name: "Done" })).toBeEnabled());
+    await expect(canvas.queryByRole("alert")).not.toBeInTheDocument();
+    await checkPhoneBounds();
+  },
+};

@@ -7,18 +7,7 @@ const ALWAYS_ENABLED_AGENT_IDS = new Set<AgentId>(["exec", "plan", "compact", "m
 
 export function isAgentDisabledByFrontmatter(frontmatter: AgentDefinitionFrontmatter): boolean {
   assert(frontmatter, "isAgentDisabledByFrontmatter: frontmatter is required");
-
-  // `disabled` is the new top-level field.
-  // When both are set, disabled takes precedence over ui.disabled.
-  if (typeof frontmatter.disabled === "boolean") {
-    return frontmatter.disabled;
-  }
-
-  if (typeof frontmatter.ui?.disabled === "boolean") {
-    return frontmatter.ui.disabled;
-  }
-
-  return false;
+  return frontmatter.disabled === true;
 }
 
 export function resolveAgentEnabledOverride(

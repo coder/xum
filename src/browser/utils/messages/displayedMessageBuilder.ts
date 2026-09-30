@@ -1,17 +1,26 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
+  BashMonitorWakeDisplayRecord,
   CompactionRequestData,
   DisplayedMessage,
   InlineSkillSnapshotMap,
   MuxFilePart,
   MuxMessage,
+  MuxMessageMetadata,
 } from "@/common/types/message";
-import { getCompactionFollowUpContent } from "@/common/types/message";
-import type { StreamErrorType } from "@/common/types/errors";
-import type { ImageEditToolResult, ImageGenerateToolResult } from "@/common/types/tools";
 import {
-  ImageEditToolResultSchema,
-  ImageGenerateToolResultSchema,
-} from "@/common/utils/tools/toolDefinitions";
+  getCompactionFollowUpContent,
+  isRolloverBoundary,
+  sanitizeAgentSkillRefs,
+  sanitizeMcpPromptRefs,
+} from "@/common/types/message";
+import type { StreamErrorType } from "@/common/types/errors";
+import {
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
+  parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -20,96 +29,10 @@ import {
   CONTEXT_BOUNDARY_KINDS,
   getContextBoundaryKind,
 } from "@/common/utils/messages/compactionBoundary";
+import { isPlainObject } from "@/common/utils/isPlainObject";
+import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
-import {
-  isSideQuestionAnswerMessage,
-  isSideQuestionUserMessage,
-} from "@/common/utils/messages/sideQuestion";
-
-function isSuccessfulImageGenerateResult(
-  result: unknown
-): result is Extract<ImageGenerateToolResult, { success: true }> {
-  const parsed = ImageGenerateToolResultSchema.safeParse(result);
-  return parsed.success && parsed.data.success;
-}
-
-function isSuccessfulImageEditResult(
-  result: unknown
-): result is Extract<ImageEditToolResult, { success: true }> {
-  const parsed = ImageEditToolResultSchema.safeParse(result);
-  return parsed.success && parsed.data.success;
-}
-
-function hasVisibleHookOutput(result: unknown): boolean {
-  if (typeof result !== "object" || result === null || Array.isArray(result)) {
-    return false;
-  }
-  const hookOutput = (result as Record<string, unknown>).hook_output;
-  return typeof hookOutput === "string" && hookOutput.length > 0;
-}
-
-function appendGeneratedImageMessage(
-  displayedMessages: DisplayedMessage[],
-  options: {
-    id: string;
-    historyId: string;
-    toolCallId: string;
-    output: Extract<ImageGenerateToolResult, { success: true }>;
-    isPartial: boolean;
-    historySequence: number;
-    streamSequence: number;
-    isLastPartOfMessage: boolean;
-    timestamp?: number;
-  }
-): void {
-  displayedMessages.push({
-    type: "generated-image",
-    id: options.id,
-    historyId: options.historyId,
-    toolCallId: options.toolCallId,
-    prompt: options.output.prompt,
-    model: options.output.model,
-    images: options.output.images,
-    warnings: options.output.warnings,
-    isPartial: options.isPartial,
-    historySequence: options.historySequence,
-    streamSequence: options.streamSequence,
-    isLastPartOfMessage: options.isLastPartOfMessage,
-    timestamp: options.timestamp,
-  });
-}
-
-function appendEditedImageMessage(
-  displayedMessages: DisplayedMessage[],
-  options: {
-    id: string;
-    historyId: string;
-    toolCallId: string;
-    output: Extract<ImageEditToolResult, { success: true }>;
-    isPartial: boolean;
-    historySequence: number;
-    streamSequence: number;
-    isLastPartOfMessage: boolean;
-    timestamp?: number;
-  }
-): void {
-  displayedMessages.push({
-    type: "edited-image",
-    id: options.id,
-    historyId: options.historyId,
-    toolCallId: options.toolCallId,
-    prompt: options.output.prompt,
-    model: options.output.model,
-    source: options.output.source,
-    images: options.output.images,
-    warnings: options.output.warnings,
-    isPartial: options.isPartial,
-    historySequence: options.historySequence,
-    streamSequence: options.streamSequence,
-    isLastPartOfMessage: options.isLastPartOfMessage,
-    timestamp: options.timestamp,
-  });
-}
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -248,9 +171,15 @@ function createCompactionBoundaryRow(
     type: "compaction-boundary",
     id: `${message.id}-compaction-boundary`,
     historySequence,
+    timestamp: message.metadata?.timestamp,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
+    contextWindowRollover: isRolloverBoundary(message) ? true : undefined,
     compactionEpoch,
+    ...(message.metadata?.muxMetadata?.type === "compaction-summary" &&
+    message.metadata.muxMetadata.strategy === "continuous"
+      ? { strategy: "continuous" }
+      : {}),
   };
 }
 
@@ -287,6 +216,117 @@ function buildPlanDisplayMessages(
   ];
 }
 
+/**
+ * muxMetadata is a black box across the oRPC boundary, so a corrupted
+ * chat.jsonl can persist `type: "bash-monitor-wake"` with missing/mistyped
+ * records. Validate the shape here and fall back to the normal full-text user
+ * message rendering (return undefined) so one malformed line can't brick the
+ * transcript (see AGENTS.md self-healing rule).
+ */
+function getValidBashMonitorWakeRecords(
+  muxMeta: MuxMessageMetadata | undefined
+): BashMonitorWakeDisplayRecord[] | undefined {
+  if (muxMeta?.type !== "bash-monitor-wake") return undefined;
+  const records: unknown = muxMeta.records;
+  if (!Array.isArray(records) || records.length === 0) return undefined;
+  const isValidRecord = (record: unknown): record is BashMonitorWakeDisplayRecord =>
+    isPlainObject(record) &&
+    (record.kind === "match" || record.kind === "monitor-lost") &&
+    typeof record.displayName === "string" &&
+    typeof record.filter === "string" &&
+    typeof record.filterExclude === "boolean";
+  if (!records.every(isValidRecord)) return undefined;
+  // Self-healing for the optional settlement fields: an invalid terminal or staleTerminal shape
+  // drops that field, not the record, so the wake still renders with its base summary.
+  const isValidTerminal = (
+    terminal: unknown
+  ): terminal is NonNullable<BashMonitorWakeDisplayRecord["terminal"]> =>
+    isPlainObject(terminal) &&
+    (terminal.status === "exited" ||
+      terminal.status === "killed" ||
+      terminal.status === "failed" ||
+      terminal.status === "unknown") &&
+    (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
+  return records.map((record) => {
+    const terminalValid = record.terminal === undefined || isValidTerminal(record.terminal);
+    const staleValid = record.staleTerminal === undefined || isValidTerminal(record.staleTerminal);
+    if (terminalValid && staleValid) return record;
+    const { terminal, staleTerminal, ...rest } = record;
+    return {
+      ...rest,
+      ...(terminalValid && terminal !== undefined ? { terminal } : {}),
+      ...(staleValid && staleTerminal !== undefined ? { staleTerminal } : {}),
+    };
+  });
+}
+
+/**
+ * Same self-healing contract as getValidBashMonitorWakeRecords: peer metadata is persisted
+ * black-box data, so a corrupted row (e.g. object-valued fromTitle rendered as a React child)
+ * must fall back to normal user-message rendering instead of bricking the transcript.
+ *
+ * Authenticity mirrors the provider sanitizer: the row must carry synthetic provenance and its
+ * text must be a well-formed envelope whose sender fields MATCH the metadata. A partially
+ * corrupted row (valid-looking metadata on ordinary model output, or a metadata/envelope sender
+ * mismatch) renders as an ordinary assistant message instead of collapsing under another
+ * sender's attribution.
+ */
+function getValidAgentPeerMessage(
+  message: { metadata?: { muxMetadata?: MuxMessageMetadata; synthetic?: boolean } },
+  partText: string
+): NonNullable<Extract<DisplayedMessage, { type: "assistant" }>["agentPeerMessage"]> | undefined {
+  const meta = getValidAgentPeerMessageMeta(message.metadata?.muxMetadata);
+  if (meta == null || message.metadata?.synthetic !== true) {
+    return undefined;
+  }
+  const parsed = parseAgentMessageEnvelope(partText);
+  if (
+    parsed == null ||
+    parsed.from !== meta.fromWorkspaceId ||
+    parsed.relationship !== meta.relationship ||
+    parsed.fromTitle !== meta.fromTitle
+  ) {
+    return undefined;
+  }
+  return meta;
+}
+
+/**
+ * Validated attribution of a peer-message wake trigger row, or null. SECURITY/self-healing:
+ * requires synthetic provenance AND validated attribution — a corrupted human user row wearing
+ * peer metadata must keep ordinary rendering, not be disguised as (or folded into) a machine
+ * notification. When the recipient is executing a delegated workspace turn, the trigger carries
+ * that turn's correlation metadata with the attribution nested on it.
+ */
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
+  const muxMeta = message.metadata.muxMetadata;
+  if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
+  if (muxMeta?.type === "workspace-turn-task") {
+    return getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger);
+  }
+  return null;
+}
+
+function getRawCommand(muxMetadata: unknown): string | undefined {
+  if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
+    return undefined;
+  }
+
+  // Unknown persisted metadata must render as an ordinary row rather than
+  // inheriting command-specific display behavior from a coincidental field.
+  switch (muxMetadata.type) {
+    case "compaction-request":
+    case "agent-skill":
+    case "normal":
+    case "workflow-trigger-display":
+    case "workflow-result":
+      return typeof muxMetadata.rawCommand === "string" ? muxMetadata.rawCommand : undefined;
+    default:
+      return undefined;
+  }
+}
+
 function buildUserDisplayedMessages(options: {
   message: MuxMessage;
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
@@ -298,6 +338,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -307,15 +348,29 @@ function buildUserDisplayedMessages(options: {
       filename: p.filename,
     }));
 
-  let rawCommand = muxMeta && "rawCommand" in muxMeta ? muxMeta.rawCommand : undefined;
+  let rawCommand = getRawCommand(muxMeta);
+  const sanitizedMcpPromptRefs = sanitizeMcpPromptRefs(muxMeta?.mcpPromptRefs);
+  const mcpPromptRefs = sanitizedMcpPromptRefs.length > 0 ? sanitizedMcpPromptRefs : undefined;
+  const sanitizedAgentSkillRefs = sanitizeAgentSkillRefs(muxMeta?.agentSkillRefs);
+  const agentSkillRefs = sanitizedAgentSkillRefs.length > 0 ? sanitizedAgentSkillRefs : undefined;
+  const slashMcpPromptRef = mcpPromptRefs?.find((ref) => ref.source === "slash");
   const agentSkill =
     muxMeta?.type === "agent-skill"
       ? {
           skillName: muxMeta.skillName,
           scope: muxMeta.scope,
+          arguments: muxMeta.arguments,
           snapshot: agentSkillSnapshot,
         }
-      : undefined;
+      : slashMcpPromptRef
+        ? {
+            skillName: slashMcpPromptRef.commandKey,
+            scope: "built-in" as const,
+            snapshot: agentSkillSnapshot,
+          }
+        : undefined;
+
+  const bashMonitorWakeRecords = getValidBashMonitorWakeRecords(muxMeta);
 
   const compactionFollowUp = getCompactionFollowUpContent(muxMeta);
   const compactionRequest =
@@ -347,14 +402,45 @@ function buildUserDisplayedMessages(options: {
       fileParts: fileParts.length > 0 ? fileParts : undefined,
       historySequence,
       isSynthetic: message.metadata?.synthetic === true ? true : undefined,
+      isUiVisible: message.metadata?.uiVisible === true ? true : undefined,
+      contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
+      isPlanReviewFeedback:
+        getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
+      mcpPromptRefs,
+      agentSkillRefs,
       inlineSkillSnapshots,
       compactionRequest,
       reviews: muxMeta?.reviews,
-      isSideQuestion: isSideQuestionUserMessage(message) ? true : undefined,
+      bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
+      contextBudgetWarning:
+        message.metadata?.synthetic === true &&
+        muxMeta?.type === "context-budget-warning" &&
+        Number.isFinite(muxMeta.contextTokens) &&
+        muxMeta.contextTokens >= 0 &&
+        Number.isFinite(muxMeta.maxTokens) &&
+        muxMeta.maxTokens > 0
+          ? {
+              contextTokens: muxMeta.contextTokens,
+              maxTokens: muxMeta.maxTokens,
+              final: muxMeta.final === true,
+              handoff: muxMeta.handoff === true,
+            }
+          : undefined,
+      // The peer-message wake trigger is a synthetic machine row: mark it so prompt
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
+          : undefined,
     },
   ];
 }
@@ -396,7 +482,6 @@ function appendReasoningRow(
     part: Extract<MuxMessage["parts"][number], { type: "reasoning" }>;
     partIndex: number;
     historySequence: number;
-    streamSequence: number;
     isStreaming: boolean;
     isPartial: boolean;
     isLastPartOfMessage: boolean;
@@ -411,7 +496,6 @@ function appendReasoningRow(
     historyId: options.message.id,
     content: options.part.text,
     historySequence: options.historySequence,
-    streamSequence: options.streamSequence,
     isStreaming: options.isStreaming,
     isPartial: options.isPartial,
     isLastPartOfMessage: options.isLastPartOfMessage,
@@ -430,7 +514,6 @@ function appendAssistantTextRow(
     part: Extract<MuxMessage["parts"][number], { type: "text" }>;
     partIndex: number;
     historySequence: number;
-    streamSequence: number;
     isStreaming: boolean;
     isPartial: boolean;
     isLastPartOfMessage: boolean;
@@ -445,26 +528,29 @@ function appendAssistantTextRow(
     historyId: message.id,
     content: getGoalClearedSummaryDisplayText(part.text, message.metadata?.muxMetadata),
     historySequence: options.historySequence,
-    streamSequence: options.streamSequence,
     isStreaming: options.isStreaming,
     isPartial: options.isPartial,
     isLastPartOfMessage: options.isLastPartOfMessage,
     // Support both new enum ("user"|"idle") and legacy boolean (true).
     isCompacted: !!message.metadata?.compacted,
     isIdleCompacted: message.metadata?.compacted === "idle",
-    isSideAnswer: isSideQuestionAnswerMessage(message) ? true : undefined,
     model: message.metadata?.model,
     routedThroughGateway: message.metadata?.routedThroughGateway,
     routeProvider: resolveRouteProvider(
       message.metadata?.routeProvider,
       message.metadata?.routedThroughGateway
     ),
+    modelFallback: message.metadata?.modelFallback,
+    autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
     agentId: message.metadata?.agentId ?? message.metadata?.mode,
     timestamp: part.timestamp ?? options.baseTimestamp,
     streamPresentation: options.isStreaming
       ? { source: options.streamIsReplay ? "replay" : "live" }
       : undefined,
+    // Backend-attached metadata (never model-authored text) gates the peer-message card, so a
+    // model-emitted lookalike envelope still renders as an ordinary assistant message.
+    agentPeerMessage: getValidAgentPeerMessage(message, part.text),
   });
 }
 
@@ -511,13 +597,37 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       continue;
     }
 
+    const output =
+      record.result ??
+      (typeof record.error === "string"
+        ? // success:false matches the failure shape tool cards and
+          // isFailedToolOutput already understand, so the error stays
+          // visible (e.g. bash's ErrorBox) after reload.
+          { success: false, error: record.error }
+        : undefined);
+    // RLM kernel-mode compact record (r12): the full nested result never
+    // persists in the tool output, so degraded detail after reload is expected
+    // (live streaming keeps full detail via part.nestedCalls, which takes
+    // precedence). Failure travels out-of-band via `failed` instead of a
+    // synthetic output shape, so a real tool result can never be mistaken
+    // for a reconstruction stand-in.
+    const kernelFailure = output === undefined && record.ok === false;
+
     nestedCalls.push({
       toolCallId: `${part.toolCallId}-nested-${idx}`,
       toolName: record.toolName,
       input: record.args,
-      output:
-        record.result ?? (typeof record.error === "string" ? { error: record.error } : undefined),
-      state: "output-available",
+      output,
+      ...(kernelFailure ? { failed: true } : {}),
+      // Compaction deliberately omits results. Reuse the neutral redacted state
+      // instead of making communication cards report a missing-result failure.
+      // ok:true only means the tool ran, not that a message was delivered.
+      state:
+        output === undefined &&
+        typeof record.ok === "boolean" &&
+        (record.toolName === "task_send_message" || record.toolName === "agent_report")
+          ? "output-redacted"
+          : "output-available",
       timestamp: part.timestamp,
     });
   }
@@ -527,112 +637,6 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
 
 function getNestedCallsForDisplay(part: DynamicToolPart): NestedToolCalls | undefined {
   return part.nestedCalls ?? reconstructCodeExecutionNestedCalls(part);
-}
-
-type NestedImageMessage =
-  | {
-      kind: "generated";
-      nestedCall: {
-        toolCallId: string;
-        timestamp?: number;
-        output: Extract<ImageGenerateToolResult, { success: true }>;
-      };
-    }
-  | {
-      kind: "edited";
-      nestedCall: {
-        toolCallId: string;
-        timestamp?: number;
-        output: Extract<ImageEditToolResult, { success: true }>;
-      };
-    };
-
-function collectNestedImageMessages(
-  nestedCalls: NestedToolCalls | undefined
-): NestedImageMessage[] {
-  const nestedImageMessages: NestedImageMessage[] = [];
-  if (!nestedCalls) {
-    return nestedImageMessages;
-  }
-
-  for (const nestedCall of nestedCalls) {
-    if (
-      nestedCall.toolName === "image_generate" &&
-      nestedCall.state === "output-available" &&
-      !hasVisibleHookOutput(nestedCall.output) &&
-      isSuccessfulImageGenerateResult(nestedCall.output)
-    ) {
-      nestedImageMessages.push({
-        kind: "generated",
-        nestedCall: {
-          toolCallId: nestedCall.toolCallId,
-          timestamp: nestedCall.timestamp,
-          output: nestedCall.output,
-        },
-      });
-      continue;
-    }
-    if (
-      nestedCall.toolName === "image_edit" &&
-      nestedCall.state === "output-available" &&
-      !hasVisibleHookOutput(nestedCall.output) &&
-      isSuccessfulImageEditResult(nestedCall.output)
-    ) {
-      nestedImageMessages.push({
-        kind: "edited",
-        nestedCall: {
-          toolCallId: nestedCall.toolCallId,
-          timestamp: nestedCall.timestamp,
-          output: nestedCall.output,
-        },
-      });
-    }
-  }
-
-  return nestedImageMessages;
-}
-
-function appendNestedImageRows(
-  displayedMessages: DisplayedMessage[],
-  options: {
-    message: MuxMessage;
-    part: DynamicToolPart;
-    partIndex: number;
-    nestedImageMessages: NestedImageMessage[];
-    isPartial: boolean;
-    historySequence: number;
-    isLastPartOfMessage: boolean;
-    baseTimestamp?: number;
-    nextStreamSequence: () => number;
-  }
-): void {
-  options.nestedImageMessages.forEach(({ kind, nestedCall }, nestedIndex) => {
-    const isLastNestedImage = nestedIndex === options.nestedImageMessages.length - 1;
-    const common = {
-      historyId: options.message.id,
-      toolCallId: nestedCall.toolCallId,
-      isPartial: options.isPartial,
-      historySequence: options.historySequence,
-      streamSequence: options.nextStreamSequence(),
-      isLastPartOfMessage: options.isLastPartOfMessage && isLastNestedImage,
-      timestamp: nestedCall.timestamp ?? options.part.timestamp ?? options.baseTimestamp,
-    };
-
-    if (kind === "generated") {
-      appendGeneratedImageMessage(displayedMessages, {
-        ...common,
-        id: `${options.message.id}-${options.partIndex}-nested-image-${nestedIndex}`,
-        output: nestedCall.output,
-      });
-      return;
-    }
-
-    appendEditedImageMessage(displayedMessages, {
-      ...common,
-      id: `${options.message.id}-${options.partIndex}-nested-edited-image-${nestedIndex}`,
-      output: nestedCall.output,
-    });
-  });
 }
 
 function appendToolRows(
@@ -645,64 +649,11 @@ function appendToolRows(
     isPartial: boolean;
     isLastPartOfMessage: boolean;
     baseTimestamp?: number;
-    nextStreamSequence: () => number;
   }
 ): void {
   const { message, part } = options;
   const status = getToolDisplayStatus(part, options.isPartial);
   const nestedCalls = getNestedCallsForDisplay(part);
-  const nestedImageMessages = options.isPartial ? [] : collectNestedImageMessages(nestedCalls);
-  const nestedImageMessageIds = new Set(
-    nestedImageMessages.map(({ nestedCall }) => nestedCall.toolCallId)
-  );
-  const nestedCallsForToolRow = nestedCalls?.filter(
-    (nestedCall) => !nestedImageMessageIds.has(nestedCall.toolCallId)
-  );
-
-  if (
-    part.toolName === "image_generate" &&
-    part.state === "output-available" &&
-    status === "completed" &&
-    !options.isPartial &&
-    !hasVisibleHookOutput(part.output) &&
-    isSuccessfulImageGenerateResult(part.output)
-  ) {
-    appendGeneratedImageMessage(displayedMessages, {
-      id: `${message.id}-${options.partIndex}`,
-      historyId: message.id,
-      toolCallId: part.toolCallId,
-      output: part.output,
-      isPartial: options.isPartial,
-      historySequence: options.historySequence,
-      streamSequence: options.nextStreamSequence(),
-      isLastPartOfMessage: options.isLastPartOfMessage,
-      timestamp: part.timestamp ?? options.baseTimestamp,
-    });
-    return;
-  }
-
-  if (
-    part.toolName === "image_edit" &&
-    part.state === "output-available" &&
-    status === "completed" &&
-    !options.isPartial &&
-    !hasVisibleHookOutput(part.output) &&
-    isSuccessfulImageEditResult(part.output)
-  ) {
-    appendEditedImageMessage(displayedMessages, {
-      id: `${message.id}-${options.partIndex}`,
-      historyId: message.id,
-      toolCallId: part.toolCallId,
-      output: part.output,
-      isPartial: options.isPartial,
-      historySequence: options.historySequence,
-      streamSequence: options.nextStreamSequence(),
-      isLastPartOfMessage: options.isLastPartOfMessage,
-      timestamp: part.timestamp ?? options.baseTimestamp,
-    });
-    return;
-  }
-
   displayedMessages.push({
     type: "tool",
     id: `${message.id}-${options.partIndex}`,
@@ -714,16 +665,44 @@ function appendToolRows(
     status,
     isPartial: options.isPartial,
     historySequence: options.historySequence,
-    streamSequence: options.nextStreamSequence(),
-    isLastPartOfMessage: options.isLastPartOfMessage && nestedImageMessages.length === 0,
+    isLastPartOfMessage: options.isLastPartOfMessage,
+    ...(part.workflowRun != null ? { workflowRun: part.workflowRun } : {}),
+    ...(part.mcpServer != null ? { mcpServer: part.mcpServer } : {}),
     timestamp: part.timestamp ?? options.baseTimestamp,
-    nestedCalls: nestedCallsForToolRow,
+    ...(part.executionStartedAt != null ? { executionStartedAt: part.executionStartedAt } : {}),
+    nestedCalls,
   });
+}
 
-  appendNestedImageRows(displayedMessages, {
-    ...options,
-    nestedImageMessages,
-  });
+function getNestedString(value: unknown, path: string[]): string | undefined {
+  let current = value;
+  for (const segment of path) {
+    if (!isPlainObject(current)) {
+      return undefined;
+    }
+    current = current[segment];
+  }
+
+  return typeof current === "string" ? current : undefined;
+}
+
+// @ai-sdk/anthropic >=3.0.82 maps refusal stop details to this providerMetadata
+// shape; older persisted turns simply omit it and fall back to the generic row.
+function getProviderRefusalExplanation(message: MuxMessage): string | undefined {
+  return getNestedString(message.metadata?.providerMetadata, [
+    "anthropic",
+    "stopDetails",
+    "explanation",
+  ]);
+}
+
+function buildRefusalFinishMessage(message: MuxMessage): string {
+  const finishReason = message.metadata?.finishReason ?? "content-filter";
+  const explanation = getProviderRefusalExplanation(message);
+  const base =
+    `The provider refused to continue this response (finishReason: ${finishReason}). ` +
+    "This legacy turn may end abruptly because the older backend treated the refusal as complete.";
+  return explanation ? `${base}\n\n${explanation}` : base;
 }
 
 function appendStreamErrorRows(
@@ -773,6 +752,13 @@ function appendStreamErrorRows(
       "max_output_tokens"
     );
   }
+
+  // Legacy/self-healing path: older backends finalized partial refusals as a
+  // clean stream-end with finishReason=content-filter. Surface that explicitly
+  // so a refused turn never looks like the assistant simply stopped.
+  if (!options.hasActiveStream && isRefusalFinishReason(options.message.metadata?.finishReason)) {
+    pushStreamErrorRow("refusal", buildRefusalFinishMessage(options.message), "model_refusal");
+  }
 }
 
 function buildAssistantDisplayedMessages(options: {
@@ -795,8 +781,6 @@ function buildAssistantDisplayedMessages(options: {
   const isPartial = message.metadata?.partial === true;
   const mergedParts = mergeAdjacentParts(message.parts);
   const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(mergedParts);
-  let streamSeq = 0;
-  const nextStreamSequence = (): number => streamSeq++;
 
   if (isContextBoundaryMessage(message)) {
     displayedMessages.push(createCompactionBoundaryRow(message, historySequence));
@@ -812,7 +796,6 @@ function buildAssistantDisplayedMessages(options: {
         part,
         partIndex,
         historySequence,
-        streamSequence: nextStreamSequence(),
         isStreaming,
         isPartial,
         isLastPartOfMessage: isLastPart,
@@ -829,7 +812,6 @@ function buildAssistantDisplayedMessages(options: {
         part,
         partIndex,
         historySequence,
-        streamSequence: nextStreamSequence(),
         isStreaming,
         isPartial,
         isLastPartOfMessage: isLastPart,
@@ -848,7 +830,6 @@ function buildAssistantDisplayedMessages(options: {
         isPartial,
         isLastPartOfMessage: isLastPart,
         baseTimestamp,
-        nextStreamSequence,
       });
     }
   });
@@ -866,7 +847,8 @@ function buildAssistantDisplayedMessages(options: {
 export function buildDisplayedMessagesForMessage(
   options: BuildDisplayedMessagesForMessageOptions
 ): DisplayedMessage[] {
-  const { message, agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const { agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const message = restoreContextBudgetRejectedMessageForDisplay(options.message);
   const baseTimestamp = message.metadata?.timestamp;
   const historySequence = message.metadata?.historySequence ?? 0;
   const planRows = buildPlanDisplayMessages(message, historySequence);

@@ -1,66 +1,49 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { GlobalWindow } from "happy-dom";
-import * as APIModule from "@/browser/contexts/API";
-import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { HeartbeatFormSettings } from "./useWorkspaceHeartbeat";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type React from "react";
 
-interface HeartbeatApi {
-  workspace: {
-    heartbeat: {
-      get: (input: { workspaceId: string }) => Promise<HeartbeatFormSettings | null>;
-      set: (input: { workspaceId: string } & HeartbeatFormSettings) => Promise<{
-        success: boolean;
-        error?: string;
-      }>;
-    };
-  };
-  config: {
-    getConfig: () => Promise<{
-      heartbeatDefaultIntervalMs?: number;
-      heartbeatDefaultPrompt?: string;
-    }>;
-  };
-}
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import {
+  WorkspaceContext,
+  type WorkspaceContext as WorkspaceContextValue,
+} from "@/browser/contexts/WorkspaceContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import { Ok } from "@/common/types/result";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { installDom } from "../../../tests/ui/dom";
+import { useWorkspaceHeartbeat, type HeartbeatFormSettings } from "./useWorkspaceHeartbeat";
 
 const TEST_WORKSPACE_ID = "workspace-1";
 
 type WorkspaceMetadataMap = Map<string, FrontendWorkspaceMetadata>;
 type WorkspaceMetadataUpdater = (prev: WorkspaceMetadataMap) => WorkspaceMetadataMap;
 
-let apiMock: HeartbeatApi | null = null;
 let capturedWorkspaceMetadataUpdate: WorkspaceMetadataUpdater | null = null;
 const setWorkspaceMetadataMock = mock((update: WorkspaceMetadataUpdater) => {
   capturedWorkspaceMetadataUpdate = update;
 });
 
-const actualAPIModule = { ...APIModule };
-const actualWorkspaceContextModule = { ...WorkspaceContextModule };
-
-// Keep module mocks inside test hooks: Bun loads test files before afterAll runs, so
-// file-scope mock.module() calls can pollute unrelated files during collection.
-async function installWorkspaceHeartbeatModuleMocks() {
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => ({ api: apiMock }),
-  }));
-  await mock.module("@/browser/contexts/WorkspaceContext", () => ({
-    ...actualWorkspaceContextModule,
-    useWorkspaceActions: () => ({
+// Use real providers instead of mock.module(): Bun runs test files in one process, so
+// module-level API/context mocks can leak into unrelated hook tests.
+function createWrapper(api: TestApiOverrides<APIClient>): React.FC<{ children: React.ReactNode }> {
+  return function Wrapper(props) {
+    const workspaceContext = {
+      workspaceMetadata: new Map<string, FrontendWorkspaceMetadata>(),
+      loading: false,
+      loaded: true,
+      loadError: null,
       setWorkspaceMetadata: setWorkspaceMetadataMock,
-    }),
-  }));
-}
+    } as unknown as WorkspaceContextValue;
 
-async function restoreWorkspaceHeartbeatModuleMocks() {
-  // Bun 1.3.6's mock.module() has no disposer, and mock.restore() does not undo
-  // module mocks. Restore the real exports so these stubs do not leak into later files.
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
-  await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
+    return (
+      <APIProvider client={createTestApiClient(api)}>
+        <WorkspaceContext.Provider value={workspaceContext}>
+          {props.children}
+        </WorkspaceContext.Provider>
+      </APIProvider>
+    );
+  };
 }
-
-import { useWorkspaceHeartbeat } from "./useWorkspaceHeartbeat";
 
 function createMetadata(
   overrides: Partial<FrontendWorkspaceMetadata> = {}
@@ -96,36 +79,24 @@ function applyCapturedMetadataUpdate(
 }
 
 describe("useWorkspaceHeartbeat", () => {
-  let originalWindow: typeof globalThis.window;
-  let originalDocument: typeof globalThis.document;
+  let cleanupDom: (() => void) | null = null;
 
-  afterAll(async () => {
-    await restoreWorkspaceHeartbeatModuleMocks();
-  });
-
-  beforeEach(async () => {
-    originalWindow = globalThis.window;
-    originalDocument = globalThis.document;
-    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.document = globalThis.window.document;
-    await installWorkspaceHeartbeatModuleMocks();
+  beforeEach(() => {
+    cleanupDom = installDom();
     capturedWorkspaceMetadataUpdate = null;
     setWorkspaceMetadataMock.mockClear();
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
-    await restoreWorkspaceHeartbeatModuleMocks();
-    mock.restore();
-    apiMock = null;
     capturedWorkspaceMetadataUpdate = null;
-    globalThis.window = originalWindow;
-    globalThis.document = originalDocument;
+    cleanupDom?.();
+    cleanupDom = null;
   });
 
   test("optimistically enables heartbeat metadata after a successful save", async () => {
-    const saveHeartbeat = mock(() => Promise.resolve({ success: true }));
-    apiMock = {
+    const saveHeartbeat = mock(() => Promise.resolve(Ok(undefined)));
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(null),
@@ -133,11 +104,13 @@ describe("useWorkspaceHeartbeat", () => {
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 
-    const { result } = renderHook(() => useWorkspaceHeartbeat({ workspaceId: TEST_WORKSPACE_ID }));
+    const { result } = renderHook(() => useWorkspaceHeartbeat({ workspaceId: TEST_WORKSPACE_ID }), {
+      wrapper: createWrapper(api),
+    });
 
     await waitFor(() => {
       expect(result.current.isLoading).toBe(false);
@@ -182,19 +155,21 @@ describe("useWorkspaceHeartbeat", () => {
       contextMode: "compact",
       message: "Keep watching",
     };
-    apiMock = {
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(initialSettings),
-          set: () => Promise.resolve({ success: true }),
+          set: () => Promise.resolve(Ok(undefined)),
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 
-    const { result } = renderHook(() => useWorkspaceHeartbeat({ workspaceId: TEST_WORKSPACE_ID }));
+    const { result } = renderHook(() => useWorkspaceHeartbeat({ workspaceId: TEST_WORKSPACE_ID }), {
+      wrapper: createWrapper(api),
+    });
 
     await waitFor(() => {
       expect(result.current.isLoading).toBe(false);

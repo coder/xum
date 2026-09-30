@@ -36,7 +36,7 @@ fi
 REQUEST_COMMAND="/coder-agents-review"
 # Match both the app slug and GitHub's bot-login form.
 BOT_LOGIN_REGEX="${CODER_AGENTS_REVIEW_BOT_LOGIN_REGEX:-^coder-agents-review(\[bot\])?$}"
-CODER_AGENTS_BOT_APPROVAL_REGEX="^(no (issues|problems)( found)?[.]?|no major issues( found)?[.]?|didn.t find (any )?(major )?(issues|problems)[.]?|review complete(d)?[.]?|zero open findings[.]?|zero open findings across .* (coder-agents-review |review )?complete[.]?|Round [0-9]+[.] zero open findings[.] (coder-agents-review |review )?complete[.]?|Round [0-9]+[.] zero open findings across .* (coder-agents-review |review )?complete[.]?)$"
+CODER_AGENTS_BOT_APPROVAL_REGEX="^(no (issues|problems)( found)?[.]?|no major issues( found)?[.]?|didn.t find (any )?(major )?(issues|problems)[.]?|review complete(d)?[.]?|zero open findings[.]?|zero open findings across .* (coder-agents-review |review )?complete[.]?|Round [0-9]+[.] zero open findings[.] (coder-agents-review |review )?complete[.]?|Round [0-9]+[.] zero open findings across .* (coder-agents-review |review )?complete[.]?|All [0-9]+ findings.*No open findings[.]?|No new code since .*All [0-9]+ findings remain resolved[.].*Nothing to review[.].*)$"
 CODER_AGENTS_BOT_NEGATIVE_BEFORE_APPROVAL_REGEX="^(Round [0-9]+ is blocked|Review failed|Failed to review|Unable to review|Cannot review|Could not review|Review timed out|Request timed out|Review cancelled|Request cancelled)"
 CODER_AGENTS_BOT_PROGRESS_REGEX="^(queued|started|running|in progress|reviewing|will review)[[:space:][:punct:]]*$"
 POLL_INTERVAL_SECS=30

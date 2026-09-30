@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { JSDOM } from "jsdom";
+import { Window } from "happy-dom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import * as net from "node:net";
@@ -14,15 +14,14 @@ import {
 } from "@/common/constants/toolLimits";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
-import {
-  downloadFromMuxMd,
-  getMuxMdAllowedHosts,
-  isMuxMdUrl,
-  parseMuxMdUrl,
-} from "@/common/lib/muxMd";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  isBlockedHostname,
+  isBlockedIpAddress,
+  normalizeHostname,
+} from "@/node/utils/network/blockedTargets";
 
-const USER_AGENT = "Mux/1.0 (https://github.com/coder/mux; web-fetch tool)";
+const USER_AGENT = "Xum/1.0 (https://github.com/coder/mux; web-fetch tool)";
 const WEB_FETCH_MAX_REDIRECTS = 10;
 const WEB_FETCH_RESOLVE_TIMEOUT_SECS = 5;
 const WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS = 1;
@@ -31,23 +30,13 @@ const WEB_FETCH_BLOCKED_TARGET_ERROR =
   "Blocked URL: web_fetch cannot access loopback, private, link-local, or internal network targets";
 const WEB_FETCH_RESOLVE_ERROR = "Failed to fetch URL: Could not resolve host";
 const WEB_FETCH_TIMEOUT_ERROR = "Failed to fetch URL: Operation timed out";
-const WEB_FETCH_BLOCKED_HOSTNAMES = new Set([
-  "localhost",
-  "metadata",
-  "metadata.google.internal",
-  "host.docker.internal",
-  "gateway.docker.internal",
-  "kubernetes.default.svc",
-]);
 
 class WebFetchValidationError extends Error {}
 
 /**
- * Strip <style> and <script> blocks from HTML before JSDOM parsing.
- * JSDOM's CSS parser scans minified CSS character-by-character for line
- * terminators; pages like Google Cloud's pricing ship MB of newline-free
- * CSS that pins the CPU for minutes. Readability only needs DOM structure
- * and visible text, so these blocks are dead weight.
+ * Strip <style> and <script> blocks before happy-dom parsing. Large minified
+ * blocks add substantial parsing work, while Readability only needs DOM
+ * structure and visible text.
  */
 function stripHeavyTags(html: string): string {
   return html
@@ -55,194 +44,30 @@ function stripHeavyTags(html: string): string {
     .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
 }
 
-function normalizeHostname(hostname: string): string {
-  const trimmed = hostname.trim();
-  const withoutBrackets =
-    trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-  return withoutBrackets.replace(/\.$/, "").toLowerCase();
-}
-
-function parseIpv4Octets(address: string): number[] | null {
-  if (net.isIP(address) !== 4) {
-    return null;
-  }
-
-  const octets = address.split(".").map((part) => Number.parseInt(part, 10));
-  if (
-    octets.length !== 4 ||
-    octets.some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)
-  ) {
-    return null;
-  }
-
-  return octets;
-}
-
-function normalizeIpv6Address(address: string): string {
-  let normalized = address.trim().toLowerCase();
-  const zoneIndex = normalized.indexOf("%");
-  if (zoneIndex !== -1) {
-    normalized = normalized.slice(0, zoneIndex);
-  }
-  if (normalized.startsWith("[") && normalized.endsWith("]")) {
-    normalized = normalized.slice(1, -1);
-  }
-  return normalized;
-}
-
-function parseIpv6Segments(address: string): number[] | null {
-  let normalized = normalizeIpv6Address(address);
-  if (net.isIP(normalized) !== 6) {
-    return null;
-  }
-
-  if (normalized.includes(".")) {
-    const lastColonIndex = normalized.lastIndexOf(":");
-    if (lastColonIndex === -1) {
-      return null;
-    }
-
-    const ipv4Octets = parseIpv4Octets(normalized.slice(lastColonIndex + 1));
-    if (!ipv4Octets) {
-      return null;
-    }
-
-    normalized = `${normalized.slice(0, lastColonIndex)}:${((ipv4Octets[0] << 8) | ipv4Octets[1]).toString(16)}:${((ipv4Octets[2] << 8) | ipv4Octets[3]).toString(16)}`;
-  }
-
-  const pieces = normalized.split("::");
-  if (pieces.length > 2) {
-    return null;
-  }
-
-  const head = pieces[0] ? pieces[0].split(":") : [];
-  const tail = pieces.length === 2 && pieces[1] ? pieces[1].split(":") : [];
-  if (pieces.length === 1 && head.length !== 8) {
-    return null;
-  }
-
-  const missingSegmentCount = 8 - head.length - tail.length;
-  if (missingSegmentCount < 0) {
-    return null;
-  }
-
-  const rawSegments =
-    pieces.length === 2
-      ? [...head, ...Array.from({ length: missingSegmentCount }, () => "0"), ...tail]
-      : head;
-  if (rawSegments.length !== 8) {
-    return null;
-  }
-
-  const segments: number[] = [];
-  for (const segment of rawSegments) {
-    if (!/^[0-9a-f]{1,4}$/i.test(segment)) {
-      return null;
-    }
-    segments.push(Number.parseInt(segment, 16));
-  }
-
-  return segments;
-}
-
-// URL parsing canonicalizes dotted IPv4 tails (for example ::127.0.0.1 becomes ::7f00:1),
-// so block checks need to recognize both deprecated IPv4-compatible ::/96 and
-// IPv4-mapped ::ffff:0:0/96 forms from their normalized IPv6 segments.
-function ipv4FromEmbeddedIpv6Segments(segments: number[]): string | null {
-  if (
-    segments.length !== 8 ||
-    !segments.slice(0, 5).every((segment) => segment === 0) ||
-    (segments[5] !== 0 && segments[5] !== 0xffff)
-  ) {
-    return null;
-  }
-
-  return [segments[6] >> 8, segments[6] & 0xff, segments[7] >> 8, segments[7] & 0xff].join(".");
-}
-
-function isBlockedIpv4Address(address: string): boolean {
-  const octets = parseIpv4Octets(address);
-  if (!octets) {
-    return false;
-  }
-
-  const [first, second] = octets;
-  if (first === 0 || first === 10 || first === 127) {
-    return true;
-  }
-  if (first === 100 && second >= 64 && second <= 127) {
-    return true;
-  }
-  if (first === 169 && second === 254) {
-    return true;
-  }
-  if (first === 172 && second >= 16 && second <= 31) {
-    return true;
-  }
-  if (first === 192 && second === 168) {
-    return true;
-  }
-  if (first === 198 && (second === 18 || second === 19)) {
-    return true;
-  }
-  if (first >= 224) {
-    return true;
-  }
-
-  return false;
-}
-
-function isBlockedIpv6Address(address: string): boolean {
-  const segments = parseIpv6Segments(address);
-  if (!segments) {
-    return false;
-  }
-
-  const embeddedIpv4 = ipv4FromEmbeddedIpv6Segments(segments);
-  if (embeddedIpv4) {
-    return isBlockedIpAddress(embeddedIpv4);
-  }
-
-  if (segments.every((segment) => segment === 0)) {
-    return true;
-  }
-  if (segments.slice(0, 7).every((segment) => segment === 0) && segments[7] === 1) {
-    return true;
-  }
-
-  const firstSegment = segments[0];
-  if ((firstSegment & 0xfe00) === 0xfc00) {
-    return true;
-  }
-  if ((firstSegment & 0xffc0) === 0xfe80) {
-    return true;
-  }
-  if ((firstSegment & 0xffc0) === 0xfec0) {
-    return true;
-  }
-  if ((firstSegment & 0xff00) === 0xff00) {
-    return true;
-  }
-
-  return false;
-}
-
-function isBlockedIpAddress(address: string): boolean {
-  return isBlockedIpv4Address(address) || isBlockedIpv6Address(address);
-}
-
-function isBlockedHostname(hostname: string): boolean {
-  const normalized = normalizeHostname(hostname);
-  if (!normalized) {
-    return true;
-  }
-
-  return (
-    WEB_FETCH_BLOCKED_HOSTNAMES.has(normalized) ||
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized.endsWith(".internal")
-  );
+// Exported for web_fetch.bundle.test.ts: the no-subresource-fetch guarantee
+// only reproduces under the node runtime, so it is verified in a node child
+// process rather than in the bun test runner.
+export function parseHtmlDocument(html: string, url: string): Document {
+  // SECURITY: the HTML is untrusted. Parsing must never trigger network
+  // fetches from the Mux backend (subresources like iframes or external
+  // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
+  // JavaScript evaluation is already disabled by default in happy-dom.
+  const window = new Window({
+    url,
+    settings: {
+      disableJavaScriptFileLoading: true,
+      disableCSSFileLoading: true,
+      navigation: {
+        disableMainFrameNavigation: true,
+        disableChildFrameNavigation: true,
+        disableChildPageNavigation: true,
+      },
+    },
+  });
+  window.document.write(html);
+  // happy-dom's Document is structurally DOM-compatible but uses its own type declarations.
+  const document: unknown = window.document;
+  return document as Document;
 }
 
 function assertSupportedWebFetchProtocol(url: URL): void {
@@ -379,7 +204,7 @@ async function resolveHostnameInRuntime(
   );
 
   // Resolve hostnames inside the target runtime so DNS checks match the curl path,
-  // including redirected hosts that may resolve differently from local Mux.
+  // including redirected hosts that may resolve differently from local Xum.
   const result = await runtimeHelpers.execBuffered(
     config.runtime,
     buildResolveHostnameCommand(hostname),
@@ -586,8 +411,8 @@ function tryExtractContent(
   maxBytes: number
 ): { title: string; content: string } | null {
   try {
-    const dom = new JSDOM(stripHeavyTags(body), { url });
-    const reader = new Readability(dom.window.document);
+    const document = parseHtmlDocument(stripHeavyTags(body), url);
+    const reader = new Readability(document);
     const article = reader.parse();
     if (!article?.content) return null;
 
@@ -605,14 +430,6 @@ function tryExtractContent(
   }
 }
 
-function isAllowedMuxMdHost(url: string): boolean {
-  try {
-    return getMuxMdAllowedHosts().includes(new URL(url).host);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Web fetch tool factory for AI assistant
  * Creates a tool that fetches web pages and extracts readable content as markdown
@@ -625,44 +442,6 @@ export const createWebFetchTool: ToolFactory = (config: ToolConfiguration) => {
     inputSchema: TOOL_DEFINITIONS.web_fetch.schema,
     execute: async ({ url }, { abortSignal }): Promise<WebFetchToolResult> => {
       try {
-        // Handle mux.md share links with client-side decryption.
-        // Important: `parseMuxMdUrl` does not validate the host, so we must guard with `isMuxMdUrl`
-        // to avoid treating arbitrary URLs (including those with `#fragment`) as share links.
-        if (isMuxMdUrl(url)) {
-          const muxMdParsed = parseMuxMdUrl(url);
-          if (!muxMdParsed) {
-            return { success: false, error: "Invalid mux.md URL format" };
-          }
-
-          const baseUrl = new URL(url).origin;
-
-          try {
-            const result = await downloadFromMuxMd(muxMdParsed.id, muxMdParsed.key, abortSignal, {
-              baseUrl,
-            });
-            let content = result.content;
-            if (content.length > WEB_FETCH_MAX_OUTPUT_BYTES) {
-              content = content.slice(0, WEB_FETCH_MAX_OUTPUT_BYTES) + "\n\n[Content truncated]";
-            }
-            return {
-              success: true,
-              title: result.fileInfo?.name ?? "Shared Message",
-              content,
-              url,
-              length: content.length,
-            };
-          } catch (err) {
-            return {
-              success: false,
-              error: err instanceof Error ? err.message : "Failed to download from mux.md",
-            };
-          }
-        }
-
-        if (isAllowedMuxMdHost(url)) {
-          return { success: false, error: "Invalid mux.md URL format" };
-        }
-
         const { result, finalUrl } = await executeWebFetchRequest(config, url, abortSignal);
 
         if (result.exitCode !== 0) {
@@ -746,13 +525,12 @@ export const createWebFetchTool: ToolFactory = (config: ToolConfiguration) => {
           };
         }
 
-        // Parse HTML with JSDOM (runs locally in Mux, not over SSH).
-        // Strip <style>/<script> first — JSDOM's CSS parser chokes on MB of
-        // minified CSS and Readability doesn't need either for extraction.
-        const dom = new JSDOM(stripHeavyTags(body), { url: finalUrl });
+        // Parse HTML with happy-dom locally in Xum, not over SSH. Strip heavy
+        // tags first because Readability does not need them for extraction.
+        const document = parseHtmlDocument(stripHeavyTags(body), finalUrl);
 
         // Extract article with Readability
-        const reader = new Readability(dom.window.document);
+        const reader = new Readability(document);
         const article = reader.parse();
 
         if (!article) {

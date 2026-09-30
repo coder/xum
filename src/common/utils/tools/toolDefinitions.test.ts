@@ -1,12 +1,57 @@
-import { RUNTIME_MODE } from "@/common/types/runtime";
+import { z } from "zod";
+import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
-  buildTaskToolDescription,
+  buildTaskToolAgentArgsSchema,
   getAvailableTools,
+  supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
+  TaskRetitleToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
+  TaskWorkspaceLifecycleToolInputSchema,
   TOOL_DEFINITIONS,
+  WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
 
 describe("TOOL_DEFINITIONS", () => {
+  it("only advertises intuition with both recall and memory enabled, never its internal tools", () => {
+    for (const enableMemory of [false, true]) {
+      for (const enableIntuition of [false, true]) {
+        const tools = getAvailableTools("openai:test", { enableMemory, enableIntuition });
+        expect(tools.includes("intuition")).toBe(enableMemory && enableIntuition);
+        expect(tools).not.toContain("memory_read");
+        expect(tools).not.toContain("intuition_report");
+      }
+    }
+  });
+
+  it("bounds intuition cues and confidence reports without requiring evidence for uncertain leads", () => {
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "" }).success).toBe(false);
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "x".repeat(2001) }).success).toBe(
+      false
+    );
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "Relevant task" }).success).toBe(
+      true
+    );
+    const item = {
+      path: "/memories/global/test.md",
+      relevance: 0.5,
+      excerpt: "",
+      why: "Potential lead",
+    };
+    expect(TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [item] }).success).toBe(
+      true
+    );
+    expect(
+      TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [{ ...item, relevance: 1.1 }] })
+        .success
+    ).toBe(false);
+    expect(
+      TOOL_DEFINITIONS.intuition_report.schema.safeParse({
+        items: Array.from({ length: 7 }, () => item),
+      }).success
+    ).toBe(false);
+  });
+
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
     const parsed = TaskToolArgsSchema.safeParse({
       subagent_type: "potato",
@@ -21,6 +66,15 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("requires a nonblank friendly title when retitling a persistent child", () => {
+    expect(
+      TaskRetitleToolArgsSchema.safeParse({ task_id: "child", title: "Reviewer" }).success
+    ).toBe(true);
+    expect(TaskRetitleToolArgsSchema.safeParse({ task_id: "child", title: "   " }).success).toBe(
+      false
+    );
+  });
+
   it("leaves n unset for task tool calls when omitted", () => {
     const parsed = TaskToolArgsSchema.safeParse({
       subagent_type: "explore",
@@ -31,7 +85,6 @@ describe("TOOL_DEFINITIONS", () => {
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.n).toBeUndefined();
-      expect(parsed.data.variants).toBeUndefined();
     }
   });
 
@@ -64,52 +117,160 @@ describe("TOOL_DEFINITIONS", () => {
     ).toBe(false);
   });
 
-  it("accepts variants when the prompt references ${variant}", () => {
+  it("accepts workspace task args without an agent id", () => {
     const parsed = TaskToolArgsSchema.safeParse({
-      subagent_type: "explore",
-      prompt: "Review ${variant} for regressions",
-      title: "Split review",
-      variants: ["frontend", "backend"],
+      kind: "workspace",
+      prompt: "Summarize this repository",
+      title: "Repository summary",
+      run_in_background: true,
     });
 
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.variants).toEqual(["frontend", "backend"]);
+      expect(parsed.data.kind).toBe("workspace");
+      expect(parsed.data.agentId).toBeUndefined();
+      expect(parsed.data.subagent_type).toBeUndefined();
     }
   });
 
-  it("rejects variants when the prompt does not reference ${variant}", () => {
-    expect(
-      TaskToolArgsSchema.safeParse({
-        subagent_type: "explore",
-        prompt: "Review the codebase for regressions",
-        title: "Split review",
-        variants: ["frontend", "backend"],
-      }).success
-    ).toBe(false);
+  it("accepts workspace task args with an agent id", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      agentId: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.agentId).toBe("plan");
+    }
   });
 
-  it("rejects variants when n is also provided", () => {
+  it("still rejects subagent_type for workspace tasks", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      subagent_type: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.path).toEqual(["subagent_type"]);
+    }
+  });
+
+  it("rejects workspace task fanout until workspace handles support it", () => {
     expect(
       TaskToolArgsSchema.safeParse({
-        subagent_type: "explore",
-        prompt: "Review ${variant} for regressions",
-        title: "Split review",
+        kind: "workspace",
+        prompt: "Summarize this repository",
+        title: "Repository summary",
         n: 2,
-        variants: ["frontend", "backend"],
       }).success
     ).toBe(false);
   });
 
-  it("rejects duplicate variants after trimming", () => {
+  it("validates task workspace lifecycle targets and optional nulls", () => {
     expect(
-      TaskToolArgsSchema.safeParse({
-        subagent_type: "explore",
-        prompt: "Review ${variant} for regressions",
-        title: "Split review",
-        variants: ["frontend", " frontend "],
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "archive",
+        targets: [{ taskId: "wst_child" }],
+        interrupt_active: null,
+        force: null,
+        acknowledged_untracked_paths: null,
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "delete_worktree",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "remove",
+        targets: [{ taskId: "wst_child", workspaceId: "child-workspace" }],
       }).success
     ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "archive",
+        targets: [{}],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "destroy",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+  });
+
+  it("restricts live task_workspace_lifecycle input to reversible actions", () => {
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "archive",
+        targets: [{ taskId: "wst_child" }],
+        interrupt_active: null,
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "unarchive",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(true);
+
+    // Irreversible verbs and their escape hatch must not be model-invocable through
+    // this tool; task_remove is the only irreversible verb.
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "delete_worktree",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "remove",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "archive",
+        targets: [{ workspaceId: "child-workspace" }],
+        force: true,
+      }).success
+    ).toBe(false);
+  });
+
+  it("requires workspaceId for existing workspace task targets", () => {
+    expect(
+      TaskToolArgsSchema.safeParse({
+        kind: "workspace",
+        prompt: "Continue in that workspace",
+        title: "Follow-up",
+        workspace: { mode: "existing" },
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskToolArgsSchema.safeParse({
+        kind: "workspace",
+        prompt: "Continue in that workspace",
+        title: "Follow-up",
+        workspace: { mode: "existing", workspaceId: "child-workspace" },
+      }).success
+    ).toBe(true);
   });
 
   it("accepts bash tool calls using command (alias for script)", () => {
@@ -227,6 +388,52 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("validates heartbeat tool configuration bounds", () => {
+    expect(TOOL_DEFINITIONS.heartbeat.schema.safeParse({ action: "get" }).success).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.heartbeat.schema.safeParse({
+        action: "set",
+        enabled: true,
+        intervalMs: 5 * 60 * 1000,
+        contextMode: "compact",
+      }).success
+    ).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.heartbeat.schema.safeParse({
+        action: "set",
+        intervalMs: 60 * 1000,
+      }).success
+    ).toBe(false);
+    expect(
+      TOOL_DEFINITIONS.heartbeat.schema.safeParse({
+        action: "configure",
+      }).success
+    ).toBe(false);
+  });
+
+  it("validates set_goal required and optional fields", () => {
+    const schema = TOOL_DEFINITIONS.set_goal.schema;
+
+    expect(schema.safeParse({ objective: "Ship it" }).success).toBe(true);
+    expect(schema.safeParse({ objective: "" }).success).toBe(false);
+    expect(schema.safeParse({ objective: "   " }).success).toBe(false);
+    expect(schema.safeParse({ objective: "Ship it", budgetCents: 1 }).success).toBe(true);
+    expect(schema.safeParse({ objective: "Ship it", budgetCents: 0 }).success).toBe(false);
+    expect(schema.safeParse({ objective: "Ship it", budgetCents: 1.5 }).success).toBe(false);
+    expect(schema.safeParse({ objective: "Ship it", turnCap: 1 }).success).toBe(true);
+    expect(schema.safeParse({ objective: "Ship it", turnCap: 0 }).success).toBe(false);
+    expect(
+      schema.safeParse({
+        objective: "Ship it",
+        expectedGoalId: "11111111-1111-4111-8111-111111111111",
+      }).success
+    ).toBe(true);
+    expect(schema.safeParse({ objective: "Ship it", expectedGoalId: "not-a-uuid" }).success).toBe(
+      false
+    );
+    expect(schema.safeParse({ objective: "Ship it", workspaceId: "other" }).success).toBe(false);
+  });
+
   it("requires complete_goal summary", () => {
     expect(TOOL_DEFINITIONS.complete_goal.schema.safeParse({}).success).toBe(false);
     expect(TOOL_DEFINITIONS.complete_goal.schema.safeParse({ summary: "Done." }).success).toBe(
@@ -329,43 +536,76 @@ describe("TOOL_DEFINITIONS", () => {
     }
   );
 
-  it("requires advisor_name and accepts an optional question", () => {
-    // Without advisor_name, the model cannot select which advisor to use.
-    expect(TOOL_DEFINITIONS.advisor.schema.safeParse({}).success).toBe(false);
-
-    // advisor_name alone is enough — question is optional.
-    expect(TOOL_DEFINITIONS.advisor.schema.safeParse({ advisor_name: "ml-fellow" }).success).toBe(
-      true
-    );
-    expect(
-      TOOL_DEFINITIONS.advisor.schema.safeParse({ advisor_name: "ml-fellow", question: null })
-        .success
-    ).toBe(true);
+  it("accepts an optional advisor question and encourages passing one", () => {
+    expect(TOOL_DEFINITIONS.advisor.schema.safeParse({}).success).toBe(true);
+    expect(TOOL_DEFINITIONS.advisor.schema.safeParse({ question: null }).success).toBe(true);
 
     const parsed = TOOL_DEFINITIONS.advisor.schema.safeParse({
-      advisor_name: "ml-fellow",
       question: "Should we split this refactor into smaller commits?",
     });
+
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.advisor_name).toBe("ml-fellow");
       expect(parsed.data.question).toBe("Should we split this refactor into smaller commits?");
     }
-
-    // Bad name (uppercase, underscores) must be rejected so the on-disk loader
-    // and the tool input stay in sync.
-    expect(TOOL_DEFINITIONS.advisor.schema.safeParse({ advisor_name: "Bad_Name" }).success).toBe(
-      false
-    );
   });
 
-  it("dispatches task tool description on runtime mode", () => {
-    // Different runtimes give the agent different visibility guidance for whether
-    // sub-agents see uncommitted parent changes, so the function must actually
-    // branch on runtimeMode rather than collapse to a single string.
-    expect(buildTaskToolDescription(RUNTIME_MODE.LOCAL)).not.toBe(
-      buildTaskToolDescription(RUNTIME_MODE.WORKTREE)
-    );
+  it("accepts workspace turn queue dispatch mode", () => {
+    const parsed = TOOL_DEFINITIONS.task.schema.safeParse({
+      kind: "workspace",
+      prompt: "follow up",
+      title: "Follow-up",
+      run_in_background: true,
+      workspace: {
+        mode: "existing",
+        workspaceId: "child-workspace",
+        queueDispatchMode: "turn-end",
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.workspace?.queueDispatchMode).toBe("turn-end");
+    }
+
+    expect(
+      TOOL_DEFINITIONS.task.schema.safeParse({
+        kind: "workspace",
+        prompt: "follow up",
+        title: "Follow-up",
+        workspace: {
+          mode: "existing",
+          workspaceId: "child-workspace",
+          queueDispatchMode: "after-breakfast",
+        },
+      }).success
+    ).toBe(false);
+  });
+
+  it("accepts sub-agent guidance dispatch modes and rejects blank guidance", () => {
+    expect(
+      TOOL_DEFINITIONS.task_send_message.schema.safeParse({
+        task_id: "child-task",
+        message: "Use the latest user correction.",
+        queue_dispatch_mode: "turn-end",
+      }).success
+    ).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.task_send_message.schema.safeParse({
+        task_id: "child-task",
+        message: "   ",
+      }).success
+    ).toBe(false);
+  });
+
+  describe("task tool isolation parameter", () => {
+    const validArgs = { agentId: "explore", prompt: "investigate", title: "Investigate" };
+
+    it("rejects unknown isolation modes", () => {
+      const schema = buildTaskToolAgentArgsSchema({ includeIsolation: true });
+      expect(schema.safeParse({ ...validArgs, isolation: "fork" }).success).toBe(true);
+      expect(schema.safeParse({ ...validArgs, isolation: "sandbox" }).success).toBe(false);
+    });
   });
 
   it("accepts ask_user_question headers longer than 12 characters", () => {
@@ -419,6 +659,21 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("mux_config_write");
   });
 
+  it("always includes the read-only model catalog, including for sub-agent option sets", () => {
+    expect(getAvailableTools("openai:gpt-4o")).toContain("models_list");
+    expect(
+      getAvailableTools("anthropic:claude-sonnet-5", {
+        enableAgentReport: true,
+        enableReviewPane: false,
+      })
+    ).toContain("models_list");
+    // No parameters: the strict schema rejects anything the model might invent.
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({}).success).toBe(true);
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({ includeHidden: true }).success).toBe(
+      false
+    );
+  });
+
   it("includes skills catalog tools", () => {
     const tools = getAvailableTools("openai:gpt-4o");
 
@@ -426,27 +681,208 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("skills_catalog_read");
   });
 
-  it("includes image_generate only when image generation is enabled", () => {
-    expect(getAvailableTools("openai:gpt-5")).not.toContain("image_generate");
-    expect(getAvailableTools("openai:gpt-5", { enableImageGeneration: true })).toContain(
-      "image_generate"
+  it("includes persistent child management tools", () => {
+    const tools = getAvailableTools("openai:gpt-4o");
+
+    expect(tools).toContain("task_send_message");
+    expect(tools).toContain("task_retitle");
+    expect(tools).toContain("task_stop");
+    expect(tools).toContain("task_remove");
+  });
+
+  it("only includes Review pane tools when enableReviewPane is not disabled", () => {
+    const defaultTools = getAvailableTools("openai:gpt-4o");
+    expect(defaultTools).toContain("review_pane_update");
+    expect(defaultTools).toContain("review_pane_get");
+
+    const enabledTools = getAvailableTools("openai:gpt-4o", { enableReviewPane: true });
+    expect(enabledTools).toContain("review_pane_update");
+    expect(enabledTools).toContain("review_pane_get");
+
+    // Sub-agents pass enableReviewPane: false so they can't pin code to the
+    // user-facing parent Review pane.
+    const subAgentTools = getAvailableTools("openai:gpt-4o", { enableReviewPane: false });
+    expect(subAgentTools).not.toContain("review_pane_update");
+    expect(subAgentTools).not.toContain("review_pane_get");
+  });
+
+  it("only includes mcp_prompt_get when enableMcpPromptGet is set", () => {
+    expect(getAvailableTools("openai:gpt-4o")).not.toContain("mcp_prompt_get");
+    expect(getAvailableTools("openai:gpt-4o", { enableMcpPromptGet: false })).not.toContain(
+      "mcp_prompt_get"
+    );
+    expect(getAvailableTools("openai:gpt-4o", { enableMcpPromptGet: true })).toContain(
+      "mcp_prompt_get"
     );
   });
 
-  it("includes image_edit only when image tools and upload consent are both enabled", () => {
-    expect(getAvailableTools("openai:gpt-5")).not.toContain("image_edit");
-    expect(getAvailableTools("openai:gpt-5", { enableImageEditing: true })).not.toContain(
-      "image_edit"
+  it("only includes tool_catalog_search when enableToolSearch is set", () => {
+    // Off by default: the tool-search experiment must not leak into normal assembly.
+    expect(getAvailableTools("openai:gpt-4o")).not.toContain("tool_catalog_search");
+    expect(getAvailableTools("openai:gpt-4o", { enableToolSearch: false })).not.toContain(
+      "tool_catalog_search"
     );
-    expect(getAvailableTools("openai:gpt-5", { enableImageGeneration: true })).not.toContain(
-      "image_edit"
+
+    expect(getAvailableTools("openai:gpt-4o", { enableToolSearch: true })).toContain(
+      "tool_catalog_search"
     );
+  });
+
+  it("requires workflow_run calls to use exactly one launch source", () => {
     expect(
-      getAvailableTools("openai:gpt-5", {
-        enableImageGeneration: true,
-        enableImageEditing: true,
-      })
-    ).toContain("image_edit");
+      WorkflowRunToolArgsSchema.safeParse({
+        script_path: "skill://deep-research/workflow.js",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(true);
+
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        script_source: "export default function workflow() { return { reportMarkdown: 'ok' }; }",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(true);
+
+    const both = WorkflowRunToolArgsSchema.safeParse({
+      script_path: "skill://deep-research/workflow.js",
+      script_source: "export default function workflow() {}",
+      args: { topic: "workflow tools" },
+      run_in_background: false,
+    });
+    expect(both.success).toBe(false);
+    expect(both.error?.issues.map((issue) => issue.message)).toContain(
+      "Provide exactly one of script_path or script_source."
+    );
+
+    const neither = WorkflowRunToolArgsSchema.safeParse({
+      args: { topic: "workflow tools" },
+      run_in_background: false,
+    });
+    expect(neither.success).toBe(false);
+    expect(neither.error?.issues.map((issue) => issue.message)).toContain(
+      "Provide exactly one of script_path or script_source."
+    );
+
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        script_path: null,
+        script_source: "export default function workflow() {}",
+      }).success
+    ).toBe(true);
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({ script_path: null, script_source: null }).success
+    ).toBe(false);
+
+    expect(WorkflowRunToolArgsSchema.safeParse({ script_source: "" }).success).toBe(false);
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        name: "deep-research",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(false);
+  });
+
+  // AGENTS.md: optional tool inputs use `.nullish()`, because OpenAI strict mode forces every field
+  // into `required` and expects optional ones to accept null. Convert each schema the way the AI
+  // SDK does and require every non-required property, at any depth, to accept null.
+  it("every optional tool input property accepts null", () => {
+    type JsonSchema = Record<string, unknown>;
+    const acceptsNull = (schema: unknown): boolean => {
+      if (schema == null || typeof schema !== "object") return schema !== false;
+      const node = schema as JsonSchema;
+      if (Object.keys(node).length === 0) return true;
+      if (node.type === "null" || (Array.isArray(node.type) && node.type.includes("null")))
+        return true;
+      return [node.anyOf, node.oneOf].some(
+        (branches) => Array.isArray(branches) && branches.some(acceptsNull)
+      );
+    };
+    const violations: string[] = [];
+    const visit = (schema: unknown, at: string): void => {
+      // Draft-7 tuples list their member schemas as an `items` array.
+      if (Array.isArray(schema)) {
+        schema.forEach((member, index) => visit(member, `${at}[${index}]`));
+        return;
+      }
+      if (schema == null || typeof schema !== "object") return;
+      const node = schema as JsonSchema;
+      const required = new Set((node.required as string[] | undefined) ?? []);
+      for (const [key, property] of Object.entries((node.properties as JsonSchema) ?? {})) {
+        if (!required.has(key) && !acceptsNull(property)) violations.push(`${at}.${key}`);
+        visit(property, `${at}.${key}`);
+      }
+      for (const branches of [node.anyOf, node.oneOf, node.allOf]) {
+        if (Array.isArray(branches)) for (const branch of branches) visit(branch, at);
+      }
+      visit(node.items, `${at}[]`);
+      visit(node.additionalItems, `${at}[]`);
+      visit(node.additionalProperties, `${at}{}`);
+    };
+
+    const tools = Object.entries(TOOL_DEFINITIONS);
+    expect(tools.length).toBeGreaterThan(0);
+    for (const [name, definition] of tools) {
+      visit(z.toJSONSchema(definition.schema, { target: "draft-7", io: "input" }), name);
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it("only includes workflow tools when dynamic workflows are enabled", () => {
+    const disabledTools = getAvailableTools("openai:gpt-4o", { enableDynamicWorkflows: false });
+    expect(disabledTools).not.toContain("workflow_list");
+    expect(disabledTools).not.toContain("workflow_read");
+    expect(disabledTools).not.toContain("workflow_run");
+    expect(disabledTools).not.toContain("workflow_resume");
+
+    const enabledTools = getAvailableTools("openai:gpt-4o", { enableDynamicWorkflows: true });
+    expect(enabledTools).not.toContain("workflow_list");
+    expect(enabledTools).not.toContain("workflow_read");
+    expect(enabledTools).toContain("workflow_run");
+    expect(enabledTools).toContain("workflow_resume");
+  });
+
+  it("gates native Google tools to Gemini 3 models", () => {
+    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("google_search");
+    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("url_context");
+    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("google_search");
+    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("url_context");
+
+    for (const modelString of [
+      "google:gemini-3.1-pro-preview",
+      "google:gemini-3.5-flash",
+      "google:models/gemini-3.5-flash",
+    ]) {
+      const tools = getAvailableTools(modelString);
+      expect(tools).toContain("google_search");
+      expect(tools).toContain("url_context");
+    }
+  });
+
+  it("exposes xAI native search tools only for frontier Grok", () => {
+    for (const modelString of [
+      "xai:grok-4.7",
+      "xai:grok-4.7-latest",
+      "xai:grok-4.6",
+      "xai:grok-4.6-latest",
+      "xai:grok-4.5",
+      "xai:grok-4.5-latest",
+    ]) {
+      expect(getAvailableTools(modelString)).toEqual(
+        expect.arrayContaining(["web_search", "x_search"])
+      );
+    }
+    expect(getAvailableTools("xai:grok-4-1-fast")).not.toContain("x_search");
+  });
+
+  it("classifies Gemini 3 as supporting mixed native Google and function tools", () => {
+    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-2.5-pro")).toBe(false);
+    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.1-pro-preview")).toBe(true);
+    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.5-flash")).toBe(true);
+    expect(supportsGoogleNativeToolsWithFunctionTools("models/gemini-3.5-flash")).toBe(true);
+    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-4-pro")).toBe(false);
   });
 
   it("agent_skill_write schema rejects an advertise tool argument (advertise is authored in content)", () => {
@@ -456,6 +892,66 @@ describe("TOOL_DEFINITIONS", () => {
       advertise: false,
     });
     expect(parsed.success).toBe(false);
+  });
+
+  describe("task_list instance discovery schema", () => {
+    const schema = TOOL_DEFINITIONS.task_list.schema;
+
+    it("accepts scope instance with bounded query/limit/offset paging inputs", () => {
+      expect(
+        schema.safeParse({ scope: "instance", query: "release", limit: 5, offset: 20 }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance" }).success).toBe(true);
+      // Strict-mode providers send null for omitted optional fields; null must mean "absent".
+      expect(
+        schema.safeParse({ scope: "instance", query: null, limit: null, offset: null }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", limit: 1 }).success).toBe(true);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", offset: 0 }).success).toBe(true);
+    });
+
+    it("rejects out-of-range or non-integer paging inputs", () => {
+      expect(schema.safeParse({ scope: "instance", limit: 0 }).success).toBe(false);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT + 1 }).success
+      ).toBe(false);
+      expect(schema.safeParse({ scope: "instance", limit: 2.5 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: -1 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: 1.5 }).success).toBe(false);
+    });
+
+    it("keeps the default and tree scopes parseable without paging inputs", () => {
+      expect(schema.safeParse({}).success).toBe(true);
+      expect(schema.safeParse({ scope: "tree" }).success).toBe(true);
+      expect(schema.safeParse({ scope: "everywhere" }).success).toBe(false);
+    });
+
+    it("result rows carry instance-only fields and the paging cursor", () => {
+      const result = TOOL_DEFINITIONS.task_list.resultSchema;
+      const parsed = result.safeParse({
+        tasks: [
+          {
+            taskId: "ws-other",
+            status: "workspace",
+            relationship: "unrelated",
+            projectPath: "/home/alice/projects/api",
+            activity: "busy",
+            depth: 0,
+          },
+        ],
+        nextOffset: 20,
+      });
+      expect(parsed.success).toBe(true);
+      expect(
+        result.safeParse({
+          tasks: [{ taskId: "ws-other", status: "workspace", activity: "asleep", depth: 0 }],
+        }).success
+      ).toBe(false);
+      expect(result.safeParse({ tasks: [], nextOffset: -1 }).success).toBe(false);
+    });
   });
 
   describe("skills_catalog_read schema", () => {

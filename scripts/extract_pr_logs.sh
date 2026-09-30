@@ -10,6 +10,16 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CHECK_FILTERS_SCRIPT="$SCRIPT_DIR/lib/pr_check_filters.sh"
+if [ ! -f "$CHECK_FILTERS_SCRIPT" ]; then
+  echo "❌ assertion failed: missing helper script: $CHECK_FILTERS_SCRIPT" >&2
+  exit 1
+fi
+# shellcheck source=./lib/pr_check_filters.sh
+# shellcheck disable=SC1091
+source "$CHECK_FILTERS_SCRIPT"
+
 INPUT="${1:-}"
 JOB_PATTERN="${2:-}"
 WAIT_FOR_LOGS=false
@@ -37,14 +47,20 @@ if [[ "$INPUT" =~ ^[0-9]{1,5}$ ]]; then
   PR_NUMBER="$INPUT"
   echo "🔍 Finding latest failed run for PR #$PR_NUMBER..." >&2
 
-  # Get the latest failed run for this PR
-  RUN_ID=$(gh pr checks "$PR_NUMBER" --json name,link,state --jq '.[] | select(.state == "FAILURE") | .link' | head -1 | sed -E 's|.*/runs/([0-9]+).*|\1|' || echo "")
+  # Get the latest failed non-visual-review run for this PR. Pixel review statuses are
+  # intentionally ignored for merge readiness, so they should not drive log extraction.
+  JQ_DEFS=$(visual_check_jq_defs)
+  if ! CHECKS=$(fetch_pr_checks "$PR_NUMBER"); then
+    echo "❌ Failed to get complete PR checks for PR #$PR_NUMBER" >&2
+    exit 1
+  fi
+  RUN_ID=$(jq -r "$JQ_DEFS [ .[] | select((is_visual_review_check | not) and is_failed_check) | .link | capture(\"/runs/(?<id>[0-9]+)\")? | .id ][0] // empty" <<<"$CHECKS")
 
   if [[ -z "$RUN_ID" ]]; then
-    echo "❌ No failed runs found for PR #$PR_NUMBER" >&2
+    echo "❌ No failed non-visual-review runs found for PR #$PR_NUMBER" >&2
     echo "" >&2
-    echo "Current check status:" >&2
-    gh pr checks "$PR_NUMBER" 2>&1 || true
+    echo "Current non-visual-review check status:" >&2
+    jq -r "$JQ_DEFS .[] | select(is_visual_review_check | not) | check_line" <<<"$CHECKS" >&2
     exit 1
   fi
 
@@ -67,7 +83,7 @@ fi
 
 # Filter to failed jobs only (unless specific pattern requested)
 if [[ -z "$JOB_PATTERN" ]]; then
-  FAILED_JOBS=$(echo "$JOBS" | jq -r 'select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "CANCELLED")')
+  FAILED_JOBS=$(echo "$JOBS" | jq -r 'select(.conclusion // "" | ascii_upcase | IN("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"))')
   if [[ -n "$FAILED_JOBS" ]]; then
     echo "🎯 Showing only failed jobs (use job_pattern to see others)" >&2
     JOBS="$FAILED_JOBS"
@@ -132,7 +148,7 @@ for JOB_ID in $JOB_IDS; do
 
   while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     # Use gh api to fetch logs (works for individual completed jobs even if run is in progress)
-    if gh api "/repos/coder/mux/actions/jobs/$JOB_ID/logs" 2>/dev/null; then
+    if gh api "repos/{owner}/{repo}/actions/jobs/$JOB_ID/logs" 2>/dev/null; then
       break
     else
       RETRY_COUNT=$((RETRY_COUNT + 1))

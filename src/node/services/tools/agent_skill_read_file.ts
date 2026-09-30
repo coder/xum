@@ -5,11 +5,8 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { SkillNameSchema } from "@/common/orpc/schemas";
-import {
-  IMAGEGEN_SKILL_DISABLED_MESSAGE,
-  isBuiltInImagegenSkillUnavailable,
-  readAgentSkill,
-} from "@/node/services/agentSkills/agentSkillsService";
+import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
@@ -112,10 +109,16 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
         };
       }
 
+      // claude-skills-compat experiment: allow reading skill files discovered from .claude roots.
+      const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
+      // agent-plugins experiment: allow reading skill files discovered from Agent Plugins.
+      const includeAgentPlugins = config.experiments?.agentPlugins === true;
       const skillCtx = resolveSkillStorageContext({
         runtime: config.runtime,
         workspacePath,
-        muxScope: config.muxScope ?? null,
+        xumScope: config.xumScope ?? null,
+        includeClaudeSkills,
+        includeAgentPlugins,
       });
 
       // Defensive: validate again even though inputSchema should guarantee shape.
@@ -142,20 +145,10 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           {
             roots: skillCtx.roots,
             containment: skillCtx.containment,
+            includeClaudeSkills,
+            includeAgentPlugins,
           }
         );
-
-        if (
-          isBuiltInImagegenSkillUnavailable(
-            resolvedSkill.package,
-            config.imageGenerationRuntime != null
-          )
-        ) {
-          return {
-            success: false,
-            error: IMAGEGEN_SKILL_DISABLED_MESSAGE,
-          };
-        }
 
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
@@ -246,8 +239,35 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
         }
 
         let fullContent: string;
+        // Default: the preliminary stat above. For plugin reads these are
+        // overwritten with metadata from the SAME validated handle as the
+        // content — a legitimate in-root replacement promoted between that
+        // stat and the bounded open must not pair new content with the old
+        // file's size/mtime (wrong pagination/size for the model and UI).
+        let resultFileSize = stat.size;
+        let resultModifiedTime = stat.modifiedTime.toISOString();
         try {
-          fullContent = await readFileString(skillRuntime, targetPath);
+          // Plugin skills retain plugin provenance: the consuming read must
+          // revalidate containment + file identity against the PLUGIN root
+          // through a bounded post-open handle. A managed update promoted
+          // after readAgentSkill's containment checks can replace
+          // skills/<name> (or an ancestor) with an absolute symlink to an
+          // outside directory; skill-dir-relative resolution above would
+          // then canonicalize through that same link and serve outside
+          // files as skill references.
+          if (resolvedSkill.pluginRoot != null) {
+            const pluginRead = await readPluginFileWithinRootCapped({
+              filePath: targetPath,
+              pluginRoot: resolvedSkill.pluginRoot,
+              maxBytes: MAX_FILE_SIZE,
+              label: `plugin skill file '${filePath}'`,
+            });
+            fullContent = pluginRead.content;
+            resultFileSize = pluginRead.byteSize;
+            resultModifiedTime = pluginRead.modifiedTime.toISOString();
+          } else {
+            fullContent = await readFileString(skillRuntime, targetPath);
+          }
         } catch (err) {
           if (err instanceof RuntimeError) {
             return {
@@ -260,8 +280,8 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
 
         return readContentWithFileReadLimits({
           fullContent,
-          fileSize: stat.size,
-          modifiedTime: stat.modifiedTime.toISOString(),
+          fileSize: resultFileSize,
+          modifiedTime: resultModifiedTime,
           offset,
           limit,
         });

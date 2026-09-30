@@ -1,0 +1,394 @@
+import type { SendMessageError } from "@/common/types/errors";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import assert from "@/common/utils/assert";
+import {
+  IMAGE_TOKEN_ESTIMATE,
+  MAX_OUTPUT_RESERVE_CONTEXT_RATIO,
+  MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
+  OUTPUT_RESERVE_TOKENS,
+  SYSTEM_FLOOR_TOKENS_ESTIMATE,
+  WARNING_RESERVE_TOKENS,
+  FINAL_HANDOFF_RESERVE_TOKENS,
+  FLUSH_RESERVE_TOKENS,
+} from "@/common/constants/contextBudget";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+
+export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
+
+/** Keep output headroom without making supported small context windows unusable. */
+export function getContextBudgetHardCeiling(modelContextLimit: number): number {
+  assert(
+    Number.isFinite(modelContextLimit) && modelContextLimit > 0,
+    "Context budget requires a finite positive model context limit"
+  );
+  return (
+    modelContextLimit -
+    Math.min(
+      OUTPUT_RESERVE_TOKENS,
+      Math.floor(modelContextLimit * MAX_OUTPUT_RESERVE_CONTEXT_RATIO)
+    )
+  );
+}
+
+/**
+ * Where the final handoff prompt zone opens. A window smaller than a few final reserves would
+ * reach the zone at once, so it never opens in the first half of the usable window.
+ */
+export function getContextBudgetFinalPoint(modelContextLimit: number): number {
+  const hardCeiling = getContextBudgetHardCeiling(modelContextLimit);
+  return Math.max(hardCeiling - FINAL_HANDOFF_RESERVE_TOKENS, Math.ceil(hardCeiling / 2));
+}
+
+/**
+ * The slider is an agent handoff target, not a second forced-rollover ceiling. A high slider is
+ * clamped to the final zone so the handoff request always comes before the final prompt.
+ */
+export function getContextBudgetHandoffPoint(modelContextLimit: number, threshold: number): number {
+  assert(
+    Number.isFinite(modelContextLimit) && modelContextLimit > 0,
+    "Handoff requires a finite positive model context limit"
+  );
+  assert(threshold > 0 && threshold < 1, "Handoff point requires an enabled fractional threshold");
+  return Math.min(
+    Math.floor(modelContextLimit * threshold),
+    getContextBudgetFinalPoint(modelContextLimit)
+  );
+}
+
+export interface StepBudgetInput {
+  contextTokens: number;
+  outputTokens: number;
+  toolResultChars: number;
+  imageParts: number;
+  /** Real-encoding tool-output count, including media allowances, when available. */
+  toolResultTokens?: number;
+  /**
+   * Assembled estimate of the next provider request (the measure the per-step preflight
+   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   */
+  nextRequestTokens?: number;
+  modelContextLimit: number | null | undefined;
+  threshold: number;
+  handoffRequested: boolean;
+  /** The caller can still publish this window's single final prompt. */
+  finalHandoffAvailable: boolean;
+}
+
+export interface StepBudgetEvaluation {
+  decision: "continue" | "handoff" | "final" | "rollover" | "block";
+  projected: number;
+  /** Undefined means unknown, not unlimited. The caller should log that limitation. */
+  hardCeiling: number | undefined;
+}
+
+export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation {
+  for (const value of [
+    input.contextTokens,
+    input.outputTokens,
+    input.toolResultChars,
+    input.imageParts,
+    input.threshold,
+    input.toolResultTokens ?? 0,
+    input.nextRequestTokens ?? 0,
+  ]) {
+    assert(
+      Number.isFinite(value) && value >= 0,
+      "Context budget inputs must be finite and nonnegative"
+    );
+  }
+  const projected =
+    input.contextTokens +
+    input.outputTokens +
+    Math.ceil(input.toolResultChars / 4) +
+    IMAGE_TOKEN_ESTIMATE * input.imageParts;
+  // Provider usage can sit ~10% below the assembled estimate the next step's preflight enforces
+  // (#4855). Using the stricter of the two keeps the forced rollover ahead of that hard stop.
+  const hardProjected = Math.max(
+    projected,
+    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0),
+    input.nextRequestTokens ?? 0
+  );
+  const limit = input.modelContextLimit;
+  const hardCeiling =
+    limit != null && Number.isFinite(limit) && limit > 0
+      ? getContextBudgetHardCeiling(limit)
+      : undefined;
+  const result: StepBudgetEvaluation = { decision: "continue", projected, hardCeiling };
+  // The auto-compaction Off setting disables proactive rollover, not request preflight.
+  if (hardCeiling === undefined || limit == null) return result;
+  if (hardProjected >= hardCeiling) {
+    return {
+      ...result,
+      projected: hardProjected,
+      decision: input.threshold >= 1 ? "block" : "rollover",
+    };
+  }
+  if (input.threshold >= 1) return result;
+  // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
+  // the final assembled-payload preflight remains authoritative before dispatch. Both stages
+  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  if (
+    !input.handoffRequested &&
+    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
+    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+  ) {
+    return { ...result, decision: "handoff" };
+  }
+  // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
+  if (
+    input.finalHandoffAvailable &&
+    hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
+    projected >= getContextBudgetFinalPoint(limit)
+  ) {
+    return { ...result, decision: "final" };
+  }
+  return result;
+}
+
+/** Count wire text and media separately, including media nested in tool-result data. */
+export function estimateToolResultSize(result: unknown): {
+  toolResultChars: number;
+  imageParts: number;
+} {
+  return measureBudgetContent(result);
+}
+
+function measureBudgetContent(
+  result: unknown,
+  textParts?: string[],
+  kind: "json" | "messages" | "parts" = "json"
+): {
+  toolResultChars: number;
+  imageParts: number;
+} {
+  let toolResultChars = 0;
+  let imageParts = 0;
+  const ancestors = new Set<object>();
+  const stack: Array<{
+    value: unknown;
+    leave?: boolean;
+    kind?:
+      | "json"
+      | "messages"
+      | "message"
+      | "parts"
+      | "part"
+      | "assistant-parts"
+      | "assistant-part"
+      | "reasoning-options"
+      | "openai-reasoning-options"
+      | "output";
+  }> = [{ value: result, kind }];
+  while (stack.length > 0) {
+    const entry = stack.pop()!;
+    const value = entry.value;
+    if (value == null) {
+      toolResultChars += 4;
+      textParts?.push("null");
+      continue;
+    }
+    if (typeof value === "string") {
+      // A data URL in user/tool text is still sent verbatim, not as an attachment.
+      toolResultChars += JSON.stringify(value).length;
+      textParts?.push(value);
+      continue;
+    }
+    if (typeof value !== "object") {
+      if (typeof value === "number" || typeof value === "boolean") {
+        toolResultChars += String(value).length;
+        textParts?.push(String(value));
+      }
+      continue;
+    }
+    if (entry.leave) {
+      ancestors.delete(value);
+      continue;
+    }
+    if (ancestors.has(value)) continue;
+    if (value instanceof URL) {
+      toolResultChars += JSON.stringify(value.href).length;
+      textParts?.push(value.href);
+      continue;
+    }
+    ancestors.add(value);
+    stack.push({ value, leave: true });
+    toolResultChars += 2;
+    if (Array.isArray(value)) {
+      for (const child of value)
+        stack.push({
+          value: child,
+          kind:
+            entry.kind === "messages"
+              ? "message"
+              : entry.kind === "assistant-parts"
+                ? "assistant-part"
+                : entry.kind === "parts"
+                  ? "part"
+                  : "json",
+        });
+      toolResultChars += value.length;
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    const displayOnly = isDisplayOnlyFilePart(value);
+    const toolMedia = isMediaPart(value);
+    // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
+    // attachment parts get SDK media semantics; canonical tool wrappers are also
+    // safe because the shared attachment sanitizer removes their data recursively.
+    const isPart = entry.kind === "part" || entry.kind === "assistant-part";
+    const image = isPart && record.type === "image" && "image" in record;
+    const inlineText =
+      typeof record.data === "object" &&
+      record.data !== null &&
+      "type" in record.data &&
+      record.data.type === "text";
+    const file =
+      isPart && record.type === "file" && !inlineText && ("data" in record || "url" in record);
+    const dataMedia = isPart && (record.type === "image-data" || record.type === "file-data");
+    const urlMedia = isPart && (record.type === "image-url" || record.type === "file-url");
+    if (toolMedia || image || file || dataMedia || urlMedia) imageParts += 1;
+    for (const [key, child] of Object.entries(record)) {
+      if (
+        ((toolMedia || displayOnly) && key === "data") ||
+        (image && key === "image") ||
+        (file && (key === "data" || key === "url")) ||
+        (dataMedia && key === "data") ||
+        (urlMedia && key === "url")
+      )
+        continue;
+      // Ciphertext length does not measure reasoning tokens. Provider usage tracks the underlying reasoning.
+      // Exclude only the SDK replay field; identical keys in user/tool JSON must still count.
+      if (
+        entry.kind === "openai-reasoning-options" &&
+        key === "reasoningEncryptedContent" &&
+        typeof child === "string"
+      )
+        continue;
+      toolResultChars += JSON.stringify(key).length + 2;
+      textParts?.push(key);
+      let childKind: typeof entry.kind = "json";
+      if (entry.kind === "message" && key === "content") {
+        if (record.role === "assistant") childKind = "assistant-parts";
+        else if (record.role === "user" || record.role === "tool") childKind = "parts";
+      } else if (isPart && record.type === "tool-result" && key === "output") {
+        childKind = "output";
+      } else if (entry.kind === "output" && record.type === "content" && key === "value") {
+        childKind = "parts";
+      } else if (
+        entry.kind === "assistant-part" &&
+        record.type === "reasoning" &&
+        key === "providerOptions"
+      ) {
+        childKind = "reasoning-options";
+      } else if (entry.kind === "reasoning-options" && key === "openai") {
+        childKind = "openai-reasoning-options";
+      }
+      stack.push({ value: child, kind: childKind });
+    }
+  }
+  return { toolResultChars, imageParts };
+}
+
+export interface BudgetTokenCountInput {
+  text: string;
+  fixedTokens: number;
+  heuristicTokens: number;
+}
+
+/** The same media-byte exclusion used for step sizing, with text retained for real encoding. */
+export function prepareBudgetTokenCount(
+  content: unknown,
+  kind: "json" | "messages" | "parts" = "json"
+): BudgetTokenCountInput {
+  const textParts: string[] = [];
+  const size = measureBudgetContent(content, textParts, kind);
+  const mediaTokens = size.imageParts * IMAGE_TOKEN_ESTIMATE;
+  // Raw leaves omit JSON punctuation and escape expansion. Each omitted ASCII byte costs
+  // at most one token; charge that conservative bound instead of dividing structure by 3.5.
+  const textChars = textParts.reduce((sum, text) => sum + text.length, 0);
+  const omittedBytes = size.toolResultChars - textChars;
+  assert(omittedBytes >= 0, "Budget text must be contained in the measured serialization");
+  return {
+    text: textParts.join("\n"),
+    fixedTokens: mediaTokens + omittedBytes,
+    heuristicTokens: Math.ceil(textChars / 3.5) + mediaTokens + omittedBytes,
+  };
+}
+
+export interface FreshRequestBudgetInput {
+  userText: string;
+  attachments?: readonly unknown[];
+  prelude?: readonly unknown[];
+  leadIn?: string;
+  systemFloorTokens?: number;
+  modelContextLimit?: number;
+}
+
+export function prepareFreshRequestTokenCount(
+  input: FreshRequestBudgetInput
+): BudgetTokenCountInput {
+  if (input.modelContextLimit != null) {
+    assert(
+      Number.isFinite(input.modelContextLimit) && input.modelContextLimit > 0,
+      "Fresh request estimation requires a finite positive model context limit"
+    );
+  }
+  // Unknown system/schema overhead must leave room for a small model's request.
+  // A supplied measured floor is authoritative; final assembly still checks everything.
+  const fallbackSystemFloor =
+    input.modelContextLimit == null
+      ? SYSTEM_FLOOR_TOKENS_ESTIMATE
+      : Math.min(
+          SYSTEM_FLOOR_TOKENS_ESTIMATE,
+          Math.floor(input.modelContextLimit * MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO)
+        );
+  const systemFloorTokens = input.systemFloorTokens ?? fallbackSystemFloor;
+  assert(
+    Number.isFinite(systemFloorTokens) && systemFloorTokens >= 0,
+    "System token floor must be finite and nonnegative"
+  );
+  const content = prepareBudgetTokenCount(
+    [
+      input.userText,
+      input.leadIn ?? "",
+      ...(input.attachments ?? []),
+      ...(input.prelude ?? []).flatMap((parts): unknown[] =>
+        Array.isArray(parts) ? parts : [parts]
+      ),
+    ],
+    "parts"
+  );
+  return {
+    ...content,
+    fixedTokens: content.fixedTokens + systemFloorTokens,
+    heuristicTokens: content.heuristicTokens + systemFloorTokens,
+  };
+}
+
+export interface AssembledRequestBudgetInput {
+  system?: unknown;
+  tools?: Record<string, unknown>;
+  messages: readonly unknown[];
+}
+
+/** Estimate the final wire payload, not just history: system and tool schemas count too. */
+export function prepareAssembledRequestTokenCount(
+  payload: AssembledRequestBudgetInput
+): BudgetTokenCountInput {
+  const content = prepareBudgetTokenCount([payload.system, ...payload.messages], "messages");
+  const textParts = [content.text];
+  let tokens = content.heuristicTokens;
+  for (const [name, tool] of Object.entries(payload.tools ?? {})) {
+    const record = tool as { description?: unknown; type?: unknown; id?: unknown; args?: unknown };
+    const wireTool =
+      record.type === "provider" || record.type === "provider-defined"
+        ? { name, id: record.id, args: record.args }
+        : { name, description: record.description, parameters: extractToolJsonSchema(tool) };
+    // Schemas are text, even if they describe image/data properties.
+    const schemaText = JSON.stringify(wireTool);
+    textParts.push(schemaText);
+    tokens += Math.ceil(schemaText.length / 3.5);
+  }
+  return { text: textParts.join("\n"), fixedTokens: content.fixedTokens, heuristicTokens: tokens };
+}

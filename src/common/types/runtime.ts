@@ -23,6 +23,31 @@ export const RUNTIME_MODE = {
 } as const;
 
 /**
+ * Runtime modes whose sub-agent fork creates a *separate* checkout from the parent workspace.
+ * For these, the task tool may offer `isolation: "none"` to skip the fork and run the sub-agent
+ * directly in the parent's checkout (shared working tree), avoiding fork + init overhead for
+ * read-only analysis or when isolation is handled via the prompt.
+ *
+ * - `local` already shares the project directory (forking is a no-op), so it never exposes the
+ *   option — the parameter must not even appear in the tool schema for local runtimes.
+ * - `docker`/`devcontainer` derive their runtime identity (container) from the workspace name in
+ *   the runtime factory, so a differently-named workspace cannot currently resolve the parent's
+ *   container. They are intentionally excluded until that identity override exists.
+ */
+export const SHARED_TASK_WORKSPACE_RUNTIME_MODES: readonly RuntimeMode[] = [
+  RUNTIME_MODE.WORKTREE,
+  RUNTIME_MODE.SSH,
+];
+
+/**
+ * Whether sub-agents on this runtime mode can opt out of forking via `isolation: "none"` and share
+ * the parent workspace's checkout instead. See {@link SHARED_TASK_WORKSPACE_RUNTIME_MODES}.
+ */
+export function runtimeModeSupportsSharedTaskWorkspace(mode: RuntimeMode | undefined): boolean {
+  return mode != null && SHARED_TASK_WORKSPACE_RUNTIME_MODES.includes(mode);
+}
+
+/**
  * Runtime IDs that can be enabled/disabled in Settings → Runtimes.
  * Note: includes "coder" which is a UI-level choice (not a RuntimeMode).
  */
@@ -258,8 +283,9 @@ export function isWorktreeRuntime(
   | Extract<RuntimeConfig, { type: "local"; srcBaseDir: string }> {
   if (!config) return false;
   if (config.type === "worktree") return true;
-  // Legacy: "local" with srcBaseDir is treated as worktree
-  if (config.type === "local" && "srcBaseDir" in config && config.srcBaseDir) return true;
+  // Legacy: "local" with srcBaseDir is treated as worktree. Any string counts, including a legacy
+  // empty one, because createRuntime builds a WorktreeRuntime for it (#5118).
+  if (config.type === "local" && hasSrcBaseDir(config)) return true;
   return false;
 }
 
@@ -270,8 +296,8 @@ export function isLocalProjectRuntime(
   config: RuntimeConfig | undefined
 ): config is Extract<RuntimeConfig, { type: "local"; srcBaseDir?: never }> {
   if (!config) return false;
-  // "local" without srcBaseDir is project-dir runtime
-  return config.type === "local" && !("srcBaseDir" in config && config.srcBaseDir);
+  // "local" without srcBaseDir is project-dir runtime (same string test as createRuntime, #5118)
+  return config.type === "local" && !hasSrcBaseDir(config);
 }
 
 /**

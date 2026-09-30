@@ -1,33 +1,20 @@
 import React from "react";
-import { useWorkspaceUsage, useWorkspaceConsumers } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
 import {
   sumUsageHistory,
   formatCostWithDollar,
+  getTotalCost,
   type ChatUsageDisplay,
 } from "@/common/utils/tokens/usageAggregator";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
-import { resolveCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
-import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
-import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
-import {
-  TOKEN_COMPONENT_COLORS,
-  calculateTokenMeterData,
-  formatTokens,
-} from "@/common/utils/tokens/tokenMeterUtils";
-import { ConsumerBreakdown } from "./ConsumerBreakdown";
-import { FileBreakdown } from "./FileBreakdown";
-import { ContextUsageBar } from "./ContextUsageBar";
+import { formatModelStringForDisplay } from "@/common/utils/ai/models";
+import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { useAutoCompactionSettings } from "@/browser/hooks/useAutoCompactionSettings";
-import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
+import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
-import { PostCompactionSection } from "./PostCompactionSection";
-import { usePostCompactionState } from "@/browser/hooks/usePostCompactionState";
-import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { COSTS_TAB_VIEW_MODE_KEY } from "@/common/constants/storage";
 
 type ViewMode = "last-request" | "session";
 
@@ -42,37 +29,8 @@ interface CostsTabProps {
 
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
-  const consumers = useWorkspaceConsumers(workspaceId);
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>("costsTab:viewMode", "session");
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
-  const { has1MContext } = useProviderOptions();
-  const pendingSendOptions = useSendMessageOptions(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
-
-  // Post-compaction context state for UI display
-  const postCompactionState = usePostCompactionState(workspaceId);
-
-  // Get runtimeConfig for SSH-aware editor opening
-  const workspaceContext = useOptionalWorkspaceContext();
-  const runtimeConfig = workspaceContext?.workspaceMetadata.get(workspaceId)?.runtimeConfig;
-
-  // Token counts come from usage metadata, but context limits/1M eligibility should
-  // follow the currently selected model unless a stream is actively running.
-  const contextDisplayModel = usage.liveUsage?.model ?? pendingSendOptions.baseModel;
-  // Align warning with /compact model resolution so it matches actual compaction behavior.
-  const effectiveCompactionModel =
-    resolveCompactionModel(configuredCompactionModel) ?? contextDisplayModel;
-
-  // Auto-compaction settings: threshold per-model (100 = disabled)
-  const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
-    useAutoCompactionSettings(workspaceId, contextDisplayModel);
+  const [viewMode, setViewMode] = usePersistedState<ViewMode>(COSTS_TAB_VIEW_MODE_KEY, "session");
 
   // Session usage for cost calculation
   // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
@@ -83,358 +41,297 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
     return parts.length > 0 ? sumUsageHistory(parts) : undefined;
   }, [usage.sessionTotal, usage.liveCostUsage]);
 
-  const hasUsageData =
-    usage &&
-    (usage.sessionTotal !== undefined ||
-      usage.lastContextUsage !== undefined ||
-      usage.liveUsage !== undefined);
-  const hasConsumerData = consumers && (consumers.totalTokens > 0 || consumers.isCalculating);
-  const hasAnyData = hasUsageData || hasConsumerData;
+  // Per-model session costs. Live streaming usage is not yet folded into the
+  // persisted byModel record, so merge it into the active model's bucket to
+  // keep rows consistent with the session total above.
+  const sessionModelRows = (() => {
+    const merged = new Map<string, ChatUsageDisplay>(Object.entries(usage.sessionByModel ?? {}));
+    const liveModel = usage.liveCostUsage?.model;
+    if (usage.liveCostUsage && liveModel) {
+      // Same ledger key as the backend and WorkspaceStore deltas: live Coder
+      // usage keys on the stream's request-pinned metadata identity
+      // (liveMetadataModel) — re-resolving the raw coder:<instance>/<model>
+      // against a mid-stream-refreshed providers config could re-key or
+      // split the row from the backend's bucket. Non-Coder models keep the
+      // canonical normalizeUsageModelKey.
+      const key =
+        liveModel.startsWith("coder:") && usage.liveMetadataModel
+          ? usage.liveMetadataModel
+          : normalizeUsageModelKey(liveModel, providersConfig);
+      const existing = merged.get(key);
+      merged.set(
+        key,
+        existing ? sumUsageHistory([existing, usage.liveCostUsage])! : usage.liveCostUsage
+      );
+    }
+    return Array.from(merged.entries())
+      .map(([model, entry]) => ({
+        model,
+        tokens:
+          entry.input.tokens +
+          entry.cached.tokens +
+          entry.cacheCreate.tokens +
+          entry.output.tokens +
+          entry.reasoning.tokens,
+        cost: getTotalCost(entry),
+      }))
+      .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0) || b.tokens - a.tokens);
+  })();
 
-  // Only show empty state if truly no data anywhere
-  if (!hasAnyData) {
+  // Last Request (for Cost section): from persisted data
+  const lastRequestUsage = usage.lastRequest?.usage;
+
+  const hasCostData = sessionUsage !== undefined || lastRequestUsage !== undefined;
+
+  if (!hasCostData) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
         <div className="text-secondary px-5 py-10 text-center">
           <p>No messages yet.</p>
-          <p>Send a message to see token usage statistics.</p>
+          <p>Send a message to see cost statistics.</p>
         </div>
       </div>
     );
   }
 
-  // Last Request (for Cost section): from persisted data
-  const lastRequestUsage = usage.lastRequest?.usage;
-
   // Cost and Details table use viewMode
   const displayUsage = viewMode === "last-request" ? lastRequestUsage : sessionUsage;
 
+  const getCostPercentage = (cost: number | undefined, total: number | undefined) =>
+    total !== undefined && total > 0 && cost !== undefined ? (cost / total) * 100 : 0;
+
+  // Costs are already computed from shared model metadata when usage is recorded.
+  // Repricing again here drifts from tiered per-request accounting, especially for
+  // native 1M models and session aggregates that span multiple requests.
+  const inputCost = displayUsage?.input.cost_usd;
+  const outputCost = displayUsage?.output.cost_usd;
+  const reasoningCost = displayUsage?.reasoning.cost_usd;
+
+  // Calculate total cost (undefined if any cost is unknown)
+  const totalCost: number | undefined = displayUsage
+    ? inputCost !== undefined &&
+      displayUsage.cached.cost_usd !== undefined &&
+      displayUsage.cacheCreate.cost_usd !== undefined &&
+      outputCost !== undefined &&
+      reasoningCost !== undefined
+      ? inputCost +
+        displayUsage.cached.cost_usd +
+        displayUsage.cacheCreate.cost_usd +
+        outputCost +
+        reasoningCost
+      : undefined
+    : undefined;
+
+  // Calculate cost percentages from the shared metadata-driven costs.
+  const inputCostPercentage = getCostPercentage(inputCost, totalCost);
+  const cachedCostPercentage = getCostPercentage(displayUsage?.cached.cost_usd, totalCost);
+  const cacheCreateCostPercentage = getCostPercentage(
+    displayUsage?.cacheCreate.cost_usd,
+    totalCost
+  );
+  const outputCostPercentage = getCostPercentage(outputCost, totalCost);
+  const reasoningCostPercentage = getCostPercentage(reasoningCost, totalCost);
+
+  const components = displayUsage
+    ? [
+        {
+          name: "Cache Read",
+          tokens: displayUsage.cached.tokens,
+          cost: displayUsage.cached.cost_usd,
+          color: TOKEN_COMPONENT_COLORS.cached,
+          show: displayUsage.cached.tokens > 0,
+        },
+        {
+          name: "Cache Create",
+          tokens: displayUsage.cacheCreate.tokens,
+          cost: displayUsage.cacheCreate.cost_usd,
+          color: TOKEN_COMPONENT_COLORS.cacheCreate,
+          show: displayUsage.cacheCreate.tokens > 0,
+        },
+        {
+          name: "Input",
+          tokens: displayUsage.input.tokens,
+          cost: inputCost,
+          color: TOKEN_COMPONENT_COLORS.input,
+          show: true,
+        },
+        {
+          name: "Output",
+          tokens: displayUsage.output.tokens,
+          cost: outputCost,
+          color: TOKEN_COMPONENT_COLORS.output,
+          show: true,
+        },
+        {
+          name: "Thinking",
+          tokens: displayUsage.reasoning.tokens,
+          cost: reasoningCost,
+          color: TOKEN_COMPONENT_COLORS.thinking,
+          show: displayUsage.reasoning.tokens > 0,
+        },
+      ].filter((c) => c.show)
+    : [];
+
   return (
     <div className="text-light font-primary text-[13px] leading-relaxed">
-      {hasUsageData && (
-        <div data-testid="context-usage-section" className="mt-2 mb-5">
-          <div data-testid="context-usage-list" className="flex flex-col gap-3">
-            {(() => {
-              const contextUsage = usage.liveUsage ?? usage.lastContextUsage;
-
-              const contextUsageData = contextUsage
-                ? calculateTokenMeterData(
-                    contextUsage,
-                    contextDisplayModel,
-                    has1MContext(contextDisplayModel),
-                    false,
-                    providersConfig
-                  )
-                : { segments: [], totalTokens: 0, totalPercentage: 0 };
-
-              // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
-              const contextWarning = (() => {
-                const maxTokens = contextUsageData.maxTokens;
-                if (!maxTokens || autoCompactThreshold >= 100 || !effectiveCompactionModel)
-                  return undefined;
-
-                const thresholdTokens = Math.round((autoCompactThreshold / 100) * maxTokens);
-                const compactionMaxTokens = getEffectiveContextLimit(
-                  effectiveCompactionModel,
-                  has1MContext(effectiveCompactionModel),
-                  providersConfig
-                );
-
-                if (compactionMaxTokens && compactionMaxTokens < thresholdTokens) {
-                  return { compactionModelMaxTokens: compactionMaxTokens, thresholdTokens };
-                }
-                return undefined;
-              })();
-
-              return (
-                <ContextUsageBar
-                  testId="context-usage"
-                  data={contextUsageData}
-                  model={contextDisplayModel}
-                  autoCompaction={{
-                    threshold: autoCompactThreshold,
-                    setThreshold: setAutoCompactThreshold,
-                    contextWarning,
-                  }}
-                />
-              );
-            })()}
-          </div>
-          <PostCompactionSection
-            workspaceId={workspaceId}
-            planPath={postCompactionState.planPath}
-            trackedFilePaths={postCompactionState.trackedFilePaths}
-            excludedItems={postCompactionState.excludedItems}
-            onToggleExclusion={postCompactionState.toggleExclusion}
-            runtimeConfig={runtimeConfig}
-          />
-        </div>
-      )}
-
-      {hasUsageData && (
-        <div data-testid="cost-section" className="mb-6">
-          <div className="flex flex-col gap-3">
-            {(() => {
-              // Helper to calculate cost percentage
-              const getCostPercentage = (cost: number | undefined, total: number | undefined) =>
-                total !== undefined && total > 0 && cost !== undefined ? (cost / total) * 100 : 0;
-
-              // Costs are already computed from shared model metadata when usage is recorded.
-              // Repricing again here drifts from tiered per-request accounting, especially for
-              // native 1M models and session aggregates that span multiple requests.
-              const inputCost = displayUsage?.input.cost_usd;
-              const outputCost = displayUsage?.output.cost_usd;
-              const reasoningCost = displayUsage?.reasoning.cost_usd;
-
-              // Calculate total cost (undefined if any cost is unknown)
-              const totalCost: number | undefined = displayUsage
-                ? inputCost !== undefined &&
-                  displayUsage.cached.cost_usd !== undefined &&
-                  displayUsage.cacheCreate.cost_usd !== undefined &&
-                  outputCost !== undefined &&
-                  reasoningCost !== undefined
-                  ? inputCost +
-                    displayUsage.cached.cost_usd +
-                    displayUsage.cacheCreate.cost_usd +
-                    outputCost +
-                    reasoningCost
-                  : undefined
-                : undefined;
-
-              // Calculate cost percentages from the shared metadata-driven costs.
-              const inputCostPercentage = getCostPercentage(inputCost, totalCost);
-              const cachedCostPercentage = getCostPercentage(
-                displayUsage?.cached.cost_usd,
-                totalCost
-              );
-              const cacheCreateCostPercentage = getCostPercentage(
-                displayUsage?.cacheCreate.cost_usd,
-                totalCost
-              );
-              const outputCostPercentage = getCostPercentage(outputCost, totalCost);
-              const reasoningCostPercentage = getCostPercentage(reasoningCost, totalCost);
-
-              const components = displayUsage
-                ? [
-                    {
-                      name: "Cache Read",
-                      tokens: displayUsage.cached.tokens,
-                      cost: displayUsage.cached.cost_usd,
-                      color: TOKEN_COMPONENT_COLORS.cached,
-                      show: displayUsage.cached.tokens > 0,
-                    },
-                    {
-                      name: "Cache Create",
-                      tokens: displayUsage.cacheCreate.tokens,
-                      cost: displayUsage.cacheCreate.cost_usd,
-                      color: TOKEN_COMPONENT_COLORS.cacheCreate,
-                      show: displayUsage.cacheCreate.tokens > 0,
-                    },
-                    {
-                      name: "Input",
-                      tokens: displayUsage.input.tokens,
-                      cost: inputCost,
-                      color: TOKEN_COMPONENT_COLORS.input,
-                      show: true,
-                    },
-                    {
-                      name: "Output",
-                      tokens: displayUsage.output.tokens,
-                      cost: outputCost,
-                      color: TOKEN_COMPONENT_COLORS.output,
-                      show: true,
-                    },
-                    {
-                      name: "Thinking",
-                      tokens: displayUsage.reasoning.tokens,
-                      cost: reasoningCost,
-                      color: TOKEN_COMPONENT_COLORS.thinking,
-                      show: displayUsage.reasoning.tokens > 0,
-                    },
-                  ].filter((c) => c.show)
-                : [];
-
-              return (
-                <>
-                  {totalCost !== undefined && totalCost >= 0 && (
-                    <div data-testid="cost-bar" className="relative mb-2 flex flex-col gap-1">
-                      <div
-                        data-testid="cost-header"
-                        className="mb-2 flex items-baseline justify-between"
-                      >
-                        <div className="flex items-center gap-3">
-                          <span className="text-foreground inline-flex items-baseline gap-1 font-medium">
-                            Cost
-                          </span>
-                          <ToggleGroup
-                            options={VIEW_MODE_OPTIONS}
-                            value={viewMode}
-                            onChange={setViewMode}
-                          />
-                        </div>
-                        <span className="text-muted flex items-center gap-1 text-xs tabular-nums">
-                          {formatCostWithDollar(totalCost)}
-                          {displayUsage?.hasUnknownCosts && (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <span className="text-warning cursor-help">?</span>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom" className="max-w-[200px]">
-                                Cost may be incomplete — some models in this session have unknown
-                                pricing
-                              </TooltipContent>
-                            </Tooltip>
-                          )}
-                        </span>
-                      </div>
-                      <div className="relative w-full">
-                        <div className="bg-border-light flex h-1.5 w-full overflow-hidden rounded-[3px]">
-                          {cachedCostPercentage > 0 && (
-                            <div
-                              className="h-full transition-[width] duration-300"
-                              style={{
-                                width: `${cachedCostPercentage}%`,
-                                background: TOKEN_COMPONENT_COLORS.cached,
-                              }}
-                            />
-                          )}
-                          {cacheCreateCostPercentage > 0 && (
-                            <div
-                              className="h-full transition-[width] duration-300"
-                              style={{
-                                width: `${cacheCreateCostPercentage}%`,
-                                background: TOKEN_COMPONENT_COLORS.cacheCreate,
-                              }}
-                            />
-                          )}
-                          <div
-                            className="h-full transition-[width] duration-300"
-                            style={{
-                              width: `${inputCostPercentage}%`,
-                              background: TOKEN_COMPONENT_COLORS.input,
-                            }}
-                          />
-                          <div
-                            className="h-full transition-[width] duration-300"
-                            style={{
-                              width: `${outputCostPercentage}%`,
-                              background: TOKEN_COMPONENT_COLORS.output,
-                            }}
-                          />
-                          {reasoningCostPercentage > 0 && (
-                            <div
-                              className="h-full transition-[width] duration-300"
-                              style={{
-                                width: `${reasoningCostPercentage}%`,
-                                background: TOKEN_COMPONENT_COLORS.thinking,
-                              }}
-                            />
-                          )}
-                        </div>
-                      </div>
-                    </div>
+      <div data-testid="cost-section" className="mb-6">
+        <div className="flex flex-col gap-3">
+          {totalCost !== undefined && totalCost >= 0 && (
+            <div data-testid="cost-bar" className="relative mb-2 flex flex-col gap-1">
+              <div data-testid="cost-header" className="mb-2 flex items-baseline justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="text-foreground inline-flex items-baseline gap-1 font-medium">
+                    Cost
+                  </span>
+                  <ToggleGroup
+                    options={VIEW_MODE_OPTIONS}
+                    value={viewMode}
+                    onChange={setViewMode}
+                  />
+                </div>
+                <span className="text-muted flex items-center gap-1 text-xs tabular-nums">
+                  {formatCostWithDollar(totalCost)}
+                  {displayUsage?.hasUnknownCosts && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="text-warning cursor-help">?</span>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="max-w-[200px]">
+                        Cost may be incomplete — some models in this session have unknown pricing
+                      </TooltipContent>
+                    </Tooltip>
                   )}
-                  <table
-                    data-testid="cost-details"
-                    className="mt-1 w-full border-collapse text-[11px]"
-                  >
-                    <thead>
-                      <tr className="border-border-light border-b">
-                        <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
-                          Component
-                        </th>
-                        <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
-                          Tokens
-                        </th>
-                        <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
-                          Cost
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {components.map((component) => {
-                        const costDisplay = formatCostWithDollar(component.cost);
-                        const isNegligible =
-                          component.cost !== undefined &&
-                          component.cost > 0 &&
-                          component.cost < 0.01;
+                </span>
+              </div>
+              <div className="relative w-full">
+                <div className="bg-border-light flex h-1.5 w-full overflow-hidden rounded-[3px]">
+                  {cachedCostPercentage > 0 && (
+                    <div
+                      className="h-full transition-[width] duration-300"
+                      style={{
+                        width: `${cachedCostPercentage}%`,
+                        background: TOKEN_COMPONENT_COLORS.cached,
+                      }}
+                    />
+                  )}
+                  {cacheCreateCostPercentage > 0 && (
+                    <div
+                      className="h-full transition-[width] duration-300"
+                      style={{
+                        width: `${cacheCreateCostPercentage}%`,
+                        background: TOKEN_COMPONENT_COLORS.cacheCreate,
+                      }}
+                    />
+                  )}
+                  <div
+                    className="h-full transition-[width] duration-300"
+                    style={{
+                      width: `${inputCostPercentage}%`,
+                      background: TOKEN_COMPONENT_COLORS.input,
+                    }}
+                  />
+                  <div
+                    className="h-full transition-[width] duration-300"
+                    style={{
+                      width: `${outputCostPercentage}%`,
+                      background: TOKEN_COMPONENT_COLORS.output,
+                    }}
+                  />
+                  {reasoningCostPercentage > 0 && (
+                    <div
+                      className="h-full transition-[width] duration-300"
+                      style={{
+                        width: `${reasoningCostPercentage}%`,
+                        background: TOKEN_COMPONENT_COLORS.thinking,
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+          <table data-testid="cost-details" className="mt-1 w-full border-collapse text-[11px]">
+            <thead>
+              <tr className="border-border-light border-b">
+                <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                  Component
+                </th>
+                <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                  Tokens
+                </th>
+                <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                  Cost
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {components.map((component) => {
+                const costDisplay = formatCostWithDollar(component.cost);
+                const isNegligible =
+                  component.cost !== undefined && component.cost > 0 && component.cost < 0.01;
 
-                        return (
-                          <tr key={component.name}>
-                            <td className="text-foreground py-1 pr-2 [&:last-child]:pr-0 [&:last-child]:text-right">
-                              <div className="flex items-center gap-1.5">
-                                <div
-                                  className="h-2 w-2 shrink-0 rounded-sm"
-                                  style={{ background: component.color }}
-                                />
-                                {component.name}
-                              </div>
-                            </td>
-                            <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
-                              {formatTokens(component.tokens)}
-                            </td>
-                            <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
-                              {isNegligible ? (
-                                <span className="text-dim italic">{costDisplay}</span>
-                              ) : (
-                                costDisplay
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </>
-              );
-            })()}
-          </div>
-        </div>
-      )}
-
-      {consumers.topFilePaths && consumers.topFilePaths.length > 0 && (
-        <div className="mb-4">
-          <h3 className="text-subtle m-0 mb-2 flex items-center gap-1 text-xs font-semibold tracking-wide uppercase">
-            File Breakdown
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="text-dim cursor-help text-[10px] font-normal">ⓘ</span>
-              </TooltipTrigger>
-              <TooltipContent align="start" className="max-w-72 whitespace-normal">
-                Token usage from file_read and file_edit tools, aggregated by file path. Consider
-                splitting large files to reduce context usage.
-              </TooltipContent>
-            </Tooltip>
-          </h3>
-          <FileBreakdown files={consumers.topFilePaths} totalTokens={consumers.totalTokens} />
-        </div>
-      )}
-
-      {consumers.consumers.length > 0 && (
-        <div className="mb-4">
-          <h3 className="text-subtle m-0 mb-2 text-xs font-semibold tracking-wide uppercase">
-            Consumer Breakdown
-          </h3>
-          {consumers.isCalculating ? (
-            <div className="text-secondary py-2 text-xs italic">Calculating...</div>
-          ) : (
-            <ConsumerBreakdown
-              consumers={consumers.consumers}
-              totalTokens={consumers.totalTokens}
-            />
+                return (
+                  <tr key={component.name}>
+                    <td className="text-foreground py-1 pr-2 [&:last-child]:pr-0 [&:last-child]:text-right">
+                      <div className="flex items-center gap-1.5">
+                        <div
+                          className="h-2 w-2 shrink-0 rounded-sm"
+                          style={{ background: component.color }}
+                        />
+                        {component.name}
+                      </div>
+                    </td>
+                    <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
+                      {formatTokens(component.tokens)}
+                    </td>
+                    <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
+                      {isNegligible ? (
+                        <span className="text-dim italic">{costDisplay}</span>
+                      ) : (
+                        costDisplay
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {viewMode === "session" && sessionModelRows.length > 0 && (
+            <table data-testid="cost-by-model" className="mt-4 w-full border-collapse text-[11px]">
+              <thead>
+                <tr className="border-border-light border-b">
+                  <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                    Model
+                  </th>
+                  <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                    Tokens
+                  </th>
+                  <th className="text-muted py-1 pr-2 text-left font-medium [&:last-child]:pr-0 [&:last-child]:text-right">
+                    Cost
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {sessionModelRows.map((row) => (
+                  <tr key={row.model}>
+                    <td className="text-foreground max-w-0 truncate py-1 pr-2 [&:last-child]:pr-0 [&:last-child]:text-right">
+                      {formatModelStringForDisplay(row.model)}
+                    </td>
+                    <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
+                      {formatTokens(row.tokens)}
+                    </td>
+                    <td className="text-foreground py-1 pr-2 tabular-nums [&:last-child]:pr-0 [&:last-child]:text-right">
+                      {formatCostWithDollar(row.cost)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           )}
         </div>
-      )}
-
-      {!consumers.isCalculating &&
-        consumers.consumers.length === 0 &&
-        (!consumers.topFilePaths || consumers.topFilePaths.length === 0) && (
-          <div className="text-dim py-2 text-xs italic">No consumer data available</div>
-        )}
+      </div>
     </div>
   );
 };
 
-// Memoize to prevent re-renders when parent (AIView) re-renders during streaming
-// Only re-renders when workspaceId changes or internal hook data (usage/consumers) updates
 export const CostsTab = React.memo(CostsTabComponent);

@@ -1,4 +1,5 @@
 import type { Preview } from "@storybook/react-vite";
+import { isPixel } from "@coder/pixel-storybook/storyapi";
 import { ThemeProvider, type ThemeMode } from "../src/browser/contexts/ThemeContext";
 import "../src/browser/styles/globals.css";
 import {
@@ -13,7 +14,7 @@ import { NOW } from "../src/browser/stories/storyTime";
 import { updatePersistedState } from "../src/browser/hooks/usePersistedState";
 import { configure } from "storybook/test";
 
-// Signal Storybook runtime to modules that need to stabilize for Chromatic
+// Signal Storybook runtime to modules that need to stabilize for visual snapshots
 // (e.g. the ChatInput placeholder tip carousel pins to its lead tip so
 // tip-list reorders don't cascade into baseline diffs across every story).
 // Set as early as possible so it precedes any story-module import that might
@@ -27,6 +28,26 @@ import { configure } from "storybook/test";
 // after userEvent.click can exceed the 1 s default.
 configure({ asyncUtilTimeout: 5000 });
 
+const PIXEL_STABILITY_CSS = `
+  *, *::before, *::after {
+    animation: none !important;
+    caret-color: transparent !important;
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+  /*
+   * Sticky elements (the chat composer dock, tool headers, sidebars) often rest at a
+   * fractional offset inside a composited scroller. Chromium rasterizes them either
+   * in their own layer or with the scroller depending on timing, which snaps their
+   * text/borders a device pixel apart between otherwise identical captures (seen as
+   * a composer "jitter" diff on App/MCP Identity/Chat/Plugin Server Details).
+   * Forcing a dedicated layer makes the snapping path deterministic.
+   */
+  .sticky {
+    will-change: transform;
+  }
+`;
+
 const STORYBOOK_FONTS_READY_TIMEOUT_MS = 2500;
 
 let fontsReadyPromise: Promise<void> | null = null;
@@ -39,7 +60,7 @@ function ensureStorybookFontsReady(): Promise<void> {
 
     const fonts = document.fonts;
 
-    // Trigger load of layout-affecting fonts so Chromatic doesn't snapshot mid font-swap.
+    // Trigger load of layout-affecting fonts so snapshots aren't captured mid font-swap.
     await Promise.allSettled([
       fonts.load("400 14px 'Geist'"),
       fonts.load("600 14px 'Geist'"),
@@ -53,9 +74,21 @@ function ensureStorybookFontsReady(): Promise<void> {
 
   return fontsReadyPromise;
 }
-// Mock Date.now() globally for deterministic snapshots
-// Components using Date.now() for elapsed time calculations need stable reference
-Date.now = () => NOW;
+// Freeze the wall clock globally for deterministic snapshots. Components using
+// Date.now() for elapsed-time math need a stable reference, and so does every
+// zero-arg `new Date()`: mocking only Date.now left `new Date()` on the real
+// clock, so fixtures stamped with it (e.g. createWorkspace's default createdAt)
+// sorted by whichever millisecond each call landed in. That reordered the
+// sidebar in App/ChatLoading/Replay between otherwise identical captures.
+const RealDate = Date;
+globalThis.Date = new Proxy(RealDate, {
+  construct: (target, args: unknown[], newTarget: new (...args: unknown[]) => unknown) =>
+    Reflect.construct(target, args.length === 0 ? [NOW] : args, newTarget) as object,
+  // `Date()` called as a function returns the current time as a string.
+  apply: () => new RealDate(NOW).toString(),
+  get: (target, property, receiver) =>
+    property === "now" ? () => NOW : Reflect.get(target, property, receiver),
+});
 
 // Disable tutorials by default in Storybook to prevent them from interfering with stories
 // Individual stories can override this by setting localStorage before rendering
@@ -93,10 +126,11 @@ function collapseProjects() {
 }
 
 // Clear workspace drafts to ensure deterministic snapshots.
-// Drafts persist in localStorage and can leak between stories causing flaky diffs.
-// Uses updatePersistedState to notify subscribers (WorkspaceContext uses listener: true).
+// The draft list lives on the (mock) backend now; stories seed it through the legacy localStorage
+// list, which the DraftStore imports. Remove a leftover legacy list so only the story's own seed
+// is imported (the key is read-and-remove only, so writing "{}" would shadow the seed).
 function clearWorkspaceDrafts() {
-  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
+  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
 }
 
 const preview: Preview = {
@@ -130,10 +164,9 @@ const preview: Preview = {
   decorators: [
     // Theme provider
     (Story, context) => {
-      // Default to dark if mode not set (e.g., Chromatic headless browser defaults to light)
       const mode = (context.globals.theme as ThemeMode | undefined) ?? "dark";
 
-      // Apply theme synchronously before React renders - critical for Chromatic snapshots
+      // Apply theme synchronously before React renders - critical for visual snapshots
       if (typeof document !== "undefined") {
         document.documentElement.dataset.theme = mode;
         document.documentElement.style.colorScheme = mode;
@@ -160,9 +193,13 @@ const preview: Preview = {
       clearWorkspaceDrafts();
 
       return (
-        <ThemeProvider forcedTheme={mode}>
-          <Story />
-        </ThemeProvider>
+        <>
+          {/* Pixel captures semantic states, never arbitrary animation frames or blinking carets. */}
+          {isPixel() && <style data-pixel-stability>{PIXEL_STABILITY_CSS}</style>}
+          <ThemeProvider forcedTheme={mode}>
+            <Story />
+          </ThemeProvider>
+        </>
       );
     },
   ],
@@ -199,12 +236,13 @@ const preview: Preview = {
           styles: { width: "1280px", height: "800px" },
           type: "mobile",
         },
-      },
-    },
-    chromatic: {
-      modes: {
-        dark: { theme: "dark" },
-        light: { theme: "light" },
+        wide: {
+          // Wide enough to trigger the @container query that reveals the
+          // sticky plan TOC next to a centered max-w-4xl transcript.
+          name: "Desktop wide",
+          styles: { width: "1600px", height: "900px" },
+          type: "desktop",
+        },
       },
     },
   },

@@ -8,6 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
+import { TIME_FILTER_PLACEHOLDER } from "./sqlTimeFilter";
 
 interface SavedQuerySqlDialogProps {
   open: boolean;
@@ -28,7 +29,9 @@ export function SavedQuerySqlDialog(props: SavedQuerySqlDialogProps) {
         <DialogHeader>
           <DialogTitle>{`Edit SQL — ${props.label}`}</DialogTitle>
           <DialogDescription>
-            Saving updates this panel and reruns it with the edited query.
+            Saving updates this panel and reruns it with the edited query. Use{" "}
+            <code className="text-foreground">{TIME_FILTER_PLACEHOLDER}</code> in a WHERE clause to
+            filter by the dashboard&apos;s selected date range.
           </DialogDescription>
         </DialogHeader>
 

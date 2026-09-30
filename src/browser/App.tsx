@@ -16,9 +16,19 @@ import {
   readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
-import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { openServerWindow } from "./utils/openServerWindow";
+import {
+  applyFastModeToggle,
+  getFastModeProvider,
+  isFastModeActive,
+} from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
+import {
+  computePinnedMoveOrderForWorkspace,
+  type PinnedMoveDirection,
+} from "./utils/ui/pinnedReorder";
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
@@ -32,6 +42,7 @@ import { showBrowserNotification } from "./utils/ui/showBrowserNotification";
 import { useStableReference, compareMaps } from "./hooks/useStableReference";
 import { CommandRegistryProvider, useCommandRegistry } from "./contexts/CommandRegistryContext";
 import { useOpenTerminal } from "./hooks/useOpenTerminal";
+import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
 import { useTheme, type ThemePreference } from "./contexts/ThemeContext";
 import { CommandPalette } from "./components/CommandPalette/CommandPalette";
@@ -40,10 +51,19 @@ import {
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
 } from "@/constants/layout";
+import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
 
-import { getTopLevelProjectEntries } from "@/common/utils/subProjects";
-import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  getTopLevelProjectEntries,
+  resolveWorkspaceCreationScope,
+} from "@/common/utils/subProjects";
+import {
+  THINKING_LEVELS,
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
@@ -51,32 +71,39 @@ import {
   getAgentsInitNudgeKey,
   getModelKey,
   getNotifyOnResponseKey,
+  getProjectScopeId,
   getThinkingLevelByModelKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
 } from "@/common/constants/storage";
-import { normalizeSelectedModel, normalizeToCanonical } from "@/common/utils/ai/models";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
+import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
+import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
-import { AboutDialogProvider } from "./contexts/AboutDialogContext";
+import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
+import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
 import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
@@ -94,16 +121,22 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
+import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
+import { usePopoverError } from "@/browser/hooks/usePopoverError";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -139,23 +172,22 @@ function AppInner() {
     loading,
     setWorkspaceMetadata,
     removeWorkspace,
+    removeSubagent,
     updateWorkspaceTitle,
+    reorderPinnedWorkspaces,
     selectedWorkspace,
     setSelectedWorkspace,
     pendingNewWorkspaceProject,
     pendingNewWorkspaceSubProjectPath,
     pendingNewWorkspaceDraftId,
+    createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
-  const {
-    currentWorkspaceId,
-    currentSettingsSection,
-    isAnalyticsOpen,
-    navigateToAnalytics,
-    navigateFromAnalytics,
-  } = useRouter();
+  const { currentWorkspaceId, isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics } =
+    useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
+  const { open: openAboutDialog } = useAboutDialog();
   const { confirm: confirmDialog } = useConfirmDialog();
   const setThemePreference = useCallback(
     (nextTheme: ThemePreference) => {
@@ -164,7 +196,25 @@ function AppInner() {
     [setTheme]
   );
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
+  const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
+
+  useEffect(() => {
+    setSupportedUpdateChannels([]);
+    if (!api) return;
+
+    let active = true;
+    api.update
+      .getChannel()
+      .then(({ supportedChannels }) => {
+        if (active) setSupportedUpdateChannels(supportedChannels);
+      })
+      .catch(console.error);
+    return () => {
+      active = false;
+    };
+  }, [api]);
 
   const {
     userProjects,
@@ -189,6 +239,8 @@ function AppInner() {
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -224,6 +276,15 @@ function AppInner() {
   }, [sidebarCollapsed]);
   const creationProjectPath =
     !selectedWorkspace && !currentWorkspaceId ? pendingNewWorkspaceProject : null;
+  // Sub-project creation shares the owning parent's model preference, matching ChatInput.
+  const creationScope = creationProjectPath
+    ? resolveWorkspaceCreationScope(
+        creationProjectPath,
+        userProjects,
+        pendingNewWorkspaceSubProjectPath
+      )
+    : null;
+  const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
 
   // History navigation (back/forward)
   const navigate = useNavigate();
@@ -248,14 +309,53 @@ function AppInner() {
   // Get workspace store for command palette
   const workspaceStore = useWorkspaceStoreRaw();
 
+  const handleWorkspaceCreated = (
+    metadata: FrontendWorkspaceMetadata,
+    options?: WorkspaceCreatedOptions
+  ) => {
+    workspaceStore.addWorkspace(metadata);
+    setWorkspaceMetadata((prev) => new Map(prev).set(metadata.id, metadata));
+
+    if (options?.autoNavigate !== false) {
+      let createdSelection: WorkspaceSelection | null = null;
+      setSelectedWorkspace((current) => {
+        if (current !== null) return current;
+        createdSelection = toWorkspaceSelection(metadata);
+        return createdSelection;
+      });
+
+      if (createdSelection) {
+        if (options?.markPendingInitialSend !== false) {
+          workspaceStore.markPendingInitialSend(
+            metadata.id,
+            options?.pendingStreamModel ?? null,
+            options?.pendingUserMessage,
+            options?.pendingCreationInit
+          );
+        } else if (options?.pendingCreationInit) {
+          // Sends without a user turn (initial /goal) still run init: keep the creation card
+          // on screen until the workspace's own init-start replaces it.
+          workspaceStore.markPendingCreationInit(metadata.id, options.pendingCreationInit);
+        }
+      }
+    }
+
+    telemetry.workspaceCreated(metadata.id, getRuntimeTypeForTelemetry(metadata.runtimeConfig));
+  };
+
   // Track telemetry when workspace selection changes
   const prevWorkspaceRef = useRef<WorkspaceSelection | null>(null);
   // Ref for selectedWorkspace to access in callbacks without stale closures
   const selectedWorkspaceRef = useRef(selectedWorkspace);
   selectedWorkspaceRef.current = selectedWorkspace;
-  // Ref for route-level workspace visibility to avoid stale closure in response callbacks
-  const currentWorkspaceIdRef = useRef(currentWorkspaceId);
-  currentWorkspaceIdRef.current = currentWorkspaceId;
+  const isSettingsOpenRef = useRef(isSettingsOpen);
+  isSettingsOpenRef.current = isSettingsOpen;
+  // The settings modal covers the chat, so a workspace behind it is selected but not visible:
+  // keep lastRead from advancing and keep its completion notifications.
+  const visibleChatWorkspaceId = isSettingsOpen ? null : currentWorkspaceId;
+  // Ref for chat visibility to avoid stale closure in response callbacks
+  const visibleChatWorkspaceIdRef = useRef(visibleChatWorkspaceId);
+  visibleChatWorkspaceIdRef.current = visibleChatWorkspaceId;
   useEffect(() => {
     const prev = prevWorkspaceRef.current;
     if (prev && selectedWorkspace && prev.workspaceId !== selectedWorkspace.workspaceId) {
@@ -265,8 +365,8 @@ function AppInner() {
   }, [selectedWorkspace, telemetry]);
 
   // Track last-read timestamps for unread indicators.
-  // Read-marking is gated on chat-route visibility (currentWorkspaceId).
-  useUnreadTracking(selectedWorkspace, currentWorkspaceId);
+  // Read-marking is gated on chat visibility.
+  useUnreadTracking(selectedWorkspace, visibleChatWorkspaceId);
 
   const workspaceMetadataRef = useRef(workspaceMetadata);
   useEffect(() => {
@@ -280,14 +380,14 @@ function AppInner() {
       // Update window title with workspace title (or name for legacy workspaces)
       const metadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
       const workspaceTitle = metadata?.title ?? metadata?.name ?? selectedWorkspace.workspaceId;
-      const title = `${workspaceTitle} - ${selectedWorkspace.projectName} - mux`;
+      const title = `${workspaceTitle} - ${selectedWorkspace.projectName} - ${XUM_PRODUCT_SLUG}`;
       // Set document.title locally for browser mode, call backend for Electron
       document.title = title;
       void api?.window.setTitle({ title });
     } else {
       // Set document.title locally for browser mode, call backend for Electron
-      document.title = "mux";
-      void api?.window.setTitle({ title: "mux" });
+      document.title = XUM_PRODUCT_SLUG;
+      void api?.window.setTitle({ title: XUM_PRODUCT_SLUG });
     }
   }, [selectedWorkspace, workspaceMetadata, api]);
 
@@ -386,11 +486,23 @@ function AppInner() {
   /**
    * Get the selected model for a workspace, preserving explicit gateway prefixes.
    */
-  const getModelForWorkspace = useCallback((workspaceId: string): string => {
-    const defaultModel = getDefaultModel();
-    const rawModel = readPersistedState<string>(getModelKey(workspaceId), defaultModel);
-    return normalizeSelectedModel(rawModel || defaultModel);
-  }, []);
+  const getModelForWorkspace = useCallback(
+    (workspaceId: string): string => {
+      const defaultModel = getDefaultModel();
+      const preferredModel = readPersistedState<string | null>(getModelKey(workspaceId), null);
+      const metadata = workspaceMetadata.get(workspaceId);
+      const persistedAgentId =
+        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
+          .trim()
+          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+      const agentId =
+        metadata?.parentWorkspaceId != null && metadata.agentId
+          ? metadata.agentId
+          : persistedAgentId;
+      return resolveEffectiveComposerModel(preferredModel, metadata, agentId, defaultModel);
+    },
+    [workspaceMetadata]
+  );
 
   const getThinkingLevelForWorkspace = useCallback(
     (workspaceId: string): ThinkingLevel => {
@@ -404,14 +516,14 @@ function AppInner() {
         return THINKING_LEVELS.includes(scoped) ? scoped : "off";
       }
 
-      // Migration: fall back to legacy per-model thinking and seed the workspace-scoped key.
+      // Keep this render-time palette lookup pure. ThinkingProvider owns migration to the
+      // workspace-scoped key, while the palette can read legacy values as a fallback.
       const model = getModelForWorkspace(workspaceId);
       const legacy = readPersistedState<ThinkingLevel | undefined>(
         getThinkingLevelByModelKey(model),
         undefined
       );
       if (legacy !== undefined && THINKING_LEVELS.includes(legacy)) {
-        updatePersistedState(scopedKey, legacy);
         return legacy;
       }
 
@@ -423,7 +535,6 @@ function AppInner() {
           undefined
         );
         if (canonicalLegacy !== undefined && THINKING_LEVELS.includes(canonicalLegacy)) {
-          updatePersistedState(scopedKey, canonicalLegacy);
           return canonicalLegacy;
         }
       }
@@ -432,6 +543,31 @@ function AppInner() {
     },
     [getModelForWorkspace]
   );
+
+  // Pro mode is Responses-only; the palette command hides under chatCompletions
+  // and on non-passthrough routes (mirroring the send path's header gating).
+  const {
+    config: providersConfig,
+    refresh: refreshProvidersConfig,
+    updateOptimistically,
+  } = useProvidersConfig();
+  const routing = useRouting();
+  const getRouteForModel = useCallback(
+    (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
+    [routing]
+  );
+
+  const getReasoningModeForWorkspace = useCallback((workspaceId: string): OpenAIReasoningMode => {
+    if (!workspaceId) {
+      return "standard";
+    }
+    const stored = readPersistedState<OpenAIReasoningMode | null>(
+      getReasoningModeKey(workspaceId),
+      null
+    );
+    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
+    return coerceOpenAIReasoningMode(stored) ?? "standard";
+  }, []);
 
   const setThinkingLevelFromPalette = useCallback(
     (workspaceId: string, level: ThinkingLevel) => {
@@ -442,13 +578,20 @@ function AppInner() {
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
       const model = getModelForWorkspace(workspaceId);
       const key = getThinkingLevelKey(workspaceId);
+      const reasoningMode = getReasoningModeForWorkspace(workspaceId);
 
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
+      markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
+      // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
+      setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
 
       type WorkspaceAISettingsByAgentCache = Partial<
-        Record<string, { model: string; thinkingLevel: ThinkingLevel }>
+        Record<
+          string,
+          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+        >
       >;
 
       const normalizedAgentId =
@@ -463,34 +606,16 @@ function AppInner() {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            [normalizedAgentId]: { model, thinkingLevel: normalized },
+            [normalizedAgentId]: { model, thinkingLevel: normalized, reasoningMode },
           };
         },
         {}
       );
 
-      // Persist to backend so the palette change follows the workspace across devices.
       if (api) {
-        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-          model,
-          thinkingLevel: normalized,
-        });
-
-        api.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel: normalized },
-          })
-          .then((result) => {
-            if (!result.success) {
-              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            }
-          })
-          .catch(() => {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            // Best-effort only.
-          });
+        // Mid-turn change: also apply to the active turn's next model step so
+        // the palette/keybind path behaves like the selector (ThinkingProvider).
+        requestActiveTurnThinkingLevel(api, workspaceId, normalized);
       }
 
       // Dispatch toast notification event for UI feedback
@@ -502,10 +627,111 @@ function AppInner() {
         );
       }
     },
-    [api, getModelForWorkspace]
+    [api, getModelForWorkspace, getReasoningModeForWorkspace]
   );
 
+  // Keep palette choices local until a user message sends the full settings.
+  const toggleReasoningModeFromPalette = useCallback(
+    (workspaceId: string) => {
+      if (!workspaceId) {
+        return;
+      }
+
+      const next: OpenAIReasoningMode =
+        getReasoningModeForWorkspace(workspaceId) === "pro" ? "standard" : "pro";
+      const model = getModelForWorkspace(workspaceId);
+      const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
+
+      updatePersistedState(getReasoningModeKey(workspaceId), next);
+      markAiSelectionIntent(workspaceId, "reasoningMode", next);
+
+      type WorkspaceAISettingsByAgentCache = Partial<
+        Record<
+          string,
+          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+        >
+      >;
+
+      const normalizedAgentId =
+        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
+          .trim()
+          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+
+      updatePersistedState<WorkspaceAISettingsByAgentCache>(
+        getWorkspaceAISettingsByAgentKey(workspaceId),
+        (prev) => {
+          const record: WorkspaceAISettingsByAgentCache =
+            prev && typeof prev === "object" ? prev : {};
+          return {
+            ...record,
+            [normalizedAgentId]: { model, thinkingLevel, reasoningMode: next },
+          };
+        },
+        {}
+      );
+    },
+    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
+  );
+
+  const getFastModeActive = useCallback(() => {
+    const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+    if (!scopeId || providersConfig == null) return false;
+
+    const model = getModelForWorkspace(scopeId);
+    const provider = getFastModeProvider(model, {
+      providersConfig,
+      resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+    });
+    return provider != null && isFastModeActive(provider, providersConfig[provider]);
+  }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
+
+  const fastModeToggleInFlightRef = useRef(false);
+  const toggleFastMode = useCallback(async () => {
+    const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+    if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+
+    // Creation composers use the same project-scoped model preference as their selector,
+    // so the global shortcut remains available before the first workspace exists.
+    // Serialize requests so a quick double press cannot compute two writes from stale config.
+    fastModeToggleInFlightRef.current = true;
+    const model = getModelForWorkspace(scopeId);
+    const provider = getFastModeProvider(model, {
+      providersConfig,
+      resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+    });
+    if (provider == null) {
+      fastModeToggleInFlightRef.current = false;
+      return;
+    }
+
+    try {
+      const patch = await applyFastModeToggle(api.providers, provider, providersConfig[provider]);
+      if (patch) {
+        updateOptimistically(provider, patch);
+      } else {
+        await refreshProvidersConfig();
+      }
+    } catch {
+      await refreshProvidersConfig();
+    } finally {
+      fastModeToggleInFlightRef.current = false;
+    }
+  }, [
+    api,
+    creationScopeId,
+    getModelForWorkspace,
+    getRouteForModel,
+    providersConfig,
+    refreshProvidersConfig,
+    selectedWorkspace,
+    updateOptimistically,
+  ]);
+
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
+
+  const openNewScratchFromPalette = useCallback(() => {
+    createWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY);
+  }, [createWorkspaceDraft]);
 
   const openNewWorkspaceFromPalette = useCallback(
     (projectPath: string) => {
@@ -674,10 +900,29 @@ function AppInner() {
     [setSelectedWorkspace]
   );
 
+  // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
+  // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
+  const paletteRemoveError = usePopoverError();
   const removeWorkspaceFromPalette = useCallback(
-    async (workspaceId: string) => removeWorkspace(workspaceId),
-    [removeWorkspace]
+    async (workspaceId: string) => {
+      const result = await removeWorkspace(workspaceId);
+      if (!result.success) {
+        paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
+      }
+      return result;
+    },
+    [removeWorkspace, paletteRemoveError]
   );
+  const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
+    const error = await confirmAndRemoveSubagent({
+      api,
+      confirm: confirmDialog,
+      removeSubagent,
+      workspaceId,
+      title,
+    });
+    if (error != null) paletteRemoveError.showError(workspaceId, error);
+  };
 
   const updateTitleFromPalette = useCallback(
     async (workspaceId: string, newTitle: string) => updateWorkspaceTitle(workspaceId, newTitle),
@@ -706,25 +951,75 @@ function AppInner() {
     [handleNavigateWorkspace]
   );
 
+  // Move the selected pinned chat within its visual pinned block. Shares the
+  // move-order helper with the sidebar keybind handler so palette and keyboard
+  // behavior can't drift apart.
+  const movePinnedChatFromPalette = useCallback(
+    (direction: PinnedMoveDirection) => {
+      if (!selectedWorkspace) return;
+      const meta = workspaceMetadata.get(selectedWorkspace.workspaceId);
+      if (!meta) return;
+      const order = computePinnedMoveOrderForWorkspace(
+        meta,
+        direction,
+        sortedWorkspacesByProject,
+        userProjects,
+        readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+          ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
+          : false
+      );
+      if (order) void reorderPinnedWorkspaces(order);
+    },
+    [
+      selectedWorkspace,
+      workspaceMetadata,
+      sortedWorkspacesByProject,
+      userProjects,
+      multiProjectWorkspacesEnabled,
+      reorderPinnedWorkspaces,
+    ]
+  );
+
   registerParamsRef.current = {
     userProjects,
     workspaceMetadata,
     selectedWorkspace,
+    creationScopeId,
     themePreference,
     getThinkingLevel: getThinkingLevelForWorkspace,
     onSetThinkingLevel: setThinkingLevelFromPalette,
+    getReasoningMode: getReasoningModeForWorkspace,
+    onToggleReasoningMode: toggleReasoningModeFromPalette,
+    getFastMode: getFastModeActive,
+    onToggleFastMode: toggleFastMode,
+    autoModelRoutingEnabled,
+    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // in the picker rows the way a row click does.
+    getAutoRouting: (scopeId, dimension) =>
+      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    onSetAutoRouting: (scopeId, dimension, active) =>
+      setAutoRoutingChoice(scopeId, dimension, active),
+    getEffectiveComposerModel: getModelForWorkspace,
+    providersConfig,
+    getRouteForModel,
+    getEffectiveRouteForModel: (modelString) => routing.resolveEffectiveRoute(modelString),
+    getMinThinkingOverride,
+    onStartScratchCreation: openNewScratchFromPalette,
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
+    agentPluginsEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
     onRemoveWorkspace: removeWorkspaceFromPalette,
+    onRemoveSubagent: removeSubagentFromPalette,
     onUpdateTitle: updateTitleFromPalette,
     onAddProject: addProjectFromPalette,
     onRemoveProject: removeProjectFromPalette,
     onToggleSidebar: toggleSidebarFromPalette,
     onNavigateWorkspace: navigateWorkspaceFromPalette,
+    onMovePinnedChat: movePinnedChatFromPalette,
     onOpenWorkspaceInTerminal: (workspaceId, runtimeConfig) => {
       // Best-effort only. Palette actions should never throw.
       void openWorkspaceInTerminal(workspaceId, runtimeConfig).catch(() => {
@@ -734,6 +1029,9 @@ function AppInner() {
     onToggleTheme: toggleTheme,
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
+    onOpenAbout: openAboutDialog,
+    remoteConnection: window.api?.remoteConnection,
+    supportedUpdateChannels,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
       void applySlotToWorkspace(workspaceId, slot).catch(() => {
@@ -790,7 +1088,10 @@ function AppInner() {
         return;
       }
 
-      if (matchesKeybind(e, KEYBINDS.NEXT_WORKSPACE)) {
+      if (matchesKeybind(e, KEYBINDS.NEW_SCRATCH_CHAT)) {
+        e.preventDefault();
+        openNewScratchFromPalette();
+      } else if (matchesKeybind(e, KEYBINDS.NEXT_WORKSPACE)) {
         e.preventDefault();
         handleNavigateWorkspace("next");
       } else if (matchesKeybind(e, KEYBINDS.PREV_WORKSPACE)) {
@@ -803,7 +1104,7 @@ function AppInner() {
         e.preventDefault();
         if (isCommandPaletteOpen) {
           closeCommandPalette();
-        } else {
+        } else if (!isDialogOpen()) {
           // Alternate palette shortcut opens in command mode (with ">") while the
           // primary Ctrl/Cmd+Shift+P shortcut opens default workspace-switch mode.
           const initialQuery = matchesKeybind(e, KEYBINDS.OPEN_COMMAND_PALETTE_ACTIONS)
@@ -811,12 +1112,22 @@ function AppInner() {
             : undefined;
           openCommandPalette(initialQuery);
         }
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
+        e.preventDefault();
+        // Modals trap focus and hide the page behind them; don't change hidden page UI.
+        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
-        setSidebarCollapsed((prev) => !prev);
+        if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
+        // An open palette would stay behind the settings modal and swallow its first Escape.
+        closeCommandPalette();
         openSettings();
+      } else if (matchesKeybind(e, KEYBINDS.OPEN_SERVER_WINDOW) && window.api?.remoteConnection) {
+        // Desktop-only: browser mode and server windows have no remote connection bridge.
+        e.preventDefault();
+        openServerWindow(window.api.remoteConnection, openSettings).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_ANALYTICS)) {
         e.preventDefault();
         if (isAnalyticsOpen) {
@@ -836,17 +1147,28 @@ function AppInner() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
+    openNewScratchFromPalette,
     handleNavigateWorkspace,
     setSidebarCollapsed,
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
+    toggleFastMode,
     openSettings,
     isAnalyticsOpen,
     navigateToAnalytics,
     navigateFromAnalytics,
     navigate,
   ]);
+  // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
+  useEffect(() => {
+    const bridge = window.api?.remoteConnection;
+    if (!bridge) return;
+    return bridge.onOpenServerWindowRequested(() => {
+      openServerWindow(bridge, openSettings).catch(() => undefined);
+    });
+  }, [openSettings]);
+
   // Mouse back/forward buttons (buttons 3 and 4)
   useEffect(() => {
     const handleMouseNavigation = (e: MouseEvent) => {
@@ -920,6 +1242,7 @@ function AppInner() {
         const iterator = await api.menu.onOpenSettings(undefined, { signal });
         for await (const _ of iterator) {
           if (signal.aborted) break;
+          closeCommandPalette();
           openSettings();
         }
       } catch {
@@ -928,7 +1251,7 @@ function AppInner() {
     })();
 
     return () => abortController.abort();
-  }, [api, openSettings]);
+  }, [api, openSettings, closeCommandPalette]);
 
   // Handle workspace fork switch event
   useEffect(() => {
@@ -1003,11 +1326,10 @@ function AppInner() {
       }
 
       // Only mark read when the user is actively viewing this workspace's chat.
-      // Checking currentWorkspaceIdRef ensures we don't advance lastRead when
-      // a non-chat route (e.g. /settings) is active — the workspace remains
-      // "selected" but the chat content is not visible.
+      // A non-chat route or the settings modal hides the chat even though the
+      // workspace remains "selected".
       const isChatVisible =
-        document.hasFocus() && currentWorkspaceIdRef.current === event.workspaceId;
+        document.hasFocus() && visibleChatWorkspaceIdRef.current === event.workspaceId;
       if (event.completedAt != null && isChatVisible) {
         updatePersistedState(getWorkspaceLastReadKey(event.workspaceId), event.completedAt);
       }
@@ -1017,9 +1339,11 @@ function AppInner() {
       }
 
       // Skip notification if the selected workspace is focused (Slack-like behavior).
-      // Notification suppression intentionally follows selection state, not chat-route visibility.
+      // Notification suppression follows selection state, except that settings covers the chat.
       const isWorkspaceFocused =
-        document.hasFocus() && selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
+        document.hasFocus() &&
+        !isSettingsOpenRef.current &&
+        selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
       if (isWorkspaceFocused) {
         return;
       }
@@ -1068,7 +1392,10 @@ function AppInner() {
 
   return (
     <>
-      <div className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[min(env(safe-area-inset-bottom,0px),40px)] pl-[env(safe-area-inset-left)]">
+      {/* mobile-bottom-inset-host: narrow layouts give this box's bottom inset up to a column that
+          reserves its own clearance, keyed off the column rather than the route so surfaces without
+          one still get it here. The sidebar is position: fixed with its own inset at these widths. */}
+      <div className="bg-surface-primary mobile-layout mobile-bottom-inset-host flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[min(env(safe-area-inset-bottom,0px),40px)] pl-[env(safe-area-inset-left)]">
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
@@ -1082,14 +1409,10 @@ function AppInner() {
           <WindowsToolchainBanner />
           <RosettaBanner />
           <div className="mobile-layout flex flex-1 overflow-hidden">
-            {/* Route-driven settings and analytics render in the main pane so project/workspace navigation stays visible. */}
+            {/* Route-driven analytics renders in the main pane so project/workspace navigation stays
+                visible. Settings is a modal over whatever page it was opened from. */}
             {isAnalyticsOpen ? (
               <AnalyticsDashboard
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
-            ) : currentSettingsSection ? (
-              <SettingsPage
                 leftSidebarCollapsed={sidebarCollapsed}
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
@@ -1146,69 +1469,29 @@ function AppInner() {
                   onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 />
               )
+            ) : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY ? (
+              <ScratchPage
+                leftSidebarCollapsed={sidebarCollapsed}
+                onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                pendingDraftId={pendingNewWorkspaceDraftId}
+                onWorkspaceCreated={handleWorkspaceCreated}
+              />
             ) : creationProjectPath ? (
-              (() => {
-                const projectPath = creationProjectPath;
-                const projectName =
-                  projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "Project";
-                return (
-                  <ProjectPage
-                    projectPath={projectPath}
-                    projectName={projectName}
-                    leftSidebarCollapsed={sidebarCollapsed}
-                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                    pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
-                    pendingDraftId={pendingNewWorkspaceDraftId}
-                    onWorkspaceCreated={(metadata, options) => {
-                      // IMPORTANT: Add workspace to store FIRST (synchronous) to ensure
-                      // the store knows about it before React processes the state updates.
-                      // This prevents race conditions where the UI tries to access the
-                      // workspace before the store has created its aggregator.
-                      workspaceStore.addWorkspace(metadata);
-
-                      // Add to workspace metadata map (triggers React state update)
-                      setWorkspaceMetadata((prev) => new Map(prev).set(metadata.id, metadata));
-
-                      if (options?.autoNavigate !== false) {
-                        let createdSelection: WorkspaceSelection | null = null;
-                        setSelectedWorkspace((current) => {
-                          if (current !== null) {
-                            // If the user picked another workspace before create/send resolved,
-                            // keep their explicit selection and skip the optimistic starting barrier.
-                            return current;
-                          }
-
-                          createdSelection = toWorkspaceSelection(metadata);
-                          return createdSelection;
-                        });
-
-                        // WorkspaceContext resolves functional selection updates synchronously
-                        // against its latest ref, so by the time setSelectedWorkspace() returns we
-                        // know whether this creation actually won and can safely mark the
-                        // optimistic starting barrier outside the updater callback.
-                        if (createdSelection && options?.markPendingInitialSend !== false) {
-                          workspaceStore.markPendingInitialSend(
-                            metadata.id,
-                            options?.pendingStreamModel ?? null
-                          );
-                        }
-                      }
-
-                      // Track telemetry
-                      telemetry.workspaceCreated(
-                        metadata.id,
-                        getRuntimeTypeForTelemetry(metadata.runtimeConfig)
-                      );
-
-                      // Note: No need to call clearPendingWorkspaceCreation() here.
-                      // Navigating to the workspace URL automatically clears the pending
-                      // state since pendingNewWorkspaceProject is derived from the URL.
-                    }}
-                  />
-                );
-              })()
+              <ProjectPage
+                projectPath={creationProjectPath}
+                projectName={
+                  creationProjectPath.split("/").pop() ??
+                  creationProjectPath.split("\\").pop() ??
+                  "Project"
+                }
+                leftSidebarCollapsed={sidebarCollapsed}
+                onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
+                pendingDraftId={pendingNewWorkspaceDraftId}
+                onWorkspaceCreated={handleWorkspaceCreated}
+              />
             ) : (
-              // The dedicated Mux home page was removed. Keep `/` as a minimal shell so
+              // The dedicated Xum home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,
               // without reintroducing a sticky dashboard screen.
               <RootRouteShell
@@ -1220,6 +1503,12 @@ function AppInner() {
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <SettingsPage />
+        <PopoverError
+          error={paletteRemoveError.error}
+          prefix="Failed to remove workspace"
+          onDismiss={paletteRemoveError.clearError}
+        />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
           isOpen={isProjectCreateModalOpen}

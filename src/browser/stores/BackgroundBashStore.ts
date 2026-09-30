@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
 import { isAbortError } from "@/browser/utils/isAbortError";
@@ -8,6 +8,26 @@ const EMPTY_SET = new Set<string>();
 const EMPTY_PROCESSES: BackgroundProcessInfo[] = [];
 const BASH_RETRY_BASE_MS = 250;
 const BASH_RETRY_MAX_MS = 5_000;
+
+function areMonitorSnapshotsEqual(
+  a: BackgroundProcessInfo["monitor"],
+  b: BackgroundProcessInfo["monitor"]
+): boolean {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  return (
+    a.filter === b.filter &&
+    a.filter_exclude === b.filter_exclude &&
+    a.cooldown_ms === b.cooldown_ms &&
+    a.max_events === b.max_events &&
+    a.totalMatches === b.totalMatches &&
+    a.droppedLines === b.droppedLines &&
+    a.stopped === b.stopped &&
+    a.pendingWakeKind === b.pendingWakeKind &&
+    a.lastLines.length === b.lastLines.length &&
+    a.lastLines.every((line, index) => line === b.lastLines[index])
+  );
+}
 
 function areProcessesEqual(a: BackgroundProcessInfo[], b: BackgroundProcessInfo[]): boolean {
   if (a === b) return true;
@@ -19,8 +39,12 @@ function areProcessesEqual(a: BackgroundProcessInfo[], b: BackgroundProcessInfo[
       proc.pid === other.pid &&
       proc.script === other.script &&
       proc.displayName === other.displayName &&
+      // A synthesized wake-only row and a manager-backed row can otherwise compare equal,
+      // deduping the transition that restores (or removes) the View output action.
+      proc.synthesized === other.synthesized &&
       proc.startTime === other.startTime &&
       proc.status === other.status &&
+      areMonitorSnapshotsEqual(proc.monitor, other.monitor) &&
       proc.exitCode === other.exitCode
     );
   });
@@ -40,11 +64,19 @@ export class BackgroundBashStore {
   private processesStore = new MapStore<string, BackgroundProcessInfo[]>();
   private foregroundIdsStore = new MapStore<string, Set<string>>();
   private terminatingIdsStore = new MapStore<string, Set<string>>();
+  private stateKnownStore = new MapStore<string, boolean>();
 
   private processesCache = new Map<string, BackgroundProcessInfo[]>();
   private autoBackgroundFetches = new Map<string, Promise<void>>();
   private foregroundIdsCache = new Map<string, Set<string>>();
   private terminatingIdsCache = new Map<string, Set<string>>();
+  // Workspaces whose background-bash state is KNOWN (the live subscription
+  // delivered at least one snapshot, or it failed and we self-healed).
+  // The chat view's first-paint barrier (useChatViewDataReady) waits on this
+  // so the banner can never pop in after the transcript reveals: an empty
+  // process list is only renderable as "no banner" once it is known-empty
+  // rather than not-yet-loaded. Kept across unsubscribes (last-known state).
+  private stateKnownWorkspaces = new Set<string>();
 
   private subscriptions = new Map<
     string,
@@ -59,6 +91,30 @@ export class BackgroundBashStore {
   private subscriptionCounts = new Map<string, number>();
   private retryAttempts = new Map<string, number>();
   private retryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Drops every workspace's cached process state. For a host that switches between servers (the
+   * VS Code webview): workspace IDs can repeat across servers, so one server's rows must never be
+   * shown, or terminated, against another. Call it before installing the new server's client.
+   */
+  clearCachedState(): void {
+    const workspaceIds = new Set([
+      ...this.processesCache.keys(),
+      ...this.foregroundIdsCache.keys(),
+      ...this.terminatingIdsCache.keys(),
+      ...this.stateKnownWorkspaces,
+    ]);
+    this.processesCache.clear();
+    this.foregroundIdsCache.clear();
+    this.terminatingIdsCache.clear();
+    this.stateKnownWorkspaces.clear();
+    for (const workspaceId of workspaceIds) {
+      this.processesStore.bump(workspaceId);
+      this.foregroundIdsStore.bump(workspaceId);
+      this.terminatingIdsStore.bump(workspaceId);
+      this.stateKnownStore.bump(workspaceId);
+    }
+  }
 
   setClient(client: APIClient | null): void {
     this.client = client;
@@ -109,6 +165,34 @@ export class BackgroundBashStore {
       this.untrackSubscription(workspaceId);
     };
   };
+
+  /**
+   * Subscribe to the "state known" signal. Like the data subscriptions, this
+   * ref-counts the live backend subscription — so the chat view's readiness
+   * barrier both observes AND drives the initial snapshot fetch, keeping the
+   * per-workspace subscription warm for the whole chat pane lifetime even
+   * while the banner itself renders nothing.
+   */
+  subscribeStateKnown = (workspaceId: string, listener: () => void): (() => void) => {
+    this.trackSubscription(workspaceId);
+    const unsubscribe = this.stateKnownStore.subscribeKey(workspaceId, listener);
+    return () => {
+      unsubscribe();
+      this.untrackSubscription(workspaceId);
+    };
+  };
+
+  isStateKnown(workspaceId: string): boolean {
+    return this.stateKnownStore.get(workspaceId, () => this.stateKnownWorkspaces.has(workspaceId));
+  }
+
+  private markStateKnown(workspaceId: string): void {
+    if (this.stateKnownWorkspaces.has(workspaceId)) {
+      return;
+    }
+    this.stateKnownWorkspaces.add(workspaceId);
+    this.stateKnownStore.bump(workspaceId);
+  }
 
   getProcesses(workspaceId: string): BackgroundProcessInfo[] {
     return this.processesStore.get(
@@ -271,12 +355,12 @@ export class BackgroundBashStore {
 
     this.clearRetry(workspaceId);
 
-    this.processesCache.delete(workspaceId);
-    this.foregroundIdsCache.delete(workspaceId);
-    this.terminatingIdsCache.delete(workspaceId);
-    this.processesStore.delete(workspaceId);
-    this.foregroundIdsStore.delete(workspaceId);
-    this.terminatingIdsStore.delete(workspaceId);
+    // Intentionally KEEP the per-workspace caches and the state-known flag.
+    // Revisiting a workspace then renders the last-known state synchronously
+    // at first paint (the fresh subscription reconciles within a tick) instead
+    // of re-learning "are there background bashes?" after paint — which made
+    // the banner pop in and shift the transcript on every workspace switch.
+    // The retained data is a handful of small lists per visited workspace.
   }
 
   private clearRetry(workspaceId: string): void {
@@ -372,10 +456,18 @@ export class BackgroundBashStore {
               this.terminatingIdsStore.bump(workspaceId);
             }
           }
+
+          // Mark known AFTER applying the snapshot so observers that wake on
+          // the known-flip read fully-populated caches.
+          this.markStateKnown(workspaceId);
         }
       } catch (err) {
         if (!signal.aborted && !isAbortError(err)) {
           console.error("Failed to subscribe to background bash state:", err);
+          // Self-heal: a broken subscription must not hold the chat view's
+          // first-paint barrier — treat the state as known (empty) and let
+          // the retry deliver real data later.
+          this.markStateKnown(workspaceId);
         }
       } finally {
         void subscription.iterator?.return?.();
@@ -429,28 +521,57 @@ export function useBackgroundBashStoreRaw(): BackgroundBashStore {
   return getStoreInstance();
 }
 
+// The subscribe callbacks below start and stop the workspace's backend subscription. An unstable
+// callback makes React re-subscribe on every render, which drops the last subscriber and restarts
+// the backend stream; the VS Code webview is not React-Compiler compiled, so it re-rendered the
+// background processes strip into a new stream on every chat flush (#5092). These useCallbacks
+// are for correctness, not performance.
 export function useBackgroundProcesses(workspaceId: string | undefined): BackgroundProcessInfo[] {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) => (workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined),
-    () => (workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES)
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined,
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES
   );
 }
 
 export function useForegroundBashToolCallIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeForegroundIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET
   );
 }
 
 export function useBackgroundBashTerminatingIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeTerminatingIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET
+  );
+}
+
+/**
+ * True once this workspace's background-bash state is known (first snapshot
+ * received this app session, or self-healed after a subscription failure).
+ * Subscribing also keeps the live backend subscription alive — see
+ * subscribeStateKnown.
+ */
+export function useBackgroundBashStateKnown(workspaceId: string): boolean {
+  const store = getStoreInstance();
+  return useSyncExternalStore(
+    (listener) => store.subscribeStateKnown(workspaceId, listener),
+    () => store.isStateKnown(workspaceId)
   );
 }

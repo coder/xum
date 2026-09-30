@@ -9,6 +9,15 @@ export interface WorkspaceDragItem {
   workspaceId: string;
   projectPath: string;
   currentSectionId?: string;
+  /** Whether the dragged row is pinned; gates pinned-reorder drop targets. */
+  pinned?: boolean;
+  /**
+   * Identifies the visual pinned block the row was dragged from (project +
+   * section, or the multi-project section). Pinned reordering only accepts
+   * drops within the same block; explicit so multi-project rows (whose
+   * projectPath is their primary project, not the shared bucket) still match.
+   */
+  pinnedReorderGroup?: string;
 }
 
 interface WorkspaceSectionDropZoneProps {
@@ -38,7 +47,10 @@ export const WorkspaceSectionDropZone: React.FC<WorkspaceSectionDropZoneProps> =
         // Can only drop if from same project and moving to different section
         return item.projectPath === projectPath && item.currentSectionId !== sectionId;
       },
-      drop: (item: WorkspaceDragItem) => {
+      drop: (item: WorkspaceDragItem, monitor) => {
+        // A nested row-level drop target (pinned reorder) may have already
+        // handled this drop; never double-handle it as a section move.
+        if (monitor.didDrop()) return;
         onDrop(item.workspaceId, sectionId);
       },
       collect: (monitor) => ({

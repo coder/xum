@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
+import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -22,13 +23,23 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import {
+  combineGitNoRepoAutomationEnvs,
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+  LOCAL_DISCOVERY_AUTOMATION_ERROR,
+} from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
+import { emitChatEventBestEffort } from "./toolUtils";
+import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
-  "[IMPORTANT]\n\nDO NOT use `cat`, `rg`, or `grep` to read files. Use the `file_read` tool instead (supports offset/limit paging). Bash output may be truncated or auto-filtered, which can hide parts of the file.";
+  "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
 
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
@@ -813,23 +824,18 @@ function formatResult(
 }
 
 /**
- * Shell-escape a string for safe use in bash commands (single-quote wrapping).
- */
-function shellEscape(str: string): string {
-  return `'${str.replace(/'/g, "'\\''")}'`;
-}
-
-/**
- * Build script prelude that sources .mux/tool_env if present.
+ * Build script prelude that sources .xum/tool_env if present.
  * Returns empty string if no tool_env path is provided.
  */
+const TOOL_ENV_PATH_ENV = "XUM_INTERNAL_TOOL_ENV_PATH";
+
 function buildToolEnvPrelude(toolEnvPath: string | null): string {
   if (!toolEnvPath) return "";
-  // Source the tool_env file; fail with clear error if sourcing fails
-  return `if ! source ${shellEscape(toolEnvPath)} 2>&1; then
-  echo "mux: failed to source ${toolEnvPath}" >&2
+  return `if ! source "$${TOOL_ENV_PATH_ENV}" 2>&1; then
+  echo "mux: failed to source $${TOOL_ENV_PATH_ENV}" >&2
   exit 1
 fi
+unset ${TOOL_ENV_PATH_ENV}
 `;
 }
 
@@ -866,6 +872,20 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
 }
 
 /**
+ * Local discovery treats `git -C <path>` exit 128 as "not a repository" and returns only the
+ * static env, so a missing directory would silently skip the repo's driver config. Fail
+ * instead; remote discovery already fails on a missing cwd.
+ */
+async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
+  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  if (!stats?.isDirectory()) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: new Error(`Repository directory does not exist: ${repoPath}`),
+    });
+  }
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -886,7 +906,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildBashToolDescription(config.cwd, config.projects ?? []),
     inputSchema: TOOL_DEFINITIONS.bash.schema,
     execute: async (
-      { script, timeout_secs, run_in_background, display_name },
+      { script, timeout_secs, run_in_background, display_name, monitor },
       { abortSignal, toolCallId }
     ): Promise<BashToolResult> => {
       // Validate script input
@@ -904,16 +924,49 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           ? CAT_FILE_READ_NOTICE
           : undefined;
 
-      // Look up .mux/tool_env to source before script (for direnv, nvm, venv, etc.)
+      // Look up .xum/tool_env to source before script (for direnv, nvm, venv, etc.)
       // Skip for untrusted projects — tool_env is repo-controlled code
       const toolEnvPath =
         config.trusted && config.runtime ? await getToolEnvPath(config.runtime, config.cwd) : null;
       const toolEnvPrelude = buildToolEnvPrelude(toolEnvPath);
 
-      // Neutralize git hooks for untrusted projects — prevent repository-controlled
-      // hooks from executing when the model runs git subcommands (for example,
-      // `git commit` or `git am`) through this bash tool.
-      const hooksEnv = config.trusted !== true ? GIT_NO_HOOKS_ENV : {};
+      // Neutralize repo-controlled git automation when trust is absent or the
+      // benchmark kill-switch is active. Repo-aware discovery covers drivers
+      // selected by highest-precedence .git/info/attributes on every runtime.
+      let hooksEnv: Record<string, string> = {};
+      if (!gitHooksAllowed(config.trusted)) {
+        // getProjects() returns one entry even for a single-project workspace, whose cwd is
+        // the checkout itself (or a directory inside it). Only a multi-project cwd (the
+        // _workspaces/<name> container with one <projectName> symlink per checkout) is joined
+        // with project names. The threshold matches isMultiProject().
+        const repoPaths =
+          config.projects != null && config.projects.length > 1
+            ? [
+                ...new Set(
+                  config.projects.map((project) => path.join(config.cwd, project.projectName))
+                ),
+              ]
+            : [config.cwd];
+        const repoEnvs: Array<Record<string, string>> = [];
+        for (const repoPath of repoPaths) {
+          if (config.runtime instanceof LocalBaseRuntime) {
+            await assertLocalRepoDirectoryExists(repoPath);
+            repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
+          } else {
+            repoEnvs.push(
+              config.runtime != null
+                ? await gitNoRepoAutomationEnvForRuntimeRepo(
+                    config.runtime,
+                    repoPath,
+                    abortSignal,
+                    true
+                  )
+                : gitNoRepoAutomationEnv()
+            );
+          }
+        }
+        hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
+      }
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.
@@ -936,6 +989,15 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           fileReadNotice
         );
 
+      if (monitor != null && !run_in_background) {
+        return withNotice({
+          success: false,
+          error: "monitor requires run_in_background=true",
+          exitCode: -1,
+          wall_duration_ms: 0,
+        });
+      }
+
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
           return withNotice({
@@ -947,6 +1009,43 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           });
         }
 
+        let monitorConfig: BackgroundProcessMonitorConfig | undefined;
+        let monitorResult:
+          | NonNullable<Extract<BashToolResult, { success: true; taskId: string }>["monitor"]>
+          | undefined;
+        if (monitor != null) {
+          let pattern: RegExp;
+          try {
+            pattern = new RegExp(monitor.filter);
+          } catch (error) {
+            return withNotice({
+              success: false,
+              error: `Invalid monitor filter regex: ${getErrorMessage(error)}`,
+              exitCode: -1,
+              wall_duration_ms: 0,
+            });
+          }
+
+          const filterExclude = monitor.filter_exclude ?? false;
+          const cooldownMs = monitor.cooldown_ms ?? 1000;
+          const wakeOnExit = monitor.wake_on_exit ?? true;
+          monitorConfig = {
+            filter: monitor.filter,
+            pattern,
+            exclude: filterExclude,
+            cooldownMs,
+            wakeOnExit,
+            ...(monitor.max_events != null ? { maxEvents: monitor.max_events } : {}),
+          };
+          monitorResult = {
+            filter: monitor.filter,
+            filter_exclude: filterExclude,
+            cooldown_ms: cooldownMs,
+            wake_on_exit: wakeOnExit,
+            ...(monitor.max_events != null ? { max_events: monitor.max_events } : {}),
+          };
+        }
+
         const startTime = performance.now();
         const spawnResult = await config.backgroundProcessManager.spawn(
           config.runtime,
@@ -954,10 +1053,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            // Match foreground bash behavior: muxEnv is present and secrets override it.
-            env: { ...hooksEnv, ...(config.muxEnv ?? {}), ...(config.secrets ?? {}) },
+            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
+            ...(monitorConfig ? { monitor: monitorConfig } : {}),
             timeoutSecs: timeout_secs, // Auto-terminate after this duration
           }
         );
@@ -973,11 +1073,14 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
         return withNotice({
           success: true,
-          output: `Background process started with ID: ${spawnResult.processId}`,
+          output: monitorResult
+            ? `Background process started with ID: ${spawnResult.processId}\nMonitor armed. Matching lines will wake this workspace; no polling required.`
+            : `Background process started with ID: ${spawnResult.processId}`,
           exitCode: 0,
           wall_duration_ms: Math.round(performance.now() - startTime),
           taskId: toBashTaskId(spawnResult.processId),
           backgroundProcessId: spawnResult.processId,
+          ...(monitorResult ? { monitor: monitorResult } : {}),
         });
       }
 
@@ -1030,7 +1133,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...hooksEnv, ...config.muxEnv, ...config.secrets, ...NON_INTERACTIVE_ENV_VARS },
+        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
       });
@@ -1112,14 +1216,18 @@ ${scriptWithEnv}`;
         if (liveOutputStopped) return;
         if (text.length === 0) return;
 
-        config.emitChatEvent({
-          type: "bash-output",
-          workspaceId: config.workspaceId,
-          toolCallId,
-          text,
-          isError,
-          timestamp: Date.now(),
-        } satisfies BashOutputEvent);
+        emitChatEventBestEffort(
+          config,
+          {
+            type: "bash-output",
+            workspaceId: config.workspaceId,
+            toolCallId,
+            text,
+            isError,
+            timestamp: Date.now(),
+          } satisfies BashOutputEvent,
+          "bash"
+        );
       };
 
       const flushLiveOutput = (): void => {
@@ -1294,6 +1402,9 @@ ${scriptWithEnv}`;
       // normal completion path so we don't drop any last-millisecond output (especially
       // on Windows, where stream/exit events can arrive slightly out of order).
       const BACKGROUND_EXIT_GRACE_MS = 100;
+      // Bounded wait for a terminated command's exit after a failed migration (#4805), like the
+      // MCP stdio kill join: a removal's cleanup() waits on the migration until then.
+      const FAILED_MIGRATION_EXIT_JOIN_MS = 5_000;
 
       let exitCode: number;
       try {
@@ -1308,6 +1419,28 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Tracked from here until the command is registered below, terminated after a failed
+          // migration, or found exited: a cleanup() in between waits for it (#4805), including
+          // the awaited name claim and exit grace (#4967). Refused (not admitted) once cleanup
+          // has started for the workspace (#4967).
+          using migration =
+            config.backgroundProcessManager && config.workspaceId
+              ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+              : undefined;
+          // Claim the migrated record's name across backends BEFORE the exit check below
+          // (#4878): the claim may wait on another backend's spawn lock, and a command that
+          // exits during that wait must take the normal completion path, not be reported as
+          // backgrounded (or as a failed migration). The lock stays held until the migrated
+          // record directory exists (end of this block). A refused migration claims nothing:
+          // cleanup() is waiting for it, and the lock can be held for its whole timeout.
+          const claim =
+            config.backgroundProcessManager && config.workspaceId && migration?.admitted
+              ? await config.backgroundProcessManager.claimMigrationProcessId(
+                  config.workspaceId,
+                  safeDisplayName
+                )
+              : null;
+          await using claimLock = claim?.success ? claim : null;
           const didExit =
             exitCodeResolved ||
             (await Promise.race([
@@ -1318,6 +1451,12 @@ ${scriptWithEnv}`;
             ]));
 
           if (didExit) {
+            // Nothing was written under the claimed name. Release it before draining, which
+            // can outlast the exit (e.g. a grandchild holding stdout open).
+            claimLock?.releaseName();
+            await claimLock?.[Symbol.asyncDispose]();
+            // Nor is the command migrating any more; cleanup() must not wait for the drain.
+            migration?.[Symbol.dispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
@@ -1346,9 +1485,14 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
-            if (config.backgroundProcessManager && config.workspaceId) {
-              const processId =
-                config.backgroundProcessManager.generateUniqueProcessId(safeDisplayName);
+            let migrationError =
+              migration?.admitted === false
+                ? "the workspace's background processes are being cleaned up"
+                : claim?.success === false
+                  ? claim.error
+                  : "background process manager unavailable";
+            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+              const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1368,12 +1512,14 @@ ${scriptWithEnv}`;
                   processId,
                   script,
                   existingOutput: lines,
+                  // Abort is detached from the tool call once backgrounded, so the wrapped
+                  // controller now only fires through the handle's terminate (#4760).
+                  kill: () => wrappedAbortController.abort(),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );
 
               if (migrateResult.success) {
-                // Register the migrated process with the manager
                 config.backgroundProcessManager.registerMigratedProcess(
                   migrateResult.handle,
                   processId,
@@ -1382,6 +1528,8 @@ ${scriptWithEnv}`;
                   migrateResult.outputDir,
                   safeDisplayName
                 );
+                // The processes map now holds the name; the reservation has done its job.
+                claimLock.releaseName();
 
                 return withNotice({
                   success: true,
@@ -1392,14 +1540,37 @@ ${scriptWithEnv}`;
                   backgroundProcessId: processId,
                 });
               }
-              // Migration failed, fall through to simple return
+              // Migration failed, fall through to fail-closed termination below. Keep the
+              // name reserved until the aborted process's exit actually settles; if it never
+              // does, leaking the name for the session is the safe fail-closed behavior.
+              migrationError = migrateResult.error;
+              void execStream.exitCode
+                .catch(() => undefined)
+                .finally(() => claimLock.releaseName());
             }
 
-            // Fallback: return without process ID (no manager or migration failed)
+            // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
+            // manager entry nor a durable spawn record, so archive gates and crash-orphan scans
+            // could not see the surviving command — a snapshot archive could remove the checkout
+            // (or a Coder-stop archive stop the VM) under it. Fail closed: terminate the process
+            // instead of letting it run untracked. (Backgrounding requires the manager-backed
+            // foreground registration, so the manager-unavailable branch is defensive only.)
+            wrappedAbortController.abort();
+            stdoutForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
+            stderrForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
+            // Keep the migration pending (the `using` above) until the terminated command exits,
+            // so a removal's cleanup() cannot delete the checkout while it is still stopping.
+            await raceWithAbortAndTimeout(execStream.exitCode, {
+              timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+            }).catch(() => undefined);
             return withNotice({
-              success: true,
-              output: `Process sent to background. It will continue running.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
-              exitCode: 0,
+              success: false,
+              error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
+              exitCode: -1,
               wall_duration_ms,
             });
           }

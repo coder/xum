@@ -7,9 +7,10 @@ import { createSkillsCatalogReadTool } from "./skills_catalog_read";
 import * as catalogFetch from "./skillsCatalogFetch";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 const VALID_SKILL_MD = `---

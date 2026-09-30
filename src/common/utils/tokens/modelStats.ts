@@ -41,7 +41,12 @@ const PROVIDER_KEY_ALIASES: Record<string, string> = {
   "github-copilot": "github_copilot",
 };
 
-function parseNum(value: unknown): number | null {
+/**
+ * Runtime numeric semantics for raw catalog values (accepts numeric strings
+ * with comma separators). Exported so update-models validation compares
+ * magnitudes exactly as getModelStats would parse them.
+ */
+export function parseNum(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
@@ -70,9 +75,10 @@ function hasTieredPricing(data: RawModelData): boolean {
 }
 
 /**
- * Validates raw model data has required fields
+ * Whether raw model metadata is usable for stats resolution. Exported so the
+ * update-models validation applies the same bar as getModelStats.
  */
-function isValidModelData(data: RawModelData): boolean {
+export function hasUsableTokenLimits(data: RawModelData): boolean {
   const maxInputTokens = parseNum(data.max_input_tokens);
   return maxInputTokens != null && maxInputTokens > 0;
 }
@@ -130,46 +136,134 @@ function stripVersionDateSuffix(modelName: string): string {
   return modelName.replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, "");
 }
 
+function stripLatestSuffix(modelName: string): string {
+  return modelName.replace(/-latest$/, "");
+}
+
 /**
- * Generates lookup keys for a model string with multiple naming patterns
- * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model"
+ * Generates lookup keys for a model string with multiple naming patterns.
+ * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model".
+ * Exported so capability resolution shares the exact same key preference:
+ * provider-scoped entries must win over bare-name entries in both lookups,
+ * otherwise a model can inherit stats and capabilities from different entries.
  */
-function generateLookupKeys(modelString: string): string[] {
+export function generateModelLookupKeys(modelString: string): string[] {
   const colonIndex = modelString.indexOf(":");
   const provider = colonIndex !== -1 ? modelString.slice(0, colonIndex) : "";
   const modelName = colonIndex !== -1 ? modelString.slice(colonIndex + 1) : modelString;
+  // Keep the original catalog key first — LiteLLM ships mixed-case ids like
+  // `deepinfra/Qwen/Qwen3-14B`. Lowercase variants are only fallbacks so
+  // user-facing ids like `XAI:Grok-4.5` still resolve.
   const litellmProvider = PROVIDER_KEY_ALIASES[provider] ?? provider;
+  const lowercaseProvider = litellmProvider.toLowerCase();
   const unversionedModelName = stripVersionDateSuffix(modelName);
+  const familyModelName = stripLatestSuffix(unversionedModelName);
+  const lowercaseModelName = modelName.toLowerCase();
+  const lowercaseUnversionedModelName = unversionedModelName.toLowerCase();
+  const lowercaseFamilyModelName = familyModelName.toLowerCase();
 
   const keys: string[] = [];
+  const seen = new Set<string>();
+  const push = (key: string) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+  const pushProviderScoped = (providerKey: string, name: string) => {
+    push(`${providerKey}/${name}`);
+    push(`${providerKey}/${name}-cloud`);
+  };
 
   // Prefer provider-scoped matches first so provider-specific limits win over generic entries.
   if (provider) {
-    keys.push(`${litellmProvider}/${modelName}`, `${litellmProvider}/${modelName}-cloud`);
+    pushProviderScoped(litellmProvider, modelName);
 
     // Version-pinned model IDs like gpt-5.5-2026-04-23 should fall back to the
     // base model entry when models-extra/models.json only publish the family key.
     if (unversionedModelName !== modelName) {
-      keys.push(
-        `${litellmProvider}/${unversionedModelName}`,
-        `${litellmProvider}/${unversionedModelName}-cloud`
-      );
+      pushProviderScoped(litellmProvider, unversionedModelName);
+    }
+
+    // Servable rolling aliases like grok-4.5-latest inherit the family entry.
+    if (familyModelName !== unversionedModelName) {
+      pushProviderScoped(litellmProvider, familyModelName);
     }
 
     // Fallback: strip size suffix for base model lookup
     // "ollama:gpt-oss:20b" → "ollama/gpt-oss"
     if (modelName.includes(":")) {
       const baseModel = modelName.split(":")[0];
-      keys.push(`${litellmProvider}/${baseModel}`);
+      push(`${litellmProvider}/${baseModel}`);
+    }
+
+    // Case-insensitive fallbacks after exact catalog keys.
+    if (lowercaseProvider !== litellmProvider || lowercaseModelName !== modelName) {
+      pushProviderScoped(lowercaseProvider, lowercaseModelName);
+    }
+    if (lowercaseUnversionedModelName !== lowercaseModelName) {
+      pushProviderScoped(lowercaseProvider, lowercaseUnversionedModelName);
+    }
+    if (lowercaseFamilyModelName !== lowercaseUnversionedModelName) {
+      pushProviderScoped(lowercaseProvider, lowercaseFamilyModelName);
+    }
+    if (lowercaseModelName.includes(":")) {
+      push(`${lowercaseProvider}/${lowercaseModelName.split(":")[0]}`);
     }
   }
 
-  keys.push(modelName);
+  push(modelName);
   if (unversionedModelName !== modelName) {
-    keys.push(unversionedModelName);
+    push(unversionedModelName);
+  }
+  if (familyModelName !== unversionedModelName) {
+    push(familyModelName);
+  }
+  if (lowercaseModelName !== modelName) {
+    push(lowercaseModelName);
+  }
+  if (lowercaseUnversionedModelName !== lowercaseModelName) {
+    push(lowercaseUnversionedModelName);
+  }
+  if (lowercaseFamilyModelName !== lowercaseUnversionedModelName) {
+    push(lowercaseFamilyModelName);
   }
 
   return keys;
+}
+
+export interface ResolvedRawModelEntry {
+  /** The models-extra/models.json key the stats actually come from. */
+  key: string;
+  data: RawModelData;
+}
+
+/**
+ * Resolves the raw override/catalog entry backing a model string, preserving
+ * getModelStats' precedence: models-extra across every lookup key first, then
+ * models.json. Exported so the Treat-as catalog can exclude ids whose stats
+ * would resolve from a different entry than the row represents.
+ */
+export function resolveRawModelEntry(modelString: string): ResolvedRawModelEntry | null {
+  const normalized = normalizeToCanonical(modelString);
+  const lookupKeys = generateModelLookupKeys(normalized);
+
+  // Check models-extra.ts first (overrides for models with incorrect upstream data)
+  for (const key of lookupKeys) {
+    const data = (modelsExtra as Record<string, RawModelData>)[key];
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
+    }
+  }
+
+  // Fall back to main models.json
+  for (const key of lookupKeys) {
+    const data = (modelsData as Record<string, RawModelData>)[key];
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -178,26 +272,8 @@ function generateLookupKeys(modelString: string): string[] {
  * @returns ModelStats or null if model not found
  */
 export function getModelStats(modelString: string): ModelStats | null {
-  const normalized = normalizeToCanonical(modelString);
-  const lookupKeys = generateLookupKeys(normalized);
-
-  // Check models-extra.ts first (overrides for models with incorrect upstream data)
-  for (const key of lookupKeys) {
-    const data = (modelsExtra as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
-    }
-  }
-
-  // Fall back to main models.json
-  for (const key of lookupKeys) {
-    const data = (modelsData as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
-    }
-  }
-
-  return null;
+  const entry = resolveRawModelEntry(modelString);
+  return entry === null ? null : extractModelStats(entry.data);
 }
 
 export function getModelStatsResolved(

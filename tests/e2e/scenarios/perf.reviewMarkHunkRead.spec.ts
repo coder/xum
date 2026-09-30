@@ -1,5 +1,6 @@
 import { electronTest as test, electronExpect as expect } from "../electronTest";
-import { REVIEW_SORT_ORDER_KEY, getReviewStateKey } from "../../../src/common/constants/storage";
+import { getXumE2EEnv } from "../env";
+import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   readReactProfileSnapshot,
@@ -7,9 +8,9 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import { seedLargeReviewDiff } from "../utils/reviewPerfFixture";
+import { LARGE_CHANGE_ROOT, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
 test.skip(
   ({ browserName }) => browserName !== "chromium",
@@ -17,7 +18,7 @@ test.skip(
 );
 
 test.describe("immersive review performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: mark hunk as read in immersive review for a large diff", async ({
     page,
@@ -26,7 +27,6 @@ test.describe("immersive review performance profiling", () => {
   }, testInfo) => {
     const diffSummary = seedLargeReviewDiff(workspace.demoProject.workspacePath);
     const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspace.demoProject.workspaceId);
-    const reviewStateKey = getReviewStateKey(workspace.demoProject.workspaceId);
 
     // The demo repo has no origin/main, so the perf scenario pins Review to HEAD before
     // the panel mounts. That keeps the scenario focused on a real local git diff.
@@ -60,6 +60,12 @@ test.describe("immersive review performance profiling", () => {
     const immersiveReview = page.getByTestId("immersive-review-view");
     await expect(immersiveReview).toBeVisible({ timeout: 20_000 });
 
+    const firstFilePath = `${LARGE_CHANGE_ROOT}/group-01/bucket-01/probe-001.ts`;
+    const secondFilePath = `${LARGE_CHANGE_ROOT}/group-01/bucket-01/probe-002.ts`;
+    await expect(immersiveReview.getByText(firstFilePath)).toBeVisible({ timeout: 20_000 });
+    await expect(immersiveReview).toHaveAttribute("data-selected-hunk-position", "1", {
+      timeout: 20_000,
+    });
     const markReadButton = immersiveReview.getByRole("button", { name: "Mark hunk as read" });
     await expect(markReadButton).toBeVisible({ timeout: 20_000 });
 
@@ -68,25 +74,29 @@ test.describe("immersive review performance profiling", () => {
     const runLabel = `review-immersive-mark-read-${diffSummary.fileCount}-files-${diffSummary.hunkCount}-hunks`;
     const chromeProfile = await withChromeProfiles(page, { label: runLabel }, async () => {
       await markReadButton.dispatchEvent("click");
-      await expect(
-        immersiveReview.getByRole("button", { name: "Mark hunk as unread" })
-      ).toBeVisible({ timeout: 20_000 });
+      await expect(immersiveReview.getByText(secondFilePath)).toBeVisible({ timeout: 20_000 });
+      await expect(immersiveReview).toHaveAttribute("data-selected-hunk-position", "1", {
+        timeout: 20_000,
+      });
+      await expect(immersiveReview.getByRole("button", { name: "Mark hunk as read" })).toBeVisible({
+        timeout: 20_000,
+      });
+      // Read state lives in the backend review-state store now; the completion bar reflects
+      // the composed store view the mark-read click updated.
       await expect
         .poll(
-          () =>
-            page.evaluate((key) => {
-              const raw = window.localStorage.getItem(key);
-              if (!raw) {
-                return 0;
-              }
-              const parsed = JSON.parse(raw) as {
-                readState?: Record<string, { isRead?: boolean }>;
-              };
-              return Object.values(parsed.readState ?? {}).filter((entry) => entry.isRead).length;
-            }, reviewStateKey),
+          async () => {
+            // aria-valuenow is a rounded percentage: one hunk out of this fixture's 1000 rounds
+            // to 0, so read the exact reviewed line count from aria-valuetext ("... (reviewed/total)").
+            const valueText = await immersiveReview
+              .getByRole("progressbar", { name: "Review completion by changed lines" })
+              .getAttribute("aria-valuetext");
+            const reviewedLines = /\((\d+)\/\d+\)$/.exec(valueText ?? "")?.[1];
+            return reviewedLines === undefined ? 0 : Number(reviewedLines);
+          },
           { timeout: 20_000 }
         )
-        .toBe(1);
+        .toBeGreaterThan(0);
     });
 
     const reactProfileSnapshot = await readReactProfileSnapshot(page);

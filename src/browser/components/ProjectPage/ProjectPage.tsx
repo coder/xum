@@ -2,6 +2,7 @@ import React, { useRef, useCallback, useState, useEffect } from "react";
 import { Menu } from "lucide-react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { cn } from "@/common/lib/utils";
+import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { ChatInput } from "@/browser/features/ChatInput/index";
@@ -10,11 +11,11 @@ import { ProjectMCPOverview } from "../ProjectMCPOverview/ProjectMCPOverview";
 import { ArchivedWorkspaces } from "../ArchivedWorkspaces/ArchivedWorkspaces";
 import { useAPI } from "@/browser/contexts/API";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { getErrorMessage } from "@/common/utils/errors";
 import { GitInitBanner } from "../GitInitBanner/GitInitBanner";
 import { ConfiguredProvidersBar } from "../ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { ConfigureProvidersPrompt } from "../ConfigureProvidersPrompt/ConfigureProvidersPrompt";
-import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { AgentsInitBanner } from "../AgentsInitBanner/AgentsInitBanner";
 import {
   usePersistedState,
@@ -22,14 +23,16 @@ import {
   readPersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
+  ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
   getAgentIdKey,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
-  getDraftScopeId,
-  getInputKey,
-  getPendingScopeId,
+  getArchivedWorkspacesExpandedKey,
   getProjectScopeId,
 } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -59,11 +62,132 @@ function archivedListsEqual(
   return next.every((w) => prevIds.has(w.id));
 }
 
-/** Check if any provider is configured (uses backend-computed isConfigured) */
-function hasConfiguredProvider(config: ProvidersConfigMap | null): boolean {
-  if (!config) return false;
-  return Object.values(config).some((provider) => provider?.isConfigured);
-}
+// Rendered with key={projectPath}: ProjectPage stays mounted across project navigation,
+// and a collapsed section never refetches, so the archived list must reset per project.
+const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: string }> = ({
+  projectPath,
+  projectName,
+}) => {
+  const { api } = useAPI();
+  // Initialize from localStorage cache to avoid flash when archived workspaces appear
+  const [archivedWorkspaces, setArchivedWorkspaces] = useState<
+    FrontendWorkspaceMetadata[] | undefined
+  >(() =>
+    readPersistedState<FrontendWorkspaceMetadata[] | undefined>(
+      getArchivedWorkspacesKey(projectPath),
+      undefined
+    )
+  );
+  const [archivedLoadError, setArchivedLoadError] = useState<string>();
+  const [archivedExpanded] = usePersistedState(
+    getArchivedWorkspacesExpandedKey(projectPath),
+    false,
+    { listener: true }
+  );
+
+  // Track archived workspaces in a ref; only update state when the list actually changes
+  const archivedMapRef = useRef<Map<string, FrontendWorkspaceMetadata>>(new Map());
+
+  const syncArchivedState = useCallback(() => {
+    const next = Array.from(archivedMapRef.current.values());
+    // Persist outside the state updater: a restore navigates away before its refresh
+    // resolves, and an unmounted component's updater never runs, so the next mount
+    // would otherwise start from a cache that still lists the restored workspace.
+    // The cache only seeds the first render, so keep just the leading entries that fit its budget.
+    updatePersistedState(
+      getArchivedWorkspacesKey(projectPath),
+      trimArrayToChars(next, ARCHIVED_WORKSPACES_CACHE_MAX_CHARS)
+    );
+    setArchivedWorkspaces((prev) => (prev && archivedListsEqual(prev, next) ? prev : next));
+  }, [projectPath]);
+
+  const replaceArchivedList = useCallback(
+    (allArchived: FrontendWorkspaceMetadata[]) => {
+      const projectArchived = allArchived.filter((w) => w.projectPath === projectPath);
+      archivedMapRef.current = new Map(projectArchived.map((w) => [w.id, w]));
+      syncArchivedState();
+    },
+    [projectPath, syncArchivedState]
+  );
+
+  // Keep archived metadata off the project page startup path.
+  useEffect(() => {
+    if (!api || !archivedExpanded) return;
+    let cancelled = false;
+
+    const loadArchived = async () => {
+      try {
+        const allArchived = await api.workspace.list({ archived: true });
+        if (cancelled) return;
+        setArchivedLoadError(undefined);
+        replaceArchivedList(allArchived);
+      } catch (error) {
+        console.error("Failed to load archived workspaces:", error);
+        if (!cancelled) setArchivedLoadError(getErrorMessage(error));
+      }
+    };
+
+    void loadArchived();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, replaceArchivedList, archivedExpanded]);
+
+  // Subscribe to metadata events to reactively update archived list
+  useEffect(() => {
+    if (!api || !archivedExpanded) return;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const iterator = await api.workspace.onMetadata(undefined, { signal: controller.signal });
+        for await (const event of iterator) {
+          if (controller.signal.aborted) break;
+
+          const meta = event.metadata;
+          // Only care about workspaces in this project
+          if (meta && meta.projectPath !== projectPath) continue;
+          // For deletions, check if it was in our map (i.e., was in this project)
+          if (!meta && !archivedMapRef.current.has(event.workspaceId)) continue;
+
+          const isArchived = meta && isWorkspaceArchived(meta.archivedAt, meta.unarchivedAt);
+
+          if (isArchived) {
+            archivedMapRef.current.set(meta.id, meta);
+          } else {
+            archivedMapRef.current.delete(event.workspaceId);
+          }
+
+          syncArchivedState();
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          console.error("Failed to subscribe to metadata for archived workspaces:", err);
+        }
+      }
+    })();
+
+    return () => controller.abort();
+  }, [api, projectPath, syncArchivedState, archivedExpanded]);
+
+  return (
+    <div className="flex justify-center px-4 pb-4">
+      <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
+        <ArchivedWorkspaces
+          projectPath={projectPath}
+          projectName={projectName}
+          workspaces={archivedWorkspaces}
+          loadError={archivedLoadError}
+          onWorkspacesChanged={() => {
+            // Refresh archived list after unarchive/delete
+            if (!api) return;
+            void api.workspace.list({ archived: true }).then(replaceArchivedList);
+          }}
+        />
+      </div>
+    </div>
+  );
+};
 
 /**
  * Project page shown when a project is selected but no workspace is active.
@@ -81,10 +205,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
-  // Initialize from localStorage cache to avoid flash when archived workspaces appear
-  const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>(() =>
-    readPersistedState<FrontendWorkspaceMetadata[]>(getArchivedWorkspacesKey(projectPath), [])
-  );
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -135,79 +255,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     setBranchRefreshKey((k) => k + 1);
   }, []);
 
-  // Track archived workspaces in a ref; only update state when the list actually changes
-  const archivedMapRef = useRef<Map<string, FrontendWorkspaceMetadata>>(new Map());
-
-  const syncArchivedState = useCallback(() => {
-    const next = Array.from(archivedMapRef.current.values());
-    setArchivedWorkspaces((prev) => {
-      if (archivedListsEqual(prev, next)) return prev;
-      // Persist to localStorage for optimistic cache on next load
-      updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
-      return next;
-    });
-  }, [projectPath]);
-
-  // Fetch archived workspaces for this project on mount
-  useEffect(() => {
-    if (!api) return;
-    let cancelled = false;
-
-    const loadArchived = async () => {
-      try {
-        const allArchived = await api.workspace.list({ archived: true });
-        if (cancelled) return;
-        const projectArchived = allArchived.filter((w) => w.projectPath === projectPath);
-        archivedMapRef.current = new Map(projectArchived.map((w) => [w.id, w]));
-        syncArchivedState();
-      } catch (error) {
-        console.error("Failed to load archived workspaces:", error);
-      }
-    };
-
-    void loadArchived();
-    return () => {
-      cancelled = true;
-    };
-  }, [api, projectPath, syncArchivedState]);
-
-  // Subscribe to metadata events to reactively update archived list
-  useEffect(() => {
-    if (!api) return;
-    const controller = new AbortController();
-
-    (async () => {
-      try {
-        const iterator = await api.workspace.onMetadata(undefined, { signal: controller.signal });
-        for await (const event of iterator) {
-          if (controller.signal.aborted) break;
-
-          const meta = event.metadata;
-          // Only care about workspaces in this project
-          if (meta && meta.projectPath !== projectPath) continue;
-          // For deletions, check if it was in our map (i.e., was in this project)
-          if (!meta && !archivedMapRef.current.has(event.workspaceId)) continue;
-
-          const isArchived = meta && isWorkspaceArchived(meta.archivedAt, meta.unarchivedAt);
-
-          if (isArchived) {
-            archivedMapRef.current.set(meta.id, meta);
-          } else {
-            archivedMapRef.current.delete(event.workspaceId);
-          }
-
-          syncArchivedState();
-        }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          console.error("Failed to subscribe to metadata for archived workspaces:", err);
-        }
-      }
-    })();
-
-    return () => controller.abort();
-  }, [api, projectPath, syncArchivedState]);
-
   const didAutoFocusRef = useRef(false);
 
   const handleDismissAgentsInit = useCallback(() => {
@@ -226,11 +273,15 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      const pendingScopeId =
-        typeof pendingDraftId === "string" && pendingDraftId.trim().length > 0
-          ? getDraftScopeId(projectPath, pendingDraftId)
-          : getPendingScopeId(projectPath);
-      updatePersistedState(getInputKey(pendingScopeId), "/init");
+      getDraftStore().setText(
+        getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: pendingDraftId ?? undefined,
+        }),
+        "/init"
+      );
     }
 
     setShowAgentsInitNudge(false);
@@ -287,11 +338,12 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               </Button>
             )}
           </div>
-          {/* Scrollable content area */}
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* Scrollable content area. mobile-header-spacer keeps content below
+              the fixed mobile header on touch devices. */}
+          <div className="mobile-header-spacer min-h-0 flex-1 overflow-y-auto">
             {/* Main content - vertically centered with reduced gaps */}
             <div className="flex min-h-[50vh] flex-col items-center justify-center px-4 py-6">
-              <div className="flex w-full max-w-3xl flex-col gap-4">
+              <div className={cn("flex w-full flex-col gap-4", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
                 {/* Git init banner - shown above ChatInput when not a git repo */}
                 {isNonGitRepo && (
                   <GitInitBanner projectPath={projectPath} onSuccess={handleGitInitSuccess} />
@@ -307,22 +359,10 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                         onDismiss={handleDismissAgentsInit}
                       />
                     )}
-                    {/* Configured providers bar - compact icon carousel */}
-                    {providersLoading ? (
-                      // Skeleton placeholder matching ConfiguredProvidersBar height
-                      <div className="flex items-center justify-center gap-2 py-1.5">
-                        <Skeleton className="h-7 w-32" />
-                      </div>
-                    ) : (
-                      hasProviders &&
-                      providersConfig && (
-                        <ConfiguredProvidersBar providersConfig={providersConfig} />
-                      )
-                    )}
                     {/* ChatInput for workspace creation. */}
                     <ChatInput
                       // Key by project + draft so project navigation and draft switches both remount
-                      // creation-local state (including any in-flight creation overlays).
+                      // creation-local state (including any in-flight creation send).
                       key={`${projectPath}:${pendingDraftId ?? "__pending__"}`}
                       variant="creation"
                       projectPath={projectPath}
@@ -332,6 +372,16 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       onReady={handleChatReady}
                       onWorkspaceCreated={onWorkspaceCreated}
                     />
+                    {providersLoading ? (
+                      <div className="flex items-center justify-center gap-2 py-1.5">
+                        <Skeleton className="h-7 w-32" />
+                      </div>
+                    ) : (
+                      hasProviders &&
+                      providersConfig && (
+                        <ConfiguredProvidersBar providersConfig={providersConfig} />
+                      )
+                    )}
                   </>
                 )}
               </div>
@@ -339,30 +389,17 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
             {/* MCP servers: overview between creation and archived workspaces */}
             <div className="flex justify-center px-4 pb-4">
-              <div className="w-full max-w-3xl">
+              <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
                 <ProjectMCPOverview projectPath={projectPath} />
               </div>
             </div>
 
             {/* Archived workspaces: separate section below centered area */}
-            {archivedWorkspaces.length > 0 && (
-              <div className="flex justify-center px-4 pb-4">
-                <div className="w-full max-w-3xl">
-                  <ArchivedWorkspaces
-                    projectPath={projectPath}
-                    projectName={projectName}
-                    workspaces={archivedWorkspaces}
-                    onWorkspacesChanged={() => {
-                      // Refresh archived list after unarchive/delete
-                      if (!api) return;
-                      void api.workspace.list({ archived: true }).then((all) => {
-                        setArchivedWorkspaces(all.filter((w) => w.projectPath === projectPath));
-                      });
-                    }}
-                  />
-                </div>
-              </div>
-            )}
+            <ProjectArchivedWorkspaces
+              key={projectPath}
+              projectPath={projectPath}
+              projectName={projectName}
+            />
           </div>
         </div>
       </ThinkingProvider>

@@ -15,6 +15,7 @@ import {
 } from "@/browser/stories/mocks/coder";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import {
   RUNTIME_MODE,
   type ParsedRuntime,
@@ -126,6 +127,8 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: "/home/user/projects/my-app",
+  userProjects: new Map(),
+  onSelectedProjectPathChange: fn(),
   projectName: "my-app",
   nameState: {
     name: "devcontainer-story",
@@ -295,8 +298,12 @@ function CreationControlsStoryShell(props: { children: ReactNode }) {
 
   useEffect(() => {
     workspaceStore.setClient(client);
+    // useProvidersConfig consumers read the shared store, which gets its
+    // client from AppLoader in the real app — wire it manually here too.
+    getProvidersConfigStore().setClient(client);
     return () => {
       workspaceStore.setClient(null);
+      getProvidersConfigStore().setClient(null);
     };
   }, [client, workspaceStore]);
 
@@ -336,6 +343,8 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: CREATION_PROJECT_PATH,
+  userProjects: new Map(),
+  onSelectedProjectPathChange: fn(),
   projectName: "my-project",
   runtimeAvailabilityState: BASE_ARGS.runtimeAvailabilityState,
   nameState: BASE_CREATION_NAME_STATE,
@@ -411,7 +420,6 @@ export const NameGenerationAuthError: Story = {
     ),
 };
 
-/** Manual naming validation error for characters outside the workspace-name policy. */
 export const NameValidationError: Story = {
   render: () =>
     renderCreationControls(
@@ -421,7 +429,7 @@ export const NameValidationError: Story = {
         error: {
           kind: "validation",
           message:
-            "Workspace names can only contain lowercase letters, numbers, hyphens, and underscores",
+            'Branch names can only contain lowercase letters, numbers, hyphens, underscores, and "/" separators',
         },
       })
     ),

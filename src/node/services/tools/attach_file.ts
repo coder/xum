@@ -40,7 +40,7 @@ export const createAttachFileTool: ToolFactory = (config: ToolConfiguration) => 
                 type: "text",
                 text:
                   `[File shown to user: ${label}. ` +
-                  "This type is not supported as a model attachment, so the model will receive this notice. Use another tool to inspect or convert the file if needed.]",
+                  "Only images, SVG, and PDF can be sent to the model as attachments; this file was shown to the user for preview/download but its contents were NOT sent to you. Use file_read if you need to read its contents.]",
               },
               createDisplayOnlyFilePart(result.file),
             ],

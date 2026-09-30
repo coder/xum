@@ -23,6 +23,8 @@ function mockSidebarState(
     loadedSkills: [],
     skillLoadErrors: [],
     agentStatus: undefined,
+    activeWorkflowRunCount: 0,
+    activeBashMonitorCount: 0,
     terminalActiveCount: 0,
     terminalSessionCount: 0,
     ...overrides,
@@ -69,7 +71,8 @@ describe("WorkspaceStatusIndicator", () => {
 
     const icon = view.container.querySelector("svg");
     expect(icon).toBeTruthy();
-    expect(icon?.getAttribute("class") ?? "").toContain("animate-spin");
+    expect(icon?.getAttribute("class") ?? "").not.toContain("animate-spin");
+    expect(icon?.parentElement?.classList.contains("animate-spin")).toBe(true);
   });
 
   test("keeps the steady streaming layout free of the transient handoff slot", () => {
@@ -143,6 +146,8 @@ describe("WorkspaceStatusIndicator", () => {
       loadedSkills: [],
       skillLoadErrors: [],
       agentStatus: undefined,
+      activeWorkflowRunCount: 0,
+      activeBashMonitorCount: 0,
       terminalActiveCount: 0,
       terminalSessionCount: 0,
     };
@@ -201,6 +206,8 @@ describe("WorkspaceStatusIndicator", () => {
       loadedSkills: [],
       skillLoadErrors: [],
       agentStatus: undefined,
+      activeWorkflowRunCount: 0,
+      activeBashMonitorCount: 0,
       terminalActiveCount: 0,
       terminalSessionCount: 0,
     };

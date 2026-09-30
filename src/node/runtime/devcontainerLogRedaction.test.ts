@@ -1,12 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import {
-  redactDevcontainerArgsForLog,
-  SENSITIVE_REMOTE_ENV_KEYS,
-} from "./devcontainerLogRedaction";
+import { redactDevcontainerArgsForLog } from "./devcontainerLogRedaction";
 
 describe("redactDevcontainerArgsForLog", () => {
   it("redacts every sensitive --remote-env key", () => {
-    for (const key of SENSITIVE_REMOTE_ENV_KEYS) {
+    // Test-owned list: dropping a credential key from the production set must fail here.
+    for (const key of [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "CODER_AGENT_TOKEN",
+    ]) {
       const args = ["exec", "--remote-env", `${key}=super-secret-value`];
       expect(redactDevcontainerArgsForLog(args)).toEqual([
         "exec",
@@ -17,7 +21,7 @@ describe("redactDevcontainerArgsForLog", () => {
   });
 
   it("leaves non-sensitive --remote-env keys unchanged", () => {
-    const args = ["exec", "--remote-env", "GIT_AUTHOR_NAME=Mux Tester"];
+    const args = ["exec", "--remote-env", "GIT_AUTHOR_NAME=Xum Tester"];
     expect(redactDevcontainerArgsForLog(args)).toEqual(args);
   });
 
@@ -34,7 +38,7 @@ describe("redactDevcontainerArgsForLog", () => {
       "--remote-env",
       "GH_TOKEN=shhh",
       "--remote-env",
-      "GIT_AUTHOR_NAME=Mux Tester",
+      "GIT_AUTHOR_NAME=Xum Tester",
       "--remote-env",
       "CODER_AGENT_TOKEN=super-secret",
       "--",
@@ -48,7 +52,7 @@ describe("redactDevcontainerArgsForLog", () => {
       "--remote-env",
       "GH_TOKEN=<redacted>",
       "--remote-env",
-      "GIT_AUTHOR_NAME=Mux Tester",
+      "GIT_AUTHOR_NAME=Xum Tester",
       "--remote-env",
       "CODER_AGENT_TOKEN=<redacted>",
       "--",

@@ -1,6 +1,9 @@
 import {
   getAgentIdKey,
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
   getModelKey,
+  getReasoningModeKey,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
   getDisableWorkspaceAgentsKey,
@@ -12,7 +15,11 @@ import {
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
@@ -64,6 +71,14 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     WORKSPACE_DEFAULTS.agentId
   );
 
+  // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
+  // Coerce untrusted persisted values so corrupt entries self-heal to "standard"
+  // instead of failing SendMessageOptionsSchema on retry/resume/creation flows.
+  const reasoningMode =
+    coerceOpenAIReasoningMode(
+      readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(workspaceId), null)
+    ) ?? "standard";
+
   const providerOptions = getProviderOptions();
 
   const disableWorkspaceAgents = readPersistedState<boolean>(
@@ -71,19 +86,35 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     false
   );
 
+  // Same gate as useAutoRoutingSelection: a stale persisted true must not
+  // reach the backend once the experiment is off.
+  const autoRoutingEnabled = isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const autoModelRouting =
+    autoRoutingEnabled &&
+    readPersistedState<boolean>(getAutoModelRoutingKey(workspaceId), false) === true;
+  const autoThinkingLevel =
+    autoRoutingEnabled &&
+    readPersistedState<boolean>(getAutoThinkingLevelKey(workspaceId), false) === true;
+
   return buildSendMessageOptions({
     model: baseModel,
     agentId,
     thinkingLevel,
+    reasoningMode,
     providerOptions,
     disableWorkspaceAgents,
+    autoModelRouting,
+    autoThinkingLevel,
     experiments: {
       programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-      programmaticToolCallingExclusive: isExperimentEnabled(
-        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-      ),
-      execSubagentHardRestart: isExperimentEnabled(EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART),
-      imageGenerationTool: isExperimentEnabled(EXPERIMENT_IDS.IMAGE_GENERATION_TOOL),
+      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
+      advisorTool: isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
+      dynamicWorkflows: isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS),
+      memory: isExperimentEnabled(EXPERIMENT_IDS.MEMORY),
+      memoryIntuition: isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION),
+      toolSearch: isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH),
+      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
+      tokenBudget: isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
     },
   });
 }

@@ -61,3 +61,56 @@ export const LoadingToolsDiagnostic: Story = {
     },
   },
 };
+
+/**
+ * Active streaming state with the token-stats slot revealed. The slot is reserved
+ * (rendered but hidden) during startup, so the row geometry is identical across the
+ * starting -> streaming transition — compare against the startup stories above to
+ * confirm the status text and stop control do not shift when stats appear.
+ */
+export const Streaming: Story = {
+  args: {
+    statusText: "claude-opus-4 streaming...",
+    cancelText: "hit Esc to cancel",
+    cancelShortcutText: "Esc",
+    onCancel: fn(),
+    tokenCount: 12_840,
+    tps: 73,
+  },
+};
+
+/**
+ * Idle turn that is waiting on an armed background bash monitor. There is no
+ * active stream, so the stop control is replaced by an informational hint and
+ * the token-stats slot is not rendered.
+ */
+export const WaitingOnBackgroundBashMonitor: Story = {
+  args: {
+    statusText: "Waiting on background bash monitor...",
+    cancelText: "agent wakes on matching output",
+    reserveStatsSlot: false,
+    hideHintOnNarrow: true,
+  },
+};
+
+/**
+ * Same waiting state in a phone-width pane: the low-priority hint hides via the
+ * barrier's own container query so the row cannot overflow horizontally. The
+ * fixed-width wrapper drives the container query directly, so this contract
+ * holds in the Storybook test-runner and Pixel without viewport variants.
+ */
+export const WaitingOnBackgroundBashMonitorNarrow: Story = {
+  args: {
+    statusText: "Waiting on background bash monitor...",
+    cancelText: "agent wakes on matching output",
+    reserveStatsSlot: false,
+    hideHintOnNarrow: true,
+  },
+  render: (args) => (
+    <div className="bg-background flex min-h-screen items-start p-6">
+      <div className="w-[320px] rounded-md border border-[var(--color-border-medium)] bg-[var(--color-card)] p-4">
+        <StreamingBarrierView {...args} />
+      </div>
+    </div>
+  ),
+};

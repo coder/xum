@@ -36,6 +36,7 @@ function createSession(overrides: Partial<BrowserSession> = {}): BrowserSession 
 function renderViewport(session: BrowserSession, overrides?: { screenshotSrc?: string | null }) {
   return render(
     <BrowserViewport
+      panelId="browser-preview-viewport"
       workspaceId="workspace-1"
       session={session}
       screenshotSrc={overrides?.screenshotSrc ?? "data:image/jpeg;base64,frame-data"}
@@ -72,6 +73,156 @@ describe("BrowserViewport", () => {
     expect(
       mapDomPointToViewport(10, 100, { left: 0, top: 0, width: 300, height: 200 }, FRAME_METADATA)
     ).toBeNull();
+  });
+
+  test("defaults intrinsic frame mapping to 1x display scale", () => {
+    const highResolutionMetadata = {
+      ...FRAME_METADATA,
+      deviceWidth: 2160,
+      deviceHeight: 2160,
+    };
+
+    expect(
+      mapDomPointToViewport(
+        500,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        { frameImageSize: { width: 720, height: 720 } }
+      )
+    ).toEqual({ x: 1080, y: 1080 });
+    expect(
+      mapDomPointToViewport(
+        100,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        { frameImageSize: { width: 720, height: 720 } }
+      )
+    ).toBeNull();
+  });
+
+  test("maps input within the DPR-capped frame", () => {
+    const highResolutionMetadata = {
+      ...FRAME_METADATA,
+      deviceWidth: 2160,
+      deviceHeight: 2160,
+    };
+    const options = {
+      devicePixelRatio: 2,
+      frameImageSize: { width: 720, height: 720 },
+    };
+
+    expect(
+      mapDomPointToViewport(
+        500,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toEqual({ x: 1080, y: 1080 });
+    expect(
+      mapDomPointToViewport(
+        330,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toEqual({ x: 60, y: 1080 });
+    expect(
+      mapDomPointToViewport(
+        300,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toBeNull();
+  });
+
+  test("does not enlarge the frame when device pixel ratio is below 1", () => {
+    const highResolutionMetadata = {
+      ...FRAME_METADATA,
+      deviceWidth: 2160,
+      deviceHeight: 2160,
+    };
+    const surface = { left: 0, top: 0, width: 360, height: 360 };
+    const frameImageSize = { width: 720, height: 720 };
+
+    expect(
+      mapDomPointToViewport(180, 180, surface, highResolutionMetadata, {
+        devicePixelRatio: 0.5,
+        frameImageSize,
+      })
+    ).toEqual(mapDomPointToViewport(180, 180, surface, highResolutionMetadata, { frameImageSize }));
+  });
+
+  test("maps decoded frame height when Chrome outer height differs from the page viewport", () => {
+    expect(
+      mapDomPointToViewport(
+        640,
+        317,
+        { left: 0, top: 0, width: 1280, height: 633 },
+        { ...FRAME_METADATA, deviceWidth: 1280, deviceHeight: 720 },
+        { frameImageSize: { width: 1280, height: 633 } }
+      )
+    ).toEqual({ x: 640, y: 317 });
+  });
+
+  test("uses decoded frame dimensions for click input when outer height differs", () => {
+    const view = renderViewport(
+      createSession({
+        frameMetadata: { ...FRAME_METADATA, deviceWidth: 1280, deviceHeight: 720 },
+      })
+    );
+    const image = view.getByAltText("Browser session screenshot") as HTMLImageElement;
+    const viewport = view.getByRole("region", { name: "Browser viewport" });
+
+    Object.defineProperties(image, {
+      naturalWidth: { configurable: true, value: 1280 },
+      naturalHeight: { configurable: true, value: 633 },
+    });
+    fireEvent.load(image);
+    Object.assign(viewport, {
+      setPointerCapture: () => undefined,
+      releasePointerCapture: () => undefined,
+      hasPointerCapture: () => true,
+    });
+    Object.defineProperty(viewport, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        left: 0,
+        top: 0,
+        width: 1280,
+        height: 633,
+        right: 1280,
+        bottom: 633,
+        x: 0,
+        y: 0,
+        toJSON: () => undefined,
+      }),
+    });
+
+    fireEvent.pointerDown(viewport, {
+      pointerId: 7,
+      button: 0,
+      buttons: 1,
+      clientX: 640,
+      clientY: 317,
+      detail: 1,
+    });
+
+    expect(sendInputMock).toHaveBeenCalledWith({
+      type: "input_mouse",
+      eventType: "mousePressed",
+      x: 640,
+      y: 317,
+      button: "left",
+      clickCount: 1,
+      modifiers: 0,
+    });
   });
 
   test("forwards mapped click and wheel input for interactive sessions", () => {
@@ -153,6 +304,80 @@ describe("BrowserViewport", () => {
       y: 50,
       deltaX: 4,
       deltaY: 12,
+      modifiers: 0,
+    });
+  });
+
+  test("DPR-caps the loaded screenshot and pointer hit testing", () => {
+    Object.defineProperty(globalThis.window, "devicePixelRatio", {
+      configurable: true,
+      value: 2,
+    });
+    const view = renderViewport(
+      createSession({
+        frameMetadata: {
+          ...FRAME_METADATA,
+          deviceWidth: 2160,
+          deviceHeight: 2160,
+        },
+      })
+    );
+    const image = view.getByAltText("Browser session screenshot") as HTMLImageElement;
+    Object.defineProperties(image, {
+      naturalWidth: { configurable: true, value: 720 },
+      naturalHeight: { configurable: true, value: 720 },
+    });
+    fireEvent.load(image);
+
+    expect(image.style.maxWidth).toBe("min(100%, 360px)");
+    expect(image.style.maxHeight).toBe("min(100%, 360px)");
+
+    const viewport = view.getByRole("region", { name: "Browser viewport" });
+    Object.assign(viewport, {
+      setPointerCapture: () => undefined,
+      releasePointerCapture: () => undefined,
+      hasPointerCapture: () => true,
+    });
+    Object.defineProperty(viewport, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        left: 0,
+        top: 0,
+        width: 1000,
+        height: 1000,
+        right: 1000,
+        bottom: 1000,
+        x: 0,
+        y: 0,
+        toJSON: () => undefined,
+      }),
+    });
+
+    fireEvent.pointerDown(viewport, {
+      pointerId: 7,
+      button: 0,
+      buttons: 1,
+      clientX: 500,
+      clientY: 500,
+      detail: 1,
+    });
+    fireEvent.pointerDown(viewport, {
+      pointerId: 8,
+      button: 0,
+      buttons: 1,
+      clientX: 300,
+      clientY: 500,
+      detail: 1,
+    });
+
+    expect(sendInputMock).toHaveBeenCalledTimes(1);
+    expect(sendInputMock).toHaveBeenCalledWith({
+      type: "input_mouse",
+      eventType: "mousePressed",
+      x: 1080,
+      y: 1080,
+      button: "left",
+      clickCount: 1,
       modifiers: 0,
     });
   });

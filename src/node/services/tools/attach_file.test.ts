@@ -9,9 +9,10 @@ import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/readAttachm
 import { createAttachFileTool } from "./attach_file";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 function createTestAttachFileTool(cwd: string) {
@@ -281,7 +282,6 @@ describe("attach_file tool", () => {
       throw new Error("Expected display-only status text");
     }
     expect(result.value[0].text).toContain("clip.webm");
-    expect(result.value[0].text).toContain("not supported as a model attachment");
     expect(result.value[1]).toEqual({
       type: "display_file",
       data: webmBytes.toString("base64"),
@@ -310,7 +310,6 @@ describe("attach_file tool", () => {
       throw new Error("Expected display-only status text");
     }
     expect(result.value[0].text).toContain("release-notes.md (text/markdown)");
-    expect(result.value[0].text).toContain("not supported as a model attachment");
     expect(result.value[1]).toEqual({
       type: "display_file",
       data: Buffer.from(markdown).toString("base64"),
@@ -343,54 +342,83 @@ describe("attach_file tool", () => {
     });
   });
 
-  it("rejects text-like unsupported files so the model can use file_read", async () => {
+  it("shows text files to the user as display-only text/plain", async () => {
     using workspaceDir = new TestTempDir("attach-file-workspace");
     const tool = createTestAttachFileTool(workspaceDir.path);
     const textPath = path.join(workspaceDir.path, "notes.txt");
-    await fs.writeFile(textPath, "hello");
+    const text = "hello";
+    await fs.writeFile(textPath, text);
 
-    const result = (await tool.execute!(
-      { path: "notes.txt" },
-      mockToolCallOptions
-    )) as AttachFileToolResult;
+    const result = expectSuccessfulAttachFileResult(
+      (await tool.execute!({ path: "notes.txt" }, mockToolCallOptions)) as AttachFileToolResult
+    );
 
-    expect(result).toEqual({
-      success: false,
-      error: `Unsupported attachment type: ${textPath}`,
+    expect(result.value[1]).toEqual({
+      type: "display_file",
+      data: Buffer.from(text).toString("base64"),
+      mediaType: "text/plain",
+      filename: "notes.txt",
+      providerOptions: { mux: { displayOnly: true, size: Buffer.byteLength(text) } },
     });
   });
 
-  it("rejects unmapped source files so the model can use file_read", async () => {
+  it("shows unmapped source files to the user as display-only text/plain", async () => {
     using workspaceDir = new TestTempDir("attach-file-workspace");
     const tool = createTestAttachFileTool(workspaceDir.path);
     const sourcePath = path.join(workspaceDir.path, "script.py");
-    await fs.writeFile(sourcePath, "print('hello')\n");
+    const source = "print('hello')\n";
+    await fs.writeFile(sourcePath, source);
 
-    const result = (await tool.execute!(
-      { path: "script.py" },
-      mockToolCallOptions
-    )) as AttachFileToolResult;
+    const result = expectSuccessfulAttachFileResult(
+      (await tool.execute!({ path: "script.py" }, mockToolCallOptions)) as AttachFileToolResult
+    );
 
-    expect(result).toEqual({
-      success: false,
-      error: `Unsupported attachment type: ${sourcePath}`,
+    expect(result.value[1]).toEqual({
+      type: "display_file",
+      data: Buffer.from(source).toString("base64"),
+      mediaType: "text/plain",
+      filename: "script.py",
+      providerOptions: { mux: { displayOnly: true, size: Buffer.byteLength(source) } },
     });
   });
 
-  it("rejects extensionless text files so the model can use file_read", async () => {
+  it("shows a diff file to the user as display-only text/plain", async () => {
+    using workspaceDir = new TestTempDir("attach-file-workspace");
+    const tool = createTestAttachFileTool(workspaceDir.path);
+    const diffPath = path.join(workspaceDir.path, "changes.diff");
+    const diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+    await fs.writeFile(diffPath, diff);
+
+    const result = expectSuccessfulAttachFileResult(
+      (await tool.execute!({ path: "changes.diff" }, mockToolCallOptions)) as AttachFileToolResult
+    );
+
+    expect(result.value[1]).toEqual({
+      type: "display_file",
+      data: Buffer.from(diff).toString("base64"),
+      mediaType: "text/plain",
+      filename: "changes.diff",
+      providerOptions: { mux: { displayOnly: true, size: Buffer.byteLength(diff) } },
+    });
+  });
+
+  it("shows extensionless text files to the user as display-only text/plain", async () => {
     using workspaceDir = new TestTempDir("attach-file-workspace");
     const tool = createTestAttachFileTool(workspaceDir.path);
     const makefilePath = path.join(workspaceDir.path, "Makefile");
-    await fs.writeFile(makefilePath, "all:\n\techo hello\n");
+    const makefile = "all:\n\techo hello\n";
+    await fs.writeFile(makefilePath, makefile);
 
-    const result = (await tool.execute!(
-      { path: "Makefile" },
-      mockToolCallOptions
-    )) as AttachFileToolResult;
+    const result = expectSuccessfulAttachFileResult(
+      (await tool.execute!({ path: "Makefile" }, mockToolCallOptions)) as AttachFileToolResult
+    );
 
-    expect(result).toEqual({
-      success: false,
-      error: `Unsupported attachment type: ${makefilePath}`,
+    expect(result.value[1]).toEqual({
+      type: "display_file",
+      data: Buffer.from(makefile).toString("base64"),
+      mediaType: "text/plain",
+      filename: "Makefile",
+      providerOptions: { mux: { displayOnly: true, size: Buffer.byteLength(makefile) } },
     });
   });
 
@@ -414,7 +442,7 @@ describe("attach_file tool", () => {
     });
   });
 
-  it("rejects oversized unsupported files with both unsupported-type and size context", async () => {
+  it("rejects oversized display-only files with the size cap message", async () => {
     using workspaceDir = new TestTempDir("attach-file-workspace");
     const tool = createTestAttachFileTool(workspaceDir.path);
     const largePath = path.join(workspaceDir.path, "huge.webm");
@@ -427,7 +455,7 @@ describe("attach_file tool", () => {
 
     expect(result).toEqual({
       success: false,
-      error: `Unsupported attachment type: ${largePath}. Could not show file to user: Attachment is too large (10.00MB). The maximum supported size is 10.00MB.`,
+      error: "Attachment is too large (10.00MB). The maximum supported size is 10.00MB.",
     });
   });
 

@@ -1,32 +1,39 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Bell, BellOff, Ellipsis, Menu, Pencil } from "lucide-react";
+import { Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   getNotifyOnResponseKey,
   getNotifyOnResponseAutoEnableKey,
 } from "@/common/constants/storage";
-import { GitStatusIndicator } from "../GitStatusIndicator/GitStatusIndicator";
-import { MultiProjectGitStatusIndicator } from "../GitStatusIndicator/MultiProjectGitStatusIndicator";
-import { RuntimeBadge } from "../RuntimeBadge/RuntimeBadge";
-import { BranchSelector } from "../BranchSelector/BranchSelector";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
+import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
-import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
-import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import {
+  formatKeybind,
+  isDialogOpen,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
-import { useLinkSharingEnabled } from "@/browser/contexts/TelemetryEnabledContext";
+import {
+  isDevcontainerRuntime,
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -37,23 +44,29 @@ import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { isDesktopMode, DESKTOP_TITLEBAR_HEIGHT_CLASS } from "@/browser/hooks/useDesktopTitlebar";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { DebugLlmRequestModal } from "../DebugLlmRequestModal/DebugLlmRequestModal";
-import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { ShareTranscriptDialog } from "../ShareTranscriptDialog/ShareTranscriptDialog";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
+import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
+import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useAPI } from "@/browser/contexts/API";
 import { useAgent } from "@/browser/contexts/AgentContext";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { isMultiProject } from "@/common/utils/multiProject";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
-import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
+import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import {
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
+} from "@/constants/layout";
+import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -70,10 +83,7 @@ interface WorkspaceMenuBarProps {
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
 }
 
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 
 const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
   paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
@@ -93,16 +103,17 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 }) => {
   const { api } = useAPI();
   const { disableWorkspaceAgents } = useAgent();
-  const { preflightArchiveWorkspace, archiveWorkspace } = useWorkspaceActions();
+  const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
+    useWorkspaceActions();
+  const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-  const linkSharingEnabled = useLinkSharingEnabled();
+  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
-  const gitStatus = useGitStatus(workspaceId);
   const runtimeStatus = useRuntimeStatus(workspaceId);
   const workspaceEntry = workspaceMetadata.get(workspaceId);
-  const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
+  const hasRepository = hasWorkspaceRepository(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar
@@ -110,9 +121,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const { userProjects } = useProjectContext();
   const subProjectPath = workspaceEntry?.subProjectPath;
   const projectLabel =
-    subProjectPath && userProjects.has(subProjectPath)
-      ? formatProjectHierarchyLabel(subProjectPath, userProjects)
-      : projectName;
+    workspaceEntry?.kind === "scratch"
+      ? SCRATCH_PROJECT_NAME
+      : subProjectPath && userProjects.has(subProjectPath)
+        ? formatProjectHierarchyLabel(subProjectPath, userProjects)
+        : projectName;
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { canInterrupt, isStarting, awaitingUserQuestion, loadedSkills, skillLoadErrors } =
     useWorkspaceSidebarState(workspaceId);
@@ -122,21 +135,33 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // Keyed by workspace (same pattern as the timeline dialog below): consent is granted per
+  // recipient workspace, so switching workspaces while the dialog is open must close it
+  // rather than let the switch be flipped against the workspace the user navigated to.
+  const [unrelatedMessagingWorkspaceId, setUnrelatedMessagingWorkspaceId] = useState<string | null>(
+    null
+  );
+  if (unrelatedMessagingWorkspaceId !== null && unrelatedMessagingWorkspaceId !== workspaceId) {
+    setUnrelatedMessagingWorkspaceId(null);
+  }
+  const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
+  // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
+  // workspace" action) implicitly closes the dialog instead of covering the new view.
+  const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
+  if (timelineDialogWorkspaceId !== null && timelineDialogWorkspaceId !== workspaceId) {
+    // Render-time adjustment (not an effect): leaving the dialog's workspace closes it
+    // for good; merely deriving open=false would reopen it when navigating back.
+    setTimelineDialogWorkspaceId(null);
+  }
+  const timelineDialogOpen = timelineDialogWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuBarRef = useRef<HTMLDivElement | null>(null);
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const [shareTranscriptOpen, setShareTranscriptOpen] = useState(false);
-  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
-  // Untracked paths from archive preflight that the user needs to acknowledge.
-  // When set, the confirmation dialog warns about permanent file deletion.
-  const [archiveUntrackedPaths, setArchiveUntrackedPaths] = useState<string[] | null>(null);
-  // Whether the confirmation includes an active-stream interruption warning.
-  const [archiveConfirmIsStreaming, setArchiveConfirmIsStreaming] = useState(false);
-  const [isArchiving, setIsArchiving] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -149,17 +174,23 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // Notification on response toggle (workspace-level) - defaults to disabled
   const [notifyOnResponse, setNotifyOnResponse] = usePersistedState<boolean>(
     getNotifyOnResponseKey(workspaceId),
-    false
+    false,
+    { listener: true }
   );
 
+  const notificationScope =
+    workspaceEntry?.kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : projectPath;
   // Auto-enable notifications for new workspaces (project-level)
   const [autoEnableNotifications, setAutoEnableNotifications] = usePersistedState<boolean>(
-    getNotifyOnResponseAutoEnableKey(projectPath),
-    false
+    getNotifyOnResponseAutoEnableKey(notificationScope),
+    false,
+    { listener: true }
   );
 
   // Popover state for notification settings (interactive on click)
   const [notificationPopoverOpen, setNotificationPopoverOpen] = useState(false);
+  const [detailsPopoverOpen, setDetailsPopoverOpen] = useState(false);
+  const [detailsTooltipOpen, setDetailsTooltipOpen] = useState(false);
 
   const handleOpenTerminal = useCallback(() => {
     // On mobile touch devices, always use popout since the right sidebar is hidden
@@ -176,11 +207,86 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
+  // The right sidebar (home of the Timeline tab) is CSS-hidden by two independent
+  // rules: a viewport media query (<=768px, any pointer) and the workspace-shell
+  // container query (<=684px shell, e.g. a ~900px window with the left sidebar
+  // expanded). Read the sidebar's actual computed visibility so the timeline dialog
+  // gate matches the CSS truth; fall back to the media query when no shell is in
+  // the DOM (scratch pages, first render before refs attach, tests).
+  const isTimelineSidebarHidden = useCallback((): boolean => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const sidebar = menuBarRef.current
+      ?.closest("[data-workspace-shell]")
+      ?.querySelector(".mobile-hide-right-sidebar");
+    if (sidebar instanceof HTMLElement) {
+      // Immersive review hides the sidebar on any viewport (marked aria-hidden);
+      // only a responsive hide should surface the dialog entry points.
+      if (sidebar.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
+      return window.getComputedStyle(sidebar).display === "none";
+    }
+    return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+  }, []);
+
+  // Keep the gate reactive: resizing re-evaluates CSS instantly, but a render-time read
+  // would leave the More menu stale until an unrelated state update. The media-query
+  // listener covers viewport transitions and the ResizeObserver covers the shell
+  // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
+  const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
+  useEffect(() => {
+    const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
+    compute();
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", compute);
+    const shell = menuBarRef.current?.closest("[data-workspace-shell]");
+    let resizeObserver: ResizeObserver | undefined;
+    if (shell instanceof HTMLElement && typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(compute);
+      resizeObserver.observe(shell);
+    }
+    return () => {
+      mql.removeEventListener("change", compute);
+      resizeObserver?.disconnect();
+    };
+  }, [isTimelineSidebarHidden]);
+
+  // The dialog is the only timeline entry point while the sidebar is hidden, and every
+  // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
+  // live viewport/layout changes without a resize subscription.
+  useEffect(() => {
+    if (!timelineExperimentEnabled) {
+      return;
+    }
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
+        isDialogOpen() ||
+        isEditableElement(e.target) ||
+        !isTimelineSidebarHidden()
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setTimelineDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [timelineExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
+
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
-  const devcontainerChip = isDevcontainerWorkspace
-    ? getDevcontainerStatusChip(runtimeStatus)
-    : null;
+  // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
+  // worktree runtimes on both endpoints, so remote/container workspaces get no consent switch —
+  // a grant there could never be honoured. The dialog itself stays reachable everywhere because
+  // its hold-until-turn-end preference also covers same-tree senders, which work on any runtime.
+  // An unset config resolves to the same canonical default the backend applies.
+  const unrelatedMessagingRuntime = runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+  const unrelatedMessagingSupported =
+    isLocalProjectRuntime(unrelatedMessagingRuntime) ||
+    isWorktreeRuntime(unrelatedMessagingRuntime);
 
   const getMoreMenuAnchor = useCallback(() => {
     const rect = moreActionsButtonRef.current?.getBoundingClientRect();
@@ -216,91 +322,33 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [workspaceId, namedWorkspacePath, openInEditor, runtimeConfig]);
 
-  // Mirror sidebar archive behavior so the workspace menu bar matches existing actions.
-  /**
-   * Execute the archive call (optionally with acknowledged untracked paths).
-   * Callers are responsible for the isArchiving guard — this function only does the RPC
-   * and error display. Called from handleArchiveChat (no-confirmation path) and from
-   * the confirmation modal's onConfirm.
-   */
-  const executeArchive = useCallback(
-    async (anchorEl?: HTMLElement, acknowledgedUntrackedPaths?: string[]) => {
-      setIsArchiving(true);
-      try {
-        const res = await archiveWorkspace(
-          workspaceId,
-          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-        );
-        if (res.success && res.data?.kind === "confirm-lossy-untracked-files") {
-          setArchiveUntrackedPaths(res.data.paths);
-          // The retry path already handled any earlier streaming warning. Only surface the
-          // interruption warning again when the archive attempt has not yet been confirmed.
-          setArchiveConfirmIsStreaming(acknowledgedUntrackedPaths == null ? isWorking : false);
-          setArchiveConfirmOpen(true);
-          return;
-        }
-        if (!res.success) {
-          const rect = anchorEl?.getBoundingClientRect();
-          archiveError.showError(
-            workspaceId,
-            res.error ?? "Failed to archive chat",
-            rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-          );
-        }
-      } finally {
-        setIsArchiving(false);
-      }
+  // Same archive flow as the sidebar rows so the two entry points cannot drift apart.
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace,
+    isArchiving: () => isArchiving,
+    isStreaming: () => isWorking,
+    getDisplayTitle: () => workspaceTitle,
+    showError: (errorWorkspaceId, error, anchorEl) => {
+      const rect = anchorEl?.getBoundingClientRect();
+      archiveError.showError(
+        errorWorkspaceId,
+        error,
+        rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
+      );
     },
-    [workspaceId, archiveWorkspace, archiveError, isWorking]
-  );
-
-  /**
-   * Entry point for the archive action. Runs a preflight check and either:
-   * - archives immediately (no warnings),
-   * - opens a combined confirmation dialog (streaming / untracked-file warnings), or
-   * - shows an error popover (unexpected backend failures).
-   */
-  const handleArchiveChat = useCallback(
-    async (anchorEl?: HTMLElement) => {
-      if (isArchiving) return;
-
-      // Set the in-flight guard before the async preflight call so duplicate clicks
-      // during the await are rejected.
-      setIsArchiving(true);
-      try {
-        // Run preflight to check for untracked files that can't be preserved.
-        const preflight = await preflightArchiveWorkspace(workspaceId);
-        if (!preflight.success) {
-          const rect = anchorEl?.getBoundingClientRect();
-          archiveError.showError(
-            workspaceId,
-            preflight.error ?? "Failed to check archive readiness",
-            rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-          );
-          return;
-        }
-
-        const preflightData = preflight.data;
-        const untrackedPaths =
-          preflightData?.kind === "confirm-lossy-untracked-files" ? preflightData.paths : null;
-        const streamingNow = isWorking;
-
-        if (untrackedPaths || streamingNow) {
-          // Show a single combined confirmation dialog for all warnings.
-          setArchiveUntrackedPaths(untrackedPaths);
-          setArchiveConfirmIsStreaming(streamingNow);
-          setArchiveConfirmOpen(true);
-        } else {
-          // No warnings — archive immediately. Await so the finally block doesn't
-          // clear isArchiving before the archive call completes.
-          await executeArchive(anchorEl);
-        }
-      } finally {
-        setIsArchiving(false);
-      }
-    },
-    [workspaceId, preflightArchiveWorkspace, archiveError, isWorking, isArchiving, executeArchive]
-  );
+  });
+  // The menu bar is reused across workspaces. Render-time adjustment (not an effect): a
+  // confirmation for another workspace, including one opened by a preflight that resolved after
+  // navigation, must never show over (or be confirmed from) the workspace now in view.
+  if (
+    archiveFlow.confirmationWorkspaceId !== null &&
+    archiveFlow.confirmationWorkspaceId !== workspaceId
+  ) {
+    archiveFlow.cancel();
+  }
+  const handleArchiveChat = (anchorEl?: HTMLElement) =>
+    archiveFlow.requestArchive(workspaceId, anchorEl);
 
   const handleForkChat = useCallback(
     async (anchorEl: HTMLElement) => {
@@ -412,6 +460,17 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [setNotifyOnResponse]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (matchesKeybind(e, KEYBINDS.SHOW_WORKSPACE_DETAILS)) {
+        e.preventDefault();
+        setDetailsPopoverOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   // Keybind for opening MCP configuration
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -438,20 +497,20 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [workspaceHeartbeatsEnabled]);
 
-  // Keybind for sharing transcript — lives here (not AgentListItem) so it
-  // works even when the left sidebar is collapsed and list items are unmounted.
+  // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
+  // a window listener subscribing to an external event source, not derived state). Like the
+  // timeline shortcut, it yields to any modal already open so it cannot stack a consent dialog
+  // over another dialog's focus trap.
   useEffect(() => {
-    if (linkSharingEnabled !== true) return;
-
     const handler = (e: KeyboardEvent) => {
-      if (matchesKeybind(e, KEYBINDS.SHARE_TRANSCRIPT)) {
+      if (matchesKeybind(e, KEYBINDS.CONFIGURE_UNRELATED_MESSAGING) && !isDialogOpen()) {
         e.preventDefault();
-        setShareTranscriptOpen(true);
+        setUnrelatedMessagingWorkspaceId(workspaceId);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [linkSharingEnabled]);
+  }, [workspaceId]);
 
   useEffect(() => {
     isSkillsMountedRef.current = true;
@@ -495,6 +554,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   return (
     <div
+      ref={menuBarRef}
       data-testid="workspace-menu-bar"
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
@@ -511,7 +571,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     >
       <div
         className={cn(
-          "text-foreground flex min-w-0 items-center gap-2.5 overflow-hidden font-semibold",
+          "text-foreground flex min-w-0 items-center gap-1.5 overflow-hidden",
           isDesktop && "titlebar-no-drag"
         )}
       >
@@ -531,53 +591,55 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
           </Tooltip>
         )}
-        <RuntimeBadge
-          runtimeConfig={runtimeConfig}
-          isWorking={isWorking}
-          workspacePath={namedWorkspacePath}
-          workspaceName={workspaceName}
-          tooltipSide="bottom"
-        />
-        <span className="min-w-0 truncate font-mono text-xs">{projectLabel}</span>
-        <div className="flex items-center gap-1">
-          {/* BranchSelector keeps workspace-scoped local UI state (current branch fallback,
-              open popover contents, remote expansion). Key it by workspace identity so
-              switching workspaces resets that state instead of leaking the previous
-              workspace's branch presentation into the next one. */}
-          <BranchSelector
-            key={workspaceId}
-            workspaceId={workspaceId}
-            workspaceName={workspaceName}
-          />
-          {devcontainerChip && (
-            <span
-              className={cn(
-                "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
-                devcontainerChip.className
-              )}
-            >
-              {devcontainerChip.label}
-            </span>
-          )}
-          {showMultiProjectStatus ? (
-            <MultiProjectGitStatusIndicator
-              workspaceId={workspaceId}
-              tooltipPosition="bottom"
-              isWorking={isWorking}
-            />
-          ) : (
-            <GitStatusIndicator
-              gitStatus={gitStatus}
-              workspaceId={workspaceId}
-              projectPath={projectPath}
-              tooltipPosition="bottom"
-              isWorking={isWorking}
-            />
-          )}
-        </div>
+        <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
+          {workspaceTitle ?? workspaceName}
+        </span>
+        {/* Touch and keyboard users need a focusable control for workspace details. */}
+        <Popover open={detailsPopoverOpen} onOpenChange={setDetailsPopoverOpen}>
+          <Tooltip
+            open={detailsTooltipOpen && !detailsPopoverOpen}
+            onOpenChange={setDetailsTooltipOpen}
+          >
+            <TooltipTrigger asChild>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  className="text-muted hover:text-foreground focus-visible:ring-accent flex shrink-0 cursor-pointer items-center border-0 bg-transparent p-0 transition-colors focus-visible:ring-1"
+                  aria-label="Workspace details"
+                  onKeyDown={stopKeyboardPropagation}
+                >
+                  <Info className="h-3.5 w-3.5" />
+                </button>
+              </PopoverTrigger>
+            </TooltipTrigger>
+            <TooltipContent>
+              Workspace details ({formatKeybind(KEYBINDS.SHOW_WORKSPACE_DETAILS)})
+            </TooltipContent>
+          </Tooltip>
+          <PopoverContent align="start" className="flex flex-col gap-0.5 p-2 text-xs">
+            <span className="font-mono">{projectLabel}</span>
+            <span>{workspaceName}</span>
+            <span className="text-muted">{namedWorkspacePath}</span>
+          </PopoverContent>
+        </Popover>
+        {isArchiving && (
+          <span
+            role="status"
+            className="text-muted flex shrink-0 items-center gap-1 text-xs whitespace-nowrap"
+            data-testid="workspace-archiving-status"
+          >
+            <ArchiveIcon className="h-3 w-3 shrink-0" />
+            Archiving...
+          </span>
+        )}
       </div>
       <div className={cn("flex items-center gap-2", isDesktop && "titlebar-no-drag")}>
-        <WorkspaceLinks workspaceId={workspaceId} />
+        {/* The footer hides these links at this width, so the header carries them. */}
+        <WorkspaceLinks
+          workspaceId={workspaceId}
+          className="hidden [@media(max-width:768px)]:inline-flex"
+          menuDirection="down"
+        />
         <Popover open={notificationPopoverOpen} onOpenChange={setNotificationPopoverOpen}>
           <Tooltip {...(notificationPopoverOpen ? { open: false } : {})}>
             <TooltipTrigger asChild>
@@ -747,7 +809,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             side="bottom"
             align="end"
             sideOffset={6}
-            className="w-[240px] !min-w-0 p-1"
+            // Size to the widest row ("Messages from other workspaces" + shortcut
+            // overflowed a fixed 240px), but never wider than the viewport.
+            className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
             onClick={(event: React.MouseEvent<HTMLDivElement>) => {
               event.stopPropagation();
             }}
@@ -758,22 +822,47 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onConfigureHeartbeat={
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
+              onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
               onOpenTouchFullscreenReview={
-                isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
+                hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
-              onEnterImmersiveReview={isTouchMobileScreen ? null : handleEnterImmersiveReview}
+              onEnterImmersiveReview={
+                hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
+              }
+              onOpenTimeline={
+                timelineExperimentEnabled && timelineSidebarHidden
+                  ? () => setTimelineDialogWorkspaceId(workspaceId)
+                  : null
+              }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
-              onForkChat={(anchorEl) => {
-                void handleForkChat(anchorEl);
-              }}
-              onShareTranscript={() => setShareTranscriptOpen(true)}
-              onArchiveChat={(anchorEl) => {
-                // handleArchiveChat runs preflight and opens a confirmation dialog
-                // when streaming or untracked files are detected.
-                void handleArchiveChat(anchorEl);
-              }}
+              // Scratch chats have no repo: review events are ignored by
+              // RightSidebar and fork is unsupported on the backend, so hide
+              // both instead of offering dead menu items.
+              onForkChat={
+                hasRepository
+                  ? (anchorEl) => {
+                      void handleForkChat(anchorEl);
+                    }
+                  : null
+              }
+              onTogglePinned={
+                workspaceEntry && isWorkspacePinnable(workspaceEntry)
+                  ? () => {
+                      void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
+                    }
+                  : null
+              }
+              isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
+              onArchiveChat={
+                workspaceEntry?.parentWorkspaceId != null
+                  ? null
+                  : (anchorEl) => {
+                      // handleArchiveChat runs preflight and opens a confirmation dialog
+                      // when streaming or untracked files are detected.
+                      void handleArchiveChat(anchorEl);
+                    }
+              }
               onCloseMenu={() => setMoreMenuOpen(false)}
-              linkSharingEnabled={linkSharingEnabled === true}
               shortcutClassName="mobile-hide-shortcut-hints"
               configureMcpTestId="workspace-mcp-button"
             />
@@ -787,56 +876,50 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onOpenChange={setHeartbeatModalOpen}
         />
       )}
+      <WorkspaceUnrelatedMessagingModal
+        // Remount per workspace: the keyed open state above only closes the dialog, while
+        // the modal's own pending/error state and in-flight request id would otherwise
+        // survive the switch and surface in the next workspace's dialog.
+        key={workspaceId}
+        open={unrelatedMessagingModalOpen}
+        onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
+        consentSupported={unrelatedMessagingSupported}
+        // Read straight from published metadata: the switch moves only after the backend
+        // commits and republishes, never on the local ack alone.
+        enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
+        onSetEnabled={(enabled) =>
+          api
+            ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
+            : Promise.resolve({ success: false as const, error: "Not connected to server" })
+        }
+        holdUntilTurnEnd={workspaceEntry?.agentMessageDispatchMode === "turn-end"}
+        onSetHoldUntilTurnEnd={(hold) =>
+          api
+            ? api.workspace.setAgentMessageDispatchMode({
+                workspaceId,
+                mode: hold ? "turn-end" : "tool-end",
+              })
+            : Promise.resolve({ success: false as const, error: "Not connected to server" })
+        }
+      />
       <WorkspaceMCPModal
         workspaceId={workspaceId}
         projectPath={projectPath}
         open={mcpModalOpen}
         onOpenChange={setMcpModalOpen}
       />
+      <TimelineDialog
+        workspaceId={workspaceId}
+        open={timelineDialogOpen}
+        onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
+      />
       <DebugLlmRequestModal
         workspaceId={workspaceId}
         open={debugLlmRequestOpen}
         onOpenChange={setDebugLlmRequestOpen}
       />
-      {linkSharingEnabled === true && (
-        <ShareTranscriptDialog
-          workspaceId={workspaceId}
-          workspaceName={workspaceName}
-          workspaceTitle={workspaceTitle}
-          open={shareTranscriptOpen}
-          onOpenChange={setShareTranscriptOpen}
-        />
-      )}
       {/* Combined confirmation for archive warnings (streaming + untracked files). */}
-      <ConfirmationModal
-        isOpen={archiveConfirmOpen}
-        title={
-          archiveUntrackedPaths
-            ? "Archive workspace with untracked files?"
-            : workspaceTitle
-              ? `Archive "${workspaceTitle}" while streaming?`
-              : "Archive chat?"
-        }
-        description={buildArchiveConfirmDescription(
-          archiveConfirmIsStreaming,
-          archiveUntrackedPaths
-        )}
-        warning={buildArchiveConfirmWarning(archiveConfirmIsStreaming, archiveUntrackedPaths)}
-        confirmLabel={archiveUntrackedPaths ? "Archive and delete files" : "Archive"}
-        confirmVariant="destructive"
-        onConfirm={() => {
-          const paths = archiveUntrackedPaths;
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-          void executeArchive(undefined, paths ?? undefined);
-        }}
-        onCancel={() => {
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-        }}
-      />
+      <ConfirmationModal {...archiveFlow.modalProps} />
       <PopoverError
         error={stopRuntimeError.error}
         prefix="Failed to stop container"

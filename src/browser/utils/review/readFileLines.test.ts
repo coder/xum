@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
-import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { readFileLines } from "./readFileLines";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const workspaceMetadata: Pick<FrontendWorkspaceMetadata, "projects"> = {
   projects: [
@@ -14,19 +14,20 @@ describe("readFileLines", () => {
   test("keeps plain file reads on the shared container cwd", async () => {
     const executeBash = mock(() =>
       Promise.resolve({
-        success: true,
+        success: true as const,
         data: {
-          success: true,
+          success: true as const,
           output: "first\nsecond\n",
-          exitCode: 0,
+          exitCode: 0 as const,
+          wall_duration_ms: 0,
         },
       })
     );
-    const api = {
+    const api = createTestApiClient({
       workspace: {
         executeBash,
       },
-    } as unknown as APIClient;
+    });
 
     const lines = await readFileLines(
       api,
@@ -49,19 +50,20 @@ describe("readFileLines", () => {
   test("uses repo-relative paths for git-ref reads in secondary repos", async () => {
     const executeBash = mock(() =>
       Promise.resolve({
-        success: true,
+        success: true as const,
         data: {
-          success: true,
+          success: true as const,
           output: "first\nsecond\n",
-          exitCode: 0,
+          exitCode: 0 as const,
+          wall_duration_ms: 0,
         },
       })
     );
-    const api = {
+    const api = createTestApiClient({
       workspace: {
         executeBash,
       },
-    } as unknown as APIClient;
+    });
 
     const lines = await readFileLines(
       api,

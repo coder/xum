@@ -1,6 +1,7 @@
 import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   isBashOutputEvent,
@@ -9,6 +10,7 @@ import {
   isGoalBudgetLimitedEvent,
   isInitEnd,
   isInitOutput,
+  isInitProgress,
   isInitStart,
   isMuxMessage,
   isQueuedMessageChanged,
@@ -24,6 +26,7 @@ import {
   isStreamStart,
   isToolCallDelta,
   isToolCallEnd,
+  isToolCallExecutionStart,
   isToolCallStart,
   isUsageDelta,
 } from "@/common/orpc/types";
@@ -36,6 +39,7 @@ import type {
   StreamStartEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
+  ToolCallExecutionStartEvent,
   ToolCallStartEvent,
   UsageDeltaEvent,
   RuntimeStatusEvent,
@@ -67,6 +71,7 @@ export interface WorkspaceChatEventAggregator {
   handleStreamError(data: StreamErrorMessage): void;
 
   handleToolCallStart(data: ToolCallStartEvent): void;
+  handleToolCallExecutionStart(data: ToolCallExecutionStartEvent): void;
   handleToolCallDelta(data: ToolCallDeltaEvent): void;
   handleToolCallEnd(data: ToolCallEndEvent): void;
 
@@ -86,40 +91,9 @@ export interface WorkspaceChatEventAggregator {
   clearTokenState(messageId: string): void;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object";
-}
-
-function isSuccessfulProposePlanResult(result: unknown): boolean {
-  if (!isRecord(result)) return false;
-  if (result.success !== true) return false;
-
-  const hasFileResult = typeof result.planPath === "string";
-  const hasLegacyResult = typeof result.title === "string" && typeof result.plan === "string";
-  return hasFileResult || hasLegacyResult;
-}
-
-function shouldRefreshAgentsAfterToolCallEnd(event: ToolCallEndEvent): boolean {
-  if (event.replay === true) return false;
-  if (event.toolName !== "propose_plan") return false;
-  return isSuccessfulProposePlanResult(event.result);
-}
-
-function dispatchAgentsRefreshRequested(): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED));
-}
-
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
-}
-
-function dispatchGoalChildBudgetToast(workspaceId: string, message: string): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, { workspaceId, message })
-  );
 }
 
 function dispatchMuxGatewaySessionExpired(): void {
@@ -191,6 +165,11 @@ export function applyWorkspaceChatEventToAggregator(
     return "immediate";
   }
 
+  if (isToolCallExecutionStart(event)) {
+    aggregator.handleToolCallExecutionStart(event);
+    return "immediate";
+  }
+
   if (isToolCallDelta(event)) {
     aggregator.handleToolCallDelta(event);
     return "throttled";
@@ -198,12 +177,6 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isToolCallEnd(event)) {
     aggregator.handleToolCallEnd(event);
-
-    if (allowSideEffects && shouldRefreshAgentsAfterToolCallEnd(event)) {
-      // Keep agent discovery in sync when propose_plan succeeds so conditionally visible
-      // agents (for example, those gated by `ui.requires: ["plan"]`) appear immediately.
-      dispatchAgentsRefreshRequested();
-    }
 
     if (
       allowSideEffects &&
@@ -228,7 +201,7 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isGoalBudgetLimitedEvent(event)) {
     if (allowSideEffects && event.causedByChild) {
-      dispatchGoalChildBudgetToast(event.workspaceId, event.message);
+      publishChatError(event.workspaceId, event.message);
     }
     return "ignored";
   }
@@ -254,8 +227,14 @@ export function applyWorkspaceChatEventToAggregator(
     return "immediate";
   }
 
-  // init-* and ChatMuxMessage are handled via the aggregator's unified handleMessage.
-  if (isMuxMessage(event) || isInitStart(event) || isInitOutput(event) || isInitEnd(event)) {
+  // init-* and ChatXumMessage are handled via the aggregator's unified handleMessage.
+  if (
+    isMuxMessage(event) ||
+    isInitStart(event) ||
+    isInitOutput(event) ||
+    isInitProgress(event) ||
+    isInitEnd(event)
+  ) {
     aggregator.handleMessage(event);
     return "immediate";
   }

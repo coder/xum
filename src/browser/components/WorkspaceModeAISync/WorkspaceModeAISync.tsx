@@ -6,32 +6,38 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
+  getAutoRoutingChoiceByAgentKey,
   getModelKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   AGENT_AI_DEFAULTS_KEY,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
+  applyAutoRoutingOutcome,
+  setWorkspaceModelWithOrigin,
+  setWorkspaceThinkingLevelWithOrigin,
+} from "@/browser/utils/modelChange";
+import {
+  resolveAutoRoutingForAgent,
   resolveWorkspaceAiSettingsForAgent,
+  type AutoRoutingChoiceByAgent,
   type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 
 export function WorkspaceModeAISync(props: { workspaceId: string }): null {
   const workspaceId = props.workspaceId;
-  const { agentId } = useAgent();
+  const { agentId, agents } = useAgent();
+  const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
     AGENT_AI_DEFAULTS_KEY,
-    {},
-    { listener: true }
-  );
-  const [workspaceByAgent] = usePersistedState<WorkspaceAISettingsCache>(
-    getWorkspaceAISettingsByAgentKey(workspaceId),
     {},
     { listener: true }
   );
@@ -58,20 +64,46 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     prevAgentIdRef.current = normalizedAgentId;
     prevWorkspaceIdRef.current = workspaceId;
 
+    // Read at call time rather than subscribing: this cache only feeds explicit agent
+    // switches, yet every model/thinking/pro-mode change rewrites it, so a subscription
+    // would re-run this effect and re-apply the mode default over the user's own pick.
+    const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
+      getWorkspaceAISettingsByAgentKey(workspaceId),
+      {}
+    );
+
     const existingModel = readPersistedState<string>(modelKey, fallbackModel);
     const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
+    const reasoningKey = getReasoningModeKey(workspaceId);
+    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
 
-    const { resolvedModel, resolvedThinking } = resolveWorkspaceAiSettingsForAgent({
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
+      resolveWorkspaceAiSettingsForAgent({
+        agentId: normalizedAgentId,
+        agentAiDefaults,
+        // Keep deterministic handoff behavior: background sync should trust the
+        // currently active workspace model, but explicit mode switches should
+        // restore the selected agent's per-workspace override (if any).
+        workspaceByAgent,
+        useWorkspaceByAgentFallback: isExplicitAgentSwitch,
+        fallbackModel,
+        existingModel,
+        existingThinking,
+        existingReasoningMode: existingReasoning,
+        agentBaseById,
+      });
+    const autoRoutingOutcome = resolveAutoRoutingForAgent({
       agentId: normalizedAgentId,
       agentAiDefaults,
-      // Keep deterministic handoff behavior: background sync should trust the
-      // currently active workspace model, but explicit mode switches should
-      // restore the selected agent's per-workspace override (if any).
+      agentBaseById,
+      explicitSwitch: isExplicitAgentSwitch,
+      experimentEnabled: autoRoutingEnabled,
+      routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
+        getAutoRoutingChoiceByAgentKey(workspaceId),
+        {}
+      ),
       workspaceByAgent,
-      useWorkspaceByAgentFallback: isExplicitAgentSwitch,
-      fallbackModel,
-      existingModel,
-      existingThinking,
     });
 
     if (existingModel !== resolvedModel) {
@@ -83,9 +115,19 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      setWorkspaceThinkingLevelWithOrigin(
+        workspaceId,
+        resolvedThinking,
+        isExplicitAgentSwitch ? "agent" : "sync"
+      );
     }
-  }, [agentAiDefaults, agentId, workspaceByAgent, workspaceId]);
+
+    if (existingReasoning !== resolvedReasoningMode) {
+      updatePersistedState(reasoningKey, resolvedReasoningMode);
+    }
+
+    applyAutoRoutingOutcome(workspaceId, autoRoutingOutcome);
+  }, [agentAiDefaults, agentId, agents, autoRoutingEnabled, workspaceId]);
 
   return null;
 }

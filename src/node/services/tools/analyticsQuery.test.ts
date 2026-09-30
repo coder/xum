@@ -4,9 +4,10 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { createAnalyticsQueryTool, TOOL_RESULT_ROW_LIMIT } from "./analyticsQuery";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
-const mockToolCallOptions: ToolExecutionOptions = {
+const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
+  context: undefined,
 };
 
 async function expectToolExecutionFailure(

@@ -2,12 +2,13 @@ import { z } from "zod";
 import { ThinkingLevelSchema } from "../../types/thinking";
 import { RuntimeConfigSchema } from "./runtime";
 import { WorkspaceAISettingsByAgentSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 import { GoalSnapshotSchema } from "./goal";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  HEARTBEAT_TRIGGER_VALUES,
+  HEARTBEAT_WHEN_BUSY_VALUES,
 } from "@/constants/heartbeat";
 
 export const ProjectRefSchema = z.object({
@@ -28,13 +29,6 @@ export const BestOfGroupSchema = z.object({
   total: z.number().int().min(2).meta({
     description: "Total number of sibling tasks spawned in the grouped task request.",
   }),
-  kind: z.enum(TASK_GROUP_KIND_VALUES).optional().meta({
-    description:
-      'Optional grouped task mode ("bestOf" for repeated candidates or "variants" for labeled siblings). Missing values default to "bestOf" at read time for backward compatibility.',
-  }),
-  label: z.string().min(1).optional().meta({
-    description: "Optional per-sibling label for grouped task variants.",
-  }),
 });
 
 /**
@@ -46,7 +40,7 @@ export const BestOfGroupSchema = z.object({
  * value for new goals in this workspace". A workspace with all three
  * fields null is semantically identical to no override at all — the
  * backend should drop the entire object in that case to keep
- * `~/.mux/config.json` tidy.
+ * `~/.xum/config.json` tidy.
  *
  * Mirrors the heartbeat pattern (per-workspace override of a global
  * default, persisted inside `WorkspaceConfigSchema`) so the
@@ -68,6 +62,8 @@ export const WorkspaceGoalDefaultsOverrideSchema = z.object({
 });
 
 export const HeartbeatContextModeSchema = z.enum(HEARTBEAT_CONTEXT_MODE_VALUES);
+export const HeartbeatTriggerSchema = z.enum(HEARTBEAT_TRIGGER_VALUES);
+export const HeartbeatWhenBusySchema = z.enum(HEARTBEAT_WHEN_BUSY_VALUES);
 
 export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
@@ -84,9 +80,96 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
     description:
       'Whether heartbeats use the existing context ("normal"), perform a real compaction first ("compact"), or append a synthetic reset boundary first ("reset"). Missing values default to "normal" at read time for backward compatibility.',
   }),
+  // No Zod .default() on trigger/whenBusy: defaults resolve at read time via
+  // resolveHeartbeatSchedulePolicy (src/constants/heartbeat.ts) because the whenBusy default is
+  // conditional on the resolved trigger and strict-mode tool providers send explicit null.
+  trigger: HeartbeatTriggerSchema.nullish().meta({
+    description:
+      'How the heartbeat countdown is anchored: "idle" resets on workspace activity (fires only after a full quiet interval), "interval" is a fixed wall-clock cadence. Missing/null values default to "idle" at read time.',
+  }),
+  whenBusy: HeartbeatWhenBusySchema.nullish().meta({
+    description:
+      'What happens when a heartbeat fires while the workspace is busy: "skip" misses the slot, "tool-end" queues the heartbeat for the next tool boundary in the current turn, "turn-end" queues it as its own turn after the current one. Missing/null values default at read time to "skip" for the "idle" trigger and "turn-end" for the "interval" trigger.',
+  }),
+  // Server-managed (never a client input): stamped by setHeartbeatSettings when a
+  // cadence-affecting field (enabled/intervalMs/resolved trigger) changes. Fixed-interval
+  // restart anchoring uses max(last persisted firing, this) so a schedule edit is not
+  // bypassed by a heartbeat that fired under the previous schedule.
+  scheduleUpdatedAt: z.number().int().nonnegative().nullish().meta({
+    description:
+      "Timestamp (epoch ms) of the last cadence-affecting heartbeat settings edit. Server-managed.",
+  }),
 });
 
+// Single source of truth for workflow task metadata on both persisted config
+// entries (src/common/schemas/project.ts) and workspace metadata IPC. The runId
+// stays a loose non-empty string (not WorkflowRunIdSchema) so a malformed
+// persisted entry can never brick config/metadata parsing (self-healing rule).
+export const WorkflowTaskMetadataSchema = z.object({
+  runId: z.string().min(1).meta({ description: "Workflow run that spawned this task." }),
+  stepId: z.string().min(1).meta({ description: "Workflow step that spawned this task." }),
+  workflowName: z.string().min(1).optional().meta({
+    description:
+      "Human-readable workflow display name stamped at spawn time for sidebar grouping. Optional: absent on tasks created before this field existed.",
+  }),
+  outputSchema: z.unknown().optional().meta({
+    description: "Optional JSON Schema subset required for this task's structured output.",
+  }),
+});
+
+/**
+ * Shared description for the recipient-consent field on persisted config and published metadata.
+ * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
+ * it; the backend compares the generation captured at admission with the current one so an
+ * off→on flip cannot revive work queued under the previous consent. Absent means off. New root
+ * workspaces get a fresh generation once their creation setup is complete (on by default; for
+ * task-delegated targets, once their creating turn settles); the app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * application-level opt-in, not an isolation boundary.
+ */
+export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces start with one (task-delegated targets once their first turn ends, disposable ones never); absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+
+/**
+ * Fail-closed reader for the persisted consent generation. Config entries are loaded without
+ * per-field schema validation, so a corrupted, blank, or whitespace-padded value must read as
+ * "off" rather than as a permissive default — and must never make the workspace unloadable.
+ */
+export function getValidUnrelatedWorkspaceConsent(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  return value.trim() === value ? value : undefined;
+}
+
+/**
+ * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
+ * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
+ * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
+ * the current turn ends, even if the sender asked for tool-end.
+ */
+export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
+
+export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
+export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;
+
+/**
+ * Lenient reader for the persisted delivery preference. Config entries are loaded without
+ * per-field validation, so anything other than a known mode reads as absent (the tool-end default)
+ * rather than making the workspace unloadable.
+ */
+export function getValidAgentMessageDispatchMode(
+  value: unknown
+): AgentMessageDispatchMode | undefined {
+  const parsed = AgentMessageDispatchModeSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 export const WorkspaceMetadataSchema = z.object({
+  kind: z.literal("scratch").optional().meta({
+    description: "Marks an app-owned project-less scratch chat workspace.",
+  }),
   id: z.string().meta({
     description:
       "Stable unique identifier (10 hex chars for new workspaces, legacy format for old)",
@@ -132,6 +215,14 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Per-workspace overrides for goal creation defaults (budget, turn cap, explicit-budget). Layered on top of the global `goalDefaults` from app config.",
   }),
+  // Passed through from config so the settings UI reads consent from metadata instead of
+  // keeping a duplicate copy; only a validated (non-blank) generation is published.
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
@@ -143,16 +234,47 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       'If set, selects an agent definition for this workspace (e.g., "explore" or "exec").',
   }),
+  tags: z
+    .record(z.string(), z.string())
+    .optional()
+    .meta({
+      description:
+        "Programmatic key/value tags (e.g. workItemKey) set via API/CLI/workflows; " +
+        "not rendered in the UI. Stable identity for orchestration loops, unlike title/name.",
+    }),
+  workflowTask: WorkflowTaskMetadataSchema.optional().meta({
+    description: "Workflow run/step metadata for workflow-spawned child tasks.",
+  }),
   bestOf: BestOfGroupSchema.optional().meta({
     description: "Grouping metadata for child tasks spawned from the same parent tool call.",
   }),
   taskStatus: z
-    .enum(["queued", "running", "awaiting_report", "interrupted", "reported"])
+    .enum(["queued", "starting", "running", "awaiting_report", "interrupted", "reported"])
     .optional()
     .meta({
       description:
-        "Agent task lifecycle status for child workspaces (queued|running|awaiting_report|interrupted|reported).",
+        "Agent task lifecycle status for child workspaces (queued|starting|running|awaiting_report|interrupted|reported).",
     }),
+  taskPendingGuidance: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        message: z.string().min(1),
+        queueDispatchMode: z.enum(["tool-end", "turn-end"]),
+      })
+    )
+    .optional()
+    .meta({
+      description:
+        "Parent guidance queued for replacement task turns but not yet accepted into chat history.",
+    }),
+  taskLaunchError: z.string().optional().meta({
+    description: "Startup failure recorded before an agent task could begin streaming.",
+  }),
+  delegatedCreationInterrupted: z.literal(true).optional().meta({
+    description:
+      "The delegated task that created this workspace died before its setup finished, so the task never started here and its owner cannot reach it (#4983). The user removes or keeps it.",
+  }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
   }),
@@ -178,6 +300,25 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
   }),
+  // Delegation changes the operator, not the computer; checkout isolation is independent.
+  taskDesktopOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Ancestor owning the shared desktop. Absent means this workspace owns its desktop.",
+  }),
+  taskIsolation: z.enum(["fork", "none"]).optional().meta({
+    description:
+      'Workspace isolation for an agent task. "none" shares an ancestor checkout and must never be treated as an independently managed worktree.',
+  }),
+  taskSticky: z.boolean().optional().meta({
+    description: "Legacy ignored retention marker kept for on-disk downgrade compatibility.",
+  }),
+  taskExecutionId: z.string().optional().meta({
+    description: "Latest internal execution handle for a reawakened persistent sub-agent.",
+  }),
+  taskExecutionStatus: z
+    .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
+    .optional()
+    .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
   archivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last archived. Workspace is considered archived if archivedAt > unarchivedAt (or unarchivedAt is absent).",
@@ -185,6 +326,10 @@ export const WorkspaceMetadataSchema = z.object({
   unarchivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last unarchived. Used for recency calculation to bump restored workspaces to top.",
+  }),
+  pinnedAt: z.string().optional().meta({
+    description:
+      "ISO 8601 pin ordering key (not a reliable 'when pinned' record: reorderPinned re-deals existing values). Pinned workspaces sort to the top of their project in pinnedAt order (ascending). Cleared on archive.",
   }),
   projects: z
     .array(ProjectRefSchema)
@@ -202,12 +347,15 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
+  rootWorkspaceId: z.string().optional().meta({
+    description: "Task-family root derived from complete metadata, including archived ancestors.",
+  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
   incompatibleRuntime: z.string().optional().meta({
     description:
-      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of mux). The workspace should be displayed but interactions should show this error message.",
+      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of Xum). The workspace should be displayed but interactions should show this error message.",
   }),
   isRemoving: z.boolean().optional().meta({
     description: "True if this workspace is currently being deleted (deletion in progress).",
@@ -249,9 +397,31 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   hasTodos: z.boolean().optional().meta({
     description: "Whether the workspace still had todos when streaming last stopped",
   }),
+  isCompaction: z.boolean().optional().meta({
+    description:
+      "Whether the current streaming activity is a compaction turn (transient UI classification)",
+  }),
   isIdleCompaction: z.boolean().optional().meta({
     description: "Whether the current streaming activity is an idle (background) compaction",
   }),
+  activeWorkflowRunIds: z.array(z.string().min(1)).optional().meta({
+    description:
+      "IDs of top-level workflow runs in this workspace that are pending, running, or backgrounded.",
+  }),
+  activeWorkflowRunCount: z.number().int().nonnegative().optional().meta({
+    description:
+      "Number of top-level workflow runs in this workspace that are pending, running, or backgrounded.",
+  }),
+  activeBashMonitorCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .meta({
+      description:
+        "Number of running background bash processes with an armed wake-on-match monitor. " +
+        "Signals the workspace is still waiting to be woken even though no stream is active.",
+    }),
   goal: GoalSnapshotSchema.nullable().optional().meta({
     description: "Current workspace goal snapshot for sidebar indicators and the Goal tab",
   }),
@@ -259,12 +429,6 @@ export const WorkspaceActivitySnapshotSchema = z.object({
     description:
       "Internal frontend hint: merge only the goal field from this activity event; do not replace persisted activity fields.",
   }),
-});
-
-export const PostCompactionStateSchema = z.object({
-  planPath: z.string().nullable(),
-  trackedFilePaths: z.array(z.string()),
-  excludedItems: z.array(z.string()),
 });
 
 export const GitStatusSchema = z.object({
@@ -289,4 +453,27 @@ export const GitStatusSchema = z.object({
   /** Line deltas for changes that exist on origin's primary branch but not locally */
   incomingAdditions: z.number(),
   incomingDeletions: z.number(),
+});
+
+export const WorkspaceRemovalDescendantSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string(),
+  active: z.boolean(),
+});
+/**
+ * Something a successful (forced) removal could not clean up (#5143). Forced paths that skip the
+ * Force Delete dialog (bulk delete, cancel-creation, shift-click) show these to the user.
+ */
+export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("leftover"),
+    /** Names the leftover (a path, or a container by label) and what the user should do. */
+    description: z.string(),
+  }),
+]);
+export const WorkspaceRemoveResultSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+  warnings: z.array(WorkspaceRemoveWarningSchema).optional(),
 });

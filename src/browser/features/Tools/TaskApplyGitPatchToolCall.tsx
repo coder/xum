@@ -357,7 +357,12 @@ export const TaskApplyGitPatchToolCall: React.FC<TaskApplyGitPatchToolCallProps>
   const errorPreview =
     typeof errorResult?.error === "string" ? errorResult.error.split("\n")[0]?.trim() : undefined;
 
-  const { expanded, toggleExpanded } = useToolExpansion(Boolean(errorResult));
+  // A failed patch must surface its error, so force the row open when there's an error
+  // result instead of letting a stored `tools: false` preference hide it (mirrors how
+  // TaskToolCall forces open on error/failed states).
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: Boolean(errorResult),
+  });
   const { copied: copiedError, copyToClipboard: copyErrorToClipboard } = useCopyToClipboard();
 
   const effectiveThreeWay = args.three_way !== false;

@@ -1,5 +1,6 @@
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import React, { createContext, useContext } from "react";
+import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
 
 interface MessageListContextValue {
   workspaceId: string;
@@ -12,23 +13,21 @@ const MessageListContext = createContext<MessageListContextValue | null>(null);
 
 interface MessageListProviderProps {
   value: MessageListContextValue;
+  /** See TranscriptBackfillContext. */
+  isTranscriptBackfilling?: boolean;
   children: React.ReactNode;
 }
 
 export const MessageListProvider: React.FC<MessageListProviderProps> = (props) => {
   return (
-    <MessageListContext.Provider value={props.value}>{props.children}</MessageListContext.Provider>
+    <MessageListContext.Provider value={props.value}>
+      <TranscriptBackfillContext.Provider value={props.isTranscriptBackfilling ?? false}>
+        {props.children}
+      </TranscriptBackfillContext.Provider>
+    </MessageListContext.Provider>
   );
 };
 
 export function useOptionalMessageListContext(): MessageListContextValue | null {
   return useContext(MessageListContext);
-}
-
-export function useMessageListContext(): MessageListContextValue {
-  const context = useContext(MessageListContext);
-  if (!context) {
-    throw new Error("useMessageListContext must be used within MessageListProvider");
-  }
-  return context;
 }

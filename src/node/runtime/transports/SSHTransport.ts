@@ -25,6 +25,13 @@ export interface PtySessionParams {
   rows: number;
 }
 
+export interface SSHTransportAcquireOptions {
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
+  maxWaitMs?: number;
+  onWait?: (waitMs: number) => void;
+}
+
 export interface SSHTransport {
   /** Spawn a command on the remote host, returning a ChildProcess-compatible object. */
   spawnRemoteProcess(command: string, options: SpawnOptions): Promise<SpawnResult>;
@@ -33,12 +40,7 @@ export interface SSHTransport {
   isConnectionFailure(exitCode: number, stderr: string): boolean;
 
   /** Pre-flight connection check with backoff enforcement. */
-  acquireConnection(options?: {
-    abortSignal?: AbortSignal;
-    timeoutMs?: number;
-    maxWaitMs?: number;
-    onWait?: (waitMs: number) => void;
-  }): Promise<void>;
+  acquireConnection(options?: SSHTransportAcquireOptions): Promise<void>;
 
   /** Get underlying config (for PTY terminal spawning). */
   getConfig(): SSHTransportConfig;

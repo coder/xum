@@ -32,13 +32,13 @@ describe("workspace.updateAgentAISettings", () => {
 
       const client = resolveOrpcClient(env);
       const updateResult = await client.workspace.updateAgentAISettings({
-        workspaceId: workspaceId!,
+        workspaceId: workspaceId,
         agentId: "exec",
         aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
       });
       expect(updateResult.success).toBe(true);
 
-      const info = await client.workspace.getInfo({ workspaceId: workspaceId! });
+      const info = await client.workspace.getInfo({ workspaceId: workspaceId });
       expect(info?.aiSettingsByAgent?.exec).toEqual({
         model: "openai:gpt-5.2",
         thinkingLevel: "xhigh",
@@ -72,13 +72,13 @@ describe("workspace.updateAgentAISettings", () => {
 
       const client = resolveOrpcClient(env);
       const updateResult = await client.workspace.updateAgentAISettings({
-        workspaceId: workspaceId!,
+        workspaceId: workspaceId,
         agentId: "ask",
         aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "low" },
       });
       expect(updateResult.success).toBe(true);
 
-      const info = await client.workspace.getInfo({ workspaceId: workspaceId! });
+      const info = await client.workspace.getInfo({ workspaceId: workspaceId });
       expect(info?.aiSettingsByAgent?.ask).toEqual({
         model: "anthropic:claude-opus-4-6",
         thinkingLevel: "low",
@@ -106,13 +106,13 @@ describe("workspace.updateAgentAISettings", () => {
 
       const client = resolveOrpcClient(env);
       const updateResult = await client.workspace.updateAgentAISettings({
-        workspaceId: workspaceId!,
+        workspaceId: workspaceId,
         agentId: "exec",
         aiSettings: { model: "openrouter:openai/gpt-5", thinkingLevel: "off" },
       });
       expect(updateResult.success).toBe(true);
 
-      const info = await client.workspace.getInfo({ workspaceId: workspaceId! });
+      const info = await client.workspace.getInfo({ workspaceId: workspaceId });
       expect(info?.aiSettingsByAgent?.exec).toEqual({
         model: "openrouter:openai/gpt-5",
         thinkingLevel: "off",
@@ -148,7 +148,7 @@ describe("workspace.updateAgentAISettings", () => {
 
       // Set initial workspace AI settings
       const updateResult = await client.workspace.updateAgentAISettings({
-        workspaceId: workspaceId!,
+        workspaceId: workspaceId,
         agentId: "exec",
         aiSettings: { model: "anthropic:claude-sonnet-4-20250514", thinkingLevel: "medium" },
       });
@@ -157,7 +157,7 @@ describe("workspace.updateAgentAISettings", () => {
       // Send a compaction request with a different model
       // The muxMetadata type: "compaction-request" should prevent AI settings from being persisted
       await client.workspace.sendMessage({
-        workspaceId: workspaceId!,
+        workspaceId: workspaceId,
         message: "Summarize the conversation",
         options: {
           model: "openai:gpt-4.1-mini", // Different model for compaction
@@ -172,7 +172,7 @@ describe("workspace.updateAgentAISettings", () => {
       });
 
       // Verify the original workspace AI settings were NOT overwritten
-      const info = await client.workspace.getInfo({ workspaceId: workspaceId! });
+      const info = await client.workspace.getInfo({ workspaceId: workspaceId });
       expect(info?.aiSettingsByAgent?.exec).toEqual({
         model: "anthropic:claude-sonnet-4-20250514",
         thinkingLevel: "medium",

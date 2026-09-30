@@ -3,23 +3,29 @@ import assert from "node:assert/strict";
 import { streamText, tool, type Tool } from "ai";
 
 import {
-  ADVISOR_DEFAULT_MAX_USES_PER_TURN,
   ADVISOR_HANDOFF_MAX_REASONING_CHARS,
   ADVISOR_HANDOFF_MAX_TEXT_CHARS,
-  buildAdvisorToolDescription,
-  composeAdvisorSystemPrompt,
+  ADVISOR_SYSTEM_PROMPT,
 } from "@/common/constants/advisor";
 import type { ModelMessage } from "@/common/types/message";
-import type { AdvisorPackage } from "@/common/types/advisor";
 import { THINKING_LEVEL_OFF, coerceThinkingLevel } from "@/common/types/thinking";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
+import { normalizeUsage, withCacheWriteMetadata } from "@/common/utils/tokens/usageHelpers";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { getErrorMessage } from "@/common/utils/errors";
 import { sanitizeErrorMessageForDisplay } from "@/common/utils/providerOutputSanitization";
-import type { AdvisorOutputEvent, AdvisorPhaseEvent } from "@/common/types/stream";
-import { AdvisorToolInputSchema } from "@/common/utils/tools/toolDefinitions";
+import type {
+  AdvisorOutputEvent,
+  AdvisorPhaseEvent,
+  AdvisorReasoningOutputEvent,
+} from "@/common/types/stream";
+import { AdvisorToolInputSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { AdvisorToolCallSnapshot, ToolConfiguration } from "@/common/utils/tools/tools";
 import { log } from "@/node/services/log";
+import { flattenProviderExecutedToolParts } from "@/node/utils/messages/flattenProviderExecutedToolParts";
+import { emitChatEventBestEffort } from "./toolUtils";
+
+type StreamTextProviderOptions = Parameters<typeof streamText>[0]["providerOptions"];
 
 type AdvisorHandoffMessage = Extract<ModelMessage, { role: "user" }>;
 
@@ -42,12 +48,6 @@ function tailTruncate(value: string, maxChars: number): string {
   }
 
   return `...${value.slice(-(maxChars - 3))}`;
-}
-
-function formatPendingToolCall(input: Record<string, unknown>): string {
-  const serializedInput = JSON.stringify(input);
-  assert(serializedInput != null, "advisor handoff input must be JSON serializable");
-  return `advisor(${serializedInput})`;
 }
 
 function buildAdvisorHandoffMessage(
@@ -81,79 +81,67 @@ function buildAdvisorHandoffMessage(
     sections.push(`**Current-step reasoning:**\n${stepReasoning}`);
   }
 
-  if (snapshot != null) {
-    assert(
-      snapshot.toolName === "advisor",
-      "advisor handoff snapshot must come from the advisor tool"
-    );
-    sections.push(`**Pending tool call:**\n${formatPendingToolCall(snapshot.input)}`);
-  }
-
   return {
     role: "user",
     content: sections.join("\n\n"),
   };
 }
 
-function getAdvisorTextDelta(chunk: unknown): string | undefined {
+const ADVISOR_DELTA_TEXT_FIELDS = ["text", "delta", "textDelta"] as const;
+const ADVISOR_TEXT_DELTA_TYPES = ["text-delta", "text"] as const;
+const ADVISOR_REASONING_DELTA_TYPES = ["reasoning-delta", "reasoning"] as const;
+
+function getAdvisorChunkDelta(
+  chunk: unknown,
+  acceptedTypes: readonly string[]
+): string | undefined {
   if (typeof chunk !== "object" || chunk === null) {
     return undefined;
   }
 
   const record = chunk as Record<string, unknown>;
-  if (record.type !== "text-delta" && record.type !== "text") {
+  if (typeof record.type !== "string" || !acceptedTypes.includes(record.type)) {
     return undefined;
   }
 
-  const text = extractChunkDeltaText(record, ["text", "delta", "textDelta"]);
+  const text = extractChunkDeltaText(record, ADVISOR_DELTA_TEXT_FIELDS);
   return text.length > 0 ? text : undefined;
 }
 
-/**
- * Resolve the effective per-turn usage cap for a single advisor.
- *
- * Resolution order (most specific wins):
- * 1. `frontmatter.max_uses_per_turn === null` → unlimited
- * 2. `frontmatter.max_uses_per_turn === <positive int>` → exact cap
- * 3. Falls back to the runtime-wide default
- */
-function resolveAdvisorMaxUsesPerTurn(
-  advisor: AdvisorPackage,
-  runtimeDefault: number
-): number | null {
-  const override = advisor.frontmatter.max_uses_per_turn;
-  if (override === null) {
-    return null;
-  }
-  if (override != null) {
-    return override;
-  }
-  return runtimeDefault;
+function getAdvisorTextDelta(chunk: unknown): string | undefined {
+  return getAdvisorChunkDelta(chunk, ADVISOR_TEXT_DELTA_TYPES);
 }
 
-function resolveAdvisorMaxOutputTokens(advisor: AdvisorPackage): number | undefined {
-  // `null` and `undefined` both mean unlimited; positive int means explicit cap.
-  return advisor.frontmatter.max_output_tokens ?? undefined;
-}
-
-function formatAvailableAdvisorList(advisors: readonly AdvisorPackage[]): string {
-  if (advisors.length === 0) {
-    return "(none configured)";
-  }
-  return advisors.map((a) => a.directoryName).join(", ");
+function getAdvisorReasoningDelta(chunk: unknown): string | undefined {
+  return getAdvisorChunkDelta(chunk, ADVISOR_REASONING_DELTA_TYPES);
 }
 
 export function createAdvisorTool(config: ToolConfiguration): Tool {
   assert(config.advisorRuntime, "advisorRuntime must be set when advisor tool is registered");
 
   const runtime = config.advisorRuntime;
+  const advisorModelString = runtime.advisorModelString.trim();
+  const reasoningLevel = runtime.reasoningLevel?.trim();
+  const effectiveReasoningLevel = coerceThinkingLevel(reasoningLevel) ?? THINKING_LEVEL_OFF;
+
+  assert(advisorModelString.length > 0, "advisorModelString must be a non-empty string");
   assert(
-    runtime.advisors.length > 0,
-    "advisorRuntime.advisors must be non-empty when the advisor tool is registered"
+    reasoningLevel === undefined || reasoningLevel.length > 0,
+    "advisor reasoningLevel must be undefined or a non-empty string"
   );
   assert(
-    Number.isInteger(runtime.defaultMaxUsesPerTurn) && runtime.defaultMaxUsesPerTurn > 0,
-    "advisor defaultMaxUsesPerTurn must be a positive integer"
+    reasoningLevel === undefined || effectiveReasoningLevel === reasoningLevel,
+    "advisor reasoningLevel must be a valid ThinkingLevel when provided"
+  );
+  assert(
+    runtime.maxUsesPerTurn === null ||
+      (Number.isInteger(runtime.maxUsesPerTurn) && runtime.maxUsesPerTurn > 0),
+    "advisor maxUsesPerTurn must be null or a positive integer"
+  );
+  assert(
+    runtime.maxOutputTokens === undefined ||
+      (Number.isInteger(runtime.maxOutputTokens) && runtime.maxOutputTokens > 0),
+    "advisor maxOutputTokens must be undefined or a positive integer"
   );
   assert(
     typeof runtime.getTranscriptSnapshot === "function",
@@ -165,61 +153,34 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
   );
   assert(typeof runtime.createModel === "function", "advisor createModel must be a function");
 
-  // Per-advisor turn-scoped usage counters. Keying on directoryName mirrors how
-  // the model selects an advisor (by name in `advisor_name`), so a busy
-  // ml-fellow advisor can't starve a separately-configured code-review one.
-  const usesThisTurnByAdvisor = new Map<string, number>();
-
-  // The base default-cap fallback gets resolved once at registration. Per-turn
-  // counter resets are handled by the parent stream rebuilding the runtime
-  // bundle on every prepareStep — we never need to mutate state across turns.
-  const advisorsByName = new Map(runtime.advisors.map((a) => [a.directoryName, a]));
+  let usesThisTurn = 0;
 
   return tool({
-    description: buildAdvisorToolDescription(runtime.advisors),
+    description: TOOL_DEFINITIONS.advisor.description,
     inputSchema: AdvisorToolInputSchema,
     execute: async (args, { abortSignal, toolCallId }) => {
-      const requestedName = args.advisor_name.trim();
       const question = args.question != null ? args.question.trim() || undefined : undefined;
       assert(
         question == null || question.length > 0,
         "advisor question must be undefined or a non-empty string after trimming"
       );
 
-      const advisor = advisorsByName.get(requestedName);
-      if (advisor == null) {
-        // Self-correctable: include the live catalog so the model can retry
-        // with a valid name in the same turn.
-        return {
-          type: "error" as const,
-          isError: true,
-          message: `Advisor '${requestedName}' is not configured. Available advisors: ${formatAvailableAdvisorList(runtime.advisors)}.`,
-        };
-      }
-
-      const advisorModelString = advisor.frontmatter.model.trim();
-      assert(
-        advisorModelString.length > 0,
-        `advisor '${advisor.directoryName}' has empty model after trim; should have been rejected at parse time`
-      );
-      const reasoningLevel = advisor.frontmatter.thinking ?? THINKING_LEVEL_OFF;
-      const effectiveReasoningLevel = coerceThinkingLevel(reasoningLevel) ?? THINKING_LEVEL_OFF;
-
-      const maxUsesPerTurn = resolveAdvisorMaxUsesPerTurn(advisor, runtime.defaultMaxUsesPerTurn);
-      const maxOutputTokens = resolveAdvisorMaxOutputTokens(advisor);
-
       const emitAdvisorPhase = (phase: AdvisorPhaseEvent["phase"]): void => {
         if (!config.emitChatEvent || !config.workspaceId || !toolCallId) {
           return;
         }
 
-        config.emitChatEvent({
-          type: "advisor-phase",
-          workspaceId: config.workspaceId,
-          toolCallId,
-          phase,
-          timestamp: Date.now(),
-        } satisfies AdvisorPhaseEvent);
+        emitChatEventBestEffort(
+          config,
+          {
+            type: "advisor-phase",
+            workspaceId: config.workspaceId,
+            toolCallId,
+            phase,
+            timestamp: Date.now(),
+          } satisfies AdvisorPhaseEvent,
+          "advisor"
+        );
       };
 
       const emitAdvisorOutput = (text: string): void => {
@@ -228,32 +189,59 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           return;
         }
 
-        config.emitChatEvent({
-          type: "advisor-output",
-          workspaceId: config.workspaceId,
-          toolCallId,
-          text,
-          timestamp: Date.now(),
-        } satisfies AdvisorOutputEvent);
+        emitChatEventBestEffort(
+          config,
+          {
+            type: "advisor-output",
+            workspaceId: config.workspaceId,
+            toolCallId,
+            text,
+            timestamp: Date.now(),
+          } satisfies AdvisorOutputEvent,
+          "advisor"
+        );
+      };
+
+      const emitAdvisorReasoningOutput = (text: string): void => {
+        assert(text.length > 0, "advisor reasoning output chunks must be non-empty");
+        if (!config.emitChatEvent || !config.workspaceId || !toolCallId) {
+          return;
+        }
+
+        emitChatEventBestEffort(
+          config,
+          {
+            type: "advisor-reasoning-output",
+            workspaceId: config.workspaceId,
+            toolCallId,
+            text,
+            timestamp: Date.now(),
+          } satisfies AdvisorReasoningOutputEvent,
+          "advisor"
+        );
       };
 
       emitAdvisorPhase("preparing_context");
 
-      const usesThisTurn = usesThisTurnByAdvisor.get(advisor.directoryName) ?? 0;
-      if (maxUsesPerTurn !== null && usesThisTurn >= maxUsesPerTurn) {
+      if (runtime.maxUsesPerTurn !== null && usesThisTurn >= runtime.maxUsesPerTurn) {
         return {
           type: "limit_reached" as const,
-          advisorName: advisor.directoryName,
           advisorModel: advisorModelString,
           reasoningLevel,
-          message: `Advisor '${advisor.directoryName}' limit reached for this turn (max ${maxUsesPerTurn} uses).`,
+          message: `Advisor limit reached for this turn (max ${runtime.maxUsesPerTurn} uses).`,
         };
       }
       // Reserve the slot before any await so concurrent advisor calls cannot bypass the per-turn cap.
-      usesThisTurnByAdvisor.set(advisor.directoryName, usesThisTurn + 1);
-      const remainingUses = maxUsesPerTurn !== null ? maxUsesPerTurn - (usesThisTurn + 1) : null;
+      usesThisTurn++;
+      const remainingUses =
+        runtime.maxUsesPerTurn !== null ? runtime.maxUsesPerTurn - usesThisTurn : null;
 
-      const transcript = runtime.getTranscriptSnapshot();
+      // Flatten provider-executed (server-side) tool parts to text: the live
+      // step transcript keeps them as assistant tool-call/tool-result parts,
+      // which cannot be replayed against a different provider (e.g. OpenAI
+      // rejects foreign `srvtoolu_...` ids as unknown item_references). See
+      // flattenProviderExecutedToolParts for details.
+      const transcript = flattenProviderExecutedToolParts(runtime.getTranscriptSnapshot());
       assert(Array.isArray(transcript), "advisor transcript snapshot must be an array");
       assert(transcript.length > 0, "advisor transcript snapshot must not be empty");
       assert(toolCallId, "advisor requires toolCallId");
@@ -263,11 +251,34 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
       const messages: ModelMessage[] =
         handoffMessage != null ? [...transcript, handoffMessage] : transcript;
 
-      const providerOptions = buildProviderOptions(advisorModelString, effectiveReasoningLevel);
-      const systemPrompt = composeAdvisorSystemPrompt(advisor.body);
-
       try {
-        const model = await runtime.createModel(advisorModelString);
+        const {
+          model,
+          metadataModel,
+          optionsModelString,
+          optionsProvidersConfig,
+          optionsMuxProviderOptions,
+          optionsRouteProvider,
+        } = await runtime.createModel(advisorModelString);
+        // Keep the creation-time identity, including the actual Coder instance
+        // and scoped aliases. buildProviderOptions resolves its wire namespace
+        // from the same captured config and returns provider SDK option types;
+        // streamText accepts the same JSON-shaped values through its shared
+        // providerOptions slot.
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+        const providerOptions = buildProviderOptions(
+          optionsModelString,
+          effectiveReasoningLevel,
+          undefined,
+          undefined,
+          optionsMuxProviderOptions,
+          undefined,
+          undefined,
+          optionsProvidersConfig,
+          optionsRouteProvider,
+          undefined,
+          runtime.reasoningMode
+        ) as unknown as StreamTextProviderOptions;
 
         emitAdvisorPhase("waiting_for_response");
 
@@ -275,17 +286,28 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         const streamedAdviceChunks: string[] = [];
         const result = streamText({
           model,
-          system: systemPrompt,
+          system: ADVISOR_SYSTEM_PROMPT,
           messages,
+          // The parent transcript snapshot can start with the cached
+          // { role: "system" } message StreamManager prepends for Anthropic
+          // caching; AI SDK 7 rejects it unless opted in. Trusted: mux builds
+          // the transcript server-side.
+          allowSystemInMessages: true,
           // Advisor requests are intentionally tool-less strategic consultations.
           tools: {},
           providerOptions,
           abortSignal: abortSignal ?? runtime.abortSignal,
-          ...(maxOutputTokens != null ? { maxOutputTokens } : {}),
+          ...(runtime.maxOutputTokens != null ? { maxOutputTokens: runtime.maxOutputTokens } : {}),
           onError: ({ error }) => {
             advisorStreamError = error;
           },
           onChunk: ({ chunk }) => {
+            const reasoningText = getAdvisorReasoningDelta(chunk);
+            if (reasoningText != null) {
+              emitAdvisorReasoningOutput(reasoningText);
+              return;
+            }
+
             const text = getAdvisorTextDelta(chunk);
             if (text == null) {
               return;
@@ -308,21 +330,32 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         }
 
         const advice = finalAdvice.length > 0 ? finalAdvice : streamedAdviceChunks.join("");
-        const usage = await result.usage;
-        const providerMetadata = await result.providerMetadata;
+        // Normalize AI SDK 7 usage to mux's persisted flat shape and re-inject
+        // cache-write tokens (moved off providerMetadata in v7) for pricing.
+        const rawUsage = await result.usage;
+        const usage = normalizeUsage(rawUsage);
+        const providerMetadata = withCacheWriteMetadata(
+          (await result.providerMetadata) as Record<string, unknown> | undefined,
+          rawUsage
+        );
 
         emitAdvisorPhase("finalizing_result");
 
         if (config.reportModelUsage != null && usage != null) {
           try {
+            assert(
+              advisorModelString.length > 0,
+              "advisorModelString must remain non-empty when reporting usage"
+            );
             // Keep advisor costs under the advisor model bucket instead of folding them into
             // the parent chat stream's model totals.
             config.reportModelUsage({
               source: "tool",
               toolName: "advisor",
               model: advisorModelString,
+              metadataModel,
               usage,
-              providerMetadata: providerMetadata as Record<string, unknown> | undefined,
+              providerMetadata,
               toolCallId,
               timestamp: Date.now(),
             });
@@ -333,10 +366,19 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           }
         }
 
+        // An empty stream (for example a gateway hiccup) used to surface as a
+        // success-shaped result, so the caller saw "advice" that said nothing.
+        if (advice.trim().length === 0) {
+          return {
+            type: "error" as const,
+            isError: true,
+            message: `Advisor returned no advice (finish reason: ${finishReason}). Retry once or continue without it.`,
+          };
+        }
+
         return {
           type: "advice" as const,
           advice,
-          advisorName: advisor.directoryName,
           advisorModel: advisorModelString,
           reasoningLevel,
           remainingUses,
@@ -359,7 +401,3 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
     },
   });
 }
-
-// Re-export the default for convenience; aiService.ts uses it as the fallback
-// when an advisor entry omits `max_uses_per_turn`.
-export { ADVISOR_DEFAULT_MAX_USES_PER_TURN };

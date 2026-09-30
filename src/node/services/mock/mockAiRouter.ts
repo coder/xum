@@ -25,6 +25,9 @@ export interface MockAiRouterReply {
   /** Optional: if present, the mock adapter will emit a usage-delta early in the stream. */
   usage?: LanguageModelV2Usage;
 
+  /** Optional: delay before mock tool calls begin (useful for interaction-driven queue tests). */
+  toolCallDelayMs?: number;
+
   /** Optional: mock tool calls to emit before assistant text streaming. */
   toolCalls?: MockAiToolCall[];
 
@@ -138,6 +141,17 @@ function buildForceCompactionReply(): MockAiRouterReply {
   };
 }
 
+/**
+ * ~18 s at the adapter's default pacing (24 chars / 25 ms): long enough for perf scenarios to
+ * leave and return to chats that are still mid-stream (#4504, perf.chatSwitch.spec.ts), short
+ * enough that waiting for a round's streams to finish keeps the scenario quick. Paragraph breaks keep the growing reply shaped
+ * like real prose instead of one giant line.
+ */
+function buildLongStreamReply(): MockAiRouterReply {
+  const paragraph = Array.from({ length: 40 }, () => "Streaming response...").join(" ");
+  return { assistantText: Array.from({ length: 20 }, () => paragraph).join("\n\n") };
+}
+
 function buildListProgrammingLanguagesReply(): MockAiRouterReply {
   return {
     assistantText: [
@@ -182,6 +196,41 @@ function buildPermissionExecReply(): MockAiRouterReply {
           output: "patch applied\n",
           exitCode: 0,
           wall_duration_ms: 180,
+        },
+      },
+    ],
+  };
+}
+
+function buildParallelToolStepReply(): MockAiRouterReply {
+  return {
+    assistantText: "Finished both sibling tool calls before continuing.",
+    toolCallDelayMs: 10_000,
+    toolCalls: [
+      {
+        toolCallId: "tool-parallel-step-a",
+        toolName: "file_read",
+        args: { path: "parallel-step-a.txt" },
+        result: {
+          success: true,
+          file_size: 24,
+          modifiedTime: "2024-01-01T00:00:00.000Z",
+          lines_read: 1,
+          content: "1\tparallel step A complete",
+          lease: "lease-parallel-step-a",
+        },
+      },
+      {
+        toolCallId: "tool-parallel-step-b",
+        toolName: "file_read",
+        args: { path: "parallel-step-b.txt" },
+        result: {
+          success: true,
+          file_size: 24,
+          modifiedTime: "2024-01-01T00:00:00.000Z",
+          lines_read: 1,
+          content: "1\tparallel step B complete",
+          lease: "lease-parallel-step-b",
         },
       },
     ],
@@ -358,7 +407,7 @@ function buildReviewShowDocReply(): MockAiRouterReply {
 
 function buildModelStatusReply(): MockAiRouterReply {
   return {
-    assistantText: "Claude Sonnet 4.6 is now responding with standard reasoning capacity.",
+    assistantText: "Claude Sonnet 5.5 is now responding with standard reasoning capacity.",
   };
 }
 
@@ -438,6 +487,10 @@ const defaultHandlers: MockAiRouterHandler[] = [
       hasMockMarker(request.latestUserText, "permission:exec-refactor") ||
       normalizeText(request.latestUserText) === "do it",
     respond: () => buildPermissionExecReply(),
+  },
+  {
+    match: (request) => hasMockMarker(request.latestUserText, "tool:parallel-step"),
+    respond: () => buildParallelToolStepReply(),
   },
   {
     match: (request) =>
@@ -531,6 +584,10 @@ const defaultHandlers: MockAiRouterHandler[] = [
       hasMockMarker(request.latestUserText, "error:network") ||
       normalizeText(request.latestUserText) === "trigger network error",
     respond: () => buildNetworkErrorReply(),
+  },
+  {
+    match: (request) => hasMockMarker(request.latestUserText, "long-stream"),
+    respond: () => buildLongStreamReply(),
   },
   {
     match: () => true,

@@ -16,6 +16,112 @@ export const shescape = {
   },
 };
 
+/** Thrown by streamToStringWithByteCeiling when the source exceeds the ceiling. */
+export class StreamByteCeilingExceededError extends Error {
+  constructor(maxBytes: number) {
+    super(`stream exceeded the ${maxBytes}-byte ceiling`);
+    this.name = "StreamByteCeilingExceededError";
+  }
+}
+
+/**
+ * Convert a ReadableStream to a string, FAILING as soon as the source exceeds
+ * `maxBytes` — unlike streamToStringCapped, which drains the remainder.
+ *
+ * Draining is the right call for child-process pipes (keeps them flowing to a
+ * natural exit) but fatal for file sources whose size cannot be trusted: a
+ * pre-read stat check passes for /dev/zero (size 0) and races a concurrently
+ * growing file, and an unbounded drain of /dev/zero never terminates. Cancel
+ * the reader to stop the underlying source and throw instead.
+ */
+export async function streamToStringWithByteCeiling(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number
+): Promise<string> {
+  if (!(Number.isFinite(maxBytes) && maxBytes > 0)) {
+    throw new Error(
+      `streamToStringWithByteCeiling: maxBytes must be a positive number, got ${maxBytes}`
+    );
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  // Array-join instead of += for the same rope-avoidance reason as streamToString.
+  const chunks: string[] = [];
+  let collectedBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      collectedBytes += value.byteLength;
+      if (collectedBytes > maxBytes) {
+        // Stop the underlying source (closes file handles / infinite device
+        // streams) before surfacing the failure.
+        await reader.cancel();
+        throw new StreamByteCeilingExceededError(maxBytes);
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    const tail = decoder.decode();
+    if (tail) chunks.push(tail);
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Convert a ReadableStream to a string, capping accumulation at `maxBytes` raw bytes.
+ *
+ * Once the cap is reached, remaining chunks are read and DISCARDED rather than
+ * buffered: draining keeps the child process's pipe flowing (no backpressure
+ * stall) and preserves its natural exit code, while memory stays bounded.
+ * Callers that need a duration bound must pair this with an exec timeout.
+ */
+export async function streamToStringCapped(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number
+): Promise<string> {
+  if (!(Number.isFinite(maxBytes) && maxBytes >= 0)) {
+    throw new Error(
+      `streamToStringCapped: maxBytes must be a non-negative number, got ${maxBytes}`
+    );
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  // Array-join instead of += for the same rope-avoidance reason as streamToString.
+  const chunks: string[] = [];
+  let collectedBytes = 0;
+  let truncated = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (collectedBytes >= maxBytes) {
+        // Cap reached: drain without accumulating.
+        truncated = truncated || value.byteLength > 0;
+        continue;
+      }
+      const remaining = maxBytes - collectedBytes;
+      const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      truncated = truncated || slice.byteLength < value.byteLength;
+      collectedBytes += slice.byteLength;
+      chunks.push(decoder.decode(slice, { stream: true }));
+    }
+    // Only flush the decoder when the stream ended naturally under the cap.
+    // When truncated, the cap may have split a multi-byte code point; flushing
+    // would emit U+FFFD instead of a clean prefix, so drop the partial bytes.
+    if (!truncated) {
+      const tail = decoder.decode();
+      if (tail) chunks.push(tail);
+    }
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /**
  * Convert a ReadableStream to a string.
  * Used by SSH and Docker runtimes for capturing command output.
@@ -42,48 +148,4 @@ export async function streamToString(stream: ReadableStream<Uint8Array>): Promis
   } finally {
     reader.releaseLock();
   }
-}
-
-/** Convert a ReadableStream<Uint8Array> to one concatenated Uint8Array. */
-export async function streamToUint8Array(
-  stream: ReadableStream<Uint8Array>,
-  maxBytes?: number
-): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-
-  let completed = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        completed = true;
-        break;
-      }
-      const nextLength = totalLength + value.length;
-      if (maxBytes != null && nextLength > maxBytes) {
-        throw new Error(`Stream exceeded ${maxBytes} byte limit`);
-      }
-      chunks.push(value);
-      totalLength = nextLength;
-    }
-  } finally {
-    if (!completed) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Stream may already be errored or canceled.
-      }
-    }
-    reader.releaseLock();
-  }
-
-  const output = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return output;
 }

@@ -3,7 +3,7 @@
  * Start an isolated Electron dev instance (Vite + Electron main process).
  *
  * Why:
- * - Electron uses the mux home directory (MUX_ROOT / ~/.mux-dev) for config,
+ * - Electron uses the xum home directory (XUM_ROOT / ~/.xum-dev) for config,
  *   sessions, worktrees, etc.
  * - Running multiple Electron instances against the same mux root is noisy and
  *   risky during development.
@@ -22,13 +22,14 @@
  *   - --help
  *
  * Optional env vars:
- *   - SEED_MUX_ROOT=/path/to/mux/home   # where to copy providers.jsonc/config.json from
- *   - KEEP_SANDBOX=1                   # don't delete temp MUX_ROOT on exit
- *   - VITE_PORT=5174                   # override picked Vite port
+ *   - SEED_XUM_ROOT=/path/to/xum/home # where to copy providers.jsonc/config.json from
+ *   - SEED_MUX_ROOT=/path/to/mux/home   # legacy alias for SEED_XUM_ROOT
+ *   - KEEP_SANDBOX=1                   # don't delete temp XUM_ROOT on exit
+ *   - XUM_VITE_PORT / VITE_PORT       # override picked Vite port
  *   - VITE_READY_TIMEOUT_MS=60000      # override Vite readiness timeout
  *   - ELECTRON_DEBUG_PORT=9223         # override picked Electron remote debugging port
  *   - ELECTRON_DEBUG_PORT=0            # disable Electron remote debugging port entirely
- *   - MUX_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
+ *   - XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
  *   - MAKE=gmake                       # override make binary
  */
 
@@ -38,12 +39,17 @@ import * as os from "os";
 import * as path from "path";
 
 import {
-  chooseSeedMuxRoot,
+  assignXumEnvironmentValue,
+  resolveXumEnvironmentValue,
+} from "../src/common/compat/xumEnv";
+import {
+  chooseSeedSources,
   copyConfigClearingProjectsIfExists,
   copyFileIfExists,
   forwardSignalsToChildProcesses,
   getFreePort,
   parseOptionalPort,
+  sanitizeSandboxProviderEnv,
   waitForHttpReady,
 } from "./sandboxUtils";
 
@@ -79,11 +85,11 @@ Optional CLI flags:
   --clean-projects    Do not import projects from config.json (projects will be empty)
 
 Optional env vars:
-  MUX_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
 
 Examples:
   make dev-desktop-sandbox DEV_DESKTOP_SANDBOX_ARGS="--clean-providers --clean-projects"
-  MUX_ENABLE_TUTORIALS_IN_SANDBOX=1 VITE_PORT=5175 ELECTRON_DEBUG_PORT=9223 make dev-desktop-sandbox`);
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 XUM_VITE_PORT=5175 ELECTRON_DEBUG_PORT=9223 make dev-desktop-sandbox`);
 }
 
 function parseElectronDebugPort(
@@ -158,9 +164,11 @@ async function main(): Promise<number> {
   // Do any validation that might throw *before* creating the temp root so we
   // don't leave behind stale `mux-desktop-*` directories for simple mistakes.
   const shouldSeed = !(cleanProviders && cleanProjects);
-  const seedMuxRoot = shouldSeed ? chooseSeedMuxRoot() : null;
+  const seedSources = shouldSeed ? chooseSeedSources() : { providersPath: null, configPath: null };
 
-  const vitePortOverride = parseOptionalPort(process.env.VITE_PORT);
+  const vitePortOverride = parseOptionalPort(
+    resolveXumEnvironmentValue("VITE_PORT", process.env) ?? process.env.VITE_PORT
+  );
   const debugPortConfig = parseElectronDebugPort(process.env.ELECTRON_DEBUG_PORT);
 
   let vitePort: number;
@@ -191,9 +199,8 @@ async function main(): Promise<number> {
   let electronProc: ReturnType<typeof spawn> | null = null;
 
   try {
-    const seedProvidersPath =
-      seedMuxRoot && !cleanProviders ? path.join(seedMuxRoot, "providers.jsonc") : null;
-    const seedConfigPath = seedMuxRoot ? path.join(seedMuxRoot, "config.json") : null;
+    const seedProvidersPath = !cleanProviders ? seedSources.providersPath : null;
+    const seedConfigPath = seedSources.configPath;
 
     const sandboxProvidersPath = path.join(muxRoot, "providers.jsonc");
     const sandboxConfigPath = path.join(muxRoot, "config.json");
@@ -208,14 +215,11 @@ async function main(): Promise<number> {
       : false;
 
     console.log("\nStarting mux desktop sandbox...");
-    console.log(`  MUX_ROOT:        ${muxRoot}`);
-    if (seedMuxRoot) {
-      console.log(`  Seeded from:     ${seedMuxRoot}`);
-      console.log(`  Copied config:   ${copiedConfig ? "yes" : "no"}`);
-      console.log(`  Copied providers: ${copiedProviders ? "yes" : "no"}`);
-    } else {
-      console.log("  Seeded from:     (none)");
-    }
+    console.log(`  XUM_ROOT:       ${muxRoot}`);
+    console.log(`  Seed config:     ${copiedConfig && seedConfigPath ? seedConfigPath : "(none)"}`);
+    console.log(
+      `  Seed providers:  ${copiedProviders && seedProvidersPath ? seedProvidersPath : "(none)"}`
+    );
     if (cleanProviders || cleanProjects) {
       console.log(`  Clean providers: ${cleanProviders ? "yes" : "no"}`);
       console.log(`  Clean projects:  ${cleanProjects ? "yes" : "no"}`);
@@ -230,15 +234,25 @@ async function main(): Promise<number> {
       console.log("  KEEP_SANDBOX=1 (temp root will not be deleted)");
     }
 
+    // Guard against provider env-var fallback: strip all provider env vars on
+    // --clean-providers, strip the seeded providers' env vars when a
+    // providers.jsonc was copied, and warn when env fallback would apply.
+    const childEnv = sanitizeSandboxProviderEnv({
+      cleanProviders,
+      seededProvidersPath: copiedProviders ? sandboxProvidersPath : null,
+    });
+    childEnv.NODE_ENV = "development";
+    assignXumEnvironmentValue(childEnv, "ROOT", muxRoot);
+    assignXumEnvironmentValue(childEnv, "VITE_PORT", String(vitePort));
+    assignXumEnvironmentValue(
+      childEnv,
+      "ENABLE_TUTORIALS_IN_SANDBOX",
+      resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", process.env) ?? "0"
+    );
+
     devProc = spawn(makeCmd, ["dev"], {
       stdio: "inherit",
-      env: {
-        ...process.env,
-        NODE_ENV: "development",
-        MUX_ROOT: muxRoot,
-        MUX_VITE_PORT: String(vitePort),
-        MUX_ENABLE_TUTORIALS_IN_SANDBOX: process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX ?? "0",
-      },
+      env: childEnv,
     });
 
     const devExitPromise = waitForChildExit(devProc, `${makeCmd} dev`);
@@ -291,23 +305,27 @@ async function main(): Promise<number> {
     }
     electronArgs.push(".");
 
+    // Keep sandboxed desktop launches profile-ready; callers can set XUM_PROFILE_REACT=0
+    // to compare against an uninstrumented renderer.
+    assignXumEnvironmentValue(
+      childEnv,
+      "PROFILE_REACT",
+      resolveXumEnvironmentValue("PROFILE_REACT", process.env) ?? "1"
+    );
+    assignXumEnvironmentValue(childEnv, "DEVSERVER_HOST", "127.0.0.1");
+    assignXumEnvironmentValue(childEnv, "DEVSERVER_PORT", String(vitePort));
+    // If config.json pins apiServerPort, multiple sandboxes can collide; default to 0.
+    assignXumEnvironmentValue(
+      childEnv,
+      "SERVER_PORT",
+      resolveXumEnvironmentValue("SERVER_PORT", process.env) ?? "0"
+    );
+    assignXumEnvironmentValue(childEnv, "ALLOW_MULTIPLE_INSTANCES", "1");
+    childEnv.CMUX_ALLOW_MULTIPLE_INSTANCES = "1";
+
     electronProc = spawn("bunx", electronArgs, {
       stdio: "inherit",
-      env: {
-        ...process.env,
-        NODE_ENV: "development",
-        MUX_ROOT: muxRoot,
-        MUX_DEVSERVER_HOST: "127.0.0.1",
-        MUX_DEVSERVER_PORT: String(vitePort),
-
-        // If the user's config.json specifies apiServerPort, we can easily hit EADDRINUSE
-        // while running multiple sandboxes. Default to port 0 (random) unless overridden.
-        MUX_SERVER_PORT: process.env.MUX_SERVER_PORT ?? "0",
-
-        // Allow multiple dev Electron instances concurrently.
-        CMUX_ALLOW_MULTIPLE_INSTANCES: "1",
-        MUX_ENABLE_TUTORIALS_IN_SANDBOX: process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX ?? "0",
-      },
+      env: childEnv,
     });
 
     const electronExitPromise = waitForChildExit(electronProc, "bunx electron");

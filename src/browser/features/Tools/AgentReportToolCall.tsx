@@ -1,68 +1,87 @@
 import React from "react";
 
 import type { AgentReportToolArgs, AgentReportToolResult } from "@/common/types/tools";
+import { AgentReportToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 
+import { ErrorBox } from "./Shared/ToolPrimitives";
+import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
 import {
-  ToolContainer,
-  ToolHeader,
-  ExpandIcon,
-  ToolName,
-  StatusIndicator,
-  ToolDetails,
-  ToolIcon,
-  ErrorBox,
-} from "./Shared/ToolPrimitives";
-import {
-  useToolExpansion,
-  getStatusDisplay,
   isToolErrorResult,
+  normalizeToolResultForRendering,
   type ToolStatus,
 } from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 
+interface LegacyAgentReportFileArgs {
+  reportMarkdownPath?: string | null;
+  structuredOutputPath?: string | null;
+  title?: string | null;
+}
+
+type AgentReportRenderableArgs = AgentReportToolArgs | LegacyAgentReportFileArgs;
+
 interface AgentReportToolCallProps {
-  args: AgentReportToolArgs;
-  result?: AgentReportToolResult;
+  args: AgentReportRenderableArgs;
+  result?: unknown;
   status?: ToolStatus;
 }
 
-export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = ({
-  args,
-  result,
-  status = "pending",
-}) => {
-  // Default to expanded: the report is the entire point of this tool.
-  const { expanded, toggleExpanded } = useToolExpansion(true);
+function getSubmittedReportMarkdown(
+  args: AgentReportRenderableArgs,
+  result: AgentReportToolResult | undefined
+): string {
+  if (result && "success" in result && result.success === true && result.report?.reportMarkdown) {
+    return result.report.reportMarkdown;
+  }
+  if ("reportMarkdown" in args) {
+    return args.reportMarkdown;
+  }
+  return `Report file: ${args.reportMarkdownPath ?? "report.md"}`;
+}
 
-  const errorResult = isToolErrorResult(result) ? result : null;
-
-  const title = args.title ?? "Agent report";
-
-  // Show a small preview when collapsed so the card still has some useful context.
-  const firstLine = args.reportMarkdown.trim().split("\n")[0] ?? "";
-  const preview = firstLine.length > 80 ? firstLine.slice(0, 80).trim() + "…" : firstLine;
+export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = (props) => {
+  // Persisted results bypass input-schema validation and may be malformed.
+  const normalizedResult = normalizeToolResultForRendering(props.result);
+  const parsed = AgentReportToolResultSchema.safeParse(normalizedResult);
+  const result = isToolErrorResult(normalizedResult)
+    ? normalizedResult
+    : parsed.success
+      ? parsed.data
+      : undefined;
+  const invalidResult = (props.result != null || props.status === "completed") && result == null;
+  const reportMarkdown = getSubmittedReportMarkdown(props.args, result);
+  const failedResult = result?.success === false ? result : null;
+  const title = props.args.title?.trim() ?? "";
 
   return (
-    <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <ToolIcon toolName="agent_report" />
-        <ToolName>{title}</ToolName>
-        <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
-      </ToolHeader>
-
-      {expanded && (
-        <ToolDetails>
-          <div className="text-[11px]">
-            <MarkdownRenderer content={args.reportMarkdown} />
-          </div>
-          {errorResult && <ErrorBox className="mt-2">{errorResult.error}</ErrorBox>}
-        </ToolDetails>
-      )}
-
-      {!expanded && preview && (
-        <div className="text-muted mt-1 truncate text-[10px]">{preview}</div>
-      )}
-    </ToolContainer>
+    <AgentCommunicationCard
+      toolName="agent_report"
+      title={title.length > 0 ? title : "Agent update"}
+      destination="To parent"
+      status={failedResult || invalidResult ? "failed" : (props.status ?? "pending")}
+      statusLabel={invalidResult ? "Result unavailable" : undefined}
+      preview={reportMarkdown}
+      initiallyExpanded
+      error={
+        failedResult && (
+          <ErrorBox className="mt-2" role="alert">
+            {isToolErrorResult(failedResult) ? (
+              failedResult.error
+            ) : (
+              <>
+                {failedResult.message}
+                {failedResult.errors.map((error, index) => (
+                  <div key={index}>
+                    {error.path}: {error.message}
+                  </div>
+                ))}
+              </>
+            )}
+          </ErrorBox>
+        )
+      }
+    >
+      <MarkdownRenderer content={reportMarkdown} className="text-sm leading-relaxed" />
+    </AgentCommunicationCard>
   );
 };

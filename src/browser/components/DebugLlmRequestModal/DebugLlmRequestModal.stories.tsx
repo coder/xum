@@ -2,7 +2,7 @@ import { userEvent, waitFor } from "@storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { CHROMATIC_SMOKE_MODES, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { createOnChatAdapter } from "@/browser/stories/helpers/chatSetup";
 import {
   collapseLeftSidebar,
@@ -35,7 +35,7 @@ const createDebugLlmRequestSnapshot = (workspaceId: string): DebugLlmRequestSnap
   agentId: "exec",
   maxOutputTokens: 2048,
   systemMessage:
-    "You are Mux, a focused coding agent. Follow the user’s instructions and keep answers short.",
+    "You are Xum, a focused coding agent. Follow the user’s instructions and keep answers short.",
   messages: [
     {
       role: "user",
@@ -85,7 +85,7 @@ const createDebugLlmRequestSnapshot = (workspaceId: string): DebugLlmRequestSnap
 // Integration: story renders full app with debug snapshot + chat error to trigger the Debug LLM Request modal.
 export const DebugLlmRequestModal: AppStory = {
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   render: () => (
     <AppWithMocks
@@ -110,7 +110,7 @@ export const DebugLlmRequestModal: AppStory = {
                     timestamp: STABLE_TIMESTAMP - 100000,
                   })
                 );
-                callback({ type: "caught-up" });
+                callback({ type: "caught-up", historyReplayStatus: "complete" });
                 callback({
                   type: "stream-error",
                   messageId: "error-msg",

@@ -1,10 +1,5 @@
 import React from "react";
-import {
-  CHROMATIC_SMOKE_MODES,
-  appMeta,
-  AppWithMocks,
-  type AppStory,
-} from "@/browser/stories/meta.js";
+import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import {
   collapseLeftSidebar,
   collapseRightSidebar,
@@ -27,7 +22,7 @@ export default {
 
 function createPopulatedClient() {
   // Keep createdAt deterministic so recency tie-breakers can't reorder sibling
-  // workspaces between Storybook/Chromatic runs.
+  // workspaces between Storybook runs.
   const stableCreatedAt = "2023-11-14T22:13:20.000Z";
   const workspaces = [
     createWorkspace({
@@ -101,7 +96,7 @@ export const MacOSDesktop: AppStory = {
     },
   ],
   parameters: {
-    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+    pixel: { matrix: PIXEL_DUAL_THEME },
   },
   render: () => <AppWithMocks setup={createPopulatedClient} />,
 };

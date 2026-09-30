@@ -10,6 +10,7 @@ import { ResultTable } from "../Tools/analyticsQuery/ResultTable";
 import { inferAxes, inferChartType } from "../Tools/analyticsQuery/chartHeuristics";
 import type { ChartType } from "../Tools/analyticsQuery/types";
 import { ChartTypePicker } from "./ChartTypePicker";
+import { substituteTimeFilter, TIME_FILTER_PLACEHOLDER } from "./sqlTimeFilter";
 
 export const SAMPLE_QUERIES = [
   {
@@ -28,9 +29,33 @@ export const SAMPLE_QUERIES = [
     label: "Tokens by Thinking Level",
     sql: "SELECT thinking_level, sum(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens) as total_tokens\nFROM events\nWHERE thinking_level IS NOT NULL\nGROUP BY thinking_level\nORDER BY total_tokens DESC;",
   },
+  // Refusal analytics: 'model_fallback_refusal' rows are refused fallback hops
+  // on committed turns; 'headless:refused_stream' rows are refusals on turns
+  // that never committed (terminal refusals, aborted/errored refusal turns).
+  {
+    label: "Refusals per Day",
+    sql: "SELECT date, model, count(*) as refusals\nFROM events\nWHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\nGROUP BY date, model\nORDER BY date ASC;",
+  },
+  {
+    label: "Refusal Downgrades (Requested → Answered)",
+    sql: "SELECT requested_model, model as answered_model, count(*) as turns\nFROM events\nWHERE requested_model IS NOT NULL AND tool_name IS NULL\nGROUP BY requested_model, model\nORDER BY turns DESC;",
+  },
+  {
+    // Every events row is one recorded invocation of `model` (committed turns,
+    // tool-internal calls, and billed errored/aborted/refused attempts via
+    // headless:* rows), so attempts = count(*) per model and refusal rows are
+    // a subset — billed non-refusal failures count in the denominator instead
+    // of inflating refusal_pct. Refusal rows already carry the refused model,
+    // so requested_model must not be coalesced in (double-count).
+    label: "Refusal Rate by Model",
+    sql: "WITH attempts AS (\n  SELECT model, count(*) as n FROM events\n  WHERE model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT a.model,\n  COALESCE(r.n, 0) as refusals,\n  a.n as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / a.n, 2) as refusal_pct\nFROM attempts a LEFT JOIN refused r USING (model)\nORDER BY refusals DESC;",
+  },
 ];
 
 interface SqlExplorerProps {
+  /** Predicate for the dashboard's date-range selection, substituted for the
+   *  time-filter placeholder before the SQL is executed. */
+  timeFilterSql: string;
   onSaveQuery?: (input: {
     label: string;
     sql: string;
@@ -68,9 +93,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
     }
 
     const thisExecutionId = ++executionIdRef.current;
-    await executeQuery(normalizedSql);
+    await executeQuery(substituteTimeFilter(normalizedSql, props.timeFilterSql));
 
     if (thisExecutionId === executionIdRef.current) {
+      // Keep the raw SQL (with placeholder) so "Save as Panel" stores a query
+      // that keeps tracking the dashboard's date-range selection.
       setLastExecutedSql(normalizedSql);
     }
   };
@@ -130,7 +157,7 @@ export function SqlExplorer(props: SqlExplorerProps) {
             />
           </Button>
           {showSamples && (
-            <div className="bg-sidebar border-border-medium absolute top-full right-0 z-50 mt-1 w-64 rounded-md border p-1 shadow-lg">
+            <div className="bg-dark border-border-medium absolute top-full right-0 z-50 mt-1 w-64 rounded-md border p-1 shadow-lg">
               {SAMPLE_QUERIES.map((sample) => (
                 <button
                   key={sample.label}
@@ -179,6 +206,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
               Run Query
             </Button>
           </div>
+        </div>
+
+        <div className="text-muted text-[10px]">
+          Use <code className="text-foreground">{TIME_FILTER_PLACEHOLDER}</code> in a WHERE clause
+          to filter by the selected date range (7D/30D/90D/All).
         </div>
 
         {error && (

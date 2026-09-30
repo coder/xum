@@ -23,6 +23,8 @@ export interface StreamTimeline {
 export interface WorkspaceUI {
   readonly projects: {
     openFirstWorkspace(): Promise<void>;
+    /** Select a workspace row in the sidebar by ID (expands the first project if needed). */
+    openWorkspaceById(workspaceId: string): Promise<void>;
   };
   readonly chat: {
     waitForTranscript(): Promise<void>;
@@ -30,6 +32,7 @@ export interface WorkspaceUI {
     setThinkingLevel(value: number): Promise<void>;
     sendMessage(message: string): Promise<void>;
     expectTranscriptContains(text: string): Promise<void>;
+    expectTurnSettled(): Promise<void>;
     expectActionButtonVisible(label: string): Promise<void>;
     clickActionButton(label: string): Promise<void>;
     expectStatusMessageContains(text: string): Promise<void>;
@@ -90,17 +93,8 @@ function sanitizeMode(mode: ChatMode): ChatMode {
   }
 }
 
-// Thinking level paddle controls (replaced old slider UI)
-function thinkingDecreasePaddle(page: Page): Locator {
-  return page.getByRole("button", { name: "Decrease thinking level" });
-}
-
-function thinkingIncreasePaddle(page: Page): Locator {
-  return page.getByRole("button", { name: "Increase thinking level" });
-}
-
-function thinkingLevelLabel(page: Page): Locator {
-  return page.getByLabel(/Thinking level:/);
+function thinkingSelectorTrigger(page: Page): Locator {
+  return page.locator("[data-thinking-selector-trigger]").first();
 }
 
 function transcriptLocator(page: Page): Locator {
@@ -108,40 +102,54 @@ function transcriptLocator(page: Page): Locator {
 }
 
 export function createWorkspaceUI(page: Page, context: DemoProjectConfig): WorkspaceUI {
+  /** Workspace rows of the first project, expanding it when collapsed. */
+  async function firstProjectWorkspaceRows(): Promise<Locator> {
+    const navigation = page.getByRole("navigation", { name: "Projects" });
+    await expect(navigation).toBeVisible();
+
+    const projectItems = navigation.locator('[role="button"][aria-controls]');
+    const projectItem = projectItems.first();
+    await expect(projectItem).toBeVisible();
+
+    const workspaceListId = await projectItem.getAttribute("aria-controls");
+    if (!workspaceListId) {
+      throw new Error("Project item is missing aria-controls attribute");
+    }
+
+    const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
+    const workspaceItem = workspaceItems.first();
+    const isVisible = await workspaceItem.isVisible().catch(() => false);
+    if (!isVisible) {
+      // Click the expand/collapse button within the project item
+      const expandButton = projectItem.getByRole("button", { name: /expand project/i });
+      await expandButton.click();
+      await workspaceItem.waitFor({ state: "visible" });
+    }
+    return workspaceItems;
+  }
+
   const projects = {
     async openFirstWorkspace(): Promise<void> {
-      const navigation = page.getByRole("navigation", { name: "Projects" });
-      await expect(navigation).toBeVisible();
-
-      const projectItems = navigation.locator('[role="button"][aria-controls]');
-      const projectItem = projectItems.first();
-      await expect(projectItem).toBeVisible();
-
-      const workspaceListId = await projectItem.getAttribute("aria-controls");
-      if (!workspaceListId) {
-        throw new Error("Project item is missing aria-controls attribute");
-      }
-
-      const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
-      const workspaceItem = workspaceItems.first();
-      const isVisible = await workspaceItem.isVisible().catch(() => false);
-      if (!isVisible) {
-        // Click the expand/collapse button within the project item
-        const expandButton = projectItem.getByRole("button", { name: /expand project/i });
-        await expandButton.click();
-        await workspaceItem.waitFor({ state: "visible" });
-      }
-
+      const workspaceItem = (await firstProjectWorkspaceRows()).first();
       await workspaceItem.click();
 
       // Startup can land on a project page or a restored workspace. After clicking a
       // workspace we need to confirm the navigation actually landed on the demo workspace
       // (not just any transcript).
       const expectedProjectName = path.basename(context.projectPath);
-      await expect(page.getByTestId("workspace-menu-bar")).toContainText(expectedProjectName, {
+      await expect(page.getByTestId("workspace-footer-bar")).toContainText(expectedProjectName, {
         timeout: 20_000,
       });
 
+      await chat.waitForTranscript();
+    },
+
+    async openWorkspaceById(workspaceId: string): Promise<void> {
+      const workspaceItem = (await firstProjectWorkspaceRows()).and(
+        page.locator(`[data-workspace-id="${workspaceId}"]`)
+      );
+      await workspaceItem.click();
+      await expect(workspaceItem).toHaveAttribute("aria-current", "true");
       await chat.waitForTranscript();
     },
   };
@@ -180,142 +188,30 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
      * matching the app's model-aware thinking policy.
      */
     async setThinkingLevel(targetLevel: number): Promise<void> {
-      if (!Number.isInteger(targetLevel)) {
-        throw new Error("Thinking level must be an integer");
-      }
-      if (targetLevel < 0 || targetLevel > 4) {
-        throw new Error(`Thinking level ${targetLevel} is outside expected range 0-4`);
+      if (!Number.isInteger(targetLevel) || targetLevel < 0) {
+        throw new Error("Thinking level must be a non-negative integer");
       }
 
-      const levelLabels = ["OFF", "LOW", "MED", "HIGH", "XHIGH"];
-      const label = thinkingLevelLabel(page);
-      const decreasePaddle = thinkingDecreasePaddle(page);
-      const increasePaddle = thinkingIncreasePaddle(page);
+      const trigger = thinkingSelectorTrigger(page);
+      await expect(trigger).toBeVisible();
+      await trigger.dispatchEvent("click");
 
-      // Wait for thinking controls to be visible
-      await expect(label).toBeVisible();
-
-      const readCurrentLabel = async (): Promise<string> => {
-        const text = await label.textContent();
-        const normalized = text?.trim().toUpperCase() ?? "";
-
-        // Note: XHIGH contains HIGH as a substring, so we must avoid includes()-based matching here.
-        return levelLabels.find((candidate) => normalized === candidate) ?? levelLabels[0];
-      };
-
-      const clickUntilLabelChanges = async (
-        control: Locator,
-        previousLabel: string
-      ): Promise<string> => {
-        if (await control.isDisabled()) {
-          return previousLabel;
-        }
-
-        for (let attempt = 0; attempt < 3; attempt++) {
-          await control.dispatchEvent("click");
-          try {
-            await expect
-              .poll(
-                async () => {
-                  const currentLabel = await readCurrentLabel();
-                  return currentLabel === previousLabel ? null : currentLabel;
-                },
-                { timeout: 1_000 }
-              )
-              .not.toBeNull();
-            return await readCurrentLabel();
-          } catch {
-            // Linux CI can drop clicks during rapid mode transitions; retry the same control.
-          }
-        }
-
-        return await readCurrentLabel();
-      };
-
-      const discoverAllowedLabels = async (): Promise<string[]> => {
-        const startLabel = await readCurrentLabel();
-        const seen = new Set<string>([startLabel]);
-        let currentLabel = startLabel;
-
-        while (!(await decreasePaddle.isDisabled())) {
-          const nextLabel = await clickUntilLabelChanges(decreasePaddle, currentLabel);
-          if (nextLabel === currentLabel) {
-            break;
-          }
-          currentLabel = nextLabel;
-          seen.add(currentLabel);
-        }
-
-        while (!(await increasePaddle.isDisabled())) {
-          const nextLabel = await clickUntilLabelChanges(increasePaddle, currentLabel);
-          if (nextLabel === currentLabel) {
-            break;
-          }
-          currentLabel = nextLabel;
-          seen.add(currentLabel);
-        }
-
-        while (currentLabel !== startLabel) {
-          const needsLowerLevel =
-            levelLabels.indexOf(currentLabel) > levelLabels.indexOf(startLabel);
-          const nextLabel = await clickUntilLabelChanges(
-            needsLowerLevel ? decreasePaddle : increasePaddle,
-            currentLabel
-          );
-          if (nextLabel === currentLabel) {
-            break;
-          }
-          currentLabel = nextLabel;
-        }
-
-        return [...seen].sort(
-          (left, right) => levelLabels.indexOf(left) - levelLabels.indexOf(right)
-        );
-      };
-
-      const allowedLabels = await discoverAllowedLabels();
-      const clampedTargetLevel = Math.max(0, Math.min(targetLevel, allowedLabels.length - 1));
-      const targetLabel = allowedLabels[clampedTargetLevel] ?? allowedLabels[0] ?? levelLabels[0];
-
-      const getCurrentLevel = async (): Promise<number> => {
-        const currentLabel = await readCurrentLabel();
-        const labelIndex = allowedLabels.findIndex((candidate) => currentLabel === candidate);
-        return labelIndex === -1 ? 0 : labelIndex;
-      };
-
-      // Click paddles until we reach the target level. clickUntilLabelChanges() retries
-      // the interaction and dispatches DOM clicks directly so transient Linux Electron
-      // overlays do not interfere with toolbar hit-testing.
-      for (let i = 0; i < allowedLabels.length * 2; i++) {
-        const currentLevel = await getCurrentLevel();
-        if (currentLevel === clampedTargetLevel) {
-          break;
-        }
-
-        const currentLabel = allowedLabels[currentLevel] ?? (await readCurrentLabel());
-        const nextLabel = await clickUntilLabelChanges(
-          currentLevel < clampedTargetLevel ? increasePaddle : decreasePaddle,
-          currentLabel
-        );
-        if (nextLabel === currentLabel) {
-          break;
-        }
+      const menu = page.locator('[data-component="ThinkingSelectorMenu"]');
+      await expect(menu).toBeVisible();
+      const options = menu.getByRole("option");
+      const optionCount = await options.count();
+      if (optionCount === 0) {
+        throw new Error("Thinking selector has no available effort levels");
       }
 
-      let finalLevel = await getCurrentLevel();
-      if (finalLevel !== clampedTargetLevel) {
-        for (let i = 0; i < allowedLabels.length; i++) {
-          const currentLabel = await readCurrentLabel();
-          const nextLabel = await clickUntilLabelChanges(label, currentLabel);
-          finalLevel = await getCurrentLevel();
-          if (finalLevel === clampedTargetLevel || nextLabel === currentLabel) {
-            break;
-          }
-        }
-      }
+      // Numeric inputs index the model-aware menu order from lowest to highest.
+      const option = options.nth(Math.min(targetLevel, optionCount - 1));
+      await option.dispatchEvent("click");
+      await expect(option).toHaveAttribute("aria-selected", "true");
 
-      // Verify we reached the target
-      await expect(label).toContainText(targetLabel);
+      // The selector intentionally stays open after selection; close it before the scenario proceeds.
+      await trigger.dispatchEvent("click");
+      await expect(trigger).toHaveAttribute("aria-expanded", "false");
     },
 
     async sendMessage(message: string): Promise<void> {
@@ -332,11 +228,22 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       if (message.startsWith("/")) {
         await page.keyboard.press("Escape");
       }
+      // A send is refused (toast, draft kept) until the transcript is verified caught-up;
+      // wait for the send affordance like a user would instead of racing the replay.
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
     },
 
     async expectTranscriptContains(text: string): Promise<void> {
       await expect(transcriptLocator(page)).toContainText(text, { timeout: 45_000 });
+    },
+
+    async expectTurnSettled(): Promise<void> {
+      await expect(page.getByRole("button", { name: "Stop streaming" })).toBeHidden({
+        timeout: 45_000,
+      });
     },
 
     async expectActionButtonVisible(label: string): Promise<void> {
@@ -383,9 +290,12 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       });
 
       // Send the command. Dismiss suggestion menu first so Enter sends instead of
-      // accepting a completion.
+      // accepting a completion, and wait for the send affordance (transcript caught-up).
       await input.fill(command);
       await page.keyboard.press("Escape");
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
 
       // Wait for the toast we started watching for
@@ -399,7 +309,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       const timeoutMs = options?.timeoutMs ?? 30_000;
       const workspaceId = context.workspaceId;
       await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -409,11 +319,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
 
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
@@ -530,13 +440,18 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         };
       }, workspaceId);
 
-      let actionError: unknown;
+      // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+      let actionFailure: { error: unknown } | undefined;
       try {
         await action();
         await page.waitForFunction(
           (id: string) => {
-            type StreamCaptureEvent = { type: string };
-            type StreamCapture = { events: StreamCaptureEvent[] };
+            interface StreamCaptureEvent {
+              type: string;
+            }
+            interface StreamCapture {
+              events: StreamCaptureEvent[];
+            }
             const win = window as unknown as {
               __muxStreamCapture?: Record<string, StreamCapture>;
             };
@@ -553,11 +468,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           { timeout: timeoutMs }
         );
       } catch (error) {
-        actionError = error;
+        actionFailure = { error };
       }
 
       const events = await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -567,11 +482,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
         };
@@ -587,8 +502,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         return capture.events.slice();
       }, workspaceId);
 
-      if (actionError) {
-        throw actionError;
+      if (actionFailure) {
+        throw actionFailure.error;
       }
 
       return { events };
@@ -726,6 +641,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
+  const settingsDialog = page.getByRole("dialog", { name: "Settings" });
   const settings = {
     async open(): Promise<void> {
       // Click the settings gear button in the title bar.
@@ -736,53 +652,34 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async close(): Promise<void> {
-      const closeControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
+      const closeControl = settingsDialog.getByRole("button", { name: "Close settings" });
       await expect(closeControl).toBeVisible({ timeout: 5000 });
       await closeControl.click();
       await settings.expectClosed();
     },
 
     async expectOpen(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => (await dialog.isVisible()) || (await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeVisible({ timeout: 5000 });
     },
 
     async expectClosed(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => !(await dialog.isVisible()) && !(await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeHidden({ timeout: 5000 });
     },
 
     async selectSection(section: "General" | "Providers" | "Models"): Promise<void> {
-      const sectionButton = page.getByRole("button", { name: section, exact: true });
+      const sectionButton = settingsDialog.getByRole("button", { name: section, exact: true });
       await expect(sectionButton).toBeVisible();
       await sectionButton.click();
     },
 
     async expandProvider(providerName: string): Promise<void> {
-      const providerButton = page.getByRole("button", { name: new RegExp(providerName, "i") });
+      const providerButton = settingsDialog.getByRole("button", {
+        name: new RegExp(providerName, "i"),
+      });
       await expect(providerButton).toBeVisible();
       await providerButton.click();
       // Wait for expansion - look for the "Base URL" label which is more unique
-      await expect(page.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
+      await expect(settingsDialog.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
     },
   };
 

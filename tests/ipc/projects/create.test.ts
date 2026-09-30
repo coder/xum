@@ -10,7 +10,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
-import { getMuxHome, getMuxProjectsDir } from "../../../src/common/constants/paths";
+import { getXumHome, getXumProjectsDir } from "../../../src/common/constants/paths";
 import * as os from "os";
 import { shouldRunIntegrationTests, createTestEnvironment, cleanupTestEnvironment } from "../setup";
 import { resolveOrpcClient } from "../helpers";
@@ -21,7 +21,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
   test.concurrent("should resolve bare project name to mux projects dir", async () => {
     const env = await createTestEnvironment();
     const bareName = `mux-test-bare-${Date.now()}`;
-    const expectedPath = path.join(getMuxProjectsDir(), bareName);
+    const expectedPath = path.join(getXumProjectsDir(), bareName);
     const client = resolveOrpcClient(env);
 
     try {
@@ -45,7 +45,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
     const env = await createTestEnvironment();
     const tildeSubpath = `mux-test-tilde-${Date.now()}`;
     const tildeProjectPath = `~/.mux/test-projects/${tildeSubpath}`;
-    const expectedPath = path.join(getMuxHome(), "test-projects", tildeSubpath);
+    const expectedPath = path.join(getXumHome(), "test-projects", tildeSubpath);
     const client = resolveOrpcClient(env);
 
     try {
@@ -69,7 +69,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
     const env = await createTestEnvironment();
     const tildeSubpath = `mux-test-tilde-win-${Date.now()}`;
     const tildeProjectPath = `~\\.mux\\test-projects\\${tildeSubpath}`;
-    const expectedPath = path.join(getMuxHome(), "test-projects", tildeSubpath);
+    const expectedPath = path.join(getXumHome(), "test-projects", tildeSubpath);
     const client = resolveOrpcClient(env);
 
     try {
@@ -92,7 +92,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
   test.concurrent("should reject duplicate bare project name", async () => {
     const env = await createTestEnvironment();
     const bareName = `mux-test-dup-${Date.now()}`;
-    const expectedPath = path.join(getMuxProjectsDir(), bareName);
+    const expectedPath = path.join(getXumProjectsDir(), bareName);
     const client = resolveOrpcClient(env);
 
     try {
@@ -185,6 +185,61 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
 
     await cleanupTestEnvironment(env);
     await fs.rm(tempProjectDir, { recursive: true, force: true });
+  });
+
+  test.concurrent("should return a friendly error when folder creation is denied", async () => {
+    // This scenario relies on POSIX permission bits and a non-root user.
+    if (
+      process.platform === "win32" ||
+      (typeof process.getuid === "function" && process.getuid() === 0)
+    ) {
+      return;
+    }
+
+    const env = await createTestEnvironment();
+    const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-project-test-"));
+    const readOnlyDir = path.join(tempProjectDir, "readonly");
+    await fs.mkdir(readOnlyDir, { mode: 0o555 });
+    const client = resolveOrpcClient(env);
+
+    try {
+      const result = await client.projects.create({
+        projectPath: path.join(readOnlyDir, "child"),
+      });
+
+      if (result.success) {
+        throw new Error("Expected failure but got success");
+      }
+      expect(result.error).toContain("permission denied");
+      expect(result.error).not.toContain("EACCES");
+    } finally {
+      await fs.chmod(readOnlyDir, 0o755);
+      await cleanupTestEnvironment(env);
+      await fs.rm(tempProjectDir, { recursive: true, force: true });
+    }
+  });
+
+  test.concurrent("should return a friendly error when the path runs through a file", async () => {
+    const env = await createTestEnvironment();
+    const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-project-test-"));
+    const occupiedFile = path.join(tempProjectDir, "occupied.txt");
+    await fs.writeFile(occupiedFile, "content");
+    const client = resolveOrpcClient(env);
+
+    try {
+      const result = await client.projects.create({
+        projectPath: path.join(occupiedFile, "child"),
+      });
+
+      if (result.success) {
+        throw new Error("Expected failure but got success");
+      }
+      expect(result.error).toContain("not a folder");
+      expect(result.error).not.toContain("ENOTDIR");
+    } finally {
+      await cleanupTestEnvironment(env);
+      await fs.rm(tempProjectDir, { recursive: true, force: true });
+    }
   });
 
   test.concurrent("should create non-existent tilde path", async () => {

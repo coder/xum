@@ -38,11 +38,16 @@ function readInlineHeightPx(el: HTMLTextAreaElement): number | null {
 /**
  * Auto-resize a textarea to fit its content.
  * Uses useLayoutEffect to measure and set height synchronously before paint.
+ *
+ * `sizingKey` is any value whose change can move the element's CSS height floor (the composer
+ * lowers its `min-height` on phone viewports). Without it the cached inline height pins the old
+ * floor until the draft itself changes.
  */
 export function useAutoResizeTextarea(
   ref: RefObject<HTMLTextAreaElement | null>,
   value: string,
-  maxHeightVh = 30
+  maxHeightVh = 30,
+  sizingKey?: string
 ): void {
   const previousValueRef = useRef<string | null>(null);
   const previousMaxRef = useRef<number | null>(null);
@@ -53,6 +58,25 @@ export function useAutoResizeTextarea(
     if (!el) return;
 
     const max = window.innerHeight * (maxHeightVh / 100);
+
+    // Fast path: an empty textarea needs no inline height at all — consumers size the
+    // empty state via CSS (rows={1} + min-height). Measuring it through the
+    // `auto` + scrollHeight dance below forces a synchronous reflow of every dirty
+    // node, and this effect runs inside React's commit phase. On workspace switch the
+    // entire transcript has just mounted, so that reflow lays out the whole document
+    // (~50k nodes in large chats) before first paint — profiled as the single hottest
+    // frame during chat switching. Drafts are empty in the common case, so skip
+    // measurement entirely and clear any stale inline height (e.g. after send).
+    if (value === "") {
+      if (el.style.height !== "") {
+        el.style.height = "";
+      }
+      appliedHeightRef.current = null;
+      previousValueRef.current = value;
+      previousMaxRef.current = max;
+      return;
+    }
+
     const previousValue = previousValueRef.current;
     const previousMax = previousMaxRef.current;
     const canOnlyGrow =
@@ -91,5 +115,5 @@ export function useAutoResizeTextarea(
 
     previousValueRef.current = value;
     previousMaxRef.current = max;
-  }, [ref, value, maxHeightVh]);
+  }, [ref, value, maxHeightVh, sizingKey]);
 }

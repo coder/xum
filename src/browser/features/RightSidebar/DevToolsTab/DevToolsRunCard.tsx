@@ -53,11 +53,11 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
   };
 
   return (
-    <div className="border-border-light bg-background-secondary rounded border">
+    <div className="border-border-light bg-background-secondary min-w-0 rounded border">
       <button
         type="button"
         onClick={handleToggle}
-        className="hover:bg-hover flex w-full items-center gap-2 px-2 py-1.5 text-left"
+        className="hover:bg-hover flex w-full min-w-0 items-center gap-2 px-2 py-1.5 text-left"
       >
         <ChevronRight
           className={cn("h-3 w-3 shrink-0 transition-transform", expanded && "rotate-90")}
@@ -66,7 +66,7 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
           {props.run.firstMessage || "\u2014"}
         </span>
         {props.run.modelId && (
-          <span className="text-muted shrink-0 text-[10px]">{props.run.modelId}</span>
+          <span className="text-muted min-w-0 truncate text-[10px]">{props.run.modelId}</span>
         )}
         <span className="text-muted shrink-0 text-[10px]">
           {props.run.stepCount} step{props.run.stepCount !== 1 ? "s" : ""}
@@ -81,7 +81,7 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
       </button>
 
       {expanded && (
-        <div className="border-border-light border-t px-2 py-1.5">
+        <div className="border-border-light min-w-0 border-t px-2 py-1.5">
           {loading && steps === null ? (
             <div className="flex justify-center py-2">
               <Loader2 className="text-muted h-4 w-4 animate-spin" />
@@ -89,7 +89,7 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
           ) : error && steps === null ? (
             <p className="text-destructive py-1 text-[10px]">{error}</p>
           ) : displaySteps && displaySteps.length > 0 ? (
-            <div className="flex flex-col gap-1">
+            <div className="flex min-w-0 flex-col gap-1">
               {displaySteps.map((step) => (
                 <DevToolsStepCard key={step.id} step={step} toolPolicy={props.run.toolPolicy} />
               ))}

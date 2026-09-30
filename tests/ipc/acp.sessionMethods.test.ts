@@ -1,4 +1,10 @@
-import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  ClientSideConnection,
+  PROTOCOL_VERSION,
+  ndJsonStream,
+} from "@agentclientprotocol/sdk";
+import type { ProjectConfig } from "../../src/common/types/project";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
@@ -6,19 +12,50 @@ import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConn
 type WorkspaceInfo = NonNullable<Awaited<ReturnType<ORPCClient["workspace"]["getInfo"]>>>;
 type WorkspaceActivityById = Awaited<ReturnType<ORPCClient["workspace"]["activity"]["list"]>>;
 
+interface WorkspaceCreateInput {
+  projectPath: string;
+  branchName?: string;
+  trunkBranch?: string;
+  title?: string;
+  runtimeConfig?: WorkspaceInfo["runtimeConfig"];
+  subProjectPath?: string;
+  pendingAutoTitle?: boolean;
+}
+
+interface WorkspaceForkInput {
+  sourceWorkspaceId: string;
+  newName?: string;
+  pendingAutoTitle?: boolean;
+}
+
 interface HarnessOptions {
   activeWorkspaces?: WorkspaceInfo[];
   archivedWorkspaces?: WorkspaceInfo[];
   workspaceActivity?: WorkspaceActivityById;
+  /**
+   * Resolve activity.list with null — the backend's read-failure signal for
+   * an unreadable extensionMetadata.json (getActivityList never rejects; it
+   * logs and returns null so callers can tell failure from an idle {}).
+   */
+  activityListUnavailable?: boolean;
   onChatEvents?: WorkspaceChatMessage[];
+  /** Stream for the Nth onChat call (falls back to `onChatEvents`); each call is its own replay. */
+  onChatStreamByCall?: (() => AsyncIterable<WorkspaceChatMessage>)[];
   onChatStream?: AsyncIterable<WorkspaceChatMessage>;
+  requireTrustedProjectForCreate?: boolean;
+  projectEntries?: [string, ProjectConfig][];
   agentOptions?: ConstructorParameters<typeof MuxAgent>[2];
 }
 
 interface Harness {
   agent: MuxAgent;
-  onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
-  listCalls: Array<{ archived?: boolean } | undefined>;
+  onChatCalls: { workspaceId: string; mode?: OnChatMode }[];
+  sendMessageCalls: { workspaceId: string; message: string }[];
+  truncateHistoryCalls: { workspaceId: string }[];
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
+  createCalls: WorkspaceCreateInput[];
+  forkCalls: WorkspaceForkInput[];
+  listCalls: ({ archived?: boolean } | undefined)[];
 }
 
 function createInMemoryAcpStream() {
@@ -49,7 +86,18 @@ function createWorkspaceInfo(overrides?: Partial<WorkspaceInfo>): WorkspaceInfo 
   };
 }
 
-function createHarness(options?: HarnessOptions): Harness {
+interface MockServer {
+  server: ServerConnection;
+  onChatCalls: { workspaceId: string; mode?: OnChatMode }[];
+  sendMessageCalls: { workspaceId: string; message: string }[];
+  truncateHistoryCalls: { workspaceId: string }[];
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
+  createCalls: WorkspaceCreateInput[];
+  forkCalls: WorkspaceForkInput[];
+  listCalls: ({ archived?: boolean } | undefined)[];
+}
+
+function createMockServer(options?: HarnessOptions): MockServer {
   const activeWorkspaces = options?.activeWorkspaces ?? [createWorkspaceInfo()];
   const archivedWorkspaces = options?.archivedWorkspaces ?? [];
   const workspaceActivity = options?.workspaceActivity ?? {};
@@ -61,25 +109,121 @@ function createHarness(options?: HarnessOptions): Harness {
     allWorkspacesById.set(workspace.id, workspace);
   }
 
-  const onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }> = [];
-  const listCalls: Array<{ archived?: boolean } | undefined> = [];
+  const setTrustCalls: { projectPath: string; trusted: boolean }[] = [];
+  const createCalls: WorkspaceCreateInput[] = [];
+  const forkCalls: WorkspaceForkInput[] = [];
+  const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
+  const onChatCalls: { workspaceId: string; mode?: OnChatMode }[] = [];
+  const sendMessageCalls: { workspaceId: string; message: string }[] = [];
+  const truncateHistoryCalls: { workspaceId: string }[] = [];
+  const listCalls: ({ archived?: boolean } | undefined)[] = [];
 
-  const client: Partial<ORPCClient> = {
+  const client = {
+    config: {
+      getConfig: async () => ({ agentAiDefaults: {} }),
+    },
+    projects: {
+      list: async () => Array.from(projectsByPath.entries()),
+      listBranches: async () => ({
+        branches: ["main"],
+        currentBranch: "main",
+        recommendedTrunk: "main",
+      }),
+      setTrust: async (input: { projectPath: string; trusted: boolean }) => {
+        setTrustCalls.push(input);
+        const currentProject = projectsByPath.get(input.projectPath) ?? { workspaces: [] };
+        projectsByPath.set(input.projectPath, {
+          ...currentProject,
+          trusted: input.trusted,
+        });
+      },
+    },
+    agents: {
+      list: async () => [],
+    },
     workspace: {
       list: async (input?: { archived?: boolean }) => {
         listCalls.push(input);
         return input?.archived ? archivedWorkspaces : activeWorkspaces;
       },
       activity: {
-        list: async () => workspaceActivity,
+        list: async () => {
+          if (options?.activityListUnavailable) {
+            return null;
+          }
+          return workspaceActivity;
+        },
       },
       getInfo: async ({ workspaceId }: { workspaceId: string }) =>
         allWorkspacesById.get(workspaceId) ?? null,
       onChat: async (input: { workspaceId: string; mode?: OnChatMode }) => {
         onChatCalls.push(input);
-        return sharedOnChatStream ?? createChatStream(onChatEvents);
+        return (
+          options?.onChatStreamByCall?.[onChatCalls.length - 1]?.() ??
+          sharedOnChatStream ??
+          createChatStream(onChatEvents)
+        );
       },
-    } as ORPCClient["workspace"],
+      create: async (input: WorkspaceCreateInput) => {
+        createCalls.push(input);
+        if (
+          options?.requireTrustedProjectForCreate === true &&
+          projectsByPath.get(input.projectPath)?.trusted !== true
+        ) {
+          return { success: false as const, error: "project not trusted" };
+        }
+
+        const workspaceId = `ws-created-${createCalls.length}`;
+        const metadata = createWorkspaceInfo({
+          id: workspaceId,
+          name: input.branchName ?? workspaceId,
+          title: input.title ?? input.branchName ?? workspaceId,
+          projectPath: input.projectPath,
+          subProjectPath: input.subProjectPath,
+          namedWorkspacePath: `${input.projectPath}/.mux/${input.branchName ?? workspaceId}`,
+          runtimeConfig: input.runtimeConfig ?? { type: "local" },
+        });
+        allWorkspacesById.set(workspaceId, metadata);
+        activeWorkspaces.push(metadata);
+        return { success: true as const, metadata };
+      },
+      fork: async (input: WorkspaceForkInput) => {
+        forkCalls.push(input);
+        const sourceWorkspace = allWorkspacesById.get(input.sourceWorkspaceId);
+        if (sourceWorkspace == null) {
+          return { success: false as const, error: "source workspace not found" };
+        }
+        if (
+          options?.requireTrustedProjectForCreate === true &&
+          projectsByPath.get(sourceWorkspace.projectPath)?.trusted !== true
+        ) {
+          return { success: false as const, error: "project not trusted" };
+        }
+
+        const workspaceId = `ws-forked-${forkCalls.length}`;
+        const metadata = createWorkspaceInfo({
+          ...sourceWorkspace,
+          id: workspaceId,
+          name: input.newName ?? workspaceId,
+          title: input.newName ?? workspaceId,
+          namedWorkspacePath: `${sourceWorkspace.projectPath}/.mux/${input.newName ?? workspaceId}`,
+        });
+        allWorkspacesById.set(workspaceId, metadata);
+        activeWorkspaces.push(metadata);
+        return { success: true as const, metadata };
+      },
+      sendMessage: async (input: { workspaceId: string; message: string }) => {
+        sendMessageCalls.push({ workspaceId: input.workspaceId, message: input.message });
+        return { success: true as const, data: undefined };
+      },
+      interruptStream: async () => ({ success: true as const, data: undefined }),
+      truncateHistory: async (input: { workspaceId: string }) => {
+        truncateHistoryCalls.push({ workspaceId: input.workspaceId });
+        return { success: true as const, data: undefined };
+      },
+      updateModeAISettings: async () => ({ success: true as const, data: undefined }),
+      updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
+    },
     agentSkills: {
       list: async () => [],
       listDiagnostics: async () => {
@@ -88,21 +232,36 @@ function createHarness(options?: HarnessOptions): Harness {
       get: async () => {
         throw new Error("createHarness: get not implemented for this test");
       },
-    } as ORPCClient["agentSkills"],
+    },
   };
 
   const server: ServerConnection = {
-    client: client as ORPCClient,
+    client: client as unknown as ORPCClient,
     baseUrl: "ws://127.0.0.1:1234",
     close: async () => undefined,
   };
+
+  return {
+    server,
+    onChatCalls,
+    sendMessageCalls,
+    truncateHistoryCalls,
+    setTrustCalls,
+    createCalls,
+    forkCalls,
+    listCalls,
+  };
+}
+
+function createHarness(options?: HarnessOptions): Harness {
+  const mockServer = createMockServer(options);
 
   let agentInstance: MuxAgent | null = null;
   // Use a real ACP connection instead of casting a hand-rolled stub to
   // AgentSideConnection. This keeps the test harness type-safe and exercises
   // the same connection surface MuxAgent uses in production.
   const _connection = new AgentSideConnection((connectionToAgent) => {
-    const createdAgent = new MuxAgent(connectionToAgent, server, options?.agentOptions);
+    const createdAgent = new MuxAgent(connectionToAgent, mockServer.server, options?.agentOptions);
     agentInstance = createdAgent;
     return createdAgent;
   }, createInMemoryAcpStream());
@@ -114,9 +273,50 @@ function createHarness(options?: HarnessOptions): Harness {
 
   return {
     agent: agentInstance,
-    onChatCalls,
-    listCalls,
+    onChatCalls: mockServer.onChatCalls,
+    sendMessageCalls: mockServer.sendMessageCalls,
+    truncateHistoryCalls: mockServer.truncateHistoryCalls,
+    setTrustCalls: mockServer.setTrustCalls,
+    createCalls: mockServer.createCalls,
+    forkCalls: mockServer.forkCalls,
+    listCalls: mockServer.listCalls,
   };
+}
+
+// Cross-wired in-memory pipes so a real ClientSideConnection talks to the real
+// AgentSideConnection over JSON-RPC. Unlike createHarness (which invokes MuxAgent
+// methods directly and therefore renames in lockstep with the implementation),
+// this exercises the SDK's wire dispatch: a missed Agent-interface rename (the
+// SDK declares listSessions/resumeSession as optional, e.g. unstable_listSessions
+// -> listSessions in SDK 0.16/0.20) still typechecks but fails here with
+// METHOD_NOT_FOUND.
+function createWireHarness(options?: HarnessOptions): { client: ClientSideConnection } {
+  const mockServer = createMockServer(options);
+  const clientToAgent = new TransformStream<Uint8Array, Uint8Array>();
+  const agentToClient = new TransformStream<Uint8Array, Uint8Array>();
+
+  const _agentConnection = new AgentSideConnection(
+    (connectionToAgent) =>
+      new MuxAgent(connectionToAgent, mockServer.server, options?.agentOptions),
+    ndJsonStream(agentToClient.writable, clientToAgent.readable)
+  );
+  void _agentConnection;
+
+  const client = new ClientSideConnection(
+    () => ({
+      requestPermission: async (params) => {
+        const firstOption = params.options[0];
+        if (firstOption == null) {
+          throw new Error("createWireHarness: requestPermission expected at least one option");
+        }
+        return { outcome: { outcome: "selected" as const, optionId: firstOption.optionId } };
+      },
+      sessionUpdate: async () => undefined,
+    }),
+    ndJsonStream(clientToAgent.writable, agentToClient.readable)
+  );
+
+  return { client };
 }
 
 async function* createChatStream(
@@ -144,8 +344,8 @@ function createNeverEndingChatStream(
     },
   };
 }
-describe("ACP unstable session support", () => {
-  it("advertises unstable list/fork/resume session capabilities", async () => {
+describe("ACP session list/resume/fork support", () => {
+  it("advertises list/resume and unstable fork session capabilities", async () => {
     const harness = createHarness();
 
     const response = await harness.agent.initialize({
@@ -213,7 +413,7 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    const firstPage = await harness.agent.unstable_listSessions({
+    const firstPage = await harness.agent.listSessions({
       cwd: "/repo/a/",
     });
 
@@ -225,7 +425,7 @@ describe("ACP unstable session support", () => {
       new Date(repoAArchivedRecency).toISOString(),
     ]);
 
-    const secondPage = await harness.agent.unstable_listSessions({
+    const secondPage = await harness.agent.listSessions({
       cwd: "/repo/a/",
       cursor: "1",
     });
@@ -235,21 +435,111 @@ describe("ACP unstable session support", () => {
     expect(harness.listCalls.slice(0, 2)).toEqual([{ archived: false }, { archived: true }]);
   });
 
+  it("lists sessions when the activity list is unavailable", async () => {
+    // activity.list resolves null when extensionMetadata.json is unreadable
+    // so the renderer can keep cached state; ACP has none, so session
+    // listing must degrade to no-activity sorting instead of failing
+    // wholesale.
+    const workspace = createWorkspaceInfo({
+      id: "ws-no-activity",
+      projectPath: "/repo/a",
+      namedWorkspacePath: "/repo/a/.mux/ws-no-activity",
+      createdAt: "2026-02-18T10:00:00.000Z",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      activityListUnavailable: true,
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const response = await harness.agent.listSessions({ cwd: "/repo/a/" });
+    expect(response.sessions.map((session) => session.sessionId)).toEqual(["ws-no-activity"]);
+    // Falls back to createdAt when no activity recency is available.
+    expect(response.sessions[0]?.updatedAt).toBe("2026-02-18T10:00:00.000Z");
+  });
+
+  it("lists and resumes sessions from a sub-project cwd", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-sub-project",
+      projectPath: "/repo/monorepo",
+      subProjectPath: "/repo/monorepo/packages/api",
+      namedWorkspacePath: "/repo/monorepo/.mux/ws-sub-project",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const listResponse = await harness.agent.listSessions({
+      cwd: "/repo/monorepo/packages/api",
+    });
+    expect(listResponse.sessions.map((session) => session.sessionId)).toEqual(["ws-sub-project"]);
+    expect(listResponse.sessions.map((session) => session.cwd)).toEqual([
+      "/repo/monorepo/packages/api",
+    ]);
+
+    await expect(
+      harness.agent.loadSession({
+        sessionId: "ws-sub-project",
+        cwd: "/repo/monorepo/packages/api",
+        mcpServers: [],
+      })
+    ).resolves.toBeDefined();
+  });
+
   it("rejects invalid list cursor values", async () => {
     const harness = createHarness();
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
     await expect(
-      harness.agent.unstable_listSessions({
+      harness.agent.listSessions({
         cursor: "not-a-number",
       })
     ).rejects.toThrow("invalid cursor");
 
     await expect(
-      harness.agent.unstable_listSessions({
+      harness.agent.listSessions({
         cursor: "1abc",
       })
     ).rejects.toThrow("invalid cursor");
+  });
+
+  it("rejects boolean config option values with an invalid-params error", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-bool-config",
+      projectPath: "/repo/boolcfg",
+      namedWorkspacePath: "/repo/boolcfg/.mux/ws-bool-config",
+    });
+
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.resumeSession({
+      sessionId: "ws-bool-config",
+      cwd: "/repo/boolcfg",
+      mcpServers: [],
+    });
+
+    // SDK 0.25 schemas permit {type:"boolean"} config values, but mux only
+    // exposes select options; the agent must reject rather than forward them.
+    await expect(
+      harness.agent.setSessionConfigOption({
+        sessionId: "ws-bool-config",
+        configId: "model",
+        type: "boolean",
+        value: true,
+      })
+    ).rejects.toThrow("expects a select value");
   });
 
   it("rejects resume when session does not belong to requested cwd", async () => {
@@ -261,13 +551,15 @@ describe("ACP unstable session support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
     await expect(
-      harness.agent.unstable_resumeSession({
+      harness.agent.resumeSession({
         sessionId: "ws-cwd-check",
         cwd: "/repo/wrong",
         mcpServers: [],
@@ -284,12 +576,14 @@ describe("ACP unstable session support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    const response = await harness.agent.unstable_resumeSession({
+    const response = await harness.agent.resumeSession({
       sessionId: "ws-resume",
       cwd: "/repo/resume/",
       mcpServers: [],
@@ -302,6 +596,238 @@ describe("ACP unstable session support", () => {
     });
   });
 
+  it("refuses prompts after a full replay reports a failed history read", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-unreadable",
+      projectPath: "/repo/unreadable",
+      namedWorkspacePath: "/repo/unreadable/.mux/ws-unreadable",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "failed",
+        } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-unreadable",
+      cwd: "/repo/unreadable",
+      mcpServers: [],
+    });
+
+    // The browser and CLI refuse to send into an unverified transcript; ACP must too, and it
+    // must not persist a user row first.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-unreadable",
+        prompt: [{ type: "text", text: "hello" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+
+    // `/clear` truncates history the client never saw: gated the same way, before the handler.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-unreadable",
+        prompt: [{ type: "text", text: "/clear" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.truncateHistoryCalls).toHaveLength(0);
+  });
+
+  it("re-subscribes after a failed replay so a later readable history unblocks prompts", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-recovering",
+      projectPath: "/repo/recovering",
+      namedWorkspacePath: "/repo/recovering/.mux/ws-recovering",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatStreamByCall: [
+        () =>
+          createChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "failed",
+            } as WorkspaceChatMessage,
+          ]),
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-recovering",
+      cwd: "/repo/recovering",
+      mcpServers: [],
+    });
+    expect(harness.onChatCalls).toHaveLength(1);
+
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-recovering",
+        prompt: [{ type: "text", text: "first" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+
+    // The failed subscription was dropped, so the next prompt replays again; that replay is
+    // complete and the send goes through. Cancel settles the (never-ending) live turn.
+    const secondPrompt = harness.agent.prompt({
+      sessionId: "ws-recovering",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (harness.sendMessageCalls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(harness.sendMessageCalls.map((call) => call.message)).toEqual(["second"]);
+    expect(harness.onChatCalls).toHaveLength(2);
+    expect(harness.onChatCalls[1]?.mode).toEqual({ type: "full" });
+    await harness.agent.cancel({ sessionId: "ws-recovering" });
+    await expect(secondPrompt).resolves.toMatchObject({ stopReason: "cancelled" });
+  });
+
+  it("re-verifies a failed session with a full replay even after a live-mode resume", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-failed-then-live",
+      projectPath: "/repo/failed-then-live",
+      namedWorkspacePath: "/repo/failed-then-live/.mux/ws-failed-then-live",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatStreamByCall: [
+        () =>
+          createChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "failed",
+            } as WorkspaceChatMessage,
+          ]),
+        // The resume's live subscription: reads no history, so it can neither fail nor clear.
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "live",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+        // The forced full re-verification.
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-failed-then-live",
+      cwd: "/repo/failed-then-live",
+      mcpServers: [],
+    });
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-failed-then-live",
+        prompt: [{ type: "text", text: "first" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+
+    // A resume switches the session to live mode; a live subscription replays no history, so
+    // the next prompt must still replay in full to clear the failed verdict.
+    await harness.agent.resumeSession({
+      sessionId: "ws-failed-then-live",
+      cwd: "/repo/failed-then-live",
+      mcpServers: [],
+    });
+    const secondPrompt = harness.agent.prompt({
+      sessionId: "ws-failed-then-live",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (harness.sendMessageCalls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(harness.sendMessageCalls.map((call) => call.message)).toEqual(["second"]);
+    // The resume subscribed live; the prompt re-verified with a full replay.
+    expect(harness.onChatCalls.slice(1).map((call) => call.mode)).toEqual([
+      { type: "live" },
+      { type: "full" },
+    ]);
+    await harness.agent.cancel({ sessionId: "ws-failed-then-live" });
+    await expect(secondPrompt).resolves.toMatchObject({ stopReason: "cancelled" });
+  });
+
+  it("refuses a prompt when the full subscription ends before reporting its replay", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-dropped",
+      projectPath: "/repo/dropped",
+      namedWorkspacePath: "/repo/dropped/.mux/ws-dropped",
+    });
+    // No caught-up at all: the transport dropped mid-replay, so nothing was verified.
+    const harness = createHarness({ activeWorkspaces: [workspace], onChatEvents: [] });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-dropped",
+      cwd: "/repo/dropped",
+      mcpServers: [],
+    });
+
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-dropped",
+        prompt: [{ type: "text", text: "hello" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+  });
+
+  it("refuses a destructive slash command when the replay was never verified", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-dropped-clear",
+      projectPath: "/repo/dropped-clear",
+      namedWorkspacePath: "/repo/dropped-clear/.mux/ws-dropped-clear",
+    });
+    const harness = createHarness({ activeWorkspaces: [workspace], onChatEvents: [] });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-dropped-clear",
+      cwd: "/repo/dropped-clear",
+      mcpServers: [],
+    });
+
+    // The gate sits after slash-command discovery, directly before the truncation.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-dropped-clear",
+        prompt: [{ type: "text", text: "/clear" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.truncateHistoryCalls).toHaveLength(0);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+  });
+
   it("updates cached onChat mode even when a subscription already exists", async () => {
     const workspace = createWorkspaceInfo({
       id: "ws-live-to-full",
@@ -311,12 +837,14 @@ describe("ACP unstable session support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatStream: createNeverEndingChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+      onChatStream: createNeverEndingChatStream([
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ]),
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-live-to-full",
       cwd: "/repo/resume",
       mcpServers: [],
@@ -348,6 +876,111 @@ describe("ACP unstable session support", () => {
     });
   });
 
+  it("trusts a loaded workspace before ACP /new creates a follow-on workspace", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-new-source",
+      projectPath: "/repo/follow-on",
+      namedWorkspacePath: "/repo/follow-on/.mux/ws-new-source",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      requireTrustedProjectForCreate: true,
+      projectEntries: [["/repo/follow-on", { workspaces: [], trusted: false }]],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "complete",
+        } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-new-source",
+      cwd: "/repo/follow-on",
+      mcpServers: [],
+    });
+
+    await harness.agent.prompt({
+      sessionId: "ws-new-source",
+      prompt: [{ type: "text", text: "/new" }],
+    });
+
+    expect(harness.setTrustCalls).toEqual([{ projectPath: "/repo/follow-on", trusted: true }]);
+    expect(harness.createCalls).toHaveLength(1);
+    expect(harness.createCalls[0]?.projectPath).toBe("/repo/follow-on");
+  });
+
+  it("trusts a loaded workspace before ACP /fork creates a follow-on workspace", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-fork-source",
+      projectPath: "/repo/fork-follow-on",
+      namedWorkspacePath: "/repo/fork-follow-on/.mux/ws-fork-source",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      requireTrustedProjectForCreate: true,
+      projectEntries: [["/repo/fork-follow-on", { workspaces: [], trusted: false }]],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "complete",
+        } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-fork-source",
+      cwd: "/repo/fork-follow-on",
+      mcpServers: [],
+    });
+
+    await harness.agent.prompt({
+      sessionId: "ws-fork-source",
+      prompt: [{ type: "text", text: "/fork" }],
+    });
+
+    expect(harness.setTrustCalls).toEqual([{ projectPath: "/repo/fork-follow-on", trusted: true }]);
+    expect(harness.forkCalls).toEqual([
+      { sourceWorkspaceId: "ws-fork-source", pendingAutoTitle: false },
+    ]);
+  });
+
+  it("trusts a loaded workspace before unstable_forkSession creates a follow-on workspace", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-rpc-fork-source",
+      projectPath: "/repo/rpc-fork-follow-on",
+      namedWorkspacePath: "/repo/rpc-fork-follow-on/.mux/ws-rpc-fork-source",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      requireTrustedProjectForCreate: true,
+      projectEntries: [["/repo/rpc-fork-follow-on", { workspaces: [], trusted: false }]],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-rpc-fork-source",
+      cwd: "/repo/rpc-fork-follow-on",
+      mcpServers: [],
+    });
+
+    const response = await harness.agent.unstable_forkSession({
+      sessionId: "ws-rpc-fork-source",
+      cwd: "/repo/rpc-fork-follow-on",
+      mcpServers: [],
+    });
+
+    expect(response.sessionId).toBe("ws-forked-1");
+    expect(harness.setTrustCalls).toEqual([
+      { projectPath: "/repo/rpc-fork-follow-on", trusted: true },
+    ]);
+    expect(harness.forkCalls).toEqual([{ sourceWorkspaceId: "ws-rpc-fork-source" }]);
+  });
+
   it("evicts least-recently-used idle sessions when tracked session cap is exceeded", async () => {
     const workspaceA = createWorkspaceInfo({
       id: "ws-a",
@@ -367,7 +1000,9 @@ describe("ACP unstable session support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspaceA, workspaceB, workspaceC],
-      onChatStream: createNeverEndingChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+      onChatStream: createNeverEndingChatStream([
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ]),
       agentOptions: {
         maxTrackedSessions: 2,
         sessionIdleTtlMs: 60_000,
@@ -376,17 +1011,17 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-a",
       cwd: "/repo/lru",
       mcpServers: [],
     });
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-b",
       cwd: "/repo/lru",
       mcpServers: [],
     });
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-c",
       cwd: "/repo/lru",
       mcpServers: [],
@@ -402,5 +1037,56 @@ describe("ACP unstable session support", () => {
     expect(sessionStateMap.has("ws-b")).toBe(true);
     expect(sessionStateMap.has("ws-c")).toBe(true);
     expect(harness.onChatCalls).toHaveLength(3);
+  });
+});
+
+describe("ACP wire-level session dispatch", () => {
+  // Regression guard for SDK upgrades: Agent-interface methods are optional in
+  // the SDK, so a missed stabilization rename would typecheck and pass the
+  // direct-call tests above while the wire dispatch silently answers
+  // METHOD_NOT_FOUND. This round-trip pins the JSON-RPC routing itself.
+  it("routes session/list, session/resume, and session/set_config_option", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-wire",
+      projectPath: "/repo/wire",
+      namedWorkspacePath: "/repo/wire/.mux/ws-wire",
+    });
+
+    const wire = createWireHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
+    });
+
+    const initResponse = await wire.client.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    expect(initResponse.agentCapabilities?.sessionCapabilities?.list).toEqual({});
+
+    const listResponse = await wire.client.listSessions({ cwd: "/repo/wire" });
+    expect(listResponse.sessions.map((session) => session.sessionId)).toEqual(["ws-wire"]);
+
+    const resumeResponse = await wire.client.resumeSession({
+      sessionId: "ws-wire",
+      cwd: "/repo/wire",
+      mcpServers: [],
+    });
+    expect(resumeResponse?.configOptions?.length).toBeGreaterThan(0);
+
+    // Boolean config values pass SDK schema validation but must surface a
+    // JSON-RPC invalid-params error (not a crash or hang).
+    await expect(
+      wire.client.setSessionConfigOption({
+        sessionId: "ws-wire",
+        configId: "model",
+        type: "boolean",
+        value: true,
+      })
+    ).rejects.toThrow("expects a select value");
+
+    // The connection must survive the rejected request.
+    const listAfterError = await wire.client.listSessions({ cwd: "/repo/wire" });
+    expect(listAfterError.sessions).toHaveLength(1);
   });
 });

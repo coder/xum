@@ -7,6 +7,10 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { normalizeAgentId as normalizeStoredAgentId } from "@/common/utils/agentIds";
 import { cn } from "@/common/lib/utils";
+import {
+  COMPOSER_PICKER_PANEL_CLASS,
+  composerPickerOptionClass,
+} from "@/browser/components/composerPickerStyles";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { Button } from "@/browser/components/Button/Button";
@@ -15,15 +19,26 @@ import {
   formatNumberedKeybind,
   KEYBINDS,
   matchNumberedKeybind,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { COMPOSER_CONTROL_HEIGHT_CLASS, COMPOSER_ICON_ONLY_HIDE_CLASS } from "@/constants/layout";
 
 interface AgentModePickerProps {
   className?: string;
 
+  /**
+   * Overrides when the trigger drops to icon-only, because the width the label needs depends on
+   * which sibling controls share its row.
+   */
+  iconOnlyHideClassName?: string;
+
   /** Called when the picker closes (best-effort). Useful for restoring focus. */
   onComplete?: () => void;
+
+  /** Disables the picker like an agent lock, e.g. while the host has no agent scope. */
+  disabled?: boolean;
 }
 
 interface AgentOption {
@@ -89,6 +104,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   } = useAgent();
 
   const onComplete = props.onComplete;
+  const iconOnlyHideClassName = props.iconOnlyHideClassName ?? COMPOSER_ICON_ONLY_HIDE_CLASS;
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number>(-1);
@@ -105,11 +121,18 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     currentAgent?.id === normalizedAgentId
       ? currentAgent
       : agents.find((entry) => entry.id === normalizedAgentId);
-  const isAgentLocked = isAgentSelectionLocked;
+  const isAgentLocked = isAgentSelectionLocked || props.disabled === true;
 
   // Derived "effectively open" — hides picker immediately when lock activates,
   // preventing stale event handlers from a hidden-but-open picker.
   const isPickerVisible = isPickerOpen && !isAgentLocked;
+
+  // A lock (or `disabled`, e.g. the VS Code host losing its agent scope) that lands while the
+  // picker is open also closes it, so lifting it later does not pop a stale menu back up.
+  if (isAgentLocked && isPickerOpen) {
+    setIsPickerOpen(false);
+    setHighlightedIndex(-1);
+  }
 
   const activeOption = !normalizedAgentId
     ? null
@@ -234,6 +257,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     if (!isPickerVisible) return;
 
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       const index = matchNumberedKeybind(e);
       if (index < 0) return;
 
@@ -295,9 +319,9 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   // Resolve display properties for the trigger pill
   const activeDisplayName = activeOption?.name ?? formatAgentIdLabel(normalizedAgentId);
   const activeStyle: React.CSSProperties | undefined = activeOption?.uiColor
-    ? { borderColor: activeOption.uiColor }
+    ? { color: activeOption.uiColor }
     : undefined;
-  const activeClassName = activeOption?.uiColor ? "" : "border-exec-mode";
+  const activeClassName = activeOption?.uiColor ? "" : "text-exec-mode";
   const TriggerIcon = getAgentIcon(normalizedAgentId);
 
   return (
@@ -321,19 +345,28 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             }}
             style={activeStyle}
             className={cn(
-              "text-foreground hover:bg-hover flex items-center gap-1.5 rounded-sm border-[0.5px] px-1.5 py-0.5 text-[11px] font-medium transition-[background-color] duration-150",
+              "text-foreground border-border-light hover:bg-hover flex items-center gap-1.5 rounded-md border px-1.5 text-[11px] font-medium transition-[background-color] duration-150 [&_svg]:size-2.5!",
+              COMPOSER_CONTROL_HEIGHT_CLASS,
               activeClassName
             )}
           >
-            <TriggerIcon
-              className="h-3 w-3 shrink-0"
-              style={activeOption?.uiColor ? { color: activeOption.uiColor } : undefined}
-            />
-            <span className="max-w-[clamp(4.5rem,30vw,130px)] truncate">{activeDisplayName}</span>
+            {/* Keep the mode glyph at the label's visual cap height so Exec reads as one aligned unit. */}
+            <TriggerIcon className="shrink-0" />
+            {/* shrink-0 leaves iconOnlyHideClassName as the only thing that hides this label. Without
+              it a tight row shrinks the label to a letter and an ellipsis instead. */}
+            <span
+              className={cn(
+                "max-w-[clamp(4.5rem,30vw,130px)] shrink-0 truncate",
+                iconOnlyHideClassName
+              )}
+            >
+              {activeDisplayName}
+            </span>
             {!isAgentLocked && (
               <ChevronDown
                 className={cn(
-                  "text-muted h-3 w-3 transition-transform duration-150",
+                  "text-muted h-3 w-3 shrink-0 transition-transform duration-150",
+                  iconOnlyHideClassName,
                   isPickerOpen && "rotate-180"
                 )}
               />
@@ -341,6 +374,9 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           </Button>
         </TooltipTrigger>
         <TooltipContent align="start" className="max-w-80 whitespace-normal">
+          {/* Name the active agent here because narrow composers render the trigger icon-only. */}
+          <strong>{activeDisplayName}</strong>
+          <br />
           Selects an agent definition (system prompt + tool policy).
           <br />
           <br />
@@ -360,9 +396,12 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           ref={dropdownRef}
           tabIndex={-1}
           onKeyDown={handleDropdownKeyDown}
-          className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-52 overflow-hidden rounded border shadow-[0_4px_12px_rgba(0,0,0,0.3)] outline-none"
+          // Left alignment prevents the menu from opening beyond the viewport.
+          className={cn(
+            "absolute bottom-full left-0 z-[1020] mb-1 min-w-52",
+            COMPOSER_PICKER_PANEL_CLASS
+          )}
         >
-          {/* Agent list — scrollable for long lists */}
           <div className="max-h-64 overflow-y-auto py-1">
             {!loaded && options.length === 0 ? (
               <div className="text-muted-light px-2.5 py-2 text-[11px]">Loading agents…</div>
@@ -384,11 +423,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
                     tabIndex={-1}
                     data-agent-id={opt.id}
                     data-testid="agent-option"
-                    className={cn(
-                      "flex cursor-pointer items-center gap-2.5 px-2.5 py-1.5 transition-colors duration-100",
-                      isHighlighted ? "bg-hover text-foreground" : "bg-transparent hover:bg-hover",
-                      isSelected ? "text-foreground" : "text-light hover:text-foreground"
-                    )}
+                    className={composerPickerOptionClass({ isHighlighted, isSelected }, "py-1.5")}
                     onMouseEnter={() => setHighlightedIndex(index)}
                     onClick={() => handleSelectAgent(opt.id)}
                   >
@@ -398,10 +433,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
                     />
                     <span
                       data-testid="agent-name"
-                      className={cn(
-                        "min-w-0 flex-1 truncate text-[11px] font-medium",
-                        isSelected && "text-accent"
-                      )}
+                      className={cn("min-w-0 flex-1 truncate", isSelected && "text-accent")}
                     >
                       {opt.name}
                     </span>

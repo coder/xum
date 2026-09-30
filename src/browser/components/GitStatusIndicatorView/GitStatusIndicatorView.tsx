@@ -64,6 +64,14 @@ export interface GitStatusIndicatorViewProps {
   isRefreshing?: boolean;
 }
 
+const CounterPill: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <span className="bg-surface-tertiary flex h-5 shrink-0 items-center rounded-md">{children}</span>
+);
+
+const CounterPillDivider: React.FC = () => (
+  <span className="bg-border-light h-full w-px shrink-0" aria-hidden="true" />
+);
+
 /**
  * Pure presentation component for git status indicator.
  * Displays git status (ahead/behind/dirty) and opens divergence details in a dialog.
@@ -97,13 +105,13 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   }
 
   const outgoingLines = gitStatus.outgoingAdditions + gitStatus.outgoingDeletions;
+  const incomingLines = gitStatus.incomingAdditions + gitStatus.incomingDeletions;
 
   // Render empty placeholder when nothing to show (prevents layout shift)
-  // In line-delta mode, also show if behind so users can toggle to divergence view
   const isEmpty =
     mode === "divergence"
       ? gitStatus.ahead === 0 && gitStatus.behind === 0 && !gitStatus.dirty
-      : outgoingLines === 0 && !gitStatus.dirty && gitStatus.behind === 0;
+      : outgoingLines === 0 && !gitStatus.dirty && incomingLines === 0;
 
   if (isEmpty) {
     return (
@@ -185,7 +193,6 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   };
 
-  // Render tooltip content
   const renderTooltipContent = () => {
     if (isLoading) {
       return "Loading...";
@@ -261,7 +268,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
           <span className="text-muted-light">Overview:</span>
-          {outgoingHasDelta ? (
+          {outgoingHasDelta || incomingLines > 0 ? (
             <span className="flex items-center gap-2">
               {gitStatus.outgoingAdditions > 0 && (
                 <span className={cn("font-normal", additionsColor)}>
@@ -272,6 +279,9 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
                 <span className={cn("font-normal", deletionsColor)}>
                   -{formatCountAbbrev(gitStatus.outgoingDeletions)}
                 </span>
+              )}
+              {incomingLines > 0 && (
+                <span className="text-muted">↓{formatCountAbbrev(incomingLines)}</span>
               )}
             </span>
           ) : (
@@ -295,39 +305,44 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   const triggerContent = (
     <>
       {mode === "divergence" ? (
-        <>
-          {gitStatus.ahead > 0 && (
-            <span className="flex items-center font-normal">
-              ↑{formatCountAbbrev(gitStatus.ahead)}
-            </span>
-          )}
-          {gitStatus.behind > 0 && (
-            <span className="flex items-center font-normal">
-              ↓{formatCountAbbrev(gitStatus.behind)}
-            </span>
-          )}
-        </>
+        hasCommitDivergence && (
+          <CounterPill>
+            {gitStatus.ahead > 0 && (
+              <span className="flex items-center px-1.5 font-normal">
+                ↑{formatCountAbbrev(gitStatus.ahead)}
+              </span>
+            )}
+            {gitStatus.ahead > 0 && gitStatus.behind > 0 && <CounterPillDivider />}
+            {gitStatus.behind > 0 && (
+              <span className="flex items-center px-1.5 font-normal">
+                ↓{formatCountAbbrev(gitStatus.behind)}
+              </span>
+            )}
+          </CounterPill>
+        )
       ) : (
         <>
           {outgoingHasDelta ? (
-            <span className="flex items-center gap-2">
+            <CounterPill>
               {gitStatus.outgoingAdditions > 0 && (
-                <span className={cn("font-normal", additionsColor)}>
+                <span className={cn("flex items-center px-1.5 font-normal", additionsColor)}>
                   +{formatCountAbbrev(gitStatus.outgoingAdditions)}
                 </span>
               )}
+              {gitStatus.outgoingAdditions > 0 && gitStatus.outgoingDeletions > 0 && (
+                <CounterPillDivider />
+              )}
               {gitStatus.outgoingDeletions > 0 && (
-                <span className={cn("font-normal", deletionsColor)}>
+                <span className={cn("flex items-center px-1.5 font-normal", deletionsColor)}>
                   -{formatCountAbbrev(gitStatus.outgoingDeletions)}
                 </span>
               )}
-            </span>
+            </CounterPill>
           ) : (
-            // No outgoing lines but behind remote - show muted behind indicator
-            // so users know they can open the divergence dialog for commit details
-            gitStatus.behind > 0 && (
+            // Keep line-delta mode in line units when only incoming changes exist.
+            incomingLines > 0 && (
               <span className="text-muted flex items-center font-normal">
-                ↓{formatCountAbbrev(gitStatus.behind)}
+                ↓{formatCountAbbrev(incomingLines)}
               </span>
             )
           )}

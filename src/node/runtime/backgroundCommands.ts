@@ -1,4 +1,5 @@
 import { shellQuote } from "@/common/utils/shell";
+import { buildGuardedCommand, buildShellExport } from "./shellEnv";
 export { shellQuote };
 
 /** Exit code for process killed by SIGKILL (128 + 9) */
@@ -37,6 +38,8 @@ export interface WrapperScriptOptions {
   exitCodePath: string;
   /** Working directory for the script */
   cwd: string;
+  /** Name of the environment variable containing the translated cwd; takes precedence over cwd. */
+  cwdEnvVar?: string;
   /** Environment variables to export */
   env?: Record<string, string>;
   /** The actual script to run */
@@ -45,7 +48,7 @@ export interface WrapperScriptOptions {
 
 /**
  * Build the wrapper script that captures exit code and sets up environment.
- * Pattern: trap 'echo $? > exit_code' EXIT && cd /path && export K=V && script
+ * Pattern: trap 'echo $? > exit_code' EXIT && cd /path && export K=V || exit; script
  */
 export function buildWrapperScript(options: WrapperScriptOptions): string {
   const parts: string[] = [];
@@ -62,19 +65,23 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   parts.push(`trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT`);
 
   // Change to working directory
-  parts.push(`cd ${shellQuote(options.cwd)}`);
+  if (options.cwdEnvVar) {
+    parts.push(`__MUX_CWD="$${options.cwdEnvVar}"`);
+    parts.push(`unset ${options.cwdEnvVar}`);
+    parts.push('cd "$__MUX_CWD"');
+  } else {
+    parts.push(`cd ${shellQuote(options.cwd)}`);
+  }
 
   // Add environment variable exports
   if (options.env) {
     for (const [key, value] of Object.entries(options.env)) {
-      parts.push(`export ${key}=${shellQuote(value)}`);
+      parts.push(buildShellExport(key, value));
     }
   }
 
-  // Add the actual script
-  parts.push(options.script);
-
-  return parts.join(" && ");
+  // A failed step skips every line of the script (#5192)
+  return buildGuardedCommand(parts, options.script);
 }
 
 /**

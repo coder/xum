@@ -1,6 +1,12 @@
 import * as path from "node:path";
 
+import { resolveLegacyMuxBuiltInSkillName } from "@/common/compat/legacyMux";
 import type { AgentSkillDescriptor, AgentSkillPackage, SkillName } from "@/common/types/agentSkill";
+import {
+  resolveSkillAdvertise,
+  resolveSkillUserInvocable,
+  resolveSkillWhenToUse,
+} from "@/common/orpc/schemas";
 import { parseSkillMarkdown } from "./parseSkillMarkdown";
 import { BUILTIN_SKILL_FILES } from "./builtInSkillContent.generated";
 
@@ -9,7 +15,7 @@ import { BUILTIN_SKILL_FILES } from "./builtInSkillContent.generated";
  *
  * Source of truth is:
  * - src/node/builtinSkills/*.md (SKILL.md content)
- * - docs/ (embedded for mux-docs)
+ * - docs/ (embedded for xum-docs)
  *
  * Content is generated into builtInSkillContent.generated.ts via scripts/gen_builtin_skills.ts.
  */
@@ -57,12 +63,16 @@ export function getBuiltInSkillDescriptors(): AgentSkillDescriptor[] {
     name: pkg.frontmatter.name,
     description: pkg.frontmatter.description,
     scope: pkg.scope,
-    advertise: pkg.frontmatter.advertise,
+    advertise: resolveSkillAdvertise(pkg.frontmatter),
+    userInvocable: resolveSkillUserInvocable(pkg.frontmatter),
+    argumentHint: pkg.frontmatter["argument-hint"],
+    whenToUse: resolveSkillWhenToUse(pkg.frontmatter),
   }));
 }
 
 export function getBuiltInSkillByName(name: SkillName): AgentSkillPackage | undefined {
-  return getBuiltInSkillDefinitions().find((pkg) => pkg.frontmatter.name === name);
+  const canonicalName = resolveLegacyMuxBuiltInSkillName(name);
+  return getBuiltInSkillDefinitions().find((pkg) => pkg.frontmatter.name === canonicalName);
 }
 
 function isAbsolutePathAny(filePath: string): boolean {
@@ -108,7 +118,8 @@ export function readBuiltInSkillFile(
 ): { resolvedPath: string; content: string } {
   const resolvedPath = normalizeBuiltInSkillFilePath(filePath);
 
-  const skillFiles = BUILTIN_SKILL_FILES[name];
+  const canonicalName = resolveLegacyMuxBuiltInSkillName(name);
+  const skillFiles = BUILTIN_SKILL_FILES[canonicalName];
   if (!skillFiles) {
     throw new Error(`Built-in skill not found: ${name}`);
   }
@@ -119,9 +130,4 @@ export function readBuiltInSkillFile(
   }
 
   return { resolvedPath, content };
-}
-
-/** Exposed for testing - clears cached parsed packages */
-export function clearBuiltInSkillCache(): void {
-  cachedPackages = null;
 }

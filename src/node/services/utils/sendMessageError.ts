@@ -1,9 +1,11 @@
+import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 import assert from "@/common/utils/assert";
 import type { ErrorEvent } from "@/common/types/stream";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { StreamErrorMessage } from "@/common/orpc/types";
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { createAssistantMessageId } from "./messageIds";
+import { formatSendMessageError as formatSendMessageErrorForDisplay } from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -108,6 +110,16 @@ export const formatSendMessageError = (
         message: `Workspace is starting: ${error.message}`,
         errorType: "runtime_start_failed",
       };
+    case "context_budget_blocked":
+      return { message: error.message, errorType: "context_budget_blocked" };
+    case "context_budget_exceeded": {
+      // Share the display formatter so early-stop counts never appear as exact request sizes.
+      const formatted = formatSendMessageErrorForDisplay(error);
+      return {
+        message: [formatted.message, formatted.resolutionHint].filter(Boolean).join(" "),
+        errorType: "context_budget_blocked",
+      };
+    }
     case "unknown":
       return {
         message: error.raw,
@@ -118,6 +130,14 @@ export const formatSendMessageError = (
         message: error.message,
         errorType: "unknown",
       };
+    case "task_checkout_unsanitized":
+      // Permanent until the task is removed (#4674): a non-retryable stream type, so a turn
+      // refused after its init wait schedules no auto-resume.
+      return { message: error.message, errorType: "runtime_not_ready" };
+    case "history-changed":
+      return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
+    case "plan_review_feedback_edit_blocked":
+      return { message: error.message, errorType: "unknown" };
   }
 };
 
@@ -125,6 +145,8 @@ export const formatSendMessageError = (
  * Stream-error payload helpers.
  */
 export interface StreamErrorPayload {
+  /** Internal per-attempt preflight failure; not part of the renderer wire payload. */
+  contextBudgetExceeded?: Extract<SendMessageError, { type: "context_budget_exceeded" }>;
   messageId: string;
   error: string;
   errorType?: StreamErrorType;

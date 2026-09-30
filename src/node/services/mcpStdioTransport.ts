@@ -1,14 +1,22 @@
 import { TextDecoder, TextEncoder } from "util";
-import type { MCPTransport, JSONRPCMessage } from "@ai-sdk/mcp";
+import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { ExecStream } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+
+// After stdin closes, how long a server gets to exit on its own before close() kills it.
+const MCP_STDIO_EXIT_GRACE_MS = 2_000;
+// Upper bound on waiting for the killed process to report its exit (a remote exec may never).
+export const MCP_STDIO_KILL_JOIN_MS = 5_000;
 
 /**
  * Minimal stdio transport for MCP servers using newline-delimited JSON (NDJSON).
  * Each message is a single line of JSON followed by \n.
- * This matches the protocol used by @ai-sdk/mcp's StdioMCPTransport.
+ * This matches the protocol used by the official SDK's StdioClientTransport,
+ * but reads/writes a Runtime.exec() stream so MCP servers can run on remote
+ * (SSH/devcontainer) runtimes too.
  */
-export class MCPStdioTransport implements MCPTransport {
+export class MCPStdioTransport implements Transport {
   private readonly decoder = new TextDecoder();
   private readonly encoder = new TextEncoder();
   private readonly stdoutReader: ReadableStreamDefaultReader<Uint8Array>;
@@ -21,14 +29,25 @@ export class MCPStdioTransport implements MCPTransport {
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
 
-  constructor(execStream: ExecStream) {
+  /**
+   * @param options.kill Kills the server's process tree (its exec's abort). Without it, close()
+   *   only closes stdin and stops reading, so a server that ignores EOF keeps running.
+   */
+  constructor(
+    execStream: ExecStream,
+    private readonly options?: { kill?: () => void }
+  ) {
     this.stdoutReader = execStream.stdout.getReader();
     this.stdinWriter = execStream.stdin.getWriter();
     this.exitPromise = execStream.exitCode;
-    // Observe process exit to trigger close event
-    void this.exitPromise.then(() => {
-      if (this.onclose) this.onclose();
-    });
+    // Observe process exit to trigger close event. A rejected exit observation proves nothing
+    // (see close()), so it does not close; handled so it is not an unhandled rejection.
+    void this.exitPromise.then(
+      () => {
+        if (this.onclose) this.onclose();
+      },
+      () => undefined
+    );
   }
 
   start(): Promise<void> {
@@ -56,6 +75,19 @@ export class MCPStdioTransport implements MCPTransport {
     } catch (error) {
       log.debug("Failed to cancel MCP stdout reader", { error });
     }
+    // Workspace removal stops servers before deleting the checkout (#4760): observe the exit,
+    // and kill a server that ignores EOF, so none outlives the checkout.
+    const kill = this.options?.kill;
+    if (kill === undefined) return;
+    // A rejected exit observation (e.g. a child-process error) does not prove the tree exited.
+    const exited = await raceWithAbortAndTimeout(this.exitPromise, {
+      timeoutMs: MCP_STDIO_EXIT_GRACE_MS,
+    }).catch(() => ({ kind: "rejected" as const }));
+    if (exited.kind === "ok") return;
+    kill();
+    await raceWithAbortAndTimeout(this.exitPromise, { timeoutMs: MCP_STDIO_KILL_JOIN_MS }).catch(
+      () => undefined
+    );
   }
 
   private async readLoop(): Promise<void> {

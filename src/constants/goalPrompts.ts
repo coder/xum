@@ -49,6 +49,8 @@ Live goal accounting at this continuation fire:
 
 Choose the next highest-value step toward completing the objective. Inspect current repository and conversation state as needed, preserve existing work, and use the available tools normally.
 
+Goal discipline: do not call \`set_goal\` to bypass this goal's budget or turn cap. Only set a new goal for a genuine user-requested pivot or follow-on objective; completing this active goal should use \`complete_goal\` after verification.
+
 Verified completion only: call \`complete_goal\` only after you have performed a completion audit that verifies the objective is satisfied in the current workspace, including relevant tests or dogfooding evidence when applicable. Do not call \`complete_goal\` merely because progress was made, a turn ended, or budget/time seems low.`;
 }
 

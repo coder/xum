@@ -1,7 +1,23 @@
-import type { AdvisorPackage } from "@/common/types/advisor";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 
-/** Fallback per-turn usage cap when an advisor file doesn't override it. */
+/** Default per-turn usage cap for the experimental advisor tool. */
 export const ADVISOR_DEFAULT_MAX_USES_PER_TURN = 3;
+
+/** Upper bound on the advisor tool's `question` input (schema and description share it). */
+export const ADVISOR_QUESTION_MAX_CHARS = 2000;
+
+const ADVISOR_ENABLED_BY_DEFAULT_AGENT_IDS = new Set(["exec", "plan"]);
+
+export function isAdvisorEnabledByDefaultForAgent(agentId: string): boolean {
+  return ADVISOR_ENABLED_BY_DEFAULT_AGENT_IDS.has(normalizeAgentId(agentId, ""));
+}
+
+export function resolveAdvisorEnabledForAgent(
+  agentId: string,
+  advisorEnabledOverride: boolean | undefined
+): boolean {
+  return advisorEnabledOverride ?? isAdvisorEnabledByDefaultForAgent(agentId);
+}
 
 /** Tail-biased truncation budget for same-step commentary included in advisor handoffs. */
 export const ADVISOR_HANDOFF_MAX_TEXT_CHARS = 4000;
@@ -11,12 +27,13 @@ export const ADVISOR_HANDOFF_MAX_REASONING_CHARS = 4000;
 
 /**
  * Shared guidance for when and how to use the advisor tool.
+ * Reused by the tool description and the system-prompt advisor-guidance section.
  *
- * Lives on the tool description (rebuilt per stream so the live advisor
- * catalog inlines below it). Repeating this in the system prompt is
- * intentionally avoided post-GA: the model attends to tool descriptions
- * during selection more reliably than to prose buried in the system message,
- * and the duplicate text spent prompt-budget for no quality lift.
+ * The "no tools / supply context" sentences exist because calling agents
+ * frequently invoke the advisor with insufficient context, as if it could
+ * investigate on its own. The advisor only sees the existing transcript plus
+ * the `question`, so the caller is responsible for surfacing the relevant
+ * files, errors, and options before (or inside) the call.
  */
 export const ADVISOR_USAGE_GUIDANCE =
   "Use this when you need help with planning ambiguity or high-impact architectural decisions, " +
@@ -27,56 +44,18 @@ export const ADVISOR_USAGE_GUIDANCE =
   "the essential excerpts into `question`. Frame a specific decision or tradeoff; do not ask the advisor " +
   "to investigate something it cannot see.";
 
-/**
- * Static base description for the advisor tool.
- *
- * The executor wraps this with the configured advisor catalog at registration
- * time (see {@link buildAdvisorToolDescription}). This base value is only
- * surfaced when an advisor catalog is unavailable (e.g., when introspecting
- * TOOL_DEFINITIONS shapes in tests).
- */
+/** Description shown to the model when the advisor tool is registered. */
 export const ADVISOR_TOOL_DESCRIPTION =
-  "Ask a configured advisor for strategic guidance based on the live conversation transcript. " +
+  "Ask a stronger model for strategic advice based on the live conversation transcript. " +
   ADVISOR_USAGE_GUIDANCE +
-  " Pass `advisor_name` to select which advisor handles the request and a brief `question` summarizing the decision or ambiguity.";
-
-/**
- * Build the runtime tool description that lists the live advisor catalog.
- *
- * The catalog is injected into the description so the model has a single
- * authoritative location to discover available advisors. Keeping the catalog
- * out of the system prompt mirrors how skills + sub-agent descriptors are
- * surfaced via tool descriptions instead of free-form prompt text.
- */
-export function buildAdvisorToolDescription(
-  advisors: ReadonlyArray<Pick<AdvisorPackage, "directoryName" | "frontmatter">>
-): string {
-  if (advisors.length === 0) {
-    // The tool should never be registered without at least one advisor — but
-    // returning a useful description here makes failures debuggable rather
-    // than blank.
-    return `${ADVISOR_TOOL_DESCRIPTION}\n\nNo advisors configured. The user must add at least one ADVISOR.md file before this tool can be used.`;
-  }
-
-  const lines: string[] = [];
-  lines.push(ADVISOR_TOOL_DESCRIPTION);
-  lines.push("");
-  lines.push("Available advisors:");
-  for (const advisor of advisors) {
-    // `description` is single-line per the schema; collapse defensively in
-    // case authors slip a newline through YAML.
-    const description = advisor.frontmatter.description.replace(/\s+/g, " ").trim();
-    lines.push(`- ${advisor.directoryName}: ${description}`);
-  }
-  return lines.join("\n");
-}
+  ` Pass a brief \`question\` (at most ${ADVISOR_QUESTION_MAX_CHARS} characters) summarizing the decision or ambiguity.`;
 
 /**
  * System prompt for the nested advisor model call.
- *
- * Per-advisor body fragments append to this base prompt at execute time —
- * the base sets the role boundary the calling assistant cannot violate, and
- * the body adds advisor-specific persona/voice/focus.
+ * Keep the role boundary explicit because the advisor sees the live transcript
+ * from the calling assistant. The prompt uses capability wording instead of
+ * policy wording so the advisor does not waste effort reasoning about tools or
+ * whether it should answer the end user directly.
  */
 export const ADVISOR_SYSTEM_PROMPT = `You are a strategic advisor for the calling assistant.
 
@@ -99,16 +78,3 @@ You may suggest user-facing wording when helpful, but keep the response addresse
 If the current direction already looks sound, confirm it briefly and explain why.
 Keep the response concise and pointed.
 The final user message may contain a structured advisor handoff summarizing the immediate consultation request and same-step context.`;
-
-/**
- * Compose the per-advisor system prompt by appending the advisor's body to
- * the shared base. The body is optional — when omitted, the base prompt
- * is used unchanged.
- */
-export function composeAdvisorSystemPrompt(advisorBody: string | undefined): string {
-  const body = advisorBody?.trim();
-  if (!body) {
-    return ADVISOR_SYSTEM_PROMPT;
-  }
-  return `${ADVISOR_SYSTEM_PROMPT}\n\n${body}`;
-}

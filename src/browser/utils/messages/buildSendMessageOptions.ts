@@ -1,22 +1,33 @@
 import type { SendMessageOptions } from "@/common/orpc/types";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
 export interface ExperimentValues {
   programmaticToolCalling: boolean | undefined;
-  programmaticToolCallingExclusive: boolean | undefined;
-  execSubagentHardRestart: boolean | undefined;
-  imageGenerationTool: boolean | undefined;
+  /** RLM mode (sub-experiment of PTC): backend ignores it unless PTC is on. */
+  rlm: boolean | undefined;
+  advisorTool: boolean | undefined;
+  dynamicWorkflows: boolean | undefined;
+  memory: boolean | undefined;
+  memoryIntuition: boolean | undefined;
+  toolSearch: boolean | undefined;
+  continuousCompaction: boolean | undefined;
+  tokenBudget: boolean | undefined;
 }
 
 export interface SendMessageOptionsInput {
   model: string;
   thinkingLevel: ThinkingLevel;
+  reasoningMode: OpenAIReasoningMode;
   agentId: string;
   providerOptions: MuxProviderOptions;
   experiments: ExperimentValues;
   disableWorkspaceAgents?: boolean;
+  /** Composer Auto selection; only real user sends set it (compaction/resume paths leave it unset). */
+  autoModelRouting?: boolean;
+  /** Composer thinking level set to Auto; independent of autoModelRouting. */
+  autoThinkingLevel?: boolean;
 }
 
 /** Normalize a preferred model string for routing while preserving explicit gateway choices. */
@@ -33,10 +44,14 @@ export function normalizeModelPreference(rawModel: unknown, fallbackModel: strin
 export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMessageOptions {
   return {
     thinkingLevel: input.thinkingLevel,
+    reasoningMode: input.reasoningMode,
     model: input.model,
     agentId: input.agentId,
     providerOptions: input.providerOptions,
     experiments: { ...input.experiments },
+    allowAgentSetGoal: true,
     disableWorkspaceAgents: input.disableWorkspaceAgents ? true : undefined,
+    autoModelRouting: input.autoModelRouting ? true : undefined,
+    autoThinkingLevel: input.autoThinkingLevel ? true : undefined,
   };
 }

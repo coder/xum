@@ -1,11 +1,15 @@
+import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import { getReviewDefaultBaseKey, getReviewDiffBaseKey } from "@/common/constants/storage";
+import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
+
 /**
  * Storage key helpers for persisted settings.
  */
 export const STORAGE_KEYS = {
   /** Per-project default diff base for code review. Pass projectPath. */
-  reviewDefaultBase: (projectPath: string) => `review-default-base:${projectPath}`,
+  reviewDefaultBase: getReviewDefaultBaseKey,
   /** Per-workspace diff base override. Pass workspaceId. */
-  reviewDiffBase: (workspaceId: string) => `review-diff-base:${workspaceId}`,
+  reviewDiffBase: getReviewDiffBaseKey,
 } as const;
 
 Object.freeze(STORAGE_KEYS);
@@ -30,9 +34,6 @@ Object.freeze(STORAGE_KEYS);
  * IMPORTANT: All values are marked `as const` to ensure immutability at the type level.
  * Do not modify these values at runtime - they serve as the single source of truth.
  */
-
-import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
-import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 
 /**
  * Hard-coded default values for workspace settings.

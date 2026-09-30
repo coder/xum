@@ -22,6 +22,9 @@ import { DesktopPanel } from "@/browser/features/desktop/DesktopPanel";
 import { BrowserTab } from "@/browser/features/RightSidebar/BrowserTab";
 import { DevToolsTab } from "@/browser/features/RightSidebar/DevToolsTab";
 import { GoalTab, type GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
+import { MemoryTab } from "@/browser/features/RightSidebar/Memory/MemoryTab";
+import { WorkflowsTab } from "@/browser/features/RightSidebar/Workflows/WorkflowsTab";
+import { TimelinePanel } from "@/browser/features/RightSidebar/Timeline/TimelinePanel";
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
 import { BASE_TAB_IDS, TAB_CONFIG, type BaseTabType, type TabConfig } from "./tabConfig";
@@ -31,20 +34,15 @@ import {
   DesktopTabLabel,
   GoalTabLabel,
   InstructionsTabLabel,
+  MemoryTabLabel,
   OutputTabLabel,
   ReviewTabLabel,
   StatsTabLabel,
+  TimelineTabLabel,
+  WorkflowsTabLabel,
 } from "./TabLabels";
 
-export {
-  BASE_TAB_IDS,
-  getDefaultLayoutTabIds,
-  getOrderedBaseTabIds,
-  getTabConfig,
-  isBaseTabId,
-  type BaseTabType,
-  type TabConfig,
-} from "./tabConfig";
+export { isBaseTabId, type BaseTabType } from "./tabConfig";
 
 /** Stats reported by ReviewPanel for tab display (kept local to the registry). */
 export interface ReviewStats {
@@ -157,6 +155,26 @@ const TAB_RENDERERS = {
       </ErrorBoundary>
     ),
   },
+  timeline: {
+    Label: TimelineTabLabel,
+    renderPanel: (ctx) => (
+      <ErrorBoundary workspaceInfo="Timeline tab">
+        <TimelinePanel workspaceId={ctx.workspaceId} />
+      </ErrorBoundary>
+    ),
+  },
+  memory: {
+    Label: MemoryTabLabel,
+    renderPanel: (ctx) => <MemoryTab workspaceId={ctx.workspaceId} />,
+  },
+  workflows: {
+    Label: ({ workspaceId }) => <WorkflowsTabLabel workspaceId={workspaceId} />,
+    renderPanel: (ctx) => (
+      <ErrorBoundary workspaceInfo="Workflows tab">
+        <WorkflowsTab workspaceId={ctx.workspaceId} />
+      </ErrorBoundary>
+    ),
+  },
   desktop: {
     Label: DesktopTabLabel,
     renderPanel: (ctx) => (
@@ -197,7 +215,3 @@ const TAB_RENDERERS = {
 export const TAB_REGISTRY: Record<BaseTabType, TabRegistration> = Object.fromEntries(
   BASE_TAB_IDS.map((id) => [id, { ...TAB_CONFIG[id], ...TAB_RENDERERS[id] }])
 ) as Record<BaseTabType, TabRegistration>;
-
-export function getTabRegistration(id: BaseTabType): TabRegistration {
-  return TAB_REGISTRY[id];
-}

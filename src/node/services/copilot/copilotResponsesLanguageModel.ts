@@ -7,7 +7,10 @@ import type {
   LanguageModelV2StreamPart,
   LanguageModelV2ToolResultOutput,
   LanguageModelV2Usage,
+  SharedV2ProviderMetadata,
 } from "@ai-sdk/provider";
+
+import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 
 export interface CopilotResponsesConfig {
   modelId: string;
@@ -39,10 +42,16 @@ export class CopilotResponsesLanguageModel implements LanguageModelV2 {
     const response = await this.post(body, options);
     const responseBody = (await response.json()) as JsonRecord;
 
+    const content = extractContent(responseBody);
+
     return {
-      content: extractTextContent(responseBody),
-      finishReason: mapFinishReason(getRawFinishReason(responseBody)),
+      content,
+      finishReason: mapFinishReason(
+        getRawFinishReason(responseBody),
+        content.some((part) => part.type === "tool-call")
+      ),
       usage: mapUsage(responseBody.usage),
+      providerMetadata: mapServiceTierMetadata(responseBody),
       warnings: [],
       request: { body },
       response: {
@@ -102,6 +111,10 @@ export class CopilotResponsesLanguageModel implements LanguageModelV2 {
 }
 
 function buildRequestBody(modelId: string, options: LanguageModelV2CallOptions, stream: boolean) {
+  // Fast mode uses the same gateway option as Chat, but Responses sends snake_case.
+  const serviceTier = ServiceTierSchema.optional().parse(
+    options.providerOptions?.["github-copilot"]?.serviceTier
+  );
   const instructions: string[] = [];
   const input: unknown[] = [];
 
@@ -162,6 +175,7 @@ function buildRequestBody(modelId: string, options: LanguageModelV2CallOptions, 
   return {
     model: modelId,
     stream,
+    ...(serviceTier != null ? { service_tier: serviceTier } : {}),
     ...(instructions.length > 0 ? { instructions: instructions.join("\n\n") } : {}),
     ...(input.length > 0 ? { input } : {}),
     ...(options.tools ? { tools: options.tools.flatMap(mapToolDefinition) } : {}),
@@ -274,15 +288,35 @@ function getReasoningOption(providerOptions: LanguageModelV2CallOptions["provide
   return typeof reasoningEffort === "string" ? { effort: reasoningEffort } : undefined;
 }
 
+interface OngoingToolCall {
+  toolCallId: string;
+  toolName: string;
+  argumentsText: string;
+  finalized: boolean;
+}
+
+interface StreamState {
+  textAliases: Map<string, string>;
+  toolCallsByIndex: Map<number, OngoingToolCall>;
+  toolCallsByItemId: Map<string, OngoingToolCall>;
+  sawFunctionCall: boolean;
+}
+
 async function consumeSseStream(
   source: ReadableStream<Uint8Array>,
   includeRawChunks: boolean,
   controller: ReadableStreamDefaultController<LanguageModelV2StreamPart>
 ) {
-  const aliasRegistry = new Map<string, string>();
+  const state: StreamState = {
+    textAliases: new Map(),
+    toolCallsByIndex: new Map(),
+    toolCallsByItemId: new Map(),
+    sawFunctionCall: false,
+  };
   const reader = source.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTerminalEvent = false;
 
   try {
     for (;;) {
@@ -294,13 +328,18 @@ async function consumeSseStream(
       while (boundary >= 0) {
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        processFrame(frame, aliasRegistry, includeRawChunks, controller);
+        sawTerminalEvent =
+          processFrame(frame, state, includeRawChunks, controller) || sawTerminalEvent;
         boundary = buffer.indexOf("\n\n");
       }
 
       if (done) {
         if (buffer.trim().length > 0) {
-          processFrame(buffer, aliasRegistry, includeRawChunks, controller);
+          sawTerminalEvent =
+            processFrame(buffer, state, includeRawChunks, controller) || sawTerminalEvent;
+        }
+        if (!sawTerminalEvent) {
+          controller.enqueue({ type: "error", error: createStreamTruncatedError() });
         }
         break;
       }
@@ -315,22 +354,26 @@ async function consumeSseStream(
 
 function processFrame(
   frame: string,
-  aliasRegistry: Map<string, string>,
+  state: StreamState,
   includeRawChunks: boolean,
   controller: ReadableStreamDefaultController<LanguageModelV2StreamPart>
-) {
+): boolean {
   const parsed = parseSseFrame(frame);
   if (parsed == null) {
-    return;
+    return false;
   }
 
   if (includeRawChunks) {
     controller.enqueue({ type: "raw", rawValue: parsed });
   }
 
-  for (const part of mapStreamEvent(parsed.event, parsed.data, aliasRegistry)) {
+  let sawTerminalEvent = false;
+  for (const part of mapStreamEvent(parsed.event, parsed.data, state)) {
+    sawTerminalEvent = part.type === "finish" || part.type === "error" || sawTerminalEvent;
     controller.enqueue(part);
   }
+
+  return sawTerminalEvent;
 }
 
 function parseSseFrame(frame: string) {
@@ -361,7 +404,7 @@ function parseSseFrame(frame: string) {
   return { event, data: JSON.parse(rawData) as JsonRecord };
 }
 
-function mapStreamEvent(event: string, data: JsonRecord, aliasRegistry: Map<string, string>) {
+function mapStreamEvent(event: string, data: JsonRecord, state: StreamState) {
   const type = getString(data.type) ?? event;
   switch (type) {
     case "response.created":
@@ -375,36 +418,156 @@ function mapStreamEvent(event: string, data: JsonRecord, aliasRegistry: Map<stri
       ] satisfies LanguageModelV2StreamPart[];
     case "response.output_item.added": {
       const item = data.item as JsonRecord | undefined;
-      if (getString(item?.type) !== "message") {
+      const itemType = getString(item?.type);
+      if (itemType === "function_call") {
+        const call = registerToolCall(data, item, state);
+        return call
+          ? ([
+              { type: "tool-input-start", id: call.toolCallId, toolName: call.toolName },
+            ] satisfies LanguageModelV2StreamPart[])
+          : [];
+      }
+      if (itemType !== "message") {
         return [];
       }
-      const id = resolveStableTextId(data, aliasRegistry, getString(item?.id));
+      const id = resolveStableTextId(data, state.textAliases, getString(item?.id));
       return id ? ([{ type: "text-start", id }] satisfies LanguageModelV2StreamPart[]) : [];
     }
     case "response.output_text.delta": {
-      const id = resolveStableTextId(data, aliasRegistry, getString(data.item_id));
+      const id = resolveStableTextId(data, state.textAliases, getString(data.item_id));
       const delta = getString(data.delta);
       return id && delta !== undefined
         ? ([{ type: "text-delta", id, delta }] satisfies LanguageModelV2StreamPart[])
         : [];
     }
     case "response.output_text.done": {
-      const id = resolveStableTextId(data, aliasRegistry, getString(data.item_id));
+      const id = resolveStableTextId(data, state.textAliases, getString(data.item_id));
       return id ? ([{ type: "text-end", id }] satisfies LanguageModelV2StreamPart[]) : [];
     }
+    case "response.function_call_arguments.delta": {
+      const call = resolveToolCall(data, state);
+      const delta = getString(data.delta);
+      if (!call || call.finalized || delta === undefined) {
+        return [];
+      }
+      call.argumentsText += delta;
+      return [
+        { type: "tool-input-delta", id: call.toolCallId, delta },
+      ] satisfies LanguageModelV2StreamPart[];
+    }
+    case "response.function_call_arguments.done": {
+      const call = resolveToolCall(data, state);
+      return call ? finalizeToolCall(call, getString(data.arguments), state) : [];
+    }
+    case "response.output_item.done": {
+      const item = data.item as JsonRecord | undefined;
+      if (getString(item?.type) !== "function_call") {
+        return [];
+      }
+      const known = resolveToolCall(data, state);
+      // Register on the fly so a done-only stream (no prior added event) still
+      // yields a terminal tool-call part, with a matching tool-input-start so
+      // consumers see a complete input lifecycle.
+      const call = known ?? registerToolCall(data, item, state);
+      if (!call) {
+        return [];
+      }
+      const parts = finalizeToolCall(call, getString(item?.arguments), state);
+      return known
+        ? parts
+        : ([
+            { type: "tool-input-start", id: call.toolCallId, toolName: call.toolName },
+            ...parts,
+          ] satisfies LanguageModelV2StreamPart[]);
+    }
     case "response.completed":
+    case "response.incomplete":
       return [
         {
           type: "finish",
           usage: mapUsage((data.response as JsonRecord | undefined)?.usage),
-          finishReason: mapFinishReason(getRawFinishReason(data.response)),
+          finishReason: mapFinishReason(getRawFinishReason(data.response), state.sawFunctionCall),
+          providerMetadata: mapServiceTierMetadata(data.response as JsonRecord | undefined),
         },
+      ] satisfies LanguageModelV2StreamPart[];
+    case "response.failed":
+      return [
+        { type: "error", error: createResponseFailedError(data) },
       ] satisfies LanguageModelV2StreamPart[];
     case "error":
       return [{ type: "error", error: data }] satisfies LanguageModelV2StreamPart[];
     default:
       return [];
   }
+}
+
+function createStreamTruncatedError() {
+  return new Error("Copilot Responses stream closed before terminal event");
+}
+
+function createResponseFailedError(data: JsonRecord) {
+  const response = data.response as JsonRecord | undefined;
+  const error = response?.error as JsonRecord | undefined;
+  const message = getString(error?.message) ?? "Response failed";
+  const code = getString(error?.code);
+
+  return new Error(
+    code ? `response failed: ${message} (code: ${code})` : `response failed: ${message}`
+  );
+}
+
+function registerToolCall(data: JsonRecord, item: JsonRecord | undefined, state: StreamState) {
+  const toolCallId = getString(item?.call_id);
+  const toolName = getString(item?.name);
+  if (toolCallId === undefined || toolName === undefined) {
+    return undefined;
+  }
+
+  const call: OngoingToolCall = { toolCallId, toolName, argumentsText: "", finalized: false };
+  const outputIndex = getNumber(data.output_index);
+  if (outputIndex !== undefined) {
+    state.toolCallsByIndex.set(outputIndex, call);
+  }
+  const itemId = getString(item?.id);
+  if (itemId !== undefined) {
+    state.toolCallsByItemId.set(itemId, call);
+  }
+  return call;
+}
+
+function resolveToolCall(data: JsonRecord, state: StreamState) {
+  const outputIndex = getNumber(data.output_index);
+  if (outputIndex !== undefined) {
+    const call = state.toolCallsByIndex.get(outputIndex);
+    if (call) {
+      return call;
+    }
+  }
+
+  const itemId = getString(data.item_id) ?? getString((data.item as JsonRecord | undefined)?.id);
+  return itemId !== undefined ? state.toolCallsByItemId.get(itemId) : undefined;
+}
+
+function finalizeToolCall(
+  call: OngoingToolCall,
+  completeArguments: string | undefined,
+  state: StreamState
+): LanguageModelV2StreamPart[] {
+  if (call.finalized) {
+    return [];
+  }
+  call.finalized = true;
+  state.sawFunctionCall = true;
+
+  return [
+    { type: "tool-input-end", id: call.toolCallId },
+    {
+      type: "tool-call",
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      input: completeArguments ?? call.argumentsText,
+    },
+  ];
 }
 
 function resolveStableTextId(
@@ -428,17 +591,33 @@ function resolveStableTextId(
   return undefined;
 }
 
-function extractTextContent(responseBody: JsonRecord): LanguageModelV2Content[] {
+function extractContent(responseBody: JsonRecord): LanguageModelV2Content[] {
   const output = Array.isArray(responseBody.output) ? responseBody.output : [];
   const content: LanguageModelV2Content[] = [];
 
   for (const item of output) {
-    const message = item as JsonRecord;
-    if (getString(message.type) !== "message" || !Array.isArray(message.content)) {
+    const outputItem = item as JsonRecord;
+    const itemType = getString(outputItem.type);
+
+    if (itemType === "function_call") {
+      const toolCallId = getString(outputItem.call_id);
+      const toolName = getString(outputItem.name);
+      if (toolCallId !== undefined && toolName !== undefined) {
+        content.push({
+          type: "tool-call",
+          toolCallId,
+          toolName,
+          input: getString(outputItem.arguments) ?? "{}",
+        });
+      }
       continue;
     }
 
-    for (const part of message.content) {
+    if (itemType !== "message" || !Array.isArray(outputItem.content)) {
+      continue;
+    }
+
+    for (const part of outputItem.content) {
       const textPart = part as JsonRecord;
       if (getString(textPart.type) === "output_text" && typeof textPart.text === "string") {
         content.push({ type: "text", text: textPart.text });
@@ -447,6 +626,18 @@ function extractTextContent(responseBody: JsonRecord): LanguageModelV2Content[] 
   }
 
   return content;
+}
+
+/**
+ * The service tier the response reports it was served at, under the OpenAI metadata
+ * key cost accounting reads (#4352). Copilot forwards OpenAI service tiers, and a
+ * response can be served at a different tier than requested.
+ */
+function mapServiceTierMetadata(
+  response: JsonRecord | undefined
+): SharedV2ProviderMetadata | undefined {
+  const serviceTier = getString(response?.service_tier);
+  return serviceTier ? { openai: { serviceTier } } : undefined;
 }
 
 function mapUsage(rawUsage: unknown): LanguageModelV2Usage {
@@ -474,11 +665,17 @@ function getRawFinishReason(value: unknown) {
   );
 }
 
-function mapFinishReason(reason: unknown): LanguageModelV2FinishReason {
+function mapFinishReason(reason: unknown, hasFunctionCall: boolean): LanguageModelV2FinishReason {
+  // The Responses API reports completion via status, not finish_reason, so a
+  // tool-calling turn typically ends with no raw reason at all.
+  if (reason === undefined && hasFunctionCall) {
+    return "tool-calls";
+  }
   switch (reason) {
     case "stop":
       return "stop";
     case "max_tokens":
+    case "max_output_tokens":
       return "length";
     case "content_filter":
       return "content-filter";

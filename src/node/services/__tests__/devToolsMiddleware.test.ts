@@ -3,29 +3,31 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import type {
-  LanguageModelV3,
-  LanguageModelV3CallOptions,
-  LanguageModelV3GenerateResult,
-  LanguageModelV3Middleware,
-  LanguageModelV3StreamPart,
-  LanguageModelV3Usage,
+  LanguageModelV4,
+  LanguageModelV4CallOptions,
+  LanguageModelV4GenerateResult,
+  LanguageModelV4Middleware,
+  LanguageModelV4StreamPart,
+  LanguageModelV4Usage,
 } from "@ai-sdk/provider";
 import { Config } from "@/node/config";
+import {
+  DEVTOOLS_STEP_ID_HEADER,
+  captureAndStripDevToolsHeader,
+  consumeRedactedRequestBody,
+} from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
-  const config = new Config(opts.sessionsDir);
-  spyOn(config, "getSessionDir").mockImplementation((workspaceId: string) =>
-    path.join(opts.sessionsDir, workspaceId)
-  );
+  const config = new Config(path.dirname(opts.sessionsDir));
   spyOn(config, "getLlmDebugLogsEnabled").mockImplementation(() => opts.enabled ?? true);
   return config;
 }
 
-function createMockModel(overrides: Partial<LanguageModelV3> = {}): LanguageModelV3 {
+function createMockModel(overrides: Partial<LanguageModelV4> = {}): LanguageModelV4 {
   return {
-    specificationVersion: "v3",
+    specificationVersion: "v4",
     provider: "test-provider",
     modelId: "test-model",
     supportedUrls: {},
@@ -37,7 +39,7 @@ function createMockModel(overrides: Partial<LanguageModelV3> = {}): LanguageMode
   };
 }
 
-function createMockParams(): LanguageModelV3CallOptions {
+function createMockParams(): LanguageModelV4CallOptions {
   return {
     prompt: [
       {
@@ -60,7 +62,7 @@ function createMockParams(): LanguageModelV3CallOptions {
   };
 }
 
-function createUsage(inputTokens: number, outputTokens: number): LanguageModelV3Usage {
+function createUsage(inputTokens: number, outputTokens: number): LanguageModelV4Usage {
   return {
     inputTokens: {
       total: inputTokens,
@@ -77,8 +79,8 @@ function createUsage(inputTokens: number, outputTokens: number): LanguageModelV3
 }
 
 function createGenerateResult(
-  overrides: Partial<LanguageModelV3GenerateResult> = {}
-): LanguageModelV3GenerateResult {
+  overrides: Partial<LanguageModelV4GenerateResult> = {}
+): LanguageModelV4GenerateResult {
   return {
     content: [{ type: "text", text: "Hello" }],
     finishReason: { unified: "stop", raw: "stop" },
@@ -90,7 +92,7 @@ function createGenerateResult(
   };
 }
 
-function getWrapGenerate(middleware: LanguageModelV3Middleware) {
+function getWrapGenerate(middleware: LanguageModelV4Middleware) {
   if (!middleware.wrapGenerate) {
     throw new Error("Expected wrapGenerate to be defined");
   }
@@ -98,7 +100,7 @@ function getWrapGenerate(middleware: LanguageModelV3Middleware) {
   return middleware.wrapGenerate;
 }
 
-function getWrapStream(middleware: LanguageModelV3Middleware) {
+function getWrapStream(middleware: LanguageModelV4Middleware) {
   if (!middleware.wrapStream) {
     throw new Error("Expected wrapStream to be defined");
   }
@@ -107,10 +109,10 @@ function getWrapStream(middleware: LanguageModelV3Middleware) {
 }
 
 async function collectStream(
-  stream: ReadableStream<LanguageModelV3StreamPart>
-): Promise<LanguageModelV3StreamPart[]> {
+  stream: ReadableStream<LanguageModelV4StreamPart>
+): Promise<LanguageModelV4StreamPart[]> {
   const reader = stream.getReader();
-  const chunks: LanguageModelV3StreamPart[] = [];
+  const chunks: LanguageModelV4StreamPart[] = [];
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -122,6 +124,58 @@ async function collectStream(
   }
 
   return chunks;
+}
+
+const SECRET_API_KEY = "sk-live-body-secret-123";
+const SECRET_ENCRYPTED_REASONING = "gAAAAABencrypted-reasoning-blob-xyz";
+const SECRET_SIGNATURE = "EqQBCkYIBRgCKkAthinking-signature";
+
+// Provider-shaped body as the SDK serializes it, with a credential and encrypted reasoning.
+const FAILED_REQUEST_BODY = JSON.stringify({
+  model: "gpt-test",
+  api_key: SECRET_API_KEY,
+  max_output_tokens: 128,
+  input: [
+    { type: "reasoning", id: "rs_1", encrypted_content: SECRET_ENCRYPTED_REASONING, summary: [] },
+    {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "plan", signature: SECRET_SIGNATURE }],
+    },
+    { role: "user", content: [{ type: "input_text", text: "Hello middleware" }] },
+  ],
+});
+
+/** Mimics Xum's fetch wrapper: the request goes out, then the provider rejects it (e.g. HTTP 400). */
+function rejectAfterFetch(params: LanguageModelV4CallOptions, failure: Error): Promise<never> {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(params.headers ?? {})) {
+    if (typeof value === "string") headers.set(key, value);
+  }
+  captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+  return Promise.reject(failure);
+}
+
+async function expectRedactedFailedRequest(service: DevToolsService): Promise<void> {
+  const runs = await service.getRuns("ws-1");
+  const step = (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+  expect(step?.error).toBe("400 invalid_encrypted_content");
+  expect(step?.rawRequest).toMatchObject({
+    model: "gpt-test",
+    api_key: "[REDACTED]",
+    max_output_tokens: 128,
+    input: [
+      {
+        type: "reasoning",
+        encrypted_content: `[REDACTED ${SECRET_ENCRYPTED_REASONING.length} chars]`,
+      },
+      { content: [{ thinking: "plan", signature: `[REDACTED ${SECRET_SIGNATURE.length} chars]` }] },
+      { content: [{ text: "Hello middleware" }] },
+    ],
+  });
+  const persisted = JSON.stringify(step);
+  for (const secret of [SECRET_API_KEY, SECRET_ENCRYPTED_REASONING, SECRET_SIGNATURE]) {
+    expect(persisted).not.toContain(secret);
+  }
 }
 
 describe("extractUsage", () => {
@@ -360,6 +414,29 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.durationMs).toBeGreaterThanOrEqual(0);
     });
 
+    it("records the redacted request body when the provider rejects before responding", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapGenerate = getWrapGenerate(middleware);
+      const params = createMockParams();
+      const failure = new Error("400 invalid_encrypted_content");
+
+      let thrownError: unknown;
+      try {
+        await wrapGenerate({
+          doGenerate: () => rejectAfterFetch(params, failure),
+          doStream: () => Promise.reject(new Error("doStream should not be called")),
+          params,
+          model: createMockModel(),
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
+
+      await expectRedactedFailedRequest(service);
+    });
+
     it("passes through result unmodified", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
@@ -409,7 +486,7 @@ describe("createDevToolsMiddleware", () => {
         event: "response.output_text.delta",
         data: "world",
       };
-      const chunks: LanguageModelV3StreamPart[] = [
+      const chunks: LanguageModelV4StreamPart[] = [
         { type: "text-start", id: "t1" },
         { type: "text-delta", id: "t1", delta: "Hello " },
         { type: "raw", rawValue: rawChunkValue },
@@ -423,7 +500,7 @@ describe("createDevToolsMiddleware", () => {
       ];
       const expectedForwardedChunks = chunks.filter((chunk) => chunk.type !== "raw");
 
-      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           for (const chunk of chunks) {
             controller.enqueue(chunk);
@@ -490,7 +567,7 @@ describe("createDevToolsMiddleware", () => {
       const wrapStream = getWrapStream(middleware);
 
       const rawValue = { event: "response.output_text.delta", data: "hidden" };
-      const chunks: LanguageModelV3StreamPart[] = [
+      const chunks: LanguageModelV4StreamPart[] = [
         { type: "raw", rawValue },
         {
           type: "finish",
@@ -499,7 +576,7 @@ describe("createDevToolsMiddleware", () => {
         },
       ];
 
-      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           for (const chunk of chunks) {
             controller.enqueue(chunk);
@@ -531,7 +608,7 @@ describe("createDevToolsMiddleware", () => {
       const wrapStream = getWrapStream(middleware);
 
       const rawValue = { event: "response.output_text.delta", data: "visible" };
-      const chunks: LanguageModelV3StreamPart[] = [
+      const chunks: LanguageModelV4StreamPart[] = [
         { type: "raw", rawValue },
         {
           type: "finish",
@@ -540,7 +617,7 @@ describe("createDevToolsMiddleware", () => {
         },
       ];
 
-      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           for (const chunk of chunks) {
             controller.enqueue(chunk);
@@ -575,7 +652,7 @@ describe("createDevToolsMiddleware", () => {
       const middleware = createDevToolsMiddleware("ws-1", service);
       const wrapStream = getWrapStream(middleware);
 
-      const chunks: LanguageModelV3StreamPart[] = [
+      const chunks: LanguageModelV4StreamPart[] = [
         {
           type: "tool-call",
           toolCallId: "call-1",
@@ -589,7 +666,7 @@ describe("createDevToolsMiddleware", () => {
         },
       ];
 
-      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           for (const chunk of chunks) {
             controller.enqueue(chunk);
@@ -624,12 +701,105 @@ describe("createDevToolsMiddleware", () => {
       });
     });
 
+    it("records the redacted request body when the stream is rejected before it starts", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const params = createMockParams();
+      const failure = new Error("400 invalid_encrypted_content");
+
+      let thrownError: unknown;
+      try {
+        await wrapStream({
+          doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+          doStream: () => rejectAfterFetch(params, failure),
+          params,
+          model: createMockModel(),
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
+
+      await expectRedactedFailedRequest(service);
+    });
+
+    it("drops the captured body on abort even when the fetch never settles", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () => {
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          // A custom fetch that ignores the abort signal and never settles.
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      controller.abort();
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
+    it("keeps no body when the provider reaches fetch only after the abort", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      controller.abort();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // An asynchronous provider that only reaches its (abort-ignoring) fetch now.
+          await Promise.resolve();
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
     it("records 'Request aborted' on stream cancel", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
       const wrapStream = getWrapStream(middleware);
 
-      const neverEndingStream = new ReadableStream<LanguageModelV3StreamPart>({
+      const neverEndingStream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           controller.enqueue({ type: "text-start", id: "t1" });
           controller.enqueue({ type: "text-delta", id: "t1", delta: "partial" });
@@ -669,7 +839,7 @@ describe("createDevToolsMiddleware", () => {
       const wrapStream = getWrapStream(middleware);
       const abortController = new AbortController();
 
-      const neverEndingStream = new ReadableStream<LanguageModelV3StreamPart>({
+      const neverEndingStream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           controller.enqueue({ type: "text-start", id: "t1" });
           controller.enqueue({ type: "text-delta", id: "t1", delta: "partial" });
@@ -703,13 +873,39 @@ describe("createDevToolsMiddleware", () => {
       await reader.cancel();
     });
 
+    it("leaves no closed-step mark behind when a started stream is aborted", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const abortController = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abortController.signal };
+
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () =>
+          Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
+        params,
+        model: createMockModel(),
+      });
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      abortController.abort();
+
+      // The fetch already settled, so the abort must not mark the id closed for good: a
+      // capture under that id is accepted again (a leaked mark would drop it).
+      captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: stepId }), "{}");
+      expect(consumeRedactedRequestBody(stepId)).toEqual({});
+      await result.stream.cancel();
+    });
+
     it("does not double-finalize when abort fires after normal completion", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
       const wrapStream = getWrapStream(middleware);
       const abortController = new AbortController();
 
-      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(controller) {
           controller.enqueue({
             type: "finish",

@@ -5,6 +5,10 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { PlanFileDialog } from "./PlanFileDialog";
+import {
+  POST_COMPACTION_COLLAPSED_KEY,
+  POST_COMPACTION_FILES_EXPANDED_KEY,
+} from "@/common/constants/storage";
 
 interface PostCompactionSectionProps {
   workspaceId: string;
@@ -26,9 +30,9 @@ function getFileName(filePath: string): string {
  */
 export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (props) => {
   const openInEditor = useOpenInEditor();
-  const [collapsed, setCollapsed] = usePersistedState("postCompaction:collapsed", true);
+  const [collapsed, setCollapsed] = usePersistedState(POST_COMPACTION_COLLAPSED_KEY, true);
   const [filesExpanded, setFilesExpanded] = usePersistedState(
-    "postCompaction:filesExpanded",
+    POST_COMPACTION_FILES_EXPANDED_KEY,
     false
   );
   const [isPlanDialogOpen, setIsPlanDialogOpen] = useState(false);
@@ -72,7 +76,7 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
   }
 
   return (
-    <div className="border-border-light mt-4 border-t pt-4">
+    <div className="mt-2">
       <button
         onClick={() => setCollapsed((prev) => !prev)}
         className="flex w-full items-center justify-between text-left"

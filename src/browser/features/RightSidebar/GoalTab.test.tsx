@@ -1,32 +1,21 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { createContext } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { GoalSnapshot } from "@/common/types/goal";
+import * as RealGoalDefaultsModalModule from "@/browser/features/RightSidebar/GoalDefaultsModal";
+import * as RealGoalBoardSectionsModule from "@/browser/features/RightSidebar/GoalBoardSections";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
-// The GoalTab now reaches into `useAPI` (via `useGoalDefaults`) when the
-// create form is mounted. The hook tolerates a null api gracefully, but
-// `useAPI` itself throws when used outside a provider. Mock the context
-// so renders without an APIProvider still work — the form falls back to
-// canonical defaults, which is exactly the storybook-without-provider
-// behavior we want at runtime too.
-//
-// `useGoalDefaults` and `useGoalBoard` import `APIContext` directly so
-// they can short-circuit on a null context. The mock must export the
-// context with a null default; otherwise the `useContext(APIContext)`
-// call inside those hooks would crash with `undefined is not iterable`
-// This keeps tests outside an APIProvider aligned with Storybook rendering.
-void mock.module("@/browser/contexts/API", () => ({
-  APIContext: createContext(null),
-  useAPI: () => ({
-    api: null,
-    status: "error",
-    error: "API unavailable",
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// No APIProvider and no contexts/API module mock: GoalTab, `useGoalDefaults` and
+// `useGoalBoard` read `APIContext` directly and fall back to canonical defaults when it is
+// null (the real context's default), matching Storybook rendering without a provider. A
+// module mock here would leak process-wide into later-evaluated suites.
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/features/RightSidebar/GoalDefaultsModal", { ...RealGoalDefaultsModalModule }],
+  ["@/browser/features/RightSidebar/GoalBoardSections", { ...RealGoalBoardSectionsModule }],
+]);
 // `GoalDefaultsModal` opens a Radix Dialog with portaled content that
 // happy-dom can't render. The test never opens the modal — only that
 // the trigger button exists — so a stub here keeps the form tree

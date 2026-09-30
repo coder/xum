@@ -316,13 +316,3 @@ export function ChatInstructionsChatDecoration(props: { workspaceId: string }) {
     />
   );
 }
-
-// -----------------------------------------------------------------------------
-// Back-compat aliases. The feature was originally named "Additional system
-// context"; the user-facing label is now "Chat Instructions". Keep the old
-// exports so call sites can be migrated incrementally if needed.
-// -----------------------------------------------------------------------------
-export const useAdditionalSystemContextScratchpad = useChatInstructions;
-export const AdditionalSystemContextEditor = ChatInstructionsEditor;
-export const AdditionalSystemContextPanel = ChatInstructionsPanel;
-export const AdditionalSystemContextChatDecoration = ChatInstructionsChatDecoration;

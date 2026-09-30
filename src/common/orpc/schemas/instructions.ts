@@ -4,7 +4,7 @@ import { z } from "zod";
  * Schemas for instruction context (AGENTS.md, CLAUDE.md, AGENTS.local.md, …).
  *
  * These are the single source of truth for both:
- * - The internal data structure used by `buildSystemMessage` to compose the
+ * - The internal data structure used by `buildSystemMessageFromSources` to compose the
  *   system prompt (so each layer is typed instead of being string-soup).
  * - The IPC payload returned by `workspace.getInstructions` and consumed by
  *   the right-sidebar Instructions tab.
@@ -17,7 +17,7 @@ import { z } from "zod";
 
 /** Where in the instruction hierarchy a file lives. */
 export const INSTRUCTION_SCOPE = {
-  /** Global ~/.mux/AGENTS.md (+ optional AGENTS.local.md). */
+  /** Host-global instruction sources, including native ~/.xum and optional compat files. */
   GLOBAL: "global",
   /** Workspace-root AGENTS.md (the workspace's own checkout). */
   WORKSPACE: "workspace",
@@ -42,6 +42,14 @@ export const InstructionFileSchema = z.object({
   filename: z.string(),
   /** True for the .local.md variant appended to the base file. */
   isLocal: z.boolean(),
+  /**
+   * True for Xum-dedicated instruction files that only Xum reads: the global
+   * `~/.xum/AGENTS.md` set and per-directory `.xum/AGENTS.md` files. Scoped
+   * `Model:`/`Mode:` directives are honored ONLY in these files, so a
+   * heading like "Model: sonnet" never confuses non-Xum agents reading the
+   * shared workspace AGENTS.md.
+   */
+  xumOnly: z.boolean(),
   /** Logical scope of the file (drives panel grouping). */
   scope: InstructionScopeSchema,
   /** Project name when scope === "project" (multi-project workspaces). */
@@ -75,8 +83,8 @@ export const InstructionSetSchema = z.object({
 
 /** All instruction sets resolved for a workspace. */
 export const InstructionSourcesSchema = z.object({
-  /** ~/.mux/AGENTS.md set, if any. */
-  global: InstructionSetSchema.nullable(),
+  /** Host-global sets in prompt order, with compatibility sources before native ~/.xum files. */
+  global: z.array(InstructionSetSchema),
   /**
    * Workspace-level context sets in prompt order:
    * - single-project: [workspace, optional sub-project]

@@ -37,7 +37,7 @@ import type {
  * telemetry.commandUsed(commandType);
  * telemetry.voiceTranscription(audioDurationSecs, success);
  * telemetry.errorOccurred(errorType, context);
- * telemetry.experimentOverridden(experimentId, assignedVariant, userChoice);
+ * telemetry.experimentOverridden(experimentId, userChoice);
  * ```
  */
 export function useTelemetry() {
@@ -92,12 +92,9 @@ export function useTelemetry() {
     trackErrorOccurred(errorType, context);
   }, []);
 
-  const experimentOverridden = useCallback(
-    (experimentId: string, assignedVariant: string | boolean | null, userChoice: boolean) => {
-      trackExperimentOverridden(experimentId, assignedVariant, userChoice);
-    },
-    []
-  );
+  const experimentOverridden = useCallback((experimentId: string, userChoice: boolean) => {
+    trackExperimentOverridden(experimentId, userChoice);
+  }, []);
 
   return {
     workspaceSwitched,

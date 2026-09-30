@@ -17,6 +17,7 @@ import type {
   WorkspaceForkResult,
   InitLogger,
   EnsureReadyResult,
+  ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError as RuntimeErrorClass } from "./Runtime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -25,10 +26,161 @@ import { shellQuote } from "@/common/utils/shell";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { expandTilde } from "./tildeExpansion";
-import { getInitHookPath, createLineBufferedLoggers } from "./initHook";
+import {
+  createLineBufferedLoggers,
+  findInitHookRelativePath,
+  runWorkspaceInitHook,
+} from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { sanitizeMuxChildEnv } from "./childProcessEnv";
+import { buildShellExport } from "./shellEnv";
+import { sanitizeXumChildEnv } from "./childProcessEnv";
+
+/**
+ * Acquire a regular file for ReadFileOptions.requireRegularFile.
+ *
+ * O_NONBLOCK makes open() of a writer-less FIFO return at once instead of
+ * blocking in the kernel (which would park a libuv worker that no abort can
+ * release); it has no effect on reads of a regular file. The type check is an
+ * fstat on the descriptor we just acquired, so whatever the path points at
+ * afterwards cannot change what is streamed.
+ *
+ * Ownership: this function owns the handle until the stream is created; on
+ * classification failure or an abort observed before hand-off it closes the
+ * handle itself. After hand-off the stream owns it (autoClose on end/error/
+ * destroy) and nothing else may close it.
+ */
+async function openRegularFileStream(
+  filePath: string,
+  resolvedPath: string,
+  abortSignal?: AbortSignal
+): Promise<Readable> {
+  // O_NONBLOCK is undefined on Windows; a plain open is the best we can do there.
+  const nonblock = fs.constants.O_NONBLOCK ?? 0;
+  const handle = await fsPromises.open(resolvedPath, fs.constants.O_RDONLY | nonblock);
+  try {
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    const stat = await handle.stat();
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    if (!stat.isFile()) {
+      throw new RuntimeErrorClass(`${filePath} is not a regular file`, "file_io");
+    }
+    // Inside the try so a construction failure still closes the handle; once
+    // this returns, the stream owns the handle (autoClose).
+    return handle.createReadStream({ autoClose: true });
+  } catch (err) {
+    await handle.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Wrap a (possibly lazily acquired) node Readable as a pull-based web stream
+ * with abort and cancel plumbing. `acquire` runs inside start(); a failure
+ * there surfaces as a file_io RuntimeError on the stream.
+ */
+function wrapNodeReadable(
+  filePath: string,
+  acquire: () => Readable | Promise<Readable>,
+  abortSignal?: AbortSignal
+): ReadableStream<Uint8Array> {
+  // Set once acquisition succeeds; abort/cancel arriving earlier are replayed
+  // right after acquisition so the source is never left open.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+
+  // r19: honor caller aborts (kernel deadline, workspace removal), not just
+  // consumer cancellation — a FIFO or blocked network-mounted file can
+  // stall before yielding enough bytes for a consumer-side ceiling to
+  // cancel, leaving the pending read and its fd blocked forever. Aborting
+  // cancels the inner reader, which destroys the node stream and settles
+  // the pinned READ. It cannot release a kernel-blocked OPEN — only the
+  // nonblocking acquisition in openRegularFileStream avoids that.
+  const onAbort = () => {
+    void reader?.cancel(abortSignal?.reason).catch(() => undefined);
+  };
+  if (abortSignal?.aborted) {
+    onAbort();
+  } else {
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+  }
+  const cleanupAbortForwarder = () => {
+    abortSignal?.removeEventListener("abort", onAbort);
+  };
+
+  // Pull-based (not an eager start loop): consumers control the read rate
+  // (backpressure), and cancellation can reach the source — the old eager
+  // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
+  // byte ceiling on /dev/zero) abandoned the reader and leaked the open
+  // file handle (r18).
+  return new ReadableStream<Uint8Array>({
+    start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        const nodeStream = await acquire();
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+        const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+        reader = webStream.getReader();
+        if (cancelled || abortSignal?.aborted) {
+          // Landed while acquiring (reader did not exist yet): release the source now.
+          void reader.cancel(abortSignal?.reason).catch(() => undefined);
+        }
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          err instanceof RuntimeErrorClass
+            ? err
+            : new RuntimeErrorClass(
+                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+                "file_io",
+                err
+              )
+        );
+      }
+    },
+    pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        // start() either set the reader or errored the stream (pull is not called then).
+        if (!reader) {
+          throw new Error("reader missing after start");
+        }
+        const { done, value } = await reader.read();
+        // reader.cancel() settles a pinned read as {done: true}; surface
+        // the abort as an error rather than a clean EOF so consumers do
+        // not mistake a truncated read for the whole file.
+        if (abortSignal?.aborted) {
+          cleanupAbortForwarder();
+          controller.error(new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io"));
+          return;
+        }
+        if (done) {
+          cleanupAbortForwarder();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          new RuntimeErrorClass(
+            `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+            "file_io",
+            err
+          )
+        );
+      }
+    },
+    cancel: async (reason: unknown) => {
+      cancelled = true;
+      cleanupAbortForwarder();
+      // Destroys the underlying node stream and closes the fd.
+      await reader?.cancel(reason);
+    },
+  });
+}
 
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
@@ -53,6 +205,10 @@ export abstract class LocalBaseRuntime implements Runtime {
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
+    if (options.abortSignal?.aborted) {
+      throw new RuntimeErrorClass("Operation aborted before execution", "exec");
+    }
+
     // Use the specified working directory (must be a specific workspace path)
     const cwd = options.cwd;
 
@@ -61,11 +217,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     try {
       await fsPromises.access(cwd);
     } catch (err) {
-      throw new RuntimeErrorClass(
-        `Working directory does not exist: ${cwd}`,
-        "exec",
-        err instanceof Error ? err : undefined
-      );
+      throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
 
     const bashPath = getBashPath();
@@ -77,13 +229,23 @@ export abstract class LocalBaseRuntime implements Runtime {
     // - On Windows, env var casing and shell startup state can be surprising.
     // - These are non-sensitive vars that we want to guarantee for git/editor safety.
     const nonInteractivePrelude = Object.entries(NON_INTERACTIVE_ENV_VARS)
-      .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
+      .map(([key, value]) => buildShellExport(key, value))
       .join("\n");
 
-    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${command}`];
+    // Expand host-side with the same semantics as local file I/O: expandTilde
+    // routes ~/.xum (and legacy homes) through getXumHome, which in-shell $HOME
+    // expansion would miss (XUM_ROOT, dev suffix), and relative values resolve
+    // against the exec cwd, matching the shell's $PWD when the exports run.
+    const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
+      .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
+      .join("\n");
+    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`];
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    const mergedEnv = sanitizeMuxChildEnv({ ...process.env, ...(options.env ?? {}) });
+    const mergedEnv = sanitizeXumChildEnv({
+      ...process.env,
+      ...(options.env ?? {}),
+    });
     const basePath =
       (options.env?.PATH && options.env.PATH.length > 0
         ? mergedEnv.PATH
@@ -112,8 +274,11 @@ export abstract class LocalBaseRuntime implements Runtime {
     const disposable = new DisposableProcess(childProcess);
 
     // Convert Node.js streams to Web Streams
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdout = Readable.toWeb(childProcess.stdout) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stderr = Readable.toWeb(childProcess.stderr) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin) as unknown as WritableStream<Uint8Array>;
 
     // No stream cleanup in DisposableProcess - streams close naturally when process exits
@@ -179,12 +344,16 @@ export abstract class LocalBaseRuntime implements Runtime {
     });
 
     // Handle abort signal
-    if (options.abortSignal) {
-      options.abortSignal.addEventListener("abort", () => {
-        aborted = true;
-        disposable[Symbol.dispose](); // Kill process and run cleanup
+    const onAbort = () => {
+      aborted = true;
+      disposable[Symbol.dispose](); // Kill process and run cleanup
+    };
+    options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+    void exitCode
+      .catch(() => undefined)
+      .finally(() => {
+        options.abortSignal?.removeEventListener("abort", onAbort);
       });
-    }
 
     // Handle timeout
     if (options.timeout !== undefined) {
@@ -200,42 +369,30 @@ export abstract class LocalBaseRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
-  readFile(filePath: string, _abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before reading (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
-    const nodeStream = fs.createReadStream(expandedPath);
-
-    // Handle errors by wrapping in a transform
-    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
-
-    return new ReadableStream<Uint8Array>({
-      async start(controller: ReadableStreamDefaultController<Uint8Array>) {
-        try {
-          const reader = webStream.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-          controller.close();
-        } catch (err) {
-          controller.error(
-            new RuntimeErrorClass(
-              `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-              "file_io",
-              err instanceof Error ? err : undefined
-            )
-          );
-        }
-      },
-    });
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
+    const resolvedPath = path.resolve(expandTilde(filePath));
+    if (options?.requireRegularFile) {
+      return wrapNodeReadable(
+        filePath,
+        () => openRegularFileStream(filePath, resolvedPath, abortSignal),
+        abortSignal
+      );
+    }
+    // Default: exactly the historical fs.createReadStream(path). FIFOs, devices
+    // and sockets keep their native semantics here, including a kernel-blocking
+    // open() on a writer-less FIFO — callers that cannot tolerate that opt in
+    // to requireRegularFile above.
+    const nodeStream = fs.createReadStream(resolvedPath);
+    return wrapNodeReadable(filePath, () => nodeStream, abortSignal);
   }
 
   writeFile(filePath: string, _abortSignal?: AbortSignal): WritableStream<Uint8Array> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before writing (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const canonicalPath = path.resolve(expandTilde(filePath));
     let tempPath: string;
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let resolvedPath: string;
@@ -245,13 +402,12 @@ export abstract class LocalBaseRuntime implements Runtime {
       async start() {
         // Resolve symlinks to write through them (preserves the symlink)
         try {
-          resolvedPath = await fsPromises.realpath(expandedPath);
+          resolvedPath = await fsPromises.realpath(canonicalPath);
           // Save original permissions to restore after write
           const stat = await fsPromises.stat(resolvedPath);
           originalMode = stat.mode;
         } catch {
-          // If file doesn't exist, use the expanded path and default permissions
-          resolvedPath = expandedPath;
+          resolvedPath = canonicalPath;
           originalMode = undefined;
         }
 
@@ -282,7 +438,7 @@ export abstract class LocalBaseRuntime implements Runtime {
           throw new RuntimeErrorClass(
             `Failed to write file ${filePath}: ${getErrorMessage(err)}`,
             "file_io",
-            err instanceof Error ? err : undefined
+            err
           );
         }
       },
@@ -304,10 +460,9 @@ export abstract class LocalBaseRuntime implements Runtime {
 
   async stat(filePath: string, _abortSignal?: AbortSignal): Promise<FileStat> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before stat (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const resolvedPath = path.resolve(expandTilde(filePath));
     try {
-      const stats = await fsPromises.stat(expandedPath);
+      const stats = await fsPromises.stat(resolvedPath);
       return {
         size: stats.size,
         modifiedTime: stats.mtime,
@@ -317,20 +472,23 @@ export abstract class LocalBaseRuntime implements Runtime {
       throw new RuntimeErrorClass(
         `Failed to stat ${filePath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
 
-  async ensureDir(dirPath: string): Promise<void> {
-    const expandedPath = expandTilde(dirPath);
+  async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass("Operation aborted before directory creation", "file_io");
+    }
+    const resolvedPath = path.resolve(expandTilde(dirPath));
     try {
-      await fsPromises.mkdir(expandedPath, { recursive: true });
+      await fsPromises.mkdir(resolvedPath, { recursive: true });
     } catch (err) {
       throw new RuntimeErrorClass(
         `Failed to create directory ${dirPath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -390,8 +548,8 @@ export abstract class LocalBaseRuntime implements Runtime {
     return Promise.resolve(isWindows ? (process.env.TEMP ?? "C:\\Temp") : "/tmp");
   }
 
-  getMuxHome(): string {
-    return "~/.mux";
+  getXumHome(): string {
+    return "~/.xum";
   }
 
   /**
@@ -401,23 +559,37 @@ export abstract class LocalBaseRuntime implements Runtime {
     return Promise.resolve({ ready: true });
   }
 
+  protected initLocalWorkspace(params: WorkspaceInitParams, runtimeType: "local" | "worktree") {
+    return runWorkspaceInitHook({
+      params,
+      runtimeType,
+      findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
+      runHook: ({ hookRelativePath, xumEnv, initLogger, abortSignal }) =>
+        this.runInitHook(
+          params.workspacePath,
+          this.normalizePath(hookRelativePath, params.workspacePath),
+          xumEnv,
+          initLogger,
+          abortSignal
+        ),
+    });
+  }
+
   /**
-   * Helper to run .mux/init hook if it exists and is executable.
+   * Helper to run .xum/init hook if it exists and is executable.
    * Shared between WorktreeRuntime and LocalRuntime.
    * @param workspacePath - Path to the workspace directory
-   * @param muxEnv - MUX_ environment variables (from getMuxEnv)
+   * @param xumEnv - Canonical XUM_ variables plus legacy MUX_ aliases
    * @param initLogger - Logger for streaming output
    * @param abortSignal - Optional abort signal
    */
   protected async runInitHook(
     workspacePath: string,
-    muxEnv: Record<string, string>,
+    hookPath: string,
+    xumEnv: Record<string, string>,
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    // Hook path is derived from MUX_PROJECT_PATH in muxEnv
-    const projectPath = muxEnv.MUX_PROJECT_PATH;
-    const hookPath = getInitHookPath(projectPath);
     initLogger.logStep(`Running init hook: ${hookPath}`);
 
     if (abortSignal?.aborted) {
@@ -425,17 +597,16 @@ export abstract class LocalBaseRuntime implements Runtime {
       return;
     }
 
-    // Create line-buffered loggers
     const loggers = createLineBufferedLoggers(initLogger);
 
     return new Promise<void>((resolve) => {
       const bashPath = getBashPath();
-      const proc = spawn(bashPath, ["-c", `"${hookPath}"`], {
+      const proc = spawn(bashPath, ["-c", shellQuote(hookPath)], {
         cwd: workspacePath,
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
-          ...muxEnv,
+          ...xumEnv,
         },
         // Prevent console window from appearing on Windows
         windowsHide: true,
