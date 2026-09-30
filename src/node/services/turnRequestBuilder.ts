@@ -2987,16 +2987,12 @@ export class TurnRequestBuilder {
 
     // Listings that change during a workspace's life travel in durable
     // synthetic rows (one per changed section) instead of tool descriptions,
-    // so they never rewrite the cached tools prefix (#5248). Live turns only: admission candidates must
-    // not touch accepted history, compaction requests summarize rather than
-    // act, and a resumed assistant turn keeps its original request shape.
+    // so they never rewrite the cached tools prefix (#5248). Compaction
+    // requests summarize rather than act, and a resumed assistant turn keeps
+    // its original request shape.
     let requestSourceMessages = messages;
     let requestProviderMessages = providerRequestMessages;
-    if (
-      context.admissionOnly !== true &&
-      !isCompactionRequest &&
-      providerRequestMessages.at(-1)?.role === "user"
-    ) {
+    if (!isCompactionRequest && providerRequestMessages.at(-1)?.role === "user") {
       const memoryAllowed = applyToolPolicyToNames(["memory"], effectiveToolPolicy).length === 1;
       const listingRows = buildContextListingMessages(providerRequestMessages, [
         {
@@ -3011,17 +3007,35 @@ export class TurnRequestBuilder {
               : "",
         },
       ]);
-      for (const listingRow of listingRows) {
-        const appendListing = await this.dependencies.historyService.appendToHistory(
-          workspaceId,
-          listingRow
+      // Admission candidates (token-budget rollover) must not touch accepted
+      // history: their rows ride in the candidate request only, and the first
+      // live turn of the new window persists them.
+      let includedRows = listingRows;
+      if (context.admissionOnly !== true) {
+        const snapshotTail = messages.reduce(
+          (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
+          -1
         );
-        if (!appendListing.success) {
-          return { type: "finished", result: Err({ type: "unknown", raw: appendListing.error }) };
+        for (const listingRow of listingRows) {
+          const appendListing = await this.dependencies.historyService.appendToHistory(
+            workspaceId,
+            listingRow
+          );
+          if (!appendListing.success) {
+            return { type: "finished", result: Err({ type: "unknown", raw: appendListing.error }) };
+          }
         }
+        // Another writer (e.g. a sub-agent report) may have appended after
+        // this request's history snapshot. Including the rows would advance
+        // requestHistorySequence past rows the request never saw, so leave
+        // them for the next turn, which reads them from history.
+        const contiguous = listingRows.every(
+          (row, index) => row.metadata?.historySequence === snapshotTail + 1 + index
+        );
+        if (!contiguous) includedRows = [];
       }
-      if (listingRows.length > 0) {
-        requestSourceMessages = [...messages, ...listingRows];
+      if (includedRows.length > 0) {
+        requestSourceMessages = [...messages, ...includedRows];
         requestProviderMessages = prepareProviderRequestMessages(
           requestSourceMessages,
           wireProviderName,
