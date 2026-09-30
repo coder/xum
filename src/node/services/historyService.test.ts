@@ -3990,6 +3990,56 @@ describe("HistoryService", () => {
       expect(archiveRows.map((m) => m.id)).toEqual(["old-0"]);
     });
 
+    it("windowed chat-open reads skip the rotation scan on legacy files (#5300)", async () => {
+      const boundary = boundaryMessage("boundary-1", 1);
+      const lines = [
+        messageLine(wsId, createMuxMessage("old-0", "user", "old", { historySequence: 0 })),
+        messageLine(wsId, createMuxMessage("old-1", "assistant", "old", { historySequence: 1 })),
+        messageLine(wsId, { ...boundary, metadata: { ...boundary.metadata, historySequence: 2 } }),
+        messageLine(wsId, createMuxMessage("post-0", "user", "after", { historySequence: 3 })),
+        messageLine(wsId, createMuxMessage("post-1", "assistant", "reply", { historySequence: 4 })),
+      ];
+      await writeHistoryLines(config, wsId, lines);
+      const legacyBytes = await fs.readFile(chatPath(wsId), "utf8");
+      const internals = service as unknown as {
+        findLastBoundaryByteOffset(filePath: string, skip?: number): Promise<number | null>;
+      };
+      const scan = spyOn(internals, "findLastBoundaryByteOffset");
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      try {
+        const window = await service.getHistoryWindowFromLatestBoundary(wsId, caps);
+        const page = await service.getHistoryPageFromLatestBoundary(wsId, caps, 4);
+        const since = await service.getHistorySinceFromLatestBoundary(wsId, caps, {
+          floor: 2,
+          anchor: 3,
+        });
+        assert(window.success && window.data.kind === "window");
+        assert(page.success && page.data.kind === "page");
+        assert(since.success && since.data.kind === "range");
+        expect(scan).not.toHaveBeenCalled();
+        // The unrotated sealed prefix stays in chat.jsonl and is never returned.
+        expect(await fs.readFile(chatPath(wsId), "utf8")).toBe(legacyBytes);
+        expect(await fs.stat(archivePath(wsId)).catch(() => null)).toBeNull();
+
+        // The full read still rotates lazily and returns the same epoch.
+        const latest = await service.getHistoryFromLatestBoundary(wsId);
+        assert(latest.success);
+        expect(scan).toHaveBeenCalled();
+        expect(latest.data.map((m) => m.id)).toEqual(["boundary-1", "post-0", "post-1"]);
+        expect(window.data.messages).toEqual(latest.data);
+        expect(since.data.messages).toEqual(latest.data);
+        expect(page.data.messages).toEqual(latest.data.slice(0, 2));
+      } finally {
+        scan.mockRestore();
+      }
+      expect((await readJsonlFile(chatPath(wsId))).map((m) => m.id)).toEqual([
+        "boundary-1",
+        "post-0",
+        "post-1",
+      ]);
+      expect((await readJsonlFile(archivePath(wsId))).map((m) => m.id)).toEqual(["old-0", "old-1"]);
+    });
+
     it("reads boundary windows across the archive seam (skip + paging)", async () => {
       await service.appendToHistory(wsId, createMuxMessage("e1-user", "user", "msg")); // seq 0
       await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 1
