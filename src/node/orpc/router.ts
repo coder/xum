@@ -148,6 +148,7 @@ import {
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
  * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
@@ -757,6 +758,15 @@ export const router = (authToken?: string) => {
         .output(schemas.providers.discoverModels.output)
         .handler(({ context, input, signal }) =>
           context.providerService.discoverModels(input.provider, signal)
+        ),
+      searchModelCatalog: t
+        .input(schemas.providers.searchModelCatalog.input)
+        .output(schemas.providers.searchModelCatalog.output)
+        .handler(({ context, input }) =>
+          // Filter by policy before paging so totals match what the UI can add.
+          searchModelCatalog(input, (provider, modelId) =>
+            context.policyService.isModelAllowed(provider, modelId)
+          )
         ),
       list: t
         .input(schemas.providers.list.input)

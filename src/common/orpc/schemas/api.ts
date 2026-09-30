@@ -13,6 +13,7 @@ import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehav
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -447,10 +448,38 @@ export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status",
   }),
 ]);
 
+export const ModelCatalogSearchInputSchema = z.object({
+  query: z.string().optional(),
+  provider: z.string().optional(),
+  offset: z.number().int().min(0).optional(),
+  // Omitted limit returns every match; paging is opt-in.
+  limit: z.number().int().min(1).max(MAX_RENDERED_MODELS).optional(),
+});
+
+export const ModelCatalogEntrySchema = z.object({
+  /** Canonical `provider:model` id. */
+  id: z.string(),
+  provider: z.string(),
+  providerModelId: z.string(),
+  contextWindowTokens: z.number().nullable(),
+  builtIn: z.boolean(),
+});
+
+export const ModelCatalogSearchResultSchema = z.object({
+  models: z.array(ModelCatalogEntrySchema),
+  /** Match count before paging. */
+  total: z.number(),
+  nextOffset: z.number().nullable(),
+});
+
 export const providers = {
   discoverModels: {
     input: z.object({ provider: z.string() }),
     output: ProviderModelDiscoveryResultSchema,
+  },
+  searchModelCatalog: {
+    input: ModelCatalogSearchInputSchema,
+    output: ModelCatalogSearchResultSchema,
   },
   addCustomProvider: {
     input: z.object({

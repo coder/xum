@@ -36,7 +36,7 @@ interface RawModelData {
   [key: string]: unknown;
 }
 
-const PROVIDER_KEY_ALIASES: Record<string, string> = {
+export const PROVIDER_KEY_ALIASES: Record<string, string> = {
   // GitHub Copilot keys in models.json use underscores for LiteLLM provider names.
   "github-copilot": "github_copilot",
 };
