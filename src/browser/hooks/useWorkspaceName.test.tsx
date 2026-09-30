@@ -52,6 +52,9 @@ describe("useWorkspaceName persisted draft state", () => {
     act(() => first.result.current.setAutoGenerate(false));
     act(() => first.result.current.setName(longName));
     expect(first.result.current.name).toBe(longName);
+    // Edits past the limit leave the persisted prefix unchanged but must still show.
+    act(() => first.result.current.setName(longName.slice(0, -1)));
+    expect(first.result.current.name).toBe(longName.slice(0, -1));
     first.unmount();
 
     restartLocalStorage();
