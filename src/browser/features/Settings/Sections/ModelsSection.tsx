@@ -357,17 +357,6 @@ export function ModelsSection() {
       : discoveryResult?.status === "ok"
         ? discoveryResult.modelIds
         : [];
-  const discoveryMessage =
-    suggestionsSession && lastProvider && lastProvider !== "coder" && api && config
-      ? !discoveryResult
-        ? "Loading models… You can still enter a model ID."
-        : discoveryResult.status !== "ok"
-          ? "Suggestions unavailable. Enter a model ID manually."
-          : discoveryResult.modelIds.length === 0
-            ? "No models found. Enter a model ID manually."
-            : null
-      : null;
-
   // One editable field handles both manual IDs and policy-filtered discovery.
   // Suggestions never replace a typed ID unless the user explicitly chooses one.
   const discoveredUnconfigured = discoveredModels.filter(
@@ -399,6 +388,20 @@ export function ModelsSection() {
     catalogOptions.push({ key: "catalog-more", kind: "catalog-more" });
   }
   const options = [...discoveredOptions, ...catalogOptions];
+  // Visible catalogue matches are suggestions too, so a failed or empty
+  // discovery must not claim there are none.
+  const discoveryMessage =
+    suggestionsSession && lastProvider && lastProvider !== "coder" && api && config
+      ? !discoveryResult
+        ? "Loading models… You can still enter a model ID."
+        : catalogOptions.length > 0
+          ? null
+          : discoveryResult.status !== "ok"
+            ? "Suggestions unavailable. Enter a model ID manually."
+            : discoveryResult.modelIds.length === 0
+              ? "No models found. Enter a model ID manually."
+              : null
+      : null;
   const showSuggestions = suggestionsSession !== null && options.length > 0;
   const highlightedIndex =
     showSuggestions &&

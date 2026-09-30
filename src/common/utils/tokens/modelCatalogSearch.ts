@@ -18,6 +18,7 @@ import type {
 } from "@/common/orpc/types";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { listModelCatalogIds } from "./modelCatalog";
+import modelsData from "./models.json";
 import { PROVIDER_KEY_ALIASES, getModelStats } from "./modelStats";
 
 /** Lowercased whitespace-separated query tokens; empty for a blank query. */
@@ -40,9 +41,28 @@ interface IndexedCatalogEntry {
 
 // Catalogue rows use LiteLLM provider names; only those naming a Xum provider
 // (directly or via the stats lookup alias) are addable as custom models.
-const XUM_PROVIDER_BY_CATALOG_PROVIDER = new Map(
-  Object.entries(PROVIDER_KEY_ALIASES).map(([xum, litellm]) => [litellm, xum])
-);
+// LiteLLM files the Gemini API as `gemini/<model>`; Xum calls it `google` and
+// resolves `google:<model>` stats through the bare model key instead.
+const XUM_PROVIDER_BY_CATALOG_PROVIDER = new Map<string, string>([
+  ...Object.entries(PROVIDER_KEY_ALIASES).map(([xum, litellm]): [string, string] => [litellm, xum]),
+  ["gemini", "google"],
+]);
+
+// When a models-extra bare override (e.g. gemini-3.7-flash) shadows the
+// `gemini/<model>` entry, the catalogue exposes the model only through the bare
+// key's Vertex provider. Such a row is still a Gemini API model when LiteLLM
+// also lists it under `gemini/`; Vertex-only models (medlm) stay excluded.
+const VERTEX_BARE_CATALOG_PROVIDER = "vertex_ai-language-models";
+
+function resolveXumProvider(catalogProvider: string, providerModelId: string): string {
+  if (
+    catalogProvider === VERTEX_BARE_CATALOG_PROVIDER &&
+    Object.hasOwn(modelsData, `gemini/${providerModelId}`)
+  ) {
+    return "google";
+  }
+  return XUM_PROVIDER_BY_CATALOG_PROVIDER.get(catalogProvider) ?? catalogProvider;
+}
 
 const BUILT_IN_BY_ID = new Map<string, (typeof KNOWN_MODELS)[keyof typeof KNOWN_MODELS]>(
   Object.values(KNOWN_MODELS).map((model) => [model.id, model])
@@ -60,7 +80,7 @@ function getCatalogIndex(): IndexedCatalogEntry[] {
     const colonIndex = catalogId.indexOf(":");
     const catalogProvider = catalogId.slice(0, colonIndex);
     const providerModelId = catalogId.slice(colonIndex + 1);
-    const provider = XUM_PROVIDER_BY_CATALOG_PROVIDER.get(catalogProvider) ?? catalogProvider;
+    const provider = resolveXumProvider(catalogProvider, providerModelId);
     if (!isValidProvider(provider) || CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) {
       continue;
     }

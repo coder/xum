@@ -3,6 +3,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isValidProvider } from "@/common/constants/providers";
 import { listModelCatalogIds } from "./modelCatalog";
 import { searchModelCatalog } from "./modelCatalogSearch";
+import { getModelStats } from "./modelStats";
 
 describe("searchModelCatalog", () => {
   test("offers only addable Xum providers, mapping LiteLLM aliases", () => {
@@ -41,6 +42,21 @@ describe("searchModelCatalog", () => {
     const opus = KNOWN_MODELS.OPUS;
     const aliasHits = searchModelCatalog({ query: opus.aliases?.[0] }).models;
     expect(aliasHits[0]?.id).toBe(opus.id);
+  });
+
+  test("offers LiteLLM Gemini API models as google models", () => {
+    const models = searchModelCatalog({ query: "gemini flash" }).models;
+    const byId = new Map(models.map((model) => [model.id, model]));
+    // Listed only as gemini/<model> in LiteLLM.
+    expect(byId.get("google:gemini-flash-latest")?.builtIn).toBe(false);
+    // Only reachable via its Vertex bare key because models-extra overrides it.
+    expect(byId.get("google:gemini-3.7-flash")).toMatchObject({
+      builtIn: false,
+      contextWindowTokens: getModelStats("google:gemini-3.7-flash")?.max_input_tokens,
+    });
+    expect(byId.get(KNOWN_MODELS.GEMINI_FLASH.id)?.builtIn).toBe(true);
+    // Vertex-only models are not served by the Gemini API.
+    expect(searchModelCatalog({ query: "medlm" }).total).toBe(0);
   });
 
   test("ranks exact model ids above prefix matches before preferring built-ins", () => {

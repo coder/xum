@@ -451,6 +451,22 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(ui.input.value).toBe("");
   });
 
+  test.each<ProviderModelDiscoveryResult>([
+    { status: "not-configured" },
+    { status: "ok", modelIds: [] },
+  ])("visible catalogue matches suppress the unavailable discovery status %j", async (result) => {
+    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    ui.open();
+    await ui.type("fable");
+    await ui.reply(0, result);
+    await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    expect(ui.view.queryByRole("status")).toBeNull();
+
+    await ui.type("no-such-catalogue-model");
+    expect(ui.view.queryByRole("option")).toBeNull();
+    expect(ui.view.getByRole("status")).toBeTruthy();
+  });
+
   test.each(["policy", "reconnect", "reopen"])(
     "a %s change hides old catalogue matches until the new search replies",
     async (change) => {
