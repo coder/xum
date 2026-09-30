@@ -1055,6 +1055,49 @@ describe("AgentSession turn completion", () => {
       await h.cleanup();
     }
   });
+  test("reading another stream's compaction decision while a compaction prepares, or after a request is left behind, never creates a wait nothing resolves (#5326)", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          entered.resolve();
+          await release.promise;
+          return Err({ type: "unknown" as const, raw: "provider unavailable" });
+        }),
+      },
+    });
+    const settled = (decision: Promise<boolean>) =>
+      Promise.race([
+        decision,
+        new Promise<"unresolved">((resolve) => setTimeout(() => resolve("unresolved"), 500)),
+      ]);
+    try {
+      // The compaction's operation is configured, but has no stream identity yet.
+      const compacting = h.session.sendMessage("Please compact", {
+        model,
+        agentId: "compact",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      await entered.promise;
+      expect(internal(h.session).activeCompactionRequest).toBeDefined();
+      expect(await settled(h.session.waitForPendingCompactionCompletionDecision("resume-1"))).toBe(
+        false
+      );
+      release.resolve();
+      await compacting;
+      // A request that outlived its turn authorizes no wait either.
+      internal(h.session).activeCompactionRequest = { id: "left-behind", modelString: model };
+      expect(await settled(h.session.waitForPendingCompactionCompletionDecision("resume-1"))).toBe(
+        false
+      );
+    } finally {
+      release.resolve();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
   test("synchronous compaction completion publishes its decision, sanitizes the renderer and starts its follow-up", async () => {
     const emitter = new EventEmitter();
     let calls = 0;

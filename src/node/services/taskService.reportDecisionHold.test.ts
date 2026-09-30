@@ -5,6 +5,7 @@ import * as path from "path";
 
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
@@ -52,13 +53,14 @@ interface Internals {
   streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
   workspaceStopRecords: Map<string, unknown>;
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  workspaceEventLocks: { withLock<T>(key: string, operation: () => Promise<T>): Promise<T> };
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
 function streamEndEvent(
   taskId: string,
   messageId: string,
-  options: { report?: string; finishReason?: string }
+  options: { report?: string; finishReason?: string; agentId?: string }
 ) {
   const parts: unknown[] = [];
   if (options.report != null) {
@@ -76,7 +78,11 @@ function streamEndEvent(
     type: "stream-end",
     workspaceId: taskId,
     messageId,
-    metadata: { model, finishReason: options.finishReason ?? "stop" },
+    metadata: {
+      model,
+      finishReason: options.finishReason ?? "stop",
+      ...(options.agentId != null ? { agentId: options.agentId } : {}),
+    },
     parts,
   };
 }
@@ -261,7 +267,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     /** End the current stream the way StreamManager does: the event first, then the completion. */
     const endStream = (
       index: number,
-      options: { report?: string; finishReason?: string },
+      options: { report?: string; finishReason?: string; agentId?: string },
       completeTurn: boolean
     ) => {
       const event = streamEndEvent(childId, `assistant-${index + 1}`, options);
@@ -2019,4 +2025,135 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  describe("a compact-agent resume without compaction-request metadata (#5326)", () => {
+    // The frontend resume path sends agentId "compact" with no compaction-request metadata, so the
+    // session runs it as an ordinary operation: no compaction decision is created at its raw
+    // stream end. TaskService still classifies the stream as a compaction by its agentId and asks
+    // the session for that stream's decision once it holds the workspace event lock.
+    const compactionRequest = {
+      type: "compaction-request",
+      rawCommand: "/compact",
+      parsed: {},
+    } as const;
+    /** Hold TaskService's per-workspace event lock, as any other lock user can. */
+    function holdEventLock(svc: Internals, workspaceId: string) {
+      const gate = Promise.withResolvers<void>();
+      const held = svc.workspaceEventLocks.withLock(workspaceId, () => gate.promise);
+      return {
+        release: async () => {
+          gate.resolve();
+          await held;
+        },
+      };
+    }
+    /** The user row a resume continues from. */
+    async function seedUserRow(workspaceId: string) {
+      const appended = await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(`${workspaceId}-work`, "user", "work")
+      );
+      expect(appended.success).toBe(true);
+    }
+    /** Resolves once every earlier holder of the workspace's event lock has released it. */
+    function lockReleased(svc: Internals, workspaceId: string) {
+      let released = false;
+      void svc.workspaceEventLocks.withLock(workspaceId, () => {
+        released = true;
+        return Promise.resolve();
+      });
+      return () => released;
+    }
+
+    test("a compaction started before TaskService reads the resume's decision never parks the event lock on a decision nothing resolves (non-task workspace)", async () => {
+      const childId = "orphancompact01";
+      const stack = await createStack(childId, {
+        parentWorkspaceId: undefined,
+        agentType: undefined,
+        agentId: undefined,
+        taskStatus: undefined,
+        taskAttemptId: undefined,
+        taskModelString: undefined,
+      });
+      const { svc, workspaceService, sessionHarness, completions } = stack;
+      let lock: ReturnType<typeof holdEventLock> | undefined;
+      try {
+        await seedUserRow(childId);
+        lock = holdEventLock(svc, childId);
+        // The frontend resume path: agentId "compact", no compaction-request metadata.
+        expect(await workspaceService.resumeStream(childId, { model, agentId: "compact" })).toEqual(
+          Ok({ started: true })
+        );
+        // The resume ends while its TaskService handler waits behind the lock holder.
+        stack.endStream(0, { agentId: "compact" }, true);
+        await until(() => !sessionHarness.session.isBusy(), "resume turn settled");
+        // Not a task: nothing fences this send, so a real compaction starts and streams.
+        expect(
+          await workspaceService.sendMessage(childId, "/compact", {
+            model,
+            agentId: "compact",
+            muxMetadata: compactionRequest,
+          })
+        ).toEqual(Ok(undefined));
+        expect(completions).toHaveLength(2);
+        // The resume's handler now reads the resume's decision while the compaction is active.
+        await lock.release();
+        const released = lockReleased(svc, childId);
+        // The handler must finish; a wait on a decision nothing resolves would hold the lock (and
+        // every later stream-end handler of this workspace) until the session is disposed.
+        await until(released, "the resume's stream-end handler released the event lock");
+        expect(sessionHarness.session.isBusy()).toBe(true);
+      } finally {
+        await lock?.release();
+        await stack.cleanup();
+      }
+    }, 20_000);
+
+    test("a task's queued follow-up held through the resume's decision still dispatches: no compaction can start while that decision is pending", async () => {
+      const childId = "orphancompact02";
+      const stack = await createStack(childId);
+      const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+      let lock: ReturnType<typeof holdEventLock> | undefined;
+      try {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        const attemptA = entryOf(config, childId)!.taskAttemptId!;
+        await seedUserRow(childId);
+        lock = holdEventLock(svc, childId);
+        // The frontend resume path: agentId "compact", no compaction-request metadata.
+        expect(await workspaceService.resumeStream(childId, { model, agentId: "compact" })).toEqual(
+          Ok({ started: true })
+        );
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", stack.sendOptions)
+        ).toEqual(Ok(undefined));
+        stack.endStream(0, { agentId: "compact" }, true);
+        await until(() => !stack.sessionHarness.session.isBusy(), "resume turn settled");
+        // The follow-up is held behind the pending stream-end decision, and the attempt fence
+        // refuses every turn start, a compaction send and a resume alike: no compaction can become
+        // active before TaskService reads the resume's decision.
+        expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+        const stale = Err({ type: "unknown" as const, raw: SEND_ADMISSION_STALE_MESSAGE });
+        expect(
+          await workspaceService.sendMessage(childId, "/compact", {
+            model,
+            agentId: "compact",
+            muxMetadata: compactionRequest,
+          })
+        ).toEqual(stale);
+        expect(await workspaceService.resumeStream(childId, { model, agentId: "compact" })).toEqual(
+          stale
+        );
+        expect(completions).toHaveLength(1);
+        await lock.release();
+        // The decision resolves (not a report) and the held follow-up runs under the same attempt.
+        await until(() => completions.length === 2, "held follow-up dispatched");
+        await until(lockReleased(svc, childId), "event lock released");
+        expect(streamStarts[1]).toMatchObject({ row: attemptA, owner: attemptA });
+        expect(stack.heldInputs()).toHaveLength(0);
+      } finally {
+        await lock?.release();
+        await stack.cleanup();
+      }
+    }, 20_000);
+  });
 });
