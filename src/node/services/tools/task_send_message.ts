@@ -59,6 +59,9 @@ export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration
                   ...(result.data.queueDispatchMode != null
                     ? { queueDispatchMode: result.data.queueDispatchMode }
                     : {}),
+                  ...(result.data.awaitsDelegatedTurn === true
+                    ? { awaitsDelegatedTurn: true as const }
+                    : {}),
                 },
           "task_send_message"
         );

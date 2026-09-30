@@ -91,6 +91,7 @@ function createWorkspaceTurnManagerHost(
     backgroundForegroundWaitsForWorkspace,
     buildParentAiSettingsFallbacks,
     bumpWorkspaceStopEpoch: () => undefined,
+    onWorkspaceTurnRegistrationReleased: () => undefined,
     countActiveAgentTasks: (cfg) =>
       countActiveAgentTasks(listAgentTaskWorkspaces(cfg), {
         isStreaming,
