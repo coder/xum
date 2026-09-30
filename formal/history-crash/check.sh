@@ -42,17 +42,20 @@ cases=(
   "HistoryPartial|M1-unlink-before-commit|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MU=TRUE|NoLostStreamedContent"
   "HistoryPartial|M2-no-torn-separator|NoLostCommittedRow|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MS=TRUE|NoLostCommittedRow"
   # --- ArchiveSwap: current code -------------------------------------------
-  "ArchiveSwap|A1-single-backend|pass|B=1 C=1 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  "ArchiveSwap|A1-single-backend-2crash|pass|B=1 C=2 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  # F5, not fixed yet: read-path rotation skips truncate recovery. Checks NoLostRow only:
-  # TLC's parallel workers otherwise report NoLostRow or TruncationAtomic nondeterministically.
-  "ArchiveSwap|A2-two-backend-rotation|NoLostRow|B=2 C=1 A=3 R=2 X=1|NoLostRow"
-  "ArchiveSwap|A2-two-backend-no-crash|pass|B=2 C=0 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
-  # --- ArchiveSwap: candidate F5 fix + mutation sanity ---------------------
+  # F5 is fixed (RR=TRUE): rotateSealedHistoryUnlocked re-runs truncate recovery under its
+  # own lock hold, so rotation never appends over a crashed foreign truncation.
+  "ArchiveSwap|A1-single-backend|pass|B=1 C=1 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|A1-single-backend-2crash|pass|B=1 C=2 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
   "ArchiveSwap|A3-rotation-recovers|pass|B=2 C=1 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
-  "ArchiveSwap|M3-unlink-tombstone-first|TruncationAtomic|B=1 C=1 A=3 R=1 X=1 MU=TRUE|TruncationAtomic"
-  "ArchiveSwap|M4-recover-forward-only|NoLostRow|B=1 C=1 A=3 R=1 X=1 MR=TRUE|NoLostRow"
-  "ArchiveSwap|M5-no-torn-separator|NoLostRow|B=1 C=1 A=2 R=0 X=0 MT=TRUE|NoLostRow"
+  "ArchiveSwap|A2-two-backend-no-crash|pass|B=2 C=0 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
+  # --- ArchiveSwap: before the F5 fix (RR=FALSE) --------------------------------
+  # Read-path rotation skipped truncate recovery. Checks NoLostRow only: TLC's parallel
+  # workers otherwise report NoLostRow or TruncationAtomic nondeterministically.
+  "ArchiveSwap|A2-two-backend-rotation|NoLostRow|B=2 C=1 A=3 R=2 X=1|NoLostRow"
+  # --- ArchiveSwap: mutation sanity --------------------------------------------
+  "ArchiveSwap|M3-unlink-tombstone-first|TruncationAtomic|B=1 C=1 A=3 R=1 X=1 RR=TRUE MU=TRUE|TruncationAtomic"
+  "ArchiveSwap|M4-recover-forward-only|NoLostRow|B=1 C=1 A=3 R=1 X=1 RR=TRUE MR=TRUE|NoLostRow"
+  "ArchiveSwap|M5-no-torn-separator|NoLostRow|B=1 C=1 A=2 R=0 X=0 RR=TRUE MT=TRUE|NoLostRow"
 )
 
 render_partial_cfg() {

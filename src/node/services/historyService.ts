@@ -2910,6 +2910,18 @@ export class HistoryService {
     const chatPath = this.getChatHistoryPath(workspaceId);
     const archivePath = this.getChatArchivePath(workspaceId);
 
+    // Re-verify truncation recovery under THIS lock hold before touching the archive.
+    // The lazy read path recovers under an earlier hold of the lock and then re-acquires
+    // it to rotate; a foreign backend can truncate and crash in that gap (marker +
+    // tombstone, no archive). Appending would then create an archive that the next
+    // recovery cannot match to the marker, so recovery deletes it with the rotated rows
+    // (TLA+ formal/history-crash ArchiveSwap A2 vs A3). Rolling back first restores the
+    // tombstoned archive, and rotation appends to it. Two stats when there is nothing to do.
+    if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {
+      invalidateHistoryAppendProvenance();
+      await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+    }
+
     const boundaryOffset = await this.findLastBoundaryByteOffset(chatPath);
     if (boundaryOffset === null || boundaryOffset === 0) {
       return; // Nothing sealed — boundary already starts the file (or no boundary).

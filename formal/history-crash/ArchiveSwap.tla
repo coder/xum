@@ -18,7 +18,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
   Backends,
   MaxCrashes, MaxAppends, MaxRotations, MaxTruncations,
-  RotationRecovers,         \* FIX candidate: read-path rotation runs truncate recovery in-lock
+  RotationRecovers,         \* F5 fix: rotation re-runs truncate recovery in-lock (TRUE = current code)
   MutUnlinkTombstoneFirst,  \* mutation: drop the old archive (tombstone) before writing chat.jsonl
   MutRecoverForwardOnly,    \* mutation: recovery always rolls forward (never restores the tombstone)
   MutNoTornSeparator        \* mutation: appends do not delimit a torn tail
@@ -157,7 +157,8 @@ AppendRow(b) ==
 (* Read path with lazy rotation: withRecoveredHistoryLock (1454) recovers  *)
 (* under the file lock and RELEASES it (1443-1451); later                  *)
 (* ensureSealedHistoryRotatedUnlocked (2780) re-acquires the bare lock     *)
-(* (2790) and rotates WITHOUT truncate recovery.                           *)
+(* (2790). RotationRecovers = FALSE rotates WITHOUT truncate recovery    *)
+(* (the pre-fix code); TRUE re-runs recovery first (the F5 fix).          *)
 ReadBegin(b) ==
   /\ pc[b] = "idle" /\ rotations < MaxRotations
   /\ LockAndRecover(b, "read_unlock")
