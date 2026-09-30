@@ -934,6 +934,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
     appendToHistorySpy: ReturnType<typeof spyOn<HistoryService, "appendToHistory">>;
     resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
+    historyService: HistoryService;
     streamManager: StreamManager;
     providerService: ProviderService;
   }
@@ -1051,6 +1052,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       getToolsForModelSpy,
       appendToHistorySpy,
       resolveAndCreateModelSpy,
+      historyService,
       streamManager,
       providerService,
     };
@@ -2544,138 +2546,151 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("appends a durable context row only when its listing section changes", async () => {
-    using xumHome = new DisposableTempDir("ai-service-context-listing");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-    const workspaceId = "workspace-context-listing";
+  // Listing rows rely on real JSONL sequencing, so these tests use the real
+  // HistoryService append and read history back from disk.
+  function createListingHarness(xumHomePath: string, workspaceId: string) {
+    const projectPath = path.join(xumHomePath, "project");
     const harness = createHarness(
-      xumHome.path,
+      xumHomePath,
       createLocalWorkspaceMetadata(workspaceId, projectPath)
     );
+    harness.appendToHistorySpy.mockRestore();
     harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
       harness.config,
-      new MemoryMetaService(xumHome.path)
+      new MemoryMetaService(xumHomePath)
     );
-    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
-    const written = { path: "/memories/project/new.md", description: "written later" };
-    // Other sections (built-in skills and sub-agents) get their own rows.
-    const listingRows = () =>
-      harness.appendToHistorySpy.mock.calls
-        .map(([, message]) => message)
-        .filter(
-          (message) =>
-            isContextListingMessage(message) && message.id.startsWith("context-listing-memory-")
-        );
-    const send = async (
-      history: MuxMessage[],
-      indexEntries: Array<{ path: string; description: string }>
-    ) => {
-      const result = await harness.service.streamMessage({
-        messages: history,
-        workspaceId,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-        experiments: { memory: true },
-        resolveMemoryContext: () => Promise.resolve({ indexEntries, hotMemoriesBlock: null }),
-      });
-      expect(result.success).toBe(true);
+    const append = async (message: MuxMessage) => {
+      const appended = await harness.historyService.appendToHistory(workspaceId, message);
+      expect(appended.success).toBe(true);
     };
-
-    // The harness appends every row at sequence 7; a snapshot tail of 6 keeps
-    // the appended row contiguous with the request's history.
-    const user1 = createMuxMessage("user-1", "user", "hello", { historySequence: 6 });
-    await send([user1], [lesson]);
-    expect(listingRows()).toHaveLength(1);
-    const firstRow = listingRows()[0];
-    // The request carries the row it just persisted.
-    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
-
-    // Unchanged listings: the persisted row already says it all.
-    const assistant1 = createMuxMessage("assistant-1", "assistant", "hi");
-    const user2 = createMuxMessage("user-2", "user", "again");
-    await send([user1, firstRow, assistant1, user2], [lesson]);
-    expect(listingRows()).toHaveLength(1);
-
-    // A memory write changes the index: exactly one new row, earlier rows untouched.
-    await send([user1, firstRow, assistant1, user2], [lesson, written]);
-    expect(listingRows()).toHaveLength(2);
-    expect(JSON.stringify(listingRows()[1].parts)).toContain(written.path);
-
-    // A resumed assistant turn keeps its request shape.
-    const partial = createMuxMessage("assistant-2", "assistant", "working", { partial: true });
-    await send([user1, firstRow, assistant1, user2, partial], [lesson]);
-    expect(listingRows()).toHaveLength(2);
-  });
-
-  it("keeps listing rows out of a request whose history snapshot went stale", async () => {
-    using xumHome = new DisposableTempDir("ai-service-context-listing-race");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-    const workspaceId = "workspace-context-listing-race";
-    const harness = createHarness(
-      xumHome.path,
-      createLocalWorkspaceMetadata(workspaceId, projectPath)
-    );
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
-    const send = async (tailSequence: number) =>
-      harness.service.streamMessage({
-        messages: [createMuxMessage("user-1", "user", "hello", { historySequence: tailSequence })],
-        workspaceId,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-        experiments: { memory: true },
-        resolveMemoryContext: () =>
-          Promise.resolve({ indexEntries: [lesson], hotMemoriesBlock: null }),
-      });
-
-    // The harness appends every row at sequence 7. Snapshot tail 6: nothing
-    // was written in between, so the row joins this request.
-    expect((await send(6)).success).toBe(true);
-    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
-
-    // Snapshot tail 5: another writer took sequence 6 after the snapshot. The
-    // row stays in history for the next turn but not in this request.
-    expect((await send(5)).success).toBe(true);
-    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).not.toContain(lesson.path);
-  });
-
-  it("carries listing rows in a rollover candidate without persisting them", async () => {
-    using xumHome = new DisposableTempDir("ai-service-context-listing-candidate");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-    const workspaceId = "workspace-context-listing-candidate";
-    const harness = createHarness(
-      xumHome.path,
-      createLocalWorkspaceMetadata(workspaceId, projectPath)
-    );
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
-    const options = {
-      messages: [createMuxMessage("user-1", "user", "hello")],
+    const readHistory = async () => {
+      const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data;
+    };
+    // Other sections (built-in skills and sub-agents) get their own rows.
+    const memoryRows = async () =>
+      (await readHistory()).filter(
+        (message) =>
+          isContextListingMessage(message) && message.id.startsWith("context-listing-memory-")
+      );
+    const lastRequestSequence = async () =>
+      (await readHistory()).findLast((message) => message.role === "assistant")?.metadata
+        ?.requestHistorySequence;
+    const options = (
+      messages: MuxMessage[],
+      indexEntries: Array<{ path: string; description: string }>
+    ) => ({
+      messages,
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off" as const,
       experiments: { memory: true },
-      resolveMemoryContext: () =>
-        Promise.resolve({ indexEntries: [lesson], hotMemoriesBlock: null }),
+      resolveMemoryContext: () => Promise.resolve({ indexEntries, hotMemoriesBlock: null }),
+    });
+    const lastRequestText = () => JSON.stringify(harness.startStreamCalls.at(-1)?.messages);
+    return {
+      harness,
+      projectPath,
+      append,
+      readHistory,
+      memoryRows,
+      lastRequestSequence,
+      options,
+      lastRequestText,
+    };
+  }
+
+  it("appends a durable context row only when its listing section changes", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing");
+    const h = createListingHarness(xumHome.path, "workspace-context-listing");
+    await fs.mkdir(h.projectPath, { recursive: true });
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const written = { path: "/memories/project/new.md", description: "written later" };
+    const send = async (
+      entries: Array<{ path: string; description: string }>,
+      tail: MuxMessage[] = []
+    ) => {
+      const result = await h.harness.service.streamMessage(
+        h.options([...(await h.readHistory()), ...tail], entries)
+      );
+      expect(result.success).toBe(true);
     };
 
-    const prepared = await harness.service.prepareStreamMessage(options);
+    await h.append(createMuxMessage("user-1", "user", "hello"));
+    await send([lesson]);
+    const [firstRow] = await h.memoryRows();
+    expect(await h.memoryRows()).toHaveLength(1);
+    // The request carries the row it just persisted, and its watermark covers it.
+    expect(h.lastRequestText()).toContain(lesson.path);
+    expect(await h.lastRequestSequence()).toBe(firstRow.metadata?.historySequence);
+
+    // Unchanged listings: the persisted row already says it all.
+    await h.append(createMuxMessage("user-2", "user", "again"));
+    await send([lesson]);
+    expect(await h.memoryRows()).toHaveLength(1);
+
+    // A memory write changes the index: exactly one new row, earlier rows untouched.
+    await h.append(createMuxMessage("user-3", "user", "once more"));
+    await send([lesson, written]);
+    const rows = await h.memoryRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toEqual(firstRow);
+    expect(JSON.stringify(rows[1].parts)).toContain(written.path);
+
+    // A resumed assistant turn keeps its request shape.
+    const partial = createMuxMessage("assistant-2", "assistant", "working", { partial: true });
+    await send([lesson], [partial]);
+    expect(await h.memoryRows()).toHaveLength(2);
+  });
+
+  it("keeps listing rows out of a request whose history snapshot went stale", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing-race");
+    const h = createListingHarness(xumHome.path, "workspace-context-listing-race");
+    await fs.mkdir(h.projectPath, { recursive: true });
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const user = createMuxMessage("user-1", "user", "hello");
+    await h.append(user);
+    const snapshot = await h.readHistory();
+    // Another writer (e.g. a sub-agent report) appends after the snapshot.
+    await h.append(createMuxMessage("report-1", "user", "report", { synthetic: true }));
+
+    expect((await h.harness.service.streamMessage(h.options(snapshot, [lesson]))).success).toBe(
+      true
+    );
+    // The row stays in history for the next turn but not in this request,
+    // whose watermark must not move past the report it never saw.
+    expect(await h.memoryRows()).toHaveLength(1);
+    expect(h.lastRequestText()).not.toContain(lesson.path);
+    expect(await h.lastRequestSequence()).toBe(user.metadata?.historySequence);
+  });
+
+  it("persists a rollover candidate's listing rows with the caller's batch", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing-candidate");
+    const h = createListingHarness(xumHome.path, "workspace-context-listing-candidate");
+    await fs.mkdir(h.projectPath, { recursive: true });
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const batch = [createMuxMessage("user-1", "user", "hello")];
+    const options = h.options(batch, [lesson]);
+
+    const prepared = await h.harness.service.prepareStreamMessage(options);
     if (!prepared.success) throw new Error("Expected a prepared candidate");
-    // The first turn of the new window still sees the listing...
+    // Preparing an admission candidate never writes accepted history.
+    expect(await h.readHistory()).toHaveLength(0);
+    const admittedRows = prepared.data.admittedRows ?? [];
+    expect(admittedRows.filter(isContextListingMessage).length).toBeGreaterThan(0);
+
+    // The caller appends the candidate's rows right after its batch.
+    for (const row of [...batch, ...admittedRows]) await h.append(row);
     expect((await prepared.data.start(options)).success).toBe(true);
-    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
-    // ...while accepted history stays untouched until a live turn persists it.
-    const appended = harness.appendToHistorySpy.mock.calls.map(([, message]) => message);
-    expect(appended.filter(isContextListingMessage)).toHaveLength(0);
+    expect(h.lastRequestText()).toContain(lesson.path);
+    // Replay can rebuild the request: its watermark covers the listing rows.
+    const [memoryRow] = await h.memoryRows();
+    const lastAdmitted = Math.max(
+      ...admittedRows.map((row) => row.metadata?.historySequence ?? -1)
+    );
+    expect(memoryRow.metadata?.historySequence).toBeLessThanOrEqual(lastAdmitted);
+    expect(await h.lastRequestSequence()).toBe(lastAdmitted);
   });
 
   it("keeps the tool definitions byte-identical when the memory index changes", async () => {

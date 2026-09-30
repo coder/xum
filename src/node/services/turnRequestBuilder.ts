@@ -571,11 +571,21 @@ type TurnRequestBuildOutcome =
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
     };
 
-export interface PreparedStreamMessage extends AsyncDisposable {
+/**
+ * Admission candidates never write history, but their request can carry rows
+ * that are not in the caller's batch yet (context listings, #5248). The caller
+ * must append `admittedRows` right after its batch, in the same append, before
+ * `start()`: requestHistorySequence and replay rebuild the request from them.
+ */
+interface AdmittedRows {
+  readonly admittedRows?: readonly MuxMessage[];
+}
+
+export interface PreparedStreamMessage extends AsyncDisposable, AdmittedRows {
   start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
 }
 
-export interface PreparedTurnRequest extends AsyncDisposable {
+export interface PreparedTurnRequest extends AsyncDisposable, AdmittedRows {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
 }
 
@@ -2992,6 +3002,7 @@ export class TurnRequestBuilder {
     // its original request shape.
     let requestSourceMessages = messages;
     let requestProviderMessages = providerRequestMessages;
+    let admittedRows: MuxMessage[] = [];
     if (!isCompactionRequest && providerRequestMessages.at(-1)?.role === "user") {
       const memoryAllowed = applyToolPolicyToNames(["memory"], effectiveToolPolicy).length === 1;
       const listingRows = buildContextListingMessages(providerRequestMessages, [
@@ -3008,10 +3019,12 @@ export class TurnRequestBuilder {
         },
       ]);
       // Admission candidates (token-budget rollover) must not touch accepted
-      // history: their rows ride in the candidate request only, and the first
-      // live turn of the new window persists them.
+      // history: the caller persists their rows with its rollover batch
+      // (admittedRows), so they stay contiguous with the new window.
       let includedRows = listingRows;
-      if (context.admissionOnly !== true) {
+      if (context.admissionOnly === true) {
+        admittedRows = listingRows;
+      } else {
         const snapshotTail = messages.reduce(
           (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
           -1
@@ -3101,7 +3114,13 @@ export class TurnRequestBuilder {
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
       if (context.admissionOnly) {
-        requestHistorySequence = messages.reduce(
+        // Fail fast if a caller started the candidate without persisting its
+        // admitted rows: the request would cover rows history cannot replay.
+        assert(
+          admittedRows.every((row) => row.metadata?.historySequence != null),
+          "admitted rows must be persisted with the rollover batch before start"
+        );
+        requestHistorySequence = [...messages, ...admittedRows].reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
@@ -3565,6 +3584,9 @@ export class TurnRequestBuilder {
       };
     };
     retained = true;
-    return { type: "prepared", request: { start, [Symbol.asyncDispose]: dispose } };
+    return {
+      type: "prepared",
+      request: { start, [Symbol.asyncDispose]: dispose, admittedRows },
+    };
   }
 }

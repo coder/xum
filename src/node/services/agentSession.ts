@@ -3886,7 +3886,7 @@ export class AgentSession {
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
-        | { kind: "trigger"; messages: MuxMessage[] }
+        | { kind: "trigger"; messages: MuxMessage[]; trailing?: readonly MuxMessage[] }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
       if (publication.kind === "prefix") {
@@ -3894,7 +3894,9 @@ export class AgentSession {
         return Ok(undefined);
       }
       const replacesCancellation = manualReplacement || automaticReplacement;
-      const batch = [...stagedPrefixes, ...messages];
+      // Trailing rows follow the input in the same append, e.g. a rollover
+      // candidate's context listings, which its request places after the input.
+      const batch = [...stagedPrefixes, ...messages, ...(publication.trailing ?? [])];
       attempt.inputPublication = messages.at(-1);
       assert(replacementCapture, "Publication requires its admission capture");
       // Plan-review feedback (direct, or nested in an on-send compaction request) is admitted
@@ -4975,7 +4977,12 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
         // Ordinary sends stay append-only; only coupled snapshots/boundaries need an atomic batch.
-        const publish = () => publishPreparedHistory({ kind: "trigger", messages: batch });
+        const publish = () =>
+          publishPreparedHistory({
+            kind: "trigger",
+            messages: batch,
+            trailing: contextRollover ? attempt.preparedRequest?.admittedRows : undefined,
+          });
         const appended = contextRollover
           ? await this.appendContextRolloverRows(batch, publish)
           : await publish();
@@ -5963,7 +5970,11 @@ export class AgentSession {
         this.coordinator.closing
       )
         return Ok(undefined);
-      const appended = await this.appendContextRolloverRows(rows);
+      // The candidate's context listings follow the continuation in its request.
+      const appended = await this.appendContextRolloverRows([
+        ...rows,
+        ...(candidate.data.admittedRows ?? []),
+      ]);
       if (
         !this.coordinator.isCurrentTurn(turn) ||
         !this.coordinator.isCurrentOperation(operation) ||
@@ -6105,6 +6116,7 @@ export class AgentSession {
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
+      admittedRows: prepared.data.admittedRows,
     });
   }
 
