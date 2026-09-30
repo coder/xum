@@ -5,7 +5,7 @@
 (*                                                                         *)
 (* Disk state: chat.jsonl (a sequence of JSONL lines) and partial.json.    *)
 (* Every filesystem call is ONE atomic step, annotated with file:line.     *)
-(* Semantics assumed (process-crash model, see README):                    *)
+(* Semantics assumed (process-crash model; runs and bounds in check.sh):                    *)
 (*   - writeFileAtomic (temp + fsync + rename) is all-or-nothing;          *)
 (*   - unlink is atomic;                                                   *)
 (*   - an O_APPEND append is NOT atomic across a crash: TornCrash leaves   *)
