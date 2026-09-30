@@ -219,7 +219,7 @@ function getInitialRoute(): string {
   // In Storybook, stories seed localStorage via selectWorkspace() during setup.
   // Read that selection so stories start at the correct workspace view.
   if (isStorybook) {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );
@@ -229,7 +229,7 @@ function getInitialRoute(): string {
   }
 
   if (!isStandalone && launchBehavior === "last-workspace") {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );

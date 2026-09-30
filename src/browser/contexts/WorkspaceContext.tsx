@@ -1042,8 +1042,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (newValue) {
         hasExplicitRootRouteRef.current = false;
         navigateToWorkspace(newValue.workspaceId);
-        // Persist to localStorage for next session
-        updatePersistedState(SELECTED_WORKSPACE_KEY, newValue);
+        // Persist only the id for next session: readers re-derive the rest from metadata, and the
+        // paths would make the value grow with the project path.
+        updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: newValue.workspaceId });
       } else {
         hasExplicitRootRouteRef.current = true;
         navigateToHome();

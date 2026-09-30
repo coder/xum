@@ -3,7 +3,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
-import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
@@ -1439,8 +1439,39 @@ describe("WorkspaceContext", () => {
     });
 
     await waitFor(() =>
-      expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toContain("ws-persist")
+      expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toBe(
+        JSON.stringify({ workspaceId: "ws-persist" })
+      )
     );
+  });
+
+  // A selection that embedded long paths was over budget and lived only in memory.
+  test("restores a last workspace with very long paths after a restart", async () => {
+    const projectPath = `/${"p".repeat(1100)}`;
+    const workspace = createProjectWorkspaceMetadata("ws-long", projectPath, {
+      namedWorkspacePath: `/${"w".repeat(1100)}`,
+    });
+    createMockAPI({
+      workspace: { list: () => Promise.resolve([workspace]) },
+      projects: { list: () => Promise.resolve([[projectPath, { workspaces: [] }]]) },
+      localStorage: { [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace") },
+    });
+    const first = await setup();
+    await waitFor(() => expect(first().loading).toBe(false));
+    act(() => {
+      first().setSelectedWorkspace({
+        workspaceId: workspace.id,
+        projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      });
+    });
+    cleanup();
+
+    window.location.href = "http://localhost/";
+    restartLocalStorage();
+    const restarted = await setup();
+    await waitFor(() => expect(restarted().selectedWorkspace?.workspaceId).toBe("ws-long"));
   });
 
   test("root startup opens the recent project page instead of restoring selectedWorkspace localStorage", async () => {

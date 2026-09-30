@@ -1203,7 +1203,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(UI_THEME_KEY, "synced", 64),
   globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
-  globalKey(SELECTED_WORKSPACE_KEY, "ui", 2048),
+  // { workspaceId } (older builds also stored paths; readers use only the id).
+  globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
   globalKey(LAST_VISITED_ROUTE_KEY, "ui", 4096),
   globalKey(LAUNCH_BEHAVIOR_KEY, "synced", 32),
   globalKey(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "synced", 16),
