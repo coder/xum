@@ -2542,7 +2542,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     async function streamWithRealAgentTools(
       xumHomePath: string,
       metadataOverrides: Partial<WorkspaceMetadata>,
-      agentIds: string[]
+      agentIds: string[],
+      experiments?: { continuousCompaction?: boolean }
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
@@ -2563,10 +2564,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHomePath,
         createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides)
       );
-      // Real agent resolution and tool assembly: the advertised block is under test.
+      // Real agent resolution, tool assembly, system prompt and message
+      // preparation: the serialized request is under test.
       harness.getToolsForModelSpy.mockRestore();
       spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+      spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
       const toolsByAgent: Record<string, Record<string, Tool>> = {};
+      const requestByAgent: Record<string, TurnExecutionOptions> = {};
       for (const agentId of agentIds) {
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
@@ -2574,11 +2580,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
+          experiments,
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
+        requestByAgent[agentId] = harness.startStreamCalls.at(-1)!;
       }
-      return { toolsByAgent, projectPath };
+      return { toolsByAgent, requestByAgent, projectPath };
     }
 
     const shape = (tools: Record<string, Tool>) =>
@@ -2591,14 +2599,28 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       );
     const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
 
+    const lastUserText = (request: TurnExecutionOptions) =>
+      JSON.stringify(request.messages.findLast((message) => message.role === "user")?.content);
+
     it("keeps the tool block byte-identical across exec, plan and a custom agent", async () => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-      const { toolsByAgent, projectPath } = await streamWithRealAgentTools(xumHome.path, {}, [
-        "exec",
-        "plan",
-        "reader",
-      ]);
+      const { toolsByAgent, requestByAgent, projectPath } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec", "plan", "reader"]
+      );
       const exec = toolsByAgent.exec;
+      // The system prompt carries every switchable agent's section, so it does
+      // not depend on the active agent either; the user row names the mode.
+      const system = JSON.stringify(requestByAgent.exec.system);
+      expect(system).toContain(JSON.stringify(systemMessageModule.AGENT_MODE_RULE).slice(1, -1));
+      for (const agentId of ["exec", "plan", "reader"]) {
+        expect(system).toContain(`<agent-mode id=\\"${agentId}\\">`);
+        expect(JSON.stringify(requestByAgent[agentId].system)).toBe(system);
+        expect(lastUserText(requestByAgent[agentId])).toContain(
+          systemMessageModule.formatAgentModeTag(agentId)
+        );
+      }
       expect(shape(toolsByAgent.plan)).toBe(shape(exec));
       expect(shape(toolsByAgent.reader)).toBe(shape(exec));
       for (const name of ["propose_plan", "task_remove", "file_edit_insert", "bash"]) {
@@ -2642,6 +2664,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
     });
 
+    it("keeps today's prompt shape under continuous compaction", async () => {
+      // Its prefix swap replaces the latest user row with an untagged copy.
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { requestByAgent } = await streamWithRealAgentTools(xumHome.path, {}, ["plan"], {
+        continuousCompaction: true,
+      });
+      expect(JSON.stringify(requestByAgent.plan.system)).not.toContain("<agent-mode");
+      expect(lastUserText(requestByAgent.plan)).not.toContain("[mode:");
+    });
+
     it.each([
       { label: "hidden root agent (explore)", overrides: {}, agentId: "explore" },
       { label: "root agent hidden through its base", overrides: {}, agentId: "scout" },
@@ -2652,11 +2684,18 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
     ])("keeps per-agent tool sets for a $label", async ({ overrides, agentId }) => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, overrides, [agentId]);
+      const { toolsByAgent, requestByAgent } = await streamWithRealAgentTools(
+        xumHome.path,
+        overrides,
+        [agentId]
+      );
       const tools = toolsByAgent[agentId];
       // Explore and exec sub-agents never get propose_plan; absent, not refused.
       expect(tools.propose_plan).toBeUndefined();
       expect(tools.file_read).toBeDefined();
+      // Their prompts keep today's shape: no mode sections, no mode tags.
+      expect(JSON.stringify(requestByAgent[agentId].system)).not.toContain("<agent-mode");
+      expect(lastUserText(requestByAgent[agentId])).not.toContain("[mode:");
     });
   });
 

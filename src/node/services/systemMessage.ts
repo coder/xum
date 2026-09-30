@@ -51,6 +51,25 @@ function sanitizeSectionTag(value: string | undefined, fallback: string): string
   return normalized.length > 0 ? normalized : fallback;
 }
 
+/**
+ * One tool set and one system prompt across root agent-mode switches (#5253,
+ * user decision): the system prompt carries a section per switchable agent,
+ * and each user message carries the tag of the mode it was sent in, so a
+ * switch appends a tag instead of rewriting the cached prefix.
+ */
+export function formatAgentModeTag(agentId: string): string {
+  return `[mode: ${agentId}]`;
+}
+export const AGENT_MODE_RULE =
+  "The sections below apply one per agent mode. The current mode is the agent named by the most recent `[mode: <agent>]` tag on a user message. Follow only the `<agent-mode>` section whose id matches it; ignore the others. Tools the current mode does not allow return an error; do not retry them.";
+
+export interface AgentModeSection {
+  agentId: string;
+  sections: readonly string[];
+  /** "Mode: <mode>" candidates for this agent (effective mode, agent id). */
+  modes: readonly string[];
+}
+
 function buildTaggedSection(
   content: string | null,
   rawTagValue: string | undefined,
@@ -632,6 +651,13 @@ export interface BuildSystemMessageFromSourcesOptions {
    * injected <mode-...> tag. Duplicates are ignored.
    */
   modes?: readonly string[];
+  /**
+   * Root workspaces (#5253): every switchable agent's prompt and "Mode:"
+   * sections, rendered side by side so the system prompt does not depend on
+   * the active agent. `agentSystemPromptSections` then holds only the shared
+   * guidance, and `modes` is ignored.
+   */
+  agentModeSections?: readonly AgentModeSection[];
 }
 
 /**
@@ -728,10 +754,33 @@ export function buildSystemMessageFromSources(
     return stripped.trim().length > 0 ? stripped : undefined;
   };
 
-  const sanitizedAgentSections = agentPromptSections
-    .map((section) => sanitizeScopedInstructions(section, "mux"))
-    .filter((value): value is string => Boolean(value));
-  if (sanitizedAgentSections.length > 0) {
+  const sanitizeAgentSections = (sections: readonly string[]) =>
+    sections
+      .map((section) => sanitizeScopedInstructions(section.trim(), "mux"))
+      .filter((value): value is string => Boolean(value));
+  const sanitizedAgentSections = sanitizeAgentSections(agentPromptSections);
+  const agentModeSections = options?.agentModeSections;
+  // Scoped Mode: sections for one agent, from every Xum-dedicated source.
+  const extractModeContent = (candidates: readonly string[], sources: readonly string[]) =>
+    sources
+      .flatMap((src) => candidates.map((candidate) => extractModeSection(src, candidate)))
+      .filter((content): content is string => content != null && content.trim().length > 0)
+      .join("\n\n");
+  if (agentModeSections !== undefined) {
+    const allAgentSources = [
+      ...agentModeSections.flatMap((agent) => agent.sections),
+      ...muxContextContents,
+      ...muxGlobalContents,
+    ];
+    const blocks = agentModeSections.map((agent) => {
+      const body = [
+        ...sanitizeAgentSections(agent.sections),
+        buildTaggedSection(extractModeContent(agent.modes, allAgentSources), "mode", "mode").trim(),
+      ].filter((part) => part.length > 0);
+      return `<agent-mode id="${agent.agentId}">\n${body.join("\n\n")}\n</agent-mode>`;
+    });
+    systemMessage += `\n<agent-instructions>\n${[AGENT_MODE_RULE, ...blocks, ...sanitizedAgentSections].join("\n\n")}\n</agent-instructions>`;
+  } else if (sanitizedAgentSections.length > 0) {
     systemMessage += `\n<agent-instructions>\n${sanitizedAgentSections.join("\n\n")}\n</agent-instructions>`;
   }
 
@@ -752,7 +801,12 @@ export function buildSystemMessageFromSources(
 
   // Scoped directive sources in priority order: agent definition → workspace
   // .xum/AGENTS.md files → global ~/.xum/AGENTS.md. All matches are joined.
-  const xumScopedSources = [...agentPromptSections, ...muxContextContents, ...muxGlobalContents];
+  const xumScopedSources = [
+    ...agentPromptSections,
+    ...(agentModeSections?.flatMap((agent) => agent.sections) ?? []),
+    ...muxContextContents,
+    ...muxGlobalContents,
+  ];
 
   // Extract model-specific section based on active model identifier
   const modelContent = modelString
@@ -766,13 +820,8 @@ export function buildSystemMessageFromSources(
   // agent id). Source priority dominates: all candidates are checked within a
   // source before moving to the next source.
   const modeContent =
-    modeCandidates.length > 0
-      ? xumScopedSources
-          .flatMap((src) =>
-            src ? modeCandidates.map((candidate) => extractModeSection(src, candidate)) : []
-          )
-          .filter((content): content is string => content != null && content.trim().length > 0)
-          .join("\n\n")
+    modeCandidates.length > 0 && agentModeSections === undefined
+      ? extractModeContent(modeCandidates, xumScopedSources)
       : null;
 
   if (customInstructions) {
