@@ -2649,6 +2649,66 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(serializedTools[1]).toBe(serializedTools[0]);
   });
 
+  it("keeps the tool definitions byte-identical when skills or sub-agents change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-static-listing-tools");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-static-listing-tools";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.getToolsForModelSpy.mockRestore();
+    const skill = (name: string) => ({
+      name,
+      description: `${name} skill`,
+      scope: "project" as const,
+    });
+    const agent = (id: string) => ({
+      id,
+      scope: "project" as const,
+      name: id,
+      description: `${id} agent`,
+      uiSelectable: false,
+      subagentRunnable: true,
+    });
+
+    const serializedTools: string[] = [];
+    for (const variant of [
+      { skills: [skill("review")], agents: [agent("scout")] },
+      // A skill and an agent definition were added between turns.
+      { skills: [skill("review"), skill("deploy")], agents: [agent("scout"), agent("auditor")] },
+    ]) {
+      spyOn(turnContextAssembler, "buildStreamSystemContext").mockResolvedValue({
+        instructionSources: { global: [], context: [] },
+        agentSystemPromptSections: [],
+        systemMessage: "test-system-message",
+        systemMessageTokens: 1,
+        agentDefinitions: variant.agents,
+        availableSkills: variant.skills,
+        ancestorPlanFilePaths: [],
+      });
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const tools = harness.startStreamCalls.at(-1)?.tools ?? {};
+      expect(tools.agent_skill_read).toBeDefined();
+      expect(tools.task).toBeDefined();
+      serializedTools.push(
+        JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]))
+      );
+    }
+    expect(serializedTools[1]).toBe(serializedTools[0]);
+    // The model still sees both additions, in the durable listing rows.
+    const listed = JSON.stringify(harness.appendToHistorySpy.mock.calls.map(([, row]) => row));
+    expect(listed).toContain("deploy");
+    expect(listed).toContain("auditor");
+  });
+
   it.each([true, false])(
     "offers the session memory scope only in token-budget mode (tokenBudget=%p)",
     async (tokenBudget) => {
