@@ -61,12 +61,11 @@ export const Tasks: Story = {
     await waitFor(() => {
       // Look the inputs up by label: the section also hosts the Advisor
       // panel's spinbutton, so positional counting breaks.
-      const maxParallelAgentTasks = (
-        canvas.getByLabelText("Max parallel agent tasks") as HTMLInputElement
+      const maxParallelAgentTasks = canvas.getByLabelText<HTMLInputElement>(
+        "Max parallel agent tasks"
       ).value;
-      const maxTaskNestingDepth = (
-        canvas.getByLabelText("Max task nesting depth") as HTMLInputElement
-      ).value;
+      const maxTaskNestingDepth =
+        canvas.getByLabelText<HTMLInputElement>("Max task nesting depth").value;
 
       if (maxParallelAgentTasks !== "2") {
         throw new Error(
