@@ -17,25 +17,25 @@ budget=${BUDGET:-300}
 out=${OUT:-$(mktemp -d)}
 glob=${1:-MC_*}
 
-invariants=(TypeOK MutualExclusion CommitExclusion NoReclaimFromLiveHolder
-  ReleaseOwnOnly StaleGuardUnlinkSafe NoOrphanLock NoOrphanGuard)
+invariants=(TypeOK MutualExclusion CommitExclusion GuardExclusion NoReclaimFromLiveHolder
+  ReleaseOwnOnly StaleGuardReclaimSafe NoOrphanLock NoOrphanGuard)
 
 # Expected verdict per config: invariants listed here must be violated; all
 # others must hold. Keep in sync with the report in the commit message.
 declare -A EXPECT=(
   [MC_mutation_noreread]="MutualExclusion CommitExclusion NoReclaimFromLiveHolder ReleaseOwnOnly NoOrphanLock"
   [MC_stale_lock]=""
-  [MC_stale_guard]="MutualExclusion CommitExclusion NoReclaimFromLiveHolder ReleaseOwnOnly StaleGuardUnlinkSafe NoOrphanLock"
-  [MC_stale_guard_2p]="NoReclaimFromLiveHolder StaleGuardUnlinkSafe NoOrphanLock"
+  [MC_stale_guard]=""
+  [MC_stale_guard_2p]=""
   [MC_crash_small]=""
-  [MC_crash_guard]="StaleGuardUnlinkSafe"
-  [MC_release_fault]="NoOrphanLock NoOrphanGuard"
+  [MC_crash_guard]=""
+  [MC_release_fault]=""
   [MC_old_lease]="MutualExclusion CommitExclusion NoReclaimFromLiveHolder ReleaseOwnOnly NoOrphanLock"
   [MC_nonlinux_reuse]="NoOrphanLock NoOrphanGuard"
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=(
-  [MC_crash_guard]="StaleGuardUnlinkSafe"
+  [MC_crash_guard]="GuardExclusion StaleGuardReclaimSafe"
 )
 
 status=0
