@@ -42,8 +42,7 @@ export function openaiCyberAccessProgram(
   const program = CYBER_ACCESS_PROGRAM_BY_MODEL_ID.get(normalized);
   if (program == null) return undefined;
 
-  const route =
-    options.effectiveRouteProvider ?? resolveProviderOptionsRoute(modelString, options);
+  const route = options.effectiveRouteProvider ?? resolveProviderOptionsRoute(modelString, options);
   return openaiDirectProviderOptionsAvailable(normalized, {
     ...options,
     resolvedRouteProvider: route,
