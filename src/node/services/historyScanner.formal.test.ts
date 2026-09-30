@@ -4,10 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_RESET_NEEDLE,
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
 } from "@/common/constants/contextBudget";
 import { createMuxMessage } from "@/common/types/message";
-import { findProviderHistoryStart, readProviderHistory } from "./historyScanner";
+import { findProviderHistoryStart, hasRawResetMarker, readProviderHistory } from "./historyScanner";
 import { mulberry32 } from "./historyScanner.generator.testHarness";
 
 // Bridge from the Lean model in formal/history-locator to the real provider locator.
@@ -21,8 +22,8 @@ import { mulberry32 } from "./historyScanner.generator.testHarness";
 // frozen copy of the same algorithm, the expected answer here never runs the production
 // recognizers.
 //
-// The `test.failing` cases at the end document confirmed findings where the production locator
-// breaks the rule (inputs outside the model's assumptions). Remove `.failing` once fixed.
+// The cases at the end pin fixed findings F1-F3, where the production locator used to break the
+// rule on inputs outside the model's assumptions.
 
 type Tok = "key" | "colon" | "value";
 type Kind = "plain" | "boundary" | "resetMarker" | "resetFloor" | "unreadable";
@@ -411,7 +412,7 @@ describe("findProviderHistoryStart against the Lean rule", () => {
   }, 120_000);
 });
 
-// ── Confirmed findings (outside the model's assumptions) ────────────────────────────────────
+// ── Fixed findings (outside the model's assumptions) ────────────────────────────────────────
 //
 // Each case: an older public-looking row "old", a reset-evidence row (or boundary), a newer row
 // "new". The rule keeps only rows newer than the floor, so the provider must never see "old".
@@ -435,28 +436,25 @@ describe("provider history privacy findings", () => {
     const rows = await readProviderHistory({ chat, archive: path.join(dir, "missing.jsonl") });
     return rows.map((row) => row.id);
   }
-  // A NUL inside the key: hasRawResetMarker removes it, the reverse token probe does not.
+  // A NUL inside the key: hasRawResetMarker removes it; the reverse token probe used not to.
   const nulKeyMarker = '{"metadata":{"context\u0000BoundaryKind":"reset"},broken ';
 
-  // F1: oversized rows are never classified, so only the reverse token probe sees them, and it
-  // does not remove separators inside a token (historyScanner.ts addHistoryResetProbe). The same
-  // row under SESSION_HISTORY_MAX_LINE_BYTES is a floor via classifyHistoryScanRow.
+  // F1: oversized rows are never classified, so only the reverse token probe saw them, and it did
+  // not remove separators inside a token. The same row under SESSION_HISTORY_MAX_LINE_BYTES is a
+  // floor via classifyHistoryScanRow; oversized rows now also stream through the raw probe.
   test("F1 control: a reset key split by a separator floors a normal-size unreadable row", async () => {
     expect(
       await providerIds([message("old"), nulKeyMarker + "x".repeat(100), message("new")])
     ).toEqual(["new"]);
   });
-  test.failing(
-    "F1: the same reset evidence in an oversized unreadable row floors the read",
-    async () => {
-      expect(await providerIds([message("old"), nulKeyMarker + pad, message("new")])).toEqual([
-        "new",
-      ]);
-    }
-  );
+  test("F1: the same reset evidence in an oversized unreadable row floors the read", async () => {
+    expect(await providerIds([message("old"), nulKeyMarker + pad, message("new")])).toEqual([
+      "new",
+    ]);
+  });
 
   // F2: a marker fragmented over rows is matched by concatenating unreadable rows without their
-  // LF, but a CR (CRLF) or space before the LF stays inside the token.
+  // LF; a CR (CRLF) or space before the LF used to stay inside the token.
   test("F2 control: a reset value split by LF across unreadable rows floors the read", async () => {
     expect(
       await providerIds([
@@ -471,24 +469,21 @@ describe("provider history privacy findings", () => {
     ["CR", "\r"],
     ["space", " "],
   ] as const) {
-    test.failing(
-      `F2: a reset value split by ${name} plus LF across unreadable rows floors the read`,
-      async () => {
-        expect(
-          await providerIds([
-            message("old"),
-            `{"metadata":{"contextBoundaryKind":"res${separator}`,
-            'et"},broken',
-            message("new"),
-          ])
-        ).toEqual(["new"]);
-      }
-    );
+    test(`F2: a reset value split by ${name} plus LF across unreadable rows floors the read`, async () => {
+      expect(
+        await providerIds([
+          message("old"),
+          `{"metadata":{"contextBoundaryKind":"res${separator}`,
+          'et"},broken',
+          message("new"),
+        ])
+      ).toEqual(["new"]);
+    });
   }
 
-  // F3: an oversized compaction boundary is recovered only when its raw bytes hold the compact
-  // needle '"compactionBoundary":true' (recoverOversizedBoundary / boundaryMarkerSeen). A
-  // normal-size boundary is recognized after JSON.parse, so an escaped key or a space works there.
+  // F3: an oversized compaction boundary used to be recovered only when its raw bytes held the
+  // compact needle '"compactionBoundary":true'. A normal-size boundary is recognized after
+  // JSON.parse, so an escaped key or a space works there.
   const boundary = (text: string) =>
     JSON.stringify(
       createMuxMessage("boundary", "assistant", text, {
@@ -514,11 +509,188 @@ describe("provider history privacy findings", () => {
     ["escaped key", escapedKey],
     ["space after the colon", spaced],
   ] as const) {
-    test.failing(`F3: an oversized compaction boundary with ${name} starts the epoch`, async () => {
+    test(`F3: an oversized compaction boundary with ${name} starts the epoch`, async () => {
       expect(await providerIds([message("old"), shape(boundary(pad)), message("new")])).toEqual([
         "boundary",
         "new",
       ]);
     });
   }
+  // Properties behind F1-F3: random spellings of the evidence, with the 64 KiB chunk edge (counted
+  // from EOF) moved through it so escapes, UTF-8 sequences and tokens straddle segments. The
+  // expected floor is hasRawResetMarker itself: whatever the classifier would floor at normal size
+  // must floor oversized or fragmented.
+  const RAW_SEPARATORS = [" ", "\t", "\r", "\u0000", "\u0085", "\u00a0", "\u2028", "\ufeff"];
+  const ESCAPED_SEPARATORS = ["\\u0020", "\\x09", "\\U001f", "\\X7F", "\\u0000"];
+  const DECOYS = ["é", "€", "𝄞", "q", "\\", '"'];
+  function noisyMarker(random: () => number, text = '"contextBoundaryKind":"reset"'): string {
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
+    const noise = () => {
+      const r = random();
+      if (r < 0.3) return pick(RAW_SEPARATORS);
+      if (r < 0.4) return pick(ESCAPED_SEPARATORS);
+      if (r < 0.43) return pick(DECOYS);
+      return "";
+    };
+    return [...text]
+      .map((c) => {
+        const r = random();
+        const code = c.charCodeAt(0).toString(16).padStart(2, "0");
+        // Raw separators may sit inside an escape too: they are removed before decoding.
+        if (r < 0.15) return "\\" + noise() + "u00" + noise() + code;
+        if (r < 0.25) return "\\x" + code.toUpperCase();
+        return c;
+      })
+      .map((unit) => unit + noise())
+      .join("");
+  }
+  /** The newest row, sized so a chunk edge (a multiple of 64 KiB from EOF) lands at `target`. */
+  function newestRowForEdge(before: number, target: number): string {
+    const shortest = message("new", "p");
+    let length = target - before - 1;
+    while (length < shortest.length) length += SESSION_HISTORY_SCAN_CHUNK_BYTES;
+    return message("new", "p".repeat(length - shortest.length + 1));
+  }
+  const bytes = (text: string) => Buffer.byteLength(text);
+
+  /** A byte offset inside `text` that splits a multibyte character or an escape, if any. */
+  function splittingOffset(random: () => number, text: string): number | null {
+    const offsets: number[] = [];
+    let at = 0;
+    for (const unit of text) {
+      const size = bytes(unit);
+      for (let i = 1; i < size; i++) offsets.push(at + i);
+      if (unit === "\\") for (let i = 1; i <= 5; i++) offsets.push(at + i);
+      at += size;
+    }
+    return offsets.length > 0 ? offsets[Math.floor(random() * offsets.length)] : null;
+  }
+
+  const spacedEscapedMarker = [...SESSION_HISTORY_RESET_NEEDLE]
+    .map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"))
+    .join("\\u0020");
+  test("F1 property: an oversized row with its own raw reset marker floors the read", async () => {
+    let floors = 0;
+    for (let seed = 1; seed <= 60; seed++) {
+      const random = mulberry32(seed);
+      // Escaping every unit and putting an escaped separator between units makes the key token
+      // longer than the token probe's retained overlap, so at a chunk edge inside the key only the
+      // raw probe finds the marker.
+      const core = random() < 0.7 ? spacedEscapedMarker : noisyMarker(random);
+      const head = `{bad ${"q".repeat(SESSION_HISTORY_MAX_LINE_BYTES)}`;
+      const row = `${head}${core} tail`;
+      if (!hasRawResetMarker(row)) continue;
+      floors++;
+      const coreStart = bytes(message("old")) + 1 + bytes(head);
+      const split = random() < 0.6 ? splittingOffset(random, core) : null;
+      const target = coreStart + (split ?? Math.floor(random() * (bytes(core) + 1)));
+      const before = bytes(message("old")) + 1 + bytes(row) + 1;
+      const ids = await providerIds([message("old"), row, newestRowForEdge(before, target)]);
+      expect(ids, `seed ${seed}`).toEqual(["new"]);
+    }
+    expect(floors).toBeGreaterThan(20);
+  }, 120_000);
+
+  test("F2 property: a raw reset marker fragmented over unreadable rows floors the read", async () => {
+    let floors = 0;
+    for (let seed = 1; seed <= 300; seed++) {
+      const random = mulberry32(seed);
+      const core = `{bad ${noisyMarker(random)}`;
+      // Split anywhere, even inside an escape or a UTF-8 sequence's code units.
+      const units = [...core];
+      const fragments: string[] = [];
+      let current = "";
+      for (const unit of units) {
+        current += unit;
+        if (random() < 0.08) {
+          fragments.push(current);
+          current = "";
+        }
+      }
+      fragments.push(current + " tail");
+      if (!hasRawResetMarker(fragments.join(""))) continue;
+      floors++;
+      const coreStart = bytes(message("old")) + 1;
+      const run = fragments.join("\n");
+      const target = coreStart + Math.floor(random() * (bytes(run) + 1));
+      const before = coreStart + bytes(run) + 1;
+      const ids = await providerIds([
+        message("old"),
+        ...fragments,
+        newestRowForEdge(before, target),
+      ]);
+      expect(ids, `seed ${seed}: ${JSON.stringify(fragments)}`).toEqual(["new"]);
+    }
+    expect(floors).toBeGreaterThan(50);
+  }, 120_000);
+
+  test("unreadable runs floor alike under every chunk alignment, nested escapes included", async () => {
+    // Removing one escaped separator can expose another (\u00\u002020 leaves \u0020), which the
+    // single-pass rule does not remove; where the chunk edge falls must not change the answer.
+    const NESTED = ["\\u00\\u002020", "\\x\\x2020", "\\ u0020", "\\\\u0020", "\\u0\\x2000"];
+    let floors = 0;
+    let keeps = 0;
+    for (let seed = 1; seed <= 80; seed++) {
+      const random = mulberry32(seed);
+      const nestedRate = random() < 0.5 ? 0 : 0.05;
+      const marker = random() < 0.5 ? undefined : '"contextBoundaryKind":"rezet"';
+      const units = [...`{bad ${noisyMarker(random, marker)}`].map((unit) =>
+        random() < nestedRate ? NESTED[Math.floor(random() * NESTED.length)] + unit : unit
+      );
+      const fragments: string[] = [];
+      let current = "";
+      for (const unit of units) {
+        current += unit;
+        if (random() < 0.1) {
+          fragments.push(current);
+          current = "";
+        }
+      }
+      fragments.push(current + " tail");
+      const coreStart = bytes(message("old")) + 1;
+      const run = fragments.join("\n");
+      const before = coreStart + bytes(run) + 1;
+      const results = new Set<string>();
+      for (let k = 0; k < 12; k++) {
+        const target = coreStart + Math.floor(random() * (before - coreStart + 1));
+        const ids = await providerIds([
+          message("old"),
+          ...fragments,
+          newestRowForEdge(before, target),
+        ]);
+        results.add(ids.join());
+      }
+      expect([...results], `seed ${seed}: ${JSON.stringify(fragments)}`).toHaveLength(1);
+      // The cross-row token rule is a superset of hasRawResetMarker on the joined run.
+      if (hasRawResetMarker(fragments.join("")))
+        expect([...results], `seed ${seed}`).toEqual(["new"]);
+      if ([...results][0] === "new") floors++;
+      else keeps++;
+    }
+    expect(floors).toBeGreaterThanOrEqual(3);
+    expect(keeps).toBeGreaterThanOrEqual(3);
+  }, 120_000);
+
+  test("F3 property: an oversized compaction boundary in any JSON spelling starts the epoch", async () => {
+    const whitespace = ["", "", " ", "\t", "\r", " \t "];
+    for (let seed = 1; seed <= 30; seed++) {
+      const random = mulberry32(seed);
+      const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
+      const key = [..."compactionBoundary"]
+        .map((c) => {
+          if (random() >= 0.25) return c;
+          const code = c.charCodeAt(0).toString(16).padStart(4, "0");
+          return "\\u" + (random() < 0.5 ? code : code.toUpperCase());
+        })
+        .join("");
+      const spelling = `"${key}"${pick(whitespace)}:${pick(whitespace)}true`;
+      const row = boundary(pad).replace('"compactionBoundary":true', spelling);
+      expect(row).toContain(spelling);
+      const keyStart = bytes(message("old")) + 1 + bytes(row.slice(0, row.indexOf(spelling)));
+      const target = keyStart + Math.floor(random() * (bytes(spelling) + 1));
+      const before = bytes(message("old")) + 1 + bytes(row) + 1;
+      const ids = await providerIds([message("old"), row, newestRowForEdge(before, target)]);
+      expect(ids, `seed ${seed}: ${spelling}`).toEqual(["boundary", "new"]);
+    }
+  }, 120_000);
 });

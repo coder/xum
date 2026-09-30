@@ -11,13 +11,14 @@ src/node/services/historyScanner.ts): rows arrive newest first, one at a time.
 * `runStart` is `unreadableRunEnd`: the depth of the newest row of the current unreadable run.
 * An unreadable row floors the read when the probe accepts, or when the row's own text holds
   local evidence (`hasRawResetMarker` / re-serialization inside `classifyHistoryScanRow`).
-  **Oversized rows are never classified**, so for them only the probe counts.
+  Oversized rows are never classified; their local evidence comes from the streaming raw probe
+  (`createReverseRawHistoryProbe`), which applies `hasRawResetMarker`'s rule to the whole row.
 * `left` counts the boundaries still to skip (`boundaryCount++ === skip`).
 
-`locate_eq_spec` proves the streaming locator equals the whole-run rule of `Spec.lean`, under
-one hypothesis about the concrete recognizers (`OversizedSound`): whatever local evidence an
-oversized row has must also be visible to the token probe. `oversized_gap` shows the hypothesis
-is necessary: without it the locator misses a floor the rule requires.
+`locate_eq_spec` proves the streaming locator equals the whole-run rule of `Spec.lean`. Before
+the fix, oversized rows' local evidence was ignored and the equality needed a hypothesis about
+the concrete recognizers (whatever local evidence an oversized row has is also visible to the
+token probe); `oversized_gap` shows that pre-fix locator misses a floor the rule requires.
 -/
 
 namespace HistoryLocator
@@ -29,7 +30,7 @@ def scan : Nat → Option Nat → List Tok → Nat → List Row → Option Nat
     | .unreadable =>
       let pat' := feed pat r.toks.reverse
       let start := runStart.getD d
-      if pat' = [] ∨ (r.oversized = false ∧ r.localEv = true) then some start
+      if pat' = [] ∨ r.localEv = true then some start
       else scan left (some start) pat' (d + 1) rest
     | .plain => scan left none revPattern (d + 1) rest
     | .resetMarker => some (d + 1)
@@ -41,11 +42,6 @@ def scan : Nat → Option Nat → List Tok → Nat → List Row → Option Nat
 
 /-- `findProviderHistoryStart` on the rows of one file (newest first). -/
 def locate (skip : Nat) (rows : List Row) : Option Nat := scan skip none revPattern 0 rows
-
-/-- The recognizers agree on oversized rows: local evidence implies probe-visible tokens. -/
-def OversizedSound (rows : List Row) : Prop :=
-  ∀ r ∈ rows, r.kind = .unreadable → r.oversized = true → r.localEv = true →
-    markerPattern.Sublist r.toks
 
 /-- Tokens of a newest-first run in the order the reverse probe consumes them. -/
 def revToks (run : List Row) : List Tok := (run.map fun r => r.toks.reverse).flatten
@@ -92,7 +88,7 @@ theorem pick_evs_evidence (rows : List Row) :
     · exact ih k a (d + 1) _ (h.snoc r)
     · simp [flush, h]; cases k <;> rfl
 
-theorem scan_eq_evs (rows : List Row) (hsound : OversizedSound rows) :
+theorem scan_eq_evs (rows : List Row) :
     ∀ (left : Nat) (run : Run) (rs : Option Nat) (pat : List Tok) (d : Nat),
       Inv run rs pat → scan left rs pat d rows = pick left (evs run d rows) := by
   induction rows with
@@ -102,7 +98,6 @@ theorem scan_eq_evs (rows : List Row) (hsound : OversizedSound rows) :
     cases left <;> rfl
   | cons r rest ih =>
     intro left run rs pat d hinv
-    have hsound' : OversizedSound rest := fun x hx => hsound x (List.mem_cons_of_mem _ hx)
     -- Unreadable row joining the collected run `R` that starts at depth `a`.
     have key : ∀ a R, pat = feed revPattern (revToks R) → ¬RunEvidence R → rs.getD d = a →
         r.kind = .unreadable →
@@ -115,28 +110,24 @@ theorem scan_eq_evs (rows : List Row) (hsound : OversizedSound rows) :
       · rename_i hdet
         symm
         apply pick_evs_evidence
-        rcases hdet with hacc | ⟨_, hl⟩
+        rcases hdet with hacc | hl
         · rw [hpat'] at hacc
           exact Or.inr ((probe_run_iff _).1 hacc)
         · exact Or.inl ⟨r, by simp, hl⟩
       · rename_i hdet
-        apply ih hsound'
+        apply ih
         refine ⟨rfl, hpat', ?_⟩
         rintro (⟨x, hx, hl⟩ | hs)
         · rcases List.mem_append.1 hx with hx | hx
           · exact hno (Or.inl ⟨x, hx, hl⟩)
           · simp at hx; subst hx
-            cases hov : x.oversized
-            · exact hdet (Or.inr ⟨hov, hl⟩)
-            · apply hdet; left
-              rw [hpat', probe_run_iff, runToks_snoc]
-              exact (hsound x (by simp) hk hov hl).trans (List.sublist_append_left _ _)
+            exact hdet (Or.inr hl)
         · exact hdet (Or.inl (by rw [hpat']; exact (probe_run_iff _).2 hs))
     -- Readable rows: the collected run has no evidence, so it contributes no event.
     have readable : r.kind ≠ .unreadable →
         scan left rs pat d (r :: rest) = pick left (rowEvent r d ++ evs none (d + 1) rest) := by
       intro hk
-      have hih := ih hsound'
+      have hih := ih
       cases hkr : r.kind with
       | unreadable => exact absurd hkr hk
       | plain =>
@@ -169,42 +160,58 @@ theorem scan_eq_evs (rows : List Row) (hsound : OversizedSound rows) :
     · rw [readable hk]
       simp [evs, hk, flush_eq_nil hinv]
 
-/-- **Streaming = whole-run rule.** Under `OversizedSound`, the row-by-row locator returns exactly
-the specified cut, so it inherits `privacy`, `specCut_greatest` and `exhausted_private`. -/
-theorem locate_eq_spec (skip : Nat) (rows : List Row) (h : OversizedSound rows) :
+/-- **Streaming = whole-run rule.** The row-by-row locator returns exactly the specified cut, so
+it inherits `privacy`, `specCut_greatest` and `exhausted_private`. -/
+theorem locate_eq_spec (skip : Nat) (rows : List Row) :
     locate skip rows = specCut skip rows :=
-  scan_eq_evs rows h skip none none revPattern 0 ⟨rfl, rfl⟩
+  scan_eq_evs rows skip none none revPattern 0 ⟨rfl, rfl⟩
 
-theorem locate_privacy (skip : Nat) (rows : List Row) (h : OversizedSound rows) (c : Nat)
+theorem locate_privacy (skip : Nat) (rows : List Row) (c : Nat)
     (hc : locate skip rows = some c) :
     ∀ i r, rows[i]? = some r →
       (r.kind = .resetFloor → c ≤ i) ∧
       (r.kind = .resetMarker → c ≤ i + 1) ∧
       (r.kind = .unreadable → r.localEv = true → c ≤ i) :=
-  privacy skip rows c (by rw [← locate_eq_spec skip rows h]; exact hc)
+  privacy skip rows c (by rw [← locate_eq_spec skip rows]; exact hc)
 
-theorem locate_greatest (skip : Nat) (rows : List Row) (h : OversizedSound rows) (c : Nat)
+theorem locate_greatest (skip : Nat) (rows : List Row) (c : Nat)
     (hc : locate skip rows = some c) :
     Admissible skip rows c ∧ ∀ c', Admissible skip rows c' → c' ≤ c :=
-  specCut_greatest skip rows c (by rw [← locate_eq_spec skip rows h]; exact hc)
+  specCut_greatest skip rows c (by rw [← locate_eq_spec skip rows]; exact hc)
 
-/-! ## The hypothesis is necessary (finding F1)
+/-! ## Finding F1: the pre-fix locator
 
-Newest first: a readable row, an oversized unreadable row whose text holds the reset needle only
-once separators are removed (e.g. a NUL inside the key, so no clean key token), and an older
-readable row. The rule floors at the oversized row (cut 1: keep only the newest row); the locator
-never classifies oversized rows, the probe sees no key token, and it keeps all three rows. -/
+Before the fix the locator ignored oversized rows' local evidence: only the probe counted for
+them. `scanPreFix` is `scan` with that condition. Newest first: a readable row, an oversized
+unreadable row whose text holds the reset needle only once separators are removed (e.g. a NUL
+inside the key, so no clean key token), and an older readable row. The rule floors at the
+oversized row (cut 1: keep only the newest row); the pre-fix locator keeps all three rows. The
+fixed `locate` agrees with the rule here, as `locate_eq_spec` says for every input. -/
+def scanPreFix : Nat → Option Nat → List Tok → Nat → List Row → Option Nat
+  | _, _, _, _, [] => none
+  | left, runStart, pat, d, r :: rest =>
+    match r.kind with
+    | .unreadable =>
+      let pat' := feed pat r.toks.reverse
+      let start := runStart.getD d
+      if pat' = [] ∨ (r.oversized = false ∧ r.localEv = true) then some start
+      else scanPreFix left (some start) pat' (d + 1) rest
+    | .plain => scanPreFix left none revPattern (d + 1) rest
+    | .resetMarker => some (d + 1)
+    | .resetFloor => some d
+    | .boundary =>
+      match left with
+      | 0 => some (d + 1)
+      | k + 1 => scanPreFix k none revPattern (d + 1) rest
+
 def gapRows : List Row :=
   [ { kind := .plain },
     { kind := .unreadable, toks := [.colon, .value], localEv := true, oversized := true },
     { kind := .plain } ]
 
 theorem gap_spec : specCut 0 gapRows = some 1 := by decide
-theorem gap_locate : locate 0 gapRows = none := by decide
+theorem gap_locate : locate 0 gapRows = some 1 := by decide
 
-theorem oversized_gap : ¬OversizedSound gapRows ∧ locate 0 gapRows ≠ specCut 0 gapRows := by
-  refine ⟨fun h => ?_, by decide⟩
-  have := h (gapRows[1]'(by decide)) (by simp [gapRows]) rfl rfl rfl
-  exact absurd this (by decide)
+theorem oversized_gap : scanPreFix 0 none revPattern 0 gapRows ≠ specCut 0 gapRows := by decide
 
 end HistoryLocator

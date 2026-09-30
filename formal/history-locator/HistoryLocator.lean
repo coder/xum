@@ -14,8 +14,8 @@ Main results:
 
 * `Spec.lean`: `specCut` (intended rule), `specCut_greatest` (privacy + maximality),
   `privacy` (row-level), `exhausted_private`.
-* `Scanner.lean`: `locate_eq_spec` (streaming locator = rule, under `OversizedSound`),
-  `oversized_gap` (the hypothesis is necessary: finding F1).
+* `Scanner.lean`: `locate_eq_spec` (streaming locator = rule), `oversized_gap` (the pre-fix
+  locator, which ignored oversized rows' local evidence, misses a floor: finding F1).
 * `Probe.lean`: `feed_append`, `feed_eq_nil_iff`, `probe_accepts_iff`.
 * `Chunked.lean`: `chunkedRows_eq`, `wholeRows_encode`, `chunked_locate_eq`.
 
@@ -25,10 +25,14 @@ Abstraction gaps (checked by src/node/services/historyScanner.formal.test.ts ins
   the boundary predicates to put each row in the right class.
 * The probe works on abstract tokens. The TS regex matches bytes in overlapping windows and
   keeps `SESSION_HISTORY_RESET_PROBE_CHARS - 1` characters of overlap; a token split over a
-  window edge is assumed to be matched once. Separator characters are not modeled: a token broken
-  by a separator is simply absent from `toks` (finding F2 lives there).
-* Oversized compaction boundary recovery (`recoverOversizedBoundary`) is not modeled: an
-  oversized row is `unreadable` or, when recovered, `boundary` (finding F3 lives there).
+  window edge is assumed to be matched once. Separator characters are not modeled: `toks` are the
+  tokens the TS matcher finds after skipping separators inside and between token characters
+  (finding F2 was a token broken by a separator missing from them).
+* Oversized compaction boundary recovery is not modeled: an oversized row is `unreadable` or,
+  when recovered, `boundary`. The TS re-reads an oversized row whose raw text holds the boundary
+  needle in any JSON spelling and lets the classifier decide (finding F3 was a spelling missed).
+* An oversized row's `localEv` is computed by a streaming raw probe instead of the classifier;
+  the model assumes it equals `hasRawResetMarker` on the whole row.
 * Byte offsets are replaced by depths; empty rows are dropped (they change no state).
 * `skip` is counted down (`left`) instead of up (`boundaryCount++ === skip`).
 * The `visit` stop (status suffix reads) and `includeReadableResetFloor` are out of scope.

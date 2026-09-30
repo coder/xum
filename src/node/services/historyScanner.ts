@@ -38,23 +38,7 @@ import { log } from "./log";
 import { projectStatusHistoryRow } from "./historyStatusProjection";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
-const resetTokenPattern = new RegExp(
-  [resetKeyToken, resetValueToken, ":"]
-    .map((token) =>
-      [...token]
-        .map((character) => {
-          const hex = character
-            .charCodeAt(0)
-            .toString(16)
-            .padStart(4, "0")
-            .replace(/[a-f]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
-          return `(?:${character}|\\\\(?:u${hex}|x${hex.slice(2)}))`;
-        })
-        .join("")
-    )
-    .join("|"),
-  "g"
-);
+const RESET_PROBE_TOKENS = [resetKeyToken, resetValueToken, ":"] as const;
 
 export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
   return (
@@ -100,6 +84,211 @@ function stripEscapedResetSeparators(text: string): string {
   return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
 }
 
+// ── Separator-aware matching on latin1 text ───────────────────────────────────────────────
+// addHistoryResetProbe and the oversized-row raw probe read rows as latin1 (one character per
+// byte) and match markers in place instead of rewriting the text: separators are skipped where
+// they occur, reproducing hasRawResetMarker's single pass (remove raw separators, then escaped
+// separators once, then decode escapes) without a replace over every space of a giant row.
+
+/**
+ * RESET_SEPARATOR as latin1 bytes: the UTF-8 encoding of every separator code point. A
+ * separator's lead byte is never a UTF-8 continuation byte, so its complete encoding always
+ * decodes as that separator, and UTF-8 decoding yields a separator only from its encoding
+ * (invalid bytes become U+FFFD). All separators are in the BMP.
+ */
+const [RAW_SEPARATOR_BYTE, MULTIBYTE_SEPARATORS] = (() => {
+  const single = new Uint8Array(256);
+  const multi = new Set<string>();
+  let bmp = "";
+  for (let cp = 0; cp < 0x10000; cp++)
+    if (cp < 0xd800 || cp > 0xdfff) bmp += String.fromCharCode(cp);
+  for (const match of bmp.matchAll(RESET_SEPARATORS)) {
+    const bytes = Buffer.from(match[0], "utf8");
+    if (bytes.length === 1) single[bytes[0]] = 1;
+    else multi.add(bytes.toString("latin1"));
+  }
+  assert(single[0x20] === 1 && multi.size > 0, "reset separators cover ASCII and multibyte");
+  return [single, multi] as const;
+})();
+const MULTIBYTE_SEPARATOR_LEAD = new Uint8Array(256);
+for (const bytes of MULTIBYTE_SEPARATORS) MULTIBYTE_SEPARATOR_LEAD[bytes.charCodeAt(0)] = 1;
+
+/** Length of the raw separator starting at `i`, or 0. */
+function rawSeparatorLength(text: string, i: number): number {
+  const c = text.charCodeAt(i);
+  if (RAW_SEPARATOR_BYTE[c] === 1) return 1;
+  if (MULTIBYTE_SEPARATOR_LEAD[c] !== 1) return 0;
+  if (MULTIBYTE_SEPARATORS.has(text.slice(i, i + 2))) return 2;
+  return MULTIBYTE_SEPARATORS.has(text.slice(i, i + 3)) ? 3 : 0;
+}
+
+function skipRawSeparators(text: string, i: number): number {
+  for (let length = rawSeparatorLength(text, i); length > 0; length = rawSeparatorLength(text, i))
+    i += length;
+  return i;
+}
+
+function hexValue(c: number): number {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;
+  const lower = c | 0x20;
+  return lower >= 0x61 && lower <= 0x66 ? lower - 0x57 : -1;
+}
+
+/**
+ * End of the escaped separator starting at the backslash at `i`, or -1: a
+ * stripEscapedResetSeparators shape, with raw separators allowed between its characters because
+ * they are removed first.
+ */
+function escapedSeparatorEnd(text: string, i: number): number {
+  let j = skipRawSeparators(text, i + 1);
+  const kind = text.charCodeAt(j) | 0x20;
+  if (kind === 0x75) {
+    for (let zero = 0; zero < 2; zero++) {
+      j = skipRawSeparators(text, j + 1);
+      if (text.charCodeAt(j) !== 0x30) return -1;
+    }
+  } else if (kind !== 0x78) return -1;
+  j = skipRawSeparators(text, j + 1);
+  const high = text.charCodeAt(j);
+  j = skipRawSeparators(text, j + 1);
+  const low = text.charCodeAt(j);
+  const separator =
+    high === 0x30 || high === 0x31 || high === 0x38 || high === 0x39
+      ? hexValue(low) >= 0
+      : high === 0x32
+        ? low === 0x30
+        : high === 0x37 && (low | 0x20) === 0x66;
+  return separator ? j + 1 : -1;
+}
+
+/** Skip raw and escaped separators (single pass: an escaped separator exposed by removing another is not one). */
+function skipSeparators(text: string, i: number): number {
+  for (;;) {
+    const raw = rawSeparatorLength(text, i);
+    if (raw > 0) i += raw;
+    else if (text.charCodeAt(i) !== 0x5c) return i;
+    else {
+      const end = escapedSeparatorEnd(text, i);
+      if (end < 0) return i;
+      i = end;
+    }
+  }
+}
+
+let unitEnd = 0;
+/**
+ * Decoded character of the unit at `i`, ending at unitEnd: a character, or a \uXXXX / \xXX escape
+ * with separators allowed inside (they are removed before decoding). -1 past the text.
+ */
+function readUnit(text: string, i: number): number {
+  const c = text.charCodeAt(i);
+  if (Number.isNaN(c)) return -1;
+  unitEnd = i + 1;
+  if (c !== 0x5c) return c;
+  let j = skipSeparators(text, i + 1);
+  const kind = text.charCodeAt(j);
+  const digits = kind === 0x75 ? 4 : kind === 0x78 ? 2 : 0;
+  let value = 0;
+  for (let digit = 0; digit < digits; digit++) {
+    j = skipSeparators(text, j + 1);
+    const hex = hexValue(text.charCodeAt(j));
+    if (hex < 0) return 0x5c;
+    value = value * 16 + hex;
+  }
+  if (digits === 0) return 0x5c;
+  unitEnd = j + 1;
+  return value;
+}
+
+/**
+ * End of `literal` read unit by unit from the unit starting at `start`, separators skipped
+ * between units, or -1. For any unit start, this matches exactly where the text after
+ * hasRawResetMarker's transforms holds `literal`.
+ */
+function matchResetLiteral(text: string, start: number, literal: string): number {
+  // Exact fast reject for the common case, a unit followed by a plain byte (no separator or
+  // escape can start there): then the first two units are single characters, except that a
+  // backslash starts an escape only before u or x. Scanning giant rows depends on this.
+  const c = text.charCodeAt(start);
+  const next = text.charCodeAt(start + 1);
+  if (next !== 0x5c && RAW_SEPARATOR_BYTE[next] !== 1 && MULTIBYTE_SEPARATOR_LEAD[next] !== 1) {
+    if (c === 0x5c) {
+      if (next !== 0x75 && next !== 0x78 && literal.charCodeAt(0) !== 0x5c) return -1;
+    } else if (c !== literal.charCodeAt(0)) return -1;
+    else if (literal.length > 1 && next !== literal.charCodeAt(1)) return -1;
+  }
+  let i = start;
+  for (let k = 0; k < literal.length; k++) {
+    if (k > 0) i = skipSeparators(text, i);
+    if (readUnit(text, i) !== literal.charCodeAt(k)) return -1;
+    i = unitEnd;
+  }
+  return i;
+}
+
+/**
+ * Global regex matching exactly the positions where matchResetLiteral passes its fast reject
+ * for one of `literals`: a literal's first character followed by its second or by a byte that is
+ * not plain, or a backslash followed by u, x or a byte that is not plain. Every other position
+ * fails (readUnit reads its own character there, and literals never start with a backslash), so
+ * a caller visiting only these positions misses no match, while the regex engine skips the plain
+ * text in between natively.
+ */
+function resetCandidatePattern(literals: readonly string[]): RegExp {
+  const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
+  let notPlain = byte(0x5c);
+  for (let c = 0; c < 256; c++)
+    if (RAW_SEPARATOR_BYTE[c] === 1 || MULTIBYTE_SEPARATOR_LEAD[c] === 1) notPlain += byte(c);
+  const alternatives = new Set([`${byte(0x5c)}[${byte(0x75)}${byte(0x78)}${notPlain}]`]);
+  for (const literal of literals) {
+    assert(literal.length > 0 && literal.charCodeAt(0) !== 0x5c, "literal starts plainly");
+    const first = byte(literal.charCodeAt(0));
+    alternatives.add(
+      literal.length === 1 ? first : `${first}[${byte(literal.charCodeAt(1))}${notPlain}]`
+    );
+  }
+  return new RegExp([...alternatives].join("|"), "g");
+}
+const RAW_PROBE_CANDIDATES = resetCandidatePattern([
+  SESSION_HISTORY_RESET_NEEDLE,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
+]);
+const TOKEN_PROBE_CANDIDATES = resetCandidatePattern(RESET_PROBE_TOKENS);
+
+/**
+ * `text` from `start` with every separator run shortened to a form the matcher reads alike, until
+ * at least `limit` characters are out. A run of raw separators is dropped, or kept as one space
+ * next to a byte >= 0x80 (a join could otherwise form a multibyte separator); a run holding an
+ * escaped separator becomes \x00 (an escaped separator admits only raw ones inside). This bounds
+ * retained overlap without changing what a later join can match.
+ */
+function canonicalizeSeparators(text: string, start: number, limit: number): string {
+  let out = "";
+  let i = start;
+  while (i < text.length && out.length < limit) {
+    let j = i;
+    let escaped = false;
+    for (;;) {
+      const raw = rawSeparatorLength(text, j);
+      if (raw > 0) j += raw;
+      else if (text.charCodeAt(j) !== 0x5c) break;
+      else {
+        const end = escapedSeparatorEnd(text, j);
+        if (end < 0) break;
+        j = end;
+        escaped = true;
+      }
+    }
+    if (j === i) out += text[i++];
+    else {
+      if (escaped) out += "\\x00";
+      else if (text.charCodeAt(i - 1) >= 0x80 || text.charCodeAt(j) >= 0x80) out += " ";
+      i = j;
+    }
+  }
+  return out;
+}
+
 /** Streaming counterpart of hasRawResetMarker; each transform keeps only a partial escape. */
 export function createRawHistoryResetProbe() {
   const decoder = new StringDecoder("utf8");
@@ -126,6 +315,48 @@ export function createRawHistoryResetProbe() {
     finish() {
       pushText(decoder.end(), true);
       return found;
+    },
+  };
+}
+
+/**
+ * The raw reset check (hasRawResetMarker) for one row pushed last segment first, as the provider
+ * locator reads rows. `boundary` says whether the same transforms of the row hold the compaction
+ * boundary needle, which covers every JSON spelling of that pair (escaped key characters,
+ * whitespace around the colon). Retains only a canonical head (canonicalizeSeparators) of the
+ * text pushed so far, so memory stays bounded for any row size.
+ */
+function createReverseRawHistoryProbe() {
+  const resetNeedle = SESSION_HISTORY_RESET_NEEDLE;
+  const boundaryNeedle = SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE;
+  // A needle unit spans at most 10 canonical characters: a \u00XX escape plus a \x00 run.
+  const keep = 10 * Math.max(resetNeedle.length, boundaryNeedle.length);
+  let head = "";
+  let reset = false;
+  let boundary = false;
+  return {
+    push(bytes: Buffer) {
+      // Reset evidence decides the row (a floor), so stop once it is found.
+      if (reset) return;
+      const raw = bytes.toString("latin1");
+      const text = raw + head;
+      // Anchors in `head` were tried when their segment arrived, with all text to their right.
+      const candidates = RAW_PROBE_CANDIDATES;
+      candidates.lastIndex = 0;
+      for (let found = candidates.exec(text); found !== null; found = candidates.exec(text)) {
+        const i = found.index;
+        if (i >= raw.length) break;
+        candidates.lastIndex = i + 1;
+        if (matchResetLiteral(text, i, resetNeedle) >= 0) {
+          reset = true;
+          return;
+        }
+        boundary ||= matchResetLiteral(text, i, boundaryNeedle) >= 0;
+      }
+      head = canonicalizeSeparators(text, 0, keep).slice(0, keep);
+    },
+    finish(): { reset: boolean; boundary: boolean } {
+      return { reset, boundary };
     },
   };
 }
@@ -185,26 +416,53 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // Keep only token-sized raw overlap plus a three-stage recognizer.
   // Junk of arbitrary size may separate intact tokens in unreadable rows;
   // the locator resets this state after every readable row (settle()).
+  //
+  // Separators are skipped inside and between token characters as hasRawResetMarker removes them
+  // (F2): rows join without their LF, so a CR or space before it, or a separator anywhere inside a
+  // token, must not hide the token. Tokens are matched at every `"`, `:` and backslash, so they may
+  // overlap. Retained overlap is canonical (canonicalizeSeparators): long separator runs never
+  // push a token half out of it. #5212 plans to skip matching for segments with no byte a token
+  // can start with; anchors are exactly those bytes, but a segment without them can still finish a
+  // token that starts in the retained overlap (forward) or supply its tail (reverse).
   const raw = segment.toString("latin1");
-  const previousLength = state.resetProbe.length;
-  const probe = reverse ? raw + state.resetProbe : state.resetProbe + raw;
-  const tokens = [...probe.matchAll(resetTokenPattern)];
+  const window = reverse ? raw + state.resetProbe : state.resetProbe + raw;
+  // Tokens starting at or after `edge` (reverse) or ending at or before it (forward) lie in the
+  // already-consumed overlap: counted before, and replaying them could manufacture the opposite
+  // token ordering.
+  const edge = reverse ? raw.length : state.resetProbe.length;
+  const tokens: string[] = [];
+  const candidates = TOKEN_PROBE_CANDIDATES;
+  candidates.lastIndex = 0;
+  for (let found = candidates.exec(window); found !== null; found = candidates.exec(window)) {
+    const i = found.index;
+    if (reverse && i >= edge) break;
+    candidates.lastIndex = i + 1;
+    for (const token of RESET_PROBE_TOKENS) {
+      const end = matchResetLiteral(window, i, token);
+      if (end >= 0 && (reverse || end > edge)) tokens.push(token);
+    }
+  }
   if (reverse) tokens.reverse();
-  for (const match of tokens) {
-    // Ignore tokens entirely inside already-consumed overlap. Otherwise
-    // replaying overlap could manufacture the opposite token ordering.
-    if (reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength)
-      continue;
-    const token = decodeResetEscapes(match[0]);
+  for (const token of tokens) {
     if (token === (reverse ? resetValueToken : resetKeyToken)) {
       if (state.resetStage === 0) state.resetStage = 1;
     } else if (token === ":" && state.resetStage === 1) state.resetStage = 2;
     else if (token === (reverse ? resetKeyToken : resetValueToken) && state.resetStage === 2)
       state.possibleReset = true;
   }
-  state.resetProbe = reverse
-    ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
-    : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+  const keep = SESSION_HISTORY_RESET_PROBE_CHARS - 1;
+  if (reverse) state.resetProbe = canonicalizeSeparators(window, 0, keep).slice(0, keep);
+  else {
+    // Canonicalize a tail long enough to yield `keep` characters.
+    for (let from = Math.max(0, window.length - 2 * keep); ; ) {
+      const tail = canonicalizeSeparators(window, from, Infinity);
+      if (tail.length >= keep || from === 0) {
+        state.resetProbe = tail.slice(-keep);
+        break;
+      }
+      from = Math.max(0, window.length - 2 * (window.length - from));
+    }
+  }
 }
 
 /** Feed one oversized row in reverse byte ranges, using the provider's unchanged recognizer. */
@@ -353,6 +611,13 @@ export function hasUnreadableHistoryResetEvidence(rows: readonly Buffer[]): bool
     addHistoryResetProbe(probe, raw, true);
     if (raw.length <= SESSION_HISTORY_MAX_LINE_BYTES)
       classifyHistoryScanRow(raw.toString("utf8"), probe);
+    else {
+      // The provider locator also checks an oversized row's own text for the marker (F1).
+      const local = createRawHistoryResetProbe();
+      for (let offset = 0; offset < raw.length; offset += SESSION_HISTORY_SCAN_CHUNK_BYTES)
+        local.push(raw.subarray(offset, offset + SESSION_HISTORY_SCAN_CHUNK_BYTES));
+      probe.possibleReset ||= local.finish();
+    }
     if (probe.possibleReset) return true;
   }
   return false;
@@ -373,8 +638,6 @@ type ProviderHistoryStart =
   | ({ kind: "start" } & LocatedHistoryBoundary)
   | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number }
   | { kind: "stopped" };
-
-const COMPACTION_BOUNDARY_NEEDLE = Buffer.from(SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE);
 
 /** One non-empty row delivered by the provider locator, newest first. */
 interface ScannedHistoryRow {
@@ -409,11 +672,11 @@ export async function findProviderHistoryStart(
   let unreadableRunEnd: number | null = null;
   let oldestBoundary: LocatedHistoryBoundary | null = null;
   let boundaryCount = 0;
-  // Oversized rows are not buffered, so remember whether their raw bytes could hold the compact
-  // boundary marker. Segments arrive in reverse order: carry the start of the later segment so a
-  // marker split across two segments is still seen.
-  let boundaryMarkerSeen = false;
-  let boundaryMarkerCarry = Buffer.alloc(0);
+  // Oversized rows are never classified, so their segments also stream through the raw probe:
+  // hasRawResetMarker for the row's own reset evidence (a floor, F1), and any JSON spelling of the
+  // compaction boundary pair to pick rows worth re-reading (F3). Rows up to the line limit get
+  // both from the classifier instead.
+  let oversizedProbe: ReturnType<typeof createReverseRawHistoryProbe> | null = null;
   // `parts` holds the row's segments in arrival (reverse file) order while the row fits
   // SESSION_HISTORY_MAX_LINE_BYTES. Their reset-probe calls are deferred (readPlainHistoryRow,
   // point 1): replayed in arrival order by readBufferedRow when the fast path declines, or flushed
@@ -422,30 +685,35 @@ export async function findProviderHistoryStart(
     for (const segment of segments) addHistoryResetProbe(probe, segment, true);
   };
   const add = (bytes: Buffer) => {
-    if (!boundaryMarkerSeen) {
-      const window =
-        boundaryMarkerCarry.length > 0 ? Buffer.concat([bytes, boundaryMarkerCarry]) : bytes;
-      boundaryMarkerSeen = window.includes(COMPACTION_BOUNDARY_NEEDLE);
-      boundaryMarkerCarry = Buffer.from(window.subarray(0, COMPACTION_BOUNDARY_NEEDLE.length - 1));
-    }
     size += bytes.length;
     if (size <= SESSION_HISTORY_MAX_LINE_BYTES) {
       parts.push(bytes);
       return;
     }
+    if (!oversizedProbe) {
+      oversizedProbe = createReverseRawHistoryProbe();
+      for (const part of parts) oversizedProbe.push(part);
+    }
     feedProbe(parts);
     parts = [];
     addHistoryResetProbe(probe, bytes, true);
+    oversizedProbe.push(bytes);
   };
   /**
    * An oversized compaction boundary behaves exactly like a normal-size one (#4551): rotation
    * already treats it as the epoch start, and skipping it here would bring the sealed epoch back
    * from the archive. Re-read just that row and classify it unchanged, accepting only a durable
-   * compaction boundary; ordinary oversized rows and reset evidence keep today's handling (the
-   * classifier treats reset keys in oversized text as ambiguous, i.e. an unreadable floor).
+   * compaction boundary. The raw probe picks candidates in any JSON spelling (F3), so the classifier
+   * decides; memory stays bounded by SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES as before. Reset
+   * evidence keeps the row an unreadable floor (the classifier also treats reset keys in oversized
+   * text as ambiguous).
    */
   const recoverOversizedBoundary = async (start: number): Promise<MuxMessage | null> => {
-    if (!boundaryMarkerSeen || probe.possibleReset) return null;
+    assert(oversizedProbe, "an oversized row streams through the raw probe");
+    const evidence = oversizedProbe.finish();
+    // Local reset evidence floors an oversized row exactly like a classified one.
+    probe.possibleReset ||= evidence.reset;
+    if (!evidence.boundary || probe.possibleReset) return null;
     if (size > SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES) {
       log.warn("Oversized compaction boundary row exceeds the recovery ceiling", {
         offset: start,
@@ -525,16 +793,13 @@ export async function findProviderHistoryStart(
     parts = [];
     size = 0;
     rowEnd = start;
-    boundaryMarkerSeen = false;
-    boundaryMarkerCarry = Buffer.alloc(0);
+    oversizedProbe = null;
     return null;
   };
   /** Synchronous for rows up to the line limit: only an oversized row may re-read the file. */
   const deliver = (start: number): Delivered | Promise<Delivered> => {
     if (size === 0) {
       rowEnd = start;
-      boundaryMarkerSeen = false;
-      boundaryMarkerCarry = Buffer.alloc(0);
       return null;
     }
     if (size > SESSION_HISTORY_MAX_LINE_BYTES)
