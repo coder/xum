@@ -16,25 +16,37 @@ describe("HomeClutterReminderSource", () => {
     await fs.rm(home, { recursive: true, force: true });
   });
 
-  const poll = (source: HomeClutterReminderSource, toolSucceeded = true) =>
-    source.poll({ toolName: "bash", toolSucceeded, now: Date.now() });
+  const poll = (
+    source: HomeClutterReminderSource,
+    result: { toolSucceeded?: boolean; resultCanCarryNotifications?: boolean } = {}
+  ) =>
+    source.poll({
+      toolName: "bash",
+      toolSucceeded: result.toolSucceeded ?? true,
+      resultCanCarryNotifications: result.resultCanCarryNotifications ?? true,
+      now: Date.now(),
+    });
 
-  test("a failed tool call does not use up the turn's reminder", async () => {
+  test("keeps the reminder until a tool result can actually carry it", async () => {
     const turn = new HomeClutterReminderSource({ homeDir: home });
+    expect(await poll(turn)).toEqual([]); // a first tool call with nothing new
 
-    // The notification wrapper drops notifications from failed calls, so nothing may be spent.
+    // Failed calls and string results (e.g. MCP tools) drop notifications, so nothing is spent.
     await fs.mkdir(path.join(home, "from-failed-call"));
-    expect(await poll(turn, false)).toEqual([]);
+    expect(await poll(turn, { toolSucceeded: false })).toEqual([]);
+    await fs.mkdir(path.join(home, "from-string-result"));
+    expect(await poll(turn, { resultCanCarryNotifications: false })).toEqual([]);
 
     const next = await poll(turn);
     expect(next).toHaveLength(1);
     expect(next[0].content).toContain("~/from-failed-call");
+    expect(next[0].content).toContain("~/from-string-result");
   });
 
-  test("tells the model once per turn, starting from the turn's first tool call", async () => {
+  test("tells the model once per turn", async () => {
     const turn = new HomeClutterReminderSource({ homeDir: home });
+    expect(await poll(turn)).toEqual([]); // a first tool call with nothing new
 
-    // Created during the first tool call: the baseline was taken when the turn started.
     await fs.mkdir(path.join(home, "perf-runs"));
     const first = await poll(turn);
     expect(first).toHaveLength(1);

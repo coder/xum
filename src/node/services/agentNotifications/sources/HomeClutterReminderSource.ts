@@ -18,21 +18,7 @@ import type {
 // Every tool result waits for this scan, so a slow or stalled home dir (network/FUSE mount)
 // must never hold results back; a skipped poll just defers detection to the next tool call.
 const SNAPSHOT_TIMEOUT_MS = 250;
-
-async function snapshotWithin(
-  roots: readonly ClutterWatchRoot[],
-  timeoutMs: number
-): Promise<ClutterSnapshot | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
-  });
-  try {
-    return await Promise.race([snapshotClutterRoots(roots), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+const MAX_LOGGED_ENTRIES = 5;
 
 /**
  * Tells the model, at most once per turn, that new entries appeared directly in the shared home
@@ -48,8 +34,14 @@ export class HomeClutterReminderSource implements NotificationSource {
   private readonly homeDir: string;
   private readonly workspaceId: string | undefined;
   private readonly roots: ClutterWatchRoot[];
-  private baseline: Promise<ClutterSnapshot | null>;
-  /** Detected but not yet delivered (a failed tool call cannot carry notifications). */
+  /** Latest completed snapshot; null until the first scan finishes. */
+  private baseline: ClutterSnapshot | null = null;
+  /**
+   * At most one scan runs at a time. readdir cannot be cancelled, so on a stalled filesystem a
+   * timed-out scan stays in flight and later polls skip instead of piling up more reads.
+   */
+  private inFlight: Promise<ClutterSnapshot> | null = null;
+  /** Detected but not yet delivered to the model. */
   private readonly pending = new Set<string>();
   private emitted = false;
 
@@ -58,39 +50,83 @@ export class HomeClutterReminderSource implements NotificationSource {
     this.workspaceId = args.workspaceId;
     this.roots = getClutterWatchRoots(args.homeDir);
     // Start now (turn start) so entries created by the first tool call are not in the baseline.
-    this.baseline = snapshotWithin(this.roots, SNAPSHOT_TIMEOUT_MS);
+    this.startScan();
+  }
+
+  /** Starts a scan and records it as the in-flight one; the caller checks the slot is free. */
+  private startScan(): void {
+    assert(this.inFlight == null, "a clutter scan is already in flight");
+    const scan = snapshotClutterRoots(this.roots);
+    this.inFlight = scan;
+    // A scan that outlived its timeout frees the slot whenever it finally settles.
+    const release = () => this.releaseScan(scan);
+    scan.then(release, release);
+  }
+
+  private releaseScan(scan: Promise<ClutterSnapshot>): void {
+    if (this.inFlight === scan) this.inFlight = null;
+  }
+
+  /** Resolves with the scan, or null if it does not finish within the timeout. */
+  private async awaitScan(scan: Promise<ClutterSnapshot>): Promise<ClutterSnapshot | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), SNAPSHOT_TIMEOUT_MS);
+    });
+    try {
+      const result = await Promise.race([scan, timeout]);
+      // Release synchronously so the next scan can start right away (the settle callback
+      // above may not have run yet at this point).
+      if (result != null) this.releaseScan(scan);
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async poll(ctx: NotificationPollContext): Promise<AgentNotification[]> {
     assert(typeof ctx.toolName === "string", "toolName must be a string");
 
-    const before = await this.baseline;
-    const after = await snapshotWithin(this.roots, SNAPSHOT_TIMEOUT_MS);
-    if (after == null) {
-      // Timed out: keep the old baseline so nothing created meanwhile is lost.
+    if (this.baseline == null && this.inFlight != null) {
+      // The turn-start scan is the baseline; give it the same bounded wait.
+      this.baseline = await this.awaitScan(this.inFlight);
+    }
+    if (this.inFlight != null) {
+      // A previous scan is still stuck; do not pile up more reads behind it.
       return [];
     }
-    this.baseline = Promise.resolve(after);
+    this.startScan();
+    const scan = this.inFlight;
+    assert(scan != null, "startScan must record the in-flight scan");
+    const after = await this.awaitScan(scan);
+    if (after == null) {
+      // Timed out: keep the old baseline so nothing created meanwhile is lost, and try again
+      // on the next tool call.
+      return [];
+    }
+    const before = this.baseline;
+    this.baseline = after;
     if (before == null) {
-      // No usable baseline yet (the turn-start scan timed out); start comparing from here.
       return [];
     }
 
     const added = diffClutterSnapshots(this.roots, before, after);
     if (added.length > 0) {
-      // Always log, so the new-entry rate stays measurable even after the model was told.
-      log.info("New entries outside the workspace appeared during a turn", {
+      // Debug level and a bounded sample: this runs on every poll that sees new entries.
+      log.debug("New entries outside the workspace appeared during a turn", {
         workspaceId: this.workspaceId,
         afterTool: ctx.toolName,
-        entries: added,
+        count: added.length,
+        sample: added.slice(0, MAX_LOGGED_ENTRIES),
       });
       if (!this.emitted) {
         for (const entry of added) this.pending.add(entry);
       }
     }
-    // The notification wrapper drops notifications of failed tool calls, so only a successful
-    // call may consume the once-per-turn reminder.
-    if (this.emitted || this.pending.size === 0 || !ctx.toolSucceeded) {
+    // Only a result that will actually carry the notification may consume the once-per-turn
+    // reminder: failed calls and non-object results (strings from MCP tools) drop it.
+    const canDeliver = ctx.toolSucceeded && ctx.resultCanCarryNotifications !== false;
+    if (this.emitted || this.pending.size === 0 || !canDeliver) {
       return [];
     }
     this.emitted = true;

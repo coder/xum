@@ -73,7 +73,10 @@ import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
 import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
-import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
+import {
+  attachModelOnlyToolNotifications,
+  canCarryModelOnlyToolNotifications,
+} from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
 import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
@@ -88,7 +91,6 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as os from "os";
-import * as path from "path";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -505,6 +507,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
         notifications = await engine.pollAfterToolCall({
           toolName,
           toolSucceeded: true,
+          resultCanCarryNotifications: canCarryModelOnlyToolNotifications(result),
           now: Date.now(),
         });
       } catch (error) {
@@ -530,12 +533,6 @@ function wrapToolExecuteWithModelOnlyNotifications(
   return wrappedTool;
 }
 
-/** HOME as tool processes see it: project secrets are merged after xumEnv and may override it. */
-function getEffectiveChildHome(config: ToolConfiguration): string {
-  const secretHome = config.secrets?.HOME;
-  return secretHome != null && path.isAbsolute(secretHome) ? secretHome : os.homedir();
-}
-
 function wrapToolsWithModelOnlyNotifications(
   tools: Record<string, Tool>,
   config: ToolConfiguration
@@ -552,7 +549,9 @@ function wrapToolsWithModelOnlyNotifications(
     ...(config.xumEnv?.XUM_SCRATCH_DIR != null
       ? [
           new HomeClutterReminderSource({
-            homeDir: getEffectiveChildHome(config),
+            // The host user's real home is where clutter piles up. A HOME override (project
+            // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
+            homeDir: os.homedir(),
             workspaceId: config.workspaceId,
           }),
         ]
