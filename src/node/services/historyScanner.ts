@@ -935,10 +935,9 @@ export type HistoryPage =
 
 export async function readProviderHistoryWindow(
   paths: Record<HistoryArtifact, string>,
-  caps: HistoryWindowCaps,
-  onBytesRead?: (bytes: number) => void
+  caps: HistoryWindowCaps
 ): Promise<HistoryWindow> {
-  const tail = await readActiveEpochTail(paths, caps, undefined, undefined, onBytesRead);
+  const tail = await readActiveEpochTail(paths, caps, undefined);
   assert(tail.kind !== "before-epoch", "a window has no cursor");
   return tail.kind === "page" ? { ...tail, kind: "window" } : { kind: "not-windowable" };
 }
@@ -959,12 +958,11 @@ export type HistorySinceRange =
 export async function readProviderHistorySince(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps,
-  since: { floor: number; anchor: number },
-  onBytesRead?: (bytes: number) => void
+  since: { floor: number; anchor: number }
 ): Promise<HistorySinceRange> {
   assert(isNonNegativeInteger(since.floor), "since floor must be a sequence");
   assert(isNonNegativeInteger(since.anchor), "since anchor must be a sequence");
-  const tail = await readActiveEpochTail(paths, caps, undefined, since, onBytesRead);
+  const tail = await readActiveEpochTail(paths, caps, undefined, since);
   return tail.kind === "page"
     ? { kind: "range", messages: tail.messages }
     : { kind: "not-in-range" };
@@ -972,16 +970,13 @@ export async function readProviderHistorySince(
 
 /**
  * The newest rows of the active epoch that precede the `before` row (or EOF when undefined), or
- * with `since`, the rows from EOF back to the floor row. `onBytesRead` reports the bytes the scan
- * covered (each file from its lowest visited row to its end) plus oversized-row re-reads, for the
- * onChat replay log (#4961).
+ * with `since`, the rows from EOF back to the floor row.
  */
 function readActiveEpochTail(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps,
   before: number | undefined,
-  since?: { floor: number; anchor: number },
-  onBytesRead?: (bytes: number) => void
+  since?: { floor: number; anchor: number }
 ): Promise<HistoryPage> {
   assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
   assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
@@ -1003,10 +998,7 @@ function readActiveEpochTail(
       const file = files.get(artifact);
       if (!file) continue;
       const fileRows: ScannedHistoryRow[] = [];
-      // Rows arrive newest first, so the last one visited is the lowest offset scanned.
-      let lowestVisited = file.size;
       const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
-        lowestVisited = row.start;
         if (before !== undefined && row.message) {
           const sequence = row.message.metadata?.historySequence;
           if (!isNonNegativeInteger(sequence)) unpageable = true;
@@ -1040,7 +1032,6 @@ function readActiveEpochTail(
         // to there is in full replay, and rows past the budget were counted, never kept.
         return overBudget || unpageable;
       });
-      onBytesRead?.(file.size - lowestVisited);
       const from = location.kind === "start" ? location.offset : 0;
       // A cursor row below the file's epoch start is not a row of full replay.
       if (cursor?.file === file && cursor.start < from) unpageable = true;
@@ -1057,7 +1048,6 @@ function readActiveEpochTail(
     }
     const messages: MuxMessage[] = [];
     for (let i = kept.length - 1; i >= 0; i--) {
-      if (kept[i].row.size > SESSION_HISTORY_MAX_LINE_BYTES) onBytesRead?.(kept[i].row.size);
       const message = await projectScannedRow(kept[i].file, kept[i].row, false);
       if (message) messages.push(message);
     }

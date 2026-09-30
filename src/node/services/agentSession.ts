@@ -3074,11 +3074,6 @@ export class AgentSession {
     // reason on the caught-up payload plus a log line with row counts.
     let downgradeReason: OnChatDowngradeReason | undefined;
     let epochRowCount: number | undefined;
-    // Replay log (#4961): rows the history read returned, whether it was a windowed read, and
-    // whether it covered the whole active epoch (only then is epochRowCount known).
-    let historyRows: number | undefined;
-    let windowedRead = false;
-    let readCoversEpoch = false;
     let windowSeed: CaughtUpMessage["windowSeed"];
     let sentRowCount = 0;
     let emittedReplayMessages = false;
@@ -3289,19 +3284,11 @@ export class AgentSession {
         maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
         maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
       };
-      const onBytesRead = (bytes: number) => {
-        historyBytesRead += bytes;
-      };
       const readReplayWindow = async (): Promise<Result<MuxMessage[]> | undefined> => {
-        const window = await replayTimer.timeLocked("historyLockWait", "historyRead", (onLock) =>
-          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps, {
-            onLockAcquired: onLock,
-            onBytesRead,
-          })
+        const window = await replayTimer.time("historyRead", () =>
+          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps)
         );
         if (!window.success || window.data.kind !== "window") return undefined;
-        windowedRead = true;
-        readCoversEpoch = window.data.reachedEpochStart;
         if (window.data.reachedEpochStart) return Ok(window.data.messages);
         const floor = oldestSequenceOf(window.data.messages);
         if (
@@ -3317,16 +3304,15 @@ export class AgentSession {
       };
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      const readFullHistory = () => {
-        windowedRead = false;
-        readCoversEpoch = true;
-        return replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
+      const readFullHistory = () =>
+        replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
           this.historyService.getHistoryFromLatestBoundary(this.workspaceId, 0, {
             onLockAcquired,
-            onBytesRead,
+            onBytesRead: (bytes) => {
+              historyBytesRead += bytes;
+            },
           })
         );
-      };
       let historyResult: Result<MuxMessage[]> | undefined;
       // True when history is a windowed client's since range, not the active epoch.
       let sinceRange = false;
@@ -3335,19 +3321,20 @@ export class AgentSession {
         const anchor = mode.cursor.history.historySequence;
         const range =
           isNonNegativeInteger(floor) && isNonNegativeInteger(anchor)
-            ? await replayTimer.timeLocked("historyLockWait", "historyRead", (onLock) =>
+            ? await replayTimer.time("historyRead", () =>
                 this.historyService.getHistorySinceFromLatestBoundary(
                   this.workspaceId,
                   windowCaps,
-                  { floor, anchor },
-                  { onLockAcquired: onLock, onBytesRead }
+                  {
+                    floor,
+                    anchor,
+                  }
                 )
               )
             : undefined;
         if (range?.success && range.data.kind === "range") {
           historyResult = Ok(range.data.messages);
           sinceRange = true;
-          windowedRead = true;
         } else
           downgradeReason = range?.success === false ? "history-read-failed" : "outside-window";
       }
@@ -3364,8 +3351,7 @@ export class AgentSession {
 
       if (historyResult.success) {
         let history = historyResult.data;
-        historyRows = history.length;
-        epochRowCount = readCoversEpoch ? history.length : undefined;
+        epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
         // A windowed client whose range was not read has already downgraded (downgradeReason).
@@ -3454,9 +3440,7 @@ export class AgentSession {
             const downgrade = (await readReplayWindow()) ?? (await readFullHistory());
             if (!downgrade.success) throw new Error(downgrade.error);
             history = downgrade.data;
-            // Rows, bytes and phase times all add up over both reads.
-            historyRows = (historyRows ?? 0) + history.length;
-            epochRowCount = readCoversEpoch ? history.length : undefined;
+            epochRowCount = history.length;
             oldestHistorySequence = oldestSequenceOf(history);
             anchorFingerprint = undefined;
           }
@@ -3671,9 +3655,6 @@ export class AgentSession {
         replayMode,
         ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
         epochRowCount,
-        historyRows,
-        windowed: windowedRead,
-        reachedEpochStart: readCoversEpoch,
         sentRowCount,
         historyBytesRead,
         streamReplayed,

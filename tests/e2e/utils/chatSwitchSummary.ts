@@ -40,12 +40,7 @@ export interface ChatSwitchServerReplay {
   requestedMode?: string;
   replayMode?: string;
   downgradeReason?: string;
-  /** Omitted when a windowed read stopped short of the epoch start (#4961). */
   epochRowCount?: number;
-  /** Rows the history read returned: the epoch, a window, or a since range (#4961). */
-  historyRows?: number;
-  windowed?: boolean;
-  reachedEpochStart?: boolean;
   sentRowCount?: number;
   historyBytesRead?: number;
   streamReplayed?: boolean;
@@ -98,10 +93,6 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
   const server = record.server;
   const sum = (pick: (replay: ChatSwitchServerReplay) => number | undefined) =>
     server.length === 0 ? null : server.reduce((total, replay) => total + (pick(replay) ?? 0), 0);
-  // Unknown (not zero) when any replay lacks the count: a windowed read that stopped short of
-  // the epoch start omits epochRowCount, and logs from before #4961 PR4a have no historyRows.
-  const sumKnown = (pick: (replay: ChatSwitchServerReplay) => number | undefined) =>
-    server.some((replay) => pick(replay) === undefined) ? null : sum(pick);
   const phaseNames = new Set(server.flatMap((replay) => Object.keys(replay.phasesMs)));
   const phases: Record<string, number | null> = {};
   for (const phase of phaseNames) {
@@ -119,8 +110,7 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
     "server.totalMs": sum((replay) => replay.totalMs),
     ...phases,
     "server.sentRowCount": sum((replay) => replay.sentRowCount),
-    "server.epochRowCount": sumKnown((replay) => replay.epochRowCount),
-    "server.historyRows": sumKnown((replay) => replay.historyRows),
+    "server.epochRowCount": sum((replay) => replay.epochRowCount),
     "server.historyBytesRead": sum((replay) => replay.historyBytesRead),
   };
 }

@@ -1466,11 +1466,10 @@ export class HistoryService {
   private async withRecoveredHistoryResultLock<T>(
     workspaceId: string,
     errorPrefix: string,
-    operation: () => Promise<Result<T>>,
-    onLockAcquired?: () => void
+    operation: () => Promise<Result<T>>
   ): Promise<Result<T>> {
     try {
-      return await this.withRecoveredHistoryLock(workspaceId, operation, onLockAcquired);
+      return await this.withRecoveredHistoryLock(workspaceId, operation);
     } catch (error) {
       return Err(`${errorPrefix}: ${getErrorMessage(error)}`);
     }
@@ -2607,8 +2606,7 @@ export class HistoryService {
    */
   async getHistoryWindowFromLatestBoundary(
     workspaceId: string,
-    caps: HistoryWindowCaps,
-    observer?: HistoryReadObserver
+    caps: HistoryWindowCaps
   ): Promise<Result<HistoryWindow>> {
     return this.withRecoveredHistoryResultLock(
       workspaceId,
@@ -2622,12 +2620,10 @@ export class HistoryService {
               chat: this.getChatHistoryPath(workspaceId),
               archive: this.getChatArchivePath(workspaceId),
             },
-            caps,
-            observer?.onBytesRead
+            caps
           )
         );
-      },
-      observer?.onLockAcquired
+      }
     );
   }
 
@@ -2655,8 +2651,7 @@ export class HistoryService {
   async getHistorySinceFromLatestBoundary(
     workspaceId: string,
     caps: HistoryWindowCaps,
-    since: { floor: number; anchor: number },
-    observer?: HistoryReadObserver
+    since: { floor: number; anchor: number }
   ): Promise<Result<HistorySinceRange>> {
     return this.withRecoveredHistoryResultLock(
       workspaceId,
@@ -2667,9 +2662,8 @@ export class HistoryService {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
         };
-        return Ok(await readProviderHistorySince(paths, caps, since, observer?.onBytesRead));
-      },
-      observer?.onLockAcquired
+        return Ok(await readProviderHistorySince(paths, caps, since));
+      }
     );
   }
 
