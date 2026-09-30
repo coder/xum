@@ -35,14 +35,13 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
@@ -198,7 +197,7 @@ import {
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
@@ -207,7 +206,8 @@ import {
   buildPlanInstructions,
   buildContextWindowSection,
   buildStreamSystemContext,
-  formatMcpWarningPrefix,
+  formatMcpWarningSection,
+  measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
 } from "./turnContextAssembler";
@@ -333,8 +333,6 @@ export interface StreamMessageOptions {
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
-  /** Candidate admission previews tool availability only; executions keep the real goal service. */
-  prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -1615,25 +1613,18 @@ export class TurnRequestBuilder {
     const advisorToolEligible =
       advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
 
-    // Goals graduated to GA: tools are gated solely on the workspace's
-    // current goal status + agent capability, not on an experiment flag.
-    let currentGoalForTools: GoalRecordV1 | null = null;
-    if (workspaceGoalService) {
-      currentGoalForTools = await workspaceGoalService.getGoal(workspaceId);
-    }
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       metadata.goalDefaults ?? null
     );
-    const goalToolAvailability = getGoalToolAvailability({
-      goalStatus:
-        opts.prospectiveGoalStatusForToolAvailability !== undefined
-          ? opts.prospectiveGoalStatusForToolAvailability
-          : (currentGoalForTools?.status ?? null),
+    // Goal tools are registered whenever a goal service exists and gate at
+    // execution time on these per-turn inputs plus the live goal status, so the
+    // tool block does not change when the goal does (prompt caching, #5247).
+    const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       allowAgentSetGoal,
       agentInheritanceChain,
-    });
+    };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)
     // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
@@ -2443,7 +2434,7 @@ export class TurnRequestBuilder {
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
-      enableGoalTools: goalToolAvailability,
+      goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
       // RLM family messaging: gate on the flags persisted on the task record at
@@ -2614,10 +2605,10 @@ export class TurnRequestBuilder {
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    const mcpWarningPrefix = mcpStats
-      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+    const mcpWarningSection = mcpStats
+      ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
-    if (mcpWarningPrefix != null) {
+    if (mcpWarningSection != null) {
       workspaceLog.warn("MCP servers failed to start", {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
@@ -2690,6 +2681,13 @@ export class TurnRequestBuilder {
         // Intuition's internal memory_read must not bypass a policy denying memory.
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
 
+        // Same predicate and model as the tools cache breakpoint
+        // (applyCacheControlToTools), so "caches the tools block" and "keeps the
+        // tool list stable" cannot disagree (#5250).
+        const toolSearchPromptCacheActive = supportsAnthropicCache(
+          seed.rawModelString,
+          seed.providersConfig
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2698,6 +2696,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2710,6 +2709,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -2744,8 +2744,10 @@ export class TurnRequestBuilder {
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        if (mcpWarningPrefix != null) {
-          attemptSystem = mcpWarningPrefix + attemptSystem;
+        // Volatile sections (hot memories, this warning, the context-window
+        // ids) go last so the stable prefix stays cacheable (#5251).
+        if (mcpWarningSection != null) {
+          attemptSystem = attemptSystem + mcpWarningSection;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -2771,6 +2773,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied
@@ -2799,24 +2802,36 @@ export class TurnRequestBuilder {
         // re-render it without rerunning assembly middleware or tool construction.
         const baseSystem = attemptSystem;
         const baseSystemTokens = attemptSystemTokens;
+        let attemptVolatileSystemSuffixLength = 0;
         const renderContextWindowSection = async () => {
           const ids = tokenBudgetEnabled
             ? resolveContextWindowIds(options.sourceMessages)
             : undefined;
           attemptSystem = baseSystem;
           attemptSystemTokens = baseSystemTokens;
-          if (ids == null) return;
-          const section = `\n\n${buildContextWindowSection(ids)}`;
-          attemptSystem += section;
-          const tokenizer = await getTokenizerForModel(
-            seed.rawModelString,
-            seed.capabilityModelString
-          );
-          attemptSystemTokens += await tokenizer.countTokens(section);
+          const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
+          if (section != null) {
+            attemptSystem += section;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens += await tokenizer.countTokens(section);
+          }
+          // Re-measured on every render: the window section can change length.
+          attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
+            systemContext.hotMemoriesSection,
+            mcpWarningSection,
+            section,
+          ]);
         };
         await renderContextWindowSection();
 
-        if (options.initializeToolSearch && toolSearchRuntime?.state) {
+        // Also on fallbacks: a primary with prompt caching seeds nothing into
+        // its inactive state, so a fallback that turns deferral on must seed
+        // prior-turn activations itself. Seeding only adds names, so repeating
+        // it is harmless.
+        if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
             attemptProviderRequestMessages
@@ -2868,6 +2883,7 @@ export class TurnRequestBuilder {
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
+              volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
@@ -2907,6 +2923,7 @@ export class TurnRequestBuilder {
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
             systemMessage: attemptSystem,
+            systemVolatileSuffixLength: attemptVolatileSystemSuffixLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -3060,12 +3077,13 @@ export class TurnRequestBuilder {
       }
       const finalMessages = primaryRequest.messages;
       // Debug sinks pair systemMessage with the message list, so when the
-      // assembler embedded the system prompt as a leading cached row
-      // (engineSystem undefined), drop that row to keep the system prompt
-      // single-sourced in captures.
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures.
+      const leadingSystemRows = finalMessages.findIndex((message) => message.role !== "system");
       const debugViewMessages =
-        primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-          ? finalMessages.slice(1)
+        primaryRequest.engineSystem == null
+          ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
           : finalMessages;
       if (combinedAbortSignal.aborted)
         return {

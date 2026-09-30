@@ -27,6 +27,7 @@ import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
   assemblePromptPayload,
+  measureVolatileSystemSuffix,
   buildPlanInstructions,
   buildStreamSystemContext,
   prepareProviderRequestMessages,
@@ -504,6 +505,52 @@ describe("assemblePromptPayload", () => {
     });
   }
 
+  test("puts a volatile system tail after each provider's cached stable block", async () => {
+    const stable = "stable instructions";
+    const withTail = (tail: string) => ({
+      systemMessage: stable + tail,
+      volatileSystemSuffixLength: tail.length,
+    });
+    const openai = {
+      modelString: "openai:gpt-5.6-luna",
+      providerForMessages: "openai",
+      routeProvider: "openai",
+      providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+    };
+    const tails = ["\n\n[Warning: a]", "\n\n<hot_memories>b</hot_memories>"];
+
+    // The stable (cached) block is byte-identical whatever the tail says,
+    // and the tail block is delivered uncached right after it.
+    for (const tail of tails) {
+      const anthropic = await assemble({
+        modelString: "anthropic:claude-sonnet-4-5",
+        providerForMessages: "anthropic",
+        ...withTail(tail),
+      });
+      expect(anthropic.messages.slice(0, 2)).toEqual([
+        {
+          role: "system",
+          content: stable,
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+        { role: "system", content: tail },
+      ]);
+
+      const structured = await assemble({ ...openai, ...withTail(tail) });
+      expect(structured.system).toEqual([
+        {
+          role: "system",
+          content: stable,
+          providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } },
+        },
+        { role: "system", content: tail },
+      ]);
+
+      // No explicit breakpoints: one string, volatile text last.
+      expect((await assemble(withTail(tail))).system).toBe(stable + tail);
+    }
+  });
+
   test("injects an interrupted sentinel only when a partial assistant remains terminal", async () => {
     const partial = createMuxMessage("partial", "assistant", "working", { partial: true });
     const withoutFollowingUser = await assemble({
@@ -589,6 +636,33 @@ describe("assemblePromptPayload", () => {
     const payload = await assemble({ history: [snapshot, request], tagHistoryItemIds: true });
     expect(JSON.stringify(payload.messages)).not.toContain("[id: 11]");
     expect(JSON.stringify(payload.messages)).toContain("[id: 12]");
+  });
+});
+
+describe("measureVolatileSystemSuffix", () => {
+  const hot = "\n\n<hot_memories>h</hot_memories>";
+  const warning = "\n\n[Warning: w]";
+  const windowIds = "\n\n<context_window>c</context_window>";
+
+  test("covers the trailing run of known sections, skipping absent ones", () => {
+    expect(
+      measureVolatileSystemSuffix("base" + hot + warning + windowIds, [hot, warning, windowIds])
+    ).toBe((hot + warning + windowIds).length);
+    expect(measureVolatileSystemSuffix("base" + hot + windowIds, [hot, undefined, windowIds])).toBe(
+      (hot + windowIds).length
+    );
+    expect(measureVolatileSystemSuffix("base", [undefined, null, undefined])).toBe(0);
+  });
+
+  test("keeps sections that middleware moved or stripped in the stable part", () => {
+    // Middleware appended text after the warning: nothing trails any more.
+    expect(measureVolatileSystemSuffix("base" + hot + warning + " extra", [hot, warning])).toBe(0);
+    // The hot block was stripped (its separator stays): only the warning trails.
+    expect(measureVolatileSystemSuffix("base\n\n" + warning, [hot, warning])).toBe(warning.length);
+  });
+
+  test("never leaves an empty stable part", () => {
+    expect(measureVolatileSystemSuffix(hot + warning, [hot, warning])).toBe(0);
   });
 });
 

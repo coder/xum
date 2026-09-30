@@ -844,29 +844,109 @@ async function scanHistorySnapshot(
     const { file, rows, from } = scanned[s];
     onBytesRead?.(file.size - from);
     for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i];
-      if (row.start < from) continue;
-      if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) {
-        if (row.message) messages.push(row.message);
-        continue;
-      }
-      // The locator does not parse oversized rows, but the full read's tail projection does.
-      // allocUnsafe is safe only because a short read throws before any byte is decoded.
-      const buffer = Buffer.allocUnsafe(row.size);
-      const read = await file.handle.read(buffer, 0, buffer.length, row.start);
-      if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
-      try {
-        // Status only: cut the payloads it never reads before decoding (#4790).
-        const text =
-          (projectOversized ? projectStatusHistoryRow(buffer) : null) ?? buffer.toString("utf8");
-        const value: unknown = JSON.parse(text);
-        if (isReadableHistoryMessage(value)) messages.push(normalizePersistedMessage(value));
-      } catch {
-        // Same as the full read: unusable rows are not projected.
-      }
+      if (rows[i].start < from) continue;
+      const message = await projectScannedRow(file, rows[i], projectOversized);
+      if (message) messages.push(message);
     }
   }
   return messages;
+}
+
+/** A located row as the full read projects it: the locator's parse, or a re-read if oversized. */
+async function projectScannedRow(
+  file: HistorySnapshotFile,
+  row: ScannedHistoryRow,
+  projectOversized: boolean
+): Promise<MuxMessage | null> {
+  if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) return row.message;
+  // The locator does not parse oversized rows, but the full read's tail projection does.
+  // allocUnsafe is safe only because a short read throws before any byte is decoded.
+  const buffer = Buffer.allocUnsafe(row.size);
+  const read = await file.handle.read(buffer, 0, buffer.length, row.start);
+  if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+  try {
+    // Status only: cut the payloads it never reads before decoding (#4790).
+    const text =
+      (projectOversized ? projectStatusHistoryRow(buffer) : null) ?? buffer.toString("utf8");
+    const value: unknown = JSON.parse(text);
+    return isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null;
+  } catch {
+    // Same as the full read: unusable rows are not projected.
+    return null;
+  }
+}
+
+// ── Trailing window for onChat replay (#4961) ──────────────────────────────
+// Contract of readProviderHistoryWindow:
+// - It returns at most `maxRows` rows and `maxBytes` raw row bytes.
+// - It never returns a row that full replay (readProviderHistory) would drop: the window is
+//   always a suffix of that read.
+// - The window starts at a clean turn start: the first row after the previous turn's last
+//   assistant row, so a prompt's snapshot cluster always stays with its prompt. An active epoch
+//   that fits the budget is returned whole, from the epoch start.
+// - The only fallback: when the budget holds no clean turn start (one turn is longer than the
+//   window, or the newest row alone is over `maxBytes`), it returns "not-windowable" and the
+//   caller uses full replay.
+// How: the backward scan counts every row toward the budget (unreadable, oversized and malformed
+// rows too) and never classifies them. It keeps only rows within the budget, so a long corrupt
+// tail is never retained (#5220). The final pass projects those rows exactly as full replay does
+// (dropping malformed rows, re-reading oversized ones) and trims forward only, to the first clean
+// turn start. There is no backward extension.
+
+export interface HistoryWindowCaps {
+  maxRows: number;
+  maxBytes: number;
+}
+
+export type HistoryWindow =
+  | { kind: "window"; messages: MuxMessage[]; reachedEpochStart: boolean }
+  | { kind: "not-windowable" };
+
+export function readProviderHistoryWindow(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps
+): Promise<HistoryWindow> {
+  assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
+  assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
+  return withVerifiedHistorySnapshot(paths, async (files) => {
+    // Newest first, like scanHistorySnapshot: rows starting before a file's located start are
+    // not part of full replay, and the archive is read only after chat.jsonl is exhausted.
+    const kept: Array<{ file: HistorySnapshotFile; row: ScannedHistoryRow }> = [];
+    let rows = 0;
+    let bytes = 0;
+    let overBudget = false;
+    for (const artifact of ["chat", "archive"] as const) {
+      const file = files.get(artifact);
+      if (!file) continue;
+      const fileRows: ScannedHistoryRow[] = [];
+      const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
+        if (!overBudget && rows < caps.maxRows && bytes + row.size <= caps.maxBytes) {
+          rows++;
+          bytes += row.size;
+          fileRows.push(row);
+        } else overBudget = true;
+        // Monotonic: the locator honors the stop at the next readable row. Every row visited up
+        // to there is in full replay, and rows past the budget were counted, never kept.
+        return overBudget;
+      });
+      const from = location.kind === "start" ? location.offset : 0;
+      for (const row of fileRows) if (row.start >= from) kept.push({ file, row });
+      if (location.kind !== "exhausted" || overBudget) break;
+    }
+    const messages: MuxMessage[] = [];
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const message = await projectScannedRow(kept[i].file, kept[i].row, false);
+      if (message) messages.push(message);
+    }
+    // Within budget, the scan reached the epoch start (or read all history): the whole epoch.
+    if (!overBudget) return { kind: "window", messages, reachedEpochStart: true };
+    // Otherwise the oldest kept row's turn may begin before the budget: trim forward only.
+    const start = messages.findIndex(
+      (message, i) => i > 0 && message.role === "user" && messages[i - 1].role === "assistant"
+    );
+    if (start === -1) return { kind: "not-windowable" };
+    return { kind: "window", messages: messages.slice(start), reachedEpochStart: false };
+  });
 }
 
 /** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */

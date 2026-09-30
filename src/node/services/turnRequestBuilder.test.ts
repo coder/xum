@@ -276,6 +276,48 @@ describe("TurnRequestBuilder assembled preflight", () => {
     }
   });
 
+  it("applies the claude-encoding correction only when Token Budget is on", async () => {
+    // Same request and window for both encodings: its OpenAI-encoded estimate fits the 8100-token
+    // ceiling, while the corrected claude-encoded estimate does not (#5219).
+    const window = 10_800;
+    const request = (modelString: string) => {
+      const base = options(modelString);
+      return {
+        ...base,
+        providersConfig: {
+          ...base.providersConfig,
+          openai: {
+            ...base.providersConfig.openai,
+            models: [{ id: "custom-context-model", contextWindowTokens: window }],
+          },
+          anthropic: {
+            apiKeySet: true,
+            isEnabled: true,
+            isConfigured: true,
+            models: [{ id: "custom-claude", contextWindowTokens: window }],
+          },
+        },
+      };
+    };
+    const openai = await assembleBudgetCheckedPromptPayload(
+      request("openai:custom-context-model"),
+      {
+        enabled: true,
+      }
+    );
+    expect(openai.contextBudgetLimit).toBe(window);
+    const refused = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: true,
+    }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ContextBudgetExceededError);
+    // Token Budget off: no estimate gates the request, so it is sent unchanged.
+    const off = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: false,
+    });
+    expect(off.contextBudgetLimit).toBeUndefined();
+    expect(off.messages.length).toBeGreaterThan(0);
+  });
+
   it("rechecks the target limit when a large-window primary falls back to a smaller model", async () => {
     const primary = await assembleBudgetCheckedPromptPayload(
       options("openai:large-context-model"),

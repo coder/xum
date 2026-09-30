@@ -15,6 +15,11 @@ import {
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import {
+  CLAUDE_ENCODING_BUDGET_FACTOR,
+  CLAUDE_TOOL_OVERHEAD_TOKENS,
+  CLAUDE_TOOL_PREAMBLE_TOKENS,
+} from "@/constants/tokenizerCorrection";
 
 interface BudgetModel {
   model: string;
@@ -30,12 +35,24 @@ async function countBudgetInput(
   input: BudgetTokenCountInput,
   model: BudgetModel,
   framing: number,
-  ceiling?: number
+  ceiling?: number,
+  toolCount = 0
 ): Promise<number> {
   const tokenizer = await getTokenizerForModel(model.model, model.metadataModel, {
     requireRealEncoding: true,
   });
   assert(tokenizer.encoding !== "approx-4", "A hard budget guard requires a real encoding");
+  // The local `claude` encoding under-counts newer Claude tokenizers by up to ~1.55x (#5219), so
+  // every claude-encoded count is scaled by one measured factor and pays Anthropic's tool-use
+  // framing. Older Claude models are over-counted on purpose; see tokenizerCorrection.ts.
+  const claude = tokenizer.encoding === "claude";
+  const factor = claude ? CLAUDE_ENCODING_BUDGET_FACTOR : 1;
+  const toolFraming =
+    claude && toolCount > 0
+      ? CLAUDE_TOOL_PREAMBLE_TOKENS + CLAUDE_TOOL_OVERHEAD_TOKENS * toolCount
+      : 0;
+  // The factor scales encoded text only: fixedTokens already charges one token per omitted byte.
+  const textEstimate = (count: number) => Math.ceil(count * factor) + input.fixedTokens + framing;
   let encoded = 0;
   let chunks = 0;
   for (let start = 0; start < input.text.length; ) {
@@ -47,12 +64,13 @@ async function countBudgetInput(
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
     // This early exit returns a lower bound, not an exact request size.
-    if (ceiling != null && encoded + input.fixedTokens + framing > ceiling) return ceiling + 1;
+    if (ceiling != null && textEstimate(encoded) + toolFraming > ceiling) return ceiling + 1;
     start = end;
   }
   // Retain existing conservative ASCII estimates while correcting token-dense text.
   // Encoding failures propagate; never fall back silently to chars-per-token.
-  return Math.max(input.heuristicTokens, encoded + input.fixedTokens + framing);
+  // Tool framing is provider overhead neither text measure contains, so it is added after both.
+  return Math.max(input.heuristicTokens, textEstimate(encoded)) + toolFraming;
 }
 
 export function estimateFreshRequestTokensForModel(
@@ -100,13 +118,14 @@ export async function estimateAssembledRequestTokensForModel(
             payload.tools && name in payload.tools ? [[name, payload.tools[name]]] : []
           )
         );
-  const framing =
-    REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + Object.keys(tools ?? {}).length);
+  const toolCount = Object.keys(tools ?? {}).length;
+  const framing = REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + toolCount);
   const estimate = await countBudgetInput(
     prepareAssembledRequestTokenCount({ ...payload, tools }),
     options,
     framing,
-    hardCeiling
+    hardCeiling,
+    toolCount
   );
   return { estimate, hardCeiling };
 }

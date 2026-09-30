@@ -7,8 +7,11 @@ import {
   prepareAssembledRequestTokenCount,
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
+import type { JSONSchema7 } from "@ai-sdk/provider";
+import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
+  estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -583,4 +586,83 @@ describe("real-encoding budget guards", () => {
       ).catch((error: unknown) => error)
     ).toBe(failure);
   });
+});
+
+describe("claude-encoding budget correction (#5219)", () => {
+  // A tool-heavy request whose provider input tokens were recorded with Anthropic count_tokens.
+  const asTools = (
+    defs: ReadonlyArray<{ name: string; description: string; inputSchema: unknown }>
+  ) =>
+    Object.fromEntries(
+      defs.map((t) => [
+        t.name,
+        tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
+      ])
+    );
+  const estimate = async (target: string, request: AssembledRequestBudgetInput) =>
+    (
+      await estimateAssembledRequestTokensForModel(request, {
+        model: target,
+        modelContextLimit: 1e7,
+      })
+    )?.estimate ?? Number.NaN;
+  const direct = async (target: string, text: string) =>
+    (
+      await tokenizerModule.getTokenizerForModel(target, undefined, { requireRealEncoding: true })
+    ).countTokens(text);
+
+  test("a new-tokenizer Claude request is estimated at or above its recorded provider count", async () => {
+    const request = {
+      system: calibration.request.system,
+      messages: calibration.request.messages,
+      tools: asTools(calibration.request.tools),
+    };
+    expect(await estimate("anthropic:claude-opus-5-5", request)).toBeGreaterThanOrEqual(
+      calibration.providerInputTokens["claude-opus-5-5"]
+    );
+  });
+
+  test("claude-encoded counts are scaled; OpenAI-encoded counts are not", async () => {
+    // Token-dense text, so the encoded count (not the character heuristic) decides the estimate.
+    const text = "a0b1c2d3e4f5".repeat(1500);
+    const claude = "anthropic:claude-opus-5-5";
+    const openai = "openai:gpt-5.5-pro";
+    const claudeDirect = await direct(claude, text);
+    const openaiDirect = await direct(openai, text);
+    // Scaled well past the chunk and framing slack (a few percent) every estimate adds.
+    expect(
+      (await estimateToolResultTokensForModel(text, { model: claude })) - claudeDirect
+    ).toBeGreaterThan(claudeDirect / 3);
+    expect(
+      (await estimateToolResultTokensForModel(text, { model: openai })) - openaiDirect
+    ).toBeLessThanOrEqual(openaiDirect / 20);
+  });
+
+  test.each([
+    [
+      "claude-opus-5-5",
+      calibration.oneToolProviderTokens["claude-opus-5-5"],
+      calibration.smallToolsProviderTokens["claude-opus-5-5"],
+    ],
+    [
+      "claude-sonnet-4-6",
+      calibration.oneToolProviderTokens["claude-sonnet-4-6"],
+      calibration.smallToolsProviderTokens["claude-sonnet-4-6"],
+    ],
+  ] as const)(
+    "%s tool framing grows with the tool count and covers the provider's tool cost",
+    async (id, oneToolTokens, allToolsTokens) => {
+      const target = `anthropic:${id}`;
+      const bare = { messages: [{ role: "user", content: [{ type: "text", text: "x" }] }] };
+      const none = await estimate(target, bare);
+      const one = await estimate(target, {
+        ...bare,
+        tools: asTools(calibration.smallTools.slice(0, 1)),
+      });
+      const all = await estimate(target, { ...bare, tools: asTools(calibration.smallTools) });
+      expect(one - none).toBeGreaterThanOrEqual(oneToolTokens);
+      expect(all - none).toBeGreaterThanOrEqual(allToolsTokens);
+      expect(all).toBeGreaterThan(one);
+    }
+  );
 });

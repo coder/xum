@@ -31,6 +31,7 @@ import type {
 import {
   DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
+  SEEDED_MODEL_FALLBACKS,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -2025,10 +2026,12 @@ export class Config {
       // Completing the original seed pass claims defaultModelFallbacksSeeded,
       // which downgraded builds trust for their own (pre-5.1) default keys;
       // seed those legacy chains too so a downgrade keeps refusal fallback.
+      // SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added
+      // after these flags shipped reach fresh installs only (#5087).
       const seedDefaults =
         migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS }
-          : DEFAULT_MODEL_FALLBACKS;
+          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...SEEDED_MODEL_FALLBACKS }
+          : SEEDED_MODEL_FALLBACKS;
       const missingDefaults = Object.fromEntries(
         Object.entries(seedDefaults).filter(
           ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)

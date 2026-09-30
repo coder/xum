@@ -10,18 +10,31 @@ export interface ToolAvailabilityContext {
   parentWorkspaceId?: string | null;
 }
 
+/**
+ * Which goal tool operations are allowed right now. The goal tools themselves
+ * are always registered whenever a goal service exists, so the tool block stays
+ * byte-identical across turns for provider prompt caching (#5247). The tool
+ * handlers call this with the live goal status at execution time and refuse
+ * with a typed result when an operation is not allowed.
+ */
 export interface GoalToolAvailability {
   setGoal: boolean;
   getGoal: boolean;
   completeGoal: boolean;
 }
 
-export interface GoalToolAvailabilityContext {
-  goalStatus: GoalStatus | null;
+/** Per-turn inputs to the goal tool gates. Deliberately excludes goal status. */
+export interface GoalToolContext {
   parentWorkspaceId?: string | null;
   allowAgentSetGoal?: boolean;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
+
+export interface GoalToolAvailabilityContext extends GoalToolContext {
+  goalStatus: GoalStatus | null;
+}
+
+export type SetGoalRefusalReason = "sub_agent" | "agent_set_goal_disabled" | "read_only_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -31,12 +44,21 @@ const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
   "complete",
 ]);
 
+/** Why set_goal is refused in this turn, or null when it is allowed. */
+export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusalReason | null {
+  if (context.parentWorkspaceId != null) return "sub_agent";
+  if (context.allowAgentSetGoal !== true) return "agent_set_goal_disabled";
+  if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
+    return "read_only_agent";
+  }
+  return null;
+}
+
 export function getGoalToolAvailability(
   context: GoalToolAvailabilityContext
 ): GoalToolAvailability {
   const isEditingCapable = isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain);
-  const setGoal =
-    context.allowAgentSetGoal === true && context.parentWorkspaceId == null && isEditingCapable;
+  const setGoal = getSetGoalRefusalReason(context) === null;
   const hasActiveGoal =
     context.goalStatus != null && GOAL_TOOL_ACTIVE_STATUSES.has(context.goalStatus);
   const hasGoalReadableForReplacement =
