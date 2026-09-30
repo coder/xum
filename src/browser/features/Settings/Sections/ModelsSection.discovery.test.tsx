@@ -643,7 +643,7 @@ describe("ModelsSection Escape", () => {
 });
 
 describe("ModelsSection manual model IDs", () => {
-  test.each(["sonnet 4", "tab\tid", "bogus<script>"])(
+  test.each(["sonnet 4", "tab\tid"])(
     "rejects %p, flags the field until it is edited",
     async (modelId) => {
       const ui = await setup();
@@ -656,6 +656,16 @@ describe("ModelsSection manual model IDs", () => {
       expect(ui.input.hasAttribute("aria-invalid")).toBe(false);
     }
   );
+
+  test("accepts IDs with characters beyond the common set", async () => {
+    const ui = await setup();
+    await ui.type("vendor/model+fast#v2");
+    fireEvent.click(ui.add);
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["vendor/model+fast#v2"],
+    });
+  });
 });
 
 describe("ModelsSection table filter and paging", () => {

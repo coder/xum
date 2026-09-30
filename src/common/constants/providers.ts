@@ -247,9 +247,6 @@ export const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_DEFINITIONS) as Provider
  */
 export const CUSTOM_MODEL_HIDDEN_PROVIDERS: ReadonlySet<string> = new Set(["mux-gateway"]);
 
-/** Characters a typed custom model ID may use; covers catalogue forms like Bedrock `region/id:0`. */
-export const CUSTOM_MODEL_ID_PATTERN = /^[A-Za-z0-9._:/@-]+$/;
-
 /**
  * Display names for providers (proper casing for UI)
  * Derived from PROVIDER_DEFINITIONS - do not edit directly

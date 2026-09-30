@@ -43,10 +43,7 @@ import {
   MAX_RENDERED_MODELS,
   MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
 } from "@/common/constants/ui";
-import {
-  CUSTOM_MODEL_HIDDEN_PROVIDERS,
-  CUSTOM_MODEL_ID_PATTERN,
-} from "@/common/constants/providers";
+import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
 import {
   matchesModelQueryTokens,
   tokenizeModelQuery,
@@ -255,8 +252,10 @@ export function ModelsSection() {
   const handleAddModel = () => {
     const trimmedModelId = newModelId.trim();
     if (!lastProvider || !trimmedModelId) return;
-    if (!CUSTOM_MODEL_ID_PATTERN.test(trimmedModelId)) {
-      setError("Model IDs can only contain letters, numbers, and . - _ : / @");
+    // IDs stay free-form (providers reject unknown ones), but the field doubles
+    // as a search box, so whitespace means a query was submitted as an ID.
+    if (/\s/.test(trimmedModelId)) {
+      setError("Model IDs can't contain spaces");
       return;
     }
 
