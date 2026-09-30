@@ -2589,6 +2589,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides),
         { experimentsService }
       );
+      if (!options?.toolSearch) await harness.config.updateToolSearchEnabled(false);
       if (options?.toolSearch) {
         // A selectable agent that requires an MCP tool the other modes only allow.
         await fs.writeFile(
@@ -2635,7 +2636,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
-          experiments: { memory: options?.memory, toolSearch: options?.toolSearch },
+          experiments: { memory: options?.memory },
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};

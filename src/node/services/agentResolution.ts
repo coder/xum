@@ -551,7 +551,6 @@ export async function resolveAgentForStream(
           agentDiscoveryPath,
           agentDefinition.id,
           {
-            includeAgentPlugins,
             cache,
             skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           }
@@ -559,16 +558,16 @@ export async function resolveAgentForStream(
       )?.ui
     ).selectable;
   if (activeSelectable && effectiveToolPolicy !== undefined) {
-    const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
-      includeAgentPlugins,
-    }).catch(() => []);
+    const descriptors = await discoverAgentDefinitions(
+      agentDiscoveryRuntime,
+      agentDiscoveryPath
+    ).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
       descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
         if (descriptor.id === agentDefinition.id) return undefined;
         try {
           const readOptions = {
-            includeAgentPlugins,
             cache,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           };
@@ -601,7 +600,6 @@ export async function resolveAgentForStream(
             agentId: definition.id,
             agentDefinition: definition,
             workspaceId,
-            includeAgentPlugins,
             cache,
           });
           const toolPolicy = composeWithCallerPolicy(
@@ -609,12 +607,10 @@ export async function resolveAgentForStream(
               agents: chain,
               isSubagent: false,
               disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
-              advisorEnabled:
-                isAdvisorExperimentEnabled === true &&
-                resolveAdvisorEnabledForAgent(
-                  descriptor.id,
-                  cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
-                ),
+              advisorEnabled: resolveAdvisorEnabledForAgent(
+                descriptor.id,
+                cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
+              ),
             })
           );
           if (toolPolicy === undefined) return undefined;
