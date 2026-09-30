@@ -2542,7 +2542,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     async function streamWithRealAgentTools(
       xumHomePath: string,
       metadataOverrides: Partial<WorkspaceMetadata>,
-      agentIds: string[]
+      agentIds: string[],
+      options?: { memory?: boolean; toolSearch?: boolean }
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
@@ -2558,15 +2559,71 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         path.join(projectPath, ".xum", "agents", "scout.md"),
         "---\nname: Scout\ndescription: Hidden via base\nbase: explore\n---\n\nScout.\n"
       );
+      // An invalid regex in an agent nobody runs must not abort other sends.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "broken.md"),
+        '---\nname: Broken\ndescription: Invalid tool regex\ntools:\n  add:\n    - "["\n---\n\nBroken.\n'
+      );
+      // Selectable, full tools except memory.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "forgetful.md"),
+        "---\nname: Forgetful\ndescription: No memory\nbase: exec\ntools:\n  remove:\n    - memory\n---\n\nForget.\n"
+      );
       const workspaceId = "workspace-stable-agent-tools";
+      let experimentsService: ExperimentsService | undefined;
+      if (options?.memory) {
+        experimentsService = new ExperimentsService({
+          telemetryService: new TelemetryService(xumHomePath),
+          xumHome: xumHomePath,
+        });
+        spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+          (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        );
+      }
       const harness = createHarness(
         xumHomePath,
-        createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides)
+        createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides),
+        { experimentsService }
       );
+      if (options?.toolSearch) {
+        // A selectable agent that requires an MCP tool the other modes only allow.
+        await fs.writeFile(
+          path.join(projectPath, ".xum", "agents", "tracker.md"),
+          "---\nname: Tracker\ndescription: Needs issues\nbase: exec\ntools:\n  require:\n    - tracker_list_issues\n---\n\nTrack.\n"
+        );
+        const mcpTools: Record<string, Tool> = {
+          tracker_list_issues: tool({
+            description: "List issues",
+            inputSchema: jsonSchema({ type: "object" }),
+            execute: () => Promise.resolve({}),
+          }),
+        };
+        harness.service.turnRequestBuilderBindings.mcpServerManager = {
+          listServers: () => Promise.resolve({}),
+          getToolsForWorkspace: () =>
+            Promise.resolve({
+              tools: mcpTools,
+              promptDescriptors: [],
+              stats: {
+                totalTools: 1,
+                activeServerCount: 1,
+                failedServerCount: 0,
+                failedServerNames: [],
+              },
+            }),
+        } as unknown as MCPServerManager;
+      }
+      if (options?.memory) {
+        harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+          harness.config,
+          new MemoryMetaService(xumHomePath)
+        );
+      }
       // Real agent resolution and tool assembly: the advertised block is under test.
       harness.getToolsForModelSpy.mockRestore();
       spyOn(agentResolution, "resolveAgentForStream").mockRestore();
       const toolsByAgent: Record<string, Record<string, Tool>> = {};
+      const deferredByAgent: Record<string, string[]> = {};
       for (const agentId of agentIds) {
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
@@ -2574,11 +2631,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
+          experiments: { memory: options?.memory, toolSearch: options?.toolSearch },
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
+        deferredByAgent[agentId] = [
+          ...(harness.startStreamCalls.at(-1)?.toolSearchState?.deferredToolNames ?? []),
+        ].sort();
       }
-      return { toolsByAgent, projectPath };
+      return { toolsByAgent, deferredByAgent, projectPath, harness };
     }
 
     const shape = (tools: Record<string, Tool>) =>
@@ -2640,6 +2701,39 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         success: false,
         error: "Tool 'propose_plan' is not allowed in exec mode. Switch agents to use it.",
       });
+    });
+
+    it("keeps memory-dependent behavior on the active agent's policy", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, harness } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec", "forgetful"],
+        { memory: true }
+      );
+      const { memory, intuition, ...execWithoutMemory } = toolsByAgent.exec;
+      expect(memory).toBeDefined();
+      expect(intuition).toBeDefined();
+      // Memory's description carries the memory index, so an agent denied
+      // memory gets no refusal stub, and intuition (reads memory) goes too.
+      expect(shape(toolsByAgent.forgetful)).toBe(shape(execWithoutMemory));
+      // No hot memories or memory/intuition guidance for the agent without memory.
+      expect(harness.streamSystemContextMemoryToolFlags.at(-1)).toBe(false);
+      expect(harness.streamSystemContextIntuitionFlags.at(-1)).toBe(false);
+    });
+
+    it("does not defer a tool that one switchable agent requires", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, deferredByAgent } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec", "tracker"],
+        { toolSearch: true }
+      );
+      expect(toolsByAgent.exec.tracker_list_issues).toBeDefined();
+      expect(deferredByAgent.exec).not.toContain("tracker_list_issues");
+      expect(deferredByAgent.exec).toEqual(deferredByAgent.tracker);
+      expect(shape(toolsByAgent.exec)).toBe(shape(toolsByAgent.tracker));
     });
 
     it.each([

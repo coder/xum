@@ -24,7 +24,11 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  applyToolPolicyToNames,
+  buildRequiredToolPatterns,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
@@ -624,7 +628,12 @@ export async function resolveAgentForStream(
                 ),
             })
           );
-          return toolPolicy === undefined ? undefined : { id: descriptor.id, toolPolicy };
+          if (toolPolicy === undefined) return undefined;
+          // An invalid tools.add/remove regex would otherwise throw in tool
+          // assembly and abort every send, not just a switch to this agent.
+          applyToolPolicyToNames([], toolPolicy);
+          buildRequiredToolPatterns(toolPolicy);
+          return { id: descriptor.id, toolPolicy };
         } catch (error) {
           // An unreadable agent cannot be switched to either; its tools just stay out.
           workspaceLog.debug("Skipping agent for the stable tool set", {
