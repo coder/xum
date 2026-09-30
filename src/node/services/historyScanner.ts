@@ -1084,6 +1084,9 @@ export async function readProviderHistoryFromSnapshot(
   return messages;
 }
 
+/** Assembly's synchronous stretch before a yield; an event-loop block budget, not a timeout. */
+const ASSEMBLY_YIELD_BUDGET_MS = 8;
+
 /**
  * Shared scan of readStatusHistorySuffix (with `stop`, projecting oversized rows) and
  * readProviderHistory (without either). Every positional read checks its length: under the
@@ -1122,10 +1125,14 @@ async function scanHistorySnapshot(
     if (location.kind !== "exhausted" || (stop && matching >= stop.minMatching)) break;
   }
   const messages: MuxMessage[] = [];
+  // Assembly awaits only microtasks for normal rows, so a 1.24M-row epoch was one long block
+  // (#5301). Yield a macrotask about every 8 ms; the rows and their order are unchanged.
+  const yielder = new EventLoopYielder(ASSEMBLY_YIELD_BUDGET_MS);
   for (let s = scanned.length - 1; s >= 0; s--) {
     const { file, rows, from } = scanned[s];
     onBytesRead?.(file.size - from);
     for (let i = rows.length - 1; i >= 0; i--) {
+      if (yielder.isDue()) await yielder.yield();
       if (rows[i].start < from) continue;
       const message = await projectScannedRow(file, rows[i], projectOversized);
       if (message) messages.push(message);
