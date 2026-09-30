@@ -467,6 +467,24 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(ui.view.getByRole("status")).toBeTruthy();
   });
 
+  test.each(["no provider", "discovery without matches"])(
+    "with %s, a query matching nothing in the catalogue gets a status",
+    async (scenario) => {
+      const ui = await setup(scenario === "no provider" ? "" : "anthropic", null, {
+        catalog: searchModelCatalog,
+      });
+      ui.open();
+      if (scenario !== "no provider") await ui.reply(0, { status: "ok", modelIds: ["other"] });
+      await ui.type("fable");
+      await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+      expect(ui.view.queryByRole("status")).toBeNull();
+
+      await ui.type("no-such-catalogue-model");
+      await ui.view.findByRole("status");
+      expect(ui.view.queryByRole("option")).toBeNull();
+    }
+  );
+
   test.each(["policy", "reconnect", "reopen"])(
     "a %s change hides old catalogue matches until the new search replies",
     async (change) => {

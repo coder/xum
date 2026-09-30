@@ -388,20 +388,29 @@ export function ModelsSection() {
     catalogOptions.push({ key: "catalog-more", kind: "catalog-more" });
   }
   const options = [...discoveredOptions, ...catalogOptions];
-  // Visible catalogue matches are suggestions too, so a failed or empty
-  // discovery must not claim there are none.
-  const discoveryMessage =
-    suggestionsSession && lastProvider && lastProvider !== "coder" && api && config
+  // One status line at most. Visible suggestions (discovered or catalogue)
+  // suppress everything but loading, so the line never contradicts the list.
+  const catalogueHasNoMatches = activeCatalog?.query === catalogQuery && options.length === 0;
+  const noMatchesMessage = lastProvider
+    ? "No matching catalogue models to add."
+    : "No matching catalogue models. Choose a provider to add this ID manually.";
+  const statusMessage = !suggestionsSession
+    ? null
+    : lastProvider && lastProvider !== "coder" && api && config
       ? !discoveryResult
         ? "Loading models… You can still enter a model ID."
-        : catalogOptions.length > 0
+        : options.length > 0
           ? null
           : discoveryResult.status !== "ok"
             ? "Suggestions unavailable. Enter a model ID manually."
             : discoveryResult.modelIds.length === 0
               ? "No models found. Enter a model ID manually."
-              : null
-      : null;
+              : catalogueHasNoMatches
+                ? noMatchesMessage
+                : null
+      : catalogueHasNoMatches
+        ? noMatchesMessage
+        : null;
   const showSuggestions = suggestionsSession !== null && options.length > 0;
   const highlightedIndex =
     showSuggestions &&
@@ -804,7 +813,7 @@ export function ModelsSection() {
                   aria-autocomplete="list"
                   aria-describedby={
                     [
-                      discoveryMessage && `${suggestionsId}-status`,
+                      statusMessage && `${suggestionsId}-status`,
                       addError && `${suggestionsId}-error`,
                     ]
                       .filter(Boolean)
@@ -861,7 +870,7 @@ export function ModelsSection() {
                       e.preventDefault();
                       stopKeyboardPropagation(e);
                       // Matches the filter: close the list, then clear, then close Settings.
-                      if (showSuggestions || discoveryMessage) {
+                      if (showSuggestions || statusMessage) {
                         setSuggestionsSession(null);
                         setHighlightedModel(null);
                       } else if (newModelId) resetAddField();
@@ -920,13 +929,13 @@ export function ModelsSection() {
               Add
             </Button>
           </div>
-          {discoveryMessage && (
+          {statusMessage && (
             <div
               id={`${suggestionsId}-status`}
               role="status"
               className="text-muted px-2 py-1.5 text-xs md:px-3"
             >
-              {discoveryMessage}
+              {statusMessage}
             </div>
           )}
           {addError && (
