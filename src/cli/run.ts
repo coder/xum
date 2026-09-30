@@ -85,6 +85,7 @@ import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
 import {
   EXPERIMENT_IDS,
+  GRADUATED_EXPERIMENT_IDS,
   LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   type ExperimentId,
 } from "../common/constants/experiments";
@@ -310,10 +311,6 @@ function isSendMessageExperimentId(
   // produce a garbage experiments field.
   return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
 }
-
-// Experiments that graduated to always-on. Accepting their old IDs as no-ops
-// keeps existing `-e` automation working instead of erroring after upgrade.
-const GRADUATED_EXPERIMENT_IDS: ReadonlySet<string> = new Set(["advisor-tool"]);
 
 function collectExperiments(value: string, previous: string[]): string[] {
   let experimentId = value.trim().toLowerCase();

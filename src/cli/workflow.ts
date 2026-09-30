@@ -9,7 +9,11 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  GRADUATED_EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+} from "@/common/constants/experiments";
 import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
@@ -177,6 +181,11 @@ function collectExperiments(value: string, previous: string[]): string[] {
   // automation that passes the removed ID working instead of erroring.
   if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
     experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
+  // Graduated experiments are always-on: accept their old IDs as no-ops so
+  // existing `-e` automation keeps working after upgrade.
+  if (GRADUATED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
   }
   if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
     throw new Error(

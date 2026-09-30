@@ -35,6 +35,12 @@ export const EXPERIMENT_IDS = {
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 
 /**
+ * Experiments that graduated to always-on. CLI entry points accept their old
+ * IDs as no-ops so existing `-e` automation keeps working after upgrade.
+ */
+export const GRADUATED_EXPERIMENT_IDS: ReadonlySet<string> = new Set(["advisor-tool"]);
+
+/**
  * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
  * before Programmatic Tool Calling became exclusive-only. Persistence layers
  * (backend feature_flags.json, renderer localStorage) alias a stored `true`

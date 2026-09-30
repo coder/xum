@@ -95,6 +95,20 @@ describe("xum workflow CLI helpers", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  test("graduated advisor-tool experiment is accepted as a no-op", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-graduated");
+    // Nonexistent script: the run fails AFTER option parsing, which is all
+    // this compat contract needs (`-e advisor-tool` must not be rejected).
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/nope.js -e advisor-tool --dir ${tmp.path}`
+        .env({ ...process.env, MUX_ROOT: tmp.path })
+        .nothrow()
+        .quiet();
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).not.toContain("Unknown experiment");
+  });
+
   // The CLI root owns an Effect runtime (createCoreServices). Its cleanup must
   // close the supervised fiber scope before the session-level disposers and
   // release the runtime after the background processes are terminated, mirroring
