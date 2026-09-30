@@ -4,7 +4,12 @@ import type { TaskCreatedEvent } from "@/common/types/stream";
 import { tool } from "ai";
 import { z } from "zod";
 
-import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
+import {
+  createTaskTool,
+  formatSubagentIndexSection,
+  markBuiltInTaskTool,
+  isBuiltInTaskTool,
+} from "./task";
 import {
   createFakeWorkspaceTurnManager,
   createTestToolConfig,
@@ -1526,5 +1531,21 @@ describe("built-in task marker", () => {
     expect(isBuiltInTaskTool(t)).toBe(false);
     markBuiltInTaskTool(t);
     expect(isBuiltInTaskTool(t)).toBe(true);
+  });
+});
+
+describe("formatSubagentIndexSection", () => {
+  it("bounds the persisted sub-agent listing and reports what it left out", () => {
+    const agents = Array.from({ length: 60 }, (_, index) => ({
+      id: `agent-${index}`,
+      scope: "project" as const,
+      name: `Agent ${index}`,
+      description: "d".repeat(1024),
+      uiSelectable: false,
+      subagentRunnable: true,
+    }));
+    const lines = formatSubagentIndexSection(agents).split("\n");
+    expect(lines.filter((line) => line.startsWith("- agent-"))).toHaveLength(50);
+    expect(lines.at(-1)).toContain("+10");
   });
 });

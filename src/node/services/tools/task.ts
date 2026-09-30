@@ -100,14 +100,23 @@ function buildTaskDescription(config: ToolConfiguration): string {
   return `${baseDescription}\n\n${contextListingPointer("Available sub-agents (use the `agentId` parameter)")}`;
 }
 
+// Same disclosure budget as the skill index. The row is persisted before the
+// request is budgeted, so it must stay bounded; descriptions are schema-capped.
+const MAX_LISTED_SUBAGENTS = 50;
+
 /** Render the sub-agent section of the context listing ("" when none are runnable). */
 export function formatSubagentIndexSection(
   availableSubagents: readonly AgentDefinitionDescriptor[]
 ): string {
-  return availableSubagents
-    .filter((agent) => agent.subagentRunnable)
-    .map((agent) => `- ${agent.id}${agent.description ? `: ${agent.description}` : ""}`)
-    .join("\n");
+  const runnable = availableSubagents.filter((agent) => agent.subagentRunnable);
+  const lines = runnable
+    .slice(0, MAX_LISTED_SUBAGENTS)
+    .map((agent) => `- ${agent.id}${agent.description ? `: ${agent.description}` : ""}`);
+  const omitted = runnable.length - lines.length;
+  if (omitted > 0) {
+    lines.push(`(+${omitted} more not shown)`);
+  }
+  return lines.join("\n");
 }
 
 function buildParentRuntimeAiSettings(
