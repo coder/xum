@@ -2023,7 +2023,13 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (agentAdvisorEnabled && advisorModelString.length === 0) {
+    // Default-on agents (exec/plan) without an advisor model are the normal
+    // unconfigured state now that the advisor needs no experiment opt-in; only
+    // an explicit per-agent override without a model is worth a warning.
+    if (
+      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled === true &&
+      advisorModelString.length === 0
+    ) {
       workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
         effectiveAgentId,
       });
