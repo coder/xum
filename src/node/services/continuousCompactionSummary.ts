@@ -208,7 +208,9 @@ export async function summarizeContinuousCompaction(args: {
       providerOptions: buildProviderOptions(
         created.data.optionsModelString,
         thinkingLevel,
-        args.head,
+        // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
+        // which must see the same boundary-sliced history as the resolution above.
+        prepared.providerRequestMessages,
         undefined,
         created.data.optionsMuxProviderOptions,
         args.workspaceId,

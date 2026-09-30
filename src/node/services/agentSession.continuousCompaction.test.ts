@@ -1806,6 +1806,47 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(JSON.stringify(requests[0].prompt)).toContain("earlier thinking");
   });
 
+  test("a Sonnet 5.5 'off' summary ignores a higher-effort turn before the context boundary", async () => {
+    // #5086: the effort pin reads provider-visible history only; a reset seals
+    // everything before it, so this summary still sends between_tools.
+    const { h, args } = await summarySetup();
+    const sonnet55 = "anthropic:claude-sonnet-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, sonnet55),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    await summarizeContinuousCompaction({
+      ...args,
+      head: [
+        createMuxMessage("assistant-high", "assistant", "earlier answer", {
+          thinkingLevel: "high",
+        }),
+        createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" }),
+        ...args.head,
+        createMuxMessage("next", "user", "next step"),
+      ],
+      compactOptions: { ...args.compactOptions, model: sonnet55, thinkingLevel: "off" },
+    });
+
+    expect(requests[0].providerOptions?.anthropic).toMatchObject({
+      thinking: { type: "between_tools" },
+      effort: "low",
+    });
+  });
+
   test("a compact model too small for the head falls back to the configured parent route without truncating", async () => {
     const { h, args } = await summarySetup();
     spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
