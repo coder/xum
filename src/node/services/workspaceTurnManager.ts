@@ -4699,6 +4699,39 @@ export class WorkspaceTurnManager {
     return lock.state === "held" ? "keep" : undefined;
   }
 
+  /**
+   * A withdrawn owner/peer continuation (#5261) can orphan a stream end that deferred to it.
+   * Callers run this once the target is idle; "retry" means other session turn work is still
+   * pending, so the caller should wait for idle again before retrying.
+   */
+  async reconcileWithdrawnWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: WorkspaceTurnMuxMetadata
+  ): Promise<"retry" | "done"> {
+    assert(workspaceId.length > 0, "reconcileWithdrawnWorkspaceTurnContinuation requires id");
+    const readDeferredRecord = async () => {
+      const record = await this.taskHandleStore.getWorkspaceTurn(
+        muxMetadata.ownerWorkspaceId,
+        muxMetadata.taskHandleId
+      );
+      return record?.workspaceId === workspaceId &&
+        record.turnId === muxMetadata.turnId &&
+        isActiveWorkspaceTurnTaskStatus(record.status) &&
+        (record.deferredMessageIds?.length ?? 0) > 0
+        ? record
+        : undefined;
+    };
+    const record = await readDeferredRecord();
+    if (record == null) return "done";
+    await this.settleStaleWorkspaceTurn(record);
+    // Non-runtime blockers (descendants, workflows, nested turns) keep the turn live and continue
+    // it through their own correlated continuations, so only runtime work warrants a retry.
+    const hasSessionTurnWork =
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId);
+    return hasSessionTurnWork && (await readDeferredRecord()) != null ? "retry" : "done";
+  }
+
   async countActiveWorkspaceTurns(
     records?: readonly WorkspaceTurnTaskHandleRecord[]
   ): Promise<number> {

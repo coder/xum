@@ -10164,6 +10164,14 @@ export class TaskService implements AgentTaskIntegration {
       sendOptions = { ...sendOptions, queueDispatchMode: effectiveDispatchMode };
 
       let accepted = false;
+      const reconcileWithdrawnContinuation =
+        workspaceTurnMuxMetadata != null
+          ? () =>
+              this.scheduleWithdrawnWorkspaceTurnContinuationReconcile(
+                targetId,
+                workspaceTurnMuxMetadata
+              )
+          : undefined;
       // Admission classification: parent guidance into a live child continues its attempt (no
       // rotation); the fence at the handoff refuses it once the attempt closed.
       const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
@@ -10193,7 +10201,9 @@ export class TaskService implements AgentTaskIntegration {
         // durable rows only refuses.
         onCanceled: () => {
           if (firstAttempt && admissionRefusal === awaitDelegatedTurn) park();
+          reconcileWithdrawnContinuation?.();
         },
+        onAcceptedPreStreamFailure: reconcileWithdrawnContinuation,
       });
       if (!sendResult.success) {
         if (admissionRefusal === awaitDelegatedTurn) {
@@ -11705,6 +11715,47 @@ export class TaskService implements AgentTaskIntegration {
       })
       .then(() => {
         this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+      })
+      .finally(() => {
+        this.pendingTerminalAttentionDrains.delete(promise);
+      });
+    this.pendingTerminalAttentionDrains.add(promise);
+  }
+
+  /**
+   * A withdrawn correlated continuation settles nothing itself, but its turn's stream end may have
+   * deferred to it (#5261). Once the target is idle the stale-turn sweep decides from live state;
+   * the event lock orders this after any already-emitted stream end. Tracked with terminal
+   * attention drains, which a settlement here schedules.
+   */
+  private scheduleWithdrawnWorkspaceTurnContinuationReconcile(
+    targetId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): void {
+    const reconcile = async () => {
+      for (;;) {
+        const idle = await this.workspaceService.waitForIdleAndNoQueuedMessages(targetId).then(
+          () => true,
+          (error: unknown) => {
+            log.debug("Withdrawn continuation idle wait failed; reconciling once", {
+              targetId,
+              error,
+            });
+            return false;
+          }
+        );
+        const outcome = await this.workspaceEventLocks.withLock(targetId, () =>
+          this.getWorkspaceTurnManager().reconcileWithdrawnWorkspaceTurnContinuation(
+            targetId,
+            muxMetadata
+          )
+        );
+        if (!idle || outcome !== "retry") return;
+      }
+    };
+    const promise = reconcile()
+      .catch((error: unknown) => {
+        log.warn("Withdrawn workspace-turn continuation reconcile failed", { targetId, error });
       })
       .finally(() => {
         this.pendingTerminalAttentionDrains.delete(promise);
