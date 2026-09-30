@@ -1132,7 +1132,7 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // embedded copy), and the budget derives from that bound. Data that has no natural bound belongs on
 // the backend, as composer drafts do (DraftService). The session-only fallback for an
 // over-budget value is a safety net for bugs, not a supported path: a value that can legitimately
-// exceed its budget is a bug in its owner. Known instances are tracked in #5237.
+// exceed its budget is a bug in its owner.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
