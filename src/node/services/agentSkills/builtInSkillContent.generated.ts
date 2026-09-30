@@ -5065,7 +5065,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "provide approved access for cybersecurity work; a Responses API request selects one with",
       "`access_programs.cyber`. The request value selects behavior within your approved access and does",
       "not grant access. Turn on",
-      "**Settings → Providers → OpenAI → Enable cyber model** (off by default) to add a **Cyber** option",
+      "**Settings → Providers → OpenAI → Cyber mode** (off by default) to add a **Cyber** option",
       'to the reasoning selector next to the model picker, or run "Toggle Cyber Mode" from the Command',
       "Palette. Cyber and Pro are mutually exclusive.",
       "",

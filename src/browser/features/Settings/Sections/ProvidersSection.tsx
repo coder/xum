@@ -3024,7 +3024,7 @@ export function ProvidersSection() {
                                 <div className="flex items-center justify-between gap-3">
                                   <div>
                                     <label className="text-foreground block text-xs font-medium">
-                                      Enable cyber model
+                                      Cyber mode
                                     </label>
                                     <span className="text-muted text-xs">
                                       Shows a Cyber option in the thinking menu for supported
@@ -3047,7 +3047,7 @@ export function ProvidersSection() {
                                         value: nextChecked ? true : "",
                                       });
                                     }}
-                                    aria-label="Enable cyber model"
+                                    aria-label="Cyber mode"
                                   />
                                 </div>
                               </div>

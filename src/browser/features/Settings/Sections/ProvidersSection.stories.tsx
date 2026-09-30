@@ -152,7 +152,7 @@ export const OpenAICyberModelEnabled: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: /openai/i }));
-    await expect(await canvas.findByRole("switch", { name: "Enable cyber model" })).toHaveAttribute(
+    await expect(await canvas.findByRole("switch", { name: "Cyber mode" })).toHaveAttribute(
       "aria-checked",
       "true"
     );
