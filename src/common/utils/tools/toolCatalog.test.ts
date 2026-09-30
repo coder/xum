@@ -563,6 +563,20 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
     expect(computeActiveToolNames(state)).toBeUndefined();
   });
 
+  test("deactivates in place when the fallback model uses Anthropic prompt caching", () => {
+    // #5250: a fallback onto a prompt-cache model must advertise the
+    // experiment-off tool list, even if the primary had activations.
+    const state = activeState();
+    const result = rebuildToolSearchState(state, {
+      tools: baseTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    expect(Object.keys(result.tools)).not.toContain("tool_catalog_search");
+    expect(Object.keys(result.tools)).toContain("slack_send_message");
+    expect(computeActiveToolNames(state)).toBeUndefined();
+  });
+
   test("deactivates in place when tool_catalog_search is gone from the fallback toolset", () => {
     const state = activeState();
     const nextTools = baseTools();

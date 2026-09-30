@@ -197,7 +197,7 @@ import {
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
@@ -2681,6 +2681,13 @@ export class TurnRequestBuilder {
         // Intuition's internal memory_read must not bypass a policy denying memory.
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
 
+        // Same predicate and model as the tools cache breakpoint
+        // (applyCacheControlToTools), so "caches the tools block" and "keeps the
+        // tool list stable" cannot disagree (#5250).
+        const toolSearchPromptCacheActive = supportsAnthropicCache(
+          seed.rawModelString,
+          seed.providersConfig
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2689,6 +2696,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2701,6 +2709,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -2764,6 +2773,7 @@ export class TurnRequestBuilder {
               mcpToolServers: mcpToolServerNames,
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied

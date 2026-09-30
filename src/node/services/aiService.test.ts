@@ -32,6 +32,7 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -2294,6 +2295,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, denied !== "memory"]);
     });
   }
+
+  // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
+  // first) on every tool_catalog_search activation, so deferral stays off
+  // wherever Anthropic prompt caching is active.
+  async function startToolSearchStream(modelString: string, toolSearch: boolean) {
+    using xumHome = new DisposableTempDir("ai-tool-search-cache");
+    const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
+    harness.getToolsForModelSpy.mockImplementation((_model, config) =>
+      Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...mcpTools,
+      })
+    );
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: mcpTools,
+          promptDescriptors: [],
+          stats: {
+            totalTools: 1,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString,
+      thinkingLevel: "off",
+      experiments: { toolSearch },
+    });
+    expect(result.success).toBe(true);
+    const started = harness.startStreamCalls[0];
+    if (!started) throw new Error("Expected streamManager.startStream call");
+    return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
+  }
+
+  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
+    const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
+    expect(on.state).toBeUndefined();
+    expect(on.toolNames).toEqual(off.toolNames);
+    expect(on.toolNames).toContain("tracker_list_issues");
+    expect(on.toolNames).not.toContain("tool_catalog_search");
+  });
+
+  it("keeps tool-search deferral on models without Anthropic prompt caching", async () => {
+    const on = await startToolSearchStream("openai:gpt-5.2", true);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.toolNames).toContain("tool_catalog_search");
+  });
 
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",
