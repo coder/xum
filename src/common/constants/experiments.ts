@@ -210,7 +210,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   },
   // Sub-experiment of Agent Memory (flat flag, gated on the parent at the call
   // site; Settings nests it under the Agent Memory toggle). Without it, memories
-  // stay pull-based like skills: index advertised in the memory tool description,
+  // stay pull-based like skills: index advertised in the context listing row,
   // contents fetched on demand.
   [EXPERIMENT_IDS.MEMORY_INTUITION]: {
     id: EXPERIMENT_IDS.MEMORY_INTUITION,

@@ -12,9 +12,11 @@ import {
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
 import type { z } from "zod";
+import { contextListingPointer } from "@/node/services/contextListing";
 import {
-  formatMemoryIndexForToolDescription,
+  formatMemoryIndexForContextListing,
   parseMemoryPath,
+  type MemoryIndexEntry,
   type MemoryScopeContext,
   type MemoryService,
 } from "@/node/services/memoryService";
@@ -70,21 +72,28 @@ function toolMemoryScopes(config: ToolConfiguration): readonly MemoryScope[] {
 }
 
 /**
- * Build the dynamic memory tool description: the base description plus the
- * session-segment memory index (same disclosure mechanic as skills — index
- * advertised next to the tool schema, contents fetched on demand). Falls back
- * to the base description when no snapshot was resolved.
+ * Static memory tool description. The memory index changes with every memory
+ * write, so it travels in the durable context listing row instead of here
+ * (prompt-cache stability, #5248); see formatMemoryIndexSection.
  */
 function buildMemoryDescription(config: ToolConfiguration): string {
   const scopes = toolMemoryScopes(config);
   const baseDescription = buildMemoryToolDescription({ sessionScope: scopes.includes("session") });
-  if (config.memoryIndexEntries == null) {
-    return baseDescription;
-  }
-  const entries = config.memoryIndexEntries.filter((entry) =>
+  return `${baseDescription}\n\n${contextListingPointer("The memory index (paths and descriptions)")}`;
+}
+
+/**
+ * Render the memory index section of the context listing, limited to the
+ * scopes this agent can reach.
+ */
+export function formatMemoryIndexSection(
+  entries: Array<Pick<MemoryIndexEntry, "path" | "description">>,
+  scopes: readonly MemoryScope[]
+): string {
+  const visible = entries.filter((entry) =>
     scopes.some((scope) => entry.path.startsWith(`${MEMORY_VIRTUAL_ROOT}/${scope}/`))
   );
-  return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(entries)}`;
+  return formatMemoryIndexForContextListing(visible);
 }
 
 /** Share exactly the same scope identity between direct and headless memory reads. */

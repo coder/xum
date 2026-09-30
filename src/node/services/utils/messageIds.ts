@@ -72,3 +72,10 @@ export const createTaskFailureMessageId = (): string =>
 /** External file-change notification message IDs: file-change-{timestamp}-{random} */
 export const createFileChangeNotificationMessageId = (): string =>
   `file-change-${Date.now()}-${randomSuffix(9)}`;
+
+/** Context listing row ID prefix (see contextListing.ts); identifies the row kind in history. */
+export const CONTEXT_LISTING_MESSAGE_ID_PREFIX = "context-listing-";
+
+/** Context listing row IDs: context-listing-{section}-{timestamp}-{random} */
+export const createContextListingMessageId = (section: string): string =>
+  `${CONTEXT_LISTING_MESSAGE_ID_PREFIX}${section}-${Date.now()}-${randomSuffix(9)}`;

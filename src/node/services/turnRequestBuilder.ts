@@ -132,7 +132,12 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
-import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
+import {
+  formatMemoryIndexSection,
+  resolveMemoryAccessPolicy,
+  resolveMemoryScopes,
+} from "@/node/services/tools/memory";
+import { buildContextListingMessages } from "@/node/services/contextListing";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -272,7 +277,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -318,7 +323,7 @@ export interface StreamMessageOptions {
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
-   * index snapshot for the memory tool description + hot-memories block.
+   * index snapshot for the context listing row + hot-memories block.
    * AgentSession caches the result per model/session segment because hot-memory
    * selection is token-budgeted with the active model tokenizer. A callback
    * (not a pre-resolved value) because it must be computed after
@@ -2588,9 +2593,6 @@ export class TurnRequestBuilder {
       availableSubagents: agentDefinitions,
       availableSkills,
       mcpPromptRuntime,
-      // Session-segment memory index advertised in the memory tool
-      // description (same disclosure mechanic as skills).
-      memoryIndexEntries: memoryContext?.indexEntries,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
       trusted: sharedExecutionTrusted,
     };
@@ -2983,7 +2985,52 @@ export class TurnRequestBuilder {
       }
     };
 
-    let requestHistorySequence = providerRequestMessages.reduce(
+    // Listings that change during a workspace's life travel in durable
+    // synthetic rows (one per changed section) instead of tool descriptions,
+    // so they never rewrite the cached tools prefix (#5248). Live turns only: admission candidates must
+    // not touch accepted history, compaction requests summarize rather than
+    // act, and a resumed assistant turn keeps its original request shape.
+    let requestSourceMessages = messages;
+    let requestProviderMessages = providerRequestMessages;
+    if (
+      context.admissionOnly !== true &&
+      !isCompactionRequest &&
+      providerRequestMessages.at(-1)?.role === "user"
+    ) {
+      const memoryAllowed = applyToolPolicyToNames(["memory"], effectiveToolPolicy).length === 1;
+      const listingRows = buildContextListingMessages(providerRequestMessages, [
+        {
+          key: "memory",
+          title: "Memory index",
+          body:
+            memoryAllowed && memoryToolEligible && memoryContext != null
+              ? formatMemoryIndexSection(
+                  memoryContext.indexEntries,
+                  resolveMemoryScopes(tokenBudgetEnabled)
+                )
+              : "",
+        },
+      ]);
+      for (const listingRow of listingRows) {
+        const appendListing = await this.dependencies.historyService.appendToHistory(
+          workspaceId,
+          listingRow
+        );
+        if (!appendListing.success) {
+          return { type: "finished", result: Err({ type: "unknown", raw: appendListing.error }) };
+        }
+      }
+      if (listingRows.length > 0) {
+        requestSourceMessages = [...messages, ...listingRows];
+        requestProviderMessages = prepareProviderRequestMessages(
+          requestSourceMessages,
+          wireProviderName,
+          effectiveThinkingLevel
+        ).providerRequestMessages;
+      }
+    }
+
+    let requestHistorySequence = requestProviderMessages.reduce(
       (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
       -1
     );
@@ -2992,8 +3039,8 @@ export class TurnRequestBuilder {
     try {
       primaryRequest = await prepareModelRequest({
         seed: modelResult.data,
-        sourceMessages: messages,
-        providerRequestMessages,
+        sourceMessages: requestSourceMessages,
+        providerRequestMessages: requestProviderMessages,
         initializeToolSearch: true,
         reusePrePolicySystemContext: true,
         requestHistorySequence: () => requestHistorySequence,
@@ -3289,10 +3336,10 @@ export class TurnRequestBuilder {
               prepare: async (nextModelString, prepareOptions) => {
                 const sourceMessages = prepareOptions?.continuation
                   ? replaceOrAppendMessageById(
-                      messages,
+                      requestSourceMessages,
                       prepareOptions.continuation.assistantMessage
                     )
-                  : messages;
+                  : requestSourceMessages;
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
                   requestedThinkingLevel:

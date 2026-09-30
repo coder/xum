@@ -3812,12 +3812,12 @@ export class MemoryService extends EventEmitter {
 /**
  * Session-segment memory context (memory experiment). Computed once per model
  * in a session segment (session start + compaction boundaries) and cached by
- * AgentSession so both the memory tool description (index) and the system
+ * AgentSession so both the context listing row (index) and the system
  * prompt (token-budgeted hot block) stay byte-identical for repeated turns
  * (prompt-cache-stable).
  */
 export interface MemorySessionContext {
-  /** Index snapshot advertised in the memory tool description. */
+  /** Index snapshot advertised in the context listing row (contextListing.ts). */
   indexEntries: Array<Pick<MemoryIndexEntry, "path" | "description">>;
   /**
    * Rendered <hot_memories> system-prompt block; null when the hot-set
@@ -3827,16 +3827,15 @@ export interface MemorySessionContext {
 }
 
 /**
- * Render the memory index for the memory tool description (same disclosure
- * mechanic as skills: index advertised next to the tool schema, contents
- * fetched on demand via the view command).
+ * Render the memory index for the durable context listing row (index
+ * advertised up front, contents fetched on demand via the view command).
  *
  * Index hardening: entries are data, not instructions — memory file content is
  * untrusted, so the index explicitly tells the model not to follow instructions
  * found inside memory files, and each
  * description is pre-sanitized to a single quoted line.
  */
-export function formatMemoryIndexForToolDescription(
+export function formatMemoryIndexForContextListing(
   entries: Array<Pick<MemoryIndexEntry, "path" | "description">>
 ): string {
   const lines = [

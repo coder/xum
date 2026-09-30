@@ -515,8 +515,7 @@ export interface BuildStreamSystemContextOptions {
    * Whether the memory tool is in the toolset (memory experiment + policy).
    * Gates the hot-memories block: preloaded memory content must not survive
    * when the toolset has no memory tool. The memory index itself lives in the
-   * memory tool description (same disclosure mechanic as skills), so it
-   * disappears with the tool.
+   * context listing row, which omits it when policy strips the tool.
    */
   memoryToolAvailable?: boolean;
   tokenBudgetEnabled?: boolean;
@@ -771,7 +770,7 @@ function buildMemoryGuidanceSection(intuitionToolAvailable: boolean, writable = 
     "You have a persistent memory directory (memory tool). Treat it as your own notebook and use it quietly as part of normal work — no announcements, no asking permission:",
     intuitionToolAvailable
       ? "- When prior context could affect your answer or next action, use `intuition` to recall relevant memories not already in context; use `memory` to read more or maintain your notebook."
-      : "- When prior context could affect your answer or next action, skim the memory index (in the memory tool description) and `view` relevant files not already in context.",
+      : "- When prior context could affect your answer or next action, skim the memory index (in the latest <system-context-listing> message) and `view` relevant files not already in context.",
     "- Record durable lessons the moment you learn them: user corrections and confirmed judgment calls, hard-won debugging insights, environment quirks, facts not discoverable from the code.",
     "- Be selective — memory must stay high-signal. Skip one-off task details, anything obvious from the codebase or instruction files, and secrets.",
     "- Maintain as you go: update or delete memories that prove wrong or stale, prefer extending an existing file over creating near-duplicates, and give new files a one-line frontmatter `description:` so the index stays useful.",
@@ -1032,7 +1031,7 @@ export async function buildStreamSystemContext(
   // Append the hot-memories block (memory-hot-set sub-experiment). Placed at
   // the end of the system message so the most recent stable prompt prefix
   // stays byte-identical for provider prompt caching. The memory index lives
-  // in the memory tool description (same disclosure mechanic as skills).
+  // in the durable context listing row (contextListing.ts).
   const hotMemoriesSection =
     opts.memoryToolAvailable && opts.hotMemoriesBlock ? `\n\n${opts.hotMemoriesBlock}` : undefined;
   if (hotMemoriesSection != null) {

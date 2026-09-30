@@ -10,7 +10,12 @@ import { MemoryService, projectMemoryDirName } from "@/node/services/memoryServi
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { RefinementEvidenceSchema } from "@/common/types/refinement";
 import { readRefinementEvents } from "@/node/services/refinement/refinementTestHelpers";
-import { createMemoryTool, resolveMemoryAccessPolicy, resolveMemoryScopes } from "./memory";
+import {
+  createMemoryTool,
+  formatMemoryIndexSection,
+  resolveMemoryAccessPolicy,
+  resolveMemoryScopes,
+} from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
 import { MEMORY_SCOPES, type MemoryScopeAccess, type MemoryScope } from "@/common/constants/memory";
@@ -360,39 +365,21 @@ describe("memory tool", () => {
     });
   });
 
-  describe("dynamic description", () => {
-    it("advertises the session-segment index in the tool description", async () => {
-      using fixture = await createFixture();
-      fixture.config.memoryIndexEntries = [
-        { path: "/memories/global/lesson.md", description: "a lesson" },
-        { path: "/memories/project/note.md", description: "" },
-      ];
-      const tool = createMemoryTool(fixture.config);
-      expect(tool.description).toContain('- /memories/global/lesson.md — "a lesson"');
-      expect(tool.description).toContain("- /memories/project/note.md");
-      // The base description (protocol, scopes, commands) must stay intact.
-      expect(tool.description).toContain(TOOL_DEFINITIONS.memory.description);
-    });
-
-    it("falls back to the base description when no index snapshot was resolved", async () => {
-      using fixture = await createFixture();
-      expect(fixture.config.memoryIndexEntries).toBeUndefined();
-      expect(fixture.tool.description).toBe(TOOL_DEFINITIONS.memory.description);
-    });
-  });
-
   describe("session scope gating", () => {
     const CHECKPOINT = "/memories/session/checkpoint.md";
 
     it("hides the session scope outside token-budget mode", async () => {
       using fixture = await createFixture({ memoryScopes: resolveMemoryScopes(false) });
-      fixture.config.memoryIndexEntries = [
-        { path: CHECKPOINT, description: "checkpoint" },
-        { path: "/memories/global/lesson.md", description: "a lesson" },
-      ];
+      const index = formatMemoryIndexSection(
+        [
+          { path: CHECKPOINT, description: "checkpoint" },
+          { path: "/memories/global/lesson.md", description: "a lesson" },
+        ],
+        resolveMemoryScopes(false)
+      );
+      expect(index).not.toContain("/memories/session/");
+      expect(index).toContain("- /memories/global/lesson.md");
       const tool = createMemoryTool(fixture.config);
-      expect(tool.description).not.toContain("/memories/session/");
-      expect(tool.description).toContain("- /memories/global/lesson.md");
 
       const created = await run(tool, { command: "create", path: CHECKPOINT, file_text: "x" });
       expect(created).toMatchObject({ success: false });
@@ -404,9 +391,13 @@ describe("memory tool", () => {
 
     it("serves the session scope in token-budget mode", async () => {
       using fixture = await createFixture({ memoryScopes: resolveMemoryScopes(true) });
-      fixture.config.memoryIndexEntries = [{ path: CHECKPOINT, description: "checkpoint" }];
+      expect(
+        formatMemoryIndexSection(
+          [{ path: CHECKPOINT, description: "checkpoint" }],
+          resolveMemoryScopes(true)
+        )
+      ).toContain(`- ${CHECKPOINT}`);
       const tool = createMemoryTool(fixture.config);
-      expect(tool.description).toContain(`- ${CHECKPOINT}`);
 
       const created = await run(tool, { command: "create", path: CHECKPOINT, file_text: "x" });
       expect(created.success).toBe(true);

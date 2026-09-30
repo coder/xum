@@ -250,7 +250,7 @@ export class AIService extends EventEmitter {
 
   /**
    * Build the session-segment memory context: the index snapshot advertised
-   * in the memory tool description, plus the hot-memories block (pinned +
+   * in the context listing row, plus the hot-memories block (pinned +
    * frequently used memory files; memory-hot-set sub-experiment). Returns
    * null when the memory experiment is off.
    *

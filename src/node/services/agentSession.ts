@@ -1189,7 +1189,7 @@ export class AgentSession {
 
   /**
    * Cached memory session context (memory experiment): index snapshot for
-   * the memory tool description plus an optional hot-memories block, keyed by
+   * the context listing row plus an optional hot-memories block, keyed by
    * model because the hot set is token-budgeted with the active model's
    * tokenizer. Index-only entries can be upgraded once final tool policy keeps
    * the memory tool; compaction clears the map so repeated turns keep

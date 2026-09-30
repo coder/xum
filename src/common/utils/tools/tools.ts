@@ -91,7 +91,7 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
+import type { MemoryService } from "@/node/services/memoryService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import type { MemoryScope, MemoryScopeAccess } from "@/common/constants/memory";
@@ -350,13 +350,6 @@ export interface ToolConfiguration {
   availableSubagents?: AgentDefinitionDescriptor[];
   /** Available skills for the agent_skill_read tool description (dynamic context) */
   availableSkills?: AgentSkillDescriptor[];
-  /**
-   * Session-segment memory index for the memory tool description (dynamic
-   * context, same disclosure mechanic as skills). Absent when no snapshot was
-   * resolved (e.g. non-stream tool builds): the tool falls back to its base
-   * description.
-   */
-  memoryIndexEntries?: Array<Pick<MemoryIndexEntry, "path" | "description">>;
   /** Whether the project is trusted for hook/script execution */
   trusted?: boolean;
   /** Analytics service for raw SQL queries against DuckDB analytics data */

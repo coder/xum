@@ -28,6 +28,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 
 import { createTaskTool } from "./tools/task";
 import { createTestToolConfig } from "./tools/testHelpers";
+import { isContextListingMessage } from "./contextListing";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -36,7 +37,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
 import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -364,6 +365,7 @@ function stubCommonStreamMessageDependencies(args: {
   model?: LanguageModel;
 }): {
   getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
+  appendToHistorySpy: ReturnType<typeof spyOn<HistoryService, "appendToHistory">>;
   /** Prototype spy (AIService builds its factory internally); tests may re-point it. */
   resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
 } {
@@ -447,10 +449,15 @@ function stubCommonStreamMessageDependencies(args: {
     projectPath: args.metadata.projectPath,
   });
   spyOn(args.historyService, "commitPartial").mockResolvedValue({ success: true, data: undefined });
-  spyOn(args.historyService, "appendToHistory").mockImplementation((_workspaceId, message) => {
-    message.metadata = { ...(message.metadata ?? {}), historySequence: args.historySequence ?? 7 };
-    return Promise.resolve({ success: true, data: undefined });
-  });
+  const appendToHistorySpy = spyOn(args.historyService, "appendToHistory").mockImplementation(
+    (_workspaceId, message) => {
+      message.metadata = {
+        ...(message.metadata ?? {}),
+        historySequence: args.historySequence ?? 7,
+      };
+      return Promise.resolve({ success: true, data: undefined });
+    }
+  );
 
   const streamManager = args.streamManager;
   const streamToken = "stream-token" as ReturnType<StreamManager["generateStreamToken"]>;
@@ -477,7 +484,7 @@ function stubCommonStreamMessageDependencies(args: {
   };
   spyOn(streamManager, "startStream").mockImplementation(stubStartStream);
 
-  return { getToolsForModelSpy, resolveAndCreateModelSpy };
+  return { getToolsForModelSpy, resolveAndCreateModelSpy, appendToHistorySpy };
 }
 
 describe("AIService workspace metadata lookup", () => {
@@ -925,6 +932,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     streamSystemContextDefinitionCaches: unknown[];
     startStreamCalls: TurnExecutionOptions[];
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
+    appendToHistorySpy: ReturnType<typeof spyOn<HistoryService, "appendToHistory">>;
     resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
     streamManager: StreamManager;
     providerService: ProviderService;
@@ -978,7 +986,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const streamSystemContextDefinitionCaches: unknown[] = [];
     const startStreamCalls: TurnExecutionOptions[] = [];
 
-    const { getToolsForModelSpy, resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
+    const stubs = stubCommonStreamMessageDependencies({
       service,
       streamManager,
       config,
@@ -1016,6 +1024,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       onResolveAgentForStream: (resolveArgs) =>
         resolveAgentDefinitionCaches.push(resolveArgs.agentDefinitionCache),
     });
+    const { getToolsForModelSpy, resolveAndCreateModelSpy, appendToHistorySpy } = stubs;
     if (options?.postPolicyTools) {
       spyOn(toolAssembly, "applyToolPolicyAndExperiments").mockResolvedValue(
         options.postPolicyTools
@@ -1040,6 +1049,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       streamSystemContextDefinitionCaches,
       startStreamCalls,
       getToolsForModelSpy,
+      appendToHistorySpy,
       resolveAndCreateModelSpy,
       streamManager,
       providerService,
@@ -2532,12 +2542,112 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
       "<hot_memories>cached</hot_memories>"
     );
-    // The index snapshot flows into the tool configuration so the memory tool
-    // can advertise it in its description (same disclosure mechanic as skills).
-    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-    expect(toolConfig).toMatchObject({
-      memoryIndexEntries: [{ path: "/memories/global/lesson.md", description: "a lesson" }],
-    });
+  });
+
+  it("appends a durable context row only when its listing section changes", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-context-listing";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const written = { path: "/memories/project/new.md", description: "written later" };
+    // Other sections (built-in skills and sub-agents) get their own rows.
+    const listingRows = () =>
+      harness.appendToHistorySpy.mock.calls
+        .map(([, message]) => message)
+        .filter(
+          (message) =>
+            isContextListingMessage(message) && message.id.startsWith("context-listing-memory-")
+        );
+    const send = async (
+      history: MuxMessage[],
+      indexEntries: Array<{ path: string; description: string }>
+    ) => {
+      const result = await harness.service.streamMessage({
+        messages: history,
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () => Promise.resolve({ indexEntries, hotMemoriesBlock: null }),
+      });
+      expect(result.success).toBe(true);
+    };
+
+    const user1 = createMuxMessage("user-1", "user", "hello");
+    await send([user1], [lesson]);
+    expect(listingRows()).toHaveLength(1);
+    const firstRow = listingRows()[0];
+    // The request carries the row it just persisted.
+    expect(JSON.stringify(harness.startStreamCalls.at(-1)?.messages)).toContain(lesson.path);
+
+    // Unchanged listings: the persisted row already says it all.
+    const assistant1 = createMuxMessage("assistant-1", "assistant", "hi");
+    const user2 = createMuxMessage("user-2", "user", "again");
+    await send([user1, firstRow, assistant1, user2], [lesson]);
+    expect(listingRows()).toHaveLength(1);
+
+    // A memory write changes the index: exactly one new row, earlier rows untouched.
+    await send([user1, firstRow, assistant1, user2], [lesson, written]);
+    expect(listingRows()).toHaveLength(2);
+    expect(JSON.stringify(listingRows()[1].parts)).toContain(written.path);
+
+    // A resumed assistant turn keeps its request shape.
+    const partial = createMuxMessage("assistant-2", "assistant", "working", { partial: true });
+    await send([user1, firstRow, assistant1, user2, partial], [lesson]);
+    expect(listingRows()).toHaveLength(2);
+  });
+
+  it("keeps the tool definitions byte-identical when the memory index changes", async () => {
+    using xumHome = new DisposableTempDir("ai-service-static-memory-tool");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-static-memory-tool";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    // Real tool assembly: the memory tool description is what must stay put.
+    harness.getToolsForModelSpy.mockRestore();
+
+    // Prompt caches read the tools block first, so a memory write that
+    // rewrites a tool description misses the cache for the whole transcript.
+    const serializedTools: string[] = [];
+    for (const indexEntries of [
+      [{ path: "/memories/global/lesson.md", description: "a lesson" }],
+      [
+        { path: "/memories/global/lesson.md", description: "a lesson" },
+        { path: "/memories/project/new.md", description: "written this turn" },
+      ],
+    ]) {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () => Promise.resolve({ indexEntries, hotMemoriesBlock: null }),
+      });
+      expect(result.success).toBe(true);
+      const tools = harness.startStreamCalls.at(-1)?.tools ?? {};
+      expect(tools.memory).toBeDefined();
+      serializedTools.push(
+        JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]))
+      );
+    }
+    expect(serializedTools[1]).toBe(serializedTools[0]);
   });
 
   it.each([true, false])(
