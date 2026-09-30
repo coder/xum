@@ -18,7 +18,7 @@
 (* WTM = workspaceTurnManager.ts, AS = agentSession.ts,                     *)
 (* WS = workspaceService.ts), at commit 491bb881b5.                        *)
 (*                                                                          *)
-(* Abstractions (see README.md for the full list)                           *)
+(* Abstractions (see check.sh's header for the full list)                           *)
 (*  - Stream end at a tool boundary (tool-end dispatch) and at completion   *)
 (*    (turn-end) are both the single StreamEnd action: dispatch mode only   *)
 (*    changes WHEN the stream ends, not what the gates check.               *)
@@ -39,7 +39,10 @@ CONSTANTS
     AllowWithdraw,   \* may the owner's continuation be withdrawn (#5261)
     Fix5277,         \* park records the epoch seen by the refusing gate
     Fix5261,         \* withdrawing the last correlated continuation settles the turn
-    FixStopPark      \* a park after a user Stop drops the message (finding F1)
+    FixStopPark,     \* a park after a user Stop drops the message (finding F1)
+    FixRegReplace,   \* a reservation never replaces a live registration (finding F2)
+    FixStaleCorr     \* only the owner resolves a correlation, and a correlation whose
+                     \* registration is gone refuses (finding F3)
 
 Msgs  == 1..NM
 Turns == 1..NT
@@ -137,7 +140,8 @@ ReleaseIf(t) ==
 DelegRefusal(i) ==
     LET r == m[i] IN
     IF r.retry /\ regEpoch # r.rEpoch THEN "await"             \* TS 9724-9730
-    ELSE IF reg.t = None THEN "none"                          \* TS 9731-9732
+    ELSE IF reg.t = None                                      \* TS 9731-9732
+    THEN IF FixStaleCorr /\ r.corrDone /\ r.corr # 0 THEN "starting" ELSE "none"
     ELSE IF ~IsOwner(i) \/ r.retry THEN "await"                \* TS 9734-9736
     ELSE IF ~reg.acc THEN "starting"                          \* TS 9737
     ELSE IF ~r.corrDone THEN "none"                           \* TS 9739
@@ -180,6 +184,20 @@ ContinuationPending(t) ==
     \/ \E k \in 1..Len(queue) : queue[k].kind = "msg" /\ m[queue[k].id].corr = t
     \/ slot.k # "idle" /\ slot.kind = "msg" /\ m[slot.id].corr = t
 
+\* Same, ignoring message i (the entry being withdrawn).
+OtherContinuation(t, i) ==
+    \/ \E k \in 1..Len(queue) : queue[k].kind = "msg" /\ queue[k].id # i /\ m[queue[k].id].corr = t
+    \/ slot.k # "idle" /\ slot.kind = "msg" /\ slot.id # i /\ m[slot.id].corr = t
+
+\* Fix5261 (the issue's suggested direction, compare WTM
+\* settleWorkspaceTurnContinuationFailure 5632): withdrawing the last
+\* correlated continuation of a deferred turn settles it once and releases it.
+SettleWithdrawn(i, r) ==
+    IF Fix5261 /\ r.corr # 0 /\ turn[r.corr] = "deferred" /\ ~OtherContinuation(r.corr, i)
+    THEN /\ turn' = [turn EXCEPT ![r.corr] = "done"]
+         /\ ReleaseIf(r.corr)
+    ELSE UNCHANGED <<turn, reg, fl>>
+
 -----------------------------------------------------------------------------
 (* Peer / owner message pipeline: TS sendTreeMessage (9532-10214) *)
 
@@ -216,7 +234,7 @@ Enter(i) ==
 Corr(i) ==
     /\ m[i].pc = "corr"
     /\ LET r == m[i]
-           c == IF ~r.retry /\ reg.t # None /\ reg.acc /\ turn[reg.t] \in {"running", "deferred"}
+           c == IF ~r.retry /\ (FixStaleCorr => IsOwner(i)) /\ reg.t # None /\ reg.acc /\ turn[reg.t] \in {"running", "deferred"}
                 THEN reg.t ELSE 0
        IN m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "gate1", !.corr = c, !.corrDone = TRUE]]
     /\ UNCHANGED <<reg, regEpoch, turn, nextTurn, create, slot, queue, stopEpoch, latch,
@@ -318,15 +336,13 @@ Rollback(i) ==
           THEN /\ Park(i, r, epoch)
                /\ fl' = [fl EXCEPT !.sched = TRUE]
                /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done", !.told = "queued"]]
+               /\ UNCHANGED <<turn, reg>>
           ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, r.refusal)]
-               /\ UNCHANGED <<parked, listExists, fl>>
+               /\ UNCHANGED <<parked, listExists>>
+               /\ SettleWithdrawn(i, r)
        /\ slot' = IdleSlot
        /\ lock' = ReleaseLock(i)
-       \* Fix5261 (issue's suggested direction): a withdrawn last correlated continuation settles the turn.
-       /\ IF Fix5261 /\ r.corr # 0 /\ ~doPark /\ turn[r.corr] = "deferred"
-          THEN turn' = [turn EXCEPT ![r.corr] = "done"]
-          ELSE UNCHANGED turn
-    /\ UNCHANGED <<reg, regEpoch, nextTurn, create, queue, stopEpoch, latch, interrupted,
+    /\ UNCHANGED <<regEpoch, nextTurn, create, queue, stopEpoch, latch, interrupted,
                    userStops, ownerInts, ownerGone, listGen, pendingEnd, pendingAbort,
                    intr, ustop>>
 
@@ -361,16 +377,14 @@ Dequeue ==
                THEN /\ Park(i, r, regEpoch)
                     /\ fl' = [fl EXCEPT !.sched = TRUE]
                     /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done"]]
-                    /\ UNCHANGED <<slot, turn>>
+                    /\ UNCHANGED <<slot, turn, reg>>
                ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, s)]
-                    /\ UNCHANGED <<parked, listExists, fl, slot>>
-                    /\ IF Fix5261 /\ r.corr # 0 /\ turn[r.corr] = "deferred"
-                       THEN turn' = [turn EXCEPT ![r.corr] = "done"]
-                       ELSE UNCHANGED turn
+                    /\ UNCHANGED <<parked, listExists, slot>>
+                    /\ SettleWithdrawn(i, r)
           ELSE /\ slot' = [k |-> "prep", kind |-> "msg", id |-> i]
                /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "qpersist"]]
-               /\ UNCHANGED <<parked, listExists, fl, turn>>
-       /\ UNCHANGED <<reg, regEpoch>>
+               /\ UNCHANGED <<parked, listExists, fl, turn, reg>>
+       /\ UNCHANGED regEpoch
     /\ UNCHANGED <<nextTurn, create, stopEpoch, latch, interrupted, userStops, ownerInts,
                    ownerGone, listGen, lock, pendingEnd, pendingAbort, intr, ustop>>
 
@@ -394,6 +408,7 @@ CreateRegister(t) ==
     /\ create[t].pc = "register"
     /\ IF create[t].mode = "reserve"
        THEN \* Map.set with a new handle: a live entry is replaced without release (WTM 644-649).
+            /\ FixRegReplace => reg.t = None
             /\ reg' = [t |-> t, acc |-> FALSE]
             /\ regEpoch' = regEpoch + 1                        \* WTM 648 -> TS 2491-2496
             /\ turn' = [turn EXCEPT ![t] = "reserved"]
