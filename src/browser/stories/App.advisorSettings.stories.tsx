@@ -47,7 +47,6 @@ async function exerciseAdvisorMode(canvasElement: HTMLElement) {
   const canvas = within(advisorBlock);
   const trigger = await canvas.findByRole("button", { name: "Reasoning" });
   await expect(trigger).toHaveTextContent("Low");
-  trigger.scrollIntoView({ block: "center" });
   await userEvent.click(trigger);
   const mode = canvas.getByRole("button", { name: /Pro mode/ });
   await expect(mode).toHaveAttribute("aria-pressed", "false");
