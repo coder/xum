@@ -24,6 +24,7 @@ import {
   getAnthropicEffort,
   anthropicBindsThinkingToPrefix,
   anthropicRejectsDisabledThinking,
+  anthropicSupportsBetweenToolsThinking,
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
@@ -39,6 +40,7 @@ import {
 import {
   isGeminiFlashMinimalRejectingModelName,
   isGeminiFlashThinkingLevelModelName,
+  resolveBetweenToolsThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import {
   isOfficialProviderBaseUrl,
@@ -295,6 +297,33 @@ function anthropicThinkingBlockBindingAvailable(
 }
 
 /**
+ * Route-aware eligibility for Anthropic's `thinking: { type: "between_tools" }`.
+ * It needs no beta header but must reach the API verbatim, which only
+ * @ai-sdk/anthropic 4.0.67+ does: the direct `anthropic` route (a base URL proxy
+ * forwards the body) and the `coder` route (Coder AI gateway, anthropic type).
+ * Everything else fails closed: mux-gateway's server SDK is outside Xum's control,
+ * Bedrock pins an older @ai-sdk/anthropic, and custom providers may validate the enum.
+ */
+export function anthropicBetweenToolsRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  if (!resolveOptionsCanonicalModel(modelString, providersConfig).startsWith("anthropic:")) {
+    return false;
+  }
+  if (routeProvider === "anthropic") {
+    const anthropicConfig = providersConfig?.anthropic;
+    return (
+      modelString.startsWith("anthropic:") &&
+      anthropicConfig != null &&
+      !isCustomProviderConfig(anthropicConfig)
+    );
+  }
+  return routeProvider === "coder" && !isCustomProviderConfig(providersConfig?.coder);
+}
+
+/**
  * Build provider-specific options for AI SDK based on thinking level
  *
  * This function configures provider-specific options for supported providers:
@@ -331,7 +360,6 @@ export function buildProviderOptions(
 ): ProviderOptions {
   // Caller is responsible for enforcing thinking policy before calling this function.
   // agentSession.ts is the canonical enforcement point.
-  const effectiveThinking = thinkingLevel;
   // Parse origin from normalized model string
   const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig);
   const [origin, modelName] = normalizedModel.split(":", 2);
@@ -379,6 +407,16 @@ export function buildProviderOptions(
   const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
+  // Sonnet 5.5 "off" is `between_tools` only for the Anthropic payload on an eligible
+  // route; elsewhere it runs as "low" adaptive. The turn path already applied the
+  // effort pin; this pass covers headless callers.
+  const effectiveThinking = resolveBetweenToolsThinkingLevel(
+    capabilityModel,
+    thinkingLevel,
+    formatProvider === "anthropic" &&
+      anthropicBetweenToolsRouteAvailable(modelString, routeProvider, providersConfig),
+    []
+  );
 
   log.debug("buildProviderOptions", {
     modelString,
@@ -444,11 +482,16 @@ export function buildProviderOptions(
       // thinking content on adaptive requests; non-native adaptive models
       // (Opus 4.6 / Sonnet 4.6) must not receive `display`.
       // See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
+      // Sonnet 5.5 "off" reaches here only on an eligible route (see effectiveThinking
+      // above) and becomes `between_tools`, with no display/blockBinding field: the API
+      // rejects either one alongside it.
       const thinking: AnthropicProviderOptions["thinking"] = usesAdaptiveThinking
         ? effectiveThinking === "off"
-          ? anthropicRejectsDisabledThinking(capabilityModel)
-            ? undefined
-            : { type: "disabled" }
+          ? anthropicSupportsBetweenToolsThinking(capabilityModel)
+            ? { type: "between_tools" }
+            : anthropicRejectsDisabledThinking(capabilityModel)
+              ? undefined
+              : { type: "disabled" }
           : supportsNativeXhigh
             ? { type: "adaptive", display: "summarized", ...(blockBinding && { blockBinding }) }
             : { type: "adaptive" }
@@ -464,7 +507,11 @@ export function buildProviderOptions(
 
       const anthropicOptions: AnthropicProviderOptions = {
         disableParallelToolUse: false,
-        sendReasoning: true,
+        // `between_tools` cannot carry blockBinding, and Xum's replay is not append-only
+        // (see above), so a replayed block with a changed prefix would 400 on enforced
+        // accounts. Replay none: #5086's "strip from the edited turn onward", applied to
+        // every turn, since a system prompt or tools change edits every block's prefix.
+        sendReasoning: thinking?.type !== "between_tools",
         ...(thinking && { thinking }),
         effort: effortLevel,
       };

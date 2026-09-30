@@ -80,8 +80,8 @@ const MODEL_DEFINITIONS = {
   // Claude Sonnet 5.5 - released September 28, 2026, successor to Sonnet 5 at the same
   // pricing ($2/M input, $10/M output). API id `claude-sonnet-5-5`; Sonnet 5 stays usable as
   // the custom model string `anthropic:claude-sonnet-5`. Unlike Sonnet 5, thinking cannot be
-  // disabled (see anthropicRejectsDisabledThinking). The bare `sonnet` alias tracks the latest
-  // Sonnet tier.
+  // disabled: "off" maps to `between_tools` (see anthropicSupportsBetweenToolsThinking). The
+  // bare `sonnet` alias tracks the latest Sonnet tier.
   SONNET: {
     provider: "anthropic",
     providerModelId: "claude-sonnet-5-5",

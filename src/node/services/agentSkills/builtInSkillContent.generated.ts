@@ -4525,7 +4525,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Numeric levels are **model-relative** — they map to the model's allowed thinking range:",
       "",
-      "- `0` = model's lowest allowed level (e.g., `off` for Haiku, `low` for Sonnet, `medium` for GPT-5.5 Pro)",
+      "- `0` = model's lowest allowed level (e.g., `off` for Haiku and Sonnet, `low` for Opus, `medium` for GPT-5.5 Pro)",
       "- Higher numbers select progressively higher levels, clamped to the model's maximum",
       "",
       "This means `/haiku+0` disables thinking while `/gpt-pro+0` sets thinking to medium (GPT-5.5 Pro's minimum).",

@@ -6,7 +6,10 @@ import type { OnStepSettled } from "./streamManager";
 import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
@@ -151,9 +154,11 @@ import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
   lookupMinThinkingLevelOverride,
+  resolveBetweenToolsThinkingLevel,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
@@ -808,10 +813,17 @@ export class TurnRequestBuilder {
         options.minThinkingLevel,
         options.providersConfigSnapshot
       );
-      const effective = resolveEffectiveThinkingLevel(
-        options.rawModelString,
-        clamped,
-        options.providersConfigSnapshot
+      // A mid-turn switch to "off" changes the effort within the conversation, so on
+      // Sonnet 5.5 it runs as "low" adaptive rather than `between_tools` (#5086).
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        false,
+        []
       );
       if (
         effective === currentLevel ||
@@ -1169,7 +1181,7 @@ export class TurnRequestBuilder {
         options.minimumThinkingLevelOverride,
         providersConfig
       );
-      const effectiveThinkingLevel = options.enforceMinimum
+      const policyThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
@@ -1200,18 +1212,35 @@ export class TurnRequestBuilder {
         };
       }
 
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        sliceMessagesForProviderFromLatestContextBoundary(messages).map((message) =>
+          message.role === "assistant" ? message.metadata?.thinkingLevel : undefined
+        )
+      );
+
       return Ok({
         ...resolved.data,
         rawModelString: options.rawModelString,
         providersConfig,
         minThinkingLevel,
         effectiveThinkingLevel,
-        capabilityModelString: resolveModelForMetadata(
-          options.rawModelString.startsWith("coder:")
-            ? options.rawModelString
-            : resolved.data.canonicalModelString,
-          providersConfig
-        ),
+        capabilityModelString,
         toolsModelString: toolsIdentity.modelString,
         optionsModelString,
       });

@@ -463,6 +463,40 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     }
   });
 
+  it("runs a mid-turn switch to 'off' on Sonnet 5.5 as low adaptive, not between_tools", async () => {
+    // #5086: effort stays pinned for the conversation, and a mid-turn level change
+    // is a change within it.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const snapshot: ProvidersConfigMap = {
+        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      };
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(snapshot, {
+          rawModelString: sonnet55,
+          canonicalModelString: sonnet55,
+          effectiveModelString: sonnet55,
+          optionsModelString: sonnet55,
+          routeProvider: "anthropic",
+          effectiveThinkingLevel: "medium",
+        })
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off");
+      expect(rebuilt?.effectiveLevel).toBe("low");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        sendReasoning: true,
+        thinking: { type: "adaptive", display: "summarized" },
+        effort: "low",
+      });
+      // Already at low: "off" resolves to the same level, so nothing is rebuilt.
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
     { routeProvider: "mux-gateway" as const, hasCacheKey: false },
