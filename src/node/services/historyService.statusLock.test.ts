@@ -400,16 +400,19 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
       );
     const before = await stamps();
     const drained = new Set<string>();
+    const drains: Array<Promise<void>> = [];
     let enterDrain!: () => void;
     const drainEntered = new Promise<"drain">((resolve) => (enterDrain = () => resolve("drain")));
     const waitForClose = historyStatusScanReaders.waitForClose.bind(historyStatusScanReaders);
     const drainSpy = spyOn(historyStatusScanReaders, "waitForClose").mockImplementation(
       (filePath) => {
+        const drain = waitForClose(filePath);
         if (watched.includes(path.resolve(filePath))) {
           drained.add(path.resolve(filePath));
+          drains.push(drain);
           enterDrain();
         }
-        return waitForClose(filePath);
+        return drain;
       }
     );
     restores.push(() => drainSpy.mockRestore());
@@ -420,6 +423,12 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     let settled = false;
     const op = run().finally(() => (settled = true));
     expect(await Promise.race([op.then(() => "op" as const), drainEntered])).toBe("drain");
+    // The paused scan must hold the drain open; an unregistered scan resolves it at once.
+    const drainState = await Promise.race([
+      ...drains.map((drain) => drain.then(() => "closed" as const)),
+      new Promise<"open">((resolve) => setImmediate(() => resolve("open"))),
+    ]);
+    expect(drainState).toBe("open");
     expect(await stamps()).toEqual(before);
     expect(settled).toBe(false);
     paused.release();
