@@ -2746,6 +2746,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       createLocalWorkspaceMetadata(workspaceId, projectPath)
     );
     harness.getToolsForModelSpy.mockRestore();
+    // Real appends: the listing rows are read back from history below.
+    harness.appendToHistorySpy.mockRestore();
     const skill = (name: string) => ({
       name,
       description: `${name} skill`,
@@ -2791,7 +2793,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
     expect(serializedTools[1]).toBe(serializedTools[0]);
     // The model still sees both additions, in the durable listing rows.
-    const listed = JSON.stringify(harness.appendToHistorySpy.mock.calls.map(([, row]) => row));
+    const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const listed = JSON.stringify(history.data.filter(isContextListingMessage));
     expect(listed).toContain("deploy");
     expect(listed).toContain("auditor");
   });

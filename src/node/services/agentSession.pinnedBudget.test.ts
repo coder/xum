@@ -488,7 +488,9 @@ describe("pinned full-payload rollover admission", () => {
       const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!after.success) throw new Error(after.error);
       const boundary = after.data[0];
-      const trigger = after.data.findLast((row) => row.role === "user");
+      const trigger = after.data.findLast(
+        (row) => row.role === "user" && !isContextListingMessage(row)
+      );
       expect(boundary.metadata?.muxMetadata?.type).toBe("context-window-rollover");
       expect(start).toHaveBeenCalledTimes(1);
       const request = start.mock.calls[0][0];
@@ -530,7 +532,8 @@ describe("pinned full-payload rollover admission", () => {
       const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!after.success) throw new Error(after.error);
       expect(after.data[0].metadata?.muxMetadata?.type).toBe("context-window-rollover");
-      const listing = after.data.findIndex(isContextListingMessage);
+      // Other sections (built-in skills) list too; the last row ends the window.
+      const listing = after.data.findLastIndex(isContextListingMessage);
       const userIndex = after.data.findLastIndex(
         (row) => row.role === "user" && !isContextListingMessage(row)
       );
