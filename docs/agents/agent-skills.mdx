@@ -56,14 +56,14 @@ Many repositories already ship skills in Claude Code's directories. Enable the *
 
 Within the same directory, compat roots have the lowest precedence (`.xum/skills` > `.agents/skills` > `.claude/skills`); a nearer directory still wins over a farther one. The global roots use the same convention order. Compat roots are read-only: Xum never writes or deletes skills in `.claude` directories. Skills that package Xum workflow scripts are not discovered from `.claude` roots.
 
-### Agent Plugins (experiment)
+### Agent Plugins
 
-Enable the **Agent Plugins** experiment (Settings → Experiments) to also discover skills packaged in [Agent Plugins 1.0.0](https://agent-plugins.org) directories — a plugin is a directory with a `plugin.json` manifest plus an optional `skills/` folder. Plugins are discovered from:
+Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugins.org) directories. A plugin is a directory with a `plugin.json` manifest plus an optional `skills/` folder. Plugins are discovered from:
 
 - **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
-Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers-experiment).
+Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers).
 
 Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`). The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.
 

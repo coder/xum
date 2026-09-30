@@ -264,8 +264,6 @@ export const WorkspaceConfigSchema = z.object({
         // (persistent sandbox kernel, family messaging tools) across app restarts
         // without depending on live frontend experiment state.
         rlm: z.boolean().optional(),
-        advisorTool: z.boolean().optional(),
-        dynamicWorkflows: z.boolean().optional(),
       })
     )
     .optional()

@@ -812,6 +812,61 @@ const RemoteMCPOAuthSection: React.FC<{
   );
 };
 
+function ToolSearchSetting() {
+  const { api } = useAPI();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!api) return;
+    let cancelled = false;
+    api.config
+      .getConfig()
+      .then((cfg) => {
+        if (!cancelled) setEnabled(cfg.toolSearchEnabled);
+      })
+      .catch(() => {
+        // Keep the switch disabled; the next settings visit retries the read.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  const handleChange = async (next: boolean) => {
+    if (!api) return;
+    const previous = enabled;
+    setEnabled(next);
+    setError(null);
+    try {
+      await api.config.updateToolSearchEnabled({ enabled: next });
+    } catch (err) {
+      setEnabled(previous);
+      setError(err instanceof Error ? err.message : "Failed to update tool search");
+    }
+  };
+
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div className="min-w-0">
+        <h3 className="text-foreground text-sm font-medium">Tool search</h3>
+        <p className="text-content-secondary mt-1 text-xs">
+          Defer MCP tool definitions until the model discovers them with{" "}
+          <code className="text-accent">tool_catalog_search</code>. Not applied when Anthropic
+          prompt caching is active.
+        </p>
+        {error && <p className="text-destructive mt-1 text-xs">{error}</p>}
+      </div>
+      <Switch
+        checked={enabled ?? true}
+        disabled={enabled === null}
+        onCheckedChange={(checked) => void handleChange(checked)}
+        aria-label="Toggle MCP tool search"
+      />
+    </div>
+  );
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
   const designRevision = useClaudeDesignRevision();
@@ -1298,6 +1353,8 @@ export const MCPSettingsSection: React.FC = () => {
           <code className="text-accent">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
+
+      <ToolSearchSetting />
 
       {designEnabled && (
         <ClaudeDesignCard

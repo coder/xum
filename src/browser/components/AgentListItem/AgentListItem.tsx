@@ -1,7 +1,6 @@
 import { useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   getWorkspaceStreamingStatusPhase,
   useWorkspaceStreamingStatusPhase,
@@ -19,7 +18,6 @@ import {
 } from "@/browser/utils/ui/workspaceFiltering";
 import assert from "@/common/utils/assert";
 import { cn } from "@/common/lib/utils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -609,7 +607,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
   // Destructure metadata for convenience
   const { id: workspaceId, namedWorkspacePath } = metadata;
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const isInitializing = metadata.isInitializing === true;
   const isRemoving = isRemovingProp === true || metadata.isRemoving === true;
   const isDisabled = isRemoving || isArchiving === true;
@@ -866,7 +863,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     !showCompletedChildrenIndicator &&
     !showsVisibleStatusDot;
   const shouldShowHeartbeatFallback =
-    workspaceHeartbeatsEnabled &&
     metadata.heartbeat?.enabled === true &&
     !isSubAgentRow &&
     !showCompletedChildrenIndicator &&
@@ -1224,9 +1220,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   <WorkspaceActionsMenuContent
                     onEditTitle={startEditing}
-                    onConfigureHeartbeat={
-                      workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
-                    }
+                    onConfigureHeartbeat={() => setHeartbeatModalOpen(true)}
                     onStopRuntime={
                       isRuntimeRunning && onStopRuntime
                         ? () =>
@@ -1311,13 +1305,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   />
                 </PopoverContent>
               </Popover>
-              {workspaceHeartbeatsEnabled && (
-                <WorkspaceHeartbeatModal
-                  workspaceId={workspaceId}
-                  open={heartbeatModalOpen}
-                  onOpenChange={setHeartbeatModalOpen}
-                />
-              )}
+              <WorkspaceHeartbeatModal
+                workspaceId={workspaceId}
+                open={heartbeatModalOpen}
+                onOpenChange={setHeartbeatModalOpen}
+              />
             </ActionButtonWrapper>
           )
         )}

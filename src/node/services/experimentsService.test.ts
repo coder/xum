@@ -69,9 +69,9 @@ describe("ExperimentsService", () => {
     const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await sibling.initialize();
     await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
-    await sibling.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await sibling.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
     expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(false);
-    expect((await first.getOverrides())[EXPERIMENT_IDS.TIMELINE]).toBe(true);
+    expect((await first.getOverrides())[EXPERIMENT_IDS.AGENT_BROWSER]).toBe(true);
   });
 
   test("disk reconciliation updates and clears sibling telemetry variants", async () => {
@@ -92,7 +92,7 @@ describe("ExperimentsService", () => {
       false
     );
     await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, null);
-    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
     expect(first.setFeatureFlagVariant).toHaveBeenCalledWith(
       EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
       null
@@ -194,7 +194,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {
-          [EXPERIMENT_IDS.TOOL_SEARCH]: { value: "test", fetchedAtMs: Date.now() },
+          [EXPERIMENT_IDS.MEMORY]: { value: "test", fetchedAtMs: Date.now() },
         },
         overrides: { [EXPERIMENT_IDS.AGENT_BROWSER]: true },
       }),
@@ -207,7 +207,7 @@ describe("ExperimentsService", () => {
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.AGENT_BROWSER)).toBe(true);
     // A cached remote assignment must not survive as an implicit opt-in.
-    expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.MEMORY)).toBe(false);
   });
 
   test("legacy exclusive-only override keeps PTC enabled after upgrade", async () => {
@@ -346,7 +346,7 @@ describe("ExperimentsService", () => {
   test("writes an empty experiments map so older builds still read overrides", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
-    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
 
     expect((await readOverridesFile()).experiments).toEqual({});
   });

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import { getCommandGhostHint } from "./registry";
 
@@ -40,29 +39,17 @@ describe("getCommandGhostHint", () => {
     expect(getCommandGhostHint("/compact ", false, "creation")).toBeNull();
   });
 
-  it("returns null for experiment-gated command hints when disabled", () => {
+  it("returns heartbeat hints regardless of experiment state", () => {
     expect(
       getCommandGhostHint("/heartbeat ", false, {
         isExperimentEnabled: () => false,
-      })
-    ).toBeNull();
-  });
-
-  it("returns hints for experiment-gated commands when enabled", () => {
-    const enabledExperiments = new Set<ExperimentId>([EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]);
-
-    expect(
-      getCommandGhostHint("/heartbeat ", false, {
-        isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
       })
     ).toBe(SLASH_COMMAND_HINTS.heartbeat);
   });
 
   it("returns only workflow args after the typed /workflow command", () => {
-    const enabledExperiments = new Set<ExperimentId>([EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]);
-
     const hint = getCommandGhostHint("/workflow ", false, {
-      isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
+      isExperimentEnabled: () => false,
     });
 
     expect(hint).toBe("<script_path> [json_args]");

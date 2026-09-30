@@ -9,7 +9,11 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  PROMOTED_EXPERIMENT_IDS,
+} from "@/common/constants/experiments";
 import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
@@ -172,6 +176,9 @@ async function gatherStdin(): Promise<string> {
 
 function collectExperiments(value: string, previous: string[]): string[] {
   let experimentId = value.trim().toLowerCase();
+  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
+  }
   // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
   // flag activates exactly the old exclusive posture — keep existing
   // automation that passes the removed ID working instead of erroring.
@@ -256,12 +263,6 @@ function buildExperimentsObject(experimentIds: readonly string[]) {
     // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
     // silently dropped and workflow sends ran the non-kernel PTC toolset.
     rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
-    // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
-    // experiment is enabled implicitly for this invocation (never persisted).
-    dynamicWorkflows: true,
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-    // Loading third-party plugin code stays an explicit per-invocation opt-in.
-    agentPlugins: experimentIds.includes(EXPERIMENT_IDS.AGENT_PLUGINS),
   };
 }
 
@@ -528,7 +529,6 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
-        includeAgentPlugins: experiments.agentPlugins,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -585,7 +585,6 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
-      includeAgentPlugins: buildExperimentsObject(options.experiment).agentPlugins,
     });
     const result = await workflowService.startWorkflow({
       script,
@@ -640,9 +639,7 @@ export async function main(): Promise<number> {
   const program = new Command();
   program
     .name("xum workflow")
-    .description(
-      "Run xum workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
-    )
+    .description("Run xum workflow scripts by explicit script path.")
     .option("-d, --dir <path>", "project directory")
     .option("-r, --runtime <runtime>", "runtime type (currently only local is supported)", "local")
     .option("-m, --model <model>", "model to use for workflow-owned agents", defaultModel)

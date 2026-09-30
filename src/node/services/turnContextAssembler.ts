@@ -533,8 +533,6 @@ export interface BuildStreamSystemContextOptions {
   hotMemoriesBlock?: string;
   /** claude-skills-compat experiment: read Claude skills and global instructions (read-only). */
   claudeSkillsCompatEnabled?: boolean;
-  /** agent-plugins experiment: discover skills from Agent Plugins containers (read-only). */
-  agentPluginsEnabled?: boolean;
   /**
    * Instruction snapshot from an earlier build in the same turn. Post-policy
    * and per-model rebuilds reuse it so one turn reads AGENTS.md files once.
@@ -882,7 +880,6 @@ export async function buildStreamSystemContext(
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
 
   const agentResolveOptions = {
-    includeAgentPlugins: opts.agentPluginsEnabled,
     skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
     cache: opts.agentDefinitionCache,
   };
@@ -891,7 +888,6 @@ export async function buildStreamSystemContext(
     workspacePath,
     xumScope,
     includeClaudeSkills: opts.claudeSkillsCompatEnabled,
-    includeAgentPlugins: opts.agentPluginsEnabled,
   });
 
   // The agent body, subagent frontmatter, subagent discovery, skill discovery,
@@ -943,7 +939,6 @@ export async function buildStreamSystemContext(
           workspacePath: agentDiscoveryPath,
           cfg,
           loadDesktopCapability,
-          includeAgentPlugins: opts.agentPluginsEnabled,
           cache: opts.agentDefinitionCache,
         }),
     // Discover available skills for tool description context
@@ -952,7 +947,6 @@ export async function buildStreamSystemContext(
       containment: skillCtx.containment,
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
-      includeAgentPlugins: opts.agentPluginsEnabled,
     }).catch((error: unknown) => {
       // An unreachable host must fail the turn, not silently drop the skills index (#4438).
       if (isRuntimeTransportError(error)) throw error;
@@ -1078,8 +1072,6 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   cfg: ProjectsConfig;
   roots?: AgentDefinitionsRoots;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
-  /** agent-plugins experiment: also discover agents contributed by Agent Plugins. */
-  includeAgentPlugins?: boolean;
   /** Per-request definition reuse shared with agent resolution. */
   cache?: AgentDefinitionRequestCache;
 }): Promise<Awaited<ReturnType<typeof discoverAgentDefinitions>>> {
@@ -1093,7 +1085,6 @@ export async function discoverAvailableSubagentsForToolContext(args: {
 
   const discovered = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     roots: args.roots,
-    includeAgentPlugins: args.includeAgentPlugins,
   });
 
   let desktopAvailablePromise: Promise<boolean> | undefined;
@@ -1120,7 +1111,6 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           descriptor.id,
           {
             roots: args.roots,
-            includeAgentPlugins: args.includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
             cache: args.cache,
           }

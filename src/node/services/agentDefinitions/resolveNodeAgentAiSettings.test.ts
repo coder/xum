@@ -152,7 +152,8 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
       { runtime, workspacePath, workspaceId: "ws" },
       { abortSignal: controller.signal }
     );
-    await Bun.sleep(0);
+    // Agent Plugins container discovery reads the host filesystem before the first stat.
+    for (let i = 0; i < 100 && state.inFlight === 0; i++) await Bun.sleep(1);
     expect(state.inFlight).toBe(1);
     const statsBeforeAbort = state.statPaths.length;
 

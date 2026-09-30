@@ -740,7 +740,6 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options?: { includeHotMemories?: boolean }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
-  isAgentPluginsEnabled?(): boolean;
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
@@ -11776,10 +11775,6 @@ export class AgentSession {
         const includeClaudeSkills =
           typeof this.aiService.isClaudeSkillsCompatEnabled === "function" &&
           this.aiService.isClaudeSkillsCompatEnabled();
-        // agent-plugins experiment: same treatment for plugin-provided skills.
-        const includeAgentPlugins =
-          typeof this.aiService.isAgentPluginsEnabled === "function" &&
-          this.aiService.isAgentPluginsEnabled();
         // Resolve project workspaces through the same storage context as the
         // skill tools so subprojects inherit checkout-level skills and plugins
         // across host-local and runtime-backed workspaces. disableWorkspaceAgents
@@ -11796,7 +11791,6 @@ export class AgentSession {
                 workspacePath: skillDiscoveryPath,
                 xumScope,
                 includeClaudeSkills,
-                includeAgentPlugins,
               })
             : null;
         resolved = await readAgentSkill(
@@ -11808,7 +11802,6 @@ export class AgentSession {
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
               : {}),
             includeClaudeSkills,
-            includeAgentPlugins,
           }
         );
       } catch (error) {

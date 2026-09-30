@@ -582,6 +582,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
   let keepScreenAwake = initialKeepScreenAwake;
+  let toolSearchEnabled = true;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -832,6 +833,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           muxGovernorEnrolled,
           llmDebugLogs: false,
           keepScreenAwake,
+          toolSearchEnabled,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -936,6 +938,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateKeepScreenAwake: (input: { enabled: boolean }) => {
         keepScreenAwake = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateToolSearchEnabled: (input: { enabled: boolean }) => {
+        toolSearchEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

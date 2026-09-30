@@ -23,8 +23,6 @@ export interface DiscoverWorkflowScriptsInput {
   /** Inclusive checkout/repository boundary for inherited project skills. */
   projectSearchRoot?: string;
   projectTrusted: boolean;
-  /** agent-plugins experiment: also enumerate plugin skills and plugin workflows/ scripts. */
-  includeAgentPlugins?: boolean;
   skillStorageContext?: SkillStorageContext;
 }
 
@@ -73,7 +71,6 @@ export async function discoverWorkflowScripts(
                 kind: "runtime",
                 root: input.projectSearchRoot ?? input.workspacePath,
               },
-              includeAgentPlugins: input.includeAgentPlugins,
             }
       )
     ).forEach(addSkill);
@@ -89,7 +86,6 @@ export async function discoverWorkflowScripts(
         workspacePath: input.workspacePath,
         projectSearchRoot: input.projectSearchRoot,
         projectTrusted: input.projectTrusted,
-        includeAgentPlugins: input.includeAgentPlugins,
         skillStorageContext: input.skillStorageContext,
       });
       const descriptor = buildWorkflowScriptDescriptor(resolved);
@@ -122,24 +118,22 @@ export async function discoverWorkflowScripts(
 
   // Agent Plugins: standalone workflows/ contributions, addressed as
   // plugin://<name>/<file>.js. Same per-script failure isolation as skills.
-  if (input.includeAgentPlugins === true) {
-    try {
-      const plugins = await discoverWorkflowPlugins(input);
-      const seenPluginNames = new Set<string>();
-      for (const plugin of plugins) {
-        if (plugin.workflowsDir == null) continue;
-        // The resolver picks the first plugin matching a name, so duplicate
-        // names in lower-precedence containers cannot contribute here either.
-        if (seenPluginNames.has(plugin.name)) continue;
-        seenPluginNames.add(plugin.name);
+  try {
+    const plugins = await discoverWorkflowPlugins(input);
+    const seenPluginNames = new Set<string>();
+    for (const plugin of plugins) {
+      if (plugin.workflowsDir == null) continue;
+      // The resolver picks the first plugin matching a name, so duplicate
+      // names in lower-precedence containers cannot contribute here either.
+      if (seenPluginNames.has(plugin.name)) continue;
+      seenPluginNames.add(plugin.name);
 
-        for (const fileName of await listWorkflowScriptFiles(plugin.workflowsDir)) {
-          await tryPush(available, `plugin://${plugin.name}/${fileName}`);
-        }
+      for (const fileName of await listWorkflowScriptFiles(plugin.workflowsDir)) {
+        await tryPush(available, `plugin://${plugin.name}/${fileName}`);
       }
-    } catch (error) {
-      log.warn(`Workflow script discovery: failed to enumerate plugins: ${getErrorMessage(error)}`);
     }
+  } catch (error) {
+    log.warn(`Workflow script discovery: failed to enumerate plugins: ${getErrorMessage(error)}`);
   }
 
   available.sort((a, b) => a.descriptor.name.localeCompare(b.descriptor.name));

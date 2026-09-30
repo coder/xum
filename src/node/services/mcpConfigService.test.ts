@@ -311,7 +311,7 @@ describe("MCP server disable filtering", () => {
     });
   });
 
-  // --- Agent Plugins provider (agent-plugins experiment) ---
+  // --- Agent Plugins provider ---
 
   const PLUGIN_SERVER = {
     transport: "stdio" as const,

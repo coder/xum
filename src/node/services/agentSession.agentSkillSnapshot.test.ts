@@ -205,7 +205,6 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       workspaceId,
       workspacePath: subprojectPath,
       aiServiceOverrides: {
-        isAgentPluginsEnabled: () => true,
         // Mirrors AIService: checkout root anchors plugin containers even though
         // the execution path is the subproject directory.
         resolveXumToolScopeForWorkspace: () => ({

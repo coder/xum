@@ -65,7 +65,6 @@ async function createPreparationHarness() {
       throw new Error("not used by request preparation tests");
     },
     isClaudeSkillsCompatEnabled: () => false,
-    isAgentPluginsEnabled: () => false,
     wrapToolsForDelegation: (_workspaceId, tools) => tools,
     durableEventJournalFor: () => {
       throw new Error("not used by request preparation tests");

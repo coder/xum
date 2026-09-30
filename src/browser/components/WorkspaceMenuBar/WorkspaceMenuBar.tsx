@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
@@ -42,7 +41,6 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { isDesktopMode, DESKTOP_TITLEBAR_HEIGHT_CLASS } from "@/browser/hooks/useDesktopTitlebar";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { DebugLlmRequestModal } from "../DebugLlmRequestModal/DebugLlmRequestModal";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -107,8 +105,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -257,9 +253,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
   // live viewport/layout changes without a resize subscription.
   useEffect(() => {
-    if (!timelineExperimentEnabled) {
-      return;
-    }
     const handler = (e: KeyboardEvent) => {
       if (
         !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
@@ -274,7 +267,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [timelineExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
+  }, [isTimelineSidebarHidden, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -485,8 +478,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   // Keybind for opening heartbeat configuration
   useEffect(() => {
-    if (!workspaceHeartbeatsEnabled) return;
-
     const handler = (e: KeyboardEvent) => {
       if (matchesKeybind(e, KEYBINDS.CONFIGURE_HEARTBEAT)) {
         e.preventDefault();
@@ -495,7 +486,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [workspaceHeartbeatsEnabled]);
+  }, []);
 
   // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
   // a window listener subscribing to an external event source, not derived state). Like the
@@ -819,9 +810,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
             <WorkspaceActionsMenuContent
               onConfigureMcp={() => setMcpModalOpen(true)}
-              onConfigureHeartbeat={
-                workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
-              }
+              onConfigureHeartbeat={() => setHeartbeatModalOpen(true)}
               onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
@@ -830,9 +819,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
               }
               onOpenTimeline={
-                timelineExperimentEnabled && timelineSidebarHidden
-                  ? () => setTimelineDialogWorkspaceId(workspaceId)
-                  : null
+                timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
               }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
               // Scratch chats have no repo: review events are ignored by
@@ -869,13 +856,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           </PopoverContent>
         </Popover>
       </div>
-      {workspaceHeartbeatsEnabled && (
-        <WorkspaceHeartbeatModal
-          workspaceId={workspaceId}
-          open={heartbeatModalOpen}
-          onOpenChange={setHeartbeatModalOpen}
-        />
-      )}
+      <WorkspaceHeartbeatModal
+        workspaceId={workspaceId}
+        open={heartbeatModalOpen}
+        onOpenChange={setHeartbeatModalOpen}
+      />
       <WorkspaceUnrelatedMessagingModal
         // Remount per workspace: the keyed open state above only closes the dialog, while
         // the modal's own pending/error state and in-flight request id would otherwise

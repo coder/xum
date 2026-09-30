@@ -143,10 +143,9 @@ xum run --budget 2.00 "Refactor the authentication module"
 Run a durable workflow JavaScript file from the command line without opening the desktop app. Workflows are addressed by explicit `script_path` values; there is no workflow discovery, `list`, or `show` command. Skill-packaged workflows use `skill://<skill-name>/<file.js>`, and local workflow files use an explicit workspace-contained `.js` path. `xum wf` is a shorthand alias for `xum workflow`.
 
 <Note>
-  `xum workflow` is experimental. Invoking the command implicitly enables the `dynamic-workflows`
-  experiment for that invocation only. The initial CLI runner supports the `local` runtime only;
-  `worktree`, SSH, Docker, and devcontainer workflow execution are blocked until their workflow
-  isolation and cleanup semantics are implemented.
+  The CLI workflow runner supports the `local` runtime only; `worktree`, SSH, Docker, and
+  devcontainer workflow execution are blocked until their workflow isolation and cleanup semantics
+  are implemented.
 </Note>
 
 Use local workflow files for cheap CLI smoke tests. `skill://` paths run the packaged workflow they reference, which may require AI credentials or model budget.

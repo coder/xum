@@ -21,7 +21,7 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { FALLBACK_AGENTS } from "./TasksSection.agents";
 
-let advisorExperimentEnabled = false;
+let experimentsEnabledByDefault = false;
 let experimentValues: Record<string, boolean> = {};
 
 let apiMock: {
@@ -51,7 +51,7 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
-  useExperimentValue: (id: string) => experimentValues[id] ?? advisorExperimentEnabled,
+  useExperimentValue: (id: string) => experimentValues[id] ?? experimentsEnabledByDefault,
 }));
 
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
@@ -215,7 +215,7 @@ describe("TasksSection Exec subagent defaults", () => {
   beforeEach(() => {
     restoreDom = installDom();
     getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = {};
     apiMock = null;
     selectedWorkspaceMock = null;
@@ -235,7 +235,7 @@ describe("TasksSection Exec subagent defaults", () => {
     [true, false],
     [true, true],
   ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     experimentValues = {
       [EXPERIMENT_IDS.MEMORY]: memory,
       [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
@@ -288,7 +288,7 @@ describe("TasksSection Exec subagent defaults", () => {
   });
 
   test("Intuition can display and save Off and Low below the chat minimum", async () => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     getAppConfigStore().updateOptimistically({
       minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
     });
@@ -329,7 +329,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test.each([undefined, "openai:gpt-6-luna"])(
     "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
     async (workspaceModel) => {
-      advisorExperimentEnabled = true;
+      experimentsEnabledByDefault = true;
       const view = renderTasksSection({
         workspaceModel,
         agentAiDefaults: { exec: { modelString: "xai:grok-4-1-fast" } },
@@ -351,7 +351,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test.each([undefined, "xai:grok-4-1-fast"])(
     "Intuition prefers its own model override to its definition, then the parent (override=%s)",
     async (modelString) => {
-      advisorExperimentEnabled = true;
+      experimentsEnabledByDefault = true;
       const view = renderTasksSection({
         agents: FALLBACK_AGENTS.map((agent) =>
           agent.id === "intuition"
@@ -379,7 +379,7 @@ describe("TasksSection Exec subagent defaults", () => {
   );
 
   test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     const view = renderTasksSection({
       agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
     });
@@ -415,8 +415,7 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(view.getByText("Sub-agents")).toBeTruthy();
   });
 
-  test("defaults advisor on for Exec and Plan when the experiment is enabled", async () => {
-    advisorExperimentEnabled = true;
+  test("defaults advisor on for Exec and Plan", async () => {
     const view = renderTasksSection();
 
     const planAdvisorSwitch = await view.findByRole("switch", { name: "Toggle plan advisor" });
@@ -834,7 +833,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test("hides the Pro mode toggle on the Dream card even for pro-capable models", async () => {
     // Dream's headless requests (raw streamText) never apply reasoningMode,
     // so the card must not offer a toggle that cannot affect them.
-    advisorExperimentEnabled = true; // shared experiment mock also enables memory consolidation
+    experimentsEnabledByDefault = true; // enables memory consolidation
     const view = renderTasksSection({
       agentAiDefaults: {
         dream: { modelString: "openai:gpt-6-luna" },
@@ -870,7 +869,7 @@ describe("TasksSection Auto routing defaults", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true };
     apiMock = null;
     selectedWorkspaceMock = null;

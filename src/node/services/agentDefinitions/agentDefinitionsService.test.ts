@@ -220,7 +220,6 @@ describe("agentDefinitionsService", () => {
       // Project-only listing does not use workspace initialization or AI services.
       const context: AgentDefinitionsContext = {
         config,
-        experimentsService: { isExperimentEnabled: () => false },
         aiService: {
           getWorkspaceMetadata: () => {
             throw new Error("Unexpected workspace lookup");

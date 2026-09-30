@@ -99,6 +99,11 @@ export interface ProjectsConfig {
    * streaming or waiting on background bash / workflow activity. Absent = off.
    */
   keepScreenAwake?: boolean;
+  /**
+   * Defer MCP tool definitions out of the model-visible tool list until the model
+   * discovers them via tool_catalog_search. Absent = on; only `false` disables it.
+   */
+  toolSearchEnabled?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */

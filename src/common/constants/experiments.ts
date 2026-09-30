@@ -14,20 +14,14 @@ export const EXPERIMENT_IDS = {
   MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
   AGENT_BROWSER: "agent-browser",
-  ADVISOR_TOOL: "advisor-tool",
-  WORKSPACE_HEARTBEATS: "workspace-heartbeats",
   PORTABLE_DESKTOP: "portable-desktop",
-  DYNAMIC_WORKFLOWS: "dynamic-workflows",
   MEMORY: "memory",
   MEMORY_HOT_SET: "memory-hot-set",
   MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
-  TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
-  AGENT_PLUGINS: "agent-plugins",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
-  TIMELINE: "timeline",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
@@ -74,6 +68,20 @@ export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling
   if (experiments?.programmaticToolCalling !== true) return experiments;
   return { ...experiments, programmaticToolCallingExclusive: true };
 }
+
+/**
+ * Former experiment IDs whose features are now always on. CLI `-e` parsing
+ * accepts them as no-ops so existing automation (for example terminal-bench)
+ * keeps working instead of failing on an unknown experiment.
+ */
+export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
+  "advisor-tool",
+  "agent-plugins",
+  "dynamic-workflows",
+  "timeline",
+  "tool-search",
+  "workspace-heartbeats",
+]);
 
 export interface ExperimentDefinition {
   id: ExperimentId;
@@ -171,33 +179,12 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.ADVISOR_TOOL]: {
-    id: EXPERIMENT_IDS.ADVISOR_TOOL,
-    name: "Advisor Tool",
-    description: "Enable the experimental client-side advisor tool foundation",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: {
-    id: EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
-    name: "Workspace Heartbeats",
-    description: "Persist per-workspace heartbeat settings for future background follow-ups",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.PORTABLE_DESKTOP]: {
     id: EXPERIMENT_IDS.PORTABLE_DESKTOP,
     name: "Portable Desktop",
     description: "Enable virtual desktop sessions for GUI-based agent interactions",
     enabledByDefault: false,
     platformRestriction: ["linux"],
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: {
-    id: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
-    name: "Dynamic Workflows",
-    description: "Enable durable JavaScript workflow orchestration for delegated agent tasks",
-    enabledByDefault: false,
     showInSettings: true,
   },
   [EXPERIMENT_IDS.MEMORY]: {
@@ -237,14 +224,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.TOOL_SEARCH]: {
-    id: EXPERIMENT_IDS.TOOL_SEARCH,
-    name: "Tool Search",
-    description:
-      "Defer MCP tool definitions out of the model-visible tool list until the model discovers them via the tool_catalog_search tool. Not applied to models with Anthropic prompt caching, where each discovery would invalidate the cache",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT]: {
     id: EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT,
     name: "Claude compatibility",
@@ -253,27 +232,11 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.AGENT_PLUGINS]: {
-    id: EXPERIMENT_IDS.AGENT_PLUGINS,
-    name: "Agent Plugins",
-    description:
-      "Discover Agent Plugins (agent-plugins.org 1.0.0) from .xum/plugins, .agents/plugins, ~/.xum/plugins, and ~/.agents/plugins: plugin skills join skill discovery and plugin MCP servers appear disabled by default",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT]: {
     id: EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT,
     name: "Skill dynamic context injection",
     description:
       "When you invoke a skill, whole-line !`command` directives in SKILL.md run in the workspace and are replaced with their output before the model sees the skill. Commands come from skill files, so only enable this if you trust the skills in your projects.",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.TIMELINE]: {
-    id: EXPERIMENT_IDS.TIMELINE,
-    name: "Timeline",
-    description:
-      "Record a durable birds-eye timeline per workspace: prompts, agent events, goals, heartbeats, sub-agents, and workflows",
     enabledByDefault: false,
     showInSettings: true,
   },

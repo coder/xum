@@ -16,7 +16,6 @@ import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
-import { normalizeTaskSettings, type TaskSettings } from "@/common/types/tasks";
 import {
   coerceThinkingLevel,
   coerceOpenAIReasoningMode,
@@ -48,10 +47,6 @@ interface AdvisorSettingsState {
   advisorReasoningMode: OpenAIReasoningMode;
   advisorMaxUsesPerTurn: number | null;
   advisorMaxOutputTokens: number | null;
-}
-
-interface AdvisorSavePayload extends AdvisorSettingsState {
-  taskSettings: TaskSettings;
 }
 
 function normalizeAdvisorModelString(value: string | null | undefined): string | null {
@@ -145,7 +140,7 @@ function areAdvisorSettingsEqual(a: AdvisorSettingsState, b: AdvisorSettingsStat
   );
 }
 
-export function AdvisorToolExperimentConfig() {
+export function AdvisorConfig() {
   const { api } = useAPI();
   const { config: providersConfig } = useProvidersConfig();
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
@@ -169,10 +164,9 @@ export function AdvisorToolExperimentConfig() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const taskSettingsRef = useRef<TaskSettings | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const savingRef = useRef(false);
-  const pendingSaveRef = useRef<AdvisorSavePayload | null>(null);
+  const pendingSaveRef = useRef<AdvisorSettingsState | null>(null);
   const lastSyncedRef = useRef<AdvisorSettingsState | null>(null);
   const isMountedRef = useRef(true);
 
@@ -200,7 +194,6 @@ export function AdvisorToolExperimentConfig() {
           return;
         }
 
-        const normalizedTaskSettings = normalizeTaskSettings(cfg.taskSettings);
         const normalizedModelString = normalizeAdvisorModelString(cfg.advisorModelString);
         const normalizedThinkingLevel =
           coerceThinkingLevel(cfg.advisorThinkingLevel) ?? THINKING_LEVEL_OFF;
@@ -221,7 +214,6 @@ export function AdvisorToolExperimentConfig() {
         const nextMaxOutputTokens =
           nextMaxOutputTokensMode === "unlimited" ? null : nextOutputTokensValue;
 
-        taskSettingsRef.current = normalizedTaskSettings;
         setAdvisorModelString(normalizedModelString ?? "");
         setAdvisorThinkingLevel(normalizedThinkingLevel);
         setAdvisorReasoningMode(normalizedReasoningMode);
@@ -246,7 +238,6 @@ export function AdvisorToolExperimentConfig() {
           return;
         }
 
-        taskSettingsRef.current = null;
         setSaveError(getErrorMessage(error));
         setLoadFailed(true);
         setLoaded(true);
@@ -265,11 +256,6 @@ export function AdvisorToolExperimentConfig() {
       return;
     }
     if (loadFailed) {
-      return;
-    }
-
-    const taskSettings = taskSettingsRef.current;
-    if (!taskSettings) {
       return;
     }
 
@@ -296,7 +282,7 @@ export function AdvisorToolExperimentConfig() {
       return;
     }
 
-    pendingSaveRef.current = { taskSettings, ...normalizedAdvisorSettings };
+    pendingSaveRef.current = normalizedAdvisorSettings;
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
@@ -318,7 +304,6 @@ export function AdvisorToolExperimentConfig() {
 
         void api.config
           .saveConfig({
-            taskSettings: payload.taskSettings,
             advisorModelString: payload.advisorModelString,
             advisorThinkingLevel: payload.advisorThinkingLevel,
             advisorReasoningMode: payload.advisorReasoningMode,
@@ -399,13 +384,12 @@ export function AdvisorToolExperimentConfig() {
         return;
       }
 
-      // The inline advisor settings disappear immediately when the experiment is toggled off, so
-      // flush any debounced edits during unmount instead of dropping the user's last change.
+      // Closing Settings or switching sections unmounts this block immediately, so flush any
+      // debounced edits during unmount instead of dropping the user's last change.
       pendingSaveRef.current = null;
       savingRef.current = true;
       void api.config
         .saveConfig({
-          taskSettings: payload.taskSettings,
           advisorModelString: payload.advisorModelString,
           advisorThinkingLevel: payload.advisorThinkingLevel,
           advisorReasoningMode: payload.advisorReasoningMode,
@@ -518,7 +502,7 @@ export function AdvisorToolExperimentConfig() {
   }
 
   return (
-    <div className="bg-background-secondary space-y-3 px-4 py-3">
+    <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Advisor Model</div>

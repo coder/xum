@@ -174,6 +174,8 @@ export const AppConfigOnDiskSchema = z
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
+    /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
+    toolSearchEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()

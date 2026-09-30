@@ -4,7 +4,6 @@ import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
-import * as RealExperimentsContextModule from "@/browser/contexts/ExperimentsContext";
 import {
   cloneElement,
   createContext,
@@ -58,12 +57,7 @@ interface MockDialogTriggerChildProps {
   "aria-haspopup"?: "dialog";
 }
 
-restoreModulesAfterSuite([
-  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
-  // The experiments stub below exports only useExperimentValue; without a restore, later
-  // suites that render the real ExperimentsProvider/useExperiment would see it too.
-  ["@/browser/contexts/ExperimentsContext", { ...RealExperimentsContextModule }],
-]);
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: {
@@ -112,12 +106,6 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
   DialogTitle: (props: { children: ReactNode; className?: string }) => (
     <h2 className={props.className}>{props.children}</h2>
   ),
-}));
-
-// Keep experiment state local to this suite so cross-file happy-dom storage cannot affect cards.
-let dynamicWorkflowsEnabled = false;
-void mock.module("@/browser/contexts/ExperimentsContext", () => ({
-  useExperimentValue: () => dynamicWorkflowsEnabled,
 }));
 
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "./WorkflowRunToolCall";
@@ -342,7 +330,6 @@ describe("WorkflowRunToolCall", () => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
-    dynamicWorkflowsEnabled = false;
   });
 
   afterEach(() => {
@@ -399,9 +386,7 @@ describe("WorkflowRunToolCall", () => {
     expect(getStoredPrefs()).toBeNull();
   });
 
-  test("keeps active workflow runs expanded with the workflows experiment enabled", () => {
-    dynamicWorkflowsEnabled = true;
-
+  test("keeps active workflow runs expanded and collapses completed runs", () => {
     for (const status of ["running", "backgrounded"] as const) {
       const run = createTimelineRun({ id: `wfr_active_${status}`, status });
       const view = renderWithStickyToolProviders(
@@ -429,7 +414,6 @@ describe("WorkflowRunToolCall", () => {
   });
 
   test("auto-collapses a non-interacted card when its run becomes terminal", () => {
-    dynamicWorkflowsEnabled = true;
     const runningRun = createTimelineRun({ id: "wfr_transition" });
     const completedRun = createTimelineRun({ id: runningRun.id, status: "completed" });
     const renderCard = (run: WorkflowRunRecord) =>
@@ -448,7 +432,6 @@ describe("WorkflowRunToolCall", () => {
   });
 
   test("manual collapse sticks while the live header summary updates", () => {
-    dynamicWorkflowsEnabled = true;
     const runningRun = createTimelineRun({ id: "wfr_manual_live" });
     const updatedRun = createTimelineRun({
       id: runningRun.id,
@@ -4126,15 +4109,13 @@ describe("WorkflowRunToolCall", () => {
         </ThemeProvider>
       </APIHarness>
     );
+    // Settled runs start collapsed; expand to reach the recovery actions.
+    fireEvent.click(getWorkflowHeader(view));
 
     fireEvent.click(view.getByRole("button", { name: "Resume workflow" }));
 
     await waitFor(() => expect(resumed).toBe(true));
     await waitFor(() => expect(view.getAllByText("completed").length).toBeGreaterThan(0));
-    expect(view.queryByText("resumed")).toBeNull();
-
-    fireEvent.click(getWorkflowHeader(view));
-
     expect(view.getByText("resumed")).toBeTruthy();
   });
 
@@ -4232,12 +4213,13 @@ describe("WorkflowRunToolCall", () => {
         </ThemeProvider>
       </APIHarness>
     );
+    // Settled runs start collapsed; expand to reach the recovery actions.
+    fireEvent.click(getWorkflowHeader(view));
 
     fireEvent.click(view.getByRole("button", { name: "Retry from checkpoint" }));
 
     await waitFor(() => expect(retried).toBe(true));
     await waitFor(() => expect(view.getAllByText("completed").length).toBeGreaterThan(0));
-    fireEvent.click(getWorkflowHeader(view));
     expect(view.getByText("retried")).toBeTruthy();
   });
 
@@ -4347,6 +4329,8 @@ describe("WorkflowRunToolCall", () => {
           </ThemeProvider>
         </APIHarness>
       );
+      // Settled runs start collapsed; expand to reach the recovery actions.
+      fireEvent.click(getWorkflowHeader(view));
 
       fireEvent.click(view.getByRole("button", { name: "Retry from checkpoint" }));
 
@@ -4469,6 +4453,8 @@ describe("WorkflowRunToolCall", () => {
           </ThemeProvider>
         </APIHarness>
       );
+      // Settled runs start collapsed; expand to reach the recovery actions.
+      fireEvent.click(getWorkflowHeader(view));
 
       fireEvent.click(view.getByRole("button", { name: "Resume workflow" }));
 
@@ -4569,6 +4555,8 @@ describe("WorkflowRunToolCall", () => {
         </ThemeProvider>
       </APIHarness>
     );
+    // Settled runs start collapsed; expand to reach the recovery actions.
+    fireEvent.click(getWorkflowHeader(view));
 
     const retryButton = view.getByRole("button", { name: "Retry from checkpoint" });
     fireEvent.click(retryButton);
@@ -4800,6 +4788,8 @@ describe("WorkflowRunToolCall", () => {
         </ThemeProvider>
       </APIHarness>
     );
+    // Settled runs start collapsed; expand to reach the recovery actions.
+    fireEvent.click(getWorkflowHeader(view));
 
     fireEvent.click(view.getByRole("button", { name: "Resume workflow" }));
 

@@ -1497,7 +1497,6 @@ describe("useCreationWorkspace", () => {
     const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
-      dynamicWorkflowsEnabled: true,
       onWorkspaceCreated,
       message: "/deep-research mux workflows",
     });
@@ -2234,7 +2233,6 @@ interface HookOptions {
       markPendingInitialSend?: boolean;
     }
   ) => void;
-  dynamicWorkflowsEnabled?: boolean;
   autoRoutingEnabled?: boolean;
   message?: string;
   draftId?: string | null;

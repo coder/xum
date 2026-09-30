@@ -2192,6 +2192,7 @@ export class Config {
       muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
+      toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
@@ -2308,6 +2309,11 @@ export class Config {
       // Opt-in flag: only the enabled state is written so "off" leaves no key behind.
       if (parseOptionalBoolean(config.keepScreenAwake) === true) {
         data.keepScreenAwake = true;
+      }
+
+      // Default-on flag: only the opt-out is written so "on" leaves no key behind.
+      if (parseOptionalBoolean(config.toolSearchEnabled) === false) {
+        data.toolSearchEnabled = false;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -2738,6 +2744,7 @@ export class Config {
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
+      toolSearchEnabled: config.toolSearchEnabled !== false,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -2779,6 +2786,14 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) config.keepScreenAwake = true;
       else delete config.keepScreenAwake;
+      return config;
+    });
+  }
+
+  async updateToolSearchEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) delete config.toolSearchEnabled;
+      else config.toolSearchEnabled = false;
       return config;
     });
   }

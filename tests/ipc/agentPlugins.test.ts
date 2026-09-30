@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
@@ -52,10 +51,6 @@ function unwrap<T>(result: Result<T, string>): T {
   beforeAll(async () => {
     env = await createTestEnvironment();
     remote = await createTempGitRepo();
-    await env.orpc.experiments.setOverride({
-      experimentId: EXPERIMENT_IDS.AGENT_PLUGINS,
-      enabled: true,
-    });
     await commitComponents(["selective-first", "selective-second"]);
   });
 

@@ -8,6 +8,7 @@ import {
   X,
   FlaskConical,
   Bot,
+  HeartPulse,
   Keyboard,
   Layout,
   Container,
@@ -26,6 +27,7 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
+import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
 import { GovernorSection } from "./Sections/GovernorSection";
@@ -45,7 +47,7 @@ import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
-const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
+const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals"]);
 const FOCUS_HISTORY_LIMIT = 3;
 
 const BASE_SECTIONS: SettingsSection[] = [
@@ -60,6 +62,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "heartbeat",
+    label: "Heartbeats",
+    icon: <HeartPulse className="h-4 w-4" />,
+    component: HeartbeatSection,
   },
   {
     id: "instructions",
@@ -84,6 +92,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "MCP",
     icon: <Server className="h-4 w-4" />,
     component: MCPSettingsSection,
+  },
+  {
+    id: "plugins",
+    label: "Plugins",
+    icon: <Blocks className="h-4 w-4" />,
+    component: PluginsSettingsSection,
   },
   {
     id: "secrets",
@@ -137,7 +151,6 @@ interface SettingsSectionRedirect {
 export function getSettingsSections(
   governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
@@ -148,17 +161,6 @@ export function getSettingsSections(
       label: "Remote Connection",
       icon: <Monitor className="h-4 w-4 shrink-0" />,
       component: RemoteConnectionSection,
-    });
-  }
-  if (agentPluginsEnabled) {
-    // Next to MCP: plugins contribute skills + MCP servers.
-    const mcpIndex = sections.findIndex((section) => section.id === "mcp");
-    sections.splice(mcpIndex + 1, 0, {
-      id: "plugins",
-      label: "Plugins",
-      icon: <Blocks className="h-4 w-4" />,
-      component: PluginsSettingsSection,
-      experimental: true,
     });
   }
   if (memoryEnabled) {
@@ -191,7 +193,6 @@ export function getSettingsSectionRedirect(
   activeSection: string,
   governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
@@ -203,10 +204,6 @@ export function getSettingsSectionRedirect(
   }
 
   if (!memoryEnabled && activeSection === "memory") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
-  }
-
-  if (!agentPluginsEnabled && activeSection === "plugins") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -222,7 +219,6 @@ export function SettingsPage() {
   const onboardingPause = useOnboardingPause();
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
   // Radix only returns focus to a DialogTrigger, and settings opens from shortcuts, menus, and the
   // command palette, whose focused item often unmounts as settings opens. Recent focus is tracked
@@ -257,7 +253,6 @@ export function SettingsPage() {
       activeSection,
       governorEnabled,
       memoryEnabled,
-      agentPluginsEnabled,
       remoteConnectionAvailable
     );
     if (!redirect) {
@@ -276,16 +271,10 @@ export function SettingsPage() {
     setActiveSection,
     governorEnabled,
     memoryEnabled,
-    agentPluginsEnabled,
     remoteConnectionAvailable,
   ]);
 
-  const sections = getSettingsSections(
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable
-  );
+  const sections = getSettingsSections(governorEnabled, memoryEnabled, remoteConnectionAvailable);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 

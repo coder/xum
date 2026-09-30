@@ -7903,9 +7903,6 @@ export class TaskService implements AgentTaskIntegration {
           runtime,
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
-          includeAgentPlugins: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.AGENT_PLUGINS
-          ),
         },
       }));
     } catch (error) {
@@ -8638,10 +8635,7 @@ export class TaskService implements AgentTaskIntegration {
       if (planEntry == null) {
         return Err({ code: "not_found" as const });
       }
-      const contextKey = buildReawakenContextKey(
-        planEntry,
-        this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
-      );
+      const contextKey = buildReawakenContextKey(planEntry);
       const plan = planReawakenAi({
         config: planConfig,
         taskId,
@@ -8818,11 +8812,8 @@ export class TaskService implements AgentTaskIntegration {
     if (workspace.runtimeConfig == null || workspaceName == null) {
       return undefined;
     }
-    const includeAgentPlugins = this.workspaceService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    );
     const agentId = resolveTaskAgentIdForResume(workspace);
-    const contextKey = buildReawakenContextKey(entry, includeAgentPlugins);
+    const contextKey = buildReawakenContextKey(entry);
     let context: ReturnType<typeof buildWorkspaceAgentContext>;
     try {
       context = buildWorkspaceAgentContext({
@@ -8831,7 +8822,6 @@ export class TaskService implements AgentTaskIntegration {
         workspaceName,
         persistedWorkspacePath: workspace.path,
         subProjectPath: workspace.subProjectPath,
-        includeAgentPlugins,
       });
     } catch (error) {
       log.debug("prepareReawakenAi: definition context unavailable", {
@@ -8846,7 +8836,6 @@ export class TaskService implements AgentTaskIntegration {
         runtime: context.runtime,
         workspacePath: context.workspacePath,
         workspaceId: taskId,
-        includeAgentPlugins,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );

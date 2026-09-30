@@ -8,7 +8,6 @@ import { preloadTestModules } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo } from "../../ipc/helpers";
 import { createAppHarness, type AppHarness } from "../harness";
 import { openSettingsDialog } from "../helpers";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
@@ -92,12 +91,6 @@ describeIntegration("Selective plugin imports", () => {
     app = await createAppHarness({
       aiMode: "none",
       branchPrefix: "plugin-imports",
-      beforeRenderEnvironment: async (env) => {
-        await env.orpc.experiments.setOverride({
-          experimentId: EXPERIMENT_IDS.AGENT_PLUGINS,
-          enabled: true,
-        });
-      },
     });
   }, 120000);
   afterEach(async () => {

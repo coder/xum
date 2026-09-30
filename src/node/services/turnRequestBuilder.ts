@@ -646,7 +646,6 @@ interface TurnRequestBuilderDependencies {
     SendMessageError
   >;
   isClaudeSkillsCompatEnabled: () => boolean;
-  isAgentPluginsEnabled: () => boolean;
   wrapToolsForDelegation: (
     workspaceId: string,
     tools: Record<string, Tool>,
@@ -1484,32 +1483,15 @@ export class TurnRequestBuilder {
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
-    const advisorExperimentEnabled =
-      experiments?.advisorTool ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) ===
-        true;
-    const dynamicWorkflowsExperimentEnabled =
-      experiments?.dynamicWorkflows ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.DYNAMIC_WORKFLOWS
-      ) === true;
     const memoryExperimentEnabled =
       experiments?.memory ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
     const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
-    const timelineExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
-    const workspaceHeartbeatsExperimentEnabled =
-      experiments?.workspaceHeartbeats ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-      ) === true;
-    const toolSearchExperimentEnabled =
-      experiments?.toolSearch ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
-        true;
+    // Tool search is a host-level user setting (default on); sub-agents and CLI
+    // runs follow the same config.
+    const toolSearchEnabled = cfg.toolSearchEnabled !== false;
     const memoryIntuitionExperimentEnabled =
       experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
@@ -1520,7 +1502,6 @@ export class TurnRequestBuilder {
     // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
     // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
-    const agentPluginsExperimentEnabled = this.dependencies.isAgentPluginsEnabled();
     // Once final tool policy keeps the memory tool, upgrade the index-only
     // memory context (resolved pre-policy with includeHotMemories: false) to
     // the token-budgeted hot block for the model that will actually stream.
@@ -1555,8 +1536,6 @@ export class TurnRequestBuilder {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
-      isAdvisorExperimentEnabled: advisorExperimentEnabled,
-      includeAgentPlugins: agentPluginsExperimentEnabled,
       agentDefinitionCache,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
@@ -1610,8 +1589,7 @@ export class TurnRequestBuilder {
       cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
-    const advisorToolEligible =
-      advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
+    const advisorToolEligible = agentAdvisorEnabled && advisorModelString.length > 0;
 
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -1673,7 +1651,7 @@ export class TurnRequestBuilder {
       ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
       : null;
 
-    // Tier-1 plugin hooks (agent-plugins experiment): reconcile discovered
+    // Tier-1 plugin hooks: reconcile discovered
     // hooks.js modules with the event spine BEFORE request assembly so both
     // request.assemble and tool.execute middleware are in place for this
     // turn. Failure posture: a broken plugin never blocks a send.
@@ -1683,7 +1661,6 @@ export class TurnRequestBuilder {
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
-        enabled: this.dependencies.isAgentPluginsEnabled(),
       });
     }
 
@@ -1765,7 +1742,6 @@ export class TurnRequestBuilder {
       runtime,
       workspacePath,
       xumScope,
-      includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
     });
 
     const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
@@ -1850,7 +1826,6 @@ export class TurnRequestBuilder {
         intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
-        agentPluginsEnabled: agentPluginsExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
       });
@@ -1974,13 +1949,13 @@ export class TurnRequestBuilder {
       }
     }
 
-    // Tool search (tool-search experiment): assembly-time gate. The runtime
+    // Tool search (user setting, default on): assembly-time gate. The runtime
     // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
     // is assigned only after policy filtering builds the deferred catalog
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =
-      toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+      toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
     const createTempDirForStreamStartedAt = Date.now();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
@@ -2029,7 +2004,7 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
+    if (agentAdvisorEnabled && advisorModelString.length === 0) {
       workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
         effectiveAgentId,
       });
@@ -2135,7 +2110,7 @@ export class TurnRequestBuilder {
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
     const workflowService =
-      dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
+      this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
             runStore: new WorkflowRunStore({
@@ -2182,11 +2157,7 @@ export class TurnRequestBuilder {
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
-                experiments: {
-                  ...experiments,
-                  dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                  workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                },
+                experiments,
               }),
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
@@ -2195,7 +2166,6 @@ export class TurnRequestBuilder {
                 workspacePath,
                 projectSearchRoot: projectCheckoutRoot ?? workspacePath,
                 projectTrusted: getWorkflowProjectTrusted(),
-                includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
                 skillStorageContext: workflowSkillStorageContext,
               }),
             // Background workflow tools outlive the model turn that started them. Feed the
@@ -2262,11 +2232,7 @@ export class TurnRequestBuilder {
                     additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
                     maxOutputTokens,
                     providerOptions: effectiveMuxProviderOptions,
-                    experiments: {
-                      ...experiments,
-                      dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                      workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                    },
+                    experiments,
                     skipAiSettingsPersistence: true,
                     muxMetadata: {
                       type: WORKFLOW_RESULT_METADATA_TYPE,
@@ -2426,9 +2392,7 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       strictAgentResolution,
       xumScope,
-      timelineService: timelineExperimentEnabled
-        ? this.dependencies.bindings.timelineService
-        : undefined,
+      timelineService: this.dependencies.bindings.timelineService,
       workspaceHeartbeatService: this.dependencies.bindings.workspaceHeartbeatService,
       workflowService,
       goalService: workspaceGoalService,
@@ -2576,13 +2540,8 @@ export class TurnRequestBuilder {
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,
-        dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
         memory: memoryExperimentEnabled,
-        timeline: timelineExperimentEnabled,
-        workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        toolSearch: toolSearchExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
-        agentPlugins: agentPluginsExperimentEnabled,
       },
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,

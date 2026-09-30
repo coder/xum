@@ -679,7 +679,7 @@ describe("createAgentPluginsMcpProvider", () => {
           "project-only",
           mcpDoc({ unmanaged: STDIO_ENTRY })
         );
-        const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+        const provider = createAgentPluginsMcpProvider({ xumHome });
         const context = { projectRoot: home.path, projectKey: home.path };
         const unfiltered = await provider({ ...context, trusted: true });
         const keyFor = (name: string) => {
@@ -721,7 +721,6 @@ describe("createAgentPluginsMcpProvider", () => {
           const loaded = await provider({ ...context, trusted: true });
           const physicalProvider = createAgentPluginsMcpProvider({
             xumHome: physicalHome,
-            isEnabled: () => true,
           });
           const physicalKeys = Object.keys(await physicalProvider({ ...context, trusted: true }));
           expect(Object.keys(loaded).sort()).toEqual(
@@ -780,7 +779,7 @@ describe("createAgentPluginsMcpProvider", () => {
       const projectAlias = path.join(project.path, ".xum", "plugins");
       await fs.mkdir(path.dirname(projectAlias));
       await fs.symlink(owner, projectAlias, "dir");
-      const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+      const provider = createAgentPluginsMcpProvider({ xumHome });
       const globalKey = buildPluginServerKey(
         computePluginInstanceId(path.join(owner, "managed")),
         "allowed"
@@ -800,24 +799,6 @@ describe("createAgentPluginsMcpProvider", () => {
       } finally {
         manager.dispose();
       }
-    });
-  });
-
-  test("returns no servers when the experiment is disabled", async () => {
-    using home = new DisposableTempDir("plugin-provider-home");
-    using xumHome = new DisposableTempDir("plugin-provider-mux");
-    await withHomeDir(home.path, async () => {
-      await writeDiscoverablePlugin(
-        path.join(xumHome.path, "plugins"),
-        "demo",
-        mcpDoc({ srv: STDIO_ENTRY })
-      );
-
-      const provider = createAgentPluginsMcpProvider({
-        xumHome: xumHome.path,
-        isEnabled: () => false,
-      });
-      expect(await provider({ trusted: false })).toEqual({});
     });
   });
 
@@ -844,7 +825,6 @@ describe("createAgentPluginsMcpProvider", () => {
 
       const provider = createAgentPluginsMcpProvider({
         xumHome: xumHome.path,
-        isEnabled: () => true,
       });
 
       const pluginNamesOf = (servers: Record<string, { plugin?: { pluginName: string } }>) =>
@@ -886,7 +866,6 @@ describe("createAgentPluginsMcpProvider", () => {
 
       const provider = createAgentPluginsMcpProvider({
         xumHome: xumHome.path,
-        isEnabled: () => true,
       });
 
       const before = Object.keys(await provider({ trusted: false })).sort();
@@ -910,7 +889,6 @@ describe("createAgentPluginsMcpProvider", () => {
 
       const provider = createAgentPluginsMcpProvider({
         xumHome: xumHome.path,
-        isEnabled: () => true,
       });
       const servers = await provider({ trusted: false });
 
@@ -939,7 +917,6 @@ describe("createAgentPluginsMcpProvider", () => {
 
       const provider = createAgentPluginsMcpProvider({
         xumHome: xumHome.path,
-        isEnabled: () => true,
       });
 
       // Engine flow: scans the worktree, keys by the project identity.
@@ -1072,7 +1049,7 @@ test("MCP discovery rechecks selection after loading component files", async () 
       }
     );
     try {
-      const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+      const provider = createAgentPluginsMcpProvider({ xumHome });
       expect(await provider({ trusted: false })).toEqual({});
     } finally {
       open.mockRestore();

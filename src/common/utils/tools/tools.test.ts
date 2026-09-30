@@ -164,7 +164,7 @@ describe("getToolsForModel", () => {
     expect(toolsWith.task_message_sibling).toBeDefined();
   });
 
-  test("includes heartbeat only when the heartbeat service and experiment are configured", async () => {
+  test("includes heartbeat only for top-level workspaces with a heartbeat service", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
 
@@ -175,7 +175,6 @@ describe("getToolsForModel", () => {
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { workspaceHeartbeats: true },
       },
       "ws-1",
       initStateManager
@@ -191,20 +190,6 @@ describe("getToolsForModel", () => {
       ),
       unsetHeartbeatSettings: mock(() => Promise.resolve(Ok(undefined))),
     };
-    const toolsWithExperimentDisabled = await getToolsForModel(
-      "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        workspaceHeartbeatService: heartbeatService,
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(toolsWithExperimentDisabled.heartbeat).toBeUndefined();
-
     const toolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
@@ -212,7 +197,6 @@ describe("getToolsForModel", () => {
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { workspaceHeartbeats: true },
         workspaceHeartbeatService: heartbeatService,
       },
       "ws-1",
@@ -226,7 +210,6 @@ describe("getToolsForModel", () => {
         runtimeTempDir: "/tmp",
         workspaceId: "child-ws",
         enableAgentReport: true,
-        experiments: { workspaceHeartbeats: true },
         workspaceHeartbeatService: heartbeatService,
       },
       "child-ws",
@@ -331,41 +314,31 @@ describe("getToolsForModel", () => {
     expect(subAgentTools.review_pane_get).toBeUndefined();
   });
 
-  test("only includes workflow tools when dynamic workflows service and experiment are enabled", async () => {
+  test("only includes workflow tools when the workflow service is available", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
 
-    const withoutExperiment = await getToolsForModel(
+    const withoutService = await getToolsForModel(
       "noop:model",
       {
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        workflowService: {
-          startWorkflow: mock(async () => ({
-            runId: "wfr_1",
-            status: "completed" as const,
-            result: null,
-          })),
-        },
       },
       "ws-1",
       initStateManager
     );
-    expect(withoutExperiment.workflow_list).toBeUndefined();
-    expect(withoutExperiment.workflow_read).toBeUndefined();
-    expect(withoutExperiment.workflow_run).toBeUndefined();
-    expect(withoutExperiment.workflow_resume).toBeUndefined();
+    expect(withoutService.workflow_run).toBeUndefined();
+    expect(withoutService.workflow_resume).toBeUndefined();
 
-    const withExperiment = await getToolsForModel(
+    const withService = await getToolsForModel(
       "noop:model",
       {
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { dynamicWorkflows: true },
         workflowService: {
           startWorkflow: mock(async () => ({
             runId: "wfr_1",
@@ -377,10 +350,10 @@ describe("getToolsForModel", () => {
       "ws-1",
       initStateManager
     );
-    expect(withExperiment.workflow_list).toBeUndefined();
-    expect(withExperiment.workflow_read).toBeUndefined();
-    expect(withExperiment.workflow_run).toBeDefined();
-    expect(withExperiment.workflow_resume).toBeDefined();
+    expect(withService.workflow_list).toBeUndefined();
+    expect(withService.workflow_read).toBeUndefined();
+    expect(withService.workflow_run).toBeDefined();
+    expect(withService.workflow_resume).toBeDefined();
   });
 
   test("includes desktop tools when workspace capability is available", async () => {

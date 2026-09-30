@@ -15,16 +15,8 @@ import {
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
 } from "@/constants/heartbeat";
 
-interface HeartbeatDefaultsControlsProps {
-  loadConfig?: () => Promise<{
-    heartbeatDefaultPrompt?: string;
-    heartbeatDefaultIntervalMs?: number;
-  }>;
-}
-
-export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps) {
+export function HeartbeatSection() {
   const { api } = useAPI();
-  const loadConfig = props.loadConfig;
   const [heartbeatDefaultPrompt, setHeartbeatDefaultPrompt] = useState("");
   const [heartbeatDefaultPromptLoaded, setHeartbeatDefaultPromptLoaded] = useState(false);
   const [heartbeatDefaultPromptLoadedOk, setHeartbeatDefaultPromptLoadedOk] = useState(false);
@@ -41,7 +33,7 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
   const heartbeatDefaultIntervalEditedSinceLoadRef = useRef(false);
 
   useEffect(() => {
-    const configPromise = loadConfig?.() ?? api?.config?.getConfig();
+    const configPromise = api?.config?.getConfig();
     if (!configPromise) {
       return;
     }
@@ -85,7 +77,7 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
           setHeartbeatDefaultIntervalLoaded(true);
         }
       });
-  }, [api, loadConfig]);
+  }, [api]);
 
   const handleHeartbeatDefaultPromptBlur = useCallback(() => {
     if (!heartbeatDefaultPromptLoaded || !api?.config?.updateHeartbeatDefaultPrompt) {
@@ -231,8 +223,4 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
       </div>
     </div>
   );
-}
-
-export function HeartbeatSection() {
-  return <HeartbeatDefaultsControls />;
 }

@@ -107,8 +107,6 @@ interface UseCreationWorkspaceOptions {
   subProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
   draftId?: string | null;
-  /** Dynamic workflows gate used when an initial creation command starts a workflow. */
-  dynamicWorkflowsEnabled?: boolean;
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
@@ -334,7 +332,6 @@ export function useCreationWorkspace({
   message,
   subProjectPath,
   draftId,
-  dynamicWorkflowsEnabled = false,
   userModel,
   agentBaseById,
   autoRoutingEnabled = false,
@@ -810,7 +807,6 @@ export function useCreationWorkspace({
             variant: "workspace",
             projectPath: metadata.projectPath,
             rawInput: messageText,
-            dynamicWorkflowsEnabled,
             sendMessageOptions,
           };
           // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
@@ -960,7 +956,6 @@ export function useCreationWorkspace({
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,
-      dynamicWorkflowsEnabled,
       autoRoutingEnabled,
       draftId,
       promoteWorkspaceDraft,

@@ -1034,7 +1034,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     return result;
@@ -1772,7 +1771,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
 
     expect(result.success).toBe(true);
@@ -1812,7 +1810,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true },
       });
       expect(result.success).toBe(true);
     }
@@ -2242,6 +2239,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
     const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
     const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -2269,7 +2267,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString,
       thinkingLevel: "off",
-      experiments: { toolSearch },
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
@@ -2277,7 +2274,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
   }
 
-  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
+  it("advertises the tool-search-off tool list on Anthropic prompt-cache models", async () => {
     const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
     const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
     expect(computeActiveToolNames(on.state)).toBeUndefined();
@@ -2290,6 +2287,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const on = await startToolSearchStream("openai:gpt-5.2", true);
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
+  });
+
+  it("disables tool-search deferral when the user setting is off", async () => {
+    const off = await startToolSearchStream("openai:gpt-5.2", false);
+    expect(off.state).toBeUndefined();
+    expect(off.toolNames).toContain("tracker_list_issues");
+    expect(off.toolNames).not.toContain("tool_catalog_search");
   });
 
   it.each(["memory", "intuition", "restore-denied"])(
@@ -2734,7 +2738,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.6",
       thinkingLevel: "max",
       reasoningMode: testCase.parentMode,
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
@@ -3395,7 +3398,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true, memory: true },
+      experiments: { memory: true },
     });
     expect(result.success).toBe(true);
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -3484,7 +3487,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true, memory: true },
+        experiments: { memory: true },
       });
 
       expect(result.success).toBe(true);

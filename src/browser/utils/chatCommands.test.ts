@@ -1,6 +1,5 @@
 import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
 import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   executeCompaction,
   parseRuntimeString,
@@ -168,13 +167,6 @@ function expectToast(
   if (expected.title) expect(action?.toast.title).toBe(expected.title);
 }
 
-function setHeartbeatExperiment(enabled: boolean): void {
-  localStorage.setItem(
-    getExperimentKey(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-    JSON.stringify(enabled)
-  );
-}
-
 /**
  * The transcript mutation barrier reads the store's caught-up flag at dispatch time. Pin it for
  * the duration of `fn` instead of driving a full onChat replay through the singleton store.
@@ -212,19 +204,6 @@ describe("processSlashCommand workflow results", () => {
     const start = mock(() =>
       Promise.resolve({ runId: "wfr_123", status: "running", result: null })
     );
-    const disabled = await processSlashCommand(
-      { type: "workflow-run", scriptPath: "skill://deep-research/workflow.js", argsText: "{}" },
-      createEnv({
-        api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: false,
-      })
-    );
-    expect(disabled.kind).toBe("complete");
-    if (disabled.kind !== "complete") throw new Error("expected complete result");
-    expectDisposition(disabled, "restore");
-    expectToast(disabled.actions, { type: "error", message: "Dynamic workflows are disabled" });
-    expect(start).not.toHaveBeenCalled();
-
     const invalidArgs = await processSlashCommand(
       {
         type: "workflow-run",
@@ -233,7 +212,6 @@ describe("processSlashCommand workflow results", () => {
       },
       createEnv({
         api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     expect(invalidArgs.kind).toBe("complete");
@@ -273,7 +251,6 @@ describe("processSlashCommand workflow results", () => {
           workspace: { sendMessage },
         } as unknown as SlashCommandEnv["api"],
         rawInput: '/deep-research {"input":"mux"}',
-        dynamicWorkflowsEnabled: true,
       })
     );
     expect(initial.kind).toBe("phase");
@@ -323,7 +300,6 @@ describe("processSlashCommand workflow results", () => {
       { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
       createEnv({
         api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     const settled = await finishCommand(initial);
@@ -347,7 +323,6 @@ describe("processSlashCommand workflow results", () => {
           workflows: { start, getRun },
           workspace: { sendMessage: mock(() => Promise.resolve({ success: true })) },
         } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
         isCurrent: () => false,
       })
     );
@@ -363,7 +338,6 @@ describe("processSlashCommand workflow results", () => {
         api: {
           workflows: { start: mock(() => Promise.reject(new Error("workflow failed"))) },
         } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     const settled = await finishCommand(initial);
@@ -388,7 +362,6 @@ describe("processSlashCommand workflow results", () => {
             workflows: { start, getRun },
             workspace: { sendMessage },
           } as unknown as SlashCommandEnv["api"],
-          dynamicWorkflowsEnabled: true,
         })
       )
     );
@@ -749,20 +722,10 @@ describe("processSlashCommand goal results", () => {
 });
 
 describe("processSlashCommand heartbeat results", () => {
-  test("returns gating errors before a phase", async () => {
+  test("returns a missing-workspace error before a phase", async () => {
     const api = {
       workspace: { heartbeat: { get: mock(), set: mock() } },
     } as unknown as SlashCommandEnv["api"];
-    const disabled = await processSlashCommand(
-      { type: "heartbeat-set", minutes: 30 },
-      createEnv({ api })
-    );
-    expect(disabled.kind).toBe("complete");
-    if (disabled.kind !== "complete") throw new Error("expected complete result");
-    expectDisposition(disabled, "restore");
-    expect(disabled.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
-
-    setHeartbeatExperiment(true);
     const missing = await processSlashCommand(
       { type: "heartbeat-set", minutes: 30 },
       createEnv({ api, workspaceId: undefined })
@@ -773,7 +736,6 @@ describe("processSlashCommand heartbeat results", () => {
   });
 
   test("preserves saved heartbeat fields and returns success", async () => {
-    setHeartbeatExperiment(true);
     const heartbeatGet = mock(() =>
       Promise.resolve({
         enabled: true as const,
@@ -810,7 +772,6 @@ describe("processSlashCommand heartbeat results", () => {
   });
 
   test("uses the default interval when disabling without saved settings", async () => {
-    setHeartbeatExperiment(true);
     const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
     const settled = await finishCommand(
       await processSlashCommand(
@@ -836,7 +797,6 @@ describe("processSlashCommand heartbeat results", () => {
   });
 
   test("returns backend update failures with restore disposition", async () => {
-    setHeartbeatExperiment(true);
     const settled = await finishCommand(
       await processSlashCommand(
         { type: "heartbeat-set", minutes: 30 },

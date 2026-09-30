@@ -31,7 +31,7 @@ import {
 } from "./pluginsSectionIntents";
 
 /**
- * Settings → Plugins (agent-plugins experiment; global scope only).
+ * Settings → Plugins (global scope only).
  *
  * Managed installs come from the `~/.mux/plugins.json` registry;
  * unmanaged plugin directories found by discovery are listed read-only.

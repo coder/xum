@@ -2869,6 +2869,7 @@ export const config = {
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
+      toolSearchEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -3005,6 +3006,7 @@ export const config = {
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
   updateKeepScreenAwake: booleanToggleRoute,
+  updateToolSearchEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({

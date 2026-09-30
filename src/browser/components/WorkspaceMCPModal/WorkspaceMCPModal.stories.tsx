@@ -49,9 +49,9 @@ const POSTHOG_TOOLS = [
   "experiment-create",
 ];
 
-// The modal scopes its tool test cache by workspace (agent-plugins experiment:
-// plugin server keys are stable across worktrees, but tool lists follow each
-// workspace's checkout), so stories must seed the workspace-scoped key.
+// The modal scopes its tool test cache by workspace (plugin server keys are
+// stable across worktrees, but tool lists follow each workspace's checkout),
+// so stories must seed the workspace-scoped key.
 const PROJECT_MCP_CACHE_KEY = getMCPTestResultsKey(PROJECT_PATH, WORKSPACE_ID);
 
 interface WorkspaceMCPStoryOptions {

@@ -6,7 +6,6 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
-import * as RealExperimentsHookModule from "@/browser/hooks/useExperiments";
 import * as APIModule from "@/browser/contexts/API";
 import * as AgentContextModule from "@/browser/contexts/AgentContext";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -35,8 +34,6 @@ import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
@@ -47,13 +44,7 @@ import {
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
 // modal's own test) and restored after this suite so it cannot leak into later files.
-// useExperiments re-exports useExperimentValue from ExperimentsContext, so the timeline-gate
-// stub below also patches that live binding; restore it so later ExperimentsContext consumers
-// (e.g. GeneralSection) do not keep reading the stub.
-restoreModulesAfterSuite([
-  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
-  ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
-]);
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
     props.open ? <div>{props.children}</div> : null,
@@ -158,21 +149,7 @@ let archiveWorkspaceMock = mock(
 );
 let archiveShowErrorMock = mock(() => undefined);
 
-// Timeline gate control. useExperimentValue must be module-mocked, not driven through
-// localStorage: bun module mocks are process-global, so another test file's leaked
-// useExperiments mock would otherwise override the real hook and poison these gates.
-let mockTimelineExperimentEnabled = false;
-
 function installWorkspaceMenuBarTestDoubles() {
-  const actualExperiments =
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
-  void mock.module("@/browser/hooks/useExperiments", () => ({
-    ...actualExperiments,
-    useExperimentValue: (experimentId: string) =>
-      experimentId === EXPERIMENT_IDS.TIMELINE && mockTimelineExperimentEnabled,
-  }));
-
   preflightArchiveWorkspaceMock = mock(
     (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
   );
@@ -409,7 +386,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     workspaceMetadata = new Map();
     archivingWorkspaceIds = new Set();
     mockApi = null;
-    mockTimelineExperimentEnabled = false;
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
     /* eslint-disable @typescript-eslint/no-require-imports */
@@ -510,7 +486,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("offers the Timeline action on narrow viewports and opens the dialog", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -528,7 +503,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("hides the Timeline action on wide viewports", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -536,16 +510,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
   });
 
-  it("hides the Timeline action when the timeline experiment is disabled", () => {
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
-
-    render(<WorkspaceMenuBar {...defaultProps} />);
-
-    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
-  });
-
   it("offers the Timeline action when the shell container hides the sidebar at wide viewports", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     // Mimic WorkspaceShell: the shell wraps the menu bar and a CSS-hidden right sidebar
@@ -567,7 +532,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("re-gates the Timeline action when the viewport crosses the narrow breakpoint", () => {
-    mockTimelineExperimentEnabled = true;
     let narrow = false;
     const media = stubMatchMedia(
       (query) => narrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
@@ -585,7 +549,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -599,7 +562,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("ignores the timeline shortcut while the sidebar is visible", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -612,7 +574,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("ignores the timeline shortcut while another modal is open", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     const modal = document.createElement("div");
@@ -631,7 +592,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("closes the timeline dialog when switching workspaces", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
@@ -826,7 +786,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
-    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     // Immersive review hides the sidebar via the same display:none but marks it

@@ -3,7 +3,6 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -22,9 +21,6 @@ import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
 export default {
   ...appMeta,
   title: "App/Workflows",
-  beforeEach: () => () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), undefined);
-  },
   parameters: {
     ...appMeta.parameters,
     viewport: {
@@ -148,7 +144,6 @@ function createWorkflowFixture(initialRun: WorkflowRunRecord, sidebarWidth = 480
           ),
         ],
       });
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), true);
       updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "workflows");

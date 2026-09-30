@@ -6,13 +6,11 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext } from "@/browser/contexts/API";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
-import * as RealExperimentsHookModule from "@/browser/hooks/useExperiments";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
 import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
 import type * as WorkspaceTitleEditContextModuleType from "@/browser/contexts/WorkspaceTitleEditContext";
 import type * as ContextMenuPositionModuleType from "@/browser/hooks/useContextMenuPosition";
-import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
 import type * as WorkspaceFallbackModelModuleType from "@/browser/hooks/useWorkspaceFallbackModel";
 import type * as WorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
 import type * as RuntimeStatusStoreModuleType from "@/browser/stores/RuntimeStatusStore";
@@ -48,12 +46,9 @@ import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 
 // Restore the provider contexts after the suite; partial row stubs must not
-// replace the real contexts used by later full Settings renders. useExperiments re-exports
-// useExperimentValue from ExperimentsContext, so its stub also patches that live binding and
-// would pin every later ExperimentsContext consumer (e.g. GeneralSection) to the stub value.
+// replace the real contexts used by later full Settings renders.
 restoreModulesAfterSuite([
   ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
-  ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
   // installAgentListItemTestDoubles() re-registers these from beforeEach with overridden
   // exports, and `mock.restore()` does not undo mock.module, so the overrides otherwise leak
   // into every later test file (#4639).
@@ -87,7 +82,6 @@ const SUBAGENT_ROW_META: AgentRowRenderMeta = {
 type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorkspaceUnread>;
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
-let mockWorkspaceHeartbeatsEnabled = false;
 let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
 let mockWorkspaceSidebarState: MockWorkspaceSidebarState;
@@ -206,8 +200,6 @@ function installAgentListItemTestDoubles() {
     require("@/browser/contexts/WorkspaceTitleEditContext?real=1") as typeof WorkspaceTitleEditContextModuleType;
   const actualContextMenuPosition =
     require("@/browser/hooks/useContextMenuPosition?real=1") as typeof ContextMenuPositionModuleType;
-  const actualExperiments =
-    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
   const actualWorkspaceUnread =
     require("@/browser/hooks/useWorkspaceUnread?real=1") as typeof WorkspaceUnreadModule;
   const actualRuntimeStatusStore =
@@ -271,11 +263,6 @@ function installAgentListItemTestDoubles() {
       suppressClickIfLongPress: () => false,
       close: () => undefined,
     }),
-  }));
-
-  void mock.module("@/browser/hooks/useExperiments", () => ({
-    ...actualExperiments,
-    useExperimentValue: () => mockWorkspaceHeartbeatsEnabled,
   }));
 
   void mock.module("@/browser/hooks/useWorkspaceUnread", () => ({
@@ -381,7 +368,6 @@ describe("AgentListItem", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
-    mockWorkspaceHeartbeatsEnabled = false;
     mockWorkspaceUnreadState = createWorkspaceUnreadState();
     mockWorkspaceSidebarState = createWorkspaceSidebarState();
     installAgentListItemTestDoubles();
@@ -955,7 +941,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a goal target pill in the workspace row", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceSidebarState = createWorkspaceSidebarState({
       goal: {
         goalId: "11111111-1111-4111-8111-111111111111",
@@ -974,9 +959,7 @@ describe("AgentListItem", () => {
     expect(within(row).queryByTestId(`workspace-goal-pill-${TEST_WORKSPACE_ID}`)).toBeNull();
   });
 
-  test("renders a heartbeat icon directly in the leading slot for seen rows when the heartbeat experiment is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
+  test("renders a heartbeat icon directly in the leading slot for seen rows", () => {
     const { row } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
     });
@@ -1041,8 +1024,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a heartbeat icon fallback when completed children indicator is shown", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
     const { row, metadata } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
       rowRenderMeta: {
@@ -1071,19 +1052,15 @@ describe("AgentListItem", () => {
   });
 
   test.each([
-    ["the heartbeat experiment is disabled", false, createHeartbeatMetadata()],
-    ["heartbeat is disabled", true, createHeartbeatMetadata({ enabled: false })],
-    ["heartbeat settings are missing", true, createMetadata()],
-  ])("does not render a heartbeat icon fallback when %s", (_name, experimentEnabled, metadata) => {
-    mockWorkspaceHeartbeatsEnabled = experimentEnabled;
-
+    ["heartbeat is disabled", createHeartbeatMetadata({ enabled: false })],
+    ["heartbeat settings are missing", createMetadata()],
+  ])("does not render a heartbeat icon fallback when %s", (_name, metadata) => {
     const { row } = renderWorkspaceItem({ metadata });
 
     expect(within(row).queryByTestId("heartbeat-icon")).toBeNull();
   });
 
   test("keeps the unread idle status dot when heartbeat is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: true });
 
     const { row } = renderWorkspaceItem({
@@ -1164,7 +1141,6 @@ describe("AgentListItem", () => {
   ])(
     "leaves $name unchanged when heartbeat is enabled",
     ({ sidebarState, expectedSelector, expectedText }) => {
-      mockWorkspaceHeartbeatsEnabled = true;
       mockWorkspaceSidebarState = sidebarState;
 
       const { row } = renderWorkspaceItem({

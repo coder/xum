@@ -5,10 +5,7 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 
 describe("throwWorkflowOrpcError", () => {
   test("preserves workflow bad-request messages", () => {
-    for (const error of [
-      new Error("Dynamic workflows are disabled"),
-      new WorkflowArgsValidationError("Workflow argument topic is required"),
-    ]) {
+    for (const error of [new WorkflowArgsValidationError("Workflow argument topic is required")]) {
       try {
         throwWorkflowOrpcError(error);
       } catch (thrown) {
