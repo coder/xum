@@ -885,8 +885,9 @@ export function computeActiveToolNames(
 
 /**
  * Tools whose definitions occupy model context: core tools plus activated
- * deferred tools, in both modes. For context-budget accounting only; native
- * deferred tools are sent but not loaded until referenced.
+ * deferred tools, in both modes. For context-budget accounting and the
+ * agent-transition tool list; native deferred tools are sent but not loaded
+ * until referenced.
  */
 export function computeLoadedToolNames(
   state: ToolSearchStreamState | undefined

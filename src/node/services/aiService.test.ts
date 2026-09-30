@@ -2288,6 +2288,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       toolNames: Object.keys(tools).sort(),
       deferLoadingNames: [...collectDeferLoadingToolNames(tools)],
       state: started.toolSearchState,
+      pipelineToolNames: harness.preparedToolNamesForSentinel[0],
     };
   }
 
@@ -2299,6 +2300,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.toolNames).toEqual([...off.toolNames, "tool_catalog_search"].sort());
     expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
     expect(off.deferLoadingNames).toEqual([]);
+  });
+
+  it("tells an agent transition only about loaded tools in native mode", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
+    expect(on.state?.native).toBe(true);
+    expect(on.pipelineToolNames).toEqual(["file_read", "tool_catalog_search"]);
+  });
+
+  it("keeps scoped tool search on Claude models older than 4.5", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-20250514", true);
+    expect(on.state?.native).toBe(false);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.deferLoadingNames).toEqual([]);
   });
 
   it("keeps scoped tool search when the request disables Anthropic beta features", async () => {

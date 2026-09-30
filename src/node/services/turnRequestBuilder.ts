@@ -49,6 +49,7 @@ import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
   getToolsForModel,
+  supportsAnthropicToolSearch,
   type AdvisorStepCaptureRef,
   type MCPPromptRuntime,
   type ToolConfiguration,
@@ -2725,9 +2726,11 @@ export class TurnRequestBuilder {
         // Anthropic deferred loading instead of activeTools scoping (#5262).
         // A request-level beta opt-out also makes the provider strip cache
         // markers, and must keep defer_loading/tool_reference off the wire too.
+        // Claude models before 4.5 reject both, so they keep scoped search.
         const toolSearchPromptCacheActive =
           supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
-          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true;
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "");
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2879,6 +2882,10 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        // Native mode sends deferred tools unloaded, so an agent transition must
+        // not list them as callable before a search loads them.
+        const loadedToolNames =
+          computeLoadedToolNames(toolSearchRuntime?.state)?.sort() ?? toolNamesForSentinel;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2930,7 +2937,7 @@ export class TurnRequestBuilder {
               providerForMessages: seed.wireProviderName,
               effectiveThinkingLevel: level,
               effectiveAgentId,
-              toolNamesForSentinel,
+              toolNamesForSentinel: loadedToolNames,
               planContentForTransition,
               planFilePath,
               postCompactionAttachments,
@@ -2973,7 +2980,7 @@ export class TurnRequestBuilder {
             thinkingLevel: level,
             providerOptions: providerOptionsForEnvelope,
             requestHistorySequence: options.requestHistorySequence(),
-            sentinelToolNames: toolNamesForSentinel,
+            sentinelToolNames: loadedToolNames,
             wireProviderName: seed.wireProviderName,
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,

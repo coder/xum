@@ -11,6 +11,7 @@ import {
   getForcedXaiSearchToolNames,
   getToolsForModel,
   supportsAnthropicNativeWebFetch,
+  supportsAnthropicToolSearch,
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
@@ -93,6 +94,21 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-3-7-sonnet-20250219", false],
   ] as const)("%s -> %s", (modelId, expected) => {
     expect(supportsAnthropicNativeWebFetch(modelId)).toBe(expected);
+  });
+});
+
+describe("supportsAnthropicToolSearch", () => {
+  test.each([
+    ["claude-haiku-4-5-20251001", true],
+    ["claude-sonnet-4-5", true],
+    ["claude-opus-4-5-20251101", true],
+    ["claude-opus-5-5", true],
+    ["claude-fable-5", true],
+    ["claude-opus-4-1", false],
+    ["claude-sonnet-4-20250514", false],
+    ["claude-3-7-sonnet-20250219", false],
+  ] as const)("%s -> %s", (modelId, expected) => {
+    expect(supportsAnthropicToolSearch(modelId)).toBe(expected);
   });
 });
 
