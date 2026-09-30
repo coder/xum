@@ -446,6 +446,7 @@ export const ThinkingSelectorOpen: AppStory = {
               isEnabled: true,
               isConfigured: true,
               serviceTier: "priority",
+              cyberModelEnabled: true,
             },
           },
           messages: [],
@@ -461,7 +462,7 @@ export const ThinkingSelectorOpen: AppStory = {
     docs: {
       description: {
         story:
-          "Opens the chat-input thinking selector with Pro and fast mode active, including the phone-width layout.",
+          "Opens the chat-input thinking selector with Pro and fast mode active and the Cyber row offered, including the phone-width layout.",
       },
     },
   },
@@ -480,15 +481,15 @@ export const ThinkingSelectorOpen: AppStory = {
       if (!within(menu).getByRole("button", { name: /Fast mode/i })) {
         throw new Error("Fast mode row missing");
       }
+      if (!within(menu).getByRole("button", { name: /Cyber/ })) {
+        throw new Error("Cyber row missing");
+      }
     });
   },
 };
 
 export const ThinkingSelectorCyberOpen: AppStory = {
   tags: ["thinking-selector"],
-  globals: {
-    viewport: { value: "mobile1", isRotated: false },
-  },
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -512,13 +513,12 @@ export const ThinkingSelectorCyberOpen: AppStory = {
   ),
   parameters: {
     ...appMeta.parameters,
-    pixel: {
-      matrix: { themes: ["dark"], viewports: ["phone", "laptop"] },
-    },
+    // ThinkingSelectorOpen snapshots the Cyber row; this story checks the active-Cyber state.
+    pixel: PIXEL_DISABLED,
     docs: {
       description: {
         story:
-          "Opens the chat-input thinking selector with the OpenAI cyber model setting on and Cyber mode active, including the phone-width layout.",
+          "Opens the chat-input thinking selector with the OpenAI cyber model setting on and Cyber mode active.",
       },
     },
   },
