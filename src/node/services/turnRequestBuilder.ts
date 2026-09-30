@@ -701,7 +701,7 @@ interface PreparedModelAttempt {
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
     currentLevel: ThinkingLevel,
-    beforeFirstStep?: boolean
+    beforeFirstStep: boolean
   ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
@@ -808,7 +808,7 @@ export class TurnRequestBuilder {
     const computeRebuiltProviderOptions = (
       level: ThinkingLevel,
       currentLevel: ThinkingLevel,
-      beforeFirstStep = false
+      beforeFirstStep: boolean
     ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
       const clamped = enforceThinkingPolicy(
         options.rawModelString,
