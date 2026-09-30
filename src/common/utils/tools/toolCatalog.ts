@@ -352,7 +352,7 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
  * - `tool_catalog_search` absent (policy-disabled) ⇒ safe fallback: no state, tools
  *   unchanged — MCP tools stay advertised exactly as without the experiment.
  * - Anthropic prompt caching active (`promptCacheActive`) ⇒ drop `tool_catalog_search`,
- *   no state: the experiment-off tool list keeps the cached prefix stable (#5250).
+ *   inactive state: the experiment-off tool list keeps the cached prefix stable (#5250).
  * - Nothing deferred (all MCP tools policy-disabled / PTC-removed) ⇒ drop
  *   `tool_catalog_search` from the record (a search tool with an empty catalog is
  *   noise) and return no state.
@@ -393,7 +393,19 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   // without cache misses (#5262).
   if (inputs.promptCacheActive === true) {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
-    return { tools: rest };
+    // Inactive state (empty deferred set ⇒ computeActiveToolNames returns
+    // undefined) instead of none: StreamManager keeps this object, so a model
+    // fallback to a model without prompt caching can still turn deferral on
+    // in place via rebuildToolSearchState.
+    return {
+      tools: rest,
+      state: {
+        catalog: [],
+        deferredToolNames: new Set<string>(),
+        allToolNames: Object.keys(rest),
+        activatedToolNames: new Set<string>(),
+      },
+    };
   }
   const classification = buildToolCatalog(inputs);
   if (classification.deferredToolNames.size === 0) {

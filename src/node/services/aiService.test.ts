@@ -33,6 +33,7 @@ import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { computeActiveToolNames } from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -2343,7 +2344,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
     const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
     const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
-    expect(on.state).toBeUndefined();
+    expect(computeActiveToolNames(on.state)).toBeUndefined();
     expect(on.toolNames).toEqual(off.toolNames);
     expect(on.toolNames).toContain("tracker_list_issues");
     expect(on.toolNames).not.toContain("tool_catalog_search");

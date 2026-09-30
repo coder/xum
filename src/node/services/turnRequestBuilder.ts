@@ -2827,7 +2827,11 @@ export class TurnRequestBuilder {
         };
         await renderContextWindowSection();
 
-        if (options.initializeToolSearch && toolSearchRuntime?.state) {
+        // Also on fallbacks: a primary with prompt caching seeds nothing into
+        // its inactive state, so a fallback that turns deferral on must seed
+        // prior-turn activations itself. Seeding only adds names, so repeating
+        // it is harmless.
+        if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
             attemptProviderRequestMessages
