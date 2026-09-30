@@ -136,9 +136,10 @@ export function AnalyticsDashboard() {
       {/* Phone widths get a full-screen sheet; md+ gets a large centered dialog. */}
       <DialogContent
         showCloseButton={false}
-        // Escape in the SQL explorer (or any other editable field) stays with that field instead
-        // of closing the dialog, which would unmount unsaved query text. This matches Settings
-        // and the previous page-level Escape handler, which also ignored editable targets.
+        // Escape in the SQL explorer (or any other text field) stays with that field instead of
+        // closing the dialog, which would unmount unsaved query text. This matches Settings and
+        // the previous page-level Escape handler, which also ignored editable targets. A focused
+        // <select> (the autofocused project filter) still lets Escape close the dialog.
         allowEditableEscape
         aria-describedby={undefined}
         onOpenAutoFocus={focusReturn.onOpenAutoFocus}

@@ -1,8 +1,8 @@
 /**
  * UI integration test: analytics is a modal over the current page.
  *
- * The chat underneath stays mounted (keeping its draft and scroll), Escape inside an editable
- * field stays with that field, and an unclaimed Escape closes analytics.
+ * The chat underneath stays mounted (keeping its draft and scroll), Escape inside a text field or
+ * an open inner menu stays there, and an unclaimed Escape (including on a select) closes analytics.
  */
 
 import "../dom";
@@ -17,7 +17,7 @@ describe("Analytics modal", () => {
     await preloadTestModules();
   });
 
-  test("opens over the mounted chat; editable Escape stays open, unclaimed Escape closes", async () => {
+  test("opens over the mounted chat; inner Escape stays open, unclaimed Escape closes", async () => {
     const app = await createAppHarness({ branchPrefix: "analytics-modal" });
 
     try {
@@ -40,7 +40,29 @@ describe("Analytics modal", () => {
       fireEvent.keyDown(sqlEditor, { key: "Escape" });
       expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
 
-      fireEvent.keyDown(dialog, { key: "Escape" });
+      // Escape in the open Sample Queries menu closes only that menu, not the whole modal.
+      fireEvent.click(within(dialog).getByRole("button", { name: /Sample Queries/ }));
+      const sampleItem = await body.findByRole("button", { name: "Top Models by Cost" });
+      fireEvent.keyDown(sampleItem, { key: "Escape" });
+      await waitFor(() => {
+        expect(body.queryByRole("button", { name: "Top Models by Cost" })).toBeNull();
+      });
+      expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
+
+      // With Settings stacked over analytics, the analytics toggle returns to analytics.
+      fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+      await body.findByRole("dialog", { name: "Settings" }, { timeout: 10_000 });
+      fireEvent.keyDown(window, { key: "Y", ctrlKey: true, shiftKey: true });
+      await waitFor(() => {
+        expect(body.queryByRole("dialog", { name: "Settings" })).toBeNull();
+      });
+      const analyticsAgain = await body.findByRole("dialog", { name: "Analytics" });
+
+      // The project filter gets initial focus; Escape on a closed <select> must close analytics
+      // (it used to count as an editable target and keep the dialog open).
+      const projectFilter = within(analyticsAgain).getByLabelText("Project");
+      expect(projectFilter.tagName).toBe("SELECT");
+      fireEvent.keyDown(projectFilter, { key: "Escape" });
       await waitFor(
         () => {
           expect(body.queryByRole("dialog", { name: "Analytics" })).toBeNull();

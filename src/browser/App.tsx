@@ -1131,7 +1131,9 @@ function AppInner() {
         openServerWindow(window.api.remoteConnection, openSettings).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_ANALYTICS)) {
         e.preventDefault();
-        if (isAnalyticsOpen) {
+        // With settings stacked over analytics, the toggle returns to analytics (navigateToAnalytics
+        // closes settings), matching how it opens analytics from settings over a plain page.
+        if (isAnalyticsOpen && !isSettingsOpen) {
           navigateFromAnalytics();
         } else {
           // An open palette would stay behind the analytics modal and swallow its first Escape.
@@ -1158,6 +1160,7 @@ function AppInner() {
     openCommandPalette,
     toggleFastMode,
     openSettings,
+    isSettingsOpen,
     isAnalyticsOpen,
     navigateToAnalytics,
     navigateFromAnalytics,
