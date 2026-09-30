@@ -12,6 +12,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 import {
   createTaskServiceTestRoot,
+  registerLiveWorkspaceTurnHandle,
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
@@ -23,6 +24,11 @@ import {
 type SendArgs = Parameters<WorkspaceHost["sendMessage"]>;
 
 const TARGET_ID = "childworkspace";
+
+interface TaskServiceInternals {
+  sendTreeMessage(spec: unknown): Promise<unknown>;
+  flushParkedPeerSends(targetId: string): Promise<void>;
+}
 const HANDLE_ID = "wst_handle";
 
 function isPeerSend(args: SendArgs): boolean {
@@ -289,4 +295,94 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
       flushes.mockRestore();
     }
   );
+
+  // A message that already waited is delivered once or dropped: it never joins a delegated turn
+  // and never waits a second time. Each case interferes right as the waiting message is retried,
+  // then proves with a later message that the first one is gone for good.
+  async function retryWithInterference(
+    s: Setup,
+    interfere: (retry: (spec: unknown) => Promise<unknown>) => (spec: unknown) => Promise<unknown>
+  ) {
+    const internals = s.taskService as unknown as TaskServiceInternals;
+    const original = internals.sendTreeMessage.bind(s.taskService);
+    const retry = spyOn(internals, "sendTreeMessage").mockImplementationOnce(interfere(original));
+    const flushes = spyOn(internals, "flushParkedPeerSends");
+    await settle.completed(s);
+    expect(retry).toHaveBeenCalled();
+    await Promise.all(flushes.mock.results.map((result) => result.value as Promise<void>));
+    retry.mockRestore();
+    flushes.mockRestore();
+  }
+
+  async function expectOnlyLaterMessageDelivered(s: Setup, alreadyDelivered: number) {
+    const delivered = s.peerSendCount(alreadyDelivered + 1);
+    expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "later")).success).toBe(
+      true
+    );
+    await delivered;
+    const texts = s.peerSends.map((args) => /first|later/.exec(payloadText(args))?.[0]);
+    expect(texts.filter((text) => text === "first")).toHaveLength(alreadyDelivered);
+    expect(texts.at(-1)).toBe("later");
+  }
+
+  test.each(["reserved", "accepted"] as const)(
+    "a retry that meets a new %s delegated turn of its own sender is dropped, not correlated",
+    async (source) => {
+      const s = await setUp();
+      expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(
+        true
+      );
+      await retryWithInterference(s, (original) => async (spec) => {
+        // The sender itself starts a delegated turn on the target just before the retry runs.
+        await registerLiveWorkspaceTurnHandle(
+          s.taskService,
+          TARGET_ID,
+          "wst_next",
+          "sender",
+          source
+        );
+        return original(spec);
+      });
+      expect(s.peerSends).toHaveLength(0);
+      workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+        TARGET_ID
+      );
+      await expectOnlyLaterMessageDelivered(s, 0);
+    }
+  );
+
+  test("a retry withdrawn by the recipient's queue is dropped, not parked again", async () => {
+    const s = await setUp();
+    expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(
+      true
+    );
+    const delivered = s.nextPeerSend();
+    await settle.completed(s);
+    const [, , , internal] = await delivered;
+    // Queued behind other work; another workspace's delegated turn starts before it dispatches,
+    // and the queue's dispatch gate withdraws it (rows never written).
+    await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_other", "owner-2");
+    expect(internal?.admissionStale?.()).toBe(true);
+    await internal?.onCanceled?.("stale");
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      TARGET_ID
+    );
+    await expectOnlyLaterMessageDelivered(s, 1);
+  });
+
+  test("a user Stop and resume while a retry is in flight drops it", async () => {
+    const s = await setUp();
+    expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(
+      true
+    );
+    await retryWithInterference(s, (original) => (spec) => {
+      // The drain already took the message; the user stops and resumes the recipient before
+      // the retry runs its checks.
+      s.taskService.markParentWorkspaceInterrupted(TARGET_ID);
+      s.taskService.resetAutoResumeCount(TARGET_ID);
+      return original(spec);
+    });
+    expect(s.peerSends).toHaveLength(0);
+    await expectOnlyLaterMessageDelivered(s, 0);
+  });
 });
