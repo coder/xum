@@ -2480,6 +2480,28 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * WorkspaceTurnTaskHost: a delegated turn registered (#5271). A message waits once, for the
+   * turn it was parked behind. Drop the messages that waited for any other turn right here, at
+   * registration: checking later in the drain misses a replacement turn that also settled while
+   * an earlier message was being delivered. Updates of the awaited turn keep its messages.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string, handleId: string): void {
+    const parked = this.parkedPeerSendsByTarget.get(workspaceId);
+    if (parked == null) return;
+    const kept = parked.filter((waiting) => waiting.awaitedDelegatedTurn.handleId === handleId);
+    for (const waiting of parked) {
+      if (kept.includes(waiting)) continue;
+      log.debug("Dropped a peer message: another delegated turn started before delivery", {
+        senderWorkspaceId: waiting.senderWorkspaceId,
+        targetId: workspaceId,
+      });
+    }
+    // In place: a running drain holds this array and stops once it is empty or unregistered.
+    parked.splice(0, parked.length, ...kept);
+    if (parked.length === 0) this.parkedPeerSendsByTarget.delete(workspaceId);
+  }
+
+  /**
    * Park a peer message behind the target's delegated turn, then schedule a flush. Park first,
    * check second: the registration may have been released between the caller's synchronous
    * check and this call, and that release found nothing to flush. Only first attempts park: a
@@ -2516,31 +2538,14 @@ export class TaskService implements AgentTaskIntegration {
     const parked = this.parkedPeerSendsByTarget.get(targetId);
     let drainStarted = false;
     while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
-      const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-      if (live != null) {
-        // A message waits once, for the turn it was parked behind. A replacement turn that
-        // registered after that turn released (before or during this drain) drops the messages
-        // still waiting, instead of holding them through a second delegated turn (#5271).
-        const replaced = parked.filter(
-          (waiting) => waiting.awaitedDelegatedTurn.handleId !== live.handleId
-        );
-        if (replaced.length > 0) {
-          parked.splice(
-            0,
-            parked.length,
-            ...parked.filter((waiting) => !replaced.includes(waiting))
-          );
-          for (const waiting of replaced) {
-            log.debug("Dropped a peer message: another delegated turn started before delivery", {
-              senderWorkspaceId: waiting.senderWorkspaceId,
-              targetId,
-            });
-          }
-          if (parked.length === 0) this.parkedPeerSendsByTarget.delete(targetId);
-        }
+      // A replacement turn already dropped the messages that waited for another turn when it
+      // registered (onWorkspaceTurnRegistered), so whatever is left waits for the live turn.
+      if (
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
+        this.isWorkspaceStopInProgress(targetId)
+      ) {
         return;
       }
-      if (this.isWorkspaceStopInProgress(targetId)) return;
       if (!drainStarted) {
         drainStarted = true;
         // The owner's explicit interrupt of the delegated turn bumps the target's stop epoch (so

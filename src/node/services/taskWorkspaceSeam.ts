@@ -913,6 +913,11 @@ export interface WorkspaceTurnTaskHost {
    * turn to finish (#4997). Called synchronously from the release; implementations only schedule.
    */
   onWorkspaceTurnRegistrationReleased(workspaceId: string): void;
+  /**
+   * A delegated turn registered on the workspace (a new turn, or an update of the live one).
+   * TaskService drops peer messages that waited for a different turn (#5271). Synchronous.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string, handleId: string): void;
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,

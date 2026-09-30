@@ -412,6 +412,30 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
     expect(s.peerSends.some((args) => payloadText(args).includes("second"))).toBe(false);
   });
 
+  test("messages still waiting when a replacement turn starts and ends mid-drain are dropped", async () => {
+    const s = await setUp();
+    for (const message of ["first", "second"]) {
+      expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, message)).success).toBe(
+        true
+      );
+    }
+    const internals = s.taskService as unknown as TaskServiceInternals;
+    const flushes = spyOn(internals, "flushParkedPeerSends");
+    const release = s.holdPeerSends();
+    await settle.completed(s);
+    // While "first" is being delivered, a whole replacement turn starts and finishes.
+    await s.peerSendCount(1);
+    await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_other", "owner-2");
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      TARGET_ID
+    );
+    release();
+    await Promise.all(flushes.mock.results.map((result) => result.value as Promise<void>));
+    flushes.mockRestore();
+    await expectOnlyLaterMessageDelivered(s, 1);
+    expect(s.peerSends.some((args) => payloadText(args).includes("second"))).toBe(false);
+  });
+
   test("messages are dropped when a replacement turn starts before the drain", async () => {
     const s = await setUp();
     expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(

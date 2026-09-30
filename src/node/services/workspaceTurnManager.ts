@@ -629,10 +629,21 @@ interface LiveWorkspaceTurnRegistration {
  * signal for peer messages that wait for the delegated turn to finish (#4997). Every settle,
  * recovery and stale-cleanup path releases through delete(), so hooking delete() here cannot miss
  * a path. Replacing a registration with set() is not a release: the next turn is still running.
+ * Every registration goes through set(), so hooking it reports each new turn even when that turn
+ * also settles before anyone looks (#5271).
  */
 class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegistration> {
-  constructor(private readonly onReleased: (workspaceId: string) => void) {
+  constructor(
+    private readonly onRegistered: (workspaceId: string, handleId: string) => void,
+    private readonly onReleased: (workspaceId: string) => void
+  ) {
     super();
+  }
+
+  override set(workspaceId: string, registration: LiveWorkspaceTurnRegistration): this {
+    super.set(workspaceId, registration);
+    this.onRegistered(workspaceId, registration.handleId);
+    return this;
   }
 
   override delete(workspaceId: string): boolean {
@@ -647,6 +658,7 @@ export class WorkspaceTurnManager {
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new LiveWorkspaceTurnRegistrations(
+    (workspaceId, handleId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId, handleId),
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
   );
   private lastWorkspaceTurnCreatedAtMs = 0;
