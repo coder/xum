@@ -70,6 +70,7 @@ import {
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
 import type { MCPServerManager } from "./mcpServerManager";
+import type { MCPServerMap } from "@/common/types/mcp";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -321,6 +322,7 @@ function resolvedAgentResultFor(
       taskDepth: 0,
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
+      switchableAgents: undefined,
     },
   };
 }
@@ -2574,6 +2576,434 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
     expect(toolConfig).toMatchObject({
       memoryIndexEntries: [{ path: "/memories/global/lesson.md", description: "a lesson" }],
+    });
+  });
+
+  describe("one tool set across agent-mode switches (#5253)", () => {
+    async function streamWithRealAgentTools(
+      xumHomePath: string,
+      metadataOverrides: Partial<WorkspaceMetadata>,
+      agentIds: string[],
+      options?: { memory?: boolean; toolSearch?: boolean }
+    ) {
+      const projectPath = path.join(xumHomePath, "project");
+      await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
+      // A read-only custom root agent: no edit tools, no bash. It keeps the
+      // provider-executed web_search, which a mode cannot refuse locally, so a
+      // denied one stays absent (toolAssembly.test.ts covers that).
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "reader.md"),
+        "---\nname: Reader\ndescription: Read-only agent\ntools:\n  add:\n    - file_read\n    - web_.*\n---\n\nRead only.\n"
+      );
+      // Inherits ui.hidden from explore: not in the picker, so no union.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "scout.md"),
+        "---\nname: Scout\ndescription: Hidden via base\nbase: explore\n---\n\nScout.\n"
+      );
+      // An invalid regex in an agent nobody runs must not abort other sends.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "broken.md"),
+        '---\nname: Broken\ndescription: Invalid tool regex\ntools:\n  add:\n    - "["\n---\n\nBroken.\n'
+      );
+      // Selectable, full tools except memory.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "forgetful.md"),
+        "---\nname: Forgetful\ndescription: No memory\nbase: exec\ntools:\n  remove:\n    - memory\n---\n\nForget.\n"
+      );
+      const workspaceId = "workspace-stable-agent-tools";
+      let experimentsService: ExperimentsService | undefined;
+      if (options?.memory) {
+        experimentsService = new ExperimentsService({
+          telemetryService: new TelemetryService(xumHomePath),
+          xumHome: xumHomePath,
+        });
+        spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+          (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        );
+      }
+      const harness = createHarness(
+        xumHomePath,
+        createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides),
+        { experimentsService }
+      );
+      if (options?.toolSearch) {
+        // A selectable agent that requires an MCP tool the other modes only allow.
+        await fs.writeFile(
+          path.join(projectPath, ".xum", "agents", "tracker.md"),
+          "---\nname: Tracker\ndescription: Needs issues\nbase: exec\ntools:\n  require:\n    - tracker_list_issues\n---\n\nTrack.\n"
+        );
+        const mcpTools: Record<string, Tool> = {
+          tracker_list_issues: tool({
+            description: "List issues",
+            inputSchema: jsonSchema({ type: "object" }),
+            execute: () => Promise.resolve({}),
+          }),
+        };
+        harness.service.turnRequestBuilderBindings.mcpServerManager = {
+          listServers: () => Promise.resolve({}),
+          getToolsForWorkspace: () =>
+            Promise.resolve({
+              tools: mcpTools,
+              promptDescriptors: [],
+              stats: {
+                totalTools: 1,
+                activeServerCount: 1,
+                failedServerCount: 0,
+                failedServerNames: [],
+              },
+            }),
+        } as unknown as MCPServerManager;
+      }
+      if (options?.memory) {
+        harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+          harness.config,
+          new MemoryMetaService(xumHomePath)
+        );
+      }
+      // Real agent resolution and tool assembly: the advertised block is under test.
+      harness.getToolsForModelSpy.mockRestore();
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      const toolsByAgent: Record<string, Record<string, Tool>> = {};
+      const deferredByAgent: Record<string, string[]> = {};
+      for (const agentId of agentIds) {
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+          agentId,
+          experiments: { memory: options?.memory, toolSearch: options?.toolSearch },
+        });
+        expect(result.success).toBe(true);
+        toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
+        deferredByAgent[agentId] = [
+          ...(harness.startStreamCalls.at(-1)?.toolSearchState?.deferredToolNames ?? []),
+        ].sort();
+      }
+      return { toolsByAgent, deferredByAgent, projectPath, harness };
+    }
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(
+        Object.entries(tools).map(([name, tool]) => [
+          name,
+          tool.description,
+          asSchema(tool.inputSchema).jsonSchema,
+        ])
+      );
+    const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
+
+    it("keeps the tool block byte-identical across exec, plan and a custom agent", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, projectPath } = await streamWithRealAgentTools(xumHome.path, {}, [
+        "exec",
+        "plan",
+        "reader",
+      ]);
+      const exec = toolsByAgent.exec;
+      expect(shape(toolsByAgent.plan)).toBe(shape(exec));
+      expect(shape(toolsByAgent.reader)).toBe(shape(exec));
+      for (const name of ["propose_plan", "task_remove", "file_edit_insert", "bash"]) {
+        expect(exec[name]).toBeDefined();
+      }
+      // Tools no switchable agent allows (global config tools) stay out.
+      expect(exec.mux_config_write).toBeUndefined();
+
+      // The read-only agent is refused before any side effect.
+      const target = path.join(projectPath, "created-by-reader.txt");
+      expect(
+        await toolsByAgent.reader.file_edit_insert.execute!(
+          { path: target, content: "x", insert_after: null, insert_before: null },
+          callOptions
+        )
+      ).toEqual({
+        success: false,
+        error: "Tool 'file_edit_insert' is not allowed in reader mode. Switch agents to use it.",
+      });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+      expect(
+        await toolsByAgent.reader.bash.execute!(
+          { script: `touch ${target}`, timeout_secs: 5, display_name: "t" },
+          callOptions
+        )
+      ).toEqual({
+        success: false,
+        error: "Tool 'bash' is not allowed in reader mode. Switch agents to use it.",
+      });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+      // Each built-in mode refuses the other mode's tools.
+      expect(
+        await toolsByAgent.plan.task_remove.execute!({ task_ids: ["t"] }, callOptions)
+      ).toEqual({
+        success: false,
+        error: "Tool 'task_remove' is not allowed in plan mode. Switch agents to use it.",
+      });
+      expect(await exec.propose_plan.execute!({}, callOptions)).toEqual({
+        success: false,
+        error: "Tool 'propose_plan' is not allowed in exec mode. Switch agents to use it.",
+      });
+    });
+
+    it("keeps memory-dependent behavior on the active agent's policy", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, harness } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec", "forgetful"],
+        { memory: true }
+      );
+      const { memory, intuition, ...execWithoutMemory } = toolsByAgent.exec;
+      expect(memory).toBeDefined();
+      expect(intuition).toBeDefined();
+      // Memory's description carries the memory index, so an agent denied
+      // memory gets no refusal stub, and intuition (reads memory) goes too.
+      expect(shape(toolsByAgent.forgetful)).toBe(shape(execWithoutMemory));
+      // No hot memories or memory/intuition guidance for the agent without memory.
+      expect(harness.streamSystemContextMemoryToolFlags.at(-1)).toBe(false);
+      expect(harness.streamSystemContextIntuitionFlags.at(-1)).toBe(false);
+    });
+
+    it("does not defer a tool that one switchable agent requires", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, deferredByAgent } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec", "tracker"],
+        { toolSearch: true }
+      );
+      expect(toolsByAgent.exec.tracker_list_issues).toBeDefined();
+      expect(deferredByAgent.exec).not.toContain("tracker_list_issues");
+      expect(deferredByAgent.exec).toEqual(deferredByAgent.tracker);
+      expect(shape(toolsByAgent.exec)).toBe(shape(toolsByAgent.tracker));
+    });
+
+    it.each([
+      { label: "hidden root agent (explore)", overrides: {}, agentId: "explore" },
+      { label: "root agent hidden through its base", overrides: {}, agentId: "scout" },
+      {
+        label: "sub-agent",
+        overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
+        agentId: "exec",
+      },
+    ])("keeps per-agent tool sets for a $label", async ({ overrides, agentId }) => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, overrides, [agentId]);
+      const tools = toolsByAgent[agentId];
+      // Explore and exec sub-agents never get propose_plan; absent, not refused.
+      expect(tools.propose_plan).toBeUndefined();
+      expect(tools.file_read).toBeDefined();
+    });
+  });
+
+  // #5254 regression guard: provider prompt caches key on the tool block, then
+  // the system prompt. State that changes between turns of one workspace must
+  // change neither, or every later turn re-reads the whole transcript uncached.
+  // User actions that were decided to cost one miss (skill add, MCP connect,
+  // experiment toggles: #5248, #5249) are deliberately not flipped here.
+  describe("prompt-cache prefix stability (#5254)", () => {
+    interface PrefixState {
+      goalStatus?: GoalRecordV1["status"];
+      rolloverAvailable?: boolean;
+      failedMcpServers?: string[];
+      agentId?: string;
+    }
+
+    // Captured right after each request, while its state is current.
+    type Observe = (
+      request: TurnExecutionOptions,
+      toolConfig: Parameters<typeof realGetToolsForModel>[1] | undefined
+    ) => unknown;
+
+    async function streamPair(
+      xumHomePath: string,
+      states: [PrefixState, PrefixState],
+      observe?: Observe
+    ) {
+      const projectPath = path.join(xumHomePath, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-prefix-guard";
+      // Memory on: new_context needs it, and its index is part of the tool block.
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHomePath),
+        xumHome: xumHomePath,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY
+      );
+      const harness = createHarness(
+        xumHomePath,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        { useRequestedModelString: true, experimentsService }
+      );
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHomePath)
+      );
+      // Real tools, agent resolution, system prompt and message preparation:
+      // the serialized request is under test.
+      // Call through, so each request's tool configuration is recorded too.
+      harness.getToolsForModelSpy.mockImplementation(realGetToolsForModel);
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+      spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
+      let state: PrefixState = states[0];
+      const mcpServers = {
+        alpha: { transport: "stdio", command: "alpha-server" },
+        beta: { transport: "stdio", command: "beta-server" },
+      } as unknown as MCPServerMap;
+      // beta fails to start in some states; it never contributes tools.
+      const mcpTools: Record<string, Tool> = {
+        alpha_lookup: tool({
+          description: "Look something up",
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => Promise.resolve({}),
+        }),
+      };
+      harness.service.turnRequestBuilderBindings.mcpServerManager = {
+        listServers: () => Promise.resolve(mcpServers),
+        getToolsForWorkspace: () => {
+          const failedServerNames = state.failedMcpServers ?? [];
+          return Promise.resolve({
+            tools: mcpTools,
+            promptDescriptors: [],
+            // Like the real manager: the prompt inventory is the enabled
+            // (configured, trusted, allowed) servers, not the running ones.
+            overridesUsed: {},
+            serversUsed: mcpServers,
+            stats: {
+              totalTools: 1,
+              activeServerCount: 2 - failedServerNames.length,
+              failedServerCount: failedServerNames.length,
+              failedServerNames,
+            },
+          });
+        },
+      } as unknown as MCPServerManager;
+      const goalService = {
+        getGoal: mock(() => {
+          // The request builder reads only the status, so a partial record is enough.
+          const goal: Partial<GoalRecordV1> = {
+            goalId: "goal-1",
+            objective: "Ship it",
+            status: state.goalStatus,
+          };
+          return Promise.resolve(state.goalStatus == null ? null : (goal as GoalRecordV1));
+        }),
+        setGoal: mock(() => Promise.resolve({ success: true, data: { goalId: "goal-1" } })),
+      } as unknown as WorkspaceGoalService;
+
+      const requests: TurnExecutionOptions[] = [];
+      const observations: string[] = [];
+      for (const next of states) {
+        state = next;
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "off",
+          agentId: state.agentId ?? "exec",
+          experiments: { tokenBudget: true, memory: true },
+          contextBudgetRolloverAvailable: state.rolloverAvailable === true,
+          workspaceGoalService: goalService,
+        });
+        expect(result.success).toBe(true);
+        const request = harness.startStreamCalls.at(-1)!;
+        requests.push(request);
+        observations.push(
+          JSON.stringify(
+            (await observe?.(request, harness.getToolsForModelSpy.mock.calls.at(-1)?.[1])) ?? null
+          )
+        );
+      }
+      return { requests, observations };
+    }
+
+    // Ordered, so a reorder or a moved cache breakpoint is a difference too
+    // (#5252). Provider-native tools are identified by id and args on the wire.
+    const toolBlock = (request: TurnExecutionOptions) =>
+      JSON.stringify(
+        Object.entries(request.tools ?? {}).map(([name, requestTool]) => [
+          name,
+          requestTool.type ?? "function",
+          requestTool.type === "provider" ? [requestTool.id, requestTool.args] : null,
+          requestTool.description,
+          asSchema(requestTool.inputSchema).jsonSchema,
+          requestTool.providerOptions ?? null,
+        ])
+      );
+    const breakpointTools = (request: TurnExecutionOptions) =>
+      Object.entries(request.tools ?? {})
+        .filter(([, requestTool]) => requestTool.providerOptions?.anthropic?.cacheControl != null)
+        .map(([name]) => name);
+    const stableSystemRow = (request: TurnExecutionOptions) => {
+      const row = request.messages[0];
+      // Non-vacuous: the row compared is the cached system prefix.
+      expect(row?.role).toBe("system");
+      expect(row?.providerOptions?.anthropic?.cacheControl).toBeDefined();
+      return JSON.stringify(row);
+    };
+
+    const systemTail = (request: TurnExecutionOptions) =>
+      JSON.stringify(request.messages.slice(1).filter((message) => message.role === "system"));
+    // Goal status is read by the handlers at execution time (#5247), so the
+    // flip shows in what complete_goal does, not in the request.
+    const completeGoal: Observe = (request) =>
+      request.tools?.complete_goal?.execute?.(
+        { summary: "done", goalId: null },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      );
+
+    it.each<{
+      label: string;
+      states: [PrefixState, PrefixState];
+      // Must differ between the two requests, so the flipped state provably
+      // reached them and the equality below is not vacuous.
+      observe: Observe;
+    }>([
+      { label: "goal status", states: [{}, { goalStatus: "active" }], observe: completeGoal },
+      {
+        label: "goal completion",
+        states: [{ goalStatus: "active" }, { goalStatus: "complete" }],
+        observe: completeGoal,
+      },
+      {
+        label: "rollover availability",
+        states: [{ rolloverAvailable: false }, { rolloverAvailable: true }],
+        observe: (_request, toolConfig) => toolConfig?.contextBudgetRolloverAvailable,
+      },
+      {
+        // The <mcp> inventory lists configured servers; the failure goes to the uncached tail.
+        label: "MCP server failure",
+        states: [{}, { failedMcpServers: ["beta"] }],
+        observe: (request) => systemTail(request),
+      },
+    ])(
+      "keeps the tool block and the cached system row across $label",
+      async ({ states, observe }) => {
+        using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+        const {
+          requests: [before, after],
+          observations,
+        } = await streamPair(xumHome.path, states, observe);
+        expect(observations[1]).not.toBe(observations[0]);
+        expect(breakpointTools(before)).toHaveLength(1);
+        expect(breakpointTools(after)).toEqual(breakpointTools(before));
+        expect(toolBlock(after)).toBe(toolBlock(before));
+        expect(stableSystemRow(after)).toBe(stableSystemRow(before));
+      }
+    );
+
+    it("keeps the tool block across a root agent switch", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [exec, plan],
+      } = await streamPair(xumHome.path, [{ agentId: "exec" }, { agentId: "plan" }]);
+      expect(breakpointTools(exec)).toHaveLength(1);
+      expect(toolBlock(plan)).toBe(toolBlock(exec));
+      // Expected difference until #5292: the system prompt still carries the
+      // active agent's instructions. Flip this once #5292 lands.
+      expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
     });
   });
 

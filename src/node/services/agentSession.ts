@@ -95,11 +95,14 @@ import type {
   OnChatMode,
   OnChatCursor,
   OnChatDowngradeReason,
+  CaughtUpMessage,
   ProvidersConfigMap,
   StreamErrorMessage,
   AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -3071,6 +3074,7 @@ export class AgentSession {
     // reason on the caught-up payload plus a log line with row counts.
     let downgradeReason: OnChatDowngradeReason | undefined;
     let epochRowCount: number | undefined;
+    let windowSeed: CaughtUpMessage["windowSeed"];
     let sentRowCount = 0;
     let emittedReplayMessages = false;
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
@@ -3525,6 +3529,18 @@ export class AgentSession {
           };
           break;
         }
+
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // The window missed the epoch start, so it may miss the last todo_write or
+          // review_pane_update too. Send the files the agent reads (both readers return [] on
+          // any read error) as the client's baseline (#4961).
+          const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+          const [todos, assistedReview] = await Promise.all([
+            readTodosForSessionDir(sessionDir),
+            readAssistedReviewForSessionDir(sessionDir),
+          ]);
+          windowSeed = { todos, assistedReview };
+        }
       }
 
       const attemptedStreamReplay = streamInfo !== undefined;
@@ -3656,6 +3672,7 @@ export class AgentSession {
           historyReplayStatus: historyReplayFailed ? "failed" : "complete",
           ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
+          ...(windowSeed && !historyReplayFailed ? { windowSeed } : {}),
           cursor: serverCursor,
         },
       });

@@ -24,10 +24,15 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  applyToolPolicyToNames,
+  buildRequiredToolPatterns,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
+  discoverAgentDefinitions,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -99,6 +104,21 @@ export interface AgentResolutionResult {
   shouldDisableTaskToolsForDepth: boolean;
   /** Composed tool policy: agent → caller (in application order). */
   effectiveToolPolicy: ToolPolicy | undefined;
+  /**
+   * Root workspaces only (#5253): the composed policy of every agent the user
+   * can switch this workspace to, the active one included. Tool assembly
+   * advertises their union and refuses calls the active policy denies, so a
+   * mode switch keeps the tools block, and with it the prompt cache,
+   * byte-identical. Undefined for sub-agents (their agent is fixed, except one
+   * plan-to-exec handoff) and for hidden agents such as compaction.
+   */
+  switchableAgents: SwitchableAgent[] | undefined;
+}
+
+/** An agent the root mode picker offers (see AgentResolutionResult.switchableAgents). */
+export interface SwitchableAgent {
+  id: string;
+  toolPolicy: ToolPolicy;
 }
 
 /**
@@ -519,14 +539,116 @@ export async function resolveAgentForStream(
   // Drop agent-level require filters in that case to avoid multiple-required-tool conflicts.
   const callerRequiresTool =
     callerToolPolicy?.some((filter) => filter.action === "require") === true;
-  const agentToolPolicyForComposition = callerRequiresTool
-    ? agentToolPolicy.filter((filter) => filter.action !== "require")
-    : agentToolPolicy;
-
-  const effectiveToolPolicy: ToolPolicy | undefined =
-    callerToolPolicy || agentToolPolicyForComposition.length > 0
-      ? [...agentToolPolicyForComposition, ...(callerToolPolicy ?? [])]
+  const composeWithCallerPolicy = (policy: ToolPolicy): ToolPolicy | undefined => {
+    const forComposition = callerRequiresTool
+      ? policy.filter((filter) => filter.action !== "require")
+      : policy;
+    return callerToolPolicy || forComposition.length > 0
+      ? [...forComposition, ...(callerToolPolicy ?? [])]
       : undefined;
+  };
+  const effectiveToolPolicy = composeWithCallerPolicy(agentToolPolicy);
+
+  let switchableAgents: SwitchableAgent[] | undefined;
+  // Visibility can be inherited from a base, so check the resolved frontmatter
+  // like the mode picker does.
+  const activeSelectable =
+    !isSubagentWorkspace &&
+    effectiveToolPolicy !== undefined &&
+    resolveAgentVisibility(
+      (
+        await resolveAgentFrontmatter(
+          agentDiscoveryRuntime,
+          agentDiscoveryPath,
+          agentDefinition.id,
+          {
+            includeAgentPlugins,
+            cache,
+            skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+          }
+        ).catch(() => undefined)
+      )?.ui
+    ).selectable;
+  if (activeSelectable && effectiveToolPolicy !== undefined) {
+    const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
+      includeAgentPlugins,
+    }).catch(() => []);
+    // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
+    const policies = await Promise.all(
+      descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
+        if (descriptor.id === agentDefinition.id) return undefined;
+        try {
+          const readOptions = {
+            includeAgentPlugins,
+            cache,
+            skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+          };
+          const frontmatter = await resolveAgentFrontmatter(
+            agentDiscoveryRuntime,
+            agentDiscoveryPath,
+            descriptor.id,
+            readOptions
+          );
+          // Same filter as the mode picker (listAgentDefinitions).
+          if (
+            !resolveAgentVisibility(frontmatter.ui).selectable ||
+            isAgentEffectivelyDisabled({
+              cfg,
+              agentId: descriptor.id,
+              resolvedFrontmatter: frontmatter,
+            })
+          ) {
+            return undefined;
+          }
+          const definition = await readAgentDefinition(
+            agentDiscoveryRuntime,
+            agentDiscoveryPath,
+            descriptor.id,
+            readOptions
+          );
+          const chain = await resolveAgentInheritanceChain({
+            runtime: agentDiscoveryRuntime,
+            workspacePath: agentDiscoveryPath,
+            agentId: definition.id,
+            agentDefinition: definition,
+            workspaceId,
+            includeAgentPlugins,
+            cache,
+          });
+          const toolPolicy = composeWithCallerPolicy(
+            resolveToolPolicyForAgent({
+              agents: chain,
+              isSubagent: false,
+              disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
+              advisorEnabled:
+                isAdvisorExperimentEnabled === true &&
+                resolveAdvisorEnabledForAgent(
+                  descriptor.id,
+                  cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
+                ),
+            })
+          );
+          if (toolPolicy === undefined) return undefined;
+          // An invalid tools.add/remove regex would otherwise throw in tool
+          // assembly and abort every send, not just a switch to this agent.
+          applyToolPolicyToNames([], toolPolicy);
+          buildRequiredToolPatterns(toolPolicy);
+          return { id: descriptor.id, toolPolicy };
+        } catch (error) {
+          // An unreadable agent cannot be switched to either; its tools just stay out.
+          workspaceLog.debug("Skipping agent for the stable tool set", {
+            agentId: descriptor.id,
+            error: getErrorMessage(error),
+          });
+          return undefined;
+        }
+      })
+    );
+    switchableAgents = [
+      { id: agentDefinition.id, toolPolicy: effectiveToolPolicy },
+      ...policies.filter((agent): agent is SwitchableAgent => agent !== undefined),
+    ];
+  }
 
   return Ok({
     effectiveAgentId,
@@ -541,5 +663,6 @@ export async function resolveAgentForStream(
     taskDepth,
     shouldDisableTaskToolsForDepth,
     effectiveToolPolicy,
+    switchableAgents,
   });
 }

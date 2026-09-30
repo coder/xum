@@ -751,6 +751,15 @@ export interface WorkspaceProvisioningHost {
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
+  /** Project-less create for scratch owners; same consent/crash-binding options as create(). */
+  createScratch(
+    title?: string,
+    tags?: Record<string, string>,
+    options?: {
+      defaultUnrelatedConsent?: "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
   /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
   grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;

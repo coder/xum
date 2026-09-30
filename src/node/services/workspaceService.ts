@@ -5821,7 +5821,31 @@ export class WorkspaceService
     );
   }
 
-  async createScratch(title?: string): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+  async createScratch(
+    title?: string,
+    tags?: Record<string, string>,
+    /**
+     * Delegated task(kind:"workspace") targets from a scratch owner (see create()): only
+     * "caller-finalizes" and "none" apply, since scratch has no setup that must precede the
+     * default consent; omitted keeps the interactive default of granting it with the entry.
+     */
+    options?: {
+      defaultUnrelatedConsent?: "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+    const delegatedCreation = options?.delegatedCreation;
+    assert(
+      delegatedCreation == null ||
+        (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
+      "createScratch: a delegated creation names its handle and owner"
+    );
+    if (tags != null) {
+      for (const [tagKey, tagValue] of Object.entries(tags)) {
+        assert(tagKey.trim().length > 0, "Workspace tag keys must be non-empty");
+        assert(typeof tagValue === "string", "Workspace tag values must be strings");
+      }
+    }
     // Scratch chats always run on the local runtime; locked-down deployments
     // that disallow local runtimes must not get a local tool-execution
     // workspace through the scratch path either.
@@ -5856,7 +5880,23 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: { type: "local" },
-          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
+          ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
+          // Same consent/crash-binding contract as create(): a delegated target's pending
+          // default is finalized by its creating turn (#4453), and the creation mark lands in
+          // the row's own write so a crash cannot leave the target unbound (#4983).
+          ...(options?.defaultUnrelatedConsent === "caller-finalizes"
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : options?.defaultUnrelatedConsent === "none"
+              ? {}
+              : { unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent() }),
+          ...(delegatedCreation != null
+            ? {
+                delegatedCreation: {
+                  handleId: delegatedCreation.handleId,
+                  ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
+                },
+              }
+            : {}),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
