@@ -85,6 +85,7 @@ import type { TaskService } from "@/node/services/taskService";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { historyStatusScanReaders } from "./historyStatusScanReaders";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -124,10 +125,6 @@ import {
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 const STATUS_SUFFIX_ERROR_PREFIX = "Failed to read history suffix from boundary";
-// Windows: libuv's rename (MoveFileExW + MOVEFILE_REPLACE_EXISTING) fails with EPERM while any
-// handle has the destination open, and writeFileAtomic does not retry. An unlocked status scan
-// every tick would make in-process rewrites fail there, so Windows keeps the whole scan locked.
-const STATUS_SCAN_RELEASES_HISTORY_LOCK = process.platform !== "win32";
 
 export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
@@ -1645,6 +1642,8 @@ export class HistoryService {
         await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       }
       await using directory = await this.openHistoryPublicationDirectory(chatPath);
+      await historyStatusScanReaders.waitForClose(chatPath);
+      await historyStatusScanReaders.waitForClose(archivePath);
       await publication.assertStillOwned();
       if (!publication.isCurrent()) throw new Error("History publication no longer owned");
       try {
@@ -2702,7 +2701,7 @@ export class HistoryService {
    * Rows over SESSION_HISTORY_MAX_LINE_BYTES are status-grade, never provider-grade: tool
    * payloads come back null and file URLs "" (readStatusHistorySuffix).
    *
-   * Lock scope: on POSIX only truncate recovery, open and fstat run under the history lock; the
+   * Lock scope: only truncate recovery, open and fstat run under the history lock; the
    * scan and the final stamp check run on the pinned descriptors after it is released, so
    * partial writes and chat opens no longer wait behind a giant-row scan. Why that is safe:
    * - Every in-process mutation holds the same mutex for its whole read+replace (see
@@ -2720,6 +2719,9 @@ export class HistoryService {
    *   on a conflict), so an in-process writer never makes status skip a tick. If that read
    *   fails too, Err: the status tick keeps the current status and retries at its normal
    *   interval, the path cross-process races already take today.
+   * - On Windows an async replacement retries in writeFileAtomic until the scan closes its
+   *   descriptors, and the synchronous publications wait for in-flight scans first
+   *   (historyStatusScanReaders).
    */
   async getStatusHistorySuffix(
     workspaceId: string,
@@ -2745,11 +2747,16 @@ export class HistoryService {
       this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
         read(await openHistorySnapshot(paths))
       );
-    if (!STATUS_SCAN_RELEASES_HISTORY_LOCK) return lockedRead();
     // Only truncate recovery + open + fstat need the lock (see the doc comment).
     let snapshot: OpenHistorySnapshot;
     try {
-      snapshot = await this.withRecoveredHistoryLock(workspaceId, () => openHistorySnapshot(paths));
+      snapshot = await this.withRecoveredHistoryLock(workspaceId, async () => {
+        const opened = await openHistorySnapshot(paths);
+        const release = historyStatusScanReaders.track([paths.chat, paths.archive]);
+        // Released on close, which read() runs before any lockedRead() fallback: a publisher
+        // draining this scan holds the mutex that fallback needs.
+        return { ...opened, close: () => opened.close().finally(release) };
+      });
     } catch (error) {
       return Err(`${STATUS_SUFFIX_ERROR_PREFIX}: ${getErrorMessage(error)}`);
     }
@@ -4595,6 +4602,7 @@ export class HistoryService {
         let published = false;
         try {
           await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+          await historyStatusScanReaders.waitForClose(historyPath);
           await assertStillOwned();
           // Admission may change while the file is staged. The final check and rename
           // are synchronous, so the retired owner cannot publish in that gap.
@@ -4779,6 +4787,7 @@ export class HistoryService {
     try {
       await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       await using directory = await this.openHistoryPublicationDirectory(historyPath);
+      await historyStatusScanReaders.waitForClose(historyPath);
       // Staging can outlive a filesystem lease even while the logical owner is current.
       await publication.assertStillOwned();
       // Replacement acceptance must capture its receipt in the same synchronous

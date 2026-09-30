@@ -16,6 +16,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { historyStatusScanReaders } from "./historyStatusScanReaders";
 import { log } from "./log";
 
 // JSON.stringify otherwise silently drops functions/symbols and coerces binary/URL options.
@@ -100,6 +101,7 @@ export async function publishCompactionFile(
   const stagedPath = `${filePath}.continuous-${randomUUID()}`;
   try {
     await writeFileAtomic(stagedPath, contents, { mode: 0o600 });
+    await historyStatusScanReaders.waitForClose(filePath);
     // Staging can outlive the lock lease; check ownership after that final I/O.
     if (assertStillOwned) await assertStillOwned();
     if (!isCurrent()) return false;
