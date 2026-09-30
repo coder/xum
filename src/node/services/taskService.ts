@@ -10007,6 +10007,11 @@ export class TaskService implements AgentTaskIntegration {
       // gates, so a stop in those windows refuses the send instead of queueing a wake or
       // resurrecting the stopped task via markInterruptedTaskRunning.
       let admissionRefusal: SendAgentTreeMessageError | null = null;
+      // Registration count when a delegated turn first refused this attempt. The message waits
+      // for that turn only: the session's final admission gate awaits its rollback before
+      // onCanceled parks the message, and a turn registering during that await must not count as
+      // the awaited one (#5277).
+      let refusedAtRegistrationEpoch: number | undefined;
       const admissionStale = (): boolean => {
         // Latched stop checks first: unlike the level-triggered probes below, a generation bump
         // stays observable even when a user resume already cleared suppression and restored
@@ -10028,6 +10033,9 @@ export class TaskService implements AgentTaskIntegration {
         }
         const delegatedRootRefusal = getDelegatedRootRefusal();
         if (delegatedRootRefusal != null) {
+          if (delegatedRootRefusal === awaitDelegatedTurn) {
+            refusedAtRegistrationEpoch ??= this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0;
+          }
           admissionRefusal = delegatedRootRefusal;
           return true;
         }
@@ -10121,7 +10129,8 @@ export class TaskService implements AgentTaskIntegration {
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
-            registrationEpoch: this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+            registrationEpoch:
+              refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
             stopEpochs: new Map(capturedStopEpochs),
           },
         });
