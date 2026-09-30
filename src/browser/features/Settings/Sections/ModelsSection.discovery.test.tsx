@@ -33,7 +33,6 @@ interface DiscoveryRequest {
   reject: (error: Error) => void;
 }
 
-// A reconnect hands the settings tree a new API client while config and policy stay put.
 function SettingsProbe() {
   const settings = useSettings();
   return (
@@ -43,6 +42,7 @@ function SettingsProbe() {
   );
 }
 
+// A reconnect hands the settings tree a new API client while config and policy stay put.
 function SwappableAPI(props: {
   initial: APIClient;
   handle: RefObject<((client: APIClient) => void) | null>;
@@ -527,12 +527,10 @@ describe("ModelsSection Escape", () => {
     const ui = await setup();
     fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
     const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    if (!(filter instanceof HTMLInputElement)) throw new Error("Expected an editable filter");
     await ui.user.type(filter, "gpt");
     fireEvent.keyDown(filter, { key: "Escape" });
-    expect([
-      (filter as HTMLInputElement).value,
-      ui.view.queryByText("Settings open") !== null,
-    ]).toEqual(["", true]);
+    expect([filter.value, ui.view.queryByText("Settings open") !== null]).toEqual(["", true]);
     fireEvent.keyDown(filter, { key: "Escape" });
     await ui.view.findByText("Settings closed");
   });

@@ -278,7 +278,7 @@ export function ModelsSection() {
   const catalogQuery = newModelId.trim();
   const catalogQueryActive = catalogQuery.length > 0;
   useEffect(() => {
-    if (!suggestionsSession || !catalogQueryActive || !api) {
+    if (!suggestionsSession || !catalogQuery || !api) {
       return;
     }
     const controller = new AbortController();
@@ -303,7 +303,7 @@ export function ModelsSection() {
         () => undefined
       );
     return () => controller.abort();
-  }, [api, suggestionsSession, catalogQuery, catalogQueryActive, effectivePolicy]);
+  }, [api, suggestionsSession, catalogQuery, effectivePolicy]);
 
   // Previous-query matches stay visible until the new reply lands to avoid
   // flicker while typing; a new session, client, or policy revokes them.
