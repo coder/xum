@@ -16,7 +16,7 @@ import type {
   // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
   XaiResponsesProviderOptions,
 } from "@ai-sdk/xai";
-import type { ProviderName } from "@/common/constants/providers";
+import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
@@ -304,6 +304,9 @@ function anthropicThinkingBlockBindingAvailable(
  * forwards the body) and the `coder` route (Coder AI gateway, anthropic type).
  * Everything else fails closed: mux-gateway's server SDK is outside Xum's control,
  * Bedrock pins an older @ai-sdk/anthropic, and custom providers may validate the enum.
+ * On the coder route only an instance whose type is exactly "anthropic" qualifies:
+ * a bedrock-typed instance also speaks the Anthropic wire, but its upstream is
+ * Bedrock, and any other or unknown type may reject the enum.
  */
 export function anthropicBetweenToolsRouteAvailable(
   modelString: string,
@@ -321,7 +324,25 @@ export function anthropicBetweenToolsRouteAvailable(
       !isCustomProviderConfig(anthropicConfig)
     );
   }
-  return routeProvider === "coder" && !isCustomProviderConfig(providersConfig?.coder);
+  if (routeProvider !== "coder" || isCustomProviderConfig(providersConfig?.coder)) {
+    return false;
+  }
+  // A model routed onto Coder from its canonical id (anthropic:x) goes to the
+  // instance the route table names (anthropic/x), the same id the factory builds.
+  const colonIndex = modelString.indexOf(":");
+  if (colonIndex <= 0) {
+    return false;
+  }
+  const gatewayModelId = modelString.startsWith("coder:")
+    ? modelString.slice("coder:".length)
+    : PROVIDER_DEFINITIONS.coder.toGatewayModelId(
+        modelString.slice(0, colonIndex),
+        modelString.slice(colonIndex + 1)
+      );
+  return (
+    resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder)?.providerType ===
+    "anthropic"
+  );
 }
 
 /**

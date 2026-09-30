@@ -239,6 +239,14 @@ describe("buildProviderOptions - Anthropic", () => {
         discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
       },
     };
+    const coderInstance = (name: string, type: string): ProvidersConfigMap => ({
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name, type }],
+      },
+    });
     const optionsFor = (
       model: string,
       level: Parameters<typeof buildProviderOptions>[1],
@@ -277,6 +285,13 @@ describe("buildProviderOptions - Anthropic", () => {
           "anthropic",
         ],
         ["Coder gateway", "coder:anthropic/claude-sonnet-5-5", coderConfig, "coder"],
+        ["canonical id routed through Coder", sonnet55, coderConfig, "coder"],
+        [
+          "custom-named anthropic-typed Coder instance",
+          "coder:prod-claude/claude-sonnet-5-5",
+          coderInstance("prod-claude", "anthropic"),
+          "coder",
+        ],
       ];
       for (const [label, model, config, route] of eligible) {
         expect({ label, options: optionsFor(model, "off", config, route) }).toEqual({
@@ -307,6 +322,38 @@ describe("buildProviderOptions - Anthropic", () => {
         ],
         ["OpenRouter", "openrouter:anthropic/claude-sonnet-5-5", directConfig(), "openrouter"],
         ["Bedrock", "bedrock:anthropic.claude-sonnet-5-5", directConfig(), "bedrock"],
+        // The Coder route allows only an instance whose type is exactly "anthropic".
+        [
+          "bedrock-typed Coder instance",
+          "coder:bedrock/anthropic.claude-sonnet-5-5",
+          coderInstance("bedrock", "bedrock"),
+          "coder",
+        ],
+        [
+          "canonical id routed to a bedrock-typed Coder instance",
+          sonnet55,
+          coderInstance("anthropic", "bedrock"),
+          "coder",
+        ],
+        [
+          "unknown-typed Coder instance",
+          "coder:prod-claude/claude-sonnet-5-5",
+          coderInstance("prod-claude", "future-type"),
+          "coder",
+        ],
+        [
+          "Coder instance with no type",
+          "coder:prod-claude/claude-sonnet-5-5",
+          {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              discoveredProviders: [{ name: "prod-claude" }],
+            },
+          } as unknown as ProvidersConfigMap,
+          "coder",
+        ],
       ];
       for (const [label, model, config, route] of ineligible) {
         expect({ label, options: optionsFor(model, "off", config, route) }).toEqual({
