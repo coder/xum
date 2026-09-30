@@ -1305,11 +1305,15 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   />
                 </PopoverContent>
               </Popover>
-              <WorkspaceHeartbeatModal
-                workspaceId={workspaceId}
-                open={heartbeatModalOpen}
-                onOpenChange={setHeartbeatModalOpen}
-              />
+              {/* Mounted on demand so each sidebar row skips the modal's hooks and
+                  context requirements until the user opens it. */}
+              {heartbeatModalOpen && (
+                <WorkspaceHeartbeatModal
+                  workspaceId={workspaceId}
+                  open
+                  onOpenChange={setHeartbeatModalOpen}
+                />
+              )}
             </ActionButtonWrapper>
           )
         )}
