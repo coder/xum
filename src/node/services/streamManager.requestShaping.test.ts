@@ -301,6 +301,64 @@ describe("StreamManager - tool search activeTools scoping", () => {
     const nextStep = await prepareStep({ messages });
     expect(nextStep?.activeTools).toEqual(["bash", "tool_catalog_search", "slack_send_message"]);
   });
+
+  test("a tool-set change ends in-turn reasoning replay on between_tools requests (#5086)", async () => {
+    // between_tools cannot carry blockBinding: a thinking block replayed after the
+    // advertised tools changed would fail the prefix check on enforced accounts.
+    const inTurn: ModelMessage[] = [
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "note", providerOptions: { anthropic: { signature: "s" } } },
+          { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ];
+    const replaysReasoning = (step: PreparedStepForTests) =>
+      (step?.messages ?? inTurn).some(
+        (message) =>
+          message.role === "assistant" &&
+          typeof message.content !== "string" &&
+          message.content.some((part) => part.type === "reasoning")
+      );
+    const run = async (thinking: Record<string, unknown>) => {
+      const toolSearchState: ToolSearchStreamState = {
+        catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+        deferredToolNames: new Set(["slack_send_message"]),
+        allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+        activatedToolNames: new Set(),
+      };
+      const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+        model,
+        messages,
+        toolSearchState,
+        providerOptions: { anthropic: { thinking, effort: "low" } },
+      });
+      const prepareStep = capturePrepareStep(streamTextSpy);
+      const replayed = [replaysReasoning(await prepareStep({ messages: inTurn }))];
+      toolSearchState.activatedToolNames.add("slack_send_message");
+      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
+      // Sticky: the blocks stay invalid on later steps with an unchanged tool set.
+      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
+      return replayed;
+    };
+
+    expect(await run({ type: "between_tools" })).toEqual([true, false, false]);
+    // Adaptive requests carry blockBinding (drop_block), so they keep replaying.
+    expect(await run({ type: "adaptive" })).toEqual([true, true, true]);
+  });
 });
 
 describe("StreamManager - same-turn envelope lookalike neutralization", () => {
