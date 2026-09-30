@@ -1033,6 +1033,7 @@ describe("prompt-prefix fingerprints (#5254)", () => {
     params: LanguageModelV4CallOptions,
     modelString = "anthropic:model"
   ) {
+    const before = new Set((await service.getRuns("ws-1")).map((run) => run.id));
     await getWrapGenerate(createDevToolsMiddleware("ws-1", service, modelString))({
       doGenerate: () => Promise.resolve(createGenerateResult()),
       doStream: () => Promise.reject(new Error("doStream should not be called")),
@@ -1040,9 +1041,10 @@ describe("prompt-prefix fingerprints (#5254)", () => {
       // Same bare SDK model id for every route: only the model string tells them apart.
       model: createMockModel(),
     });
-    const runs = await service.getRuns("ws-1");
-    const newest = runs.reduce((a, b) => (a.startedAt >= b.startedAt ? a : b));
-    const run = await service.getRunWithSteps("ws-1", newest.id);
+    // The run this attempt created (startedAt can tie within a millisecond).
+    const created = (await service.getRuns("ws-1")).filter((run) => !before.has(run.id));
+    if (created.length !== 1) throw new Error(`expected one new run, got ${created.length}`);
+    const run = await service.getRunWithSteps("ws-1", created[0].id);
     return run?.steps[0]?.promptPrefix;
   }
 
