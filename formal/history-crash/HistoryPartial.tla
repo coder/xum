@@ -5,6 +5,8 @@
 (*                                                                         *)
 (* Disk state: chat.jsonl (a sequence of JSONL lines) and partial.json.    *)
 (* Every filesystem call is ONE atomic step, annotated with file:line.     *)
+(* Line numbers refer to historyService.ts before the F1/F2 fix; with     *)
+(* CommitRequiresRow = UpdateMatchesId = TRUE the model is the current code. *)
 (* Semantics assumed (process-crash model; runs and bounds in check.sh):                    *)
 (*   - writeFileAtomic (temp + fsync + rename) is all-or-nothing;          *)
 (*   - unlink is atomic;                                                   *)
@@ -27,8 +29,8 @@ CONSTANTS
   CrossBackendBusyGuard, \* TRUE = hypothetical guard: edit refused while ANY backend streams
   CompleteDeletesFirst,  \* TRUE = code order streamManager.ts:4935 (deletePartial before updateHistory)
   RetirePartialOnEdit,   \* TRUE = code (historyService.ts:5478); FALSE = pre-retirement builds
-  CommitRequiresRow,     \* FIX candidate: commitPartial retires a partial whose id has no row
-  UpdateMatchesId,       \* FIX candidate: updateHistory refuses a same-seq row with another id
+  CommitRequiresRow,     \* FIX (current code, F1/F2): commitPartial retires a partial whose id has no row
+  UpdateMatchesId,       \* FIX (current code, F1/F2): updateHistory refuses a same-seq row with another id
   MutUnlinkFirst,        \* mutation: commitPartial unlinks partial.json before writing chat.jsonl
   ConcurrentStreams,     \* TRUE = a backend may start a turn while another backend's turn runs
   MutNoSeparator         \* mutation: append does not delimit a torn tail (historyAppendProvenance.ts:325)
@@ -212,6 +214,7 @@ FinishDelete(b) ==
 
 \* streamManager.ts:4943 updateHistory -> updateHistoryUnderWriteLock (4785): replaces the
 \* FIRST row whose historySequence matches (4812), whatever its id; Err if none (4844).
+\* UpdateMatchesId = TRUE (current code): the row must also carry the message id.
 FinishUpdate(b) ==
   /\ pc[b] = "fin_upd" /\ Free
   /\ LET t == turn[b]
