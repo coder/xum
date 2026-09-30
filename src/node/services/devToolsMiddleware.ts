@@ -244,9 +244,7 @@ export function extractUsage(
 
 export function createDevToolsMiddleware(
   workspaceId: string,
-  service: DevToolsService,
-  /** This attempt's selected model string: identifies the route for prefix attribution. */
-  modelString: string
+  service: DevToolsService
 ): LanguageModelV4Middleware {
   assert(workspaceId.trim().length > 0, "createDevToolsMiddleware requires a workspaceId");
   assert(service, "createDevToolsMiddleware requires a DevToolsService");
@@ -317,12 +315,11 @@ export function createDevToolsMiddleware(
       const stepNumber = (stepCounter += 1);
       const input = extractInput(params);
 
-      await service.createStep(
-        workspaceId,
-        createEmptyStep(stepId, runId, stepNumber, stepType, model, input),
+      await service.createStep(workspaceId, {
+        ...createEmptyStep(stepId, runId, stepNumber, stepType, model, input),
         // Only on this debug-logs-on path: no hashing cost otherwise (#5254).
-        { fingerprint: fingerprintPromptPrefix(params), modelString, runMetadataId }
-      );
+        promptPrefix: fingerprintPromptPrefix(params),
+      });
 
       return {
         stepId,

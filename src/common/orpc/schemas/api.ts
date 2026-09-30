@@ -3108,14 +3108,16 @@ const DevToolsStepSchema = z.object({
   promptPrefix: z
     .object({
       toolsHash: z.string(),
+      tools: z.array(
+        z.object({
+          name: z.string(),
+          description: z.string(),
+          schema: z.string(),
+          options: z.string(),
+        })
+      ),
       systemPrefixHash: z.string(),
       systemTailHash: z.string().nullable(),
-      change: z
-        .object({
-          components: z.array(z.string()),
-          expected: z.enum(["model-switch", "agent-switch"]).optional(),
-        })
-        .optional(),
     })
     .optional(),
 });

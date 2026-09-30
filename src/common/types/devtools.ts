@@ -41,18 +41,24 @@ export interface DevToolsStep {
 
 /**
  * Prompt-cache prefix fingerprint of the step's SDK input (#5254): hashes of
- * the ordered tool block, the cached system rows and the uncached system tail.
+ * the ordered tool block (and of each tool), the cached system rows and the
+ * uncached system tail. Compare consecutive steps offline to see which part
+ * of the prefix changed; nothing is compared at runtime.
  */
 export interface DevToolsPromptPrefix {
   toolsHash: string;
+  /** In request order. */
+  tools: DevToolsToolFingerprint[];
   systemPrefixHash: string;
   systemTailHash: string | null;
-  /** Live turns only: what differs from the workspace's previous live request. */
-  change?: {
-    components: string[];
-    /** Set when a model or agent switch explains the change. */
-    expected?: "model-switch" | "agent-switch";
-  };
+}
+
+export interface DevToolsToolFingerprint {
+  name: string;
+  description: string;
+  schema: string;
+  /** Provider options, including a tool cache marker. */
+  options: string;
 }
 
 export interface DevToolsStepInput {

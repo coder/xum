@@ -3,8 +3,10 @@
  *
  * Provider prompt caches key on the tool block, then the system prompt, then
  * earlier messages. A change to that prefix between turns of one workspace
- * re-reads the whole transcript uncached, so the debug log records what the
- * prefix was and, when it changed, which part changed. These are fingerprints
+ * re-reads the whole transcript uncached, so the debug log records a
+ * fingerprint of the prefix on every step. Comparing consecutive steps
+ * offline shows which part changed; nothing is compared at runtime, so there
+ * is no shared state to keep in step with the log. These are fingerprints
  * of the SDK call input (tools and prompt), not of the provider wire bytes:
  * the SDK input does not carry a provider-native tool's cache marker, so a
  * moved tool breakpoint shows up as a tool order or options change.
@@ -13,19 +15,7 @@
 import crypto from "node:crypto";
 import type { LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import { stableStringify } from "@/common/utils/stableStringify";
-import type { DevToolsPromptPrefix } from "@/common/types/devtools";
-
-interface ToolFingerprint {
-  name: string;
-  description: string;
-  schema: string;
-  options: string;
-}
-
-/** The step record's fields plus per-tool hashes, kept only as the comparison baseline. */
-export interface PromptPrefixFingerprint extends Omit<DevToolsPromptPrefix, "change"> {
-  tools: ToolFingerprint[];
-}
+import type { DevToolsPromptPrefix, DevToolsToolFingerprint } from "@/common/types/devtools";
 
 function hash(value: unknown): string {
   return crypto
@@ -45,8 +35,8 @@ function hasCacheMarker(providerOptions: unknown): boolean {
 
 export function fingerprintPromptPrefix(
   params: Pick<LanguageModelV4CallOptions, "tools" | "prompt">
-): PromptPrefixFingerprint {
-  const tools = (params.tools ?? []).map((tool): ToolFingerprint => {
+): DevToolsPromptPrefix {
+  const tools = (params.tools ?? []).map((tool): DevToolsToolFingerprint => {
     const isFunction = tool.type === "function";
     return {
       name: tool.name,
@@ -64,38 +54,8 @@ export function fingerprintPromptPrefix(
   const tail = systemRows.slice(prefixEnd);
   return {
     toolsHash: hash(tools),
+    tools,
     systemPrefixHash: hash(systemRows.slice(0, prefixEnd)),
     systemTailHash: tail.length > 0 ? hash(tail) : null,
-    tools,
   };
-}
-
-/** Names what changed between two consecutive live requests, in prefix order. */
-export function diffPromptPrefix(
-  previous: PromptPrefixFingerprint,
-  next: PromptPrefixFingerprint
-): string[] {
-  const components: string[] = [];
-  if (previous.toolsHash !== next.toolsHash) {
-    const before = new Map(previous.tools.map((tool) => [tool.name, tool]));
-    const after = new Map(next.tools.map((tool) => [tool.name, tool]));
-    for (const name of after.keys()) if (!before.has(name)) components.push(`tool-added:${name}`);
-    for (const name of before.keys()) if (!after.has(name)) components.push(`tool-removed:${name}`);
-    const shared = (tools: ToolFingerprint[], other: Map<string, ToolFingerprint>) =>
-      tools.filter((tool) => other.has(tool.name)).map((tool) => tool.name);
-    if (shared(previous.tools, after).join("\n") !== shared(next.tools, before).join("\n")) {
-      components.push("tool-order");
-    }
-    for (const tool of next.tools) {
-      const old = before.get(tool.name);
-      if (old == null) continue;
-      if (old.description !== tool.description) components.push(`tool-description:${tool.name}`);
-      if (old.schema !== tool.schema) components.push(`tool-schema:${tool.name}`);
-      // Includes a moved cache marker.
-      if (old.options !== tool.options) components.push(`tool-options:${tool.name}`);
-    }
-  }
-  if (previous.systemPrefixHash !== next.systemPrefixHash) components.push("system-prefix");
-  else if (previous.systemTailHash !== next.systemTailHash) components.push("system-tail-only");
-  return components;
 }

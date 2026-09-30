@@ -1479,7 +1479,7 @@ export class ProviderModelFactory {
         const innerModel = model;
         model = wrapLanguageModel({
           model,
-          middleware: createDevToolsMiddleware(workspaceId, devToolsService, modelString),
+          middleware: createDevToolsMiddleware(workspaceId, devToolsService),
         });
         moveLanguageModelCleanup(innerModel, model);
       }

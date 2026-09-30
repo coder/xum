@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { LanguageModelV4CallOptions, LanguageModelV4FunctionTool } from "@ai-sdk/provider";
-import { diffPromptPrefix, fingerprintPromptPrefix } from "./promptPrefixFingerprint";
+import { fingerprintPromptPrefix } from "./promptPrefixFingerprint";
 
 const cached = { anthropic: { cacheControl: { type: "ephemeral" as const } } };
 type Tools = NonNullable<LanguageModelV4CallOptions["tools"]>;
@@ -19,82 +19,74 @@ const fingerprint = (tools: Tools) =>
     tools,
     prompt: [{ role: "system", content: "Stable", providerOptions: cached }],
   });
+// Which per-tool hashes differ between two fingerprints of the same tools.
+const changedToolFields = (a: Tools, b: Tools) => {
+  const before = new Map(fingerprint(a).tools.map((tool) => [tool.name, tool]));
+  return fingerprint(b).tools.flatMap((tool) =>
+    (["description", "schema", "options"] as const)
+      .filter((field) => before.get(tool.name)?.[field] !== tool[field])
+      .map((field) => `${field}:${tool.name}`)
+  );
+};
 
-describe("diffPromptPrefix (#5254)", () => {
+describe("fingerprintPromptPrefix (#5254)", () => {
   const base = [fn("a"), fn("b"), fn("c", { providerOptions: cached })];
 
-  it.each<{ label: string; next: Tools; components: string[] }>([
-    { label: "nothing", next: base, components: [] },
+  it.each<{ label: string; next: Tools; changed: string[] }>([
     {
-      label: "an added and a removed tool",
-      next: [fn("a"), fn("d"), fn("c", { providerOptions: cached })],
-      components: ["tool-added:d", "tool-removed:b"],
-    },
-    {
-      label: "order only",
-      next: [fn("b"), fn("a"), fn("c", { providerOptions: cached })],
-      components: ["tool-order"],
+      label: "a description",
+      next: [fn("a", { description: "new" }), fn("b"), base[2]],
+      changed: ["description:a"],
     },
     {
       label: "a schema",
       next: [fn("a"), fn("b", { inputSchema: { type: "object", required: ["x"] } }), base[2]],
-      components: ["tool-schema:b"],
+      changed: ["schema:b"],
     },
     {
       label: "a moved cache marker",
       next: [fn("a"), fn("b", { providerOptions: cached }), fn("c")],
-      components: ["tool-options:b", "tool-options:c"],
+      changed: ["options:b", "options:c"],
     },
-    {
-      label: "other provider options",
-      next: [fn("a", { providerOptions: { anthropic: { deferLoading: true } } }), fn("b"), base[2]],
-      components: ["tool-options:a"],
-    },
-    {
-      label: "options changed together with a description",
-      next: [fn("a", { description: "new" }), fn("b", { providerOptions: cached }), fn("c")],
-      components: ["tool-description:a", "tool-options:b", "tool-options:c"],
-    },
-  ])("reports $label", ({ next, components }) => {
-    expect(diffPromptPrefix(fingerprint(base), fingerprint(next))).toEqual(components);
+  ])("changes only the tool hashes for $label", ({ next, changed }) => {
+    expect(fingerprint(next).toolsHash).not.toBe(fingerprint(base).toolsHash);
+    expect(changedToolFields(base, next)).toEqual(changed);
+  });
+
+  it("changes the tool block hash, not the per-tool hashes, on a reorder", () => {
+    const reordered = [base[1], base[0], base[2]];
+    expect(fingerprint(reordered).toolsHash).not.toBe(fingerprint(base).toolsHash);
+    expect(changedToolFields(base, reordered)).toEqual([]);
   });
 
   it("ignores schema key order, which provider caches ignore too (#5252)", () => {
-    const reordered = [
-      fn("a"),
-      fn("b", { inputSchema: { properties: {}, type: "object" } }),
-      base[2],
-    ];
-    const keyed = [fn("a"), fn("b", { inputSchema: { type: "object", properties: {} } }), base[2]];
-    expect(diffPromptPrefix(fingerprint(keyed), fingerprint(reordered))).toEqual([]);
+    const reordered = [fn("b", { inputSchema: { properties: {}, type: "object" } })];
+    const keyed = [fn("b", { inputSchema: { type: "object", properties: {} } })];
+    expect(fingerprint(reordered)).toEqual(fingerprint(keyed));
   });
 
-  it("separates the cached system rows from the uncached tail", () => {
-    const withTail = fingerprintPromptPrefix({
-      tools: base,
-      prompt: [
-        { role: "system", content: "Stable", providerOptions: cached },
-        { role: "system", content: "MCP warning" },
-      ],
-    });
-    expect(diffPromptPrefix(fingerprint(base), withTail)).toEqual(["system-tail-only"]);
-    const changedPrefix = fingerprintPromptPrefix({
-      tools: base,
-      prompt: [{ role: "system", content: "Changed", providerOptions: cached }],
-    });
-    expect(diffPromptPrefix(fingerprint(base), changedPrefix)).toEqual(["system-prefix"]);
-  });
-
-  it("treats OpenAI's explicit system breakpoint as the end of the cached prefix", () => {
-    const openaiCached = { openai: { promptCacheBreakpoint: { mode: "explicit" } } };
+  it.each([
+    ["Anthropic cacheControl", cached],
+    ["OpenAI's explicit breakpoint", { openai: { promptCacheBreakpoint: { mode: "explicit" } } }],
+  ])("ends the cached system prefix at the last row with %s", (_label, marker) => {
     const withTail = (tail: string) =>
       fingerprintPromptPrefix({
         tools: base,
         prompt: [
-          { role: "system", content: "Stable", providerOptions: openaiCached },
+          { role: "system", content: "Stable", providerOptions: marker },
           { role: "system", content: tail },
+          { role: "user", content: [{ type: "text", text: "Hi" }] },
         ],
       });
-    expect(diffPromptPrefix(withTail("one"), withTail("two"))).toEqual(["system-tail-only"]);
+    expect(withTail("one").systemPrefixHash).toBe(withTail("two").systemPrefixHash);
+    expect(withTail("one").systemTailHash).not.toBe(withTail("two").systemTailHash);
+  });
+
+  it("has no tail when no system row is marked", () => {
+    const unmarked = fingerprintPromptPrefix({
+      tools: base,
+      prompt: [{ role: "system", content: "Stable" }],
+    });
+    expect(unmarked.systemTailHash).toBeNull();
   });
 });

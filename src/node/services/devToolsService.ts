@@ -7,17 +7,12 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type {
   DevToolsEvent,
   DevToolsLogEntry,
-  DevToolsPromptPrefix,
   DevToolsRun,
   DevToolsRunSummary,
   DevToolsStep,
 } from "@/common/types/devtools";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
-import {
-  diffPromptPrefix,
-  type PromptPrefixFingerprint,
-} from "@/node/services/promptPrefixFingerprint";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
@@ -266,29 +261,7 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
   };
 }
 
-/** Classifies prompt-prefix changes (#5254); never persisted. */
-export interface PromptPrefixRequestContext {
-  agentId: string;
-  /** A user-facing turn (not compaction): compared with, and moves, the baseline. */
-  liveTurn: boolean;
-}
-
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">> & {
-  /**
-   * Kept after createRun consumes the run fields, so refusal-fallback hops
-   * (new runs under the same metadata ID) are classified too. Cleared with the
-   * entry when the request ends (clearPendingRunMetadata).
-   */
-  promptPrefixContext?: PromptPrefixRequestContext;
-};
-
-/** A step's fingerprint plus the identity of the attempt that produced it. */
-export interface PromptPrefixObservation {
-  fingerprint: PromptPrefixFingerprint;
-  /** The attempt's selected model string (route identity, not the bare SDK id). */
-  modelString: string;
-  runMetadataId?: string;
-}
+type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -302,15 +275,6 @@ export class DevToolsService extends EventEmitter {
    * one pending metadata payload per request instead of a single workspace slot.
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
-  /**
-   * The previous live request's prompt prefix per workspace (#5254), in memory
-   * only: after a restart or re-enable the first request sets a new baseline.
-   * Dropped with the workspace's devtools data (clear, remove, archive).
-   */
-  private readonly promptPrefixBaselines = new Map<
-    string,
-    { fingerprint: PromptPrefixFingerprint; modelString: string; agentId: string }
-  >();
   private readonly maxRetainedBytesPerWorkspace: number;
 
   constructor(
@@ -410,13 +374,8 @@ export class DevToolsService extends EventEmitter {
     if (byWorkspace && normalizedMetadataId != null && normalizedMetadataId.length > 0) {
       const pendingMetadata = byWorkspace.get(normalizedMetadataId);
       if (pendingMetadata != null) {
-        const { promptPrefixContext, ...runMetadata } = pendingMetadata;
-        Object.assign(run, runMetadata);
-        if (promptPrefixContext != null) {
-          byWorkspace.set(normalizedMetadataId, { promptPrefixContext });
-        } else {
-          byWorkspace.delete(normalizedMetadataId);
-        }
+        Object.assign(run, pendingMetadata);
+        byWorkspace.delete(normalizedMetadataId);
       }
 
       if (byWorkspace.size === 0) {
@@ -436,11 +395,7 @@ export class DevToolsService extends EventEmitter {
     this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
 
-  async createStep(
-    workspaceId: string,
-    step: DevToolsStep,
-    promptPrefix?: PromptPrefixObservation
-  ): Promise<void> {
+  async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
     if (!this.enabled) {
       return;
     }
@@ -450,25 +405,7 @@ export class DevToolsService extends EventEmitter {
 
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
-    // Compared and made the baseline in the same synchronous section that
-    // queues this step's append, so baselines follow devtools.jsonl order.
-    // rollback() runs only if the append fails.
-    const prefix =
-      promptPrefix != null ? this.comparePromptPrefix(workspaceId, promptPrefix) : null;
-    if (prefix != null) step.promptPrefix = prefix.recorded;
-    try {
-      await this.persistStep(workspaceId, data, step);
-    } catch (error) {
-      prefix?.rollback();
-      throw error;
-    }
-  }
 
-  private async persistStep(
-    workspaceId: string,
-    data: WorkspaceData,
-    step: DevToolsStep
-  ): Promise<void> {
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
 
@@ -536,53 +473,6 @@ export class DevToolsService extends EventEmitter {
     }
     this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
     this.emitRunEventIfRetained(workspaceId, data, "run-updated", step.runId);
-  }
-
-  /** Compares a live turn's prefix with the workspace's previous live request (#5254). */
-  private comparePromptPrefix(
-    workspaceId: string,
-    observation: PromptPrefixObservation
-  ): { recorded: DevToolsPromptPrefix; rollback: () => void } {
-    const { tools: _tools, ...recorded } = observation.fingerprint;
-    const context =
-      observation.runMetadataId == null
-        ? undefined
-        : this.pendingRunMetadata.get(workspaceId)?.get(observation.runMetadataId)
-            ?.promptPrefixContext;
-    // Compaction and background calls have their own prompts; they neither
-    // compare nor move the live baseline.
-    if (context?.liveTurn !== true) return { recorded, rollback: () => undefined };
-    const previous = this.promptPrefixBaselines.get(workspaceId);
-    const baseline = {
-      fingerprint: observation.fingerprint,
-      modelString: observation.modelString,
-      agentId: context.agentId,
-    };
-    this.promptPrefixBaselines.set(workspaceId, baseline);
-    // Restores the old baseline unless something replaced or cleared ours since.
-    const rollback = () => {
-      if (this.promptPrefixBaselines.get(workspaceId) !== baseline) return;
-      if (previous == null) this.promptPrefixBaselines.delete(workspaceId);
-      else this.promptPrefixBaselines.set(workspaceId, previous);
-    };
-    const components =
-      previous == null ? [] : diffPromptPrefix(previous.fingerprint, observation.fingerprint);
-    if (previous == null || components.length === 0) return { recorded, rollback };
-    const expected =
-      previous.modelString !== observation.modelString
-        ? "model-switch"
-        : previous.agentId !== context.agentId
-          ? "agent-switch"
-          : undefined;
-    return {
-      recorded: { ...recorded, change: { components, ...(expected != null ? { expected } : {}) } },
-      rollback,
-    };
-  }
-
-  /** Called when API debug logging is toggled: a gap in logging voids every baseline. */
-  resetPromptPrefixBaselines(): void {
-    this.promptPrefixBaselines.clear();
   }
 
   async updateStep(
@@ -726,7 +616,6 @@ export class DevToolsService extends EventEmitter {
     data.loaded = true;
     data.replayComplete = true;
     this.pendingRunMetadata.delete(workspaceId);
-    this.promptPrefixBaselines.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
     await this.enqueueWrite(workspaceId, () =>
@@ -764,7 +653,6 @@ export class DevToolsService extends EventEmitter {
     // appends no-ops via the workspace guard in appendToFile.
     this.workspaces.delete(workspaceId);
     this.pendingRunMetadata.delete(workspaceId);
-    this.promptPrefixBaselines.delete(workspaceId);
 
     // Enqueue the deletion so it serializes behind any pending appends.
     await this.enqueueWrite(workspaceId, async () => {

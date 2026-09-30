@@ -3322,9 +3322,6 @@ export class TurnRequestBuilder {
           // Join key for the replay verifier: re-anchors this recorded run to
           // its turn-envelope row and assistant message (see DevToolsRun).
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-          // Prompt-prefix change attribution (#5254): compaction requests carry
-          // their own prompt and must not move the live-turn baseline.
-          promptPrefixContext: { agentId: effectiveAgentId, liveTurn: !isCompactionRequest },
         });
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,
