@@ -5194,6 +5194,12 @@ describe("WorkspaceStore", () => {
       mockHistoryLoadMore.mockResolvedValueOnce(page());
       expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
       expect(initRow()).toMatchObject({ status: "success" });
+
+      // A transcript refresh drops the paged rows below the floor: the card hides again.
+      const aggregator = store.getAggregator(workspaceId)!;
+      expect(aggregator.discardMessagesBelowSequence(100)).toBeGreaterThan(0);
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.some((message) => message.type === "workspace-init")).toBe(false);
     });
 
     it("pages a windowed replay back to the start through the real backend, falling back once when not pageable", async () => {

@@ -1543,6 +1543,8 @@ export class StreamingMessageAggregator {
       }
     }
     if (removed > 0) {
+      // Rows below a seeded window's floor are gone again, so the epoch start is unloaded (#4961).
+      if (this.windowSeed !== null) this.windowMissesEpochStart = true;
       // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
       this.historyEpoch++;
       this.invalidateCache();
