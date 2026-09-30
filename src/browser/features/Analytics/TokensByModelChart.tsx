@@ -60,9 +60,11 @@ function TokensByModelTooltipContent(props: {
   return (
     <div
       className="bg-background-secondary border-border-medium rounded-md border p-2 text-xs"
-      style={{ minWidth: 200 }}
+      // Axis labels truncate long model IDs, so the tooltip is where the full name shows. Cap the
+      // width and wrap the name so recharts can keep the tooltip inside the chart on phones.
+      style={{ minWidth: 200, maxWidth: 260 }}
     >
-      <div className="text-foreground mb-1 font-medium">{row.model}</div>
+      <div className="text-foreground mb-1 font-medium break-all">{row.model}</div>
       <div className="text-muted flex items-center justify-between gap-4">
         <span>Input</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.inputTokens)}</span>
