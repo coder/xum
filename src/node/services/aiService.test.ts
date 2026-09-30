@@ -1034,7 +1034,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     return result;
@@ -1772,7 +1771,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
 
     expect(result.success).toBe(true);
@@ -1812,7 +1810,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true },
       });
       expect(result.success).toBe(true);
     }
@@ -2711,6 +2708,25 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   });
 
   it.each([
+    { advisorModelString: KNOWN_MODELS.SONNET.id, expectAdvisor: true },
+    { advisorModelString: "", expectAdvisor: false },
+  ])("exposes the advisor tool only when an advisor model is configured: %j", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-advisor-model-gate");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-advisor-model-gate";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    await enableAdvisorForHarness(harness, testCase.advisorModelString);
+    await startAdvisorStream(harness, workspaceId);
+    expect(getToolConfigFromHarness(harness).advisorRuntime !== undefined).toBe(
+      testCase.expectAdvisor
+    );
+  });
+
+  it.each([
     { advisorReasoningMode: "pro", parentMode: "standard" },
     { advisorReasoningMode: "standard", parentMode: "pro" },
     { advisorReasoningMode: undefined, parentMode: "pro" },
@@ -2734,7 +2750,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.6",
       thinkingLevel: "max",
       reasoningMode: testCase.parentMode,
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
@@ -3395,7 +3410,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true, memory: true },
+      experiments: { memory: true },
     });
     expect(result.success).toBe(true);
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -3484,7 +3499,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true, memory: true },
+        experiments: { memory: true },
       });
 
       expect(result.success).toBe(true);

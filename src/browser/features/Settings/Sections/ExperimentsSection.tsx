@@ -24,7 +24,6 @@ import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
-import { AdvisorToolExperimentConfig } from "./AdvisorToolExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 import { HeartbeatDefaultsControls } from "./HeartbeatSection";
 
@@ -670,7 +669,7 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
 
 // Renders a parent experiment's sub-experiment toggles as a nested list.
 // Extracted so the nested-config call sites mirror their siblings
-// (AdvisorToolExperimentConfig, HeartbeatDefaultsControls) instead of
+// (AutoModelRoutingExperimentConfig, HeartbeatDefaultsControls) instead of
 // inlining the map in the section render.
 function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
   return (
@@ -693,7 +692,6 @@ function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
 export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
@@ -788,9 +786,6 @@ export function ExperimentsSection() {
                     : undefined
                 }
               />
-              {exp.id === EXPERIMENT_IDS.ADVISOR_TOOL && advisorToolEnabled && (
-                <AdvisorToolExperimentConfig />
-              )}
               {exp.id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && autoModelRoutingEnabled && (
                 <AutoModelRoutingExperimentConfig />
               )}

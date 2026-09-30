@@ -1484,10 +1484,6 @@ export class TurnRequestBuilder {
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
-    const advisorExperimentEnabled =
-      experiments?.advisorTool ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) ===
-        true;
     const dynamicWorkflowsExperimentEnabled =
       experiments?.dynamicWorkflows ??
       this.dependencies.experimentsService?.isExperimentEnabled(
@@ -1555,7 +1551,6 @@ export class TurnRequestBuilder {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
-      isAdvisorExperimentEnabled: advisorExperimentEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
       agentDefinitionCache,
     });
@@ -1610,8 +1605,7 @@ export class TurnRequestBuilder {
       cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
-    const advisorToolEligible =
-      advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
+    const advisorToolEligible = agentAdvisorEnabled && advisorModelString.length > 0;
 
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -2029,7 +2023,7 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
+    if (agentAdvisorEnabled && advisorModelString.length === 0) {
       workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
         effectiveAgentId,
       });
