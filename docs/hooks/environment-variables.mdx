@@ -7,14 +7,15 @@ The following environment variables are available in all agent bash tool executi
 
 ## Available Variables
 
-| Variable             | Description                                                                                                                   |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `XUM_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces. |
-| `XUM_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                 |
-| `XUM_WORKSPACE_NAME` | Name of the workspace (typically the branch name)                                                                             |
-| `XUM_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                               |
-| `XUM_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                         |
-| `XUM_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                               |
+| Variable             | Description                                                                                                                                               |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces.                             |
+| `XUM_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                                             |
+| `XUM_WORKSPACE_NAME` | Name of the workspace (typically the branch name)                                                                                                         |
+| `XUM_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                                                           |
+| `XUM_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                                                     |
+| `XUM_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                                                           |
+| `XUM_SCRATCH_DIR`    | Local and worktree workspaces only: a durable scratch folder for files that do not belong in the repo. Deleted with the workspace. Not set in init hooks. |
 
 Matching `MUX_*` names remain accepted aliases. When both are set, the `XUM_*` value wins. See [Mux compatibility](/reference/mux-compatibility).
 

@@ -11,6 +11,7 @@ import {
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
+import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -2166,11 +2167,17 @@ export class TurnRequestBuilder {
       this.dependencies.providerService.getConfig()
     );
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // Only local/worktree commands run on this host, where the session dir lives.
+    const scratchDir =
+      runtimeType === "local" || runtimeType === "worktree"
+        ? await ensureWorkspaceScratchDir(this.dependencies.config.sessionsDir, workspaceId)
+        : undefined;
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
       thinkingLevel: thinkingLevel ?? "off",
       costsUsd: sessionCostsUsd,
+      scratchDir,
     });
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
