@@ -697,9 +697,9 @@ export function buildSystemMessageFromSources(
     systemMessage += buildMCPContext(mcpServers);
   }
 
-  // NOTE: Agent skills and available sub-agents are now injected into their respective
-  // tool descriptions (agent_skill_read, task) for better model attention per Anthropic
-  // best practices. See tools.ts ToolConfiguration.availableSkills/availableSubagents.
+  // NOTE: Agent skills and available sub-agents travel in the durable context listing
+  // row (contextListing.ts), not here or in tool descriptions, so edits never rewrite
+  // the cached prompt prefix.
 
   // Xum-dedicated per-file contents (<dir>/.xum/AGENTS.md context files, then
   // native ~/.xum global files). Claude compatibility instructions are shared.

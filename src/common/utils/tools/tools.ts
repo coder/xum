@@ -101,8 +101,6 @@ import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
-import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { ModelMessage } from "@/common/types/message";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
@@ -346,10 +344,6 @@ export interface ToolConfiguration {
    * experiment gates alone.
    */
   contextBudgetRolloverAvailable?: boolean;
-  /** Available sub-agents for the task tool description (dynamic context) */
-  availableSubagents?: AgentDefinitionDescriptor[];
-  /** Available skills for the agent_skill_read tool description (dynamic context) */
-  availableSkills?: AgentSkillDescriptor[];
   /** Whether the project is trusted for hook/script execution */
   trusted?: boolean;
   /** Analytics service for raw SQL queries against DuckDB analytics data */

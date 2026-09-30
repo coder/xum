@@ -3706,8 +3706,7 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
     description:
       "Fetch a prompt template from a connected MCP server, expanded with the given arguments. " +
       "MCP prompts are reusable instructions or workflows the user has made available through MCP servers. " +
-      "The result contains the prompt text; follow it as task guidance in the current conversation. " +
-      "Available prompts are listed in this description when connected servers advertise them.",
+      "The result contains the prompt text; follow it as task guidance in the current conversation.",
     schema: z
       .object({
         name: z

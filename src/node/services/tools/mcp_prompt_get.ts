@@ -5,6 +5,7 @@ import type { MCPPromptGetToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
+import { contextListingPointer } from "@/node/services/contextListing";
 
 // Same disclosure budget as the skills index in agent_skill_read.
 const MAX_PROMPTS = 50;
@@ -92,10 +93,17 @@ function formatArgumentHint(descriptor: MCPPromptDescriptor): string {
  * discovers prompts adjacent to the tool call schema (same mechanic as
  * agent_skill_read's skill index).
  */
-function buildMcpPromptGetDescription(prompts: MCPPromptDescriptor[]): string {
-  const baseDescription = TOOL_DEFINITIONS.mcp_prompt_get.description;
+/**
+ * Static mcp_prompt_get description. Server connects and disconnects change the
+ * advertised prompts, so the prompt index travels in the durable context
+ * listing row (prompt-cache stability, #5248); see formatMcpPromptIndexSection.
+ */
+const MCP_PROMPT_GET_DESCRIPTION = `${TOOL_DEFINITIONS.mcp_prompt_get.description}\n\n${contextListingPointer("Available MCP prompts")}`;
+
+/** Render the MCP prompt section of the context listing ("" when none are advertised). */
+export function formatMcpPromptIndexSection(prompts: readonly MCPPromptDescriptor[]): string {
   if (prompts.length === 0) {
-    return baseDescription;
+    return "";
   }
 
   const promptLines: string[] = [];
@@ -140,7 +148,7 @@ function buildMcpPromptGetDescription(prompts: MCPPromptDescriptor[]): string {
     );
   }
 
-  return `${baseDescription}\n\nAvailable MCP prompts:\n${promptLines.join("\n")}`;
+  return promptLines.join("\n");
 }
 
 /**
@@ -153,7 +161,7 @@ export const createMcpPromptGetTool: ToolFactory = (config: ToolConfiguration) =
   const prompts = runtime?.prompts ?? [];
 
   return tool({
-    description: buildMcpPromptGetDescription(prompts),
+    description: MCP_PROMPT_GET_DESCRIPTION,
     inputSchema: TOOL_DEFINITIONS.mcp_prompt_get.schema,
     execute: async (
       { name, arguments: args, list_offset: listOffset },

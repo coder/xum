@@ -1,5 +1,6 @@
 import { tool } from "ai";
 
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -7,21 +8,26 @@ import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { contextListingPointer } from "@/node/services/contextListing";
+
+const SKILL_READ_FILE_HINT = `To read referenced files inside a skill directory:\n- agent_skill_read_file({ name: "<skill-name>", filePath: "references/whatever.txt" })`;
 
 /**
- * Build dynamic agent_skill_read tool description with available skills.
- * Injects the list of available skills directly into the tool description
- * so the model sees them adjacent to the tool call schema.
+ * Static agent_skill_read description. Skills can be added or edited during a
+ * workspace's life, so the skill index travels in the durable context listing
+ * row (prompt-cache stability, #5248); see formatSkillIndexSection.
  */
-function buildSkillReadDescription(config: ToolConfiguration): string {
-  const baseDescription = TOOL_DEFINITIONS.agent_skill_read.description;
+const SKILL_READ_DESCRIPTION = `${TOOL_DEFINITIONS.agent_skill_read.description}\n\n${contextListingPointer("Available skills")}\n${SKILL_READ_FILE_HINT}`;
+
+/** Render the skill index section of the context listing ("" when none are advertised). */
+export function formatSkillIndexSection(availableSkills: readonly AgentSkillDescriptor[]): string {
   // Filter out unadvertised skills (advertise: false or disable-model-invocation: true,
-  // normalized into descriptor.advertise) from the tool description.
-  // Unadvertised skills can still be invoked via /skill-name or agent_skill_read.
-  const skills = (config.availableSkills ?? []).filter((s) => s.advertise !== false);
+  // normalized into descriptor.advertise). Unadvertised skills can still be invoked
+  // via /skill-name or agent_skill_read.
+  const skills = availableSkills.filter((s) => s.advertise !== false);
 
   if (skills.length === 0) {
-    return baseDescription;
+    return "";
   }
 
   const MAX_SKILLS = 50;
@@ -37,10 +43,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
   if (omitted > 0) {
     skillLines.push(`(+${omitted} more not shown)`);
   }
-
-  const usageHint = `\nTo read referenced files inside a skill directory:\n- agent_skill_read_file({ name: "<skill-name>", filePath: "references/whatever.txt" })`;
-
-  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}${usageHint}`;
+  return skillLines.join("\n");
 }
 
 /**
@@ -49,7 +52,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
  */
 export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
-    description: buildSkillReadDescription(config),
+    description: SKILL_READ_DESCRIPTION,
     inputSchema: TOOL_DEFINITIONS.agent_skill_read.schema,
     execute: async ({ name }): Promise<AgentSkillReadToolResult> => {
       const workspacePath = config.cwd;

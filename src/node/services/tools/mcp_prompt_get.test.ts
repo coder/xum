@@ -5,7 +5,7 @@ import type { Tool } from "ai";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { MCPPromptGetToolResult } from "@/common/types/tools";
 import type { MCPPromptRuntime } from "@/common/utils/tools/tools";
-import { createMcpPromptGetTool } from "./mcp_prompt_get";
+import { createMcpPromptGetTool, formatMcpPromptIndexSection } from "./mcp_prompt_get";
 import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 
 const REVIEW_PROMPT: MCPPromptDescriptor = {
@@ -32,6 +32,11 @@ function createTool(runtime: MCPPromptRuntime): Tool {
   return createMcpPromptGetTool({ ...config, mcpPromptRuntime: runtime });
 }
 
+/** The prompt index travels in the context listing row, not the description (#5248). */
+function promptIndex(runtime: MCPPromptRuntime): string {
+  return formatMcpPromptIndexSection(runtime.prompts);
+}
+
 async function execute(
   tool: Tool,
   args: { name: string; arguments?: Record<string, string>; list_offset?: number }
@@ -40,17 +45,17 @@ async function execute(
 }
 
 describe("createMcpPromptGetTool", () => {
-  it("advertises prompts with argument hints in the description", () => {
-    const tool = createTool({
+  it("advertises prompts with argument hints in the prompt index", () => {
+    const listing = promptIndex({
       prompts: [REVIEW_PROMPT, STATUS_PROMPT],
       getPrompt: mock(() => Promise.resolve({ text: "" })),
     });
 
-    expect(tool.description).toContain("mcp__coder__review");
-    expect(tool.description).toContain("pr: PR number");
-    expect(tool.description).toContain("focus?");
-    expect(tool.description).toContain("Review a pull request");
-    expect(tool.description).toContain("mcp__coder__status");
+    expect(listing).toContain("mcp__coder__review");
+    expect(listing).toContain("pr: PR number");
+    expect(listing).toContain("focus?");
+    expect(listing).toContain("Review a pull request");
+    expect(listing).toContain("mcp__coder__status");
   });
 
   it("keeps prompts past the full-entry cap discoverable via a names-only tail", () => {
@@ -60,26 +65,26 @@ describe("createMcpPromptGetTool", () => {
       stableKey: `mcp__coder__p${index}__hash`,
       promptName: `p${index}`,
     }));
-    const tool = createTool({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
+    const listing = promptIndex({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
 
-    expect(tool.description).toContain("mcp__coder__p49");
-    expect(tool.description).not.toContain("mcp__coder__p50:");
-    expect(tool.description).toContain("names only:");
+    expect(listing).toContain("mcp__coder__p49");
+    expect(listing).not.toContain("mcp__coder__p50:");
+    expect(listing).toContain("names only:");
     for (let index = 50; index < 60; index++) {
-      expect(tool.description).toContain(`mcp__coder__p${index}`);
+      expect(listing).toContain(`mcp__coder__p${index}`);
     }
-    expect(tool.description).not.toContain("more not shown");
+    expect(listing).not.toContain("more not shown");
   });
 
   it("clamps unbounded server names so they cannot evict their prompts from the index", () => {
-    const tool = createTool({
+    const listing = promptIndex({
       prompts: [{ ...REVIEW_PROMPT, serverName: "s".repeat(50_000) }],
       getPrompt: mock(() => Promise.resolve({ text: "" })),
     });
 
-    expect(tool.description).toContain("Review a pull request");
-    expect(tool.description).not.toContain("names only:");
-    expect(tool.description!.length).toBeLessThan(15_000);
+    expect(listing).toContain("Review a pull request");
+    expect(listing).not.toContain("names only:");
+    expect(listing.length).toBeLessThan(15_000);
   });
 
   it("builds argument hints incrementally instead of materializing huge argument arrays", () => {
@@ -95,17 +100,17 @@ describe("createMcpPromptGetTool", () => {
         },
       }
     );
-    const tool = createTool({
+    const listing = promptIndex({
       prompts: [{ ...STATUS_PROMPT, arguments: hugeArguments }],
       getPrompt: mock(() => Promise.resolve({ text: "" })),
     });
 
-    expect(tool.description!.length).toBeLessThan(2_000);
+    expect(listing.length).toBeLessThan(2_000);
     expect(elementReads).toBeLessThan(100);
   });
 
   it("clamps server-supplied prompt and argument descriptions", () => {
-    const tool = createTool({
+    const listing = promptIndex({
       prompts: [
         {
           ...STATUS_PROMPT,
@@ -116,10 +121,10 @@ describe("createMcpPromptGetTool", () => {
       getPrompt: mock(() => Promise.resolve({ text: "" })),
     });
 
-    expect(tool.description!.length).toBeLessThan(2_000);
-    expect(tool.description).toContain("d".repeat(100));
-    expect(tool.description).not.toContain("d".repeat(300));
-    expect(tool.description).not.toContain("a".repeat(300));
+    expect(listing.length).toBeLessThan(2_000);
+    expect(listing).toContain("d".repeat(100));
+    expect(listing).not.toContain("d".repeat(300));
+    expect(listing).not.toContain("a".repeat(300));
   });
 
   it("moves prompts past the total index budget into the names-only tail", () => {
@@ -133,11 +138,11 @@ describe("createMcpPromptGetTool", () => {
       description: "x".repeat(600),
       arguments: [{ name: "arg", description: "y".repeat(600), required: true }],
     }));
-    const tool = createTool({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
+    const listing = promptIndex({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
 
-    expect(tool.description!.length).toBeLessThan(15_000);
-    expect(tool.description).toContain("names only:");
-    expect(tool.description).toContain("mcp__coder__q29");
+    expect(listing.length).toBeLessThan(15_000);
+    expect(listing).toContain("names only:");
+    expect(listing).toContain("mcp__coder__q29");
   });
 
   it("bounds the names-only tail and reports the truly omitted count", () => {
@@ -147,11 +152,11 @@ describe("createMcpPromptGetTool", () => {
       stableKey: `mcp__coder__long_prompt_name_${index}__hash`,
       promptName: `long_prompt_name_${index}`,
     }));
-    const tool = createTool({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
+    const listing = promptIndex({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
 
-    expect(tool.description!.length).toBeLessThan(20_000);
-    expect(tool.description).toMatch(/\(\+\d+ more not shown; call this tool/);
-    const tail = /\(more prompts, names only: ([^)]+)\)/.exec(tool.description as string);
+    expect(listing.length).toBeLessThan(20_000);
+    expect(listing).toMatch(/\(\+\d+ more not shown; call this tool/);
+    const tail = /\(more prompts, names only: ([^)]+)\)/.exec(listing);
     expect(tail).not.toBeNull();
     for (const key of tail![1].split(", ")) {
       expect(key).toMatch(/^mcp__coder__long_prompt_name_\d+$/);
@@ -220,8 +225,9 @@ describe("createMcpPromptGetTool", () => {
       stableKey: `mcp__coder__long_prompt_name_${index}__hash`,
       promptName: `long_prompt_name_${index}`,
     }));
-    const tool = createTool({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
-    expect(tool.description).not.toContain("mcp__coder__long_prompt_name_399");
+    const runtime = { prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) };
+    const tool = createTool(runtime);
+    expect(promptIndex(runtime)).not.toContain("mcp__coder__long_prompt_name_399");
 
     const result = await execute(tool, { name: "?" });
 
@@ -340,7 +346,7 @@ describe("createMcpPromptGetTool", () => {
     expect(result).toEqual({ success: false, error: "server exploded" });
   });
 
-  it("builds the tool description without scanning a huge catalog", () => {
+  it("builds the prompt index without scanning a huge catalog", () => {
     let keyReads = 0;
     const prompts = Array.from({ length: 100_000 }, (_, index) => {
       const descriptor = {
@@ -357,10 +363,10 @@ describe("createMcpPromptGetTool", () => {
       return descriptor;
     });
 
-    const tool = createTool({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
+    const listing = promptIndex({ prompts, getPrompt: mock(() => Promise.resolve({ text: "" })) });
 
-    expect(tool.description).toMatch(/\(\+\d+ more not shown; call this tool/);
-    // Description construction must stop reading keys after both display
+    expect(listing).toMatch(/\(\+\d+ more not shown; call this tool/);
+    // Index construction must stop reading keys after both display
     // budgets are exhausted.
     expect(keyReads).toBeLessThanOrEqual(500);
   });

@@ -7,7 +7,7 @@ import type { ToolExecutionOptions } from "ai";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { createAgentSkillReadTool } from "./agent_skill_read";
+import { createAgentSkillReadTool, formatSkillIndexSection } from "./agent_skill_read";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -387,31 +387,20 @@ describe("agent_skill_read", () => {
     }
   });
 
-  it("appends whenToUse guidance only for skills that carry it in the description index", () => {
-    using tempDir = new TestTempDir("test-agent-skill-read-when-to-use");
-    const baseConfig = createTestToolConfig(tempDir.path);
-
-    const tool = createAgentSkillReadTool({
-      ...baseConfig,
-      availableSkills: [
-        {
-          name: "with-guidance",
-          description: "Skill carrying extra guidance",
-          scope: "global",
-          whenToUse: "only when triaging incoming issues",
-        },
-        {
-          name: "without-guidance",
-          description: "Skill without extra guidance",
-          scope: "global",
-        },
-      ],
-    });
-
-    // The ai SDK types `description` as string | dynamic-function; the factory always
-    // builds a static string.
-    const description = typeof tool.description === "string" ? tool.description : "";
-    const lines = description.split("\n");
+  it("appends whenToUse guidance only for skills that carry it in the skill index", () => {
+    const lines = formatSkillIndexSection([
+      {
+        name: "with-guidance",
+        description: "Skill carrying extra guidance",
+        scope: "global",
+        whenToUse: "only when triaging incoming issues",
+      },
+      {
+        name: "without-guidance",
+        description: "Skill without extra guidance",
+        scope: "global",
+      },
+    ]).split("\n");
     const withLine = lines.find((line) => line.startsWith("- with-guidance:"));
     const withoutLine = lines.find((line) => line.startsWith("- without-guidance:"));
 

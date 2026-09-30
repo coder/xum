@@ -1258,7 +1258,7 @@ export class AgentPluginInstallService {
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
-      // (both interpolate into the agent_skill_read tool description on each
+      // (both interpolate into the context listing skill index on each
       // request), and advertise (a flip from hidden to visible surfaces a
       // previously invisible skill). Changing any of them is re-consent
       // territory, same as adding a skill. The fingerprint stays JSON (field
@@ -1552,7 +1552,7 @@ export class AgentPluginInstallService {
 
   /**
    * Preview skill rows enriched with the remaining MODEL-VISIBLE frontmatter:
-   * whenToUse interpolates into the agent_skill_read tool description and
+   * whenToUse interpolates into the context listing skill index and
    * advertise gates that visibility entirely, so the update capability
    * fingerprint must cover them (the oRPC preview schema strips the extras).
    */
@@ -1637,7 +1637,7 @@ export class AgentPluginInstallService {
             ? { description: parsed.frontmatter.description }
             : {}),
           // Model-visible beyond name/description: whenToUse interpolates
-          // into the agent_skill_read tool description, and advertise
+          // into the context listing skill index, and advertise
           // controls whether the skill appears there at all. Both feed the
           // update capability fingerprint (capabilitySurface), resolved with
           // the same helpers the runtime uses.

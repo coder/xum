@@ -26,8 +26,7 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
-import { createTaskTool } from "./tools/task";
-import { createTestToolConfig } from "./tools/testHelpers";
+import { formatSubagentIndexSection } from "./tools/task";
 import { isContextListingMessage } from "./contextListing";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
@@ -4416,18 +4415,8 @@ describe("discoverAvailableSubagentsForToolContext", () => {
     expect(custom).toBeDefined();
     expect(custom?.subagentRunnable).toBe(true);
 
-    // Ensure the task tool description includes the derived agent in the runnable sub-agent list.
-    const taskTool = createTaskTool({
-      ...createTestToolConfig(project.path, { workspaceId: "test-workspace" }),
-      availableSubagents,
-    });
-
-    const description = (taskTool as unknown as { description?: unknown }).description;
-    expect(typeof description).toBe("string");
-    if (typeof description === "string") {
-      expect(description).toContain("Available sub-agents");
-      expect(description).toContain("- custom");
-    }
+    // The derived agent lands in the context listing's runnable sub-agent list.
+    expect(formatSubagentIndexSection(availableSubagents).split("\n")).toContain("- custom");
   });
 
   it("filters the desktop agent when capability is unavailable", async () => {

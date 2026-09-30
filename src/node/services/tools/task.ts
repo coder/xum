@@ -15,7 +15,9 @@ import {
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeMode,
 } from "@/common/types/runtime";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { TaskCreatedEvent } from "@/common/types/stream";
+import { contextListingPointer } from "@/node/services/contextListing";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
@@ -85,26 +87,27 @@ function supportsSharedIsolation(config: ToolConfiguration): boolean {
 }
 
 /**
- * Build dynamic task tool description with runtime-specific workspace visibility
- * guidance and the currently available sub-agents.
+ * Task tool description with runtime-specific workspace visibility guidance.
+ * Agent definitions can change during a workspace's life, so the runnable
+ * sub-agent list travels in the durable context listing row (prompt-cache
+ * stability, #5248); see formatSubagentIndexSection.
  */
 function buildTaskDescription(config: ToolConfiguration): string {
   const runtimeMode = resolveRuntimeMode(config);
   const baseDescription = buildTaskToolDescription(runtimeMode, {
     sharedIsolation: supportsSharedIsolation(config),
   });
-  const subagents = config.availableSubagents?.filter((a) => a.subagentRunnable) ?? [];
+  return `${baseDescription}\n\n${contextListingPointer("Available sub-agents (use the `agentId` parameter)")}`;
+}
 
-  if (subagents.length === 0) {
-    return baseDescription;
-  }
-
-  const subagentLines = subagents.map((agent) => {
-    const desc = agent.description ? `: ${agent.description}` : "";
-    return `- ${agent.id}${desc}`;
-  });
-
-  return `${baseDescription}\n\nAvailable sub-agents (use \`agentId\` parameter):\n${subagentLines.join("\n")}`;
+/** Render the sub-agent section of the context listing ("" when none are runnable). */
+export function formatSubagentIndexSection(
+  availableSubagents: readonly AgentDefinitionDescriptor[]
+): string {
+  return availableSubagents
+    .filter((agent) => agent.subagentRunnable)
+    .map((agent) => `- ${agent.id}${agent.description ? `: ${agent.description}` : ""}`)
+    .join("\n");
 }
 
 function buildParentRuntimeAiSettings(

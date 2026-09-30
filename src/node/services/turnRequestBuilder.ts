@@ -137,6 +137,9 @@ import {
   resolveMemoryAccessPolicy,
   resolveMemoryScopes,
 } from "@/node/services/tools/memory";
+import { formatSkillIndexSection } from "@/node/services/tools/agent_skill_read";
+import { formatSubagentIndexSection } from "@/node/services/tools/task";
+import { formatMcpPromptIndexSection } from "@/node/services/tools/mcp_prompt_get";
 import { buildContextListingMessages } from "@/node/services/contextListing";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
@@ -2589,9 +2592,6 @@ export class TurnRequestBuilder {
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
         agentPlugins: agentPluginsExperimentEnabled,
       },
-      // Dynamic context for tool descriptions (moved from system prompt for better model attention)
-      availableSubagents: agentDefinitions,
-      availableSkills,
       mcpPromptRuntime,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
       trusted: sharedExecutionTrusted,
@@ -2997,7 +2997,12 @@ export class TurnRequestBuilder {
       !isCompactionRequest &&
       providerRequestMessages.at(-1)?.role === "user"
     ) {
-      const memoryAllowed = applyToolPolicyToNames(["memory"], effectiveToolPolicy).length === 1;
+      const [memoryAllowed, skillsAllowed, taskAllowed, promptsAllowed] = [
+        "memory",
+        "agent_skill_read",
+        "task",
+        "mcp_prompt_get",
+      ].map((name) => applyToolPolicyToNames([name], effectiveToolPolicy).length === 1);
       const listingRows = buildContextListingMessages(providerRequestMessages, [
         {
           key: "memory",
@@ -3009,6 +3014,24 @@ export class TurnRequestBuilder {
                   resolveMemoryScopes(tokenBudgetEnabled)
                 )
               : "",
+        },
+        {
+          key: "skills",
+          title: "Available skills",
+          body: skillsAllowed ? formatSkillIndexSection(availableSkills ?? []) : "",
+        },
+        {
+          key: "subagents",
+          title: "Available sub-agents (task tool agentId)",
+          body:
+            taskAllowed && !shouldDisableTaskToolsForDepth
+              ? formatSubagentIndexSection(agentDefinitions ?? [])
+              : "",
+        },
+        {
+          key: "mcp-prompts",
+          title: "Available MCP prompts (mcp_prompt_get)",
+          body: promptsAllowed ? formatMcpPromptIndexSection(mcpPromptRuntime?.prompts ?? []) : "",
         },
       ]);
       for (const listingRow of listingRows) {
