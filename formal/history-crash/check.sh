@@ -34,6 +34,16 @@ cases=(
   "HistoryPartial|P4-fixed-concurrent|pass|B=2 C=1 T=2 E=1 P=1 DF=FALSE RR=TRUE UI=TRUE CS=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoCommitError"
   "HistoryPartial|M1-unlink-before-commit|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MU=TRUE|NoLostStreamedContent"
   "HistoryPartial|M2-no-torn-separator|NoLostCommittedRow|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MS=TRUE|NoLostCommittedRow"
+  # --- ArchiveSwap: code as written ----------------------------------------
+  "ArchiveSwap|A1-single-backend|pass|B=1 C=1 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|A1-single-backend-2crash|pass|B=1 C=2 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|A2-two-backend-rotation|NoLostRow|B=2 C=1 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|A2-two-backend-no-crash|pass|B=2 C=0 A=3 R=2 X=1|NoLostRow NoResurrectedRow TruncationAtomic"
+  # --- ArchiveSwap: candidate fix + mutation sanity ------------------------
+  "ArchiveSwap|A3-rotation-recovers|pass|B=2 C=1 A=3 R=2 X=1 RR=TRUE|NoLostRow NoResurrectedRow TruncationAtomic"
+  "ArchiveSwap|M3-unlink-tombstone-first|TruncationAtomic|B=1 C=1 A=3 R=1 X=1 MU=TRUE|TruncationAtomic"
+  "ArchiveSwap|M4-recover-forward-only|NoLostRow|B=1 C=1 A=3 R=1 X=1 MR=TRUE|NoLostRow"
+  "ArchiveSwap|M5-no-torn-separator|NoLostRow|B=1 C=1 A=2 R=0 X=0 MT=TRUE|NoLostRow"
 )
 
 render_partial_cfg() {
@@ -71,13 +81,13 @@ EOF
 }
 
 render_archive_cfg() {
-  local kv="$1" invs="$2" B=1 C=1 A=2 R=1 X=1 MU=FALSE MR=FALSE MT=FALSE backends
+  local kv="$1" invs="$2" B=1 C=1 A=2 R=1 X=1 RR=FALSE MU=FALSE MR=FALSE MT=FALSE backends
   local pair
   for pair in $kv; do
     case "$pair" in
       B=*) B="${pair#B=}" ;; C=*) C="${pair#C=}" ;; A=*) A="${pair#A=}" ;;
       R=*) R="${pair#R=}" ;; X=*) X="${pair#X=}" ;; MU=*) MU="${pair#MU=}" ;;
-      MR=*) MR="${pair#MR=}" ;; MT=*) MT="${pair#MT=}" ;;
+      MR=*) MR="${pair#MR=}" ;; MT=*) MT="${pair#MT=}" ;; RR=*) RR="${pair#RR=}" ;;
       *) echo "unknown constant $pair" >&2; exit 2 ;;
     esac
   done
@@ -90,6 +100,7 @@ CONSTANTS
   MaxAppends = $A
   MaxRotations = $R
   MaxTruncations = $X
+  RotationRecovers = $RR
   MutUnlinkTombstoneFirst = $MU
   MutRecoverForwardOnly = $MR
   MutNoTornSeparator = $MT
