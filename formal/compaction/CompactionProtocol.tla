@@ -22,8 +22,8 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
   Backends,
   MaxCrashes, MaxChats, MaxCompactions, MaxEdits, MaxContinuous, MaxResets, MaxRecoveries,
-  RecheckFollowUpUnderLock, \* FIX candidate: the follow-up send re-verifies the handoff under the lock
-  EditClearsFollowUp,       \* FIX candidate: an edit that exposes a summary clears its pendingFollowUp
+  RecheckFollowUpUnderLock, \* FIX (implemented): the follow-up send re-verifies the handoff under the lock
+  EditClearsFollowUp,       \* FIX (implemented): an edit that exposes a summary clears its pendingFollowUp
   MutJournalIgnoresGeneration, \* mutation: journal fold skips the stale-generation discard (272)
   MutNoInMemoryFence,       \* mutation: publish/dispatch ignore the Stop's in-memory fence and send-admission record check
   MutNoFoldIdempotence      \* mutation: journal fold ignores an already-present boundary
@@ -35,7 +35,7 @@ NoRecord == [cid |-> 0]
 Row(id, k, cid, fu) == [id |-> id, k |-> k, cid |-> cid, fu |-> fu]
 
 VARIABLES
-  hist,      \* chat.jsonl rows (archive folded in; rotation is covered by formal/history-crash)
+  hist,      \* chat.jsonl rows (archive folded in; rotation is not modeled)
   gen,       \* continuous-compaction generation file (opaque bytes; modeled as a counter)
   journal,   \* continuous-compaction journal file
   record,    \* compaction cancellation record
@@ -140,7 +140,8 @@ StopRecord(b) ==                                                      \* 340
 (* Follow-up dispatch (agentSession.ts:10759). d_check reads history and    *)
 (* the cancellation record outside the history write lock; d_send is        *)
 (* sendMessage (11176): automatic-send admission re-reads the cancellation  *)
-(* record (4172-4186), but nothing re-verifies the handoff under the lock.  *)
+(* record (4172-4186). Pre-fix, nothing re-verified the handoff under the   *)
+(* lock; RecheckFollowUpUnderLock models the implemented re-check.          *)
 Handoff(c) == Last.k = "sum" /\ Last.fu /\ (c = 0 \/ Last.cid = c)
 Canceled == record.cid # 0 /\ record.cid = Last.cid
 
