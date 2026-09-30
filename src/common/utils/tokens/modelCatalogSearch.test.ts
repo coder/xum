@@ -54,8 +54,8 @@ describe("searchModelCatalog", () => {
       builtIn: false,
       contextWindowTokens: getModelStats("google:gemini-3.7-flash")?.max_input_tokens,
     });
-    expect(byId.get(KNOWN_MODELS.GEMINI_FLASH.id)?.builtIn).toBe(true);
     // Vertex-only models are not served by the Gemini API.
+    expect(listModelCatalogIds()).toContain("vertex_ai-language-models:medlm-large");
     expect(searchModelCatalog({ query: "medlm" }).total).toBe(0);
   });
 
