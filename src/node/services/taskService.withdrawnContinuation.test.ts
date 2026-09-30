@@ -323,6 +323,6 @@ describe("TaskService withdrawn workspace-turn continuations (#5261)", () => {
     expect(await persistedTurn(taskService, correlation)).toMatchObject({ status: "completed" });
     const target = findWorkspaceInConfig(config, "target");
     expect(target?.taskExecutionStatus).toBe("completed");
-    expect(target?.taskStatus).not.toBe("running");
+    expect(target?.taskStatus).toBe("reported");
   });
 });
