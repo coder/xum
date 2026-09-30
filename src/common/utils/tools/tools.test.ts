@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/require-await */
 import { describe, expect, mock, test } from "bun:test";
+import { asSchema } from "ai";
 import { z } from "zod";
 
 import { Ok } from "@/common/types/result";
@@ -235,44 +236,64 @@ describe("getToolsForModel", () => {
     expect(toolsWithHeartbeat.heartbeat).toBeDefined();
   });
 
-  test("only includes set_goal when goal service and setGoal gate are enabled", async () => {
+  // #5247: goal tool registration and definitions must not depend on per-turn
+  // state, or the provider prompt cache misses. Handlers gate at execution time.
+  test("registers identical goal tools whenever a goal service exists", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
     // Registration-only test; goal tools capture the service but never execute it here.
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
     const goalService = {} as never;
-
-    const disabled = await getToolsForModel(
-      "noop:model",
+    const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
+    const exploreAgent = { id: "explore" as const, tools: { remove: ["file_edit_.*"] } };
+    const goalToolContexts = [
+      { parentWorkspaceId: null, allowAgentSetGoal: true, agentInheritanceChain: [execAgent] },
+      { parentWorkspaceId: null, allowAgentSetGoal: undefined, agentInheritanceChain: [execAgent] },
+      { parentWorkspaceId: "parent", allowAgentSetGoal: true, agentInheritanceChain: [execAgent] },
       {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        goalService,
-        enableGoalTools: { setGoal: false, getGoal: true, completeGoal: true },
+        parentWorkspaceId: null,
+        allowAgentSetGoal: true,
+        agentInheritanceChain: [exploreAgent, execAgent],
       },
+    ];
+
+    const serialized: string[] = [];
+    for (const goalToolContext of goalToolContexts) {
+      const tools = await getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          goalService,
+          goalToolContext,
+        },
+        "ws-1",
+        initStateManager
+      );
+      serialized.push(
+        JSON.stringify(
+          (["set_goal", "get_goal", "complete_goal"] as const).map((name) => ({
+            name,
+            description: tools[name]?.description,
+            inputSchema: tools[name] ? asSchema(tools[name].inputSchema).jsonSchema : null,
+          }))
+        )
+      );
+    }
+    expect(serialized[0]).not.toContain('"inputSchema":null');
+    expect(new Set(serialized).size).toBe(1);
+
+    const withoutGoalService = await getToolsForModel(
+      "noop:model",
+      { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", workspaceId: "ws-1" },
       "ws-1",
       initStateManager
     );
-    expect(disabled.set_goal).toBeUndefined();
-    expect(disabled.get_goal).toBeDefined();
-    expect(disabled.complete_goal).toBeDefined();
-
-    const enabled = await getToolsForModel(
-      "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        goalService,
-        enableGoalTools: { setGoal: true, getGoal: true, completeGoal: true },
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(enabled.set_goal).toBeDefined();
+    expect(withoutGoalService.set_goal).toBeUndefined();
+    expect(withoutGoalService.get_goal).toBeUndefined();
+    expect(withoutGoalService.complete_goal).toBeUndefined();
   });
 
   test("withholds review_pane_* tools from sub-agents (enableAgentReport=true)", async () => {

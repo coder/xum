@@ -119,6 +119,13 @@ interface ToolCatalogInputs {
    * normalize to `code_execution` without PTC being active.
    */
   ptcEnabled?: boolean;
+  /**
+   * Whether the attempt's model gets Anthropic prompt-cache breakpoints
+   * (`supportsAnthropicCache`). Such providers read `tools` as the first part
+   * of the cached prefix, so each activation's larger tool list rewrites the
+   * whole cached prefix (#5250).
+   */
+  promptCacheActive?: boolean;
 }
 
 interface ToolCatalogClassification {
@@ -344,6 +351,8 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
  *   the empty-catalog branch deactivates it anyway.)
  * - `tool_catalog_search` absent (policy-disabled) ⇒ safe fallback: no state, tools
  *   unchanged — MCP tools stay advertised exactly as without the experiment.
+ * - Anthropic prompt caching active (`promptCacheActive`) ⇒ drop `tool_catalog_search`,
+ *   inactive state: the experiment-off tool list keeps the cached prefix stable (#5250).
  * - Nothing deferred (all MCP tools policy-disabled / PTC-removed) ⇒ drop
  *   `tool_catalog_search` from the record (a search tool with an empty catalog is
  *   noise) and return no state.
@@ -374,6 +383,29 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   if (inputs.ptcEnabled === true) {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
     return { tools: rest };
+  }
+  // Anthropic prompt caching (#5250): each activation changes the scoped tool
+  // list mid-turn, and the next step then reads 0 cached tokens and rewrites
+  // the whole prefix (tools, system, transcript). Measured on Opus 5.5 with 42
+  // deferred MCP tools, that cost 1.6-3.2x more than advertising every tool.
+  // So these models get the experiment-off tool list, which keeps the prefix
+  // stable. Native `defer_loading` + `tool_reference` could keep deferral
+  // without cache misses (#5262).
+  if (inputs.promptCacheActive === true) {
+    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
+    // Inactive state (empty deferred set ⇒ computeActiveToolNames returns
+    // undefined) instead of none: StreamManager keeps this object, so a model
+    // fallback to a model without prompt caching can still turn deferral on
+    // in place via rebuildToolSearchState.
+    return {
+      tools: rest,
+      state: {
+        catalog: [],
+        deferredToolNames: new Set<string>(),
+        allToolNames: Object.keys(rest),
+        activatedToolNames: new Set<string>(),
+      },
+    };
   }
   const classification = buildToolCatalog(inputs);
   if (classification.deferredToolNames.size === 0) {

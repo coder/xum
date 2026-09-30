@@ -100,23 +100,16 @@ const MODEL_DEFINITIONS = {
   },
   // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
   // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
-  // Keep the durable gpt/sol aliases on the latest Sol tier without moving users to
-  // the more expensive Astra tier. GPT-6 Sol and the retired GPT-5.6 Sol/Luna stay
-  // usable as custom model strings with their own metadata.
+  // Like Astra, it cannot disable reasoning. Keep the durable gpt/sol aliases on the
+  // latest Sol tier without moving users to the more expensive Astra tier. OpenAI GPT
+  // models older than GPT-6 (and GPT-6 Sol) are no longer supported: Pro reasoning
+  // mode on the GPT-6 tiers supersedes the separate gpt-5.5-pro model id.
   GPT: {
     provider: "openai",
     providerModelId: "gpt-6.1-sol",
     aliases: ["gpt", "sol"],
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // GPT-5.6 Terra - balanced everyday tier, released July 9, 2026.
-  // GPT-5.5-class quality at a fraction of the cost: $2/M input, $12/M output; 1.05M context.
-  GPT_56_TERRA: {
-    provider: "openai",
-    providerModelId: "gpt-5.6-terra",
-    aliases: ["terra"],
     tokenizerOverride: "openai/gpt-5",
   },
   // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
@@ -132,59 +125,7 @@ const MODEL_DEFINITIONS = {
     provider: "openai",
     providerModelId: "gpt-6-astra",
     aliases: ["astra", "gpt-6-astra"],
-    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate
-    // counting (same approach as the GPT-5.6 family).
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // GPT Pro alias tracks the latest GPT-5 Pro tier.
-  GPT_PRO: {
-    provider: "openai",
-    providerModelId: "gpt-5.5-pro",
-    aliases: ["gpt-pro", "gpt-5.5-pro"],
-    warm: true,
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // GPT Mini alias tracks the latest stable GPT-5 mini tier.
-  GPT_54_MINI: {
-    provider: "openai",
-    providerModelId: "gpt-5.4-mini",
-    aliases: ["gpt-mini"],
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // GPT Nano alias tracks the latest stable GPT-5 nano tier.
-  GPT_54_NANO: {
-    provider: "openai",
-    providerModelId: "gpt-5.4-nano",
-    aliases: ["gpt-nano"],
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // GPT-5.3-Codex is the released API model id.
-  GPT_53_CODEX: {
-    provider: "openai",
-    providerModelId: "gpt-5.3-codex",
-    aliases: ["codex", "codex-5.3"],
-    warm: true,
-    tokenizerOverride: "openai/gpt-5",
-  },
-  // Codex Spark is a real-time, text-only variant of GPT-5.3-Codex with a 128k context window.
-  // We intentionally keep it first-class so users can select it directly via the `spark` alias.
-  GPT_53_CODEX_SPARK: {
-    provider: "openai",
-    providerModelId: "gpt-5.3-codex-spark",
-    aliases: ["spark"],
-    warm: true,
-    tokenizerOverride: "openai/gpt-5",
-  },
-  GPT_MINI: {
-    provider: "openai",
-    providerModelId: "gpt-5.1-codex-mini",
-    aliases: ["codex-mini"],
-  },
-  GPT_CODEX_MAX: {
-    provider: "openai",
-    providerModelId: "gpt-5.1-codex-max",
-    aliases: ["codex-max"],
-    warm: true,
+    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
   },
   DAYBREAK_BLUE: {
@@ -322,9 +263,6 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
-  "openai:gpt-5.6-sol": "openai/gpt-5",
-  "openai:gpt-5.6-luna": "openai/gpt-5",
-  "openai:gpt-6-sol": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {

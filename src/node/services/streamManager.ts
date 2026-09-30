@@ -3,7 +3,9 @@ import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget"
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
   checkAssembledRequestBudgetForModel,
-  estimateAssembledRequestTokensForModel,
+  createContextBudgetAnchor,
+  estimateAnchoredRequestTokensForModel,
+  type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
 import {
@@ -21,7 +23,7 @@ import {
   streamText,
   type stepCountIs,
   type ModelMessage,
-  type SystemModelMessage,
+  type Instructions,
   type LanguageModel,
   type Tool,
   type ToolSet,
@@ -312,7 +314,7 @@ interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   maxOutputTokens?: number;
@@ -427,6 +429,8 @@ function sendsBetweenToolsThinking(providerOptions: Record<string, unknown> | un
 
 interface StepMessageTracker {
   workspaceId?: string;
+  /** The latest step's request, anchoring the next estimate on its provider usage (#4858). */
+  contextBudgetRequest?: ContextBudgetAnchorRequest;
   pendingPrefixSwap?: ContinuousPrefixSwap;
   consumedPrefixSwap?: ContinuousPrefixSwap;
   prefixSwapInvalidated?: boolean;
@@ -443,7 +447,7 @@ interface StreamRequestConfig {
   modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
-  system?: string | SystemModelMessage;
+  system?: Instructions;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
@@ -501,7 +505,7 @@ interface PreparedModelFallback {
   /** Messages re-prepared for the fallback model's provider. */
   messages: ModelMessage[];
   /** Provider-ready system prompt rebuilt for the fallback model. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /**
    * Tools rebuilt for the fallback model. Required (even if undefined for a
    * tool-less stream) so callers cannot silently reuse the source model's
@@ -2654,7 +2658,7 @@ export class StreamManager {
             request.contextBudgetLimit == null
               ? undefined
               : (
-                  await estimateAssembledRequestTokensForModel(
+                  await estimateAnchoredRequestTokensForModel(
                     {
                       system: request.system,
                       messages: await transformStepMessages([
@@ -2671,7 +2675,10 @@ export class StreamManager {
                       metadataModel: request.budgetMetadataModel,
                       modelContextLimit: request.contextBudgetLimit,
                       activeTools: computeActiveToolNames(request.toolSearchState),
-                    }
+                    },
+                    // prepareStep anchors the next step on this same request and usage, so both
+                    // measures take the same anchored-or-full branch and the invariant holds.
+                    createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
                   )
                 )?.estimate;
           const { decision, continuationEntryId } = await request.onStepSettled({
@@ -2869,7 +2876,7 @@ export class StreamManager {
       // Trusted: mux builds these messages server-side.
       allowSystemInMessages: true,
       abortSignal: abortController.signal,
-      prepareStep: async ({ messages: stepMessages, stepNumber }) => {
+      prepareStep: async ({ messages: stepMessages, stepNumber, steps }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
         const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
@@ -3046,19 +3053,22 @@ export class StreamManager {
             effectiveMessages = stripped;
           }
         }
+        // Taken before this step records its own request; step zero has no settled step.
+        const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
+        const budgetRequest: ContextBudgetAnchorRequest = {
+          model: request.modelString,
+          metadataModel: request.budgetMetadataModel,
+          system: request.system,
+          tools: request.tools,
+          activeTools,
+          messages: rebuiltFirstStepMessages ?? effectiveMessages,
+        };
+        if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
         if (request.contextBudgetLimit != null) {
           const exceeded = await checkAssembledRequestBudgetForModel(
-            {
-              system: request.system,
-              messages: rebuiltFirstStepMessages ?? effectiveMessages,
-              tools: request.tools,
-            },
-            {
-              model: request.modelString,
-              metadataModel: request.budgetMetadataModel,
-              modelContextLimit: request.contextBudgetLimit,
-              activeTools,
-            }
+            budgetRequest,
+            { ...budgetRequest, modelContextLimit: request.contextBudgetLimit },
+            createContextBudgetAnchor(previousRequest, steps.at(-1))
           );
           // Step zero can follow executed tools on a fallback. This late hard stop
           // preserves settled results; it must not reset/replay the activated catalog.

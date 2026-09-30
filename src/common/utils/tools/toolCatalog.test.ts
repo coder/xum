@@ -563,6 +563,33 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
     expect(computeActiveToolNames(state)).toBeUndefined();
   });
 
+  test("deactivates in place when the fallback model uses Anthropic prompt caching", () => {
+    // #5250: a fallback onto a prompt-cache model must advertise the
+    // experiment-off tool list, even if the primary had activations.
+    const state = activeState();
+    const result = rebuildToolSearchState(state, {
+      tools: baseTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    expect(Object.keys(result.tools)).not.toContain("tool_catalog_search");
+    expect(Object.keys(result.tools)).toContain("slack_send_message");
+    expect(computeActiveToolNames(state)).toBeUndefined();
+  });
+
+  test("turns deferral on in place when a prompt-cache primary falls back to another model", () => {
+    const prepared = prepareToolSearch({
+      tools: baseTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    const state = prepared.state!;
+    expect(computeActiveToolNames(state)).toBeUndefined();
+    const result = rebuildToolSearchState(state, { tools: baseTools(), mcpToolNames: MCP_NAMES });
+    expect(Object.keys(result.tools)).toContain("tool_catalog_search");
+    expect(computeActiveToolNames(state)).toEqual(["bash", "file_read", "tool_catalog_search"]);
+  });
+
   test("deactivates in place when tool_catalog_search is gone from the fallback toolset", () => {
     const state = activeState();
     const nextTools = baseTools();

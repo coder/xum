@@ -97,6 +97,7 @@ import type { ProviderModelFactory } from "@/node/services/providerModelFactory"
 import type { MemoryScope, MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
@@ -302,12 +303,12 @@ export interface ToolConfiguration {
    * differ (one-shot model sends, delegated turns with per-turn overrides).
    */
   goalKickoffModel?: string;
-  /** Per-request goal tool gates derived from goal status and agent capabilities. */
-  enableGoalTools?: {
-    setGoal: boolean;
-    getGoal: boolean;
-    completeGoal: boolean;
-  };
+  /**
+   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * agent chain). The goal tools are registered whenever goalService exists and
+   * check these plus the live goal status at execution time (#5247).
+   */
+  goalToolContext?: GoalToolContext;
   /** Optional JSON Schema subset required by a workflow-spawned task report. */
   workflowAgentOutputSchema?: unknown;
   /** Allow pre-upgrade workflow child tasks with schemas now rejected by strict validation. */
@@ -930,14 +931,16 @@ export async function getToolsForModel(
         }
       : {}),
     ...(shouldExposeHeartbeatTool ? { heartbeat: createHeartbeatTool(config) } : {}),
-    ...(config.goalService && config.enableGoalTools?.setGoal
-      ? { set_goal: createSetGoalTool(config) }
-      : {}),
-    ...(config.goalService && config.enableGoalTools?.getGoal
-      ? { get_goal: createGetGoalTool(config) }
-      : {}),
-    ...(config.goalService && config.enableGoalTools?.completeGoal
-      ? { complete_goal: createCompleteGoalTool(config) }
+    // Always register all three goal tools when a goal service exists, whatever
+    // the goal status or turn kind: adding or removing them per turn changes the
+    // tool block and misses the provider prompt cache. The handlers enforce the
+    // gates at execution time with typed refusals (#5247).
+    ...(config.goalService
+      ? {
+          set_goal: createSetGoalTool(config),
+          get_goal: createGetGoalTool(config),
+          complete_goal: createCompleteGoalTool(config),
+        }
       : {}),
     todo_write: createTodoWriteTool(config),
     todo_read: createTodoReadTool(config),

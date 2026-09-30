@@ -120,8 +120,8 @@ const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: fa
  * OpenAI prices Ultrafast at 6x the model's Standard rate in both context bands
  * (gpt-6-astra: $60/$6/$75/$300 short, $120/$12/$150/$450 long). Only Astra has a
  * published card, so this factor also prices models whose Ultrafast rate is not
- * published yet (GPT-5.6 Sol preview) instead of the lower highest-published
- * fallback, keeping the budget rule's "never under-count" promise.
+ * published yet instead of the lower highest-published fallback, keeping the
+ * budget rule's "never under-count" promise.
  */
 const ULTRAFAST_SIX_BOTH_BANDS: TierFactor = { factor: 6, longContext: true };
 
@@ -130,10 +130,9 @@ type PricedTierWithFactors = "flex" | "fast" | "ultrafast";
 /**
  * Factors reproduce every published Flex/Fast cell from the model's Standard
  * rates (the page rounds a few cells, e.g. gpt-5.4 Flex cached shows $0.13 for
- * 0.5 × $0.25). Factors rather than copied rate cards so a Standard change,
- * like the end of gpt-5.6-sol's promotion, carries over ("Fast mode costs twice
- * the corresponding Standard rate"). Keys are the bare catalog keys the model's
- * Standard stats resolve from.
+ * 0.5 × $0.25). Factors rather than copied rate cards so a Standard change carries
+ * over ("Fast mode costs twice the corresponding Standard rate"). Keys are the bare
+ * catalog keys the model's Standard stats resolve from.
  */
 const SERVICE_TIER_FACTORS: Readonly<
   Record<string, Partial<Record<PricedTierWithFactors, TierFactor>>>
@@ -144,10 +143,11 @@ const SERVICE_TIER_FACTORS: Readonly<
     ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
   },
   "gpt-6.1-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  "gpt-6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
   "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  // Unsupported older models stay here: they remain routable as custom/persisted
+  // strings and LiteLLM still prices their Standard rates, so dropping the factor
+  // would bill a reported Fast/Flex response at Standard (under-counting budgets).
   "gpt-5.6-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
-  // Catalog alias priced as gpt-5.6-sol (models-extra `"gpt-5.6": GPT_56_SOL_STATS`).
   "gpt-5.6": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
   "gpt-5.6-terra": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
   "gpt-5.6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },

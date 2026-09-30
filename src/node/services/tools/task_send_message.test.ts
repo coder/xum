@@ -80,6 +80,7 @@ describe("task_send_message tool", () => {
     const outcomes: TreeSendResult[] = [
       Ok({ delivery: "accepted", relation: "target_unrelated" }),
       Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation: "target_unrelated" }),
+      Ok({ delivery: "queued", relation: "target_unrelated", awaitsDelegatedTurn: true }),
     ];
     const taskService = {
       sendAgentTreeMessage: mock((): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)),
@@ -105,6 +106,18 @@ describe("task_send_message tool", () => {
       taskId: "ws-root-b",
       queueDispatchMode: "turn-end",
       targetRelation: "unrelated",
+    });
+
+    // The target runs a delegated turn the sender does not own: the message waits for it.
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({
+      status: "queued",
+      taskId: "ws-root-b",
+      targetRelation: "unrelated",
+      awaitsDelegatedTurn: true,
     });
   });
 

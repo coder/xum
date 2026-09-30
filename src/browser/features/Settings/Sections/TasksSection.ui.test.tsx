@@ -60,8 +60,8 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
     models: [
       "anthropic:foo",
       "anthropic:ui-exec",
-      "openai:gpt-5-pro",
-      "openai:gpt-5.6-sol",
+      "xai:grok-4-1-fast",
+      "openai:gpt-6-luna",
       "openai:subagent-model",
       "xai:grok-code-fast-1",
     ],
@@ -243,7 +243,7 @@ describe("TasksSection Exec subagent defaults", () => {
     const view = renderTasksSection({
       agentAiDefaults: {
         intuition: {
-          modelString: "openai:gpt-5.6-sol",
+          modelString: "openai:gpt-6-luna",
           advisorEnabled: true,
           thinkingLevel: "high",
         },
@@ -256,7 +256,7 @@ describe("TasksSection Exec subagent defaults", () => {
     }
     const card = getAgentCardByName(view, "Intuition");
     expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
-      "openai:gpt-5.6-sol"
+      "openai:gpt-6-luna"
     );
     expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
     expect(within(card).getAllByRole("switch")).toHaveLength(1);
@@ -270,7 +270,7 @@ describe("TasksSection Exec subagent defaults", () => {
     selectReasoningOption(card, "Medium");
     await waitFor(() => {
       expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
-        modelString: "openai:gpt-5.6-sol",
+        modelString: "openai:gpt-6-luna",
         thinkingLevel: "medium",
       });
     });
@@ -280,7 +280,7 @@ describe("TasksSection Exec subagent defaults", () => {
     await waitFor(() => {
       const settings = getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition;
       expect(settings?.thinkingLevel).toBeUndefined();
-      expect(settings?.modelString).toBe("openai:gpt-5.6-sol");
+      expect(settings?.modelString).toBe("openai:gpt-6-luna");
     });
     expect(
       within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
@@ -290,12 +290,12 @@ describe("TasksSection Exec subagent defaults", () => {
   test("Intuition can display and save Off and Low below the chat minimum", async () => {
     advisorExperimentEnabled = true;
     getAppConfigStore().updateOptimistically({
-      minThinkingLevelByModel: { "openai:gpt-5.6-sol": "high" },
+      minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
     });
     const view = renderTasksSection({
       agentAiDefaults: {
-        intuition: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
-        explore: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
+        intuition: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },
+        explore: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },
       },
     });
     await view.findByText("Intuition");
@@ -326,13 +326,13 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(explore).queryByRole("option", { name: "Low" })).toBeNull();
   });
 
-  test.each([undefined, "openai:gpt-5.6-sol"])(
+  test.each([undefined, "openai:gpt-6-luna"])(
     "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
     async (workspaceModel) => {
       advisorExperimentEnabled = true;
       const view = renderTasksSection({
         workspaceModel,
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5-pro" } },
+        agentAiDefaults: { exec: { modelString: "xai:grok-4-1-fast" } },
       });
       await view.findByText("Intuition");
       const card = getAgentCardByName(view, "Intuition");
@@ -348,14 +348,14 @@ describe("TasksSection Exec subagent defaults", () => {
     }
   );
 
-  test.each([undefined, "openai:gpt-5-pro"])(
+  test.each([undefined, "xai:grok-4-1-fast"])(
     "Intuition prefers its own model override to its definition, then the parent (override=%s)",
     async (modelString) => {
       advisorExperimentEnabled = true;
       const view = renderTasksSection({
         agents: FALLBACK_AGENTS.map((agent) =>
           agent.id === "intuition"
-            ? { ...agent, aiDefaults: { model: "openai:gpt-5.6-sol" } }
+            ? { ...agent, aiDefaults: { model: "openai:gpt-6-luna" } }
             : agent
         ),
         agentAiDefaults: {
@@ -468,7 +468,7 @@ describe("TasksSection Exec subagent defaults", () => {
     });
   });
 
-  test.each(["openai:gpt-5.6-sol", "xai:grok-code-fast-1"])(
+  test.each(["openai:gpt-6-luna", "xai:grok-code-fast-1"])(
     "does not resolve or persist inherited preferences from global Exec model %s",
     async (modelString) => {
       const view = renderTasksSection({
@@ -527,7 +527,7 @@ describe("TasksSection Exec subagent defaults", () => {
       agentAiDefaults: {
         exec: {
           reasoningMode: "pro",
-          subagent: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+          subagent: { modelString: "openai:gpt-6-luna", thinkingLevel: "high" },
         },
       },
     });
@@ -631,7 +631,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test("toggling Pro mode persists the agent default", async () => {
     const view = renderTasksSection({
       agentAiDefaults: {
-        explore: { modelString: "openai:gpt-5.6-sol" },
+        explore: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -651,7 +651,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test("toggling Pro mode off removes the persisted reasoning mode", async () => {
     const view = renderTasksSection({
       agentAiDefaults: {
-        explore: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
+        explore: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
       },
     });
 
@@ -667,14 +667,14 @@ describe("TasksSection Exec subagent defaults", () => {
     const payload = getLatestSavePayload(view.saveConfig);
 
     expect(payload.agentAiDefaults.explore?.reasoningMode).toBeUndefined();
-    expect(payload.agentAiDefaults.explore?.modelString).toBe("openai:gpt-5.6-sol");
+    expect(payload.agentAiDefaults.explore?.modelString).toBe("openai:gpt-6-luna");
   });
 
   test.each(["standard", "pro"] as const)(
     "cycles inherited mode through explicit Pro and Standard regardless of global %s",
     async (reasoningMode) => {
       const view = renderTasksSection({
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5.6-sol", reasoningMode } },
+        agentAiDefaults: { exec: { modelString: "openai:gpt-6-luna", reasoningMode } },
       });
       const row = await view.findByRole("group", { name: "Exec defaults" });
       const trigger = within(row).getByRole("button", { name: "Reasoning" });
@@ -709,7 +709,7 @@ describe("TasksSection Exec subagent defaults", () => {
     const view = renderTasksSection({
       agentAiDefaults: {
         exec: { reasoningMode: "pro" },
-        explore: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
+        explore: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
       },
     });
 
@@ -753,7 +753,7 @@ describe("TasksSection Exec subagent defaults", () => {
     const view = renderTasksSection({
       agentAiDefaults: {
         exec: { reasoningMode: "pro" },
-        explore: { modelString: "openai:gpt-5.6-sol" },
+        explore: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -778,7 +778,7 @@ describe("TasksSection Exec subagent defaults", () => {
     // without first overriding the model.
     const view = renderTasksSection({
       agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
+        exec: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
       },
     });
 
@@ -803,7 +803,7 @@ describe("TasksSection Exec subagent defaults", () => {
           name: "Researcher",
           uiSelectable: false,
           subagentRunnable: true,
-          aiDefaults: { model: "openai:gpt-5.6-sol" },
+          aiDefaults: { model: "openai:gpt-6-luna" },
         },
       ],
     });
@@ -819,7 +819,7 @@ describe("TasksSection Exec subagent defaults", () => {
     // applies reasoningMode, same headless class as Dream.
     const view = renderTasksSection({
       agentAiDefaults: {
-        name_workspace: { modelString: "openai:gpt-5.6-sol" },
+        name_workspace: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -837,7 +837,7 @@ describe("TasksSection Exec subagent defaults", () => {
     advisorExperimentEnabled = true; // shared experiment mock also enables memory consolidation
     const view = renderTasksSection({
       agentAiDefaults: {
-        dream: { modelString: "openai:gpt-5.6-sol" },
+        dream: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -967,13 +967,13 @@ describe("TasksSection Auto routing defaults", () => {
     fireEvent.click(within(plan).getByRole("button", { name: "Reset" }));
 
     fireEvent.change(within(getAgentCardByName(view, "mystery")).getByLabelText("Model"), {
-      target: { value: "openai:gpt-5.6-sol" },
+      target: { value: "openai:gpt-6-luna" },
     });
 
     await waitFor(() => {
       const payload = getLatestSavePayload(view.saveConfig);
       expect(payload.agentAiDefaults.plan).toBeUndefined();
-      expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-5.6-sol" });
+      expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-6-luna" });
     });
   });
 });

@@ -5,7 +5,8 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { resolveModelGoalSetIntent } from "@/common/utils/goals/resolveGoalSetIntent";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import { formatGoalSetError } from "./goalErrors";
+import { getSetGoalRefusalReason } from "@/common/utils/tools/toolAvailability";
+import { formatGoalSetError, setGoalRefusal } from "./goalErrors";
 
 function assertResolvedModelGoalBounds(goal: Pick<GoalRecordV1, "budgetCents" | "turnCap">): void {
   assert(
@@ -25,6 +26,14 @@ export const createSetGoalTool: ToolFactory = (config) => {
     execute: async ({ objective, budgetCents, turnCap, replaceExistingGoal, expectedGoalId }) => {
       assert(config.workspaceId, "set_goal requires workspaceId");
       assert(config.goalService, "set_goal requires goalService");
+      assert(config.goalToolContext, "set_goal requires goalToolContext");
+
+      // Execution-time gate (#5247): the tool is registered on every turn, so
+      // refuse here, before any goal state is touched.
+      const refusalReason = getSetGoalRefusalReason(config.goalToolContext);
+      if (refusalReason != null) {
+        return setGoalRefusal(refusalReason);
+      }
 
       const trimmedObjective = objective.trim();
       assert(trimmedObjective.length > 0, "set_goal requires a non-empty objective");

@@ -7,8 +7,13 @@ import {
   prepareAssembledRequestTokenCount,
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
+import type { JSONSchema7 } from "@ai-sdk/provider";
+import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
+  createContextBudgetAnchor,
+  estimateAnchoredRequestTokensForModel,
+  estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -582,5 +587,190 @@ describe("real-encoding budget guards", () => {
         { model, modelContextLimit: 10000 }
       ).catch((error: unknown) => error)
     ).toBe(failure);
+  });
+});
+
+describe("claude-encoding budget correction (#5219)", () => {
+  // A tool-heavy request whose provider input tokens were recorded with Anthropic count_tokens.
+  const asTools = (
+    defs: ReadonlyArray<{ name: string; description: string; inputSchema: unknown }>
+  ) =>
+    Object.fromEntries(
+      defs.map((t) => [
+        t.name,
+        tool({ description: t.description, inputSchema: jsonSchema(t.inputSchema as JSONSchema7) }),
+      ])
+    );
+  const estimate = async (target: string, request: AssembledRequestBudgetInput) =>
+    (
+      await estimateAssembledRequestTokensForModel(request, {
+        model: target,
+        modelContextLimit: 1e7,
+      })
+    )?.estimate ?? Number.NaN;
+  const direct = async (target: string, text: string) =>
+    (
+      await tokenizerModule.getTokenizerForModel(target, undefined, { requireRealEncoding: true })
+    ).countTokens(text);
+
+  test("a new-tokenizer Claude request is estimated at or above its recorded provider count", async () => {
+    const request = {
+      system: calibration.request.system,
+      messages: calibration.request.messages,
+      tools: asTools(calibration.request.tools),
+    };
+    expect(await estimate("anthropic:claude-opus-5-5", request)).toBeGreaterThanOrEqual(
+      calibration.providerInputTokens["claude-opus-5-5"]
+    );
+  });
+
+  test("claude-encoded counts are scaled; OpenAI-encoded counts are not", async () => {
+    // Token-dense text, so the encoded count (not the character heuristic) decides the estimate.
+    const text = "a0b1c2d3e4f5".repeat(1500);
+    const claude = "anthropic:claude-opus-5-5";
+    const openai = "openai:gpt-5.5-pro";
+    const claudeDirect = await direct(claude, text);
+    const openaiDirect = await direct(openai, text);
+    // Scaled well past the chunk and framing slack (a few percent) every estimate adds.
+    expect(
+      (await estimateToolResultTokensForModel(text, { model: claude })) - claudeDirect
+    ).toBeGreaterThan(claudeDirect / 3);
+    expect(
+      (await estimateToolResultTokensForModel(text, { model: openai })) - openaiDirect
+    ).toBeLessThanOrEqual(openaiDirect / 20);
+  });
+
+  test.each([
+    [
+      "claude-opus-5-5",
+      calibration.oneToolProviderTokens["claude-opus-5-5"],
+      calibration.smallToolsProviderTokens["claude-opus-5-5"],
+    ],
+    [
+      "claude-sonnet-4-6",
+      calibration.oneToolProviderTokens["claude-sonnet-4-6"],
+      calibration.smallToolsProviderTokens["claude-sonnet-4-6"],
+    ],
+  ] as const)(
+    "%s tool framing grows with the tool count and covers the provider's tool cost",
+    async (id, oneToolTokens, allToolsTokens) => {
+      const target = `anthropic:${id}`;
+      const bare = { messages: [{ role: "user", content: [{ type: "text", text: "x" }] }] };
+      const none = await estimate(target, bare);
+      const one = await estimate(target, {
+        ...bare,
+        tools: asTools(calibration.smallTools.slice(0, 1)),
+      });
+      const all = await estimate(target, { ...bare, tools: asTools(calibration.smallTools) });
+      expect(one - none).toBeGreaterThanOrEqual(oneToolTokens);
+      expect(all - none).toBeGreaterThanOrEqual(allToolsTokens);
+      expect(all).toBeGreaterThan(one);
+    }
+  );
+});
+
+describe("anchored request estimate (#4858)", () => {
+  const system = "system prompt ".repeat(50);
+  const tools = { read: tool({ description: "Read a file", inputSchema: jsonSchema({}) }) };
+  const activeTools = ["read"];
+  const prefix = [
+    { role: "user", content: "long history ".repeat(4000) },
+    { role: "assistant", content: "answer ".repeat(2000) },
+  ];
+  const delta = [{ role: "user", content: "follow-up question ".repeat(20) }];
+  const payload = { system, tools, messages: [...prefix, ...delta] };
+  const options = { model, modelContextLimit: 200_000, activeTools };
+  const usage = { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 };
+  const anchor = createContextBudgetAnchor(
+    { model, system, tools, activeTools, messages: prefix },
+    { usage }
+  )!;
+
+  test("an exact append costs the provider count plus the estimated appended messages", async () => {
+    const full = (await estimateAssembledRequestTokensForModel(payload, options))!.estimate;
+    const deltaOnly = (await estimateAssembledRequestTokensForModel({ messages: delta }, options))!
+      .estimate;
+    const anchored = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
+    expect(anchored).toEqual({
+      estimate: 1000 + deltaOnly,
+      hardCeiling: getContextBudgetHardCeiling(200_000),
+    });
+    expect(anchored!.estimate).toBeLessThan(full);
+  });
+
+  test.each([
+    ["another model", { payload, options: { ...options, model: "openai:gpt-4.1" } }],
+    ["another system prompt", { payload: { ...payload, system: `${system}` + "!" }, options }],
+    ["another tool set", { payload: { ...payload, tools: { ...tools } }, options }],
+    ["other advertised tools", { payload, options: { ...options, activeTools: [] } }],
+    [
+      "a rewritten prefix message",
+      { payload: { ...payload, messages: [{ ...prefix[0] }, prefix[1], ...delta] }, options },
+    ],
+    ["a shorter message list", { payload: { ...payload, messages: prefix.slice(0, 1) }, options }],
+  ])("%s falls back to the full estimate", async (_name, input) => {
+    expect(
+      await estimateAnchoredRequestTokensForModel(input.payload, input.options, anchor)
+    ).toEqual(await estimateAssembledRequestTokensForModel(input.payload, input.options));
+  });
+
+  test("usage without positive input yields no anchor", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    expect(createContextBudgetAnchor(request, { usage: undefined })).toBeUndefined();
+    expect(
+      createContextBudgetAnchor(request, { usage: { inputTokens: 0, outputTokens: 5 } })
+    ).toBeUndefined();
+  });
+
+  test("cache or reasoning details without an input total yield no anchor", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    expect(
+      createContextBudgetAnchor(request, {
+        usage: {
+          outputTokens: 80,
+          inputTokenDetails: { cacheReadTokens: 600, cacheWriteTokens: 0 },
+          outputTokenDetails: { reasoningTokens: 50 },
+        },
+      })
+    ).toBeUndefined();
+  });
+
+  test("reasoning reported only in provider metadata is added; unreported reasoning falls back", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    const usage = { inputTokens: 1000, outputTokens: 80 };
+    const reasoning = [{ type: "reasoning", text: "" }];
+    expect(
+      createContextBudgetAnchor(request, {
+        usage,
+        providerMetadata: { openai: { reasoningTokens: 50 } },
+        reasoning,
+      })?.providerTokens
+    ).toBe(1050);
+    expect(createContextBudgetAnchor(request, { usage, reasoning })).toBeUndefined();
+    expect(createContextBudgetAnchor(request, { usage })?.providerTokens).toBe(1000);
+  });
+
+  test("cache reads are counted once and replayed reasoning is added", () => {
+    const cached = createContextBudgetAnchor(
+      { model, system, tools, activeTools, messages: prefix },
+      {
+        usage: {
+          inputTokens: 1000,
+          outputTokens: 80,
+          inputTokenDetails: { cacheReadTokens: 600, noCacheTokens: 400, cacheWriteTokens: 0 },
+          outputTokenDetails: { reasoningTokens: 50, textTokens: 30 },
+        },
+      }
+    );
+    expect(cached?.providerTokens).toBe(1050);
+  });
+
+  test("an anchored request above the hard ceiling is refused", async () => {
+    const hardCeiling = getContextBudgetHardCeiling(200_000);
+    const heavy = { ...anchor, providerTokens: hardCeiling };
+    expect((await checkAssembledRequestBudgetForModel(payload, options, heavy))?.type).toBe(
+      "context_budget_exceeded"
+    );
+    expect(await checkAssembledRequestBudgetForModel(payload, options, anchor)).toBeUndefined();
   });
 });

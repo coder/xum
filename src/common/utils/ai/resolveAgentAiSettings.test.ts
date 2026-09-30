@@ -10,7 +10,7 @@ import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolve
 const MODEL_A = "custom:model-a";
 const MODEL_B = "custom:model-b";
 const MODEL_C = "custom:model-c";
-const PRO_MODEL = "openai:gpt-5.6";
+const PRO_MODEL = "openai:gpt-6.1-sol";
 
 function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSettingsInput {
   return {

@@ -1982,6 +1982,8 @@ export const workspace = {
             beforeMessageId: z.string().nullish(),
           })
           .nullish(),
+        // The client holds a replay window (#4961): bounded pages inside the active epoch.
+        windowed: z.boolean().optional(),
       }),
       output: z.object({
         messages: z.array(WorkspaceChatMessageSchema),
@@ -1992,6 +1994,8 @@ export const workspace = {
           })
           .nullable(),
         hasOlder: z.boolean(),
+        // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
+        notPageable: z.boolean().optional(),
       }),
     },
     /** Searches full history, including prompts before the replay boundary. */
@@ -2068,6 +2072,10 @@ export const workspace = {
       // send single rows; clients that do not send it (ACP, VS Code, tests, older renderers)
       // always get single rows.
       batchReplay: z.boolean().optional(),
+      // The client can hold a window of the newest rows, so a full replay may send only those
+      // (#4961); `hasOlderHistory` on caught-up then says whether older rows exist. Clients that
+      // do not send it get the whole active epoch, as before.
+      replayWindow: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },

@@ -144,6 +144,7 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
+import { HISTORY_PAGE_MAX_BYTES, HISTORY_PAGE_MAX_ROWS } from "@/constants/orpcSubscriptions";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
@@ -1305,6 +1306,7 @@ interface WorkspaceHistoryLoadMoreResult {
   messages: WorkspaceChatMessage[];
   nextCursor: WorkspaceHistoryLoadMoreCursor | null;
   hasOlder: boolean;
+  notPageable?: boolean;
 }
 
 function isCompactedSummaryMessage(message: MuxMessage): boolean {
@@ -18552,7 +18554,8 @@ export class WorkspaceService
 
   async getHistoryLoadMore(
     workspaceId: string,
-    cursor: WorkspaceHistoryLoadMoreCursor | null | undefined
+    cursor: WorkspaceHistoryLoadMoreCursor | null | undefined,
+    options?: { windowed?: boolean }
   ): Promise<WorkspaceHistoryLoadMoreResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.trim().length > 0,
@@ -18615,6 +18618,44 @@ export class WorkspaceService
         isNonNegativeInteger(beforeHistorySequence),
         "resolved beforeHistorySequence must be a non-negative integer"
       );
+
+      // A windowed client (#4961) pages inside the active epoch: a bounded page right before its
+      // oldest row (contract at readProviderHistoryPage). "before-epoch" continues below with
+      // today's older-epoch pages; "not-pageable" tells the client to do a full replay.
+      if (options?.windowed === true && cursor) {
+        const pageResult = await this.historyService.getHistoryPageFromLatestBoundary(
+          workspaceId,
+          { maxRows: HISTORY_PAGE_MAX_ROWS, maxBytes: HISTORY_PAGE_MAX_BYTES },
+          beforeHistorySequence
+        );
+        if (!pageResult.success) {
+          throw new Error(`workspace.history.loadMore: ${pageResult.error}`);
+        }
+        const page = pageResult.data;
+        if (page.kind === "not-pageable") return { ...emptyResult, notPageable: true };
+        if (page.kind === "page") {
+          // A partial page begins at a sequenced clean turn start and the next page ends right
+          // before it; at the epoch start, the next request pages older epochs as today.
+          const next = getOldestSequencedMessage(
+            page.reachedEpochStart ? page.messages : page.messages.slice(0, 1)
+          );
+          const hasOlder =
+            next !== null &&
+            (!page.reachedEpochStart ||
+              (await this.historyService.hasHistoryBeforeSequence(
+                workspaceId,
+                next.historySequence
+              )));
+          return {
+            messages: page.messages.map((message) => ({ ...message, type: "message" })),
+            nextCursor: next && {
+              beforeHistorySequence: next.historySequence,
+              beforeMessageId: next.message.id,
+            },
+            hasOlder,
+          };
+        }
+      }
 
       const historyWindowResult = await this.historyService.getHistoryBoundaryWindow(
         workspaceId,

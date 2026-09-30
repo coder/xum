@@ -907,6 +907,12 @@ export interface WorkspaceTurnTaskHost {
     targetAgentId: string
   ): AgentAiSettingsLayerValues[];
   bumpWorkspaceStopEpoch(workspaceId: string): void;
+  /**
+   * The workspace's live delegated-turn registration was released (the turn settled, or recovery
+   * or stale cleanup dropped it). TaskService then delivers peer messages that waited for that
+   * turn to finish (#4997). Called synchronously from the release; implementations only schedule.
+   */
+  onWorkspaceTurnRegistrationReleased(workspaceId: string): void;
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,

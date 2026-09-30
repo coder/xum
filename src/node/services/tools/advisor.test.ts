@@ -180,10 +180,10 @@ describe("advisor tool", () => {
   });
 
   it.each([
-    { model: "openai:gpt-5.6", mode: "pro", effort: "high", expectedMode: "pro" },
-    { model: "openai:gpt-5.6", mode: "pro", effort: "max", expectedMode: "pro" },
-    { model: "openai:gpt-5.6", mode: "standard", effort: "high", expectedMode: undefined },
-    { model: "openai:gpt-5.6", mode: undefined, effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-6.1-sol", mode: "pro", effort: "high", expectedMode: "pro" },
+    { model: "openai:gpt-6.1-sol", mode: "pro", effort: "max", expectedMode: "pro" },
+    { model: "openai:gpt-6.1-sol", mode: "standard", effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-6.1-sol", mode: undefined, effort: "high", expectedMode: undefined },
     { model: "openai:gpt-5.2", mode: "pro", effort: "high", expectedMode: undefined },
   ] as const)("forwards advisor mode independently of effort: %j", async (testCase) => {
     using tempDir = new TestTempDir("advisor-reasoning-mode");
@@ -234,12 +234,12 @@ describe("advisor tool", () => {
       ...config,
       advisorRuntime: {
         ...config.advisorRuntime,
-        advisorModelString: "openai:gpt-5.6",
+        advisorModelString: "openai:gpt-6.1-sol",
         reasoningMode: "pro",
         createModel: () =>
           Promise.resolve({
             model: Object.create(null) as LanguageModel,
-            optionsModelString: "openai:gpt-5.6",
+            optionsModelString: "openai:gpt-6.1-sol",
             optionsProvidersConfig: null,
             ...testCase.modelOptions,
           }),

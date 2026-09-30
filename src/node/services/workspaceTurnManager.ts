@@ -618,14 +618,37 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
   }
 }
 
+interface LiveWorkspaceTurnRegistration {
+  handleId: string;
+  ownerWorkspaceId: string;
+  accepted: boolean;
+}
+
+/**
+ * Live delegated-turn registrations keyed by target workspace. Releasing one is the settlement
+ * signal for peer messages that wait for the delegated turn to finish (#4997). Every settle,
+ * recovery and stale-cleanup path releases through delete(), so hooking delete() here cannot miss
+ * a path. Replacing a registration with set() is not a release: the next turn is still running.
+ */
+class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegistration> {
+  constructor(private readonly onReleased: (workspaceId: string) => void) {
+    super();
+  }
+
+  override delete(workspaceId: string): boolean {
+    const deleted = super.delete(workspaceId);
+    if (deleted) this.onReleased(workspaceId);
+    return deleted;
+  }
+}
+
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
-  private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
-    string,
-    { handleId: string; ownerWorkspaceId: string; accepted: boolean }
-  >();
+  private readonly activeWorkspaceTurnHandleByWorkspaceId = new LiveWorkspaceTurnRegistrations(
+    (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
+  );
   private lastWorkspaceTurnCreatedAtMs = 0;
   private readonly taskHandleStore: TaskHandleStore;
 
@@ -894,9 +917,7 @@ export class WorkspaceTurnManager {
    * ISO timestamp would otherwise fall back to filesystem readdir order.
    */
 
-  getLiveWorkspaceTurnRegistration(
-    workspaceId: string
-  ): { handleId: string; ownerWorkspaceId: string; accepted: boolean } | undefined {
+  getLiveWorkspaceTurnRegistration(workspaceId: string): LiveWorkspaceTurnRegistration | undefined {
     return this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
   }
 

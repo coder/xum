@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { readPersistedString, usePersistedState } from "./usePersistedState";
 import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
 import { useRouting } from "./useRouting";
@@ -29,7 +29,6 @@ import {
   isAuthoritativeProviderModelAccessible as isAuthoritativeProviderModelAccessibleIn,
   isModelAllowedByPolicyOnActiveRoute,
   isProviderConfigured,
-  resolvesToDirectOpenAI,
 } from "@/common/utils/ai/selectableModels";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
@@ -177,16 +176,6 @@ export function useModelsFromSettings() {
       isGatewayModelAccessible
     );
 
-  const requiresCodexOauth = (modelId: string) =>
-    isCodexOauthRequiredModel(modelId, config) &&
-    resolvesToDirectOpenAI(
-      modelId,
-      routePriority,
-      routeOverrides,
-      isConfigured,
-      isGatewayModelAccessible
-    );
-
   const providerHiddenModels = useMemo(() => {
     if (config == null) {
       return [];
@@ -221,15 +210,9 @@ export function useModelsFromSettings() {
 
       // Exclude OpenAI models that would also be filtered by OAuth gating.
       // Surfacing them in the hidden bucket would let users select models that
-      // fail at send time (oauth_not_connected / api_key_not_found).
-      if (modelId.startsWith("openai:")) {
-        if (!hasOpenaiApiKey && hasCodexOauth) {
-          return isCodexOauthAllowedModel(modelId, config);
-        }
-        if (hasOpenaiApiKey && hasCodexOauth) {
-          return true;
-        }
-        return !isCodexOauthRequiredModel(modelId, config);
+      // fail at send time (api_key_not_found).
+      if (modelId.startsWith("openai:") && !hasOpenaiApiKey && hasCodexOauth) {
+        return isCodexOauthAllowedModel(modelId, config);
       }
 
       return true;
@@ -366,7 +349,6 @@ export function useModelsFromSettings() {
     setDefaultModel: setDefaultModelAndPersist,
     openaiApiKeySet,
     codexOauthSet,
-    requiresCodexOauth,
     isAllowedByPolicyOnActiveRoute,
   };
 }

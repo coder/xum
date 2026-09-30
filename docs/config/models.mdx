@@ -19,16 +19,8 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Sonnet 5.5             | anthropic:claude-sonnet-5-5   | `sonnet`                                                     |         |
 | Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |
 | GPT-6.1 Sol            | openai:gpt-6.1-sol            | `gpt`, `sol`                                                 |         |
-| GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |
 | GPT-6 Luna             | openai:gpt-6-luna             | `luna`                                                       |         |
 | GPT-6 Astra            | openai:gpt-6-astra            | `astra`, `gpt-6-astra`                                       |         |
-| GPT-5.5 Pro            | openai:gpt-5.5-pro            | `gpt-pro`, `gpt-5.5-pro`                                     |         |
-| GPT-5.4 Mini           | openai:gpt-5.4-mini           | `gpt-mini`                                                   |         |
-| GPT-5.4 Nano           | openai:gpt-5.4-nano           | `gpt-nano`                                                   |         |
-| Codex 5.3              | openai:gpt-5.3-codex          | `codex`, `codex-5.3`                                         |         |
-| Spark 5.3              | openai:gpt-5.3-codex-spark    | `spark`                                                      |         |
-| Codex Mini 5.1         | openai:gpt-5.1-codex-mini     | `codex-mini`                                                 |         |
-| Codex Max 5.1          | openai:gpt-5.1-codex-max      | `codex-max`                                                  |         |
 | Daybreak Blue Latest   | openai:daybreak-blue-latest   | —                                                            |         |
 | Daybreak Red Latest    | openai:daybreak-red-latest    | —                                                            |         |
 | Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |
@@ -41,17 +33,19 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 
 {/* END KNOWN_MODELS_TABLE */}
 
-GPT-6 Sol and Luna support thinking from off through max on the default Responses API route. On the opt-in Chat Completions route, Xum disables their reasoning because OpenAI only supports function calling there with reasoning off.
+Xum supports the GPT-6 tiers (GPT-6.1 Sol, GPT-6 Astra, and GPT-6 Luna); older OpenAI GPT models are no longer supported.
 
-GPT-6.1 Sol (the `gpt` and `sol` aliases) and GPT-6 Astra support thinking from low through max; OpenAI does not allow turning their reasoning off. Use the default Responses API route with them, because OpenAI does not support tool calling for these models on Chat Completions. GPT-6 Sol stays available as `openai:gpt-6-sol`.
+GPT-6 Luna supports thinking from off through max on the default Responses API route. On the opt-in Chat Completions route, Xum disables its reasoning because OpenAI only supports function calling there with reasoning off.
+
+GPT-6.1 Sol (the `gpt` and `sol` aliases) and GPT-6 Astra support thinking from low through max; OpenAI does not allow turning their reasoning off. Use the default Responses API route with them, because OpenAI does not support tool calling for these models on Chat Completions.
 
 ### OpenAI Ultrafast
 
-To use OpenAI's fastest processing tier, choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6 Astra, and GPT-5.6 Sol if your organization has preview access. Other models run without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate. OpenAI says GPT-6.1 Sol Ultrafast will arrive later.
+To use OpenAI's fastest processing tier, choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6 Astra. Other models run without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate. OpenAI says GPT-6.1 Sol Ultrafast will arrive later.
 
-### Pro reasoning mode (GPT-5.6 and GPT-6)
+### Pro reasoning mode (GPT-6)
 
-GPT-6 models (Astra, 6.1 Sol, Sol, and Luna) and every GPT-5.6 model support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
+GPT-6.1 Sol, GPT-6 Astra, and GPT-6 Luna support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
 
 For advisor calls, enable the Advisor Tool experiment and use its **Reasoning** picker under **Settings → Experiments**. Advisor Pro mode is saved independently of reasoning effort and the calling chat’s mode.
 
@@ -111,6 +105,41 @@ A catalog entry does not guarantee account access, tool support, or availability
 through every route. Adding a model is separate from choosing its route; see
 [Providers](/config/providers) for routing and credential setup.
 
+## Model fallbacks
+
+When a model refuses to respond, Xum can retry the turn on the next model in
+that model's fallback chain. Chains apply only to refusals, never to quota,
+auth, or network errors. Edit them under **Settings → Models → Model
+Fallbacks**, or in `~/.xum/config.json` under `modelFallbacks`.
+
+New installs start with these chains:
+
+| Model                         | Falls back to               |
+| ----------------------------- | --------------------------- |
+| `anthropic:claude-fable-5-1`  | `anthropic:claude-opus-5`   |
+| `anthropic:claude-sonnet-5-5` | `anthropic:claude-sonnet-5` |
+
+Claude Sonnet 5.5 can refuse some higher-risk cybersecurity requests, and
+Anthropic's own fallback for those requests is Claude Sonnet 5.
+
+Updates never change an existing config's chains. If your config predates the
+Sonnet 5.5 chain, add it by hand:
+
+1. Under **Settings → Models**, add the custom model `claude-sonnet-5` for
+   Anthropic.
+2. Under **Model Fallbacks**, add a chain for `anthropic:claude-sonnet-5-5` and
+   pick `anthropic:claude-sonnet-5`.
+
+Or add the entry to `~/.xum/config.json` directly:
+
+```json
+{
+  "modelFallbacks": {
+    "anthropic:claude-sonnet-5-5": { "models": ["anthropic:claude-sonnet-5"] }
+  }
+}
+```
+
 ## One-shot Overrides
 
 Override the model or thinking level for a single message using slash commands. The override applies only to that message — workspace settings stay unchanged.
@@ -130,10 +159,10 @@ Append `+level` to any model alias. Levels can be **named** (`off`, `low`, `medi
 
 Numeric levels are **model-relative** — they map to the model's allowed thinking range:
 
-- `0` = model's lowest allowed level (e.g., `off` for Haiku and Sonnet, `low` for Opus, `medium` for GPT-5.5 Pro)
+- `0` = model's lowest allowed level (e.g., `off` for Haiku and Sonnet, `low` for Opus or Astra)
 - Higher numbers select progressively higher levels, clamped to the model's maximum
 
-This means `/haiku+0` disables thinking while `/gpt-pro+0` sets thinking to medium (GPT-5.5 Pro's minimum).
+This means `/haiku+0` disables thinking while `/astra+0` sets thinking to low (Astra's minimum).
 
 Use `/+level` (no model) to override thinking on the current model: `/+0 quick answer`
 

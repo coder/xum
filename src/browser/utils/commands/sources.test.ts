@@ -422,7 +422,7 @@ test("thinking effort options use the visible effective model", async () => {
       goal: null,
       currentModel: "anthropic:claude-sonnet-4-5",
     } as unknown as WorkspaceState,
-    getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+    getEffectiveComposerModel: () => "openai:gpt-6.1-sol",
   });
   const thinkingAction = actions.find((action) => action.id === "thinking:set-level");
   const thinkingField = thinkingAction?.prompt?.fields.find((field) => field.type === "select");

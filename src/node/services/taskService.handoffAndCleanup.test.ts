@@ -1723,7 +1723,7 @@ describe("TaskService", () => {
       },
       agentAiDefaults: {
         exec: {
-          modelString: "openai:gpt-5.3-codex",
+          modelString: "openai:gpt-6.1-sol",
           thinkingLevel: "xhigh",
         },
       },
@@ -1737,7 +1737,7 @@ describe("TaskService", () => {
       expect.stringContaining("Implement the plan"),
       expect.objectContaining({
         agentId: "exec",
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         thinkingLevel: "xhigh",
       }),
       expect.objectContaining({ synthetic: true })
@@ -1749,7 +1749,7 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === childId);
 
     expect(updatedTask?.agentId).toBe("exec");
-    expect(updatedTask?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(updatedTask?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(updatedTask?.taskThinkingLevel).toBe("xhigh");
   });
 
@@ -1757,13 +1757,13 @@ describe("TaskService", () => {
     const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       agentAiDefaults: {
         exec: {
-          modelString: "openai:gpt-5.2",
+          modelString: "openai:gpt-6-luna",
           thinkingLevel: "medium",
         },
       },
       subagentAiDefaults: {
         exec: {
-          modelString: "openai:gpt-5.3-codex",
+          modelString: "openai:gpt-6.1-sol",
           thinkingLevel: "xhigh",
         },
       },
@@ -1777,7 +1777,7 @@ describe("TaskService", () => {
       expect.stringContaining("Implement the plan"),
       expect.objectContaining({
         agentId: "exec",
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-6.1-sol",
         thinkingLevel: "xhigh",
       }),
       expect.objectContaining({ synthetic: true })
@@ -1789,7 +1789,7 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === childId);
 
     expect(updatedTask?.agentId).toBe("exec");
-    expect(updatedTask?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(updatedTask?.taskModelString).toBe("openai:gpt-6.1-sol");
     expect(updatedTask?.taskThinkingLevel).toBe("xhigh");
   });
 

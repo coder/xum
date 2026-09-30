@@ -91,7 +91,7 @@ TB_TIMEOUT=600 make benchmark-terminal TB_SAMPLE_SIZE=5
 
 The agent adapter accepts a few Harbor kwargs (passed via `--agent-kwarg`):
 
-- `model_name`: Model to use (e.g., `anthropic/claude-opus-5-5`, `openai/gpt-5.6-sol`)
+- `model_name`: Model to use (e.g., `anthropic/claude-opus-5-5`, `openai/gpt-6.1-sol`)
 - `experiments`: Experiments to enable, comma-separated (e.g., `programmatic-tool-calling`)
 
 All other `mux run` CLI flags (thinking level, mode, runtime, budget, etc.) are passed via `MUX_RUN_ARGS` — no per-flag plumbing needed.
@@ -106,7 +106,7 @@ gh workflow run terminal-bench.yml \
 
 # Run GPT-5.6 Sol with budget cap and high thinking
 gh workflow run terminal-bench.yml \
-  -f model_name=openai/gpt-5.6-sol \
+  -f model_name=openai/gpt-6.1-sol \
   -f mux_run_args="--thinking high --budget 5.00"
 ```
 
@@ -133,7 +133,7 @@ gh workflow run terminal-bench.yml \
 MUX_RUN_ARGS="--thinking high --use-1m" make benchmark-terminal
 
 # Model and experiments via TB_ARGS
-MUX_RUN_ARGS="--thinking high" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=openai/gpt-5.6-sol --agent-kwarg experiments=programmatic-tool-calling"
+MUX_RUN_ARGS="--thinking high" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=openai/gpt-6.1-sol --agent-kwarg experiments=programmatic-tool-calling"
 ```
 
 ## Monitoring local benchmark output

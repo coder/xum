@@ -24,6 +24,7 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
   workspaceTurnMuxMetadata,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
@@ -810,7 +811,7 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  test("sendAgentTreeMessage withholds correlation from unaccepted workspace-turn registrations", async () => {
+  test("sendAgentTreeMessage never correlates a descendant with another workspace's delegated turn", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -832,6 +833,7 @@ describe("TaskService", () => {
     // Creation-time reservation on the ROOT: the record is persisted as running BEFORE the
     // owner's requireIdle send passes admission. Correlating a peer trigger with it would let
     // that trigger's stream-end settle the owner's unaccepted handle as the delegated result.
+    // Once accepted, the turn stays owner-only (#4997): the descendant waits for it either way.
     await registerLiveWorkspaceTurnHandle(
       taskService,
       "tree-root",
@@ -839,20 +841,9 @@ describe("TaskService", () => {
       "owner-ws",
       "reserved"
     );
-
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
     );
-    const [, , options, internalArg] = sendMessage.mock.calls[0] as [
-      string,
-      string,
-      { muxMetadata?: { type?: string } },
-      { workspaceTurnContinuation?: boolean },
-    ];
-    expect(options.muxMetadata?.type).toBe("agent-peer-message");
-    expect(internalArg.workspaceTurnContinuation).toBe(false);
-
-    // Once the owner's turn is admitted, the same registration correlates again.
     await registerLiveWorkspaceTurnHandle(
       taskService,
       "tree-root",
@@ -860,17 +851,41 @@ describe("TaskService", () => {
       "owner-ws",
       "accepted"
     );
-    expect(
-      (await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).success
-    ).toBe(true);
-    const [, , secondOptions, secondInternal] = sendMessage.mock.calls[1] as [
-      string,
-      string,
-      { muxMetadata?: { type?: string } },
-      { workspaceTurnContinuation?: boolean },
-    ];
-    expect(secondOptions.muxMetadata?.type).toBe("workspace-turn-task");
-    expect(secondInternal.workspaceTurnContinuation).toBe(true);
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).toEqual(
+      Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    const delivered = new Promise<void>((resolve) => {
+      sendMessage.mockImplementation(() => {
+        if (sendMessage.mock.calls.length === 2) resolve();
+        return Promise.resolve(Ok(undefined));
+      });
+    });
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      "tree-root"
+    );
+    await delivered;
+    // Both run as ordinary turns, in the order they were sent.
+    const calls = sendMessage.mock.calls as unknown as Array<
+      [
+        string,
+        string,
+        { muxMetadata?: { type?: string } },
+        { workspaceTurnContinuation?: boolean; preTurnMessages?: Array<{ parts: unknown[] }> },
+      ]
+    >;
+    expect(calls.map(([, , options]) => options.muxMetadata?.type)).toEqual([
+      "agent-peer-message",
+      "agent-peer-message",
+    ]);
+    expect(calls.map(([, , , internal]) => internal.workspaceTurnContinuation)).toEqual([
+      false,
+      false,
+    ]);
+    const payloads = calls.map(([, , , internal]) => JSON.stringify(internal.preTurnMessages));
+    expect(payloads[0]).toContain("status?");
+    expect(payloads[1]).toContain("second update");
   });
 
   test("listTaskTreeAgents strips stale execution overlays from peer rows", async () => {

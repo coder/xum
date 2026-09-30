@@ -93,6 +93,8 @@ export async function emitTurnEnvelope(params: {
   journal: DurableEventJournal;
   workspaceId: string;
   systemMessage: string;
+  /** Volatile tail length of systemMessage (see assemblePromptPayload); 0/absent = none. */
+  systemVolatileSuffixLength?: number;
   tools: Record<string, Tool>;
   modelString: string;
   thinkingLevel: string;
@@ -194,6 +196,9 @@ export async function emitTurnEnvelope(params: {
               : {}),
             ...(params.anthropicCacheTtl != null
               ? { anthropicCacheTtl: params.anthropicCacheTtl }
+              : {}),
+            ...(params.systemVolatileSuffixLength != null && params.systemVolatileSuffixLength > 0
+              ? { systemPromptVolatileSuffixLength: params.systemVolatileSuffixLength }
               : {}),
             ...(planTransitionContentHash !== undefined
               ? {
