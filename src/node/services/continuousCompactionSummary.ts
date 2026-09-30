@@ -12,11 +12,18 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import {
+  anthropicBetweenToolsRouteAvailable,
   buildProviderOptions,
   buildRequestHeaders,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import {
+  assistantThinkingLevels,
+  enforceThinkingPolicy,
+  resolveBetweenToolsThinkingLevel,
+} from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -123,11 +130,25 @@ export async function summarizeContinuousCompaction(args: {
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
     args.signal.throwIfAborted();
-    const thinkingLevel = enforceThinkingPolicy(
-      created.data.optionsModelString,
-      coerceThinkingLevel(options.thinkingLevel) ?? "off",
-      undefined,
-      created.data.optionsProvidersConfig
+    // Resolve Sonnet 5.5 "off" (between_tools or low adaptive, #5086) before message
+    // preparation so the prepared messages and the provider options agree.
+    const thinkingLevel = resolveBetweenToolsThinkingLevel(
+      resolveModelForMetadata(
+        created.data.optionsModelString,
+        created.data.optionsProvidersConfig ?? null
+      ),
+      enforceThinkingPolicy(
+        created.data.optionsModelString,
+        coerceThinkingLevel(options.thinkingLevel) ?? "off",
+        undefined,
+        created.data.optionsProvidersConfig
+      ),
+      anthropicBetweenToolsRouteAvailable(
+        created.data.optionsModelString,
+        created.data.optionsRouteProvider,
+        created.data.optionsProvidersConfig
+      ),
+      assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(args.head))
     );
     const prepared = prepareProviderRequestMessages(
       args.head,
