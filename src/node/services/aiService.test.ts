@@ -317,6 +317,7 @@ function resolvedAgentResultFor(
       taskDepth: 0,
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
+      switchableAgentToolPolicies: undefined,
     },
   };
 }
@@ -2534,6 +2535,120 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
     expect(toolConfig).toMatchObject({
       memoryIndexEntries: [{ path: "/memories/global/lesson.md", description: "a lesson" }],
+    });
+  });
+
+  describe("one tool set across agent-mode switches (#5253)", () => {
+    async function streamWithRealAgentTools(
+      xumHomePath: string,
+      metadataOverrides: Partial<WorkspaceMetadata>,
+      agentIds: string[]
+    ) {
+      const projectPath = path.join(xumHomePath, "project");
+      await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
+      // A read-only custom root agent: no edit tools, no bash.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "reader.md"),
+        "---\nname: Reader\ndescription: Read-only agent\ntools:\n  add:\n    - file_read\n---\n\nRead only.\n"
+      );
+      const workspaceId = "workspace-stable-agent-tools";
+      const harness = createHarness(
+        xumHomePath,
+        createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides)
+      );
+      // Real agent resolution and tool assembly: the advertised block is under test.
+      harness.getToolsForModelSpy.mockRestore();
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      const toolsByAgent: Record<string, Record<string, Tool>> = {};
+      for (const agentId of agentIds) {
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+          agentId,
+        });
+        expect(result.success).toBe(true);
+        toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
+      }
+      return { toolsByAgent, projectPath };
+    }
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(
+        Object.entries(tools).map(([name, tool]) => [
+          name,
+          tool.description,
+          asSchema(tool.inputSchema).jsonSchema,
+        ])
+      );
+    const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
+
+    it("keeps the tool block byte-identical across exec, plan and a custom agent", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent, projectPath } = await streamWithRealAgentTools(xumHome.path, {}, [
+        "exec",
+        "plan",
+        "reader",
+      ]);
+      const exec = toolsByAgent.exec;
+      expect(shape(toolsByAgent.plan)).toBe(shape(exec));
+      expect(shape(toolsByAgent.reader)).toBe(shape(exec));
+      for (const name of ["propose_plan", "task_remove", "file_edit_insert", "bash"]) {
+        expect(exec[name]).toBeDefined();
+      }
+      // Tools no switchable agent allows (global config tools) stay out.
+      expect(exec.mux_config_write).toBeUndefined();
+
+      // The read-only agent is refused before any side effect.
+      const target = path.join(projectPath, "created-by-reader.txt");
+      expect(
+        await toolsByAgent.reader.file_edit_insert.execute!(
+          { path: target, content: "x", insert_after: null, insert_before: null },
+          callOptions
+        )
+      ).toEqual({
+        success: false,
+        error: "Tool 'file_edit_insert' is not allowed in reader mode. Switch agents to use it.",
+      });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+      expect(
+        await toolsByAgent.reader.bash.execute!(
+          { script: `touch ${target}`, timeout_secs: 5, display_name: "t" },
+          callOptions
+        )
+      ).toEqual({
+        success: false,
+        error: "Tool 'bash' is not allowed in reader mode. Switch agents to use it.",
+      });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+      // Each built-in mode refuses the other mode's tools.
+      expect(
+        await toolsByAgent.plan.task_remove.execute!({ task_ids: ["t"] }, callOptions)
+      ).toEqual({
+        success: false,
+        error: "Tool 'task_remove' is not allowed in plan mode. Switch agents to use it.",
+      });
+      expect(await exec.propose_plan.execute!({}, callOptions)).toEqual({
+        success: false,
+        error: "Tool 'propose_plan' is not allowed in exec mode. Switch agents to use it.",
+      });
+    });
+
+    it.each([
+      { label: "hidden root agent (explore)", overrides: {}, agentId: "explore" },
+      {
+        label: "sub-agent",
+        overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
+        agentId: "exec",
+      },
+    ])("keeps per-agent tool sets for a $label", async ({ overrides, agentId }) => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, overrides, [agentId]);
+      const tools = toolsByAgent[agentId];
+      // Explore and exec sub-agents never get propose_plan; absent, not refused.
+      expect(tools.propose_plan).toBeUndefined();
+      expect(tools.file_read).toBeDefined();
     });
   });
 

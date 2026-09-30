@@ -1576,6 +1576,7 @@ export class TurnRequestBuilder {
       taskDepth,
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
+      switchableAgentToolPolicies,
     } = agentResult.data;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
@@ -2666,6 +2667,8 @@ export class TurnRequestBuilder {
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
+          switchableAgentToolPolicies,
+          activeAgentId: effectiveAgentId,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
