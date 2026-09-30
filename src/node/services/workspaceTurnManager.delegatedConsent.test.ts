@@ -10,6 +10,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
   workspaceTurnOwnerLockPath,
   type WorkspaceTurnManager,
@@ -54,6 +55,11 @@ describe("delegated target default consent (#4453)", () => {
     const host = createWorkspaceServiceMocks({
       create: mock(async (...args: Parameters<WorkspaceHost["create"]>) => {
         const result = await real.create(...args);
+        await options.afterCreate?.();
+        return result;
+      }),
+      createScratch: mock(async (...args: Parameters<WorkspaceHost["createScratch"]>) => {
+        const result = await real.createScratch(...args);
         await options.afterCreate?.();
         return result;
       }),
@@ -349,6 +355,77 @@ describe("delegated target default consent (#4453)", () => {
     expect(git("worktree", "list")).not.toContain(path.join(srcBaseDir, "repo", branch));
     expect(git("branch", "--list", branch) === "").toBe(!existing);
     if (tipBefore !== undefined) expect(git("rev-parse", branch)).toBe(tipBefore);
+  });
+
+  /** A project-less scratch chat as the owner; its workdir sits under the managed scratch root. */
+  async function setUpScratchOwner(options: Parameters<typeof backend>[0] = {}) {
+    const a = await backend(options);
+    const parentId = "5555555555";
+    const parentPath = path.join(rootDir, "scratch", parentId);
+    await fsPromises.mkdir(parentPath, { recursive: true });
+    await a.config.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        projectKind: "system",
+        trusted: true,
+        workspaces: [
+          {
+            kind: "scratch",
+            path: parentPath,
+            id: parentId,
+            name: `scratch-${parentId}`,
+            createdAt: new Date().toISOString(),
+            runtimeConfig: { type: "local" },
+            aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+          },
+        ],
+      });
+      cfg.taskSettings = { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 };
+      return cfg;
+    });
+    return { ...a, parentId, parentPath };
+  }
+
+  test("a scratch owner's mode new creates a scratch target under the same consent contract", async () => {
+    const { config, manager, parentId } = await setUpScratchOwner();
+    // Scratch chats have no git branch to name or base on.
+    const refused = await manager.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize",
+      title: "Workspace turn",
+      workspace: { mode: "new", branchName: "feature" },
+    });
+    expect(refused.success ? "" : refused.error).toContain("no git branch");
+    expect(findWorkspaceEntry(config.loadConfigOrDefault(), TARGET)).toBeNull();
+
+    await start(manager, parentId, { mode: "new" });
+    const entry = findWorkspaceEntry(config.loadConfigOrDefault(), TARGET);
+    expect(entry?.projectPath).toBe(SCRATCH_PROJECT_CONFIG_KEY);
+    expect(entry?.workspace.kind).toBe("scratch");
+    expect(entry?.workspace.parentWorkspaceId).toBeUndefined();
+    expect(await fsPromises.stat(entry!.workspace.path).then((st) => st.isDirectory())).toBe(true);
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
+    // The handle record persisted, so the creator's crash-binding mark was dropped.
+    expect(mark(config)).toBeUndefined();
+
+    await endTurn(manager, parentId);
+    expect(targetRow(config).consent).toBeDefined();
+    expect(targetRow(config).pending).toBeUndefined();
+  });
+
+  test("a scratch owner's exit before the handle record removes only the new scratch target", async () => {
+    const late: { a?: Awaited<ReturnType<typeof setUpScratchOwner>> } = {};
+    const a = await setUpScratchOwner({
+      afterCreate: () => archive(late.a!.config, late.a!.parentId),
+    });
+    late.a = a;
+    const created = await createTurn(a.manager, a.parentId, { mode: "new" });
+
+    expect(created.success ? "" : created.error).toContain("owner workspace was archived");
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).toBeNull();
+    expect(
+      await fsPromises.stat(path.join(rootDir, "scratch", TARGET)).catch(() => null)
+    ).toBeNull();
+    expect(await fsPromises.stat(a.parentPath).then(() => true)).toBe(true);
   });
 
   test("a failed grant write still settles the turn and leaves the target off", async () => {
