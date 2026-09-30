@@ -3,7 +3,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { TokenizerService, type WorkspaceTokenStats } from "./tokenizerService";
 import { HistoryService, mergeTranscriptPartial } from "./historyService";
-import { SessionUsageService } from "./sessionUsageService";
+import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import * as tokenizerUtils from "@/node/utils/main/tokenizer";
 import * as statsUtils from "@/common/utils/tokens/tokenStatsCalculator";
@@ -647,6 +647,17 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
   });
 
   const sessionFile = (name: string) => path.join(fixture.config.sessionsDir, WS, name);
+  type CacheCounters = Pick<SessionUsageTokenStatsCacheV1, "consumers" | "totalTokens">;
+  /** Corrupts the persisted counters in place, keeping its source (receipt + inputs). */
+  async function editCacheCounters(edit: (cache: CacheCounters) => void): Promise<void> {
+    const file = sessionFile("session-usage.json");
+    const usageFile = JSON.parse(await fs.readFile(file, "utf-8")) as {
+      tokenStatsCache: SessionUsageTokenStatsCacheV1;
+    };
+    assert(usageFile.tokenStatsCache.source && usageFile.tokenStatsCache.consumers.length > 0);
+    edit(usageFile.tokenStatsCache);
+    await fs.writeFile(file, JSON.stringify(usageFile));
+  }
   const text = (label: string) => `${label} lorem ipsum ${nextId++} dolor sit amet`;
   /** Reads through the prototype so the spy only counts TokenizerService's reads. */
   async function rows(): Promise<MuxMessage[]> {
@@ -852,6 +863,14 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
       name: "a corrupted receipt",
       change: () => fs.writeFile(sessionFile(HISTORY_APPEND_PROVENANCE_FILE), "{ corrupt"),
     },
+    // The receipt still matches, but the counters break the write-path invariants.
+    ...[
+      {
+        name: "a negative consumer count",
+        edit: (c: CacheCounters) => (c.consumers[0].tokens = -1),
+      },
+      { name: "a totalTokens mismatch", edit: (c: CacheCounters) => (c.totalTokens += 1) },
+    ].map(({ name, edit }) => ({ name, change: () => editCacheCounters(edit) })),
   ];
   for (const testCase of cases) {
     test(`recounts after ${testCase.name}`, async () => {

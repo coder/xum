@@ -108,7 +108,10 @@ export class TokenizerService {
       cached.model === input.model &&
       cached.providersConfigVersion === computeProvidersConfigFingerprint(providersConfig) &&
       cached.source.inputsKey === inputsKey &&
-      cached.source.historyReceipt === before
+      cached.source.historyReceipt === before &&
+      // Same invariants as the write path: corrupt counters are a miss (sum of tokens >= 0).
+      cached.consumers.reduce((sum, c) => (c.tokens >= 0 ? sum + c.tokens : NaN), 0) ===
+        cached.totalTokens
     ) {
       const { consumers, totalTokens, tokenizerName, topFilePaths } = cached;
       return { consumers, totalTokens, model: input.model, tokenizerName, topFilePaths };
