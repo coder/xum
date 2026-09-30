@@ -861,7 +861,8 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
     await service.putListEntry(entry(projectPath, "dup", { subProjectPath: "/c" }));
     const expected = [entry(projectPath, "dup", { subProjectPath: "/c" })];
     expect((await new DraftService(config).getList()).entries).toEqual(expected);
-    expect(JSON.parse(await fs.readFile(listFile, "utf-8")).entries).toEqual(expected);
+    const file = JSON.parse(await fs.readFile(listFile, "utf-8")) as { entries: unknown };
+    expect(file.entries).toEqual(expected);
   });
 
   it("a legacy row replaces a row relisted from its body, also after a restart", async () => {
@@ -916,9 +917,9 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
       text: "first text",
     });
     const first = await new DraftService(config).getSnapshotEvent();
-    expect(first.list.entries).toEqual([
-      expect.objectContaining({ draftId: "first", subProjectPath: null }),
-    ]);
+    expect(
+      first.list.entries.map(({ draftId, subProjectPath }) => [draftId, subProjectPath])
+    ).toEqual([["first", null]]);
     expect(await exists(listFile)).toBe(true);
 
     // The same with a healthy list.json that has other rows.
