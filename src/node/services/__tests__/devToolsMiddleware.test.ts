@@ -12,12 +12,14 @@ import type {
 } from "@ai-sdk/provider";
 import { Config } from "@/node/config";
 import {
+  DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   captureAndStripDevToolsHeader,
   consumeRedactedRequestBody,
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
+import * as promptPrefixFingerprint from "@/node/services/promptPrefixFingerprint";
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
   const config = new Config(path.dirname(opts.sessionsDir));
@@ -970,5 +972,131 @@ describe("createDevToolsMiddleware", () => {
       expect(firstStep?.stepNumber).toBe(1);
       expect(secondStep?.stepNumber).toBe(2);
     });
+  });
+});
+
+describe("prompt-prefix fingerprints (#5254)", () => {
+  let tempDir: string;
+  let sessionsDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-devtools-prefix-test-"));
+    sessionsDir = path.join(tempDir, "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const cached = { anthropic: { cacheControl: { type: "ephemeral" as const } } };
+  function prefixParams(options: {
+    readDescription?: string;
+    tail?: string;
+    metadataId: string;
+  }): LanguageModelV4CallOptions {
+    return {
+      prompt: [
+        { role: "system", content: "Stable system", providerOptions: cached },
+        ...(options.tail != null ? [{ role: "system" as const, content: options.tail }] : []),
+        { role: "user", content: [{ type: "text", text: "Hello" }] },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "file_read",
+          description: options.readDescription ?? "Read a file",
+          inputSchema: { type: "object" },
+        },
+        {
+          type: "function",
+          name: "bash",
+          description: "Run a command",
+          inputSchema: { type: "object" },
+          providerOptions: cached,
+        },
+      ],
+      headers: { [DEVTOOLS_RUN_METADATA_ID_HEADER]: options.metadataId },
+    };
+  }
+
+  // One middleware per request, like providerModelFactory: each is its own run.
+  async function generate(
+    service: DevToolsService,
+    params: LanguageModelV4CallOptions,
+    runMetadata: { agentId?: string; liveTurn?: boolean }
+  ) {
+    const metadataId = params.headers?.[DEVTOOLS_RUN_METADATA_ID_HEADER];
+    if (typeof metadataId !== "string") throw new Error("expected a run metadata id");
+    service.setPendingRunMetadata("ws-1", metadataId, runMetadata);
+    await getWrapGenerate(createDevToolsMiddleware("ws-1", service))({
+      doGenerate: () => Promise.resolve(createGenerateResult()),
+      doStream: () => Promise.reject(new Error("doStream should not be called")),
+      params,
+      model: createMockModel(),
+    });
+    const runs = await service.getRuns("ws-1");
+    const newest = runs.reduce((a, b) => (a.startedAt >= b.startedAt ? a : b));
+    const run = await service.getRunWithSteps("ws-1", newest.id);
+    return run?.steps[0]?.promptPrefix;
+  }
+
+  it("computes nothing while API debug logs are off", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: false }));
+    const fingerprint = spyOn(promptPrefixFingerprint, "fingerprintPromptPrefix");
+    let called = false;
+    await getWrapGenerate(createDevToolsMiddleware("ws-1", service))({
+      doGenerate: () => {
+        called = true;
+        return Promise.resolve(createGenerateResult());
+      },
+      doStream: () => Promise.reject(new Error("doStream should not be called")),
+      params: prefixParams({ metadataId: "m-off" }),
+      model: createMockModel(),
+    });
+    expect(called).toBe(true);
+    expect(fingerprint).not.toHaveBeenCalled();
+    fingerprint.mockRestore();
+  });
+
+  it("names what changed between live turns and ignores compaction", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+
+    const first = await generate(service, prefixParams({ metadataId: "m1" }), live);
+    expect(first?.systemTailHash).toBeNull();
+    expect(first?.change).toBeUndefined();
+
+    const reworded = await generate(
+      service,
+      prefixParams({ metadataId: "m2", readDescription: "Read any file" }),
+      live
+    );
+    expect(reworded?.change).toEqual({ components: ["tool-description:file_read"] });
+    expect(reworded?.toolsHash).not.toBe(first?.toolsHash);
+
+    // A different prompt from compaction neither compares nor moves the baseline.
+    const compaction = await generate(
+      service,
+      prefixParams({ metadataId: "m3", tail: "Summarize" }),
+      { agentId: "compact", liveTurn: false }
+    );
+    expect(compaction?.change).toBeUndefined();
+
+    const switched = await generate(
+      service,
+      prefixParams({ metadataId: "m4", readDescription: "Read any file", tail: "Warning" }),
+      { agentId: "plan", liveTurn: true }
+    );
+    expect(switched?.change).toEqual({
+      components: ["system-tail-only"],
+      expected: "agent-switch",
+    });
+    expect(switched?.systemPrefixHash).toBe(first?.systemPrefixHash);
+
+    // Clearing the log drops the baseline: the next request starts fresh.
+    await service.clear("ws-1");
+    const afterClear = await generate(service, prefixParams({ metadataId: "m5" }), live);
+    expect(afterClear?.change).toBeUndefined();
   });
 });

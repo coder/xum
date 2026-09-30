@@ -14,6 +14,10 @@ export interface DevToolsRun {
    * toggling). Absent on runs recorded by older binaries.
    */
   requestHistorySequence?: number;
+  /** Effective agent of a live turn; a switch explains a prompt-prefix change (#5254). */
+  agentId?: string;
+  /** A user-facing turn (not compaction or a background call): compared for prefix changes. */
+  liveTurn?: boolean;
 }
 
 /** A "step" = a single LLM round-trip within a run. */
@@ -35,6 +39,24 @@ export interface DevToolsStep {
   responseHeaders: Record<string, string> | null;
   rawResponse: unknown;
   rawChunks: unknown;
+  /** Absent on records from older binaries or with API debug logs off at call time. */
+  promptPrefix?: DevToolsPromptPrefix;
+}
+
+/**
+ * Prompt-cache prefix fingerprint of the step's SDK input (#5254): hashes of
+ * the ordered tool block, the cached system rows and the uncached system tail.
+ */
+export interface DevToolsPromptPrefix {
+  toolsHash: string;
+  systemPrefixHash: string;
+  systemTailHash: string | null;
+  /** Live turns only: what differs from the workspace's previous live request. */
+  change?: {
+    components: string[];
+    /** Set when a model or agent switch explains the change. */
+    expected?: "model-switch" | "agent-switch";
+  };
 }
 
 export interface DevToolsStepInput {

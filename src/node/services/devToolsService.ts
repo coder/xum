@@ -7,12 +7,17 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type {
   DevToolsEvent,
   DevToolsLogEntry,
+  DevToolsPromptPrefix,
   DevToolsRun,
   DevToolsRunSummary,
   DevToolsStep,
 } from "@/common/types/devtools";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
+import {
+  diffPromptPrefix,
+  type PromptPrefixFingerprint,
+} from "@/node/services/promptPrefixFingerprint";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
@@ -261,7 +266,9 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
   };
 }
 
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">>;
+type PendingRunMetadata = Partial<
+  Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence" | "agentId" | "liveTurn">
+>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -275,6 +282,15 @@ export class DevToolsService extends EventEmitter {
    * one pending metadata payload per request instead of a single workspace slot.
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
+  /**
+   * The previous live request's prompt prefix per workspace (#5254), in memory
+   * only: after a restart or re-enable the first request sets a new baseline.
+   * Dropped with the workspace's devtools data (clear, remove, archive).
+   */
+  private readonly promptPrefixBaselines = new Map<
+    string,
+    { fingerprint: PromptPrefixFingerprint; modelId: string; agentId: string | undefined }
+  >();
   private readonly maxRetainedBytesPerWorkspace: number;
 
   constructor(
@@ -395,7 +411,11 @@ export class DevToolsService extends EventEmitter {
     this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
 
-  async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
+  async createStep(
+    workspaceId: string,
+    step: DevToolsStep,
+    promptPrefix?: PromptPrefixFingerprint
+  ): Promise<void> {
     if (!this.enabled) {
       return;
     }
@@ -405,6 +425,14 @@ export class DevToolsService extends EventEmitter {
 
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
+    if (promptPrefix != null) {
+      step.promptPrefix = this.comparePromptPrefix(
+        workspaceId,
+        data.runs.get(step.runId),
+        step.modelId,
+        promptPrefix
+      );
+    }
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
@@ -473,6 +501,31 @@ export class DevToolsService extends EventEmitter {
     }
     this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
     this.emitRunEventIfRetained(workspaceId, data, "run-updated", step.runId);
+  }
+
+  /** Compares a live turn's prefix with the workspace's previous live request (#5254). */
+  private comparePromptPrefix(
+    workspaceId: string,
+    run: DevToolsRun | undefined,
+    modelId: string,
+    fingerprint: PromptPrefixFingerprint
+  ): DevToolsPromptPrefix {
+    const { tools: _tools, ...recorded } = fingerprint;
+    // Compaction and background calls have their own prompts; they neither
+    // compare nor move the live baseline.
+    if (run?.liveTurn !== true) return recorded;
+    const previous = this.promptPrefixBaselines.get(workspaceId);
+    this.promptPrefixBaselines.set(workspaceId, { fingerprint, modelId, agentId: run.agentId });
+    if (previous == null) return recorded;
+    const components = diffPromptPrefix(previous.fingerprint, fingerprint);
+    if (components.length === 0) return recorded;
+    const expected =
+      previous.modelId !== modelId
+        ? "model-switch"
+        : previous.agentId !== run.agentId
+          ? "agent-switch"
+          : undefined;
+    return { ...recorded, change: { components, ...(expected != null ? { expected } : {}) } };
   }
 
   async updateStep(
@@ -616,6 +669,7 @@ export class DevToolsService extends EventEmitter {
     data.loaded = true;
     data.replayComplete = true;
     this.pendingRunMetadata.delete(workspaceId);
+    this.promptPrefixBaselines.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
     await this.enqueueWrite(workspaceId, () =>
@@ -653,6 +707,7 @@ export class DevToolsService extends EventEmitter {
     // appends no-ops via the workspace guard in appendToFile.
     this.workspaces.delete(workspaceId);
     this.pendingRunMetadata.delete(workspaceId);
+    this.promptPrefixBaselines.delete(workspaceId);
 
     // Enqueue the deletion so it serializes behind any pending appends.
     await this.enqueueWrite(workspaceId, async () => {

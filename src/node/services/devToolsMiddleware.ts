@@ -27,6 +27,7 @@ import {
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
+import { fingerprintPromptPrefix } from "./promptPrefixFingerprint";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -316,7 +317,9 @@ export function createDevToolsMiddleware(
 
       await service.createStep(
         workspaceId,
-        createEmptyStep(stepId, runId, stepNumber, stepType, model, input)
+        createEmptyStep(stepId, runId, stepNumber, stepType, model, input),
+        // Only on this debug-logs-on path: no hashing cost otherwise (#5254).
+        fingerprintPromptPrefix(params)
       );
 
       return {
