@@ -738,8 +738,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const workspaceStore = useWorkspaceStoreRaw();
 
   useLayoutEffect(() => {
-    // Settings keeps the workspace it was opened over in currentWorkspaceId. Analytics and cold
-    // settings links carry none, but should still preserve the active workspace subscription
+    // Settings and analytics keep the workspace they were opened over in currentWorkspaceId.
+    // Cold modal links carry none, but should still preserve the active workspace subscription
     // so chat messages aren't cleared.
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);

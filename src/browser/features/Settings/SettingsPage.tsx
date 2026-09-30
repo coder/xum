@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import {
   Blocks,
   Brain,
@@ -23,6 +23,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
@@ -46,7 +47,6 @@ import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
 const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
-const FOCUS_HISTORY_LIMIT = 3;
 
 const BASE_SECTIONS: SettingsSection[] = [
   {
@@ -224,29 +224,7 @@ export function SettingsPage() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
-  // Radix only returns focus to a DialogTrigger, and settings opens from shortcuts, menus, and the
-  // command palette, whose focused item often unmounts as settings opens. Recent focus is tracked
-  // while closed so closing can fall back to the latest element still on the page.
-  const focusHistoryRef = useRef<HTMLElement[]>([]);
-  const returnFocusRef = useRef<HTMLElement[]>([]);
-
-  useEffect(() => {
-    if (isOpen) {
-      return;
-    }
-    const recordFocus = (event: FocusEvent) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) {
-        return;
-      }
-      focusHistoryRef.current = [
-        target,
-        ...focusHistoryRef.current.filter((element) => element !== target),
-      ].slice(0, FOCUS_HISTORY_LIMIT);
-    };
-    document.addEventListener("focusin", recordFocus);
-    return () => document.removeEventListener("focusin", recordFocus);
-  }, [isOpen]);
+  const focusReturn = useModalFocusReturn(isOpen);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
@@ -296,29 +274,8 @@ export function SettingsPage() {
         showCloseButton={false}
         allowEditableEscape
         aria-describedby={undefined}
-        onOpenAutoFocus={() => {
-          returnFocusRef.current = focusHistoryRef.current;
-        }}
-        onCloseAutoFocus={(e) => {
-          e.preventDefault();
-          const candidates = returnFocusRef.current;
-          returnFocusRef.current = [];
-          // Closing by navigating elsewhere can hand focus to the destination (a newly shown chat
-          // input autofocuses); only recover focus that fell back to the body.
-          const active = document.activeElement;
-          if (active instanceof HTMLElement && active !== document.body && active.isConnected) {
-            return;
-          }
-          for (const candidate of candidates) {
-            if (!candidate.isConnected) {
-              continue;
-            }
-            candidate.focus();
-            if (document.activeElement === candidate) {
-              return;
-            }
-          }
-        }}
+        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
         className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">

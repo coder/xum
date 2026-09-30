@@ -5,7 +5,7 @@
  * Pixel snapshots both light and dark themes at the phone viewport.
  */
 
-import { userEvent, within, waitFor } from "@storybook/test";
+import { expect, userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -229,7 +229,8 @@ export const IPhone16ePRLinkPlacement: AppStory = {
   },
 };
 
-export const IPhone16eAnalyticsSidebarControl: AppStory = {
+// Analytics opens as a full-screen sheet over the still-mounted chat; ends open for the capture.
+export const IPhone16eAnalyticsSheet: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
@@ -259,12 +260,21 @@ export const IPhone16eAnalyticsSidebarControl: AppStory = {
     await stabilizePhoneViewportStory(canvasElement);
 
     await userEvent.click(await canvas.findByTestId("analytics-button"));
-    await canvas.findByTestId("analytics-header");
-    await userEvent.click(canvas.getByRole("button", { name: "Collapse sidebar" }));
+    const dialog = await within(canvasElement.ownerDocument.body).findByRole(
+      "dialog",
+      { name: "Analytics" },
+      { timeout: 10000 }
+    );
+    await expect(canvasElement.querySelector('[data-testid="message-window"]')).not.toBeNull();
 
-    const openSidebarButton = await canvas.findByRole("button", { name: "Open sidebar" });
-    if (!openSidebarButton.classList.contains("mobile-menu-btn")) {
-      throw new Error("Analytics sidebar opener is not enabled for the phone viewport");
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const close = within(dialog).getByRole("button", { name: "Close analytics" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     }
 
     blurActiveElement();

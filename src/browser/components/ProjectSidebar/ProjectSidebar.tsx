@@ -729,13 +729,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceStore = useWorkspaceStoreRaw();
   useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
-  const { navigateToProject } = useRouter();
+  const { navigateToProject, isAnalyticsOpen } = useRouter();
   const { api } = useAPI();
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
-  // The settings modal covers the chat without changing the route's workspace; treat the
-  // covered workspace as unselected so its unread state stays visible until settings closes.
-  const visibleSelectedWorkspaceId = settings.isOpen ? undefined : selectedWorkspace?.workspaceId;
+  // The settings and analytics modals cover the chat without changing the route's workspace;
+  // treat the covered workspace as unselected so its unread state stays visible until they close.
+  const visibleSelectedWorkspaceId =
+    settings.isOpen || isAnalyticsOpen ? undefined : selectedWorkspace?.workspaceId;
 
   // Get project state and operations from context
   const {

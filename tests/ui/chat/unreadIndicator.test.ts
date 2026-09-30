@@ -17,7 +17,7 @@ import { fireEvent, waitFor } from "@testing-library/react";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
-import { openSettingsDialog } from "../helpers";
+import { openAnalyticsDialog, openSettingsDialog } from "../helpers";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getNotifyOnResponseKey, getWorkspaceLastReadKey } from "@/common/constants/storage";
@@ -39,13 +39,17 @@ function getWorkspaceUnreadState(workspaceId: string): {
 }
 
 /**
- * Send a gated message, open the settings modal over the still-mounted chat, then let the
- * response stream to completion underneath it.
+ * Send a gated message, open a modal (settings by default) over the still-mounted chat, then let
+ * the response stream to completion underneath it.
  */
-async function sendGatedMessageUnderSettings(app: AppHarness, text: string): Promise<void> {
+async function sendGatedMessageUnderModal(
+  app: AppHarness,
+  text: string,
+  openModal: (container: HTMLElement) => Promise<unknown> = openSettingsDialog
+): Promise<void> {
   const message = `[mock:wait-start] ${text}`;
   await app.chat.send(message);
-  await openSettingsDialog(app.view.container);
+  await openModal(app.view.container);
   expect(app.view.container.querySelector('[data-testid="message-window"]') !== null).toBe(true);
 
   app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
@@ -273,30 +277,37 @@ describe("Unread indicator (mock AI router)", () => {
       expect(isUnread(pastTime)).toBe(true);
     });
 
-    test("stream completion while the settings modal covers the chat stays unread and notifies", async () => {
-      // Regression: settings covers the chat without changing the route's workspace, so a
-      // completion must neither mark it read nor be suppressed as "already viewing".
-      updatePersistedState(getNotifyOnResponseKey(app.workspaceId), true);
-      const notifications = captureBrowserNotifications();
-      try {
-        await sendGatedMessageUnderSettings(app, "completion while in settings");
+    test.each([
+      ["settings", openSettingsDialog],
+      ["analytics", openAnalyticsDialog],
+    ] as const)(
+      "stream completion while the %s modal covers the chat stays unread and notifies",
+      async (modal, openModal) => {
+        // Regression: the modal covers the chat without changing the route's workspace, so a
+        // completion must neither mark it read nor be suppressed as "already viewing".
+        updatePersistedState(getNotifyOnResponseKey(app.workspaceId), true);
+        const notifications = captureBrowserNotifications();
+        try {
+          await sendGatedMessageUnderModal(app, `completion while in ${modal}`, openModal);
 
-        const { recencyTimestamp, isUnread } = getWorkspaceUnreadState(app.workspaceId);
-        expect(recencyTimestamp).not.toBeNull();
-        expect(isUnread(getLastReadTimestamp(app.workspaceId))).toBe(true);
-        await waitFor(() => {
-          expect(
-            getWorkspaceUnreadIndicator(app.view.container, app.workspaceId)?.hasUnreadBar
-          ).toBe(true);
-        });
-        await waitFor(() => expect(notifications.titles).toHaveLength(1));
-      } finally {
-        notifications.restore();
-      }
-    }, 60_000);
+          const { recencyTimestamp, isUnread } = getWorkspaceUnreadState(app.workspaceId);
+          expect(recencyTimestamp).not.toBeNull();
+          expect(isUnread(getLastReadTimestamp(app.workspaceId))).toBe(true);
+          await waitFor(() => {
+            expect(
+              getWorkspaceUnreadIndicator(app.view.container, app.workspaceId)?.hasUnreadBar
+            ).toBe(true);
+          });
+          await waitFor(() => expect(notifications.titles).toHaveLength(1));
+        } finally {
+          notifications.restore();
+        }
+      },
+      60_000
+    );
 
     test("focus while the settings modal is open does NOT mark read", async () => {
-      await sendGatedMessageUnderSettings(app, "focus bypass test");
+      await sendGatedMessageUnderModal(app, "focus bypass test");
 
       // Simulate the user alt-tabbing back while settings still covers the chat.
       const lastReadBeforeFocus = getLastReadTimestamp(app.workspaceId);
