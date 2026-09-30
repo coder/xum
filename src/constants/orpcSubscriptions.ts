@@ -25,3 +25,7 @@ export const ONCHAT_REPLAY_BATCH_ROW_TEXT_LIMIT = 64 * 1024;
 // of that size kept caught-up under the #4961 target; the byte cap bounds a window of giant rows.
 export const ONCHAT_REPLAY_WINDOW_MAX_ROWS = 2_000;
 export const ONCHAT_REPLAY_WINDOW_MAX_BYTES = 8 * 1024 * 1024;
+
+// history.loadMore pages inside the active epoch for a windowed client (#4961), half a window.
+export const HISTORY_PAGE_MAX_ROWS = 1_000;
+export const HISTORY_PAGE_MAX_BYTES = 8 * 1024 * 1024;

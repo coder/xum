@@ -16,7 +16,9 @@ import {
   scanHistoryFilesBounded,
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
+  readProviderHistoryPage,
   readProviderHistoryWindow,
+  type HistoryPage,
   type HistoryWindow,
   type HistoryWindowCaps,
   openHistorySnapshot,
@@ -2619,6 +2621,26 @@ export class HistoryService {
             caps
           )
         );
+      }
+    );
+  }
+
+  /** In-epoch page before `beforeHistorySequence` (#4961); see readProviderHistoryPage. */
+  async getHistoryPageFromLatestBoundary(
+    workspaceId: string,
+    caps: HistoryWindowCaps,
+    beforeHistorySequence: number
+  ): Promise<Result<HistoryPage>> {
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history page",
+      async () => {
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        const paths = {
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        };
+        return Ok(await readProviderHistoryPage(paths, caps, beforeHistorySequence));
       }
     );
   }

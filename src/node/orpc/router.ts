@@ -2067,7 +2067,9 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.history.loadMore.input)
           .output(schemas.workspace.history.loadMore.output)
           .handler(async ({ context, input }) =>
-            context.workspaceService.getHistoryLoadMore(input.workspaceId, input.cursor)
+            context.workspaceService.getHistoryLoadMore(input.workspaceId, input.cursor, {
+              windowed: input.windowed === true,
+            })
           ),
         lastUserPrompt: t
           .input(schemas.workspace.history.lastUserPrompt.input)

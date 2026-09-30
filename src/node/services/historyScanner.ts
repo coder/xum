@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { createHash } from "node:crypto";
 import assert from "node:assert";
 import {
@@ -893,6 +894,18 @@ async function projectScannedRow(
 // (dropping malformed rows, re-reading oversized ones) and trims forward only, to the first clean
 // turn start. There is no backward extension.
 
+// Pages before a cursor (#4961 PR3) reuse the same scan. Contract of readProviderHistoryPage:
+// - A page holds at most `maxRows` rows and `maxBytes` raw row bytes, and never a row that full
+//   replay would drop.
+// - The cursor is the numeric historySequence of the client's oldest row. A page ends right
+//   before the cursor row and starts at a clean turn start (as above), or at the epoch start.
+// - The only fallback is "not-pageable" (the client then does a full replay): the cursor row is
+//   not located exactly once in the scanned range, a readable row in that range has no numeric
+//   sequence, or no clean turn start fits the budget. Rows newer than the cursor are skipped,
+//   neither kept nor counted; oversized and malformed rows are counted, never classified.
+// - "before-epoch" means no active-epoch row precedes the cursor (the cursor is the epoch's first
+//   row, or older): the caller pages older epochs as before.
+
 export interface HistoryWindowCaps {
   maxRows: number;
   maxBytes: number;
@@ -902,10 +915,35 @@ export type HistoryWindow =
   | { kind: "window"; messages: MuxMessage[]; reachedEpochStart: boolean }
   | { kind: "not-windowable" };
 
-export function readProviderHistoryWindow(
+export type HistoryPage =
+  | { kind: "page"; messages: MuxMessage[]; reachedEpochStart: boolean }
+  | { kind: "not-pageable" }
+  | { kind: "before-epoch" };
+
+export async function readProviderHistoryWindow(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps
 ): Promise<HistoryWindow> {
+  const tail = await readActiveEpochTail(paths, caps, undefined);
+  assert(tail.kind !== "before-epoch", "a window has no cursor");
+  return tail.kind === "page" ? { ...tail, kind: "window" } : { kind: "not-windowable" };
+}
+
+export function readProviderHistoryPage(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  beforeHistorySequence: number
+): Promise<HistoryPage> {
+  assert(isNonNegativeInteger(beforeHistorySequence), "page cursor must be a sequence");
+  return readActiveEpochTail(paths, caps, beforeHistorySequence);
+}
+
+/** The newest rows of the active epoch that precede the `before` row (or EOF when undefined). */
+function readActiveEpochTail(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  before: number | undefined
+): Promise<HistoryPage> {
   assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
   assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
   return withVerifiedHistorySnapshot(paths, async (files) => {
@@ -915,11 +953,28 @@ export function readProviderHistoryWindow(
     let rows = 0;
     let bytes = 0;
     let overBudget = false;
+    // Page cursor state; a window starts at EOF, so its cursor is "located" from the start.
+    let cursor: { file: HistorySnapshotFile; start: number } | undefined;
+    let unpageable = false;
+    let oldestSequence: number | undefined;
     for (const artifact of ["chat", "archive"] as const) {
       const file = files.get(artifact);
       if (!file) continue;
       const fileRows: ScannedHistoryRow[] = [];
       const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
+        if (before !== undefined && row.message) {
+          const sequence = row.message.metadata?.historySequence;
+          if (!isNonNegativeInteger(sequence)) unpageable = true;
+          else {
+            oldestSequence = sequence;
+            if (sequence === before) {
+              if (cursor) unpageable = true;
+              cursor = { file, start: row.start };
+              return false;
+            }
+          }
+        }
+        if (before !== undefined && !cursor) return unpageable;
         if (!overBudget && rows < caps.maxRows && bytes + row.size <= caps.maxBytes) {
           rows++;
           bytes += row.size;
@@ -927,11 +982,19 @@ export function readProviderHistoryWindow(
         } else overBudget = true;
         // Monotonic: the locator honors the stop at the next readable row. Every row visited up
         // to there is in full replay, and rows past the budget were counted, never kept.
-        return overBudget;
+        return overBudget || unpageable;
       });
       const from = location.kind === "start" ? location.offset : 0;
+      // A cursor row below the file's epoch start is not a row of full replay.
+      if (cursor?.file === file && cursor.start < from) unpageable = true;
       for (const row of fileRows) if (row.start >= from) kept.push({ file, row });
-      if (location.kind !== "exhausted" || overBudget) break;
+      if (location.kind !== "exhausted" || overBudget || unpageable) break;
+    }
+    if (unpageable) return { kind: "not-pageable" };
+    if (before !== undefined && !cursor) {
+      // Missing from the epoch: older than all of it, or gone (truncated) while held.
+      const older = oldestSequence === undefined || before < oldestSequence;
+      return { kind: older ? "before-epoch" : "not-pageable" };
     }
     const messages: MuxMessage[] = [];
     for (let i = kept.length - 1; i >= 0; i--) {
@@ -939,13 +1002,20 @@ export function readProviderHistoryWindow(
       if (message) messages.push(message);
     }
     // Within budget, the scan reached the epoch start (or read all history): the whole epoch.
-    if (!overBudget) return { kind: "window", messages, reachedEpochStart: true };
+    if (!overBudget) {
+      if (before !== undefined && messages.length === 0) return { kind: "before-epoch" };
+      return { kind: "page", messages, reachedEpochStart: true };
+    }
     // Otherwise the oldest kept row's turn may begin before the budget: trim forward only.
     const start = messages.findIndex(
       (message, i) => i > 0 && message.role === "user" && messages[i - 1].role === "assistant"
     );
-    if (start === -1) return { kind: "not-windowable" };
-    return { kind: "window", messages: messages.slice(start), reachedEpochStart: false };
+    if (start === -1) return { kind: "not-pageable" };
+    // The next page ends right before this row, so it needs a sequence (an oversized row's
+    // sequence is only known here).
+    const first = messages[start].metadata?.historySequence;
+    if (before !== undefined && !isNonNegativeInteger(first)) return { kind: "not-pageable" };
+    return { kind: "page", messages: messages.slice(start), reachedEpochStart: false };
   });
 }
 

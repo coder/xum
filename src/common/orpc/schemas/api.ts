@@ -1982,6 +1982,8 @@ export const workspace = {
             beforeMessageId: z.string().nullish(),
           })
           .nullish(),
+        // The client holds a replay window (#4961): bounded pages inside the active epoch.
+        windowed: z.boolean().optional(),
       }),
       output: z.object({
         messages: z.array(WorkspaceChatMessageSchema),
@@ -1992,6 +1994,8 @@ export const workspace = {
           })
           .nullable(),
         hasOlder: z.boolean(),
+        // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
+        notPageable: z.boolean().optional(),
       }),
     },
     /** Searches full history, including prompts before the replay boundary. */
