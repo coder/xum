@@ -1,6 +1,7 @@
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+  historyAppendReceiptKey,
   invalidateHistoryAppendProvenance,
 } from "./historyAppendProvenance";
 import {
@@ -619,10 +620,7 @@ export class HistoryService {
         // Recovery rewrites history and takes the write lock. This read-only tool
         // must instead fail closed while a truncate transaction is unresolved.
         const assertNoTruncate = async () => {
-          for (const marker of [
-            this.getTruncateTransactionPath(workspaceId),
-            `${this.getChatArchivePath(workspaceId)}.truncate`,
-          ]) {
+          for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
             const exists = await fs.stat(marker).then(
               () => true,
               (error: NodeJS.ErrnoException) => {
@@ -657,6 +655,38 @@ export class HistoryService {
         options.abortSignal?.throwIfAborted();
         return result;
       }
+    }
+  }
+
+  private getTruncateMarkerPaths(workspaceId: string): string[] {
+    return [
+      this.getTruncateTransactionPath(workspaceId),
+      `${this.getChatArchivePath(workspaceId)}.truncate`,
+    ];
+  }
+
+  /** Token-stats cache identity of the history files under both history locks (like the
+   * bounded scan: no cooperating writer mid-write, no recovery). Null means untrusted. */
+  async captureTokenStatsReceiptKey(workspaceId: string): Promise<string | null> {
+    try {
+      return await this.withHistoryScanLocks(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return null;
+        for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
+          // Any error but ENOENT rethrows, which also yields null below.
+          const marked = await fs.stat(marker).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+          if (marked) return null;
+        }
+        const provenance = this.getAppendProvenance(workspaceId);
+        // Either artifact counts as retained history (as requireExistingHistory); a non-file
+        // artifact makes stamps() throw. Checked first so a missing session is never created.
+        const files = await provenance.stamps();
+        if (files.chat === null && files.archive === null) return null;
+        return historyAppendReceiptKey((await provenance.forScan()).receipt);
+      });
+    } catch {
+      return null;
     }
   }
 

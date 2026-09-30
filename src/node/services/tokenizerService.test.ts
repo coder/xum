@@ -1,15 +1,25 @@
 import { afterEach, beforeEach, describe, expect, test, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { TokenizerService } from "./tokenizerService";
-import type { HistoryService } from "./historyService";
-import type { SessionUsageService } from "./sessionUsageService";
+import { TokenizerService, type WorkspaceTokenStats } from "./tokenizerService";
+import { HistoryService, mergeTranscriptPartial } from "./historyService";
+import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import * as tokenizerUtils from "@/node/utils/main/tokenizer";
 import * as statsUtils from "@/common/utils/tokens/tokenStatsCalculator";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import assert from "node:assert";
+import { HISTORY_APPEND_PROVENANCE_FILE } from "./historyAppendProvenance";
+import { CHAT_FILE_NAME } from "@/common/constants/paths";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
+import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { AIService } from "./aiService";
+import { VERSION } from "@/version";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import {
   buildPlanReviewMetadata,
@@ -27,6 +37,7 @@ describe("TokenizerService", () => {
   beforeEach(async () => {
     sessionUsageService = {
       setTokenStatsCache: () => Promise.resolve(),
+      peekTokenStatsCache: () => Promise.resolve(undefined),
     } as unknown as SessionUsageService;
     const testHistory = await createTestHistoryService();
     historyService = testHistory.historyService;
@@ -53,6 +64,8 @@ describe("TokenizerService", () => {
       tokenizerName: "cl100k",
       usageHistory: [],
     };
+    // The RPC contract drops usageHistory (the cache never had it).
+    const { usageHistory: _usageHistory, ...mockProjection } = mockResult;
 
     async function seedHistory(...messages: MuxMessage[]): Promise<void> {
       for (const message of messages) {
@@ -86,7 +99,8 @@ describe("TokenizerService", () => {
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
         const result = await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
-        expect(result).toBe(mockResult);
+        expect(result).toEqual(mockProjection);
+        expect(result).not.toHaveProperty("usageHistory");
         expect(tokenizedRows(statsSpy)).toEqual([
           { id: "msg1", texts: ["Hello"] },
           { id: "msg2", texts: ["World"] },
@@ -237,7 +251,7 @@ describe("TokenizerService", () => {
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
         const result = await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
-        expect(result).toBe(mockResult);
+        expect(result).toEqual(mockProjection);
         expect(tokenizedRows(statsSpy)).toEqual([{ id: "msg1", texts: ["Hello"] }]);
       } finally {
         statsSpy.mockRestore();
@@ -259,12 +273,15 @@ describe("TokenizerService", () => {
       // Real reads run immediately; only the hand-back of each result is held so the test
       // controls which request observes its transcript first and which finishes last.
       const releaseRead: Array<() => void> = [];
-      const readSettled: Array<Promise<void>> = [];
+      // The history read starts only after the cache/receipt probes, so signal it explicitly.
+      const readSettled = [0, 1].map(() => Promise.withResolvers<void>());
+      let reads = 0;
       const realRead = historyService.getHistoryFromLatestBoundary.bind(historyService);
       const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
         (workspaceId, skip) => {
           const read = realRead(workspaceId, skip);
-          readSettled.push(read.then(() => undefined));
+          const settled = readSettled[reads++];
+          void read.then(() => settled.resolve());
           return read.then(
             (result) =>
               new Promise((resolve) => {
@@ -275,10 +292,10 @@ describe("TokenizerService", () => {
       );
       try {
         const requestA = service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
-        await readSettled[0];
+        await readSettled[0].promise;
         await seedHistory(createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }));
         const requestB = service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
-        await readSettled[1];
+        await readSettled[1].promise;
         expect(releaseRead).toHaveLength(2);
 
         // B (newer transcript) completes first; A (older transcript) completes afterwards.
@@ -573,3 +590,359 @@ describe("TokenizerService", () => {
     });
   });
 });
+
+describe("calculateWorkspaceStats persisted cache (real services)", () => {
+  const WS = "cache-ws";
+  const MODEL = "anthropic:claude-sonnet-5-5";
+  const OTHER_MODEL = "openai:gpt-6-luna";
+  const OTHER_CONFIG: ProvidersConfigMap = {
+    anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+  };
+  let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
+  let history: HistoryService;
+  let usage: SessionUsageService;
+  let tokenizer: TokenizerService;
+  let parentWorkspaceId: string | undefined;
+  let providersConfig: ProvidersConfigMap;
+  let readSpy: ReturnType<typeof spyOn<HistoryService, "getHistoryFromLatestBoundary">>;
+  let nextId = 0;
+
+  async function setup(): Promise<void> {
+    fixture = await createTestHistoryService();
+    history = fixture.historyService;
+    const projectPath = path.join(fixture.tempDir, "project");
+    await fixture.config.addWorkspace(projectPath, {
+      id: WS,
+      name: "cache-branch",
+      projectName: "project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    usage = new SessionUsageService(fixture.config, history);
+    parentWorkspaceId = undefined;
+    providersConfig = {};
+    const metadata: Pick<AIService, "getWorkspaceMetadata"> = {
+      getWorkspaceMetadata: () =>
+        Promise.resolve(
+          parentWorkspaceId === undefined
+            ? Err("not found")
+            : Ok({ parentWorkspaceId } as unknown as WorkspaceMetadata)
+        ),
+    };
+    tokenizer = new TokenizerService(
+      usage,
+      metadata,
+      { getConfig: () => providersConfig },
+      history
+    );
+    // No mockImplementation: the real read runs, calls are only counted.
+    readSpy = spyOn(history, "getHistoryFromLatestBoundary");
+  }
+
+  beforeEach(setup);
+
+  afterEach(async () => {
+    readSpy.mockRestore();
+    await fixture.cleanup();
+  });
+
+  const sessionFile = (name: string) => path.join(fixture.config.sessionsDir, WS, name);
+  const text = (label: string) => `${label} lorem ipsum ${nextId++} dolor sit amet`;
+  /** Reads through the prototype so the spy only counts TokenizerService's reads. */
+  async function rows(): Promise<MuxMessage[]> {
+    const result = await HistoryService.prototype.getHistoryFromLatestBoundary.call(history, WS, 0);
+    assert(result.success);
+    return result.data;
+  }
+
+  /** Today's full recount with the cache bypassed, projected to the RPC contract. */
+  async function reference(model: string): Promise<WorkspaceTokenStats> {
+    const merged = mergeTranscriptPartial(await rows(), await history.readPartial(WS));
+    const counted = sliceMessagesForProviderFromLatestContextBoundary(merged).filter(
+      (message) => !isPlanReviewRecordMessage(message)
+    );
+    const { usageHistory: _usageHistory, ...stats } = await statsUtils.calculateTokenStats(
+      counted,
+      model,
+      providersConfig,
+      getToolAvailabilityOptions({ workspaceId: WS, parentWorkspaceId: parentWorkspaceId ?? null })
+    );
+    return stats;
+  }
+
+  /** One RPC call: its result, whether it read history, and that it equals the reference. */
+  async function calculate(model = MODEL): Promise<{ result: WorkspaceTokenStats; read: boolean }> {
+    const readsBefore = readSpy.mock.calls.length;
+    const result = await tokenizer.calculateWorkspaceStats({ workspaceId: WS, model });
+    const read = readSpy.mock.calls.length > readsBefore;
+    expect(result).toEqual(await reference(model));
+    expect(result).not.toHaveProperty("usageHistory");
+    return { result, read };
+  }
+
+  async function append(role: "user" | "assistant", extra?: Partial<MuxMessage["metadata"]>) {
+    const result = await history.appendToHistory(
+      WS,
+      createMuxMessage(`m${nextId}`, role, text(role), extra)
+    );
+    expect(result.success).toBe(true);
+  }
+
+  async function seed(): Promise<void> {
+    for (let i = 0; i < 4; i++) await append(i % 2 === 0 ? "user" : "assistant");
+  }
+
+  async function writePartial(): Promise<void> {
+    const last = (await rows()).at(-1)?.metadata?.historySequence ?? -1;
+    const partial = createMuxMessage(`p${nextId}`, "assistant", text("streaming"), {
+      historySequence: last + 1,
+    });
+    expect((await history.writePartial(WS, partial)).success).toBe(true);
+  }
+
+  /** Strict for the matrix; the random walk tolerates edits the service legitimately refuses. */
+  async function update(
+    pick: (all: MuxMessage[]) => MuxMessage | undefined,
+    strict = true
+  ): Promise<void> {
+    const target = pick(await rows());
+    if (!strict && !target) return;
+    assert(target);
+    const edited = { ...target, parts: [{ type: "text" as const, text: text("edited") }] };
+    const result = await history.updateHistory(WS, edited);
+    if (strict) expect(result.success).toBe(true);
+  }
+
+  /** Same-length in-place rewrite; retried until the kernel's coarse file clock ticks. */
+  async function externalSameLengthEdit(strict = true): Promise<void> {
+    const chatPath = sessionFile(CHAT_FILE_NAME);
+    const before = await fs.stat(chatPath, { bigint: true }).catch(() => null);
+    const original = before ? await fs.readFile(chatPath, "utf-8") : "";
+    const at = original.indexOf("lorem");
+    if (!strict && (!before || at < 0)) return;
+    assert(before && at >= 0);
+    const edited = `${original.slice(0, at)}L${original.slice(at + 1)}`;
+    assert(edited.length === original.length && edited !== original);
+    for (let attempt = 0; ; attempt++) {
+      await fs.writeFile(chatPath, edited);
+      const after = await fs.stat(chatPath, { bigint: true });
+      expect(after.size).toBe(before.size);
+      expect(after.ino).toBe(before.ino);
+      if (after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) return;
+      assert(attempt < 200, "file clock never advanced");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  test("serves an unchanged history from the cache without reading it", async () => {
+    await seed();
+    await writePartial();
+    const first = await calculate();
+    expect(first.read).toBe(true);
+    expect((await usage.peekTokenStatsCache(WS))?.source).toBeDefined();
+    const second = await calculate();
+    expect(second.read).toBe(false);
+    expect(second.result).toEqual(first.result);
+  });
+
+  interface InvalidationCase {
+    name: string;
+    withPartial?: boolean;
+    model?: string;
+    change: () => Promise<void>;
+    restore?: () => void;
+  }
+  const cases: InvalidationCase[] = [
+    { name: "append", change: () => append("user") },
+    { name: "updateHistory on the last row", change: () => update((all) => all.at(-1)) },
+    { name: "updateHistory on a middle row", change: () => update((all) => all[1]) },
+    {
+      name: "deleteMessage",
+      change: async () => {
+        const target = (await rows())[1];
+        expect((await history.deleteMessage(WS, target.id)).success).toBe(true);
+      },
+    },
+    {
+      name: "truncateAfterMessage",
+      change: async () => {
+        const target = (await rows())[1];
+        expect((await history.truncateAfterMessage(WS, target.id)).success).toBe(true);
+      },
+    },
+    {
+      name: "a compaction boundary",
+      change: () =>
+        append("assistant", { compacted: "user", compactionBoundary: true, compactionEpoch: 1 }),
+    },
+    { name: "writePartial", change: writePartial },
+    {
+      name: "deletePartial",
+      withPartial: true,
+      change: async () => {
+        expect((await history.deletePartial(WS)).success).toBe(true);
+      },
+    },
+    {
+      name: "commitPartial",
+      withPartial: true,
+      change: async () => {
+        expect((await history.commitPartial(WS)).success).toBe(true);
+      },
+    },
+    { name: "a model change", model: OTHER_MODEL, change: () => Promise.resolve() },
+    {
+      name: "a providers-config change",
+      change: () => {
+        providersConfig = OTHER_CONFIG;
+        return Promise.resolve();
+      },
+    },
+    {
+      name: "a parent change",
+      change: () => {
+        parentWorkspaceId = "parent-ws";
+        return Promise.resolve();
+      },
+    },
+    (() => {
+      const original = VERSION.git_describe;
+      return {
+        name: "an app version change",
+        change: () => {
+          VERSION.git_describe = `${original}-next`;
+          return Promise.resolve();
+        },
+        restore: () => {
+          VERSION.git_describe = original;
+        },
+      };
+    })(),
+    (() => {
+      const original = process.env.XUM_FORCE_REAL_TOKENIZER;
+      return {
+        name: "an approx-tokenizer flag flip",
+        change: () => {
+          process.env.XUM_FORCE_REAL_TOKENIZER = "1";
+          return Promise.resolve();
+        },
+        restore: () => {
+          if (original === undefined) delete process.env.XUM_FORCE_REAL_TOKENIZER;
+          else process.env.XUM_FORCE_REAL_TOKENIZER = original;
+        },
+      };
+    })(),
+    { name: "an external same-length chat.jsonl write", change: () => externalSameLengthEdit() },
+    { name: "a deleted receipt", change: () => fs.rm(sessionFile(HISTORY_APPEND_PROVENANCE_FILE)) },
+    {
+      name: "a corrupted receipt",
+      change: () => fs.writeFile(sessionFile(HISTORY_APPEND_PROVENANCE_FILE), "{ corrupt"),
+    },
+  ];
+  for (const testCase of cases) {
+    test(`recounts after ${testCase.name}`, async () => {
+      await seed();
+      if (testCase.withPartial) await writePartial();
+      expect((await calculate()).read).toBe(true);
+      // Primed: the unchanged state is a hit, so the recount below is the change's doing.
+      expect((await calculate()).read).toBe(false);
+      await testCase.change();
+      try {
+        expect((await calculate(testCase.model)).read).toBe(true);
+      } finally {
+        testCase.restore?.();
+      }
+    });
+  }
+
+  test("does not certify a count whose history changed during the read", async () => {
+    await seed();
+    const realRead = HistoryService.prototype.getHistoryFromLatestBoundary.bind(history);
+    readSpy.mockImplementationOnce(async (workspaceId, skip) => {
+      // A cooperating writer lands between the receipt capture and the read.
+      await append("user");
+      return realRead(workspaceId, skip);
+    });
+    expect((await calculate()).read).toBe(true);
+    const cached = await usage.peekTokenStatsCache(WS);
+    expect(cached).toBeDefined();
+    expect(cached?.source).toBeUndefined();
+    expect((await calculate()).read).toBe(true);
+    expect((await calculate()).read).toBe(false);
+  });
+
+  test("randomized differential: every result equals a full recount", async () => {
+    let hits = 0;
+    let model = MODEL;
+    const ops: Array<(random: () => number) => Promise<void>> = [
+      () => append("user"),
+      () => append("assistant"),
+      () => update((all) => all.at(-1), false),
+      (random) => update((all) => all[Math.floor(random() * all.length)], false),
+      async (random) => {
+        const all = await rows();
+        if (all.length > 1)
+          await history.deleteMessage(WS, all[Math.floor(random() * all.length)].id);
+      },
+      async (random) => {
+        const all = await rows();
+        if (all.length > 1)
+          await history.truncateAfterMessage(WS, all[Math.floor(random() * all.length)].id);
+      },
+      () =>
+        append("assistant", {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: nextId,
+        }),
+      writePartial,
+      async () => void (await history.deletePartial(WS)),
+      async () => void (await history.commitPartial(WS)),
+      () => {
+        model = model === MODEL ? OTHER_MODEL : MODEL;
+        return Promise.resolve();
+      },
+      () => {
+        providersConfig = providersConfig === OTHER_CONFIG ? {} : OTHER_CONFIG;
+        return Promise.resolve();
+      },
+      () => {
+        parentWorkspaceId = parentWorkspaceId === undefined ? "parent-ws" : undefined;
+        return Promise.resolve();
+      },
+      () => externalSameLengthEdit(false),
+      () => fs.rm(sessionFile(HISTORY_APPEND_PROVENANCE_FILE), { force: true }),
+      () => fs.writeFile(sessionFile(HISTORY_APPEND_PROVENANCE_FILE), "{ corrupt"),
+    ];
+    for (let seed = 1; seed <= 30; seed++) {
+      readSpy.mockRestore();
+      await fixture.cleanup();
+      await setup();
+      model = MODEL;
+      await append("user");
+      const random = mulberry32(seed);
+      for (let step = 0; step < 25; step++) {
+        if (random() < 0.4) {
+          if (!(await calculate(model)).read) hits++;
+        } else {
+          await ops[Math.floor(random() * ops.length)](random);
+        }
+      }
+      if (!(await calculate(model)).read) hits++;
+    }
+    // Not vacuous: unchanged stretches were actually served from the cache.
+    expect(hits).toBeGreaterThan(0);
+  }, 300_000);
+});
+
+/** Small deterministic PRNG so a failing seed replays exactly. */
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
