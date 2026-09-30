@@ -452,7 +452,8 @@ export class DevToolsService extends EventEmitter {
     const data = this.getOrCreateWorkspaceData(workspaceId);
     // Compared now, committed as the baseline only once the step is durable:
     // a step that failed to persist must not become the comparison point.
-    const prefix = promptPrefix != null ? this.comparePromptPrefix(workspaceId, promptPrefix) : null;
+    const prefix =
+      promptPrefix != null ? this.comparePromptPrefix(workspaceId, promptPrefix) : null;
     if (prefix != null) step.promptPrefix = prefix.recorded;
 
     const entry: DevToolsLogEntry = { type: "step", step };
