@@ -19,7 +19,7 @@ import type {
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { listModelCatalogIds } from "./modelCatalog";
 import modelsData from "./models.json";
-import { PROVIDER_KEY_ALIASES, getModelStats } from "./modelStats";
+import { PROVIDER_KEY_ALIASES, PROVIDER_KEY_FALLBACKS, getModelStats } from "./modelStats";
 
 /** Lowercased whitespace-separated query tokens; empty for a blank query. */
 export function tokenizeModelQuery(query: string | undefined): string[] {
@@ -40,14 +40,14 @@ interface IndexedCatalogEntry {
 }
 
 // Catalogue rows use LiteLLM provider names; only those naming a Xum provider
-// (directly or via the stats lookup alias) are addable as custom models.
-// LiteLLM files the Gemini API as `gemini/<model>` and Moonshot as
-// `moonshot/<model>`; Xum calls them `google` and `moonshotai`. They stay out of
-// PROVIDER_KEY_ALIASES, which would change how built-in stats resolve.
+// (directly or via a stats lookup alias or fallback) are addable as custom models.
+// LiteLLM files the Gemini API as `gemini/<model>`; Xum calls it `google` and
+// resolves `google:<model>` stats through the bare model key instead.
 const XUM_PROVIDER_BY_CATALOG_PROVIDER = new Map<string, string>([
-  ...Object.entries(PROVIDER_KEY_ALIASES).map(([xum, litellm]): [string, string] => [litellm, xum]),
+  ...Object.entries({ ...PROVIDER_KEY_ALIASES, ...PROVIDER_KEY_FALLBACKS }).map(
+    ([xum, litellm]): [string, string] => [litellm, xum]
+  ),
   ["gemini", "google"],
-  ["moonshot", "moonshotai"],
 ]);
 
 // When a models-extra bare override (e.g. gemini-3.7-flash) shadows the

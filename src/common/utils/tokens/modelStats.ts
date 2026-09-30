@@ -42,6 +42,15 @@ export const PROVIDER_KEY_ALIASES: Record<string, string> = {
 };
 
 /**
+ * LiteLLM names for Xum providers whose built-ins are keyed under the Xum name
+ * (moonshotai/kimi-k3 in models-extra). Tried after every other key, so custom
+ * models gain LiteLLM metadata without changing what already resolves.
+ */
+export const PROVIDER_KEY_FALLBACKS: Record<string, string> = {
+  moonshotai: "moonshot",
+};
+
+/**
  * Runtime numeric semantics for raw catalog values (accepts numeric strings
  * with comma separators). Exported so update-models validation compares
  * magnitudes exactly as getModelStats would parse them.
@@ -226,6 +235,11 @@ export function generateModelLookupKeys(modelString: string): string[] {
   }
   if (lowercaseFamilyModelName !== lowercaseUnversionedModelName) {
     push(lowercaseFamilyModelName);
+  }
+
+  const fallbackProvider = PROVIDER_KEY_FALLBACKS[provider];
+  if (fallbackProvider) {
+    pushProviderScoped(fallbackProvider, modelName);
   }
 
   return keys;
