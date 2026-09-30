@@ -436,6 +436,23 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
     expect(s.peerSends.some((args) => payloadText(args).includes("second"))).toBe(false);
   });
 
+  test("a retry is dropped when a replacement turn starts and ends before it is admitted", async () => {
+    const s = await setUp();
+    expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(
+      true
+    );
+    const delivered = s.nextPeerSend();
+    await settle.completed(s);
+    const [, , , internal] = await delivered;
+    // The retry reached the recipient but is not admitted yet; a whole replacement turn starts
+    // and settles meanwhile. The admission gate must still see it.
+    await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_other", "owner-2");
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      TARGET_ID
+    );
+    expect(internal?.admissionStale?.()).toBe(true);
+  });
+
   test("messages are dropped when a replacement turn starts before the drain", async () => {
     const s = await setUp();
     expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(

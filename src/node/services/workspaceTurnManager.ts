@@ -634,15 +634,17 @@ interface LiveWorkspaceTurnRegistration {
  */
 class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegistration> {
   constructor(
-    private readonly onRegistered: (workspaceId: string, handleId: string) => void,
+    private readonly onRegistered: (workspaceId: string) => void,
     private readonly onReleased: (workspaceId: string) => void
   ) {
     super();
   }
 
   override set(workspaceId: string, registration: LiveWorkspaceTurnRegistration): this {
+    // An update of the live turn (e.g. marking it accepted) is not a new turn.
+    const isNewTurn = super.get(workspaceId)?.handleId !== registration.handleId;
     super.set(workspaceId, registration);
-    this.onRegistered(workspaceId, registration.handleId);
+    if (isNewTurn) this.onRegistered(workspaceId);
     return this;
   }
 
@@ -658,7 +660,7 @@ export class WorkspaceTurnManager {
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new LiveWorkspaceTurnRegistrations(
-    (workspaceId, handleId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId, handleId),
+    (workspaceId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId),
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
   );
   private lastWorkspaceTurnCreatedAtMs = 0;

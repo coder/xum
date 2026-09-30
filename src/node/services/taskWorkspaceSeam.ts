@@ -914,10 +914,11 @@ export interface WorkspaceTurnTaskHost {
    */
   onWorkspaceTurnRegistrationReleased(workspaceId: string): void;
   /**
-   * A delegated turn registered on the workspace (a new turn, or an update of the live one).
-   * TaskService drops peer messages that waited for a different turn (#5271). Synchronous.
+   * A new delegated turn registered on the workspace (not an update of the live one). TaskService
+   * counts registrations so a peer message that waited for an earlier turn is dropped (#5271).
+   * Synchronous.
    */
-  onWorkspaceTurnRegistered(workspaceId: string, handleId: string): void;
+  onWorkspaceTurnRegistered(workspaceId: string): void;
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,
