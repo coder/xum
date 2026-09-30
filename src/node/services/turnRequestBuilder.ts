@@ -2045,11 +2045,6 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (agentAdvisorEnabled && advisorModelString.length === 0) {
-      workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
-        effectiveAgentId,
-      });
-    }
     if (advisorToolEligible) {
       assert(
         advisorModelString.length > 0,
