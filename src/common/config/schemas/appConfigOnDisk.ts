@@ -136,7 +136,7 @@ export const AppConfigMigrationsSchema = z
     daybreakModelsHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
-    /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
+    /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */
     defaultModelFallbacksSeeded: z.boolean().optional(),
     /**
      * One-time re-run of the fallback seed after the fable alias moved to
