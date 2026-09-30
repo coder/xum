@@ -512,7 +512,7 @@ describe("assemblePromptPayload", () => {
       volatileSystemSuffixLength: tail.length,
     });
     const openai = {
-      modelString: "openai:gpt-5.6-luna",
+      modelString: "openai:gpt-6-luna",
       providerForMessages: "openai",
       routeProvider: "openai",
       providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
