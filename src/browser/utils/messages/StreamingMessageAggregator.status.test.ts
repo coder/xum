@@ -410,11 +410,13 @@ describe("StreamingMessageAggregator - Agent Status", () => {
   });
 
   // An over-budget status lived only in memory, so after a restart it was lost once compacted.
-  it("should restore a status with an overlong URL after a restart, without the URL", () => {
+  it("should restore a status with an overlong message and URL after a restart, bounded", () => {
+    // A dynamic (MCP) status_set output is not length-limited.
+    const longMessage = `PR open ${"m".repeat(600)}`;
     const aggregator = createAggregator(WORKSPACE_ID);
     startStream(aggregator);
     runStatusTool(aggregator, {
-      input: { emoji: "🔗", message: "PR open", url: `https://example.com/${"x".repeat(600)}` },
+      input: { emoji: "🔗", message: longMessage, url: `https://example.com/${"x".repeat(600)}` },
     });
     endStream(aggregator);
 
@@ -427,7 +429,11 @@ describe("StreamingMessageAggregator - Agent Status", () => {
       }),
     ]);
 
-    expect(restarted.getAgentStatus()).toEqual({ emoji: "🔗", message: "PR open" });
+    const restored = restarted.getAgentStatus();
+    expect(restored?.emoji).toBe("🔗");
+    expect(restored?.url).toBeUndefined();
+    expect(restored?.message.startsWith("PR open m")).toBe(true);
+    expect(longMessage.startsWith(restored?.message ?? "")).toBe(true);
   });
 
   it("should use truncated message from output, not original input", () => {

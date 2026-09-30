@@ -4,7 +4,9 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { APIProvider } from "@/browser/contexts/API";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createTestApiClient } from "@/browser/testUtils";
+import { getWorkspaceNameStateKey } from "@/common/constants/storage";
 import { useWorkspaceName } from "./useWorkspaceName";
 
 const generateMock = mock(() =>
@@ -62,6 +64,20 @@ describe("useWorkspaceName persisted draft state", () => {
     const valid = renderWorkspaceName("");
     expect(valid.result.current.name).toBe("my-feature");
     expect(valid.result.current.error).toBeNull();
+  });
+
+  test("another tab's manual name replaces the full name kept for this session", () => {
+    const view = renderWorkspaceName("");
+    act(() => view.result.current.setAutoGenerate(false));
+    act(() => view.result.current.setName("a".repeat(5000)));
+    act(() => {
+      updatePersistedState<Record<string, unknown>>(
+        getWorkspaceNameStateKey("draft-scope"),
+        (prev) => ({ ...prev, manualName: "other-tab" }),
+        {}
+      );
+    });
+    expect(view.result.current.name).toBe("other-tab");
   });
 
   test("a name generated for an escape-heavy message survives a restart without regenerating", async () => {

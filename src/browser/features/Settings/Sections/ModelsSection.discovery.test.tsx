@@ -693,6 +693,22 @@ describe("ModelsSection manual model IDs", () => {
     });
   }, 15_000);
 
+  test("editing a model rejects an ID too long to persist, accepts one at the limit", async () => {
+    const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
+    const original = `${"m".repeat(maxIdChars - 1)}x`;
+    const ui = await setup("anthropic", null, { anthropicModels: [original] });
+    fireEvent.click(ui.view.getAllByRole("button", { name: "Edit model" })[0]);
+    const editInput = ui.view.getByDisplayValue(original);
+    await ui.user.type(editInput, "{Backspace}mm{Enter}");
+    expect(ui.save).not.toHaveBeenCalled();
+
+    await ui.user.type(editInput, "{Backspace}{Enter}");
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["m".repeat(maxIdChars)],
+    });
+  });
+
   test("accepts IDs with characters beyond the common set", async () => {
     const ui = await setup();
     await ui.type("vendor/model+fast#v2");
