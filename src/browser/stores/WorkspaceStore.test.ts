@@ -3266,9 +3266,10 @@ describe("WorkspaceStore", () => {
         await tick(10);
       }
 
-      // batchReplay: the store unpacks replay batches (#4868).
+      // batchReplay: the store unpacks replay batches (#4868); replayWindow: it pages older rows
+      // of the active epoch itself (#4961).
       expect(mockOnChat).toHaveBeenCalledWith(
-        { workspaceId: "workspace-1", batchReplay: true },
+        { workspaceId: "workspace-1", batchReplay: true, replayWindow: true },
         expect.anything()
       );
     });
@@ -5000,6 +5001,164 @@ describe("WorkspaceStore", () => {
         workspaceId,
         cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
       });
+    });
+  });
+
+  describe("windowed replay (#4961)", () => {
+    const workspaceId = "windowed-replay";
+    type ChatAttempt = ControllableAsyncIterable<WorkspaceChatMessage>;
+    let attempts: ChatAttempt[];
+    const seed = {
+      todos: [{ content: "written before the window", status: "in_progress" as const }],
+      assistedReview: [{ path: "src/pinned.ts" }],
+    };
+    const state = () => store.getWorkspaceState(workspaceId);
+    const ids = () => state().muxMessages.map((message) => message.id);
+    const aggregator = () => store.getAggregator(workspaceId)!;
+    const initRow = () => state().messages.find((message) => message.type === "workspace-init");
+
+    beforeEach(() => {
+      attempts = [];
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        const events = createControllableAsyncIterable<WorkspaceChatMessage>();
+        attempts.push(events);
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+    });
+
+    /** Wait for the n-th (1-based) onChat attempt; the previous one is closed to reconnect. */
+    const attempt = async (ordinal: number): Promise<ChatAttempt> => {
+      if (ordinal === 1) createAndAddWorkspace(store, workspaceId);
+      else attempts[ordinal - 2].close();
+      expect(await waitUntil(() => attempts.length >= ordinal)).toBe(true);
+      return attempts[ordinal - 1];
+    };
+
+    /** Land a full caught-up for rows `sequences` (the window) on `events`. */
+    async function fullReplay(
+      events: ChatAttempt,
+      sequences: number[],
+      extra: Partial<ChatEvent<"caught-up">> = {}
+    ): Promise<void> {
+      for (const sequence of sequences) {
+        events.push(createHistoryMessageEvent(`h${sequence}`, sequence));
+      }
+      const newest = sequences[sequences.length - 1];
+      events.push(
+        caughtUpEvent({
+          replay: "full",
+          hasOlderHistory: sequences[0] > 0,
+          cursor: {
+            history: {
+              messageId: `h${newest}`,
+              historySequence: newest,
+              oldestHistorySequence: sequences[0],
+            },
+          },
+          ...extra,
+        })
+      );
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+    }
+
+    it("shows the seed's todos and pins, keeps them on since, and drops them on a full replay without one", async () => {
+      await fullReplay(await attempt(1), [100, 101], { windowSeed: seed });
+      expect(aggregator().getCurrentTodos()).toEqual(seed.todos);
+      expect(aggregator().getAssistedReviewHunks()).toEqual(seed.assistedReview);
+
+      const since = await attempt(2);
+      since.push(createHistoryMessageEvent("h101", 101));
+      since.push(sinceCaughtUpEvent(101, "h101"));
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(aggregator().getCurrentTodos()).toEqual(seed.todos);
+      expect(aggregator().getAssistedReviewHunks()).toEqual(seed.assistedReview);
+
+      // A window that reached the epoch start carries no seed: nothing may survive from the old one.
+      await fullReplay(await attempt(3), [0, 1], { downgradeReason: "outside-window" });
+      expect(aggregator().getCurrentTodos()).toEqual([]);
+      expect(aggregator().getAssistedReviewHunks()).toEqual([]);
+    });
+
+    it.each(["fingerprint-mismatch", "outside-window"] as const)(
+      "a downgrade (%s) after paging holds exactly the new window",
+      async (downgradeReason) => {
+        await fullReplay(await attempt(1), [100, 101], { windowSeed: seed });
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [createHistoryMessageEvent("h98", 98), createHistoryMessageEvent("h99", 99)],
+          nextCursor: { beforeHistorySequence: 98, beforeMessageId: "h98" },
+          hasOlder: true,
+        });
+        expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+        expect(ids()).toEqual(["h98", "h99", "h100", "h101"]);
+
+        await fullReplay(await attempt(2), [102, 103], { windowSeed: seed, downgradeReason });
+        expect(ids()).toEqual(["h102", "h103"]);
+        expect(state().hasOlderHistory).toBe(true);
+        mockHistoryLoadMore.mockClear();
+        await store.loadOlderHistory(workspaceId);
+        expect(mockHistoryLoadMore.mock.calls[0]?.[0]).toMatchObject({
+          cursor: { beforeHistorySequence: 102, beforeMessageId: "h102" },
+        });
+      }
+    );
+
+    it.each([
+      {
+        name: "the start of history",
+        page: {
+          messages: [createHistoryMessageEvent("h0", 0)],
+          nextCursor: null,
+          hasOlder: false,
+        },
+      },
+      {
+        name: "the epoch's boundary row",
+        page: {
+          messages: [
+            {
+              type: "message" as const,
+              id: "boundary",
+              role: "assistant" as const,
+              parts: [{ type: "text" as const, text: "Compacted summary" }],
+              metadata: {
+                historySequence: 50,
+                timestamp: 500,
+                compacted: "idle" as const,
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              },
+            },
+            createHistoryMessageEvent("h51", 51),
+          ],
+          nextCursor: { beforeHistorySequence: 50, beforeMessageId: "boundary" },
+          hasOlder: true,
+        },
+      },
+    ])("hides a finished init card until a page loads $name", async ({ page }) => {
+      const events = await attempt(1);
+      events.push({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1_000,
+        replay: true,
+        completed: { exitCode: 0, endTime: 2_000 },
+      });
+      events.push({ type: "init-end", exitCode: 0, timestamp: 2_000, replay: true });
+      await fullReplay(events, [100, 101], { windowSeed: seed });
+      // The window starts mid-epoch: the first loaded user row is not the transcript's first.
+      expect(initRow()).toBeUndefined();
+
+      mockHistoryLoadMore.mockResolvedValueOnce(page);
+      expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+      expect(initRow()).toMatchObject({ status: "success" });
+    });
+
+    it("keeps a running init card visible while the window misses the epoch start", async () => {
+      const events = await attempt(1);
+      events.push({ type: "init-start", hookPath: "/project", timestamp: 1_000 });
+      await fullReplay(events, [100, 101], { windowSeed: seed });
+      expect(initRow()).toMatchObject({ status: "running" });
     });
   });
 

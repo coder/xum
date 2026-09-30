@@ -2965,6 +2965,9 @@ export class WorkspaceStore {
         });
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
       }
+      if (!result.hasOlder || historicalMessages.some(isDurableCompactionBoundaryMarker)) {
+        aggregator.markEpochStartLoaded();
+      }
 
       this.historyPagination.set(workspaceId, {
         nextCursor: result.nextCursor,
@@ -4395,10 +4398,12 @@ export class WorkspaceStore {
         if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
         // batchReplay: this store unpacks `message-batch` replay events (#4868).
+        // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+        // load through loadOlderHistory (#4961).
         const input =
           legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode, batchReplay: true }
-            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true };
+            ? { workspaceId, mode, batchReplay: true, replayWindow: true }
+            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true, replayWindow: true };
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
         if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
@@ -5074,6 +5079,10 @@ export class WorkspaceStore {
         // Clear stale interruption suppression state so retry UI is derived solely
         // from the replayed transcript instead of a pre-disconnect abort reason.
         aggregator.clearLastAbortReason();
+
+        // Every full replay replaces the window seed (#4961), absent included: a stale seed must
+        // not survive a window that reached the epoch start.
+        aggregator.setWindowSeed(data.windowSeed ?? null);
       }
 
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
