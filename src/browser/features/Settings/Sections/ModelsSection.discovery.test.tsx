@@ -687,6 +687,21 @@ describe("ModelsSection manual model IDs", () => {
 });
 
 describe("ModelsSection table filter and paging", () => {
+  test("an active edit locks paging and filtering until it ends", async () => {
+    const models = Array.from({ length: 30 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
+    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    const locked = () => [
+      filter.hasAttribute("disabled"),
+      ui.view.getByRole("button", { name: "Next" }).hasAttribute("disabled"),
+    ];
+    expect(locked()).toEqual([false, false]);
+    fireEvent.click(ui.view.getAllByRole("button", { name: "Edit model" })[0]);
+    expect(locked()).toEqual([true, true]);
+    fireEvent.click(ui.view.getByRole("button", { name: /Cancel/ }));
+    expect(locked()).toEqual([false, false]);
+  });
+
   test("pages custom models and filters both tables", async () => {
     const models = Array.from({ length: 30 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
     const ui = await setup("anthropic", null, { anthropicModels: models });

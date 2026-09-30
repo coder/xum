@@ -753,6 +753,8 @@ export function ModelsSection() {
           placeholder="Filter models"
           autoComplete="off"
           value={modelFilter}
+          // Filtering or paging would unmount the row being edited and strand its Save/Cancel.
+          disabled={editing !== null}
           onChange={(e) => setModelFilter(e.target.value)}
           onKeyDown={(e) => {
             if (e.key !== "Escape") return;
@@ -1057,7 +1059,7 @@ export function ModelsSection() {
               type="button"
               variant="outline"
               size="xs"
-              disabled={customPageIndex === 0}
+              disabled={customPageIndex === 0 || editing !== null}
               onClick={() => setCustomPage({ filter: modelFilter, index: customPageIndex - 1 })}
             >
               Previous
@@ -1066,7 +1068,7 @@ export function ModelsSection() {
               type="button"
               variant="outline"
               size="xs"
-              disabled={customPageIndex >= customPageCount - 1}
+              disabled={customPageIndex >= customPageCount - 1 || editing !== null}
               onClick={() => setCustomPage({ filter: modelFilter, index: customPageIndex + 1 })}
             >
               Next

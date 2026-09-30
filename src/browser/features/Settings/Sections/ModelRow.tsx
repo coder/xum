@@ -366,7 +366,11 @@ export function ModelRow(props: ModelRowProps) {
           <Tooltip>
             <TooltipTrigger asChild>
               <span className="shrink-0" role="img" aria-label={providerDisplayName}>
-                <ProviderIcon provider={props.provider} className="text-muted h-3.5 w-3.5" />
+                {/* Some provider SVGs carry a <title>, which would add a native tooltip. */}
+                <ProviderIcon
+                  provider={props.provider}
+                  className="text-muted pointer-events-none h-3.5 w-3.5"
+                />
               </span>
             </TooltipTrigger>
             <TooltipContent side="top">{providerDisplayName}</TooltipContent>
