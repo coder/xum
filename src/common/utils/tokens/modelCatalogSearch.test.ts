@@ -65,6 +65,23 @@ describe("searchModelCatalog", () => {
     expect(ids).toEqual(["anthropic:claude-fable-5", "anthropic:claude-fable-5-1"]);
   });
 
+  test("lists newer versions first within a rank tier", () => {
+    const ids = searchModelCatalog({ query: "gemini flash" }).models.map((model) => model.id);
+    const order = [
+      "google:gemini-3.7-flash",
+      "google:gemini-2.5-flash-preview-09-2025",
+      "google:gemini-2.5-flash-lite-preview-06-17",
+      "google:gemini-2.0-flash",
+    ].map((id) => ids.indexOf(id));
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+
+    // Version chunks compare as numbers: 4.20 is past 4.3.
+    const grok = searchModelCatalog({ query: "grok-4." }).models.map((model) => model.id);
+    expect(grok.indexOf("xai:grok-4.20-0309-reasoning")).toBeLessThan(grok.indexOf("xai:grok-4.3"));
+    expect(grok.indexOf("xai:grok-4.3")).toBeGreaterThanOrEqual(0);
+  });
+
   test("applies the policy predicate before counting and paging", () => {
     const result = searchModelCatalog(
       { query: "fable", limit: 1 },

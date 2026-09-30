@@ -114,6 +114,8 @@ function getCatalogIndex(): IndexedCatalogEntry[] {
   return index;
 }
 
+const NATURAL_ORDER = new Intl.Collator("en", { numeric: true });
+
 // 0 = exact id/model/alias match, 1 = prefix, 2 = substring. A multi-token
 // query ranks by its weakest token so every token must be strong to rank high.
 function rankEntry(indexed: IndexedCatalogEntry, tokens: string[]): number {
@@ -146,11 +148,14 @@ export function searchModelCatalog(
     if (!isAllowed(entry.provider, entry.providerModelId)) continue;
     matches.push({ entry, rank: rankEntry(indexed, tokens) });
   }
+  // Within a tier, newer-looking versions come first (numeric chunks compare as
+  // numbers, so gemini-3.7 precedes gemini-2.5) so older variants sit behind Show more.
   matches.sort(
     (a, b) =>
       a.rank - b.rank ||
       Number(b.entry.builtIn) - Number(a.entry.builtIn) ||
-      (a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0)
+      NATURAL_ORDER.compare(b.entry.providerModelId, a.entry.providerModelId) ||
+      NATURAL_ORDER.compare(a.entry.provider, b.entry.provider)
   );
 
   const offset = input.offset ?? 0;
