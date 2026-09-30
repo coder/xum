@@ -276,16 +276,20 @@ export function sliceEpochForTurn(
   return prefix.slice(start);
 }
 
-/** Extract the system text from a recorded LanguageModel prompt. */
+/**
+ * Extract the system text from a recorded LanguageModel prompt: the leading
+ * system rows joined (a cached stable row plus an optional volatile row).
+ */
 function recordedSystemText(prompt: unknown): string | undefined {
-  if (!Array.isArray(prompt) || prompt.length === 0) {
+  if (!Array.isArray(prompt)) {
     return undefined;
   }
-  const first = prompt[0] as { role?: unknown; content?: unknown };
-  if (first?.role !== "system" || typeof first.content !== "string") {
-    return undefined;
+  const parts: string[] = [];
+  for (const row of prompt as Array<{ role?: unknown; content?: unknown }>) {
+    if (row?.role !== "system" || typeof row.content !== "string") break;
+    parts.push(row.content);
   }
-  return first.content;
+  return parts.length === 0 ? undefined : parts.join("");
 }
 
 /** Hash the recorded wire tools into manifest form (name-sorted). */
@@ -597,6 +601,7 @@ export async function replayVerifySession(params: {
         providersConfig: params.providersConfig,
         wireProviderName: envelope.data.wireProviderName,
         anthropicCacheTtl: parseAnthropicCacheTtl(envelope.data.anthropicCacheTtl),
+        systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
         planContentForTransition,
         planFilePath: envelope.data.planTransitionFilePath,
         postCompactionAttachments,

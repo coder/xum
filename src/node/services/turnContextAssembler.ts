@@ -20,7 +20,7 @@ import {
   addInterruptedSentinel,
   filterEmptyAssistantMessages,
 } from "@/browser/utils/messages/modelMessageTransform";
-import type { ModelMessage, SystemModelMessage, Tool } from "ai";
+import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -102,26 +102,62 @@ export function prepareProviderRequestMessages(
   };
 }
 
-export function formatMcpWarningPrefix(
+/**
+ * MCP failure warning, appended to the system prompt as a volatile section. It
+ * used to be prepended, which shifted every following byte whenever a server
+ * failed or recovered and missed the prompt cache for the whole request
+ * (#5251). The text is unchanged; its "\n\n" separator moved to the front.
+ */
+export function formatMcpWarningSection(
   failedServerCount: number,
   failedServerNames: string[]
 ): string | undefined {
   if (failedServerCount === 0) {
     return undefined;
   }
-  return `[Warning: ${failedServerCount} MCP server(s) failed to start: ${failedServerNames.join(", ")}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n`;
+  return `\n\n[Warning: ${failedServerCount} MCP server(s) failed to start: ${failedServerNames.join(", ")}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]`;
+}
+
+/**
+ * Length of the volatile tail of `systemMessage`: the longest run of trailing
+ * `sections` (in order) that the message ends with. Sections that are absent,
+ * or were altered by request.assemble middleware, end the run, so their
+ * content stays in the stable part. Splitting never changes the concatenated
+ * text, only where the cache breakpoint sits, so a short match is safe.
+ */
+export function measureVolatileSystemSuffix(
+  systemMessage: string,
+  sections: ReadonlyArray<string | null | undefined>
+): number {
+  let end = systemMessage.length;
+  for (let index = sections.length - 1; index >= 0; index--) {
+    const section = sections[index];
+    if (!section) continue;
+    if (!systemMessage.slice(0, end).endsWith(section)) break;
+    end -= section.length;
+  }
+  // Keep a non-empty stable part: a system row with only volatile content
+  // would gain nothing from the split.
+  return end > 0 ? systemMessage.length - end : 0;
 }
 
 export interface PromptPayload {
   providerRequestMessages: MuxMessage[];
   messages: ModelMessage[];
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   tools: Record<string, Tool> | undefined;
 }
 
 export interface AssemblePromptPayloadOptions {
   history: MuxMessage[];
   systemMessage: string;
+  /**
+   * Length of the volatile tail of systemMessage (MCP warning, hot memories,
+   * context-window ids; see measureVolatileSystemSuffix). Cache-marking
+   * providers get it as a separate system block after the cached stable
+   * block, so a tail change leaves the stable prefix cached (#5251).
+   */
+  volatileSystemSuffixLength?: number;
   tools?: Record<string, Tool>;
   modelString: string;
   routeProvider?: string;
@@ -204,26 +240,49 @@ export async function assemblePromptPayload(
     anthropicCacheTtl: options.anthropicCacheTtl,
     workspaceId: options.workspaceId,
   });
-  let system: string | SystemModelMessage | undefined = options.systemMessage;
+  let system: Instructions | undefined = options.systemMessage;
+  const volatileLength = options.volatileSystemSuffixLength ?? 0;
+  assert(
+    Number.isSafeInteger(volatileLength) &&
+      volatileLength >= 0 &&
+      (volatileLength === 0 || volatileLength < options.systemMessage.length),
+    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
+  );
+  const stableSystem = options.systemMessage.slice(
+    0,
+    options.systemMessage.length - volatileLength
+  );
+  // Uncached trailing block: the stable block keeps the cache breakpoint.
+  const volatileRows: SystemModelMessage[] =
+    volatileLength > 0
+      ? [{ role: "system", content: options.systemMessage.slice(stableSystem.length) }]
+      : [];
   const cachedSystemMessage = createCachedSystemMessage(
-    options.systemMessage,
+    stableSystem,
     options.modelString,
     options.anthropicCacheTtl,
     options.providersConfig
   );
   if (cachedSystemMessage) {
     // Anthropic requires the cached system row in messages and no separate system parameter.
-    messages = [cachedSystemMessage, ...messages];
+    messages = [cachedSystemMessage, ...volatileRows, ...messages];
     system = undefined;
   } else {
+    const openaiCachedSystem = createOpenAICachedSystemMessage(
+      stableSystem,
+      options.modelString,
+      options.routeProvider,
+      options.providersConfig ?? null,
+      { openaiWireFormat: options.openaiWireFormat }
+    );
+    // Providers without explicit breakpoints get the full string; the
+    // volatile tail is still last, which suits automatic prefix caching.
     system =
-      createOpenAICachedSystemMessage(
-        options.systemMessage,
-        options.modelString,
-        options.routeProvider,
-        options.providersConfig ?? null,
-        { openaiWireFormat: options.openaiWireFormat }
-      ) ?? options.systemMessage;
+      openaiCachedSystem == null
+        ? options.systemMessage
+        : volatileRows.length > 0
+          ? [openaiCachedSystem, ...volatileRows]
+          : openaiCachedSystem;
   }
 
   return {
@@ -496,6 +555,12 @@ export interface StreamSystemContextResult {
   agentSystemPromptSections: string[];
   /** Full system message string. */
   systemMessage: string;
+  /**
+   * The exact hot-memories text appended to the end of systemMessage, when
+   * present. Callers use it to move that volatile section out of the cached
+   * system block (#5251).
+   */
+  hotMemoriesSection?: string;
   /** Token count of the system message. */
   systemMessageTokens: number;
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
@@ -968,8 +1033,10 @@ export async function buildStreamSystemContext(
   // the end of the system message so the most recent stable prompt prefix
   // stays byte-identical for provider prompt caching. The memory index lives
   // in the memory tool description (same disclosure mechanic as skills).
-  if (opts.memoryToolAvailable && opts.hotMemoriesBlock) {
-    systemMessage = `${systemMessage}\n\n${opts.hotMemoriesBlock}`;
+  const hotMemoriesSection =
+    opts.memoryToolAvailable && opts.hotMemoriesBlock ? `\n\n${opts.hotMemoriesBlock}` : undefined;
+  if (hotMemoriesSection != null) {
+    systemMessage = `${systemMessage}${hotMemoriesSection}`;
   }
 
   // Count system message tokens for cost tracking
@@ -980,6 +1047,7 @@ export async function buildStreamSystemContext(
   return {
     agentSystemPromptSections,
     systemMessage,
+    ...(hotMemoriesSection != null ? { hotMemoriesSection } : {}),
     systemMessageTokens,
     agentDefinitions,
     availableSkills,

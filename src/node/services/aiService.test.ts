@@ -64,6 +64,7 @@ import {
 } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
+import type { MCPServerManager } from "./mcpServerManager";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import * as agentResolution from "./agentResolution";
@@ -3923,6 +3924,139 @@ describe("AIService.streamMessage turn envelope", () => {
 
     await streamTurn(harness, workspaceId);
     expect(harness.startStreamCalls).toHaveLength(1);
+  });
+});
+
+describe("AIService.streamMessage volatile system content (#5251)", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  it("keeps the cached system row byte-identical while MCP failures and hot memories change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-system");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-volatile-system";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (experimentId) =>
+        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, { experimentsService });
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
+    const stubTool: Tool = {} as never;
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      allTools: { memory: stubTool },
+      useRequestedModelString: true,
+    });
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(xumHome.path)
+    );
+    // Mirrors buildStreamSystemContext's contract: hot memories are appended
+    // after the stable prompt and reported as the exact appended section.
+    const stableSystem = "stable-system-prompt";
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+      const hotMemoriesSection =
+        contextArgs.memoryToolAvailable && contextArgs.hotMemoriesBlock
+          ? `\n\n${contextArgs.hotMemoriesBlock}`
+          : undefined;
+      return Promise.resolve({
+        instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
+        agentSystemPromptSections: ["test-agent-prompt"],
+        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
+        hotMemoriesSection,
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
+    });
+    let failedServerNames: string[] = [];
+    service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: failedServerNames.length,
+            failedServerNames,
+          },
+        }),
+    } as unknown as MCPServerManager;
+
+    const turns: Array<{ failed: string[]; hot: string | null }> = [
+      { failed: ["alpha-server"], hot: "<hot_memories>note v1</hot_memories>" },
+      { failed: [], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: ["beta-server"], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: [], hot: null },
+    ];
+    for (const turn of turns) {
+      failedServerNames = turn.failed;
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () =>
+          Promise.resolve({ indexEntries: [], hotMemoriesBlock: turn.hot }),
+      });
+      expect(result.success).toBe(true);
+    }
+    expect(startStreamCalls).toHaveLength(turns.length);
+
+    const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
+    const envelopes = (await journal.read()).filter((event) => event.kind === "turn-envelope");
+    expect(envelopes).toHaveLength(turns.length);
+
+    const textOf = (row: ModelMessage | undefined): string => {
+      if (typeof row?.content !== "string") throw new Error("expected a text system row");
+      return row.content;
+    };
+    const systemRowsPerTurn = startStreamCalls.map((call) => {
+      const firstNonSystem = call.messages.findIndex((message) => message.role !== "system");
+      return call.messages.slice(0, firstNonSystem);
+    });
+    for (const [index, rows] of systemRowsPerTurn.entries()) {
+      const turn = turns[index];
+      const stableRow = rows[0];
+      // The cached stable row never carries volatile content, so it stays
+      // byte-identical across turns and keeps the only system cache marker.
+      expect(stableRow?.content).toBe(stableSystem);
+      expect(stableRow?.providerOptions?.anthropic?.cacheControl).toBeDefined();
+      const hasVolatile = turn.failed.length > 0 || turn.hot != null;
+      expect(rows).toHaveLength(hasVolatile ? 2 : 1);
+      if (!hasVolatile) continue;
+      const tailRow = rows[1];
+      expect(tailRow?.providerOptions?.anthropic?.cacheControl).toBeUndefined();
+      const tail = textOf(tailRow);
+      for (const name of turn.failed) expect(tail).toContain(name);
+      if (turn.hot != null) expect(tail).toContain(turn.hot);
+      if (turn.failed.length === 0) expect(tail).not.toContain("MCP server");
+      // The model sees the same text: the rows join back to the logged prompt.
+      const envelope = envelopes[index];
+      if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+      expect(await journal.blobs.getText(envelope.data.systemPromptHash)).toBe(
+        rows.map((row) => textOf(row)).join("")
+      );
+    }
   });
 });
 
