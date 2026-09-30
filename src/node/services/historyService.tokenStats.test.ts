@@ -6,13 +6,13 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import * as historyScanner from "./historyScanner";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 // #5301: a token-stats miss reads the active epoch with the history locks held only for
 // recovery + receipt + open and for the final receipt check. These cases park that scan at a
 // deterministic gate (a spy on the snapshot read, no timers) and pin the failure policy: a stale
 // snapshot is retried exactly once, then Err, and every opened descriptor is closed.
-const posix = process.platform !== "win32";
 const WS = "stats-ws";
 
 describe("HistoryService.getHistoryForTokenStats", () => {
@@ -103,7 +103,7 @@ describe("HistoryService.getHistoryForTokenStats", () => {
     return handles;
   }
 
-  test.skipIf(!posix)("a since read, a window read and an append finish mid-scan", async () => {
+  test("a since read, a window read and an append finish mid-scan", async () => {
     await seedEpochs();
     const parked = parkNextScan();
     const read = service.getHistoryForTokenStats(WS);
@@ -126,6 +126,48 @@ describe("HistoryService.getHistoryForTokenStats", () => {
     expect(result.data.messages).toEqual(await lockedRead());
     expect(result.data.messages.at(-1)?.id).toBe("mid-scan");
     expect(result.data.receiptKey).toBe(await service.captureTokenStatsReceiptKey(WS));
+  });
+
+  test("a synchronous publication waits for the parked scan, then both finish", async () => {
+    await seedEpochs();
+    await append(user("post-1"), user("post-2"));
+    const capture = await service.captureCompactionReplacement(WS);
+    assert(capture.success);
+    const replacement = {
+      capture: capture.data,
+      isCurrent: () => true,
+      onGenerationAdvanced: () => undefined,
+    };
+    const drain = Promise.withResolvers<{ closed: Promise<void> }>();
+    const waitForClose = unlockedHistoryScans.waitForClose.bind(unlockedHistoryScans);
+    const drainSpy = spyOn(unlockedHistoryScans, "waitForClose").mockImplementation((filePath) => {
+      const closed = waitForClose(filePath);
+      if (path.resolve(filePath) === path.resolve(chatPath())) drain.resolve({ closed });
+      return closed;
+    });
+    restores.push(() => drainSpy.mockRestore());
+    const before = await fs.readFile(chatPath(), "utf-8");
+    const parked = parkNextScan();
+    const read = service.getHistoryForTokenStats(WS);
+    await parked.reached;
+    const truncate = service.truncateAfterMessage(WS, "post-1", { replacement });
+    const entered = await Promise.race([truncate.then(() => null), drain.promise]);
+    assert(entered, "the publication replaced chat.jsonl without waiting for the scan");
+    // The parked scan must hold the drain open; an unregistered scan resolves it at once.
+    const state = await Promise.race([
+      entered.closed.then(() => "closed"),
+      new Promise((resolve) => setImmediate(() => resolve("open"))),
+    ]);
+    expect(state).toBe("open");
+    expect(await fs.readFile(chatPath(), "utf-8")).toBe(before);
+    parked.release();
+    // Deadlocks (test timeout) if the stats read re-locks for its receipt check before closing.
+    const [result, truncated] = await Promise.all([read, truncate]);
+    expect(truncated.success).toBe(true);
+    assert(result.success);
+    // The publication moved the receipt, so the single retry read the truncated files.
+    expect(result.data.messages).toEqual(await lockedRead());
+    expect(result.data.messages.some((m) => m.id === "post-2")).toBe(false);
   });
 
   describe("rows equal the locked read", () => {
@@ -197,7 +239,7 @@ describe("HistoryService.getHistoryForTokenStats", () => {
       expect(scan).toHaveBeenCalledTimes(2);
     });
 
-    test.skipIf(!posix)("an in-place truncation during the scan is stale", async () => {
+    test("an in-place truncation during the scan is stale", async () => {
       await seedEpochs();
       const bytes = await fs.readFile(chatPath());
       const lastRowStart = bytes.lastIndexOf(10, bytes.length - 2) + 1;
@@ -214,7 +256,7 @@ describe("HistoryService.getHistoryForTokenStats", () => {
       expect(result.data.messages).toEqual(await lockedRead());
     });
 
-    test.skipIf(!posix)("a removal tombstone published mid-read is Err", async () => {
+    test("a removal tombstone published mid-read is Err", async () => {
       await seedEpochs();
       const parked = parkNextScan();
       const read = service.getHistoryForTokenStats(WS);

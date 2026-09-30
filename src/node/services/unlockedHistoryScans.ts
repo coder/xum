@@ -1,7 +1,8 @@
 import * as path from "node:path";
 
 /**
- * History files an unlocked status scan (HistoryService.getStatusHistorySuffix) holds open.
+ * History files that scans running after the history lock is released hold open
+ * (HistoryService.getStatusHistorySuffix and getHistoryForTokenStats).
  *
  * Windows rename cannot replace a destination another handle holds open. The history
  * publications rename synchronously with their ownership/isCurrent check and receipt, so they
@@ -15,7 +16,7 @@ interface TrackedPath {
 
 const tracked = new Map<string, TrackedPath>();
 
-export const historyStatusScanReaders = {
+export const unlockedHistoryScans = {
   /** Registers open descriptors on `paths`; the returned release is idempotent. */
   track(paths: readonly string[]): () => void {
     const keys = paths.map((filePath) => path.resolve(filePath));

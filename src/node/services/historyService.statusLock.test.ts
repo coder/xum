@@ -7,7 +7,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { renameRetryTiming } from "@/node/utils/writeFileAtomic";
 import { publishCompactionFile } from "./continuousCompactionJournal";
 import { json, rowsToBytes } from "./historyScanner.generator.testHarness";
-import { historyStatusScanReaders } from "./historyStatusScanReaders";
+import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { createTestHistoryService } from "./testHistoryService";
 
 // #4790: the sidebar status read holds the history lock only for truncate recovery,
@@ -255,7 +255,7 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     expect(result.success).toBe(false);
     // A leaked registration would block every later publication over chat.jsonl forever.
     const released = await Promise.race([
-      historyStatusScanReaders.waitForClose(pathsFor(workspaceId).chat).then(() => true),
+      unlockedHistoryScans.waitForClose(pathsFor(workspaceId).chat).then(() => true),
       new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
     ]);
     expect(released).toBe(true);
@@ -403,18 +403,16 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     const drains: Array<Promise<void>> = [];
     let enterDrain!: () => void;
     const drainEntered = new Promise<"drain">((resolve) => (enterDrain = () => resolve("drain")));
-    const waitForClose = historyStatusScanReaders.waitForClose.bind(historyStatusScanReaders);
-    const drainSpy = spyOn(historyStatusScanReaders, "waitForClose").mockImplementation(
-      (filePath) => {
-        const drain = waitForClose(filePath);
-        if (watched.includes(path.resolve(filePath))) {
-          drained.add(path.resolve(filePath));
-          drains.push(drain);
-          enterDrain();
-        }
-        return drain;
+    const waitForClose = unlockedHistoryScans.waitForClose.bind(unlockedHistoryScans);
+    const drainSpy = spyOn(unlockedHistoryScans, "waitForClose").mockImplementation((filePath) => {
+      const drain = waitForClose(filePath);
+      if (watched.includes(path.resolve(filePath))) {
+        drained.add(path.resolve(filePath));
+        drains.push(drain);
+        enterDrain();
       }
-    );
+      return drain;
+    });
     restores.push(() => drainSpy.mockRestore());
 
     const paused = instrumentOpen(workspaceId, { gate: true });
