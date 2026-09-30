@@ -19,3 +19,9 @@ export const ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES = 256 * 1024;
 
 /** Text-only rows above this summed text length are sent alone instead of joining a batch. */
 export const ONCHAT_REPLAY_BATCH_ROW_TEXT_LIMIT = 64 * 1024;
+
+// onChat windowed full replay (#4961): clients that opt in with `replayWindow` receive only the
+// newest rows of the active epoch. A 2,000-row window measured 110-116 ms at caught-up in the
+// renderer; 8 MiB bounds a window of giant rows.
+export const ONCHAT_REPLAY_WINDOW_MAX_ROWS = 2_000;
+export const ONCHAT_REPLAY_WINDOW_MAX_BYTES = 8 * 1024 * 1024;
