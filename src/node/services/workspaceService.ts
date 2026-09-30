@@ -5105,21 +5105,6 @@ export class WorkspaceService
   }
 
   /**
-   * Sub-agents share their task-tree owner's /memories/workspace store, so a
-   * workspace-scope write by one tree member stales the cached memory context
-   * of every live session in that tree, not just the acting one (which already
-   * clears its own cache on tool-call-end). `isAffected` decides membership.
-   */
-  invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
-    // Startup-recovery sessions are live too and may be promoted with their cache.
-    for (const registry of [this.sessions, this.transientStartupRecoverySessions]) {
-      for (const [workspaceId, session] of registry) {
-        if (isAffected(workspaceId)) session.invalidateMemoryContext();
-      }
-    }
-  }
-
-  /**
    * Removal's in-lock shared-memory handover (see removeSessionDirUnderMemoryLocks
    * `beforeTombstone`): the legacy-notebook adoption delta pass, run while
    * the owner-store lock is held so nothing can land after it. Throws to

@@ -1194,27 +1194,18 @@ export class AgentSession {
    * the memory tool description plus an optional hot-memories block, keyed by
    * model because the hot set is token-budgeted with the active model's
    * tokenizer. Index-only entries can be upgraded once final tool policy keeps
-   * the memory tool; compaction clears the map so repeated turns keep
-   * prompt-cache-stable bytes without preserving stale files forever.
+   * the memory tool.
+   *
+   * Frozen per context window (#5248, user-requested prompt-cache stability):
+   * only a new window (compaction, rollover, reset) or a new session clears
+   * it. Memory writes do not, neither this session's nor other sessions' or
+   * Dream's. Rebuilding after every write rewrote the memory tool description
+   * and system prompt, so the next turn missed the provider cache for the
+   * whole transcript; 37% of measured turns carry a write. Freshness
+   * trade-off: the agent sees its own writes through the memory tool results
+   * and live `memory view`; other writers' notes appear at the next window.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
-
-  /**
-   * Drop the cached memory context so the next stream rebuilds the index and
-   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
-   * entry point is for writes by OTHER sessions to a store this session also
-   * reads (a sub-agent editing the task tree's shared workspace notes).
-   */
-  invalidateMemoryContext(): void {
-    this.memoryContextByModelString.clear();
-    // A build already awaiting buildMemorySessionContext read the pre-write
-    // files, and a rollover candidate stages its cache in a separate map that
-    // is installed later: bumping the generation stops both from
-    // (re)populating the cache with the stale snapshot.
-    this.memoryContextGeneration++;
-  }
-
-  private memoryContextGeneration = 0;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -6078,7 +6069,6 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
-    const cacheGeneration = this.memoryContextGeneration;
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -6169,14 +6159,8 @@ export class AgentSession {
         : prepared;
     return Ok({
       start: (startOptions) => {
-        // A shared-notebook write by another tree session while this
-        // candidate was prepared invalidated the installed map only; the
-        // staged one is then unavoidably stale for this request and must
-        // not be reused by later turns.
-        this.memoryContextByModelString =
-          cacheGeneration === this.memoryContextGeneration
-            ? cache
-            : new Map<string, CachedMemoryContext>();
+        // The candidate's snapshot is the new window's frozen memory context.
+        this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -9300,17 +9284,8 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
-        // Includes nested PTC calls and directory/rename mutations that affect notes.
-        // Reads can also change hot-set ranking; rebuild at the next request, not mid-step.
-        if (
-          payload.toolName === "memory" &&
-          typeof payload.result === "object" &&
-          payload.result != null &&
-          "success" in payload.result &&
-          payload.result.success === true
-        ) {
-          this.memoryContextByModelString.clear();
-        }
+        // Memory writes leave the cached memory context alone: it is frozen per
+        // context window (see memoryContextByModelString).
         this.activeToolCallIds.delete(payload.toolCallId);
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
@@ -11389,7 +11364,6 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
-    const generation = this.memoryContextGeneration;
     // buildMemorySessionContext is an optional AgentSessionAIService capability.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
@@ -11397,15 +11371,12 @@ export class AgentSession {
             includeHotMemories,
           })
         : null;
-    // Invalidated mid-build: serve this snapshot once, do not cache it.
-    if (generation === this.memoryContextGeneration) {
-      cache.set(modelString, {
-        context,
-        includesHotMemories: includeHotMemories,
-        memoryEnabled,
-        hotSetEnabled,
-      });
-    }
+    cache.set(modelString, {
+      context,
+      includesHotMemories: includeHotMemories,
+      memoryEnabled,
+      hotSetEnabled,
+    });
     return context ?? undefined;
   }
 

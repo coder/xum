@@ -1,6 +1,7 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { EventEmitter } from "node:events";
 
 import type { Config } from "@/node/config";
 
@@ -15,9 +16,10 @@ import { createTestHistoryService } from "./testHistoryService";
 
 /**
  * Behavior under test: the memory session context (index snapshot +
- * hot-memories block) is computed once per model in a session segment and
- * recomputed at compaction boundaries — never per repeated model turn — so the
- * injected bytes stay prompt-cache-stable.
+ * hot-memories block) is computed once per model in a context window and
+ * recomputed only at window boundaries (compaction, rollover, reset) or in a
+ * new session, never after a memory write, so the injected bytes stay
+ * prompt-cache-stable (#5248).
  */
 
 const WORKSPACE_ID = "workspace-hot-memories-test";
@@ -27,11 +29,13 @@ async function createSession(args: {
   config: Config;
   buildMemorySessionContext: AIService["buildMemorySessionContext"];
   isExperimentEnabled?: AIService["isExperimentEnabled"];
+  aiEmitter?: EventEmitter;
 }): Promise<AgentSession> {
   const { session } = await createAgentSessionHarness({
     workspaceId: WORKSPACE_ID,
     config: args.config,
     historyService: args.historyService,
+    aiEmitter: args.aiEmitter,
     aiServiceOverrides: {
       getWorkspaceMetadata: mock(() => Promise.resolve(Err("metadata unavailable"))),
       buildMemorySessionContext: args.buildMemorySessionContext,
@@ -48,6 +52,8 @@ interface PrivateSessionAccess {
     cache?: Map<string, unknown>
   ) => Promise<MemorySessionContext | undefined>;
   getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
+  clearPostCompactionState: () => Promise<void>;
+  applyContextResetSideEffects: () => Promise<void>;
 }
 
 async function writePendingPostCompactionState(sessionDir: string): Promise<void> {
@@ -64,75 +70,79 @@ describe("AgentSession memory context", () => {
     await historyCleanup?.();
   });
 
-  test("computes the context once for a model and reuses it across turns", async () => {
+  test("keeps the window's context after a memory write", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const context: MemorySessionContext = {
-      indexEntries: [{ path: "/memories/global/a.md", description: "desc a" }],
-      hotMemoriesBlock: "<hot_memories>v1</hot_memories>",
-    };
-    const buildMemorySessionContext = mock(() => Promise.resolve(context));
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve<MemorySessionContext>({
+        indexEntries: [{ path: `/memories/global/v${version}.md`, description: "note" }],
+        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+      });
+    });
+    const aiEmitter = new EventEmitter();
     const session = await createSession({
       historyService,
       config,
       buildMemorySessionContext,
+      aiEmitter,
     });
     const priv = session as unknown as PrivateSessionAccess;
 
     try {
-      expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
-      expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
+      const first = await priv.resolveMemoryContext("test-model");
+      // The agent's own successful write: before #5248 this rebuilt the index and
+      // hot set, rewriting the memory tool description and the system prompt.
+      aiEmitter.emit("tool-call-end", {
+        type: "tool-call-end",
+        workspaceId: WORKSPACE_ID,
+        messageId: "assistant-1",
+        toolCallId: "call-1",
+        toolName: "memory",
+        result: { success: true },
+        timestamp: Date.now(),
+      });
+      await Promise.resolve();
+      expect(await priv.resolveMemoryContext("test-model")).toEqual(first);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
-
-      // A write by another task-tree member to the shared workspace notebook
-      // invalidates from outside; the next resolve rebuilds from disk.
-      session.invalidateMemoryContext();
-      expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
-      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();
     }
   });
 
-  test("does not cache a context whose build overlapped an invalidation", async () => {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
+  test.each(["reset", "new segment"] as const)(
+    "rebuilds the context at a %s window boundary",
+    async (boundary) => {
+      const { historyService, config, cleanup } = await createTestHistoryService();
+      historyCleanup = cleanup;
 
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    const stale: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: "<hot>stale</hot>" };
-    const fresh: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: "<hot>fresh</hot>" };
-    let calls = 0;
-    const buildMemorySessionContext = mock(async () => {
-      calls++;
-      if (calls === 1) await gate;
-      return calls === 1 ? stale : fresh;
-    });
-    const session = await createSession({
-      historyService,
-      config,
-      buildMemorySessionContext,
-    });
-    const priv = session as unknown as PrivateSessionAccess;
+      let version = 0;
+      const buildMemorySessionContext = mock(() => {
+        version++;
+        return Promise.resolve<MemorySessionContext>({
+          indexEntries: [],
+          hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+        });
+      });
+      const session = await createSession({ historyService, config, buildMemorySessionContext });
+      const priv = session as unknown as PrivateSessionAccess;
 
-    try {
-      // A rollover candidate builds into its own staged map.
-      const staged = new Map();
-      const building = priv.resolveMemoryContext("test-model", undefined, staged);
-      // A sibling session writes the shared notebook mid-build: the files
-      // the build read are already stale.
-      session.invalidateMemoryContext();
-      release();
-      expect(await building).toEqual(stale);
-      // Served once for the request that needed it, but never cached.
-      expect(staged.size).toBe(0);
-      expect(await priv.resolveMemoryContext("test-model")).toEqual(fresh);
-      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
-    } finally {
-      await session.dispose();
+      try {
+        const first = await priv.resolveMemoryContext("test-model");
+        // Rollover and manual reset share applyContextResetSideEffects; a full
+        // history clear or destructive replace starts a new segment.
+        if (boundary === "reset") await priv.applyContextResetSideEffects();
+        else await priv.clearPostCompactionState();
+        const next = await priv.resolveMemoryContext("test-model");
+        expect(next).not.toEqual(first);
+        expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+      } finally {
+        await session.dispose();
+      }
     }
-  });
+  );
 
   test("upgrades an index-only memory context when hot memories are requested", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
