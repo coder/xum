@@ -462,7 +462,7 @@ describe("ModelsSection catalogue suggestions", () => {
     await ui.view.findByRole("option", { name: /claude-fable-5$/ });
     expect(ui.view.queryByRole("status")).toBeNull();
 
-    await ui.type("no-such-catalogue-model");
+    await ui.type("zzqx");
     expect(ui.view.queryByRole("option")).toBeNull();
     expect(ui.view.getByRole("status")).toBeTruthy();
   });
@@ -479,7 +479,7 @@ describe("ModelsSection catalogue suggestions", () => {
       await ui.view.findByRole("option", { name: /claude-fable-5$/ });
       expect(ui.view.queryByRole("status")).toBeNull();
 
-      await ui.type("no-such-catalogue-model");
+      await ui.type("zzqx");
       await ui.view.findByRole("status");
       expect(ui.view.queryByRole("option")).toBeNull();
     }
