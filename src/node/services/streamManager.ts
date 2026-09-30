@@ -411,6 +411,13 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
  * request the next step's preflight will check.
  */
+/** Tools a turn's first step is restricted to (xAI forced native search), if any. */
+function firstStepForcedToolNames(
+  request: Pick<StreamRequestConfig, "forcedFirstStepToolNames">
+): string[] | undefined {
+  return request.forcedFirstStepToolNames?.length ? request.forcedFirstStepToolNames : undefined;
+}
+
 function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
     neutralizeAgentEnvelopeLookalikesInModelToolParts(
@@ -2589,6 +2596,7 @@ export class StreamManager {
       | "system"
       | "messages"
       | "toolSearchState"
+      | "forcedFirstStepToolNames"
     >,
     stepTracker?: StepMessageTracker
   ): Array<ReturnType<typeof stepCountIs>> {
@@ -2683,7 +2691,10 @@ export class StreamManager {
                   },
                   // prepareStep anchors the next step on this same request and usage, so both
                   // measures take the same anchored-or-full branch and the invariant holds.
-                  createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
+                  createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step),
+                  // A stage continuation is a new turn: its first request is step 0 (#5223).
+                  firstStepForcedToolNames(request) ??
+                    computeActiveToolNames(request.toolSearchState)
                 );
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
@@ -2965,9 +2976,7 @@ export class StreamManager {
         // byte-identical to the pre-feature behavior.
         const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
-          stepNumber === 0 && request.forcedFirstStepToolNames?.length
-            ? request.forcedFirstStepToolNames
-            : undefined;
+          stepNumber === 0 ? firstStepForcedToolNames(request) : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built.

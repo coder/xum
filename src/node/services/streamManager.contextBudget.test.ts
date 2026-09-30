@@ -538,6 +538,109 @@ describe("settled context hard ceiling", () => {
     20000
   );
 
+  // #5223 round 5: a stage prompt is delivered as a new turn, and a turn's first request can
+  // advertise fewer tools than the stream's later steps (xAI forced native search). The carried
+  // full estimate must count the continuation's first-request tools, not the next step's.
+  test("the next-turn estimate counts only the continuation's first-request tools", async () => {
+    const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
+    const h = await createTestHistoryService();
+    const workspaceId = "forced-first-step-carry";
+    const messageId = "assistant-forced-first-step";
+    let providerCalls = 0;
+    const settled: SettledStepBudget[] = [];
+    const usage = {
+      inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 10, text: 10, reasoning: 0 },
+    };
+    const model = new MockLanguageModelV3({
+      doStream: () => {
+        providerCalls += 1;
+        return Promise.resolve({
+          stream: simulateReadableStream<LanguageModelV3StreamPart>({
+            chunks:
+              providerCalls === 1
+                ? [
+                    { type: "stream-start", warnings: [] },
+                    {
+                      type: "tool-call",
+                      toolCallId: "search",
+                      toolName: "web_search",
+                      input: "{}",
+                    },
+                    {
+                      type: "finish",
+                      finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                      usage,
+                    },
+                  ]
+                : [
+                    { type: "stream-start", warnings: [] },
+                    { type: "text-start", id: "answer" },
+                    { type: "text-delta", id: "answer", delta: "Done" },
+                    { type: "text-end", id: "answer" },
+                    { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+                  ],
+          }),
+        });
+      },
+    });
+    const manager = new StreamManager(h.historyService);
+    const runtimeDir = path.join(h.tempDir, "runtime");
+    await fs.mkdir(runtimeDir);
+    try {
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("user", "user", "Search it"),
+            createMuxMessage(messageId, "assistant", ""),
+          ])
+        ).success
+      ).toBe(true);
+      const started = await manager.startStream({
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model,
+        modelString: "xai:grok-4",
+        messages: [{ role: "user", content: "Search it" }],
+        system: "system prompt",
+        runtime: new LocalRuntime(h.tempDir),
+        providedRuntimeTempDir: runtimeDir,
+        tools: {
+          web_search: tool({ inputSchema: z.object({}), execute: () => "result" }),
+          mcp_large: tool({
+            description: "Large schema the forced first step does not advertise",
+            inputSchema: z.object({ argument: z.string().describe("漢".repeat(5000)) }),
+          }),
+        },
+        forcedFirstStepToolNames: ["web_search"],
+        contextBudgetLimit: 100_000,
+        onStepSettled: (step) => {
+          settled.push(step);
+          return Promise.resolve({ decision: "continue" });
+        },
+      });
+      if (!started.success) throw new Error("Expected stream startup");
+      const completion = await started.data.completion;
+      expect(completion.status).toBe("completed");
+      expect(providerCalls).toBe(2);
+      // Step two advertises every tool; the continuation's first request only the forced one.
+      const [payload, budget] = preflights.mock.calls.at(-1)!;
+      expect(budget.activeTools).toBeUndefined();
+      const firstRequest = (await estimateAssembledRequestTokensForModel(payload, {
+        ...budget,
+        activeTools: ["web_search"],
+      }))!.estimate;
+      const allTools = (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate;
+      expect(await settled[0].estimateNextTurnRequestTokens?.()).toBe(firstRequest);
+      expect(firstRequest).toBeLessThan(allTools);
+    } finally {
+      preflights.mockRestore();
+      await manager.stopStream(workspaceId);
+      await h.cleanup();
+    }
+  }, 20000);
+
   test("a successful new_context settles as a request even when its checkpoint sibling failed", async () => {
     const h = await createTestHistoryService();
     const workspaceId = "new-context-sibling";

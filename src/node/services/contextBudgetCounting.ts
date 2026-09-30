@@ -234,8 +234,10 @@ export async function estimateAnchoredRequestTokensForModel(
 /**
  * Both settled-step measures: `anchored` is the next step's in-stream estimate (what its
  * preflight enforces); `full` is what a turn-start check would enforce on the same request. A
- * stage prompt is delivered as a new turn, so stages use `full`. It is a full recount, so it runs
- * only when asked for, at most once (an unanchored request already counted it).
+ * stage prompt is delivered as a new turn, so stages use `full`, counted with the tools that
+ * turn's first request advertises (`turnActiveTools`; a first step can advertise fewer tools than
+ * later steps, e.g. xAI forced native search). It is a full recount, so it runs only when asked
+ * for, at most once.
  */
 export async function estimateNextRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
@@ -243,18 +245,22 @@ export async function estimateNextRequestTokensForModel(
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   },
-  anchor: ContextBudgetAnchor | undefined
+  anchor: ContextBudgetAnchor | undefined,
+  turnActiveTools: readonly string[] | undefined
 ): Promise<{ anchored: number; full: () => Promise<number> } | undefined> {
-  const exact = anchor != null && isExactAppend(payload, options, anchor);
-  const anchored = exact
-    ? await estimateAnchoredRequestTokensForModel(payload, options, anchor)
-    : await estimateAssembledRequestTokensForModel(payload, options);
+  const anchored =
+    anchor != null && isExactAppend(payload, options, anchor)
+      ? await estimateAnchoredRequestTokensForModel(payload, options, anchor)
+      : await estimateAssembledRequestTokensForModel(payload, options);
   if (anchored == null) return undefined;
-  let full: Promise<number> | undefined = exact ? undefined : Promise.resolve(anchored.estimate);
+  let full: Promise<number> | undefined;
   return {
     anchored: anchored.estimate,
     full: () =>
-      (full ??= estimateAssembledRequestTokensForModel(payload, options).then((counted) => {
+      (full ??= estimateAssembledRequestTokensForModel(payload, {
+        ...options,
+        activeTools: turnActiveTools,
+      }).then((counted) => {
         assert(counted != null, "A full estimate exists whenever the anchored one does");
         return counted.estimate;
       })),
