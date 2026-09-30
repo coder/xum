@@ -105,6 +105,26 @@ export const CaughtUpMessageSchema = z.object({
    * Omitted for since/live replays so the client can preserve existing pagination state.
    */
   hasOlderHistory: z.boolean().optional(),
+  /**
+   * Windowed replay (#4961): present exactly when a windowed full replay stops short of the
+   * active epoch's start. Todos and Review-pane pins are derived from replayed rows, so a window
+   * can miss their last write; these are the session files the agent itself reads, for the
+   * client to use as a baseline that the replayed rows override.
+   */
+  windowSeed: z
+    .object({
+      todos: z.array(
+        z.object({ content: z.string(), status: z.enum(["pending", "in_progress", "completed"]) })
+      ),
+      assistedReview: z.array(
+        z.object({
+          path: z.string(),
+          range: z.object({ start: z.number(), end: z.number() }).optional(),
+          comment: z.string().optional(),
+        })
+      ),
+    })
+    .optional(),
   /** Server's cursor at end of replay (client should use this for next reconnect). */
   cursor: OnChatCursorSchema.optional(),
 });

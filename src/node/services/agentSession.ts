@@ -95,11 +95,14 @@ import type {
   OnChatMode,
   OnChatCursor,
   OnChatDowngradeReason,
+  CaughtUpMessage,
   ProvidersConfigMap,
   StreamErrorMessage,
   AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -3071,6 +3074,12 @@ export class AgentSession {
     // reason on the caught-up payload plus a log line with row counts.
     let downgradeReason: OnChatDowngradeReason | undefined;
     let epochRowCount: number | undefined;
+    // Replay log (#4961): rows the history read returned, whether it was a windowed read, and
+    // whether it covered the whole active epoch (only then is epochRowCount known).
+    let historyRows: number | undefined;
+    let windowedRead = false;
+    let readCoversEpoch = false;
+    let windowSeed: CaughtUpMessage["windowSeed"];
     let sentRowCount = 0;
     let emittedReplayMessages = false;
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
@@ -3280,11 +3289,19 @@ export class AgentSession {
         maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
         maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
       };
+      const onBytesRead = (bytes: number) => {
+        historyBytesRead += bytes;
+      };
       const readReplayWindow = async (): Promise<Result<MuxMessage[]> | undefined> => {
-        const window = await replayTimer.time("historyRead", () =>
-          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps)
+        const window = await replayTimer.timeLocked("historyLockWait", "historyRead", (onLock) =>
+          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps, {
+            onLockAcquired: onLock,
+            onBytesRead,
+          })
         );
         if (!window.success || window.data.kind !== "window") return undefined;
+        windowedRead = true;
+        readCoversEpoch = window.data.reachedEpochStart;
         if (window.data.reachedEpochStart) return Ok(window.data.messages);
         const floor = oldestSequenceOf(window.data.messages);
         if (
@@ -3300,15 +3317,16 @@ export class AgentSession {
       };
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      const readFullHistory = () =>
-        replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
+      const readFullHistory = () => {
+        windowedRead = false;
+        readCoversEpoch = true;
+        return replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
           this.historyService.getHistoryFromLatestBoundary(this.workspaceId, 0, {
             onLockAcquired,
-            onBytesRead: (bytes) => {
-              historyBytesRead += bytes;
-            },
+            onBytesRead,
           })
         );
+      };
       let historyResult: Result<MuxMessage[]> | undefined;
       // True when history is a windowed client's since range, not the active epoch.
       let sinceRange = false;
@@ -3317,20 +3335,19 @@ export class AgentSession {
         const anchor = mode.cursor.history.historySequence;
         const range =
           isNonNegativeInteger(floor) && isNonNegativeInteger(anchor)
-            ? await replayTimer.time("historyRead", () =>
+            ? await replayTimer.timeLocked("historyLockWait", "historyRead", (onLock) =>
                 this.historyService.getHistorySinceFromLatestBoundary(
                   this.workspaceId,
                   windowCaps,
-                  {
-                    floor,
-                    anchor,
-                  }
+                  { floor, anchor },
+                  { onLockAcquired: onLock, onBytesRead }
                 )
               )
             : undefined;
         if (range?.success && range.data.kind === "range") {
           historyResult = Ok(range.data.messages);
           sinceRange = true;
+          windowedRead = true;
         } else
           downgradeReason = range?.success === false ? "history-read-failed" : "outside-window";
       }
@@ -3347,7 +3364,8 @@ export class AgentSession {
 
       if (historyResult.success) {
         let history = historyResult.data;
-        epochRowCount = history.length;
+        historyRows = history.length;
+        epochRowCount = readCoversEpoch ? history.length : undefined;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
         // A windowed client whose range was not read has already downgraded (downgradeReason).
@@ -3436,7 +3454,8 @@ export class AgentSession {
             const downgrade = (await readReplayWindow()) ?? (await readFullHistory());
             if (!downgrade.success) throw new Error(downgrade.error);
             history = downgrade.data;
-            epochRowCount = history.length;
+            historyRows = history.length;
+            epochRowCount = readCoversEpoch ? history.length : undefined;
             oldestHistorySequence = oldestSequenceOf(history);
             anchorFingerprint = undefined;
           }
@@ -3524,6 +3543,18 @@ export class AgentSession {
             },
           };
           break;
+        }
+
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // The window missed the epoch start, so it may miss the last todo_write or
+          // review_pane_update too. Send the files the agent reads (both readers return [] on
+          // any read error) as the client's baseline (#4961).
+          const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+          const [todos, assistedReview] = await Promise.all([
+            readTodosForSessionDir(sessionDir),
+            readAssistedReviewForSessionDir(sessionDir),
+          ]);
+          windowSeed = { todos, assistedReview };
         }
       }
 
@@ -3639,6 +3670,9 @@ export class AgentSession {
         replayMode,
         ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
         epochRowCount,
+        historyRows,
+        windowed: windowedRead,
+        reachedEpochStart: readCoversEpoch,
         sentRowCount,
         historyBytesRead,
         streamReplayed,
@@ -3656,6 +3690,7 @@ export class AgentSession {
           historyReplayStatus: historyReplayFailed ? "failed" : "complete",
           ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
+          ...(windowSeed && !historyReplayFailed ? { windowSeed } : {}),
           cursor: serverCursor,
         },
       });

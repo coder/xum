@@ -40,7 +40,12 @@ export interface ChatSwitchServerReplay {
   requestedMode?: string;
   replayMode?: string;
   downgradeReason?: string;
+  /** Omitted when a windowed read stopped short of the epoch start (#4961). */
   epochRowCount?: number;
+  /** Rows the history read returned: the epoch, a window, or a since range (#4961). */
+  historyRows?: number;
+  windowed?: boolean;
+  reachedEpochStart?: boolean;
   sentRowCount?: number;
   historyBytesRead?: number;
   streamReplayed?: boolean;
@@ -110,7 +115,11 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
     "server.totalMs": sum((replay) => replay.totalMs),
     ...phases,
     "server.sentRowCount": sum((replay) => replay.sentRowCount),
-    "server.epochRowCount": sum((replay) => replay.epochRowCount),
+    // Unknown (not zero) when any replay's windowed read stopped short of the epoch start.
+    "server.epochRowCount": server.some((replay) => replay.epochRowCount === undefined)
+      ? null
+      : sum((replay) => replay.epochRowCount),
+    "server.historyRows": sum((replay) => replay.historyRows),
     "server.historyBytesRead": sum((replay) => replay.historyBytesRead),
   };
 }

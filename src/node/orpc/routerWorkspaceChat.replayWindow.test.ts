@@ -26,6 +26,10 @@ import {
   createAgentSessionHarness,
   type AgentSessionHarness,
 } from "@/node/services/agentSession.testHarness";
+import { log } from "@/node/services/log";
+import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "@/node/services/onChatReplayTiming";
+import { getAssistedReviewFilePath } from "@/node/services/reviewPane/assistedReviewStorage";
+import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import type { ORPCContext } from "./context";
 import { router } from "./router";
 
@@ -380,5 +384,111 @@ describe("onChat windowed since (#4961)", () => {
     expect(opted.caughtUp.replay).toBe("since");
     expect(ids(opted.rows)).toEqual([windowed.messageId, appended.id]);
     expect(opted.caughtUp.cursor?.history?.oldestHistorySequence).toBe(102);
+  });
+});
+
+describe("onChat window seed and replay metrics (#4961)", () => {
+  let harness: AgentSessionHarness | undefined;
+  afterEach(async () => {
+    mock.restore();
+    await harness?.session.dispose();
+    await harness?.cleanup();
+    harness = undefined;
+  });
+
+  const todos = [
+    { content: "Wrote the reader", status: "completed" as const },
+    { content: "Seeding the renderer", status: "in_progress" as const },
+  ];
+  const assistedReview = [{ path: "src/a.ts", range: { start: 3, end: 9 }, comment: "look" }];
+
+  /** The session files the agent reads; the window replays none of their writes. */
+  async function writeSeedFiles(h: AgentSessionHarness): Promise<void> {
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(getTodoFilePath(sessionDir), JSON.stringify(todos));
+    await writeFile(getAssistedReviewFilePath(sessionDir), JSON.stringify(assistedReview));
+  }
+
+  /** The fields of every "onChat replay" log line, in order. */
+  function replayLogs() {
+    const lines: Array<Record<string, unknown>> = [];
+    const capture = (message: unknown, fields?: unknown) => {
+      if (message === ONCHAT_REPLAY_TIMING_LOG_MESSAGE)
+        lines.push(fields as Record<string, unknown>);
+    };
+    spyOn(log, "debug").mockImplementation(capture);
+    spyOn(log, "info").mockImplementation(capture);
+    return lines;
+  }
+
+  const alternating = (count: number) =>
+    Array.from({ length: count }, (_, i) => row(i, i % 2 === 0 ? "user" : "assistant"));
+
+  test("a window that misses the epoch start carries the seed, also after a downgrade", async () => {
+    harness = await createHarness(alternating(EPOCH_ROWS));
+    await writeSeedFiles(harness);
+    const client = createClient(harness);
+    const windowed = await collectReplay(client, { replayWindow: true });
+    expect(windowed.caughtUp.hasOlderHistory).toBe(true);
+    expect(windowed.caughtUp.windowSeed).toEqual({ todos, assistedReview });
+
+    const cursor = windowed.caughtUp.cursor?.history;
+    if (!cursor) throw new Error("windowed replay must return a history cursor");
+    // A since fast path keeps the client's baseline: no seed.
+    const since = await collectReplay(client, {
+      replayWindow: true,
+      mode: { type: "since", cursor: { history: cursor } },
+    });
+    expect(since.caughtUp.replay).toBe("since");
+    expect(since.caughtUp.windowSeed).toBeUndefined();
+    // A downgrade replaces the client's state with a fresh window, so it carries the seed.
+    const downgraded = await collectReplay(client, {
+      replayWindow: true,
+      mode: { type: "since", cursor: { history: { ...cursor, priorHistoryFingerprint: "x" } } },
+    });
+    expect(downgraded.caughtUp.downgradeReason).toBe("fingerprint-mismatch");
+    expect(downgraded.caughtUp.windowSeed).toEqual({ todos, assistedReview });
+    // A client that did not opt in never gets one.
+    expect((await collectReplay(client, {})).caughtUp.windowSeed).toBeUndefined();
+  });
+
+  test("a window that reaches the epoch start carries no seed", async () => {
+    harness = await createHarness(alternating(10));
+    await writeSeedFiles(harness);
+    const replay = await collectReplay(createClient(harness), { replayWindow: true });
+    expect(replay.caughtUp.hasOlderHistory).toBe(false);
+    expect(replay.caughtUp.windowSeed).toBeUndefined();
+  });
+
+  test("the replay log reports bytes, lock wait and rows on the window paths", async () => {
+    harness = await createHarness(alternating(EPOCH_ROWS));
+    const client = createClient(harness);
+    const logs = replayLogs();
+    const windowed = await collectReplay(client, { replayWindow: true });
+    await collectReplay(client, {});
+    const cursor = windowed.caughtUp.cursor?.history;
+    if (!cursor) throw new Error("windowed replay must return a history cursor");
+    await collectReplay(client, {
+      replayWindow: true,
+      mode: { type: "since", cursor: { history: cursor } },
+    });
+    expect(logs).toHaveLength(3);
+    const [window, full, since] = logs;
+    const phases = (fields: Record<string, unknown>) => fields.phasesMs as Record<string, number>;
+    for (const fields of [window, since]) {
+      expect(fields.windowed).toBe(true);
+      expect(fields.reachedEpochStart).toBe(false);
+      // A cut read cannot know the epoch's length.
+      expect(fields.epochRowCount).toBeUndefined();
+      expect(fields.historyBytesRead as number).toBeGreaterThan(0);
+      expect(phases(fields).historyLockWait).toBeGreaterThanOrEqual(0);
+    }
+    expect(window.historyRows).toBe(windowed.rows.length);
+    expect(since.historyRows).toBe(windowed.rows.length);
+    // The full read is reported as before.
+    expect(full.windowed).toBe(false);
+    expect(full.epochRowCount).toBe(EPOCH_ROWS);
+    expect(full.historyBytesRead as number).toBeGreaterThan(window.historyBytesRead as number);
   });
 });
