@@ -87,8 +87,8 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import * as os from "os";
+import * as path from "path";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -530,6 +530,12 @@ function wrapToolExecuteWithModelOnlyNotifications(
   return wrappedTool;
 }
 
+/** HOME as tool processes see it: project secrets are merged after xumEnv and may override it. */
+function getEffectiveChildHome(config: ToolConfiguration): string {
+  const secretHome = config.secrets?.HOME;
+  return secretHome != null && path.isAbsolute(secretHome) ? secretHome : os.homedir();
+}
+
 function wrapToolsWithModelOnlyNotifications(
   tools: Record<string, Tool>,
   config: ToolConfiguration
@@ -540,9 +546,16 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
-    // Only commands on this host can clutter this host's home dir.
-    ...(config.runtime instanceof LocalBaseRuntime
-      ? [new HomeClutterReminderSource({ homeDir: os.homedir(), workspaceId: config.workspaceId })]
+    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
+    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
+    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
+    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? [
+          new HomeClutterReminderSource({
+            homeDir: getEffectiveChildHome(config),
+            workspaceId: config.workspaceId,
+          }),
+        ]
       : []),
   ]);
 

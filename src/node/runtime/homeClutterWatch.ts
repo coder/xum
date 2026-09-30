@@ -71,11 +71,21 @@ export function diffClutterSnapshots(
 }
 
 const MAX_LISTED_ENTRIES = 5;
+const MAX_DISPLAY_NAME_CHARS = 80;
+// Entry names are attacker-influenced (any process can create one) and land in a trusted-looking
+// model notification, so anything that could close the code span, start markup or break lines
+// is replaced before display.
+const UNSAFE_DISPLAY_CHARS = /[^A-Za-z0-9._+@=,:~/\\ -]/g;
+
+function toSafeDisplay(text: string): string {
+  const safe = text.replace(UNSAFE_DISPLAY_CHARS, "?");
+  return safe.length > MAX_DISPLAY_NAME_CHARS ? `${safe.slice(0, MAX_DISPLAY_NAME_CHARS)}…` : safe;
+}
 
 export function formatClutterNote(entries: readonly string[], homeDir: string): string {
   assert(entries.length > 0, "formatClutterNote requires at least one entry");
   const display = (entry: string) =>
-    entry.startsWith(homeDir + path.sep) ? "~" + entry.slice(homeDir.length) : entry;
+    toSafeDisplay(entry.startsWith(homeDir + path.sep) ? "~" + entry.slice(homeDir.length) : entry);
   const listed = entries.slice(0, MAX_LISTED_ENTRIES).map((entry) => `\`${display(entry)}\``);
   const more =
     entries.length > MAX_LISTED_ENTRIES ? ` (+${entries.length - MAX_LISTED_ENTRIES} more)` : "";

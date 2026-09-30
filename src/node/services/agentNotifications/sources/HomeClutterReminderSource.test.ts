@@ -16,8 +16,20 @@ describe("HomeClutterReminderSource", () => {
     await fs.rm(home, { recursive: true, force: true });
   });
 
-  const poll = (source: HomeClutterReminderSource) =>
-    source.poll({ toolName: "bash", toolSucceeded: true, now: Date.now() });
+  const poll = (source: HomeClutterReminderSource, toolSucceeded = true) =>
+    source.poll({ toolName: "bash", toolSucceeded, now: Date.now() });
+
+  test("a failed tool call does not use up the turn's reminder", async () => {
+    const turn = new HomeClutterReminderSource({ homeDir: home });
+
+    // The notification wrapper drops notifications from failed calls, so nothing may be spent.
+    await fs.mkdir(path.join(home, "from-failed-call"));
+    expect(await poll(turn, false)).toEqual([]);
+
+    const next = await poll(turn);
+    expect(next).toHaveLength(1);
+    expect(next[0].content).toContain("~/from-failed-call");
+  });
 
   test("tells the model once per turn, starting from the turn's first tool call", async () => {
     const turn = new HomeClutterReminderSource({ homeDir: home });

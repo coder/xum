@@ -20,19 +20,20 @@ export function getWorkspaceScratchDir(sessionsDir: string, workspaceId: string)
 }
 
 /**
- * Create the scratch dir if needed and return it. Returns undefined (and logs) when it cannot be
- * created, so callers never advertise a directory that does not exist.
+ * Create the scratch dir if needed and return it. Creation is best-effort: the path is returned
+ * even when mkdir fails (logged), because the environment prompt always tells local/worktree
+ * agents to use $XUM_SCRATCH_DIR. An unset variable would turn `mkdir -p "$XUM_SCRATCH_DIR/logs"`
+ * into `/logs`; a set-but-missing dir just makes the agent's own `mkdir -p` create it.
  */
 export async function ensureWorkspaceScratchDir(
   sessionsDir: string,
   workspaceId: string
-): Promise<string | undefined> {
+): Promise<string> {
   const scratchDir = getWorkspaceScratchDir(sessionsDir, workspaceId);
   try {
     await fsPromises.mkdir(scratchDir, { recursive: true });
-    return scratchDir;
   } catch (error) {
     log.warn(`Could not create workspace scratch dir ${scratchDir}: ${getErrorMessage(error)}`);
-    return undefined;
   }
+  return scratchDir;
 }

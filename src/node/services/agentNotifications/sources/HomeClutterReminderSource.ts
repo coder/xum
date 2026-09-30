@@ -15,6 +15,25 @@ import type {
   NotificationSource,
 } from "@/node/services/agentNotifications/NotificationEngine";
 
+// Every tool result waits for this scan, so a slow or stalled home dir (network/FUSE mount)
+// must never hold results back; a skipped poll just defers detection to the next tool call.
+const SNAPSHOT_TIMEOUT_MS = 250;
+
+async function snapshotWithin(
+  roots: readonly ClutterWatchRoot[],
+  timeoutMs: number
+): Promise<ClutterSnapshot | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([snapshotClutterRoots(roots), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Tells the model, at most once per turn, that new entries appeared directly in the shared home
  * folders (~, ~/.cache, ...) and that $XUM_SCRATCH_DIR is the place for temporary files.
@@ -29,7 +48,9 @@ export class HomeClutterReminderSource implements NotificationSource {
   private readonly homeDir: string;
   private readonly workspaceId: string | undefined;
   private readonly roots: ClutterWatchRoot[];
-  private baseline: Promise<ClutterSnapshot>;
+  private baseline: Promise<ClutterSnapshot | null>;
+  /** Detected but not yet delivered (a failed tool call cannot carry notifications). */
+  private readonly pending = new Set<string>();
   private emitted = false;
 
   constructor(args: { homeDir: string; workspaceId?: string }) {
@@ -37,34 +58,48 @@ export class HomeClutterReminderSource implements NotificationSource {
     this.workspaceId = args.workspaceId;
     this.roots = getClutterWatchRoots(args.homeDir);
     // Start now (turn start) so entries created by the first tool call are not in the baseline.
-    this.baseline = snapshotClutterRoots(this.roots);
+    this.baseline = snapshotWithin(this.roots, SNAPSHOT_TIMEOUT_MS);
   }
 
   async poll(ctx: NotificationPollContext): Promise<AgentNotification[]> {
     assert(typeof ctx.toolName === "string", "toolName must be a string");
 
     const before = await this.baseline;
-    const after = await snapshotClutterRoots(this.roots);
-    this.baseline = Promise.resolve(after);
-
-    const added = diffClutterSnapshots(this.roots, before, after);
-    if (added.length === 0) {
+    const after = await snapshotWithin(this.roots, SNAPSHOT_TIMEOUT_MS);
+    if (after == null) {
+      // Timed out: keep the old baseline so nothing created meanwhile is lost.
       return [];
     }
-    // Always log, so the new-entry rate stays measurable even after the model was told.
-    log.info("New entries outside the workspace appeared during a turn", {
-      workspaceId: this.workspaceId,
-      afterTool: ctx.toolName,
-      entries: added,
-    });
-    if (this.emitted) {
+    this.baseline = Promise.resolve(after);
+    if (before == null) {
+      // No usable baseline yet (the turn-start scan timed out); start comparing from here.
+      return [];
+    }
+
+    const added = diffClutterSnapshots(this.roots, before, after);
+    if (added.length > 0) {
+      // Always log, so the new-entry rate stays measurable even after the model was told.
+      log.info("New entries outside the workspace appeared during a turn", {
+        workspaceId: this.workspaceId,
+        afterTool: ctx.toolName,
+        entries: added,
+      });
+      if (!this.emitted) {
+        for (const entry of added) this.pending.add(entry);
+      }
+    }
+    // The notification wrapper drops notifications of failed tool calls, so only a successful
+    // call may consume the once-per-turn reminder.
+    if (this.emitted || this.pending.size === 0 || !ctx.toolSucceeded) {
       return [];
     }
     this.emitted = true;
+    const entries = [...this.pending].sort();
+    this.pending.clear();
     return [
       {
         source: "home_clutter_reminder",
-        content: `<notification>\n${formatClutterNote(added, this.homeDir)}\n</notification>`,
+        content: `<notification>\n${formatClutterNote(entries, this.homeDir)}\n</notification>`,
       },
     ];
   }

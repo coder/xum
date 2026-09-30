@@ -21,16 +21,18 @@ describe("ensureWorkspaceScratchDir", () => {
     const scratchDir = await ensureWorkspaceScratchDir(sessionsDir, "ws1");
 
     expect(scratchDir).toBe(getWorkspaceScratchDir(sessionsDir, "ws1"));
-    expect(path.dirname(scratchDir!)).toBe(path.join(sessionsDir, "ws1"));
-    expect((await fs.stat(scratchDir!)).isDirectory()).toBe(true);
+    expect(path.dirname(scratchDir)).toBe(path.join(sessionsDir, "ws1"));
+    expect((await fs.stat(scratchDir)).isDirectory()).toBe(true);
   });
 
-  test("returns undefined instead of advertising a dir it could not create", async () => {
+  test("still returns the path when creation fails, so the prompt never names an unset variable", async () => {
     // A regular file where the session dir should be makes mkdir fail.
     const sessionsDir = path.join(tempDir, "sessions");
     await fs.mkdir(sessionsDir);
     await fs.writeFile(path.join(sessionsDir, "ws1"), "not a dir");
 
-    expect(await ensureWorkspaceScratchDir(sessionsDir, "ws1")).toBeUndefined();
+    expect(await ensureWorkspaceScratchDir(sessionsDir, "ws1")).toBe(
+      getWorkspaceScratchDir(sessionsDir, "ws1")
+    );
   });
 });
