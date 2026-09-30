@@ -1000,6 +1000,10 @@ export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
 /** workspaceNameState stores at most this much (serialized) of a typed manual name. */
 // Valid names are at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
 export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
+/** statusState:{workspaceId} field caps (serialized chars); a longer URL is dropped, not cut. */
+export const STATUS_STATE_EMOJI_MAX_CHARS = 32;
+export const STATUS_STATE_MESSAGE_MAX_CHARS = 192;
+export const STATUS_STATE_URL_MAX_CHARS = 256;
 
 /**
  * Every key's length is capped too. Budgets bound values only: scope ids embed project paths
@@ -1156,6 +1160,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
   // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
   // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
+  // ~28 skeleton + the STATUS_STATE_*_MAX_CHARS field caps.
   workspaceKey(getStatusStateKey, "workspace-scoped", true, 512),
   // Note: auto-compaction threshold is per-model, not per-workspace.
 
