@@ -2643,6 +2643,40 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(await h.memoryRows()).toHaveLength(2);
   });
 
+  it("re-emits the current listing after a compaction boundary", async () => {
+    using xumHome = new DisposableTempDir("ai-service-context-listing-boundary");
+    const h = createListingHarness(xumHome.path, "workspace-context-listing-boundary");
+    await fs.mkdir(h.projectPath, { recursive: true });
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    const send = async () =>
+      expect(
+        (await h.harness.service.streamMessage(h.options(await h.readHistory(), [lesson]))).success
+      ).toBe(true);
+
+    await h.append(createMuxMessage("user-1", "user", "hello"));
+    await send();
+    expect(await h.memoryRows()).toHaveLength(1);
+
+    // Compaction replaces the window; listing rows are never copied behind the boundary.
+    await h.append(
+      createMuxMessage("summary", "assistant", "summary of the work", {
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        compacted: "user",
+        muxMetadata: { type: "compaction-summary" },
+      })
+    );
+    await h.append(createMuxMessage("user-2", "user", "continue"));
+    await send();
+    // The unchanged listing is emitted again in the new window and reaches the request.
+    const rows = await h.memoryRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata?.historySequence).toBeGreaterThan(
+      (await h.readHistory()).find((row) => row.id === "user-2")?.metadata?.historySequence ?? -1
+    );
+    expect(h.lastRequestText()).toContain(lesson.path);
+  });
+
   it("keeps listing rows out of a request whose history snapshot went stale", async () => {
     using xumHome = new DisposableTempDir("ai-service-context-listing-race");
     const h = createListingHarness(xumHome.path, "workspace-context-listing-race");

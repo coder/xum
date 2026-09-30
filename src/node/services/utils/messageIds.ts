@@ -6,6 +6,7 @@
  */
 
 import { MCP_PROMPT_SNAPSHOT_MESSAGE_ID_PREFIX } from "@/common/types/message";
+import { CONTEXT_LISTING_MESSAGE_ID_PREFIX } from "@/common/utils/messages/contextListingMessage";
 
 const randomSuffix = (len = 9) =>
   Math.random()
@@ -73,8 +74,7 @@ export const createTaskFailureMessageId = (): string =>
 export const createFileChangeNotificationMessageId = (): string =>
   `file-change-${Date.now()}-${randomSuffix(9)}`;
 
-/** Context listing row ID prefix (see contextListing.ts); identifies the row kind in history. */
-export const CONTEXT_LISTING_MESSAGE_ID_PREFIX = "context-listing-";
+export { CONTEXT_LISTING_MESSAGE_ID_PREFIX };
 
 /** Context listing row IDs: context-listing-{section}-{timestamp}-{random} */
 export const createContextListingMessageId = (section: string): string =>

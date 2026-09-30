@@ -24,6 +24,7 @@ import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { isContextListingMessage } from "@/common/utils/messages/contextListingMessage";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -81,8 +82,17 @@ export function prepareProviderRequestMessages(
   // A durable reset still seals history when its row is rejected or display-only.
   // Establish the boundary before any content filter can erase that structural evidence.
   const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+  // The one opt-in for context listing rows (#5248), shared by live turns, replay and the
+  // continuous-compaction prefix. A compaction request summarizes the conversation instead:
+  // stale listings must not reach the summarizer, and the first live turn after the boundary
+  // re-emits the current ones.
+  const compacting =
+    boundarySlicedMessages.findLast(
+      (message) => message.role === "user" && !isContextListingMessage(message)
+    )?.metadata?.muxMetadata?.type === "compaction-request";
   const keepContextRow = (message: MuxMessage) =>
-    !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
+    (isContextListingMessage(message) ? !compacting : !isModelHiddenMessage(message)) &&
+    !message.metadata?.contextBudgetRejected;
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
     boundarySlicedMessages.filter(keepContextRow)

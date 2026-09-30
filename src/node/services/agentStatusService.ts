@@ -21,7 +21,6 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
-import { isContextListingMessage } from "./contextListing";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -619,14 +618,7 @@ export class AgentStatusService {
 
 /** Status-visible rows; also the suffix read's stop predicate, so the window cannot differ. */
 function isStatusTranscriptRow(message: MuxMessage): boolean {
-  // Context listings (#5248) follow the real prompt as user rows; they
-  // describe available tools, not the work, so they must not read as the
-  // newest user message or push the task out of the trailing window.
-  return (
-    !isDurableContextResetBoundaryMarker(message) &&
-    !isModelHiddenMessage(message) &&
-    !isContextListingMessage(message)
-  );
+  return !isDurableContextResetBoundaryMarker(message) && !isModelHiddenMessage(message);
 }
 
 function extractMessageText(message: MuxMessage): string {

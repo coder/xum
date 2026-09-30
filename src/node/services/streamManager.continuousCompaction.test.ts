@@ -14,6 +14,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
 import { createMuxMessage } from "@/common/types/message";
+import { buildContextListingMessages } from "./contextListing";
 import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
@@ -140,6 +141,18 @@ describe("continuous prefix prepareStep and journal", () => {
     liveTurns = [];
     mock.restore();
     await history.cleanup();
+  });
+
+  it("keeps context listing rows in the rebuilt continuous prefix", async () => {
+    // The continuous prefix is a live request: it goes through the same opt-in.
+    const journal = journalFixture();
+    const [listing] = buildContextListingMessages(
+      [],
+      [{ key: "memory", title: "Memory index", body: "- /memories/global/lesson.md: a lesson" }]
+    );
+    journal.prefixSourceRows = [...journal.prefixSourceRows, listing];
+    const prefix = await rebuildContinuousPrefix(journal, workspaceId);
+    expect(JSON.stringify(prefix)).toContain("/memories/global/lesson.md");
   });
 
   async function setup() {
