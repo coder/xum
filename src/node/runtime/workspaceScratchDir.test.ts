@@ -25,6 +25,13 @@ describe("ensureWorkspaceScratchDir", () => {
     expect((await fs.stat(scratchDir)).isDirectory()).toBe(true);
   });
 
+  test("exports an absolute path even when the Xum root is relative", () => {
+    const scratchDir = getWorkspaceScratchDir(path.join(".xum-test", "sessions"), "ws1");
+
+    expect(path.isAbsolute(scratchDir)).toBe(true);
+    expect(scratchDir).toBe(path.resolve(".xum-test", "sessions", "ws1", "scratch"));
+  });
+
   test("still returns the path when creation fails, so the prompt never names an unset variable", async () => {
     // A regular file where the session dir should be makes mkdir fail.
     const sessionsDir = path.join(tempDir, "sessions");

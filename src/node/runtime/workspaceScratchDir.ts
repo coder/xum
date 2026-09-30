@@ -14,9 +14,10 @@ import { log } from "@/node/services/log";
  * (`<root>/scratch/<id>` is taken by scratch-chat workdirs and swept as orphans at startup.)
  */
 export function getWorkspaceScratchDir(sessionsDir: string, workspaceId: string): string {
-  assert(path.isAbsolute(sessionsDir), "sessionsDir must be an absolute path");
   assert(workspaceId.trim().length > 0, "workspaceId must not be empty");
-  return path.join(sessionsDir, workspaceId, "scratch");
+  // XUM_ROOT may be relative (e.g. XUM_ROOT=.xum-test); the exported value must be absolute
+  // because agent commands run with a different cwd.
+  return path.resolve(sessionsDir, workspaceId, "scratch");
 }
 
 /**

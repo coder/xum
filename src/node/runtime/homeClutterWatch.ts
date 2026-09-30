@@ -32,26 +32,39 @@ export function getClutterWatchRoots(homeDir: string): ClutterWatchRoot[] {
   ];
 }
 
-/** Direct entry names per root dir. A root that does not exist has no key. */
+/**
+ * Direct entry names per root dir. A root that does not exist maps to an empty set; a root
+ * that could not be read (EACCES, EIO, ...) has no key, meaning "unknown", so a transient error
+ * never makes every existing child look new once the root is readable again.
+ */
 export type ClutterSnapshot = ReadonlyMap<string, ReadonlySet<string>>;
 
+export type ReadDir = (dir: string) => Promise<string[]>;
+
+const defaultReadDir: ReadDir = (dir) => fsPromises.readdir(dir);
+
+function isMissingDirError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 export async function snapshotClutterRoots(
-  roots: readonly ClutterWatchRoot[]
+  roots: readonly ClutterWatchRoot[],
+  readDir: ReadDir = defaultReadDir
 ): Promise<ClutterSnapshot> {
   const entries = await Promise.all(
     roots.map(async (root): Promise<[string, Set<string>] | null> => {
       try {
-        return [root.dir, new Set(await fsPromises.readdir(root.dir))];
-      } catch {
-        // Missing or unreadable roots simply have nothing to compare.
-        return null;
+        return [root.dir, new Set(await readDir(root.dir))];
+      } catch (error) {
+        return isMissingDirError(error) ? [root.dir, new Set()] : null;
       }
     })
   );
   return new Map(entries.filter((entry) => entry != null));
 }
 
-/** Absolute paths that exist in `after` but not in `before`, sorted. */
+/** Absolute paths that exist in `after` but not in `before`, sorted. Unknown roots are skipped. */
 export function diffClutterSnapshots(
   roots: readonly ClutterWatchRoot[],
   before: ClutterSnapshot,
@@ -59,15 +72,69 @@ export function diffClutterSnapshots(
 ): string[] {
   const added: string[] = [];
   for (const root of roots) {
-    const afterNames = after.get(root.dir);
-    if (afterNames == null) continue;
     const beforeNames = before.get(root.dir);
+    const afterNames = after.get(root.dir);
+    if (beforeNames == null || afterNames == null) continue;
     for (const name of afterNames) {
-      if (beforeNames?.has(name) === true || root.isXumOwnedName?.(name) === true) continue;
+      if (beforeNames.has(name) || root.isXumOwnedName?.(name) === true) continue;
       added.push(path.join(root.dir, name));
     }
   }
   return added.sort();
+}
+
+/**
+ * One scanner per home dir, shared by every turn and provider attempt. readdir cannot be
+ * cancelled, so on a stalled filesystem (network/FUSE home) callers must not start more reads:
+ * at most one scan is in flight, and a scan that outlives its callers' timeouts still publishes
+ * its result. Unreadable roots keep their last known listing.
+ */
+export class ClutterScanner {
+  readonly roots: readonly ClutterWatchRoot[];
+  private readonly readDir: ReadDir;
+  private inFlight: { scan: Promise<ClutterSnapshot>; startedAt: number } | null = null;
+  private last: ClutterSnapshot | null = null;
+
+  constructor(roots: readonly ClutterWatchRoot[], readDir: ReadDir = defaultReadDir) {
+    this.roots = roots;
+    this.readDir = readDir;
+  }
+
+  /** The in-flight scan, or a new one when none is running. */
+  scan(now = Date.now()): Promise<ClutterSnapshot> {
+    if (this.inFlight != null) return this.inFlight.scan;
+    const scan = snapshotClutterRoots(this.roots, this.readDir)
+      .then((fresh) => {
+        const merged = new Map(fresh);
+        for (const [dir, names] of this.last ?? []) {
+          if (!merged.has(dir)) merged.set(dir, names);
+        }
+        this.last = merged;
+        return merged as ClutterSnapshot;
+      })
+      .finally(() => {
+        if (this.inFlight?.scan === scan) this.inFlight = null;
+      });
+    this.inFlight = { scan, startedAt: now };
+    return scan;
+  }
+
+  /** How long the current scan has been running (0 when idle). */
+  busyForMs(now = Date.now()): number {
+    return this.inFlight == null ? 0 : now - this.inFlight.startedAt;
+  }
+}
+
+const sharedScanners = new Map<string, ClutterScanner>();
+
+export function getSharedClutterScanner(homeDir: string): ClutterScanner {
+  const key = path.resolve(homeDir);
+  let scanner = sharedScanners.get(key);
+  if (scanner == null) {
+    scanner = new ClutterScanner(getClutterWatchRoots(key));
+    sharedScanners.set(key, scanner);
+  }
+  return scanner;
 }
 
 const MAX_LISTED_ENTRIES = 5;
