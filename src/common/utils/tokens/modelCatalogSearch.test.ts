@@ -82,10 +82,13 @@ describe("searchModelCatalog", () => {
     expect(grok.indexOf("xai:grok-4.3")).toBeGreaterThanOrEqual(0);
   });
 
-  test("keeps the direct provider's models ahead of prefixed cloud IDs", () => {
-    const models = searchModelCatalog({ query: "claude" }).models.filter((m) => !m.builtIn);
-    expect(models.some((model) => model.provider === "bedrock")).toBe(true);
-    expect(models[0]?.provider).toBe("anthropic");
+  test.each([
+    ["claude", "anthropic", "bedrock"],
+    ["gpt", "openai", "github-copilot"],
+  ])("lists %s models from %s ahead of %s", (query, firstParty, other) => {
+    const models = searchModelCatalog({ query }).models.filter((m) => !m.builtIn);
+    expect(models.some((model) => model.provider === other)).toBe(true);
+    expect(models[0]?.provider).toBe(firstParty);
   });
 
   test("applies the policy predicate before counting and paging", () => {

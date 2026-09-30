@@ -152,10 +152,18 @@ export function searchModelCatalog(
   // numbers, so gemini-3.7 precedes gemini-2.5) so older variants sit behind Show more.
   // Group by provider first: a descending compare across providers would let
   // prefixed IDs such as Bedrock's us.anthropic.* outrank the direct provider.
+  // Providers with a matching built-in (openai for gpt) lead, so resellers such
+  // as GitHub Copilot cannot fill the first page ahead of them.
+  const firstPartyProviders = new Set(
+    matches.filter((match) => match.entry.builtIn).map((match) => match.entry.provider)
+  );
+  const isFirstParty = (match: (typeof matches)[number]) =>
+    Number(firstPartyProviders.has(match.entry.provider));
   matches.sort(
     (a, b) =>
       a.rank - b.rank ||
       Number(b.entry.builtIn) - Number(a.entry.builtIn) ||
+      isFirstParty(b) - isFirstParty(a) ||
       NATURAL_ORDER.compare(a.entry.provider, b.entry.provider) ||
       NATURAL_ORDER.compare(b.entry.providerModelId, a.entry.providerModelId)
   );
