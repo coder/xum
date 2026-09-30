@@ -1581,6 +1581,98 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   );
 });
 
+async function sendWithCyberKey(
+  model: LanguageModel,
+  stream: boolean,
+  cyberAccessProgram: string | null = "daybreak_blue"
+): Promise<void> {
+  const request = {
+    model,
+    prompt: "hello",
+    maxRetries: 0,
+    providerOptions: cyberAccessProgram == null ? undefined : { openai: { cyberAccessProgram } },
+  };
+  if (stream) {
+    await streamText(request).consumeStream({ onError: () => undefined });
+  } else {
+    await generateText(request).catch(() => undefined);
+  }
+}
+
+describe("ProviderModelFactory Cyber access program", () => {
+  it.each(["responses", "chatCompletions"] as const)(
+    "serializes the private Cyber key only into direct OpenAI %s bodies",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            webSocketTransportEnabled: false,
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel("openai:gpt-6.1-sol");
+          if (!result.success) throw new Error(result.error.type);
+          for (const stream of [false, true]) {
+            await sendWithCyberKey(result.data, stream);
+            await sendWithCyberKey(result.data, stream, null);
+          }
+          expect(calls.map((call) => parseSentBody(call).access_programs)).toEqual(
+            wireFormat === "responses"
+              ? [{ cyber: "daybreak_blue" }, undefined, { cyber: "daybreak_blue" }, undefined]
+              : [undefined, undefined, undefined, undefined]
+          );
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
+  it("never sends access programs through Codex OAuth or custom Responses providers", async () => {
+    await withTempConfig(async (_config, factory, oauth, store) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 3_600_000,
+      };
+      store.saveProvidersConfig({
+        openai: { codexOauth: auth },
+        "responses-proxy": {
+          providerType: "openai-responses",
+          baseUrl: "https://proxy.example.com/v1",
+          apiKey: "custom-key",
+        },
+      });
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        for (const model of ["openai:gpt-6.1-sol", "responses-proxy:gpt-6.1-sol"]) {
+          const result = await factory.createModel(model);
+          if (!result.success) throw new Error(result.error.type);
+          await sendWithCyberKey(result.data, false);
+        }
+        expect(calls.map((call) => call.url)).toEqual([
+          CODEX_ENDPOINT,
+          "https://proxy.example.com/v1/responses",
+        ]);
+        for (const call of calls) {
+          expect(parseSentBody(call)).not.toHaveProperty("access_programs");
+        }
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
   // Headless tool loops (Dream, harvest, refine, sidebar status) call
   // streamText with tools and no provider options. Luna Chat Completions
@@ -3437,6 +3529,25 @@ describe("ProviderModelFactory Coder", () => {
       }
     }
   );
+
+  it("never sends access programs through Coder's OpenAI Responses route", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("coder:openai/gpt-6.1-sol");
+        if (!result.success) throw new Error(result.error.type);
+        await sendWithCyberKey(result.data, false);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toEndWith("/responses");
+        expect(parseSentBody(calls[0])).not.toHaveProperty("access_programs");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
 
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {

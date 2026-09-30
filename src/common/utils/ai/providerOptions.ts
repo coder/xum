@@ -648,8 +648,8 @@ export function buildProviderOptions(
           // Direct OpenAI and Coder Responses forward it; mux-gateway drops
           // this provider option and Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
-          // Private per-call key: providerModelFactory strips it before the SDK
-          // and serializes it as access_programs.cyber on direct OpenAI only.
+          // Private per-call key the SDK ignores; providerModelFactory serializes
+          // it as access_programs.cyber on direct OpenAI only.
           ...(cyberAccessProgram != null && { cyberAccessProgram }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
