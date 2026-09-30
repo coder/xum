@@ -21,7 +21,7 @@ REST="StopHonored FoldOnce NoStaleFold NoStaleJournal BoundaryOnce"
 
 # case | expected | constants (space separated k=v) | invariants
 cases=(
-  # --- code as written ------------------------------------------------------
+  # --- pre-fix code (bugs C1/C2; the code now implements F2) -----------------
   "C1-edit-crash-refollow|FollowUpAtMostOnce|B=1 C=1 CH=0 MC=1 E=1 CC=0 R=0 RC=1|FollowUpAtMostOnce"
   "C1-edit-no-crash|pass|B=1 C=0 CH=1 MC=1 E=1 CC=1 R=1 RC=1|$ALL"
   "C2-two-backend-dispatch|FollowUpAtMostOnce|B=2 C=0 CH=0 MC=1 E=0 CC=0 R=0 RC=1|FollowUpAtMostOnce"
@@ -29,7 +29,7 @@ cases=(
   "C1-two-backend-edit|FollowUpAtMostOnce|B=2 C=0 CH=0 MC=1 E=1 CC=0 R=0 RC=1 RL=TRUE|FollowUpAtMostOnce"
   "C3-other-properties-1b|pass|B=1 C=2 CH=1 MC=1 E=1 CC=1 R=1 RC=2|$REST"
   "C3-other-properties-2b|pass|B=2 C=1 CH=0 MC=1 E=1 CC=1 R=1 RC=1|$REST"
-  # --- candidate fixes -------------------------------------------------------
+  # --- fixes: F2 is implemented (agentSession.compactionFollowUpOnce.test.ts) -
   "F1-edit-clears-follow-up|pass|B=1 C=1 CH=1 MC=1 E=1 CC=1 R=1 RC=2 EC=TRUE|$ALL"
   "F2-recheck-under-lock|pass|B=2 C=1 CH=0 MC=1 E=1 CC=1 R=1 RC=1 RL=TRUE EC=TRUE|$ALL"
   # --- mutation sanity -------------------------------------------------------

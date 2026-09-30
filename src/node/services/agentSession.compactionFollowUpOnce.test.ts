@@ -1,16 +1,6 @@
 /**
- * Deterministic repros for the TLC findings in formal/compaction/ (cases in check.sh).
- *
- * NOT part of CI. Each test asserts the CORRECT behavior, so on the pre-fix code every
- * test FAILS; a FAIL means "bug reproduced". The fix (TLC case F2) landed with the routed
- * regression test src/node/services/agentSession.compactionFollowUpOnce.test.ts, which also
- * corrects the no-crash edit case's injection (edits publish via acceptCompactionReplacement).
- * Run with:
- *
- *   cp formal/compaction/repro/compactionProtocol.repro.test.ts.txt \
- *      src/node/services/compactionProtocol.repro.test.ts
- *   bun test src/node/services/compactionProtocol.repro.test.ts
- *   rm src/node/services/compactionProtocol.repro.test.ts
+ * A compaction's pending follow-up runs at most once. Regression tests for the TLC findings in
+ * formal/compaction/ (cases C1-* and C2-* in check.sh; the fixed model is F2).
  *
  * Crash = the session is disposed after a chosen durable step and a fresh AgentSession +
  * HistoryService is created on the same root. A second backend = a second AgentSession +
@@ -24,7 +14,7 @@ import type { CompactionMonitor } from "./compactionMonitor";
 import { HistoryService } from "./historyService";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
-const workspaceId = "compaction-protocol-repro";
+const workspaceId = "compaction-follow-up-once";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
 const FOLLOW_UP = "continue after compaction";
 const harnesses: AgentSessionHarness[] = [];
@@ -104,8 +94,8 @@ const textOf = (row: MuxMessage) =>
 const followUpRows = (rows: MuxMessage[]) =>
   rows.filter((row) => row.role === "user" && textOf(row) === FOLLOW_UP);
 
-describe("C1: editing the dispatched follow-up re-arms the consumed handoff", () => {
-  test("a crash between the edit's cut and its new user row re-dispatches the old follow-up", async () => {
+describe("C1: editing the dispatched follow-up retires the consumed handoff", () => {
+  test("a crash between the edit's cut and its new user row does not re-dispatch", async () => {
     const h = await backend();
     await seedHandoff(h);
     expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
@@ -114,30 +104,32 @@ describe("C1: editing the dispatched follow-up re-arms the consumed handoff", ()
     assert(dispatched, "follow-up row must exist after the first dispatch");
 
     // The user edits that follow-up. The edit's first durable step is the cut
-    // (agentSession.ts:4514 -> historyService.ts:5340); the process dies before the edited
-    // user row is appended.
+    // (truncateAfterMessage); the process dies before the edited user row is appended.
     assert((await h.historyService.truncateAfterMessage(workspaceId, dispatched.id)).success);
     await h.session.dispose();
 
     const restarted = await backend(h);
-    // Startup recovery (agentSession.ts:10830): the summary is the last visible row again.
+    // Startup recovery: the summary is the last visible row again.
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
     expect(followUpRows(await allRows(restarted))).toHaveLength(0);
   });
 
-  test("a failed edit send (no crash) leaves the same re-armed handoff", async () => {
+  test("a failed edit send (no crash) does not re-arm the handoff", async () => {
     const h = await backend();
     await seedHandoff(h);
     expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
     await h.session.waitForIdle();
     const [dispatched] = followUpRows(await allRows(h));
     assert(dispatched);
-    // The edited user row cannot be persisted (e.g. EIO / history lock timeout).
-    const original = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementation((ws, message) =>
-      message.role === "user" && textOf(message) === "edited follow-up"
-        ? Promise.resolve(Err("injected append failure"))
-        : original(ws, message)
+    // The edited user row cannot be persisted (e.g. EIO / history lock timeout). It publishes
+    // through acceptCompactionReplacement, after the edit's cut already committed.
+    const original = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+      (ws, capture, operation, observer) =>
+        operation.kind === "append" &&
+        operation.messages.some((row) => row.role === "user" && textOf(row) === "edited follow-up")
+          ? Promise.resolve(Err("injected append failure"))
+          : original(ws, capture, operation, observer)
     );
     const edit = await h.session.sendMessage("edited follow-up", {
       ...options,
@@ -149,15 +141,16 @@ describe("C1: editing the dispatched follow-up re-arms the consumed handoff", ()
 
     const restarted = await backend(h);
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+    expect(followUpRows(await allRows(restarted))).toHaveLength(0);
   });
 });
 
 describe("C2: a second backend's startup dispatch races the first backend", () => {
-  test("both backends dispatch the same follow-up", async () => {
+  test("only one backend dispatches the follow-up", async () => {
     const a = await backend();
     await seedHandoff(a);
     const b = await backend(a); // second backend on the same root, starting up
-    // A's untargeted read (agentSession.ts:10832) sees the handoff; B dispatches in between.
+    // A's unlocked startup read sees the handoff; B dispatches in between.
     const read = a.historyService.getLastMessages.bind(a.historyService);
     let raced = false;
     spyOn(a.historyService, "getLastMessages").mockImplementation(async (ws, count) => {
@@ -175,9 +168,9 @@ describe("C2: a second backend's startup dispatch races the first backend", () =
     expect(followUpRows(await allRows(a))).toHaveLength(1);
   });
 
-  // Control (passes today): TLC also reported a Stop bypass in this race, but automatic send
-  // admission re-reads the cancellation record (agentSession.ts:4172-4186) and refuses.
-  test("control: the other backend's Stop still blocks the racing dispatch", async () => {
+  // TLC also reported a Stop bypass in this race; automatic send admission re-reads the
+  // cancellation record and refuses.
+  test("the other backend's Stop still blocks the racing dispatch", async () => {
     const a = await backend();
     await seedHandoff(a);
     const b = await backend(a);

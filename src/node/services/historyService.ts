@@ -96,6 +96,7 @@ import {
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
   isDurableContextBoundaryMarker,
+  leavesCompactionFollowUpPending,
 } from "@/common/utils/messages/compactionBoundary";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
@@ -219,6 +220,32 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
       preserveReasoningOnly: true,
     })
   );
+}
+
+/**
+ * Follow-up dispatch persists no marker: the rows after a summary prove its pendingFollowUp was
+ * consumed (see leavesCompactionFollowUpPending). A cut that removes that proof and exposes the
+ * summary again must retire the handoff in the same locked write, or startup recovery (or a
+ * sibling backend) re-sends an already-dispatched follow-up, e.g. after the user edits it and
+ * the edited row never lands (formal/compaction, TLC case C1). Returns the retained-row sanitizer.
+ */
+function retireReexposedCompactionFollowUp(
+  retained: readonly MuxMessage[],
+  removed: readonly MuxMessage[]
+): (message: MuxMessage) => MuxMessage {
+  const exposed = retained.findLast((message) => !leavesCompactionFollowUpPending(message));
+  const metadata = exposed?.metadata?.muxMetadata;
+  if (
+    exposed?.role !== "assistant" ||
+    !isCompactionSummaryMetadata(metadata) ||
+    metadata.pendingFollowUp === undefined ||
+    // Only tail copies / hidden rows were cut: the handoff was already exposed and unconsumed.
+    removed.every(leavesCompactionFollowUpPending)
+  )
+    return (message) => message;
+  const { pendingFollowUp: _consumed, ...remaining } = metadata;
+  const retired = { ...exposed, metadata: { ...exposed.metadata, muxMetadata: remaining } };
+  return (message) => (message === exposed ? retired : message);
 }
 
 function deletionCreatesRawReset(
@@ -3874,7 +3901,7 @@ export class HistoryService {
        * lock right before the append; `false` skips the append. The lock is cross-process, so
        * no clear or truncation by this or a sibling backend can commit between the check and
        * the write. Scans the archive: set it only for rare rows that depend on earlier rows
-       * (plan-review feedback).
+       * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
     }
@@ -5424,7 +5451,8 @@ export class HistoryService {
           const historyEntries = this.serializeHistoryTruncation(
             rows,
             workspaceId,
-            truncatedMessages
+            truncatedMessages,
+            retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
           );
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
@@ -5552,7 +5580,8 @@ export class HistoryService {
         this.serializeHistoryTruncation(
           [...archiveRows, ...activeEpochRows],
           workspaceId,
-          truncatedMessages
+          truncatedMessages,
+          retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
         ),
         publication
       );

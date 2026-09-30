@@ -20,6 +20,7 @@ import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
+  leavesCompactionFollowUpPending,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -634,6 +635,9 @@ export const PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE =
 /** Refusal when plan-review feedback's snapshot or threads left history before its append. */
 export const PLAN_REVIEW_FEEDBACK_STALE_MESSAGE =
   "Plan review feedback was not sent: the plan snapshot or review threads it refers to were removed from the conversation. Review the current plan and send again.";
+/** Refusal when a compaction follow-up's handoff was consumed before its row could land. */
+const COMPACTION_FOLLOW_UP_CONSUMED_MESSAGE =
+  "Compaction follow-up was not sent: its handoff was already consumed.";
 const EMPTY_RESUME_HISTORY_ERROR =
   "Cannot resume stream: workspace history is empty. Send a new message instead.";
 
@@ -920,6 +924,35 @@ interface SendMessageInternalOptions {
    * `admissionStale` by WorkspaceService.
    */
   turnAdmission?: TurnAdmissionToken;
+  /**
+   * The compaction summary whose pendingFollowUp this send dispatches. Its handoff is re-checked
+   * under the history write lock at the trigger append (see isCompactionFollowUpStillPending).
+   */
+  compactionFollowUpSummary?: MuxMessage;
+}
+
+/**
+ * Re-verifies a follow-up's handoff on full history under the write lock, right before its row
+ * lands: the same summary (id and sequence) must still carry pendingFollowUp and be followed only
+ * by rows that leave it pending. dispatchPendingFollowUp reads the handoff without the lock, so a
+ * sibling backend's dispatch (or any other row) can consume it in between (formal/compaction,
+ * TLC case C2); appending anyway would run the follow-up twice.
+ */
+function isCompactionFollowUpStillPending(
+  summary: MuxMessage,
+  history: readonly MuxMessage[]
+): boolean {
+  const sequence = summary.metadata?.historySequence;
+  const matches = history.flatMap((message, index) =>
+    message.id === summary.id && message.metadata?.historySequence === sequence ? [index] : []
+  );
+  // Duplicate identities cannot prove which row owns the handoff.
+  if (matches.length !== 1) return false;
+  const index = matches[0];
+  return (
+    pendingCompactionSummary(history[index]) !== undefined &&
+    history.slice(index + 1).every(leavesCompactionFollowUpPending)
+  );
 }
 
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
@@ -4008,6 +4041,8 @@ export class AgentSession {
       // only by that check, so a refusal is told apart from any other skipped publication.
       const feedbackPrecondition = createPlanReviewFeedbackPrecondition(batch);
       let feedbackDependenciesMissing = false;
+      const followUpSummary = internal?.compactionFollowUpSummary;
+      let followUpConsumed = false;
       const publishing = this.historyService.acceptCompactionReplacement(
         this.workspaceId,
         replacementCapture,
@@ -4019,10 +4054,15 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
-          ...(feedbackPrecondition !== undefined
+          ...(feedbackPrecondition !== undefined || followUpSummary !== undefined
             ? {
                 admitsFullHistory: (history: MuxMessage[]) => {
-                  feedbackDependenciesMissing = !feedbackPrecondition(history);
+                  followUpConsumed =
+                    followUpSummary !== undefined &&
+                    !isCompactionFollowUpStillPending(followUpSummary, history);
+                  if (followUpConsumed) return false;
+                  feedbackDependenciesMissing =
+                    feedbackPrecondition !== undefined && !feedbackPrecondition(history);
                   return !feedbackDependenciesMissing;
                 },
               }
@@ -4052,9 +4092,11 @@ export class AgentSession {
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         return Err(
-          feedbackDependenciesMissing
-            ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
-            : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+          followUpConsumed
+            ? COMPACTION_FOLLOW_UP_CONSUMED_MESSAGE
+            : feedbackDependenciesMissing
+              ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+              : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
         );
       }
       if (replacesCancellation) {
@@ -11208,6 +11250,7 @@ export class AgentSession {
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
       turnAdmission,
+      compactionFollowUpSummary: lastMessage,
     });
     if (!sendResult.success) {
       if (resumeCanceled()) {
@@ -11227,6 +11270,18 @@ export class AgentSession {
           this.hasPendingManualFollowUp() || this.hasExternalSendPreflight?.() === true,
           this.isBusy() && this.coordinator.phase !== "completing"
         );
+        return false;
+      }
+      // Another dispatch (e.g. a sibling backend's startup recovery) or other row consumed the
+      // handoff after the unlocked read above; its row is the one that runs. Not a failure.
+      if (
+        sendResult.error.type === "unknown" &&
+        sendResult.error.raw === COMPACTION_FOLLOW_UP_CONSUMED_MESSAGE
+      ) {
+        log.info("Pending follow-up already consumed; skipping duplicate dispatch", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+        });
         return false;
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
