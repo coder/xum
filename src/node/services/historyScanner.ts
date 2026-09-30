@@ -329,8 +329,10 @@ export function createRawHistoryResetProbe() {
 function createReverseRawHistoryProbe() {
   const resetNeedle = SESSION_HISTORY_RESET_NEEDLE;
   const boundaryNeedle = SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE;
-  // A needle unit spans at most 10 canonical characters: a \u00XX escape plus a \x00 run.
-  const keep = 10 * Math.max(resetNeedle.length, boundaryNeedle.length);
+  // A needle unit spans at most 30 canonical characters: a \u00XX escape (6) with a \x00 run
+  // (4) in each of its 5 gaps (hasRawResetMarker removes escaped separators before decoding),
+  // plus a \x00 run before the next unit.
+  const keep = 30 * Math.max(resetNeedle.length, boundaryNeedle.length);
   let head = "";
   let reset = false;
   let boundary = false;

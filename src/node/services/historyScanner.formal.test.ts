@@ -566,8 +566,13 @@ describe("provider history privacy findings", () => {
     return offsets.length > 0 ? offsets[Math.floor(random() * offsets.length)] : null;
   }
 
+  const escapeUnits = (c: string) => ["\\", "u", ...c.charCodeAt(0).toString(16).padStart(4, "0")];
   const spacedEscapedMarker = [...SESSION_HISTORY_RESET_NEEDLE]
-    .map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"))
+    .map((c) => escapeUnits(c).join(""))
+    .join("\\u0020");
+  // Escaped separators may also sit inside each escape: hasRawResetMarker removes them first.
+  const widestEscapedMarker = [...SESSION_HISTORY_RESET_NEEDLE]
+    .map((c) => escapeUnits(c).join("\\u0020"))
     .join("\\u0020");
   test("F1 property: an oversized row with its own raw reset marker floors the read", async () => {
     let floors = 0;
@@ -576,7 +581,13 @@ describe("provider history privacy findings", () => {
       // Escaping every unit and putting an escaped separator between units makes the key token
       // longer than the token probe's retained overlap, so at a chunk edge inside the key only the
       // raw probe finds the marker.
-      const core = random() < 0.7 ? spacedEscapedMarker : noisyMarker(random);
+      const variant = random();
+      const core =
+        variant < 0.35
+          ? spacedEscapedMarker
+          : variant < 0.7
+            ? widestEscapedMarker
+            : noisyMarker(random);
       const head = `{bad ${"q".repeat(SESSION_HISTORY_MAX_LINE_BYTES)}`;
       const row = `${head}${core} tail`;
       if (!hasRawResetMarker(row)) continue;
