@@ -168,13 +168,15 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
-/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
-export async function replaceRunTrustProjects(
-  realConfig: Config,
-  targetConfig: Config
-): Promise<void> {
+/**
+ * Rebuild the run-root config from the real config's trust grants and tool-search
+ * opt-out (turns read it from this config), so removed grants and settings cannot
+ * survive root reuse.
+ */
+export async function replaceRunConfig(realConfig: Config, targetConfig: Config): Promise<void> {
+  const real = realConfig.loadConfigOrDefault();
   const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
+  for (const [projectPath, projectConfig] of real.projects) {
     if (projectConfig.trusted === undefined) {
       continue;
     }
@@ -185,7 +187,10 @@ export async function replaceRunTrustProjects(
     });
   }
 
-  await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
+  await targetConfig.editConfig(() => ({
+    projects: trustOnlyProjects,
+    ...(real.toolSearchEnabled === false ? { toolSearchEnabled: false } : {}),
+  }));
 }
 
 /**

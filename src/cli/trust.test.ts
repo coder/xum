@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects, resolveProjectDir } from "./trust";
+import { materializeResolvedTrust, replaceRunConfig, resolveProjectDir } from "./trust";
 
 const BUN_EXECUTABLE = process.execPath;
 const TRUST_ENTRY = path.join(import.meta.dir, "trust.ts");
@@ -98,7 +98,7 @@ describe("xum trust CLI", () => {
     expect(trustByPath.get(worktree)).toBe(false);
   }, 15_000);
 
-  test("replaceRunTrustProjects rebuilds config without foreign settings", async () => {
+  test("replaceRunConfig keeps trust and the tool-search opt-out, not foreign settings", async () => {
     using tmp = new DisposableTempDir("trust-replace-run");
     const realConfig = new Config(path.join(tmp.path, "real-root"));
     const targetConfig = new Config(path.join(tmp.path, "run-root"));
@@ -106,6 +106,7 @@ describe("xum trust CLI", () => {
     const staleProject = path.join(tmp.path, "removed-project");
     await realConfig.editConfig((config) => {
       config.projects.set(intendedProject, { workspaces: [], trusted: true });
+      config.toolSearchEnabled = false;
       return config;
     });
     await targetConfig.editConfig((config) => {
@@ -114,7 +115,7 @@ describe("xum trust CLI", () => {
       return config;
     });
 
-    await replaceRunTrustProjects(realConfig, targetConfig);
+    await replaceRunConfig(realConfig, targetConfig);
 
     const onDisk = JSON.parse(
       await fs.readFile(path.join(targetConfig.rootDir, "config.json"), "utf8")
@@ -128,6 +129,7 @@ describe("xum trust CLI", () => {
     expect(reloaded.projects.has(staleProject)).toBe(false);
     expect(reloaded.projects.get(intendedProject)?.trusted).toBe(true);
     expect(reloaded.routeOverrides).toBeUndefined();
+    expect(reloaded.toolSearchEnabled).toBe(false);
   });
 
   test("materializeResolvedTrust copies main-repo trust onto the exact worktree entry", async () => {

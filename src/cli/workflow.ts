@@ -14,7 +14,6 @@ import {
   LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   PROMOTED_EXPERIMENT_IDS,
 } from "@/common/constants/experiments";
-import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   DEFAULT_THINKING_LEVEL,
@@ -52,7 +51,7 @@ import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/pr
 import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
-import { resolveProjectDir, resolveProjectTrusted } from "./trust";
+import { replaceRunConfig, resolveProjectDir, resolveProjectTrusted } from "./trust";
 
 const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
@@ -239,17 +238,7 @@ async function copyPersistentConfig(
     await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
-  const existingConfig = realConfig.loadConfigOrDefault();
-  const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of existingConfig.projects) {
-    if (projectConfig.trusted !== undefined) {
-      trustOnlyProjects.set(projectPath, { workspaces: [], trusted: projectConfig.trusted });
-    }
-  }
-  if (trustOnlyProjects.size > 0) {
-    // Config.saveConfig is private (lost-update safety); route through the queue.
-    await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-  }
+  await replaceRunConfig(realConfig, config);
 }
 
 function buildExperimentsObject(experimentIds: readonly string[]) {
@@ -495,7 +484,7 @@ function createWorkflowService(input: {
       evaluationService: input.ctx.services.evaluationService,
       aiService: input.ctx.services.aiService,
       sessionUsageService: input.ctx.services.sessionUsageService,
-      // The ephemeral run config copies only providers/secrets/trust, so the
+      // The ephemeral run config copies only providers/secrets/trust/tool search, so the
       // Settings default (`evaluationDefaults.model`) must be read from the
       // real config. Precedence: per-call `model` > --evaluation-model > Settings.
       config: input.ctx.realConfig,
