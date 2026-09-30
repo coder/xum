@@ -6,7 +6,9 @@ import { describe, expect, test } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { buildContextListingMessages } from "./contextListing";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -133,6 +135,30 @@ async function buildSystemContextForTest(args: {
 }
 
 describe("prepareProviderRequestMessages", () => {
+  test("keeps context listing rows for requests but not for compaction requests", () => {
+    const user = createMuxMessage("user", "user", "fix the test", { historySequence: 1 });
+    const [listing] = buildContextListingMessages(
+      [],
+      [{ key: "memory", title: "Memory index", body: "- /memories/global/lesson.md: a lesson" }]
+    );
+    listing.metadata = { ...listing.metadata, historySequence: 2 };
+    // Every other history reader skips listing rows (titles, status, retry, harvest).
+    expect(isModelHiddenMessage(listing)).toBe(true);
+
+    const ids = (messages: MuxMessage[]) =>
+      prepareProviderRequestMessages(messages, "anthropic", "off").providerRequestMessages.map(
+        (message) => message.id
+      );
+    expect(ids([user, listing])).toEqual([user.id, listing.id]);
+
+    // The summarizer must not see stale listings; the next live turn re-emits them.
+    const compact = createMuxMessage("compact", "user", "/compact", {
+      historySequence: 3,
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    });
+    expect(ids([user, listing, compact])).toEqual([user.id, compact.id]);
+  });
+
   test("slices at reset boundaries before filtering empty assistant messages", () => {
     const oldMessage = createMuxMessage("old-user", "user", "old context", {
       historySequence: 1,
@@ -460,6 +486,20 @@ describe("assemblePromptPayload", () => {
       workspaceId: "workspace",
       ...overrides,
     });
+
+  test("carries context listing rows into the payload that replay also builds", async () => {
+    // buildReplayRequest reconstructs requests through this same entry point.
+    const [listing] = buildContextListingMessages(
+      [],
+      [{ key: "memory", title: "Memory index", body: "- /memories/global/lesson.md: a lesson" }]
+    );
+    const payload = await assemble({
+      history: [createMuxMessage("user", "user", "hello"), listing],
+      modelString: "anthropic:claude-sonnet-4-5",
+      providerForMessages: "anthropic",
+    });
+    expect(JSON.stringify(payload.messages)).toContain("/memories/global/lesson.md");
+  });
 
   for (const testCase of [
     {

@@ -14,6 +14,7 @@
  * memory write only costs a new memory-index row.
  */
 import assert from "@/common/utils/assert";
+import { isContextListingMessage } from "@/common/utils/messages/contextListingMessage";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   CONTEXT_LISTING_MESSAGE_ID_PREFIX,
@@ -75,9 +76,7 @@ function sectionIdPrefix(key: ContextListingSectionKey): string {
   return `${CONTEXT_LISTING_MESSAGE_ID_PREFIX}${key}-`;
 }
 
-export function isContextListingMessage(message: MuxMessage): boolean {
-  return message.role === "user" && message.id.startsWith(CONTEXT_LISTING_MESSAGE_ID_PREFIX);
-}
+export { isContextListingMessage };
 
 function messageText(message: MuxMessage): string {
   return message.parts

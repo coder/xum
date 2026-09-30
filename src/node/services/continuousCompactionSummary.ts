@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { isContextListingMessage } from "@/common/utils/messages/contextListingMessage";
 import { agentPluginHookService } from "./agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
@@ -130,7 +131,8 @@ export async function summarizeContinuousCompaction(args: {
       created.data.optionsProvidersConfig
     );
     const prepared = prepareProviderRequestMessages(
-      args.head,
+      // Summarizer input: listings are catalog data the next live turn re-emits (#5248).
+      args.head.filter((message) => !isContextListingMessage(message)),
       created.data.wireProviderName,
       thinkingLevel
     );
