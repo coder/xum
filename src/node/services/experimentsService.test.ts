@@ -245,7 +245,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {},
-        overrides: { "programmatic-tool-calling": true },
+        overrides: { "programmatic-tool-calling": true, "advisor-tool": true },
       }),
       "utf-8"
     );
@@ -257,6 +257,7 @@ describe("ExperimentsService", () => {
     expect((await readOverridesFile()).overrides).toEqual({
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
       "programmatic-tool-calling-exclusive": true,
+      "advisor-tool": true,
     });
   });
 
