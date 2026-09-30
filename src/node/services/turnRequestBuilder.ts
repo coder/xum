@@ -697,7 +697,7 @@ interface PreparedModelAttempt {
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
   currentEffectiveLevelRef: { current: ThinkingLevel };
-  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
+  /** `beforeFirstStep`: no provider step of this turn has been prepared yet. */
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
     currentLevel: ThinkingLevel,
