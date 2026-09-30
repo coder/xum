@@ -767,15 +767,22 @@ export function buildSystemMessageFromSources(
       .filter((content): content is string => content != null && content.trim().length > 0)
       .join("\n\n");
   if (agentModeSections !== undefined) {
-    const allAgentSources = [
-      ...agentModeSections.flatMap((agent) => agent.sections),
-      ...muxContextContents,
-      ...muxGlobalContents,
-    ];
     const blocks = agentModeSections.map((agent) => {
+      // An agent's own Mode:/Model: sections stay in its block; workspace and
+      // global Mode: sections apply to every agent whose mode matches.
+      const agentModel =
+        modelString == null
+          ? null
+          : agent.sections
+              .map((src) => extractModelSection(src, modelString))
+              .filter((content): content is string => content != null && content.trim().length > 0)
+              .join("\n\n");
+      const modes = Array.from(new Set(agent.modes));
+      const sources = [...agent.sections, ...muxContextContents, ...muxGlobalContents];
       const body = [
         ...sanitizeAgentSections(agent.sections),
-        buildTaggedSection(extractModeContent(agent.modes, allAgentSources), "mode", "mode").trim(),
+        buildTaggedSection(agentModel, `model-${modelString ?? ""}`, "model").trim(),
+        buildTaggedSection(extractModeContent(modes, sources), "mode", "mode").trim(),
       ].filter((part) => part.length > 0);
       return `<agent-mode id="${agent.agentId}">\n${body.join("\n\n")}\n</agent-mode>`;
     });
@@ -801,12 +808,7 @@ export function buildSystemMessageFromSources(
 
   // Scoped directive sources in priority order: agent definition → workspace
   // .xum/AGENTS.md files → global ~/.xum/AGENTS.md. All matches are joined.
-  const xumScopedSources = [
-    ...agentPromptSections,
-    ...(agentModeSections?.flatMap((agent) => agent.sections) ?? []),
-    ...muxContextContents,
-    ...muxGlobalContents,
-  ];
+  const xumScopedSources = [...agentPromptSections, ...muxContextContents, ...muxGlobalContents];
 
   // Extract model-specific section based on active model identifier
   const modelContent = modelString

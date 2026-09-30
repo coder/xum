@@ -2785,8 +2785,14 @@ export class TurnRequestBuilder {
         }
 
         const intuitionAdvertised = attemptTools.intuition !== undefined;
-        const intuitionToolAvailable = activeAgentAllows("intuition");
-        const advisorToolAvailable = activeAgentAllows("advisor");
+        // The mode-independent prompt applies each agent's policy to the
+        // advertised tools in its own block, so it gets presence flags.
+        const promptAllows = (name: string): boolean =>
+          modeIndependentAgents === undefined
+            ? activeAgentAllows(name)
+            : attemptTools[name] !== undefined;
+        const intuitionToolAvailable = promptAllows("intuition");
+        const advisorToolAvailable = promptAllows("advisor");
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
           memoryToolAvailable,
@@ -2849,7 +2855,7 @@ export class TurnRequestBuilder {
           if (!intuitionAdvertised || attemptTools.memory === undefined) {
             delete attemptTools.intuition;
           }
-          if (attemptTools.intuition === undefined || !activeAgentAllows("intuition")) {
+          if (attemptTools.intuition === undefined || !intuitionToolAvailable) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
               assembleCtx.systemMessage,
               attemptTools.memory !== undefined,
