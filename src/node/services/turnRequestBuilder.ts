@@ -1622,6 +1622,16 @@ export class TurnRequestBuilder {
         isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
+    // #5253: mode-independent system prompt for root agent switches. Compaction
+    // requests keep today's prompt (no mode sections, no mode tags), and so does
+    // continuous compaction: its request-only prefix swap replaces the latest
+    // user row with an untagged copy, which would lose the current mode.
+    const modeIndependentAgents =
+      isCompactionRequest ||
+      (experiments?.continuousCompaction ??
+        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
+        ? undefined
+        : switchableAgents;
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
     const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
@@ -1780,6 +1790,7 @@ export class TurnRequestBuilder {
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
         agentDefinitionCache,
+        modeIndependent: modeIndependentAgents !== undefined,
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
@@ -1880,6 +1891,7 @@ export class TurnRequestBuilder {
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
+        switchableAgents: modeIndependentAgents,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.

@@ -13,6 +13,7 @@
 
 import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import type { SendMessageError } from "@/common/types/errors";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
@@ -114,6 +115,9 @@ export interface AgentResolutionResult {
 /** An agent the root mode picker offers (see AgentResolutionResult.switchableAgents). */
 export interface SwitchableAgent {
   id: string;
+  /** Definition scope, so prompt resolution reads the same shadow the picker lists. */
+  scope: AgentDefinitionScope;
+  planLike: boolean;
   toolPolicy: ToolPolicy;
 }
 
@@ -618,7 +622,12 @@ export async function resolveAgentForStream(
           // assembly and abort every send, not just a switch to this agent.
           applyToolPolicyToNames([], toolPolicy);
           buildRequiredToolPatterns(toolPolicy);
-          return { id: descriptor.id, toolPolicy };
+          return {
+            id: descriptor.id,
+            scope: definition.scope,
+            planLike: isPlanLikeInResolvedChain(chain),
+            toolPolicy,
+          };
         } catch (error) {
           // An unreadable agent cannot be switched to either; its tools just stay out.
           workspaceLog.debug("Skipping agent for the stable tool set", {
@@ -629,10 +638,16 @@ export async function resolveAgentForStream(
         }
       })
     );
+    // Sorted: the system prompt renders one section per agent in this order.
     switchableAgents = [
-      { id: agentDefinition.id, toolPolicy: effectiveToolPolicy },
+      {
+        id: agentDefinition.id,
+        scope: agentDefinition.scope,
+        planLike: agentIsPlanLike,
+        toolPolicy: effectiveToolPolicy,
+      },
       ...policies.filter((agent): agent is SwitchableAgent => agent !== undefined),
-    ];
+    ].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }
 
   return Ok({

@@ -57,7 +57,13 @@ import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/age
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
+import {
+  AGENT_MODE_RULE,
+  buildSystemMessageFromSources,
+  formatAgentModeTag,
+  loadWorkspaceInstructionSources,
+  type AgentModeSection,
+} from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -209,21 +215,51 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
     ) {
       return message;
     }
-    const tag = `[id: ${getHistoryItemId(message)}]`;
-    // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
-    // message, so a separate tag part is dropped when this row merges with a neighbour.
-    const lastText = message.parts.findLastIndex((part) => part.type === "text");
-    return {
-      ...message,
-      parts:
-        lastText === -1
-          ? [...message.parts, { type: "text", text: tag }]
-          : message.parts.map((part, index) =>
-              index === lastText && part.type === "text"
-                ? { ...part, text: `${part.text}\n${tag}` }
-                : part
-            ),
-    };
+    return appendTagToLastTextPart(message, `[id: ${getHistoryItemId(message)}]`);
+  });
+}
+
+function appendTagToLastTextPart(message: MuxMessage, tag: string): MuxMessage {
+  // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
+  // message, so a separate tag part is dropped when this row merges with a neighbour.
+  const lastText = message.parts.findLastIndex((part) => part.type === "text");
+  return {
+    ...message,
+    parts:
+      lastText === -1
+        ? [...message.parts, { type: "text", text: tag }]
+        : message.parts.map((part, index) =>
+            index === lastText && part.type === "text"
+              ? { ...part, text: `${part.text}\n${tag}` }
+              : part
+          ),
+  };
+}
+
+/**
+ * #5253: tag every user row with the agent mode it was sent in, for the
+ * mode-independent system prompt (AGENT_MODE_RULE). Derived from history
+ * only: the row's own persisted agentId, else the nearest earlier row's. The
+ * latest user row takes the active agent, since that is the mode this request
+ * runs in and whose tools are allowed. Older rows keep their tags, so a mode
+ * switch appends a tag instead of changing the cached prefix. Enabled by the
+ * rule in the system prompt itself, so replay (which rebuilds from the
+ * recorded system prompt) tags exactly like the live request.
+ */
+export function tagUserRowsWithAgentMode(
+  messages: MuxMessage[],
+  activeAgentId: string
+): MuxMessage[] {
+  const latestUser = messages.findLastIndex((message) => message.role === "user");
+  let mode: string | undefined;
+  return messages.map((message, index) => {
+    if (message.role !== "user") return message;
+    const own: unknown = message.metadata?.retrySendOptions?.agentId;
+    if (index === latestUser) mode = activeAgentId;
+    else if (typeof own === "string" && own.length > 0) mode = own;
+    return mode === undefined
+      ? message
+      : appendTagToLastTextPart(message, formatAgentModeTag(mode));
   });
 }
 
@@ -235,11 +271,12 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  const modeTagged = options.systemMessage.includes(AGENT_MODE_RULE)
+    ? tagUserRowsWithAgentMode(prepared.providerRequestMessages, options.effectiveAgentId)
+    : prepared.providerRequestMessages;
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
-      options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-        : prepared.providerRequestMessages
+      options.tagHistoryItemIds === true ? tagUserRowsWithHistoryItemIds(modeTagged) : modeTagged
     ),
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -346,6 +383,12 @@ export interface BuildPlanInstructionsOptions {
   requestPayloadMessages: MuxMessage[];
   /** Per-request definition reuse shared with agent resolution. */
   agentDefinitionCache?: AgentDefinitionRequestCache;
+  /**
+   * Root workspaces (#5253): leave the plan texts out of the shared additional
+   * instructions; buildStreamSystemContext puts state-free versions into each
+   * agent's section so plan-file creation and mode switches keep the prompt.
+   */
+  modeIndependent?: boolean;
 }
 
 /** Result of plan instructions assembly. */
@@ -401,7 +444,9 @@ export async function buildPlanInstructions(
 
   const chatHasStartHerePlanSummary = hasStartHerePlanSummary(requestPayloadMessages);
 
-  if (effectiveMode === "plan") {
+  if (opts.modeIndependent === true) {
+    // Per-agent plan texts are rendered in buildStreamSystemContext.
+  } else if (effectiveMode === "plan") {
     const planModeInstruction = getPlanModeInstruction(planFilePath, planResult.exists);
     effectiveAdditionalInstructions = additionalSystemInstructions
       ? `${planModeInstruction}\n\n${additionalSystemInstructions}`
@@ -556,6 +601,8 @@ export interface BuildStreamSystemContextOptions {
   instructionSources?: InstructionSources;
   /** Per-request definition reuse shared with agent resolution. */
   agentDefinitionCache?: AgentDefinitionRequestCache;
+  /** Root workspaces (#5253): render every switchable agent's section. */
+  switchableAgents?: ReadonlyArray<{ id: string; scope: AgentDefinitionScope; planLike: boolean }>;
 }
 
 /** Result of system context assembly. */
@@ -1020,6 +1067,35 @@ export async function buildStreamSystemContext(
     effectiveAdditionalInstructions
   );
 
+  // #5253: one section per switchable agent, so the prompt does not depend on
+  // the active one. Shared guidance (advisor, memory) follows the toolset,
+  // which is already the same across switches.
+  const switchableAgents = opts.switchableAgents;
+  const agentModeSections =
+    switchableAgents === undefined
+      ? undefined
+      : await Promise.all(
+          switchableAgents.map(async (agent): Promise<AgentModeSection> => {
+            const body =
+              agent.id === agentDefinition.id
+                ? resolvedBody
+                : await resolveAgentBody(agentDiscoveryRuntime, agentDiscoveryPath, agent.id, {
+                    ...agentResolveOptions,
+                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                  });
+            const planText = planFilePath
+              ? agent.planLike
+                ? getPlanModeInstruction(planFilePath, undefined)
+                : getPlanFileHint(planFilePath, undefined)
+              : null;
+            return {
+              agentId: agent.id,
+              sections: planText ? [body, planText] : [body],
+              modes: [agent.planLike ? "plan" : "exec", agent.id],
+            };
+          })
+        );
+
   // Build system message from workspace metadata
   let systemMessage = buildSystemMessageFromSources(
     metadata,
@@ -1034,8 +1110,12 @@ export async function buildStreamSystemContext(
     // the injected <mode-...> tag; agentDefinition.id (may have fallen back
     // to exec) is the prompt actually in effect.
     {
-      agentSystemPromptSections,
+      agentSystemPromptSections:
+        agentModeSections === undefined
+          ? agentSystemPromptSections
+          : agentSystemPromptSections.slice(1),
       modes: [effectiveMode, agentDefinition.id],
+      agentModeSections,
     }
   );
 

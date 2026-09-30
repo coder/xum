@@ -6,13 +6,20 @@
  * non-overridable file-edit restrictions enforced by plan mode.
  * Opinionated planning guidance lives in the agent spec so users can override it.
  */
-export function getPlanModeInstruction(planFilePath: string, planExists: boolean): string {
+/** `planExists` undefined: state-free text for the mode-independent system prompt (#5253). */
+export function getPlanModeInstruction(
+  planFilePath: string,
+  planExists: boolean | undefined
+): string {
   const exactPlanPathRule = planFilePath.startsWith("~/")
     ? "You must use the plan file path exactly as shown (including the leading `~/`); do not expand `~` or use alternate paths that resolve to the same file."
     : "You must use the plan file path exactly as shown; do not rewrite it or use alternate paths that resolve to the same file.";
-  const fileStatus = planExists
-    ? `A plan file already exists at ${planFilePath}. First, read it to determine if it's relevant to the current request. After any compaction/context reset (when earlier messages are replaced by a summary), re-read the plan before continuing. If the current request is unrelated to the existing plan, delete the file and start fresh. If relevant, make incremental edits using the file_edit_* tools.`
-    : `No plan file exists yet. You should create your plan at ${planFilePath} using the file_edit_* tools.`;
+  const fileStatus =
+    planExists === undefined
+      ? `If a plan file already exists at ${planFilePath}, first read it to determine if it's relevant to the current request; if unrelated, delete it and start fresh, otherwise make incremental edits using the file_edit_* tools. If it does not exist, create your plan there using the file_edit_* tools. After any compaction/context reset (when earlier messages are replaced by a summary), re-read the plan before continuing.`
+      : planExists
+        ? `A plan file already exists at ${planFilePath}. First, read it to determine if it's relevant to the current request. After any compaction/context reset (when earlier messages are replaced by a summary), re-read the plan before continuing. If the current request is unrelated to the existing plan, delete the file and start fresh. If relevant, make incremental edits using the file_edit_* tools.`
+        : `No plan file exists yet. You should create your plan at ${planFilePath} using the file_edit_* tools.`;
 
   return `Plan file path: ${planFilePath} (MUST use this exact path string for tool calls; do NOT rewrite it into another form, even if it resolves to the same file)
 
@@ -31,7 +38,14 @@ After calling \`propose_plan\`, do not paste the plan into chat or mention the p
  *
  * We intentionally include only the path (not the contents) to avoid prompt bloat.
  */
-export function getPlanFileHint(planFilePath: string, planExists: boolean): string | null {
+export function getPlanFileHint(
+  planFilePath: string,
+  planExists: boolean | undefined
+): string | null {
+  if (planExists === undefined) {
+    // State-free variant for the mode-independent system prompt (#5253).
+    return `If a plan file exists at: ${planFilePath}, and the plan is not already included in the chat history, read it before continuing previous work (especially after a compaction/context reset) and use it as the source of truth for what remains. If it is unrelated to the current request, ignore it.`;
+  }
   if (!planExists) return null;
 
   return `A plan file exists at: ${planFilePath}. If the plan is already included in the chat history (e.g., after “Replace all chat history with this plan” or a <plan> block from an agent transition), do NOT re-read the plan file. Otherwise, if you are continuing previous work—especially after any compaction/context reset (when earlier messages are replaced by a summary)—read it before proceeding and use it as the source of truth for what remains. If it is unrelated to the current request, ignore it.`;

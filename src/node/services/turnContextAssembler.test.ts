@@ -22,6 +22,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { AGENT_MODE_RULE, formatAgentModeTag } from "./systemMessage";
 import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
@@ -670,6 +671,41 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
       JSON.stringify(shortPayload.messages)
     );
+  });
+
+  test("agent-mode tags come from history; only the latest row follows the active agent (#5253)", async () => {
+    const sentIn = (agentId: string) => ({
+      retrySendOptions: { model: "google:gemini-2.5-pro", agentId },
+    });
+    const history = [
+      createMuxMessage("u1", "user", "explore the bug", sentIn("exec")),
+      createMuxMessage("a1", "assistant", "looked"),
+      // Heartbeats, goal continuations and peer messages persist no agent.
+      createMuxMessage("u2", "user", "heartbeat", { synthetic: true }),
+      createMuxMessage("a2", "assistant", "still here"),
+      createMuxMessage("u3", "user", "plan the fix", sentIn("plan")),
+      createMuxMessage("a3", "assistant", "planned"),
+      createMuxMessage("u4", "user", "continue"),
+    ];
+    const systemMessage = `system\n${AGENT_MODE_RULE}`;
+    const userTexts = async (effectiveAgentId: string) =>
+      (await assemble({ history, systemMessage, effectiveAgentId })).messages
+        .filter((message) => message.role === "user")
+        .map((message) => JSON.stringify(message.content));
+
+    const inExec = await userTexts("exec");
+    const inPlan = await userTexts("plan");
+    expect(inExec.map((text) => /\[mode: (\w+)\]/.exec(text)?.[1])).toEqual([
+      "exec",
+      "exec",
+      "plan",
+      "exec",
+    ]);
+    // A switch changes only the latest row, so the cached prefix survives it.
+    expect(inPlan.slice(0, -1)).toEqual(inExec.slice(0, -1));
+    expect(inPlan.at(-1)).toContain(formatAgentModeTag("plan"));
+    // Without the mode-independent system prompt (sub-agents, compaction) no tags.
+    expect(JSON.stringify((await assemble({ history })).messages)).not.toContain("[mode:");
   });
 
   test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
