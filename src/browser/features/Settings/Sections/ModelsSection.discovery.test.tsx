@@ -9,13 +9,19 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
+import { MODEL_CATALOG_SUGGESTION_PAGE_SIZE } from "@/common/constants/ui";
 import type {
   EffectivePolicy,
+  ModelCatalogEntry,
+  ModelCatalogSearchInput,
+  ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import { ModelsSection } from "./ModelsSection";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils";
 
@@ -39,7 +45,14 @@ function SwappableAPI(props: {
 
 // Use the real component/store/context stack; only the RPC boundary is controlled.
 // Deferred replies deliberately ignore abort to prove the UI also fences late results.
-async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | null = null) {
+async function setup(
+  provider = "anthropic",
+  initialPolicy: EffectivePolicy | null = null,
+  options: {
+    anthropicModels?: string[];
+    catalog?: (input: ModelCatalogSearchInput) => ModelCatalogSearchResult;
+  } = {}
+) {
   const config: ProvidersConfigMap = Object.fromEntries(
     ["anthropic", "openai", "coder"].map((id) => [
       id,
@@ -47,7 +60,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [],
+        models: id === "anthropic" ? (options.anthropicModels ?? []) : [],
         ...(id === "coder" ? { discoveredModels: ["coder/model"] } : {}),
       },
     ])
@@ -79,6 +92,12 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
     const deferred = Promise.withResolvers<ProviderModelDiscoveryResult>();
     requests.push({ provider: input.provider, signal: options.signal, ...deferred });
     return deferred.promise;
+  };
+  // Discovery tests stay independent of the bundled catalogue unless they opt in.
+  const catalogRequests: ModelCatalogSearchInput[] = [];
+  client.providers.searchModelCatalog = (input) => {
+    catalogRequests.push(input);
+    return Promise.resolve(options.catalog?.(input) ?? { models: [], total: 0, nextOffset: null });
   };
   const save = mock(client.providers.setModels);
   client.providers.setModels = save;
@@ -123,6 +142,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
     input,
     add,
     requests,
+    catalogRequests,
     save,
     open,
     type,
@@ -134,18 +154,18 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
   };
 }
 
-describe("ModelsSection asynchronous discovery", () => {
-  let restoreDom: () => void;
-  beforeEach(() => {
-    restoreDom = installDom();
-  });
-  afterEach(() => {
-    cleanup();
-    getProvidersConfigStore().setClient(null);
-    getAppConfigStore().setClient(null);
-    restoreDom();
-  });
+let restoreDom: () => void;
+beforeEach(() => {
+  restoreDom = installDom();
+});
+afterEach(() => {
+  cleanup();
+  getProvidersConfigStore().setClient(null);
+  getAppConfigStore().setClient(null);
+  restoreDom();
+});
 
+describe("ModelsSection asynchronous discovery", () => {
   test("requests only on opening, filters locally, and adds only an explicit selection", async () => {
     const ui = await setup();
     expect(ui.requests).toHaveLength(0);
@@ -400,5 +420,115 @@ describe("ModelsSection asynchronous discovery", () => {
     expect(within(list).getByRole("option", { name: "coder/model" })).toBeTruthy();
     expect(ui.requests).toHaveLength(0);
     expect(ui.save).not.toHaveBeenCalled();
+  });
+});
+
+describe("ModelsSection catalogue suggestions", () => {
+  test("a catalogue match is added under its own provider, not the selected one", async () => {
+    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    ui.open();
+    await ui.type("fable");
+    const option = await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    expect(option.textContent).toContain("Anthropic");
+    // The built-in successor is already selectable, so it is not offered.
+    expect(ui.view.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    fireEvent.click(option);
+    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["claude-fable-5"] });
+    expect(ui.view.getByRole("combobox", { name: "Provider" }).textContent).toContain("Anthropic");
+    expect(ui.input.value).toBe("");
+  });
+
+  test("keyboard spans both groups and Show more loads the next page", async () => {
+    const entry = (provider: string, providerModelId: string, builtIn = false) =>
+      ({
+        id: `${provider}:${providerModelId}`,
+        provider,
+        providerModelId,
+        contextWindowTokens: null,
+        builtIn,
+      }) satisfies ModelCatalogEntry;
+    const catalog = [
+      entry("anthropic", "vendor-builtin", true),
+      entry("anthropic", "vendor-added"),
+      entry("openai", "vendor-first"),
+      entry("openai", "vendor-late"),
+    ];
+    const pageSize = 3;
+    const ui = await setup("anthropic", null, {
+      anthropicModels: ["vendor-added"],
+      catalog: (input) => {
+        const offset = input.offset ?? 0;
+        const end = offset + pageSize;
+        return {
+          models: catalog.slice(offset, end),
+          total: catalog.length,
+          nextOffset: end < catalog.length ? end : null,
+        };
+      },
+    });
+    ui.open();
+    await ui.type("vendor");
+    await ui.reply(0, { status: "ok", modelIds: ["vendor-disc"] });
+    const optionNames = () => ui.view.getAllByRole("option").map((option) => option.textContent);
+    expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "Show more (1)"]);
+    const activeName = () =>
+      document.getElementById(ui.input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+
+    ui.key("ArrowDown");
+    expect(activeName()).toBe("vendor-disc");
+    ui.key("ArrowDown");
+    expect(activeName()).toBe("OpenAIvendor-first");
+    ui.key("ArrowDown");
+    ui.key("Enter");
+    await ui.view.findByRole("option", { name: /vendor-late/ });
+    expect(ui.catalogRequests.at(-1)).toEqual({
+      query: "vendor",
+      offset: pageSize,
+      limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+    });
+    expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "OpenAIvendor-late"]);
+    expect(ui.save).not.toHaveBeenCalled();
+
+    ui.key("ArrowUp");
+    expect(activeName()).toBe("OpenAIvendor-late");
+    ui.key("Enter");
+    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "openai", models: ["vendor-late"] });
+  });
+});
+
+describe("ModelsSection table filter and paging", () => {
+  test("pages custom models and filters both tables", async () => {
+    const models = Array.from({ length: 30 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
+    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    const visible = (text: string) => ui.view.queryByText(text) !== null;
+    const builtIn = KNOWN_MODELS.OPUS.providerModelId;
+
+    expect([visible("model-25"), visible("model-26"), visible(builtIn)]).toEqual([
+      true,
+      false,
+      true,
+    ]);
+    fireEvent.click(ui.view.getByRole("button", { name: "Next" }));
+    expect([visible("model-01"), visible("model-26")]).toEqual([false, true]);
+
+    // A new filter starts from the first page even when it keeps every row.
+    await ui.user.type(filter, "anthropic");
+    expect([visible("model-01"), visible("model-26")]).toEqual([true, false]);
+
+    await ui.user.clear(filter);
+    await ui.user.type(filter, "MODEL-2");
+    expect([visible("model-02"), visible("model-20"), visible("model-29")]).toEqual([
+      false,
+      true,
+      true,
+    ]);
+    expect(visible(builtIn)).toBe(false);
+    expect(ui.view.queryByRole("button", { name: "Next" })).toBeNull();
+
+    // Built-ins also match by alias.
+    await ui.user.clear(filter);
+    await ui.user.type(filter, KNOWN_MODELS.OPUS.aliases?.[0] ?? "");
+    expect([visible(builtIn), visible("model-01")]).toEqual([true, false]);
   });
 });

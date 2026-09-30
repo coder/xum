@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useId, useRef, useState } from "react";
-import { ArrowRight, ChevronDown, Info, Loader2, Plus, ShieldCheck } from "lucide-react";
+import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search, ShieldCheck } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelFallbacksEditor } from "./ModelFallbacksEditor";
@@ -26,6 +26,8 @@ import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type {
   EffectivePolicy,
+  ModelCatalogEntry,
+  ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
   ProviderModelEntry,
   ProvidersConfigMap,
@@ -36,12 +38,19 @@ import {
   getProviderModelEntryMappedTo,
 } from "@/common/utils/providers/modelEntries";
 import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
-import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
+import {
+  CUSTOM_MODELS_PAGE_SIZE,
+  MAX_RENDERED_MODELS,
+  MODEL_CATALOG_MIN_QUERY_LENGTH,
+  MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+} from "@/common/constants/ui";
+import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
+import {
+  matchesModelQueryTokens,
+  tokenizeModelQuery,
+} from "@/common/utils/tokens/modelCatalogSearch";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { ModelRow } from "./ModelRow";
-
-// Providers to exclude from the custom models UI (handled specially or internal)
-const HIDDEN_PROVIDERS = new Set(["mux-gateway"]);
 
 // Shared header cell styles
 const headerCellBase = "py-1.5 pr-2 text-xs font-medium text-muted";
@@ -60,6 +69,11 @@ function ModelsTableHeader() {
     </thead>
   );
 }
+
+type SuggestionOption =
+  | { key: string; kind: "discovered"; modelId: string }
+  | { key: string; kind: "catalog"; model: ModelCatalogEntry }
+  | { key: string; kind: "catalog-more" };
 
 interface EditingState {
   provider: string;
@@ -131,8 +145,16 @@ export function ModelsSection() {
     policy: EffectivePolicy | null;
     result: ProviderModelDiscoveryResult;
   } | null>(null);
+  // Catalogue matches across providers, fenced by session, client, and policy.
+  const [catalog, setCatalog] = useState<{
+    session: object;
+    api: object;
+    query: string;
+    policy: EffectivePolicy | null;
+    result: ModelCatalogSearchResult;
+  } | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<{
-    modelId: string;
+    key: string;
     api: object | null;
     provider: string;
     config: ProvidersConfigMap | null;
@@ -142,11 +164,14 @@ export function ModelsSection() {
   const suggestionsId = useId();
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [modelFilter, setModelFilter] = useState("");
+  // Page belongs to the filter it was chosen under, so a new filter shows page 1.
+  const [customPage, setCustomPage] = useState({ filter: "", index: 0 });
 
   const allowedProviders = useMemo(
     () =>
       getAllowedProvidersForUi(effectivePolicy, config).filter(
-        (provider) => !HIDDEN_PROVIDERS.has(provider)
+        (provider) => !CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)
       ),
     [effectivePolicy, config]
   );
@@ -197,7 +222,7 @@ export function ModelsSection() {
     if (!config) return false;
 
     // mux-gateway is a routing layer, not a provider users should add models under.
-    if (HIDDEN_PROVIDERS.has(provider)) {
+    if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) {
       setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
       return false;
     }
@@ -219,15 +244,92 @@ export function ModelsSection() {
     return true;
   };
 
+  const resetAddField = () => {
+    setNewModelId("");
+    setSuggestionsSession(null);
+    setHighlightedModel(null);
+  };
+
   const handleAddModel = (modelId = newModelId) => {
     const trimmedModelId = modelId.trim();
     if (!lastProvider || !trimmedModelId) return;
 
     if (addModel(lastProvider, trimmedModelId)) {
-      setNewModelId("");
-      setSuggestionsSession(null);
-      setHighlightedModel(null);
+      resetAddField();
     }
+  };
+
+  // Catalogue rows name their own provider, which may differ from the selected one.
+  const handleAddCatalogModel = (model: ModelCatalogEntry) => {
+    if (addModel(model.provider, model.providerModelId)) {
+      setLastProvider(model.provider);
+      resetAddField();
+    }
+  };
+
+  const catalogQuery = newModelId.trim();
+  const catalogQueryActive = catalogQuery.length >= MODEL_CATALOG_MIN_QUERY_LENGTH;
+  useEffect(() => {
+    if (!suggestionsSession || !catalogQueryActive || !api) {
+      return;
+    }
+    const controller = new AbortController();
+    api.providers
+      .searchModelCatalog(
+        { query: catalogQuery, limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE },
+        { signal: controller.signal }
+      )
+      .then(
+        (result) => {
+          if (!controller.signal.aborted) {
+            setCatalog({
+              session: suggestionsSession,
+              api,
+              query: catalogQuery,
+              policy: effectivePolicy,
+              result,
+            });
+          }
+        },
+        // Catalogue suggestions are optional; manual entry and discovery still work.
+        () => undefined
+      );
+    return () => controller.abort();
+  }, [api, suggestionsSession, catalogQuery, catalogQueryActive, effectivePolicy]);
+
+  // Previous-query matches stay visible until the new reply lands to avoid
+  // flicker while typing; a new session, client, or policy revokes them.
+  const activeCatalog =
+    catalogQueryActive &&
+    catalog?.session === suggestionsSession &&
+    catalog?.api === api &&
+    catalog?.policy === effectivePolicy
+      ? catalog
+      : null;
+
+  const loadMoreCatalog = () => {
+    const current = activeCatalog;
+    const offset = current?.result.nextOffset ?? null;
+    if (!current || offset === null || !api) return;
+    api.providers
+      .searchModelCatalog({
+        query: current.query,
+        offset,
+        limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+      })
+      .then(
+        (page) =>
+          // Append only onto the exact result this page continues.
+          setCatalog((prev) =>
+            prev === current
+              ? {
+                  ...current,
+                  result: { ...page, models: [...current.result.models, ...page.models] },
+                }
+              : prev
+          ),
+        () => undefined
+      );
   };
 
   useEffect(() => {
@@ -292,15 +394,91 @@ export function ModelsSection() {
     modelId.toLowerCase().includes(newModelId.trim().toLowerCase())
   );
   const suggestions = matchingModels.slice(0, MAX_RENDERED_MODELS);
-  const showSuggestions = suggestionsSession !== null && suggestions.length > 0;
+  const discoveredOptions: SuggestionOption[] = suggestions.map((modelId) => ({
+    key: `discovered:${modelId}`,
+    kind: "discovered",
+    modelId,
+  }));
+  // Built-in and already-added models are selectable elsewhere, so they are not
+  // offered; neither are rows already listed as discovered for this provider.
+  const catalogOptions: SuggestionOption[] = (activeCatalog?.result.models ?? [])
+    .filter(
+      (model) =>
+        !model.builtIn &&
+        !modelExists(model.provider, model.providerModelId) &&
+        !(model.provider === lastProvider && suggestions.includes(model.providerModelId))
+    )
+    .map((model) => ({ key: `catalog:${model.id}`, kind: "catalog", model }));
+  const catalogRemaining =
+    activeCatalog?.result.nextOffset != null
+      ? activeCatalog.result.total - activeCatalog.result.models.length
+      : 0;
+  if (catalogRemaining > 0) {
+    catalogOptions.push({ key: "catalog-more", kind: "catalog-more" });
+  }
+  const options = [...discoveredOptions, ...catalogOptions];
+  const showSuggestions = suggestionsSession !== null && options.length > 0;
   const highlightedIndex =
     showSuggestions &&
     highlightedModel?.api === api &&
     highlightedModel?.config === config &&
     highlightedModel?.provider === lastProvider &&
     highlightedModel?.policy === effectivePolicy
-      ? suggestions.indexOf(highlightedModel.modelId)
+      ? options.findIndex((option) => option.key === highlightedModel.key)
       : -1;
+
+  const selectOption = (option: SuggestionOption) => {
+    if (option.kind === "discovered") handleAddModel(option.modelId);
+    else if (option.kind === "catalog") handleAddCatalogModel(option.model);
+    else loadMoreCatalog();
+  };
+
+  const renderOption = (option: SuggestionOption, index: number) => {
+    const highlighted = index === highlightedIndex;
+    const baseClassName = `hover:bg-hover w-full rounded-sm px-2 py-1 text-left text-xs ${highlighted ? "bg-hover" : ""}`;
+    return (
+      <button
+        key={option.key}
+        id={`${suggestionsId}-${index}`}
+        type="button"
+        role="option"
+        aria-selected={highlighted}
+        tabIndex={-1}
+        ref={(element) => {
+          if (highlighted) element?.scrollIntoView({ block: "nearest" });
+        }}
+        // Keep mouse selection in the input; do not cancel touch scrolling.
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => {
+          modelInputRef.current?.focus();
+          selectOption(option);
+        }}
+        className={
+          option.kind === "catalog"
+            ? `${baseClassName} grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2`
+            : option.kind === "discovered"
+              ? `${baseClassName} block truncate font-mono`
+              : `${baseClassName} text-muted block`
+        }
+      >
+        {option.kind === "discovered" ? (
+          option.modelId
+        ) : option.kind === "catalog" ? (
+          <>
+            <span className="text-muted inline-flex items-center gap-1 whitespace-nowrap">
+              <ProviderIcon provider={option.model.provider} />
+              {formatProviderDisplayName(option.model.provider, config?.[option.model.provider])}
+            </span>
+            <span className="truncate font-mono">{option.model.providerModelId}</span>
+          </>
+        ) : (
+          <>
+            Show more (<span className="counter-nums">{catalogRemaining}</span>)
+          </>
+        )}
+      </button>
+    );
+  };
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
@@ -450,7 +628,7 @@ export function ModelsSection() {
 
     for (const [provider, providerConfig] of Object.entries(config)) {
       // Skip hidden providers (mux-gateway models are routed, not managed as a standalone list)
-      if (HIDDEN_PROVIDERS.has(provider)) continue;
+      if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) continue;
       if (!providerConfig.models) continue;
 
       for (const modelEntry of providerConfig.models) {
@@ -483,6 +661,40 @@ export function ModelsSection() {
 
   const customModels = getCustomModels();
 
+  const filterTokens = tokenizeModelQuery(modelFilter);
+  const matchesModelFilter = (model: {
+    provider: string;
+    modelId: string;
+    fullId: string;
+    aliases?: string[];
+  }) =>
+    matchesModelQueryTokens(
+      filterTokens,
+      [
+        model.fullId,
+        model.provider,
+        formatProviderDisplayName(model.provider, config[model.provider]),
+        model.modelId,
+        ...(model.aliases ?? []),
+      ].map((field) => field.toLowerCase())
+    );
+  const filteredCustomModels = customModels.filter(matchesModelFilter);
+  const filteredBuiltInModels = builtInModels.filter(matchesModelFilter);
+  const customPageCount = Math.max(
+    1,
+    Math.ceil(filteredCustomModels.length / CUSTOM_MODELS_PAGE_SIZE)
+  );
+  // Clamp too: removing rows can leave the stored page past the end.
+  const customPageIndex = Math.min(
+    customPage.filter === modelFilter ? customPage.index : 0,
+    customPageCount - 1
+  );
+  const customPageStart = customPageIndex * CUSTOM_MODELS_PAGE_SIZE;
+  const pagedCustomModels = filteredCustomModels.slice(
+    customPageStart,
+    customPageStart + CUSTOM_MODELS_PAGE_SIZE
+  );
+
   return (
     <div className="space-y-4">
       {policyState.status.state === "enforced" && (
@@ -491,6 +703,30 @@ export function ModelsSection() {
           <span>Your settings are controlled by a policy.</span>
         </div>
       )}
+
+      <div className="relative">
+        <Search
+          aria-hidden
+          className="text-muted pointer-events-none absolute top-2 left-2 h-3.5 w-3.5"
+        />
+        <input
+          type="text"
+          aria-label="Filter models"
+          placeholder="Filter models"
+          autoComplete="off"
+          value={modelFilter}
+          onChange={(e) => setModelFilter(e.target.value)}
+          onKeyDown={(e) => {
+            // Only a non-empty filter consumes Escape; otherwise it still closes Settings.
+            if (e.key === "Escape" && modelFilter) {
+              e.preventDefault();
+              stopKeyboardPropagation(e);
+              setModelFilter("");
+            }
+          }}
+          className="bg-background border-border-medium focus:border-accent h-8 w-full rounded border py-1 pr-2 pl-7 text-xs focus:outline-none"
+        />
+      </div>
 
       {/* Custom Models */}
       <div className="space-y-3">
@@ -563,21 +799,27 @@ export function ModelsSection() {
                     setSuggestionsSession((session) => session ?? {});
                     const next =
                       e.key === "ArrowDown"
-                        ? Math.min(highlightedIndex + 1, suggestions.length - 1)
+                        ? Math.min(highlightedIndex + 1, options.length - 1)
                         : highlightedIndex < 0
-                          ? suggestions.length - 1
+                          ? options.length - 1
                           : Math.max(highlightedIndex - 1, 0);
-                    const modelId = suggestions[next];
+                    const option = options[next];
                     setHighlightedModel(
-                      modelId
-                        ? { modelId, api, provider: lastProvider, config, policy: effectivePolicy }
+                      option
+                        ? {
+                            key: option.key,
+                            api,
+                            provider: lastProvider,
+                            config,
+                            policy: effectivePolicy,
+                          }
                         : null
                     );
                   } else if (e.key === "Enter") {
                     e.preventDefault();
-                    handleAddModel(
-                      highlightedIndex >= 0 ? suggestions[highlightedIndex] : newModelId
-                    );
+                    const option = highlightedIndex >= 0 ? options[highlightedIndex] : undefined;
+                    if (option) selectOption(option);
+                    else handleAddModel();
                   } else if (e.key === "Escape" && suggestionsSession) {
                     e.preventDefault();
                     stopKeyboardPropagation(e);
@@ -596,35 +838,30 @@ export function ModelsSection() {
                 <div
                   id={suggestionsId}
                   role="listbox"
-                  aria-label="Discovered models"
-                  className="bg-background border-border-medium absolute top-full z-50 mt-1 max-h-48 w-full overflow-y-auto rounded border p-1 shadow-md"
+                  aria-label="Model suggestions"
+                  className="bg-background border-border-medium absolute top-full z-50 mt-1 max-h-60 w-full overflow-y-auto rounded border p-1 shadow-md"
                 >
-                  {suggestions.map((modelId, index) => (
-                    <button
-                      key={modelId}
-                      id={`${suggestionsId}-${index}`}
-                      type="button"
-                      role="option"
-                      aria-selected={index === highlightedIndex}
-                      tabIndex={-1}
-                      ref={(element) => {
-                        if (index === highlightedIndex)
-                          element?.scrollIntoView({ block: "nearest" });
-                      }}
-                      // Keep mouse selection in the input; do not cancel touch scrolling.
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => {
-                        modelInputRef.current?.focus();
-                        handleAddModel(modelId);
-                      }}
-                      className={`hover:bg-hover block w-full truncate rounded-sm px-2 py-1 text-left font-mono text-xs ${index === highlightedIndex ? "bg-hover" : ""}`}
-                    >
-                      {modelId}
-                    </button>
-                  ))}
-                  {matchingModels.length > suggestions.length && (
-                    <div className="text-muted px-2 py-1 text-xs">
-                      Keep typing to narrow the list
+                  {discoveredOptions.length > 0 && (
+                    <div role="group" aria-label="Discovered models">
+                      {discoveredOptions.map((option, index) => renderOption(option, index))}
+                      {matchingModels.length > suggestions.length && (
+                        <div className="text-muted px-2 py-1 text-xs">
+                          Keep typing to narrow the list
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {catalogOptions.length > 0 && (
+                    <div role="group" aria-labelledby={`${suggestionsId}-catalog`}>
+                      <div
+                        id={`${suggestionsId}-catalog`}
+                        className="text-muted px-2 pt-1.5 pb-0.5 text-[11px] font-medium tracking-wide uppercase"
+                      >
+                        From catalogue
+                      </div>
+                      {catalogOptions.map((option, index) =>
+                        renderOption(option, discoveredOptions.length + index)
+                      )}
                     </div>
                   )}
                 </div>
@@ -656,12 +893,17 @@ export function ModelsSection() {
         </div>
 
         {/* Table of custom models */}
-        {customModels.length > 0 && (
+        {customModels.length > 0 && filteredCustomModels.length === 0 && (
+          <div className="border-border-medium text-muted rounded-md border px-3 py-2 text-xs">
+            No custom models match the filter.
+          </div>
+        )}
+        {pagedCustomModels.length > 0 && (
           <div className="border-border-medium overflow-hidden rounded-md border">
             <table className="w-full">
               <ModelsTableHeader />
               <tbody>
-                {customModels.map((model) => {
+                {pagedCustomModels.map((model) => {
                   const isModelEditing =
                     editing?.provider === model.provider &&
                     editing?.originalModelId === model.modelId;
@@ -748,6 +990,32 @@ export function ModelsSection() {
             </table>
           </div>
         )}
+        {filteredCustomModels.length > CUSTOM_MODELS_PAGE_SIZE && (
+          <div className="flex items-center justify-end gap-2 text-xs">
+            <span className="text-muted counter-nums">
+              {customPageStart + 1}-{customPageStart + pagedCustomModels.length} of{" "}
+              {filteredCustomModels.length}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={customPageIndex === 0}
+              onClick={() => setCustomPage({ filter: modelFilter, index: customPageIndex - 1 })}
+            >
+              Previous
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={customPageIndex >= customPageCount - 1}
+              onClick={() => setCustomPage({ filter: modelFilter, index: customPageIndex + 1 })}
+            >
+              Next
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Built-in Models */}
@@ -755,47 +1023,53 @@ export function ModelsSection() {
         <div className="text-muted text-xs font-medium tracking-wide uppercase">
           Built-in Models
         </div>
-        <div className="border-border-medium overflow-hidden rounded-md border">
-          <table className="w-full">
-            <ModelsTableHeader />
-            <tbody>
-              {builtInModels.map((model) => (
-                <ModelRow
-                  key={model.fullId}
-                  provider={model.provider}
-                  modelId={model.modelId}
-                  fullId={model.fullId}
-                  aliases={model.aliases}
-                  isCustom={false}
-                  isDefault={defaultModel === model.fullId}
-                  isEditing={false}
-                  resolvedRoute={routing.resolveRoute(model.fullId)}
-                  autoResolvedRoute={routing.resolveAutoRoute(model.fullId)}
-                  availableRoutes={routing.availableRoutes(model.fullId)}
-                  is1MContextEnabled={has1MContext(model.fullId)}
-                  onSetDefault={() => setDefaultModel(model.fullId)}
-                  isHiddenFromSelector={hiddenModels.includes(model.fullId)}
-                  onToggleVisibility={() =>
-                    hiddenModels.includes(model.fullId)
-                      ? unhideModel(model.fullId)
-                      : hideModel(model.fullId)
-                  }
-                  onSetRouteOverride={(route) => routing.setRouteOverride(model.fullId, route)}
-                  minThinkingLevel={minThinking.getMinOverride(model.fullId)}
-                  onSetMinThinkingLevel={(level) =>
-                    minThinking.setMinThinkingLevel(model.fullId, level)
-                  }
-                  onToggle1MContext={
-                    supports1MContext(model.fullId, config)
-                      ? () => toggle1MContext(model.fullId)
-                      : undefined
-                  }
-                  providersConfig={config}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        {filterTokens.length > 0 && filteredBuiltInModels.length === 0 ? (
+          <div className="border-border-medium text-muted rounded-md border px-3 py-2 text-xs">
+            No built-in models match the filter.
+          </div>
+        ) : (
+          <div className="border-border-medium overflow-hidden rounded-md border">
+            <table className="w-full">
+              <ModelsTableHeader />
+              <tbody>
+                {filteredBuiltInModels.map((model) => (
+                  <ModelRow
+                    key={model.fullId}
+                    provider={model.provider}
+                    modelId={model.modelId}
+                    fullId={model.fullId}
+                    aliases={model.aliases}
+                    isCustom={false}
+                    isDefault={defaultModel === model.fullId}
+                    isEditing={false}
+                    resolvedRoute={routing.resolveRoute(model.fullId)}
+                    autoResolvedRoute={routing.resolveAutoRoute(model.fullId)}
+                    availableRoutes={routing.availableRoutes(model.fullId)}
+                    is1MContextEnabled={has1MContext(model.fullId)}
+                    onSetDefault={() => setDefaultModel(model.fullId)}
+                    isHiddenFromSelector={hiddenModels.includes(model.fullId)}
+                    onToggleVisibility={() =>
+                      hiddenModels.includes(model.fullId)
+                        ? unhideModel(model.fullId)
+                        : hideModel(model.fullId)
+                    }
+                    onSetRouteOverride={(route) => routing.setRouteOverride(model.fullId, route)}
+                    minThinkingLevel={minThinking.getMinOverride(model.fullId)}
+                    onSetMinThinkingLevel={(level) =>
+                      minThinking.setMinThinkingLevel(model.fullId, level)
+                    }
+                    onToggle1MContext={
+                      supports1MContext(model.fullId, config)
+                        ? () => toggle1MContext(model.fullId)
+                        : undefined
+                    }
+                    providersConfig={config}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <ModelFallbacksEditor />

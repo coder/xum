@@ -281,3 +281,116 @@ export const CoderCatalogDiscoveredPhone: Story = {
     await expect(list.scrollWidth).toBeLessThanOrEqual(list.clientWidth);
   },
 };
+
+// Catalogue matches name their own provider, so an older model replaced by a
+// newer built-in can be added without knowing its exact ID or picking the
+// provider first. The mock search runs the real catalogue search module.
+const catalogueSetModelsCalls: Array<{ provider: string; models: ProviderModelEntry[] }> = [];
+
+function setupCatalogueStory() {
+  const client = setupSettingsStory({
+    providersConfig: {
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, baseUrl: "", models: [] },
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true, baseUrl: "", models: [] },
+    },
+  });
+  updatePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "openai");
+  catalogueSetModelsCalls.length = 0;
+  client.providers.setModels = (input) => {
+    catalogueSetModelsCalls.push(input);
+    return Promise.resolve({ success: true, data: undefined });
+  };
+  return client;
+}
+
+export const CatalogueSuggestions: Story = {
+  render: () => (
+    <SettingsSectionStory setup={setupCatalogueStory}>
+      <ModelsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input = await canvas.findByRole("combobox", { name: "Model ID" });
+    await userEvent.type(input, "fable");
+    const option = await canvas.findByRole("option", { name: /claude-fable-5$/ });
+    // The built-in successor is already selectable and must not be offered.
+    await expect(canvas.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    await userEvent.click(option);
+    await expect(catalogueSetModelsCalls).toEqual([
+      { provider: "anthropic", models: ["claude-fable-5"] },
+    ]);
+    await canvas.findByText("claude-fable-5");
+    await expect(input).toHaveValue("");
+  },
+};
+
+export const CatalogueSuggestionsPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+    docs: {
+      description: {
+        story:
+          "Pins the phone-width contract for catalogue suggestions: provider labels and truncated model IDs fit without horizontal overflow.",
+      },
+    },
+  },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 390, maxWidth: "100%" }}>
+      <SettingsSectionStory setup={setupCatalogueStory}>
+        <ModelsSection />
+      </SettingsSectionStory>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input = await canvas.findByRole("combobox", { name: "Model ID" });
+    await userEvent.type(input, "claude");
+    const list = await canvas.findByRole("listbox");
+    await within(list).findAllByRole("option");
+    await expect(list.scrollWidth).toBeLessThanOrEqual(list.clientWidth);
+  },
+};
+
+const MANY_CUSTOM_MODELS = Array.from(
+  { length: 60 },
+  (_, i) => `custom-model-${String(i + 1).padStart(2, "0")}`
+);
+
+export const ManyCustomModelsFilterAndPaging: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            anthropic: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              baseUrl: "",
+              models: MANY_CUSTOM_MODELS,
+            },
+          },
+        })
+      }
+    >
+      <ModelsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("custom-model-25");
+    await expect(canvas.queryByText("custom-model-26")).toBeNull();
+    await userEvent.click(canvas.getByRole("button", { name: "Next" }));
+    await canvas.findByText("custom-model-26");
+    await expect(canvas.queryByText("custom-model-01")).toBeNull();
+
+    // Filtering narrows both tables and returns to the first page.
+    await userEvent.type(canvas.getByRole("textbox", { name: "Filter models" }), "model-1");
+    await canvas.findByText("custom-model-10");
+    await expect(canvas.queryByText("custom-model-26")).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Next" })).toBeNull();
+  },
+};
