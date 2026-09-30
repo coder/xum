@@ -60,6 +60,12 @@ export const TurnEnvelopeDataSchema = z.object({
   wireProviderName: z.string().optional(),
   /** Per-send Anthropic cache TTL override ("5m" | "1h"); absent = default. */
   anthropicCacheTtl: z.string().optional(),
+  /**
+   * JS string length of the system prompt's volatile tail (MCP warning, hot
+   * memories, context-window ids), sent as a separate uncached system block
+   * after the cached stable block (#5251). Absent = one block.
+   */
+  systemPromptVolatileSuffixLength: z.number().int().positive().optional(),
   /** Plan content injected on a plan→exec handoff (blob-stored, model-visible). */
   planTransitionContentHash: BlobRefSchema.optional(),
   /** Plan file path referenced by the plan→exec handoff injection. */

@@ -1198,10 +1198,10 @@ describe("TaskService", () => {
       expect(internal?.admissionStale?.()).toBe(false);
     });
 
-    // Another sender's continuation would run under the recipient's saved agent instead of the
-    // owner's per-turn override and land in the owner's result.
+    // #4997: another sender's continuation would run under the recipient's saved agent instead
+    // of the owner's per-turn override and land in the owner's result, so it waits for the turn.
     test.each(["reserved", "accepted"] as const)(
-      "refuses a sender that does not own the %s delegated turn",
+      "holds a message from a sender that does not own the %s delegated turn until it ends",
       async (source) => {
         const { taskService, sendMessage, sendCall } = await setUpDelegatedTarget();
         await registerLiveWorkspaceTurnHandle(
@@ -1211,23 +1211,23 @@ describe("TaskService", () => {
           "owner",
           source
         );
-        const result = await taskService.sendAgentTreeMessage(
-          "sender",
-          "target",
-          "Do not resume delegated work"
+        expect(
+          await taskService.sendAgentTreeMessage("sender", "target", "Do not resume delegated work")
+        ).toEqual(
+          Ok({ delivery: "queued", relation: "target_unrelated", awaitsDelegatedTurn: true })
         );
-        expect(result).toMatchObject(Err({ code: "refused" }));
-        assert(!result.success && "reason" in result.error);
-        expect(result.error.reason).toMatch(/retry after.*delegated/i);
         expect(sendMessage).not.toHaveBeenCalled();
-        // Finishing the delegation opens messaging as an ordinary idle-root wake.
+        // Releasing the delegation delivers it as an ordinary idle-root wake.
+        const delivered = new Promise<void>((resolve) =>
+          sendMessage.mockImplementationOnce(() => {
+            resolve();
+            return Promise.resolve(Ok(undefined));
+          })
+        );
         workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
           "target"
         );
-        expect(
-          (await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input"))
-            .success
-        ).toBe(true);
+        await delivered;
         const [, , options, internal] = sendCall(0);
         expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
         expect(internal?.workspaceTurnContinuation).toBe(false);
@@ -1281,7 +1281,7 @@ describe("TaskService", () => {
     });
 
     test.each(["pre-admission", "queued"] as const)(
-      "withdraws when delegation starts %s",
+      "waits when another workspace's delegation starts %s",
       async (phase) => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "repo");
@@ -1341,19 +1341,34 @@ describe("TaskService", () => {
             const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
               WorkspaceHost["sendMessage"]
             >;
+            // The target's queue withdraws it at dispatch; it then waits for the delegation.
             expect(internal?.admissionStale?.()).toBe(true);
+            await internal?.onCanceled?.("stale");
           } else {
-            expect(result).toMatchObject(Err({ code: "refused" }));
+            expect(result).toEqual(
+              Ok({ delivery: "queued", relation: "target_unrelated", awaitsDelegatedTurn: true })
+            );
             expect(sendMessage).not.toHaveBeenCalled();
           }
           expect(await collectFullHistory(historyService, "target")).toEqual([]);
+          const callsBefore = sendMessage.mock.calls.length;
+          const delivered = new Promise<void>((resolveDelivery) =>
+            sendMessage.mockImplementationOnce(() => {
+              resolveDelivery();
+              return Promise.resolve(Ok(undefined));
+            })
+          );
           workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
             "target"
           );
-          // Finishing the delegation opens messaging again.
-          expect(
-            (await taskService.sendAgentTreeMessage("sender", "target", "After delegation")).success
-          ).toBe(true);
+          // Finishing the delegation delivers it as its own turn.
+          await delivered;
+          expect(sendMessage.mock.calls).toHaveLength(callsBefore + 1);
+          const [, , options, internal] = sendMessage.mock.calls[callsBefore] as Parameters<
+            WorkspaceHost["sendMessage"]
+          >;
+          expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
+          expect(internal?.workspaceTurnContinuation).toBe(false);
         } finally {
           resolve.mockRestore();
         }

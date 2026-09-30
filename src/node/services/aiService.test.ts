@@ -32,10 +32,11 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import { computeActiveToolNames } from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
-import { jsonSchema, tool, type LanguageModel, type Tool } from "ai";
+import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import type { InstructionSources } from "@/common/types/instructions";
@@ -64,8 +65,14 @@ import {
 } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
+import type { MCPServerManager } from "./mcpServerManager";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
+import type { GoalRecordV1 } from "@/common/types/goal";
+import {
+  getSetGoalRefusalReason,
+  type GoalToolContext,
+} from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import * as messagePipeline from "./messagePipeline";
@@ -80,6 +87,10 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
+
+// Captured before any test spies on the module, so a test can still build the
+// real tool set from the configuration the request builder produced.
+const realGetToolsForModel = toolsModule.getToolsForModel;
 
 interface BasicAIServiceParts {
   config: Config;
@@ -1100,6 +1111,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return toolConfig as unknown as Record<string, unknown>;
   }
 
+  function getGoalToolContextFromHarness(harness: StreamMessageHarness): GoalToolContext {
+    const goalToolContext = (
+      getToolConfigFromHarness(harness) as { goalToolContext?: GoalToolContext }
+    ).goalToolContext;
+    if (!goalToolContext) {
+      throw new Error("Expected goalToolContext in tool configuration");
+    }
+    return goalToolContext;
+  }
+
   function getAdvisorRuntimeFromHarness(harness: StreamMessageHarness): AdvisorRuntimeForTests {
     const toolConfig = getToolConfigFromHarness(harness);
     const advisorRuntime = (toolConfig as { advisorRuntime?: AdvisorRuntimeForTests })
@@ -1416,9 +1437,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: false,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
 
   it("enables set_goal for parent streams that opt into agent-created goals", async () => {
@@ -1443,9 +1462,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: true,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
   it("keeps set_goal disabled for child workspaces even when the host opts in", async () => {
@@ -1472,10 +1489,84 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: false,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
+
+  // #5247: provider prompt caches key on the tool block, so a goal status change,
+  // or a continuation turn that does not opt into agent-created goals, must not
+  // add, remove or reword the goal tools. The handlers gate at execution time.
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace" },
+  ])(
+    "keeps the goal tools byte-identical across goal statuses and turn kinds ($kind)",
+    async ({ kind, parentWorkspaceId }) => {
+      using xumHome = new DisposableTempDir(`ai-service-stable-goal-tools-${kind}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+
+      const workspaceId = `workspace-stable-goal-tools-${kind}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+        ...(parentWorkspaceId != null ? { parentWorkspaceId } : {}),
+      });
+      const harness = createHarness(xumHome.path, metadata);
+      let currentGoal: GoalRecordV1 | null = null;
+      const goalService = {
+        getGoal: mock(() => Promise.resolve(currentGoal)),
+      } as unknown as WorkspaceGoalService;
+
+      const goalStatuses = [null, "active", "complete", "paused", "budget_limited"] as const;
+      // true = user turn; undefined = goal-continuation turn (continuationSendOptions drops it).
+      const allowAgentSetGoalValues = [true, undefined] as const;
+      const goalToolNames = ["set_goal", "get_goal", "complete_goal"] as const;
+      const serializedGoalTools: string[] = [];
+      const toolNameLists: string[] = [];
+
+      for (const goalStatus of goalStatuses) {
+        for (const allowAgentSetGoal of allowAgentSetGoalValues) {
+          // The request builder never reads goal fields beyond status, so a partial stub is enough.
+          const goalStub: Partial<GoalRecordV1> = {
+            goalId: "goal-1",
+            objective: "Ship it",
+            status: goalStatus ?? undefined,
+          };
+          currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
+          const result = await harness.service.streamMessage({
+            messages: [createMuxMessage("latest-user", "user", "hello")],
+            workspaceId,
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "off",
+            workspaceGoalService: goalService,
+            ...(allowAgentSetGoal != null ? { allowAgentSetGoal } : {}),
+          });
+          expect(result.success).toBe(true);
+
+          const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
+          if (!callArgs) throw new Error("Expected getToolsForModel to be called");
+          const tools = await realGetToolsForModel(...callArgs);
+          toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
+          serializedGoalTools.push(
+            JSON.stringify(
+              goalToolNames.map((name) => {
+                const goalTool = tools[name];
+                return goalTool == null
+                  ? { name, missing: true }
+                  : {
+                      name,
+                      description: goalTool.description,
+                      inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
+                    };
+              })
+            )
+          );
+        }
+      }
+
+      expect(serializedGoalTools[0]).not.toContain('"missing":true');
+      expect(new Set(serializedGoalTools).size).toBe(1);
+      expect(new Set(toolNameLists).size).toBe(1);
+    }
+  );
 
   it("prepares fallback system context with the fallback model's hot memories", async () => {
     using xumHome = new DisposableTempDir("ai-service-fallback-hot-memories");
@@ -2204,6 +2295,63 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, denied !== "memory"]);
     });
   }
+
+  // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
+  // first) on every tool_catalog_search activation, so deferral stays off
+  // wherever Anthropic prompt caching is active.
+  async function startToolSearchStream(modelString: string) {
+    using xumHome = new DisposableTempDir("ai-tool-search-cache");
+    const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
+    harness.getToolsForModelSpy.mockImplementation((_model, config) =>
+      Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...mcpTools,
+      })
+    );
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: mcpTools,
+          promptDescriptors: [],
+          stats: {
+            totalTools: 1,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+    const started = harness.startStreamCalls[0];
+    if (!started) throw new Error("Expected streamManager.startStream call");
+    return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
+  }
+
+  it("advertises the deferral-off tool list on Anthropic prompt-cache models", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5");
+    expect(computeActiveToolNames(on.state)).toBeUndefined();
+    expect(on.toolNames).toContain("tracker_list_issues");
+    expect(on.toolNames).toContain("file_read");
+    expect(on.toolNames).not.toContain("tool_catalog_search");
+  });
+
+  it("keeps tool-search deferral on models without Anthropic prompt caching", async () => {
+    const on = await startToolSearchStream("openai:gpt-5.2");
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.toolNames).toContain("tool_catalog_search");
+  });
 
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",
@@ -3923,6 +4071,139 @@ describe("AIService.streamMessage turn envelope", () => {
 
     await streamTurn(harness, workspaceId);
     expect(harness.startStreamCalls).toHaveLength(1);
+  });
+});
+
+describe("AIService.streamMessage volatile system content (#5251)", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  it("keeps the cached system row byte-identical while MCP failures and hot memories change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-system");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-volatile-system";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (experimentId) =>
+        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, { experimentsService });
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
+    const stubTool: Tool = {} as never;
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      allTools: { memory: stubTool },
+      useRequestedModelString: true,
+    });
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(xumHome.path)
+    );
+    // Mirrors buildStreamSystemContext's contract: hot memories are appended
+    // after the stable prompt and reported as the exact appended section.
+    const stableSystem = "stable-system-prompt";
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+      const hotMemoriesSection =
+        contextArgs.memoryToolAvailable && contextArgs.hotMemoriesBlock
+          ? `\n\n${contextArgs.hotMemoriesBlock}`
+          : undefined;
+      return Promise.resolve({
+        instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
+        agentSystemPromptSections: ["test-agent-prompt"],
+        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
+        hotMemoriesSection,
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
+    });
+    let failedServerNames: string[] = [];
+    service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: failedServerNames.length,
+            failedServerNames,
+          },
+        }),
+    } as unknown as MCPServerManager;
+
+    const turns: Array<{ failed: string[]; hot: string | null }> = [
+      { failed: ["alpha-server"], hot: "<hot_memories>note v1</hot_memories>" },
+      { failed: [], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: ["beta-server"], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: [], hot: null },
+    ];
+    for (const turn of turns) {
+      failedServerNames = turn.failed;
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () =>
+          Promise.resolve({ indexEntries: [], hotMemoriesBlock: turn.hot }),
+      });
+      expect(result.success).toBe(true);
+    }
+    expect(startStreamCalls).toHaveLength(turns.length);
+
+    const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
+    const envelopes = (await journal.read()).filter((event) => event.kind === "turn-envelope");
+    expect(envelopes).toHaveLength(turns.length);
+
+    const textOf = (row: ModelMessage | undefined): string => {
+      if (typeof row?.content !== "string") throw new Error("expected a text system row");
+      return row.content;
+    };
+    const systemRowsPerTurn = startStreamCalls.map((call) => {
+      const firstNonSystem = call.messages.findIndex((message) => message.role !== "system");
+      return call.messages.slice(0, firstNonSystem);
+    });
+    for (const [index, rows] of systemRowsPerTurn.entries()) {
+      const turn = turns[index];
+      const stableRow = rows[0];
+      // The cached stable row never carries volatile content, so it stays
+      // byte-identical across turns and keeps the only system cache marker.
+      expect(stableRow?.content).toBe(stableSystem);
+      expect(stableRow?.providerOptions?.anthropic?.cacheControl).toBeDefined();
+      const hasVolatile = turn.failed.length > 0 || turn.hot != null;
+      expect(rows).toHaveLength(hasVolatile ? 2 : 1);
+      if (!hasVolatile) continue;
+      const tailRow = rows[1];
+      expect(tailRow?.providerOptions?.anthropic?.cacheControl).toBeUndefined();
+      const tail = textOf(tailRow);
+      for (const name of turn.failed) expect(tail).toContain(name);
+      if (turn.hot != null) expect(tail).toContain(turn.hot);
+      if (turn.failed.length === 0) expect(tail).not.toContain("MCP server");
+      // The model sees the same text: the rows join back to the logged prompt.
+      const envelope = envelopes[index];
+      if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+      expect(await journal.blobs.getText(envelope.data.systemPromptHash)).toBe(
+        rows.map((row) => textOf(row)).join("")
+      );
+    }
   });
 });
 
