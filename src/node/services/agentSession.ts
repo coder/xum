@@ -4944,10 +4944,7 @@ export class AgentSession {
           optionsForStream,
           requestAssemblySnapshot,
           agentInitiated,
-          cancelSignal,
-          manualGoalInterventionPolicy != null
-            ? { enqueuedAtMs: internal?.enqueuedAtMs }
-            : undefined
+          cancelSignal
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
         if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -5998,8 +5995,7 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     snapshot: RequestAssemblySnapshot,
     agentInitiated?: boolean,
-    signal?: AbortSignal,
-    manualIntervention?: { enqueuedAtMs?: number }
+    signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
       return Err({
@@ -6008,16 +6004,6 @@ export class AgentSession {
       });
     const cache = new Map<string, CachedMemoryContext>();
     const cacheGeneration = this.memoryContextGeneration;
-    // Admission must not pause the goal yet, but the pinned tools must match the later manual pause.
-    let prospectiveGoalStatusForToolAvailability: StreamMessageOptions["prospectiveGoalStatusForToolAvailability"];
-    if (manualIntervention && this.workspaceGoalService) {
-      const goal = await this.workspaceGoalService.getGoal(this.workspaceId);
-      prospectiveGoalStatusForToolAvailability =
-        goal?.status === "active" &&
-        !manualSendPreservesGoalActivation(goal, manualIntervention.enqueuedAtMs)
-          ? "paused"
-          : (goal?.status ?? null);
-    }
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -6078,7 +6064,6 @@ export class AgentSession {
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
-        prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,

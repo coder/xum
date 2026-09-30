@@ -35,14 +35,13 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
@@ -333,8 +332,6 @@ export interface StreamMessageOptions {
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
-  /** Candidate admission previews tool availability only; executions keep the real goal service. */
-  prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -1615,25 +1612,18 @@ export class TurnRequestBuilder {
     const advisorToolEligible =
       advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
 
-    // Goals graduated to GA: tools are gated solely on the workspace's
-    // current goal status + agent capability, not on an experiment flag.
-    let currentGoalForTools: GoalRecordV1 | null = null;
-    if (workspaceGoalService) {
-      currentGoalForTools = await workspaceGoalService.getGoal(workspaceId);
-    }
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       metadata.goalDefaults ?? null
     );
-    const goalToolAvailability = getGoalToolAvailability({
-      goalStatus:
-        opts.prospectiveGoalStatusForToolAvailability !== undefined
-          ? opts.prospectiveGoalStatusForToolAvailability
-          : (currentGoalForTools?.status ?? null),
+    // Goal tools are registered whenever a goal service exists and gate at
+    // execution time on these per-turn inputs plus the live goal status, so the
+    // tool block does not change when the goal does (prompt caching, #5247).
+    const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       allowAgentSetGoal,
       agentInheritanceChain,
-    });
+    };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)
     // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
@@ -2443,7 +2433,7 @@ export class TurnRequestBuilder {
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
-      enableGoalTools: goalToolAvailability,
+      goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
       // RLM family messaging: gate on the flags persisted on the task record at

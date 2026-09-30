@@ -35,7 +35,7 @@ import type { CodexOauthService } from "@/node/services/codexOauthService";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
-import { jsonSchema, tool, type LanguageModel, type Tool } from "ai";
+import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import type { InstructionSources } from "@/common/types/instructions";
@@ -66,6 +66,11 @@ import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
+import type { GoalRecordV1 } from "@/common/types/goal";
+import {
+  getSetGoalRefusalReason,
+  type GoalToolContext,
+} from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import * as messagePipeline from "./messagePipeline";
@@ -80,6 +85,10 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
+
+// Captured before any test spies on the module, so a test can still build the
+// real tool set from the configuration the request builder produced.
+const realGetToolsForModel = toolsModule.getToolsForModel;
 
 interface BasicAIServiceParts {
   config: Config;
@@ -1100,6 +1109,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return toolConfig as unknown as Record<string, unknown>;
   }
 
+  function getGoalToolContextFromHarness(harness: StreamMessageHarness): GoalToolContext {
+    const goalToolContext = (
+      getToolConfigFromHarness(harness) as { goalToolContext?: GoalToolContext }
+    ).goalToolContext;
+    if (!goalToolContext) {
+      throw new Error("Expected goalToolContext in tool configuration");
+    }
+    return goalToolContext;
+  }
+
   function getAdvisorRuntimeFromHarness(harness: StreamMessageHarness): AdvisorRuntimeForTests {
     const toolConfig = getToolConfigFromHarness(harness);
     const advisorRuntime = (toolConfig as { advisorRuntime?: AdvisorRuntimeForTests })
@@ -1416,9 +1435,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: false,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
 
   it("enables set_goal for parent streams that opt into agent-created goals", async () => {
@@ -1443,9 +1460,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: true,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
   it("keeps set_goal disabled for child workspaces even when the host opts in", async () => {
@@ -1472,10 +1487,84 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).enableGoalTools).toMatchObject({
-      setGoal: false,
-    });
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
+
+  // #5247: provider prompt caches key on the tool block, so a goal status change,
+  // or a continuation turn that does not opt into agent-created goals, must not
+  // add, remove or reword the goal tools. The handlers gate at execution time.
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace" },
+  ])(
+    "keeps the goal tools byte-identical across goal statuses and turn kinds ($kind)",
+    async ({ kind, parentWorkspaceId }) => {
+      using xumHome = new DisposableTempDir(`ai-service-stable-goal-tools-${kind}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+
+      const workspaceId = `workspace-stable-goal-tools-${kind}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+        ...(parentWorkspaceId != null ? { parentWorkspaceId } : {}),
+      });
+      const harness = createHarness(xumHome.path, metadata);
+      let currentGoal: GoalRecordV1 | null = null;
+      const goalService = {
+        getGoal: mock(() => Promise.resolve(currentGoal)),
+      } as unknown as WorkspaceGoalService;
+
+      const goalStatuses = [null, "active", "complete", "paused", "budget_limited"] as const;
+      // true = user turn; undefined = goal-continuation turn (continuationSendOptions drops it).
+      const allowAgentSetGoalValues = [true, undefined] as const;
+      const goalToolNames = ["set_goal", "get_goal", "complete_goal"] as const;
+      const serializedGoalTools: string[] = [];
+      const toolNameLists: string[] = [];
+
+      for (const goalStatus of goalStatuses) {
+        for (const allowAgentSetGoal of allowAgentSetGoalValues) {
+          // The request builder never reads goal fields beyond status, so a partial stub is enough.
+          const goalStub: Partial<GoalRecordV1> = {
+            goalId: "goal-1",
+            objective: "Ship it",
+            status: goalStatus ?? undefined,
+          };
+          currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
+          const result = await harness.service.streamMessage({
+            messages: [createMuxMessage("latest-user", "user", "hello")],
+            workspaceId,
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "off",
+            workspaceGoalService: goalService,
+            ...(allowAgentSetGoal != null ? { allowAgentSetGoal } : {}),
+          });
+          expect(result.success).toBe(true);
+
+          const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
+          if (!callArgs) throw new Error("Expected getToolsForModel to be called");
+          const tools = await realGetToolsForModel(...callArgs);
+          toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
+          serializedGoalTools.push(
+            JSON.stringify(
+              goalToolNames.map((name) => {
+                const goalTool = tools[name];
+                return goalTool == null
+                  ? { name, missing: true }
+                  : {
+                      name,
+                      description: goalTool.description,
+                      inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
+                    };
+              })
+            )
+          );
+        }
+      }
+
+      expect(serializedGoalTools[0]).not.toContain('"missing":true');
+      expect(new Set(serializedGoalTools).size).toBe(1);
+      expect(new Set(toolNameLists).size).toBe(1);
+    }
+  );
 
   it("prepares fallback system context with the fallback model's hot memories", async () => {
     using xumHome = new DisposableTempDir("ai-service-fallback-hot-memories");

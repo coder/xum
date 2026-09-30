@@ -126,7 +126,7 @@ async function setup(
         session_history: smallTool,
         tool_catalog_search: smallTool,
         ...mcpTools,
-        ...(options.enableGoalTools?.completeGoal ? { complete_goal: smallTool } : {}),
+        ...(options.goalService ? { complete_goal: smallTool } : {}),
       })
   );
   const goalService = new WorkspaceGoalService(
@@ -347,7 +347,9 @@ describe("pinned full-payload rollover admission", () => {
   );
 
   test.each([false, true])(
-    "manual goal availability previews later pause (queued consent=%s)",
+    // #5247: the later manual pause must not change the pinned tool set; the
+    // goal tools gate on the live goal status when they execute.
+    "manual goal intervention keeps the goal tools pinned (queued consent=%s)",
     async (consent) => {
       const fixture = await setup("small");
       const { h, goalService, start, applyReset, assembly } = fixture;
@@ -370,7 +372,7 @@ describe("pinned full-payload rollover admission", () => {
           ).success
         ).toBe(true);
         expect(start).toHaveBeenCalledTimes(1);
-        expect(start.mock.calls[0][0].tools?.complete_goal !== undefined).toBe(consent);
+        expect(start.mock.calls[0][0].tools?.complete_goal).toBeDefined();
         expect((await goalService.getGoal(workspaceId))?.status).toBe(
           consent ? "active" : "paused"
         );
