@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import cjsFs from "fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { createMuxMessage } from "@/common/types/message";
 import { renameRetryTiming } from "@/node/utils/writeFileAtomic";
 import { publishCompactionFile } from "./continuousCompactionJournal";
 import { json, rowsToBytes } from "./historyScanner.generator.testHarness";
@@ -38,10 +38,11 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     chat: path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
     archive: path.join(h.config.sessionsDir, workspaceId, "chat-archive.jsonl"),
   });
-  const rows = (prefix: string, count: number) =>
+  const messages = (prefix: string, count: number) =>
     Array.from({ length: count }, (_, i) =>
-      json(createMuxMessage(`${prefix}${i}`, i % 2 ? "assistant" : "user", `${prefix} ${i}`))
+      createMuxMessage(`${prefix}${i}`, i % 2 ? "assistant" : "user", `${prefix} ${i}`)
     );
+  const rows = (prefix: string, count: number) => messages(prefix, count).map((m) => json(m));
   async function writeLayout(workspaceId: string, archive: string[] | null, chat: string[]) {
     const paths = pathsFor(workspaceId);
     await fs.mkdir(path.dirname(paths.chat), { recursive: true });
@@ -262,7 +263,7 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
 
   test("an async rewrite retries a Windows sharing violation until the scan closes", async () => {
     const workspaceId = "lock-retry";
-    const seeded = rows("m", 5).map((row) => JSON.parse(row) as MuxMessage);
+    const seeded = messages("m", 5);
     for (const message of seeded) await h.historyService.appendToHistory(workspaceId, message);
     const paths = pathsFor(workspaceId);
     const paused = instrumentOpen(workspaceId, { gate: true });
