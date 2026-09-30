@@ -436,6 +436,11 @@ interface StepMessageTracker {
   prefixSwapInvalidated?: boolean;
   prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
+  /**
+   * Set once a step of this turn prepared a provider request. Fallback and retry streams
+   * reuse the tracker, so their step 0 is not the turn's first request (#5279).
+   */
+  providerRequestPrepared?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
 }
@@ -2743,7 +2748,8 @@ export class StreamManager {
    * undefined when there is nothing to apply.
    */
   private applyPendingThinkingOverride(
-    request: StreamRequestConfig
+    request: StreamRequestConfig,
+    beforeFirstStep: boolean
   ): Record<string, unknown> | undefined {
     const state = request.thinkingOverrideState;
     const pending = state?.pending;
@@ -2755,7 +2761,7 @@ export class StreamManager {
     if (rebuild == null) {
       return undefined;
     }
-    const rebuilt = rebuild(pending);
+    const rebuilt = rebuild(pending, beforeFirstStep);
     if (rebuilt == null) {
       log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
         requestedLevel: pending,
@@ -2866,7 +2872,9 @@ export class StreamManager {
     // type (no-unsafe-return).
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
-    let inTurnPrefixChanged = false;
+    let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+    // Outgoing rows before this index predate the latest in-turn prefix change.
+    let reasoningReplayBoundary = 0;
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -2964,8 +2972,13 @@ export class StreamManager {
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
-        // this step's provider request is built.
-        const thinkingOverride = this.applyPendingThinkingOverride(request);
+        // this step's provider request is built. Before the turn's first request it
+        // resolves as at turn start (#5279); without a tracker, assume a step ran.
+        const thinkingOverride = this.applyPendingThinkingOverride(
+          request,
+          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared
+        );
+        if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3026,27 +3039,35 @@ export class StreamManager {
         // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
         // thinking block stays valid only while everything before it is unchanged.
         // A consumed prefix swap or a change to the advertised tool set edits that
-        // prefix; from then on this stream replays no reasoning on those requests.
+        // prefix, so rows sent up to that step never replay reasoning again. Blocks
+        // produced after it are bound to the new prefix and keep replaying (#5279).
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
-        if (
-          stepTracker?.consumedPrefixSwap != null ||
-          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
-        ) {
-          inTurnPrefixChanged = true;
-        }
-        previousToolSetKey = toolSetKey;
+        const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
         if (
-          inTurnPrefixChanged &&
+          (consumedSwap != null && consumedSwap !== seenPrefixSwap) ||
+          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
+        ) {
+          // Kept at the unstripped length: if stripping drops reasoning-only rows, the
+          // boundary covers a few later rows too, which only strips more (fail safe).
+          reasoningReplayBoundary = outgoing.length;
+        }
+        seenPrefixSwap = consumedSwap;
+        previousToolSetKey = toolSetKey;
+        if (
           sendsBetweenToolsThinking(request.providerOptions) &&
           outgoing.some(
-            (message) =>
+            (message, index) =>
+              index < reasoningReplayBoundary &&
               message.role === "assistant" &&
               typeof message.content !== "string" &&
               message.content.some((part) => part.type === "reasoning")
           )
         ) {
-          const stripped = stripAnthropicReasoning(outgoing);
+          const stripped = [
+            ...stripAnthropicReasoning(outgoing.slice(0, reasoningReplayBoundary)),
+            ...outgoing.slice(reasoningReplayBoundary),
+          ];
           if (rebuiltFirstStepMessages != null) {
             rebuiltFirstStepMessages = stripped;
           } else {

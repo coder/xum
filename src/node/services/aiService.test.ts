@@ -39,6 +39,7 @@ import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
+import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflowRunMessages";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -4172,6 +4173,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expectedLevel: "low",
       expectedAnthropic: { thinking: { type: "adaptive" } },
     },
+    {
+      // #5279: the pin reads the rows the provider sees; a display-only row is never sent.
+      name: "a higher effort recorded only on a display-only row",
+      priorLevels: ["off", "low"] as const,
+      hiddenLevel: "high" as const,
+      expectedLevel: "off",
+      expectedAnthropic: { thinking: { type: "between_tools" } },
+    },
   ])("maps Sonnet 5.5 'off' for $name", async (testCase) => {
     using xumHome = new DisposableTempDir("ai-service-between-tools");
     const projectPath = path.join(xumHome.path, "project");
@@ -4191,6 +4200,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         thinkingLevel: level,
       }),
     ]);
+    if ("hiddenLevel" in testCase) {
+      history.push(
+        createMuxMessage("workflow-card", "assistant", "workflow run", {
+          thinkingLevel: testCase.hiddenLevel,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: { type: WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE, runId: "run-1" },
+        })
+      );
+    }
 
     const result = await harness.service.streamMessage({
       messages: [...history, createMuxMessage("latest-user", "user", "next")],
