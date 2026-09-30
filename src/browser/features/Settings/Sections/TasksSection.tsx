@@ -1249,6 +1249,7 @@ export function TasksSection() {
             </div>
             <Input
               type="number"
+              aria-label="Max parallel agent tasks"
               value={taskSettings.maxParallelAgentTasks}
               min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
               max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
@@ -1270,6 +1271,7 @@ export function TasksSection() {
             </div>
             <Input
               type="number"
+              aria-label="Max task nesting depth"
               value={taskSettings.maxTaskNestingDepth}
               min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
               max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}

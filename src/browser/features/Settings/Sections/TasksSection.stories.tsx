@@ -59,12 +59,14 @@ export const Tasks: Story = {
     });
 
     await waitFor(() => {
-      const inputs = canvas.queryAllByRole("spinbutton");
-      if (inputs.length !== 2) {
-        throw new Error(`Expected 2 task settings inputs, got ${inputs.length}`);
-      }
-      const maxParallelAgentTasks = (inputs[0] as HTMLInputElement).value;
-      const maxTaskNestingDepth = (inputs[1] as HTMLInputElement).value;
+      // Look the inputs up by label: the section also hosts the Advisor
+      // panel's spinbutton, so positional counting breaks.
+      const maxParallelAgentTasks = (
+        canvas.getByLabelText("Max parallel agent tasks") as HTMLInputElement
+      ).value;
+      const maxTaskNestingDepth = (
+        canvas.getByLabelText("Max task nesting depth") as HTMLInputElement
+      ).value;
 
       if (maxParallelAgentTasks !== "2") {
         throw new Error(
