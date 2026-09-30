@@ -80,7 +80,10 @@ const mockGetSessionUsage = mock((_input: { workspaceId: string }) =>
   Promise.resolve<unknown>(undefined)
 );
 const mockHistoryLoadMore = mock(
-  (): Promise<LoadMoreResponse> =>
+  (_input?: {
+    workspaceId: string;
+    cursor?: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
+  }): Promise<LoadMoreResponse> =>
     Promise.resolve({
       messages: [],
       nextCursor: null,
@@ -5106,25 +5109,25 @@ describe("WorkspaceStore", () => {
     it.each([
       {
         name: "the start of history",
-        page: {
+        page: (): LoadMoreResponse => ({
           messages: [createHistoryMessageEvent("h0", 0)],
           nextCursor: null,
           hasOlder: false,
-        },
+        }),
       },
       {
         name: "the epoch's boundary row",
-        page: {
+        page: (): LoadMoreResponse => ({
           messages: [
             {
-              type: "message" as const,
+              type: "message",
               id: "boundary",
-              role: "assistant" as const,
-              parts: [{ type: "text" as const, text: "Compacted summary" }],
+              role: "assistant",
+              parts: [{ type: "text", text: "Compacted summary" }],
               metadata: {
                 historySequence: 50,
                 timestamp: 500,
-                compacted: "idle" as const,
+                compacted: "idle",
                 compactionBoundary: true,
                 compactionEpoch: 1,
               },
@@ -5133,7 +5136,7 @@ describe("WorkspaceStore", () => {
           ],
           nextCursor: { beforeHistorySequence: 50, beforeMessageId: "boundary" },
           hasOlder: true,
-        },
+        }),
       },
     ])("hides a finished init card until a page loads $name", async ({ page }) => {
       const events = await attempt(1);
@@ -5149,7 +5152,7 @@ describe("WorkspaceStore", () => {
       // The window starts mid-epoch: the first loaded user row is not the transcript's first.
       expect(initRow()).toBeUndefined();
 
-      mockHistoryLoadMore.mockResolvedValueOnce(page);
+      mockHistoryLoadMore.mockResolvedValueOnce(page());
       expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
       expect(initRow()).toMatchObject({ status: "success" });
     });
