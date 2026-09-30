@@ -39,6 +39,7 @@ import {
   type Runtime,
 } from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
+import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
@@ -239,6 +240,9 @@ export async function assemblePromptPayload(
     providersConfig: options.providersConfig,
     anthropicCacheTtl: options.anthropicCacheTtl,
     workspaceId: options.workspaceId,
+    ...(options.tools
+      ? { deferLoadingToolNames: collectDeferLoadingToolNames(options.tools) }
+      : {}),
   });
   let system: Instructions | undefined = options.systemMessage;
   const volatileLength = options.volatileSystemSuffixLength ?? 0;

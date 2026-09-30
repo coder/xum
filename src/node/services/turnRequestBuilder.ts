@@ -174,6 +174,7 @@ import {
 } from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
+  computeLoadedToolNames,
   prepareToolSearch,
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
@@ -2720,7 +2721,8 @@ export class TurnRequestBuilder {
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
-        // tool list stable" cannot disagree (#5250).
+        // tool list stable" cannot disagree (#5250): these attempts use native
+        // Anthropic deferred loading instead of activeTools scoping (#5262).
         const toolSearchPromptCacheActive = supportsAnthropicCache(
           seed.rawModelString,
           seed.providersConfig
@@ -2864,10 +2866,9 @@ export class TurnRequestBuilder {
         };
         await renderContextWindowSection();
 
-        // Also on fallbacks: a primary with prompt caching seeds nothing into
-        // its inactive state, so a fallback that turns deferral on must seed
-        // prior-turn activations itself. Seeding only adds names, so repeating
-        // it is harmless.
+        // Also on fallbacks: the rebuild drops activations the fallback cannot
+        // defer, so a fallback that defers them again must reseed prior-turn
+        // activations. Seeding only adds names, so repeating it is harmless.
         if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
@@ -2940,7 +2941,10 @@ export class TurnRequestBuilder {
             {
               enabled: tokenBudgetEnabled,
               providerOptions: effectiveMuxProviderOptions,
-              activeTools: [...firstStepToolNames],
+              // Native tool search sends deferred tools without loading them into context.
+              activeTools: forcedFirstStepToolNames?.length
+                ? forcedFirstStepToolNames
+                : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();

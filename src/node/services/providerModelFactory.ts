@@ -586,6 +586,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Anthropic wire form (`defer_loading`) or gateway prompt form (providerOptions). */
+function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
+  if (tool.defer_loading === true) return true;
+  const providerOptions = tool.providerOptions;
+  return (
+    isRecord(providerOptions) &&
+    isRecord(providerOptions.anthropic) &&
+    providerOptions.anthropic.deferLoading === true
+  );
+}
+
 /**
  * Remove every cache marker the request pipeline may have serialized:
  * `cache_control` on system/message/tool entries and nested content parts,
@@ -632,7 +643,7 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
  * and lets a higher-level cacheTtl override win at the last wire-shaping step.
  *
  * Injects cache_control on:
- * 1. Last tool (caches all tool definitions)
+ * 1. Last non-deferred tool (caches all tool definitions)
  * 2. Last message's last content part (caches entire conversation)
  *
  * When injectCacheControl is false (beta features disabled), existing markers
@@ -660,12 +671,19 @@ export function wrapFetchWithAnthropicCacheControl(
         stripAnthropicCacheControlMarkers(json);
       }
 
-      // Inject cache_control on the last tool if tools array exists.
+      // Inject cache_control on the last non-deferred tool if tools array exists.
       // If the SDK already populated cache_control, preserve it but override ttl
-      // when a higher-level cacheTtl is configured.
+      // when a higher-level cacheTtl is configured. Anthropic rejects
+      // cache_control on a defer_loading tool (#5262), so none may keep one.
       if (injectCacheControl && Array.isArray(json.tools) && json.tools.length > 0) {
-        const lastTool = json.tools[json.tools.length - 1] as Record<string, unknown>;
-        lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control, cacheTtl);
+        const tools = json.tools.filter(isRecord);
+        for (const tool of tools) {
+          if (isWireDeferLoadingTool(tool)) delete tool.cache_control;
+        }
+        const lastTool = tools.findLast((tool) => !isWireDeferLoadingTool(tool));
+        if (lastTool) {
+          lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control, cacheTtl);
+        }
       }
 
       // Inject cache_control on last message's last content part

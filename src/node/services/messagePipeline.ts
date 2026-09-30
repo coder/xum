@@ -28,7 +28,10 @@ import {
   injectAgentTransition,
   injectPostCompactionAttachments,
 } from "@/browser/utils/messages/modelMessageTransform";
-import { normalizeLegacyToolSearchMessages } from "@/common/utils/tools/toolCatalog";
+import {
+  applyNativeToolSearchReplay,
+  normalizeLegacyToolSearchMessages,
+} from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { log } from "./log";
 
@@ -63,6 +66,12 @@ export interface PrepareMessagesOptions {
   anthropicCacheTtl?: AnthropicCacheTtl | null;
   /** Workspace ID (used only for debug logging). */
   workspaceId: string;
+  /**
+   * Tools the request marks for native Anthropic deferred loading. Non-empty
+   * only in native tool-search mode, where replayed tool_catalog_search results
+   * become the same tool_reference output the live turn sent.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
 }
 
 /**
@@ -107,6 +116,7 @@ export async function prepareMessagesForProvider(
     providersConfig,
     anthropicCacheTtl,
     workspaceId,
+    deferLoadingToolNames,
   } = opts;
 
   // --- XumMessage-level transforms ---
@@ -181,8 +191,11 @@ export async function prepareMessagesForProvider(
 
   // --- ModelMessage-level transforms ---
 
-  const modelMessages = normalizeLegacyToolSearchMessages(
-    sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+  const modelMessages = applyNativeToolSearchReplay(
+    normalizeLegacyToolSearchMessages(
+      sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+    ),
+    deferLoadingToolNames ?? new Set()
   );
 
   log.debug_obj(`${workspaceId}/2_model_messages.json`, modelMessages);

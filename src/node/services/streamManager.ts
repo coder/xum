@@ -108,6 +108,7 @@ import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarize
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   computeActiveToolNames,
+  computeLoadedToolNames,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -2674,7 +2675,7 @@ export class StreamManager {
                       model: request.modelString,
                       metadataModel: request.budgetMetadataModel,
                       modelContextLimit: request.contextBudgetLimit,
-                      activeTools: computeActiveToolNames(request.toolSearchState),
+                      activeTools: computeLoadedToolNames(request.toolSearchState),
                     },
                     // prepareStep anchors the next step on this same request and usage, so both
                     // measures take the same anchored-or-full branch and the invariant holds.
@@ -2956,7 +2957,8 @@ export class StreamManager {
         // to core tools + activated deferred tools. Read per step so tools
         // activated by tool_catalog_search.execute appear on the following step.
         // undefined when the feature is inactive, keeping the return value
-        // byte-identical to the pre-feature behavior.
+        // byte-identical to the pre-feature behavior, and in native mode, which
+        // keeps the tools block stable (#5262).
         const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
           stepNumber === 0 && request.forcedFirstStepToolNames?.length
@@ -3060,7 +3062,8 @@ export class StreamManager {
           metadataModel: request.budgetMetadataModel,
           system: request.system,
           tools: request.tools,
-          activeTools,
+          // Native tool search sends deferred tools without loading them into context.
+          activeTools: forceFirstStepTools ?? computeLoadedToolNames(request.toolSearchState),
           messages: rebuiltFirstStepMessages ?? effectiveMessages,
         };
         if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
