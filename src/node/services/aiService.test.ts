@@ -66,6 +66,7 @@ import {
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
 import type { MCPServerManager } from "./mcpServerManager";
+import type { MCPServerMap } from "@/common/types/mcp";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -2751,6 +2752,225 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Explore and exec sub-agents never get propose_plan; absent, not refused.
       expect(tools.propose_plan).toBeUndefined();
       expect(tools.file_read).toBeDefined();
+    });
+  });
+
+  // #5254 regression guard: provider prompt caches key on the tool block, then
+  // the system prompt. State that changes between turns of one workspace must
+  // change neither, or every later turn re-reads the whole transcript uncached.
+  // User actions that were decided to cost one miss (skill add, MCP connect,
+  // experiment toggles: #5248, #5249) are deliberately not flipped here.
+  describe("prompt-cache prefix stability (#5254)", () => {
+    interface PrefixState {
+      goalStatus?: GoalRecordV1["status"];
+      rolloverAvailable?: boolean;
+      toolSearch?: boolean;
+      failedMcpServers?: string[];
+      agentId?: string;
+    }
+
+    // Captured right after each request, while its state is current.
+    type Observe = (
+      request: TurnExecutionOptions,
+      toolConfig: Parameters<typeof realGetToolsForModel>[1] | undefined
+    ) => unknown;
+
+    async function streamPair(
+      xumHomePath: string,
+      states: [PrefixState, PrefixState],
+      observe?: Observe
+    ) {
+      const projectPath = path.join(xumHomePath, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-prefix-guard";
+      // Memory on: new_context needs it, and its index is part of the tool block.
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHomePath),
+        xumHome: xumHomePath,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY
+      );
+      const harness = createHarness(
+        xumHomePath,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        { useRequestedModelString: true, experimentsService }
+      );
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHomePath)
+      );
+      // Real tools, agent resolution, system prompt and message preparation:
+      // the serialized request is under test.
+      // Call through, so each request's tool configuration is recorded too.
+      harness.getToolsForModelSpy.mockImplementation(realGetToolsForModel);
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+      spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
+      let state: PrefixState = states[0];
+      const mcpServers = {
+        alpha: { transport: "stdio", command: "alpha-server" },
+        beta: { transport: "stdio", command: "beta-server" },
+      } as unknown as MCPServerMap;
+      // beta fails to start in some states; it never contributes tools.
+      const mcpTools: Record<string, Tool> = {
+        alpha_lookup: tool({
+          description: "Look something up",
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => Promise.resolve({}),
+        }),
+      };
+      harness.service.turnRequestBuilderBindings.mcpServerManager = {
+        listServers: () => Promise.resolve(mcpServers),
+        getToolsForWorkspace: () => {
+          const failedServerNames = state.failedMcpServers ?? [];
+          return Promise.resolve({
+            tools: mcpTools,
+            promptDescriptors: [],
+            // Like the real manager: the prompt inventory is the enabled
+            // (configured, trusted, allowed) servers, not the running ones.
+            overridesUsed: {},
+            serversUsed: mcpServers,
+            stats: {
+              totalTools: 1,
+              activeServerCount: 2 - failedServerNames.length,
+              failedServerCount: failedServerNames.length,
+              failedServerNames,
+            },
+          });
+        },
+      } as unknown as MCPServerManager;
+      const goalService = {
+        getGoal: mock(() => {
+          // The request builder reads only the status, so a partial record is enough.
+          const goal: Partial<GoalRecordV1> = {
+            goalId: "goal-1",
+            objective: "Ship it",
+            status: state.goalStatus,
+          };
+          return Promise.resolve(state.goalStatus == null ? null : (goal as GoalRecordV1));
+        }),
+        setGoal: mock(() => Promise.resolve({ success: true, data: { goalId: "goal-1" } })),
+      } as unknown as WorkspaceGoalService;
+
+      const requests: TurnExecutionOptions[] = [];
+      const observations: string[] = [];
+      for (const next of states) {
+        state = next;
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "off",
+          agentId: state.agentId ?? "exec",
+          experiments: { tokenBudget: true, memory: true, toolSearch: state.toolSearch === true },
+          contextBudgetRolloverAvailable: state.rolloverAvailable === true,
+          workspaceGoalService: goalService,
+        });
+        expect(result.success).toBe(true);
+        const request = harness.startStreamCalls.at(-1)!;
+        requests.push(request);
+        observations.push(
+          JSON.stringify(
+            (await observe?.(request, harness.getToolsForModelSpy.mock.calls.at(-1)?.[1])) ?? null
+          )
+        );
+      }
+      return { requests, observations };
+    }
+
+    // Ordered, so a reorder or a moved cache breakpoint is a difference too
+    // (#5252). Provider-native tools are identified by id and args on the wire.
+    const toolBlock = (request: TurnExecutionOptions) =>
+      JSON.stringify(
+        Object.entries(request.tools ?? {}).map(([name, requestTool]) => [
+          name,
+          requestTool.type ?? "function",
+          requestTool.type === "provider" ? [requestTool.id, requestTool.args] : null,
+          requestTool.description,
+          asSchema(requestTool.inputSchema).jsonSchema,
+          requestTool.providerOptions ?? null,
+        ])
+      );
+    const breakpointTools = (request: TurnExecutionOptions) =>
+      Object.entries(request.tools ?? {})
+        .filter(([, requestTool]) => requestTool.providerOptions?.anthropic?.cacheControl != null)
+        .map(([name]) => name);
+    const stableSystemRow = (request: TurnExecutionOptions) => {
+      const row = request.messages[0];
+      // Non-vacuous: the row compared is the cached system prefix.
+      expect(row?.role).toBe("system");
+      expect(row?.providerOptions?.anthropic?.cacheControl).toBeDefined();
+      return JSON.stringify(row);
+    };
+
+    const systemTail = (request: TurnExecutionOptions) =>
+      JSON.stringify(request.messages.slice(1).filter((message) => message.role === "system"));
+    // Goal status is read by the handlers at execution time (#5247), so the
+    // flip shows in what complete_goal does, not in the request.
+    const completeGoal: Observe = (request) =>
+      request.tools?.complete_goal?.execute?.(
+        { summary: "done", goalId: null },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      );
+
+    it.each<{
+      label: string;
+      states: [PrefixState, PrefixState];
+      // Must differ between the two requests, so the flipped state provably
+      // reached them and the equality below is not vacuous.
+      observe: Observe;
+    }>([
+      { label: "goal status", states: [{}, { goalStatus: "active" }], observe: completeGoal },
+      {
+        label: "goal completion",
+        states: [{ goalStatus: "active" }, { goalStatus: "complete" }],
+        observe: completeGoal,
+      },
+      {
+        label: "rollover availability",
+        states: [{ rolloverAvailable: false }, { rolloverAvailable: true }],
+        observe: (_request, toolConfig) => toolConfig?.contextBudgetRolloverAvailable,
+      },
+      // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
+      {
+        label: "tool-search experiment",
+        states: [{ toolSearch: false }, { toolSearch: true }],
+        observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
+      },
+      {
+        // The <mcp> inventory lists configured servers; the failure goes to the uncached tail.
+        label: "MCP server failure",
+        states: [{}, { failedMcpServers: ["beta"] }],
+        observe: (request) => systemTail(request),
+      },
+    ])(
+      "keeps the tool block and the cached system row across $label",
+      async ({ states, observe }) => {
+        using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+        const {
+          requests: [before, after],
+          observations,
+        } = await streamPair(xumHome.path, states, observe);
+        expect(observations[1]).not.toBe(observations[0]);
+        expect(breakpointTools(before)).toHaveLength(1);
+        expect(breakpointTools(after)).toEqual(breakpointTools(before));
+        expect(toolBlock(after)).toBe(toolBlock(before));
+        expect(stableSystemRow(after)).toBe(stableSystemRow(before));
+      }
+    );
+
+    it("keeps the tool block across a root agent switch", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [exec, plan],
+      } = await streamPair(xumHome.path, [{ agentId: "exec" }, { agentId: "plan" }]);
+      expect(breakpointTools(exec)).toHaveLength(1);
+      expect(toolBlock(plan)).toBe(toolBlock(exec));
+      // Expected difference until #5292: the system prompt still carries the
+      // active agent's instructions. Flip this once #5292 lands.
+      expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
     });
   });
 
