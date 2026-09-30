@@ -76,10 +76,16 @@ describe("searchModelCatalog", () => {
     expect(order.every((index) => index >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
 
-    // Version chunks compare as numbers: 4.20 is past 4.3.
+    // Version chunks compare as numbers (20 > 3), not as text.
     const grok = searchModelCatalog({ query: "grok-4." }).models.map((model) => model.id);
     expect(grok.indexOf("xai:grok-4.20-0309-reasoning")).toBeLessThan(grok.indexOf("xai:grok-4.3"));
     expect(grok.indexOf("xai:grok-4.3")).toBeGreaterThanOrEqual(0);
+  });
+
+  test("keeps the direct provider's models ahead of prefixed cloud IDs", () => {
+    const models = searchModelCatalog({ query: "claude" }).models.filter((m) => !m.builtIn);
+    expect(models.some((model) => model.provider === "bedrock")).toBe(true);
+    expect(models[0]?.provider).toBe("anthropic");
   });
 
   test("applies the policy predicate before counting and paging", () => {

@@ -150,12 +150,14 @@ export function searchModelCatalog(
   }
   // Within a tier, newer-looking versions come first (numeric chunks compare as
   // numbers, so gemini-3.7 precedes gemini-2.5) so older variants sit behind Show more.
+  // Group by provider first: a descending compare across providers would let
+  // prefixed IDs such as Bedrock's us.anthropic.* outrank the direct provider.
   matches.sort(
     (a, b) =>
       a.rank - b.rank ||
       Number(b.entry.builtIn) - Number(a.entry.builtIn) ||
-      NATURAL_ORDER.compare(b.entry.providerModelId, a.entry.providerModelId) ||
-      NATURAL_ORDER.compare(a.entry.provider, b.entry.provider)
+      NATURAL_ORDER.compare(a.entry.provider, b.entry.provider) ||
+      NATURAL_ORDER.compare(b.entry.providerModelId, a.entry.providerModelId)
   );
 
   const offset = input.offset ?? 0;
