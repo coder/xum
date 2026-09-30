@@ -1,3 +1,5 @@
+import { MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+
 /**
  * Keep growing persisted values inside their key budgets (PERSISTED_KEY_REGISTRY maxValueChars).
  *
@@ -80,4 +82,14 @@ export function truncateStringToChars(value: string, maxChars: number): string {
     end += char.length;
   }
   return value.slice(0, end);
+}
+
+/**
+ * Why a custom model id is too long to select, or null: a selected "provider:modelId" that does
+ * not fit the per-workspace model key would be lost on restart.
+ */
+export function getModelIdLengthError(provider: string, modelId: string): string | null {
+  if (JSON.stringify(`${provider}:${modelId}`).length <= MODEL_KEY_MAX_CHARS) return null;
+  const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify(`${provider}:`).length;
+  return `Model IDs for ${provider} can be at most ${maxIdChars} characters`;
 }

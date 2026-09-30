@@ -100,6 +100,7 @@ import {
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { getModelIdLengthError } from "@/browser/utils/boundedPersistedValue";
 import {
   EDIT_NOT_HELD_MESSAGE,
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
@@ -378,6 +379,12 @@ export async function processSlashCommand(
     const separatorIndex = selectedModel.indexOf(":");
     const provider = selectedModel.slice(0, separatorIndex);
     const modelId = selectedModel.slice(separatorIndex + 1);
+    const lengthError = getModelIdLengthError(provider, modelId);
+    if (lengthError) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: lengthError }),
+      ]);
+    }
     const canonicalModel = normalizeToCanonical(selectedModel);
     const explicitGateway = getExplicitGatewayPrefix(selectedModel);
     try {

@@ -49,6 +49,7 @@ import {
   tokenizeModelQuery,
 } from "@/common/utils/tokens/modelCatalogSearch";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { getModelIdLengthError } from "@/browser/utils/boundedPersistedValue";
 import { ModelRow } from "./ModelRow";
 
 // Shared header cell styles
@@ -229,6 +230,12 @@ export function ModelsSection() {
     // Check for duplicates
     if (modelExists(provider, modelId)) {
       setError(`Model "${modelId}" already exists for this provider`);
+      return false;
+    }
+
+    const lengthError = getModelIdLengthError(provider, modelId);
+    if (lengthError) {
+      setError(lengthError);
       return false;
     }
 
@@ -598,6 +605,11 @@ export function ModelsSection() {
     if (trimmedModelId !== editing.originalModelId) {
       if (modelExists(editing.provider, trimmedModelId)) {
         setError(`Model "${trimmedModelId}" already exists for this provider`);
+        return;
+      }
+      const lengthError = getModelIdLengthError(editing.provider, trimmedModelId);
+      if (lengthError) {
+        setError(lengthError);
         return;
       }
     }

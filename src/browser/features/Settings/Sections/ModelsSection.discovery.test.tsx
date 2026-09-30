@@ -11,7 +11,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
 import { MODEL_CATALOG_SUGGESTION_PAGE_SIZE } from "@/common/constants/ui";
 import type {
   EffectivePolicy,
@@ -673,6 +673,28 @@ describe("ModelsSection manual model IDs", () => {
       await ui.user.type(ui.input, "x");
       expect(ui.input.hasAttribute("aria-invalid")).toBe(false);
     }
+  );
+
+  // A selected "provider:id" longer than the per-workspace model key would not survive a restart.
+  test(
+    "rejects an ID too long to persist as the selected model, accepts one at the limit",
+    async () => {
+      const ui = await setup();
+      const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
+      await ui.type("m".repeat(maxIdChars + 1));
+      fireEvent.click(ui.add);
+      expect(ui.save).not.toHaveBeenCalled();
+      expect(ui.input.getAttribute("aria-invalid")).toBe("true");
+
+      await ui.user.type(ui.input, "{Backspace}");
+      fireEvent.click(ui.add);
+      expect(ui.save.mock.calls[0][0]).toEqual({
+        provider: "anthropic",
+        models: ["m".repeat(maxIdChars)],
+      });
+    },
+    // Typing well over a hundred characters takes a few seconds.
+    15_000
   );
 
   test("accepts IDs with characters beyond the common set", async () => {

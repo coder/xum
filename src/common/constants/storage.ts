@@ -1000,6 +1000,11 @@ export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
 /** workspaceNameState stores at most this much (serialized) of a typed manual name. */
 // Valid names are at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
 export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
+/**
+ * model:{workspaceId} holds a "provider:modelId" string. Custom model ids are checked against it
+ * where they are entered (getModelIdLengthError); built-in ids are far shorter.
+ */
+export const MODEL_KEY_MAX_CHARS = 128;
 /** statusState:{workspaceId} field caps (serialized chars); a longer URL is dropped, not cut. */
 export const STATUS_STATE_EMOJI_MAX_CHARS = 32;
 export const STATUS_STATE_MESSAGE_MAX_CHARS = 192;
@@ -1132,7 +1137,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
   workspaceKey(getWorkspaceAISettingsByAgentKey, "synced", true, 1024),
-  workspaceKey(getModelKey, "ui", true, 128),
+  workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
   workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
   workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
