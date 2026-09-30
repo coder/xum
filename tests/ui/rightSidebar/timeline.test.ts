@@ -61,7 +61,7 @@ function timelineSnapshot(events: TimelineEvent[]): WorkspaceTimelineSnapshot {
 
 function renderTimeline(params: {
   events: TimelineEvent[];
-  loadOlderHistory?: jest.Mock<Promise<"loaded">, [string]>;
+  loadOlderHistory?: jest.Mock<Promise<"loaded">, [string, { windowed?: boolean }?]>;
   snapshot?: Partial<WorkspaceTimelineSnapshot>;
   hasOlderHistory?: boolean;
   preview?: TimelinePreview;
@@ -694,7 +694,9 @@ describe("TimelinePanel", () => {
   });
 
   test("stops reveal pagination at the page cap when the target remains unavailable", async () => {
-    const loadOlderHistory = jest.fn<Promise<"loaded">, [string]>().mockResolvedValue("loaded");
+    const loadOlderHistory = jest
+      .fn<Promise<"loaded">, [string, { windowed?: boolean }?]>()
+      .mockResolvedValue("loaded");
     const event = makeEvent("anchored", "turn.completed", 1, {
       anchor: { messageId: "missing-message" },
     });
@@ -713,8 +715,13 @@ describe("TimelinePanel", () => {
       expect(view.getByTestId("timeline-reveal-not-found")).not.toBeNull();
     });
 
-    expect(loadOlderHistory).toHaveBeenCalledTimes(10);
-    expect(loadOlderHistory).toHaveBeenCalledWith(WORKSPACE_ID);
+    // Ten windowed pages (#4961), then ten unbounded ones: the rest of the epoch, then older epochs.
+    expect(loadOlderHistory).toHaveBeenCalledTimes(20);
+    expect(loadOlderHistory.mock.calls).toEqual(
+      [true, false].flatMap((windowed) =>
+        Array.from({ length: 10 }, () => [WORKSPACE_ID, { windowed }])
+      )
+    );
     expect(mockPinTimelineRevealTarget).toHaveBeenCalledWith(WORKSPACE_ID, {
       messageId: "missing-message",
       toolCallId: undefined,

@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 // This integration regression drives the real server replay into the real renderer store.
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture: real loadMore pages
+import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -64,6 +66,7 @@ interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
   nextCursor: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
   hasOlder: boolean;
+  notPageable?: boolean;
 }
 
 // Mock client
@@ -83,6 +86,7 @@ const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
     cursor?: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
+    windowed?: boolean;
   }): Promise<LoadMoreResponse> =>
     Promise.resolve({
       messages: [],
@@ -2941,10 +2945,12 @@ describe("WorkspaceStore", () => {
         expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(1, {
           workspaceId,
           cursor: { beforeHistorySequence: 5, beforeMessageId: "h5" },
+          windowed: true,
         });
         expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(2, {
           workspaceId,
           cursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+          windowed: true,
         });
         expect(state().muxMessages.map((message) => message.id)).toEqual(["h3", "h4", "h5", "h6"]);
         // Regression: the cached target row was replaced by the fresh copy.
@@ -2979,6 +2985,37 @@ describe("WorkspaceStore", () => {
         finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
         expect(await request).toEqual({ kind: "target-not-found" });
         expect(state().hasOlderHistory).toBe(false);
+      });
+
+      it("re-pages below a windowed replay through a not-pageable page, never reporting target-not-found", async () => {
+        // Window [h5, h6] of a longer epoch (#4961); the edited row h4 sits below the floor.
+        await hydrateRows([row("h5", 5), row("h6", 6)], true);
+        mockHistoryLoadMore
+          .mockResolvedValueOnce({
+            messages: [],
+            nextCursor: null,
+            hasOlder: false,
+            notPageable: true,
+          })
+          .mockResolvedValueOnce({
+            messages: [asEvent(row("h3", 3)), asEvent(row("h4", 4))],
+            nextCursor: null,
+            hasOlder: false,
+          });
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 4,
+          editMessageId: "h4",
+        });
+        finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
+        expect((await request).kind).toBe("refreshed");
+        // The not-pageable windowed page is retried once, same cursor, as today's unbounded page.
+        const cursor = { beforeHistorySequence: 5, beforeMessageId: "h5" };
+        expect(mockHistoryLoadMore.mock.calls.map(([input]) => input)).toEqual([
+          { workspaceId, cursor, windowed: true },
+          { workspaceId, cursor },
+        ]);
+        expect(state().muxMessages.map((message) => message.id)).toEqual(["h3", "h4", "h5", "h6"]);
       });
 
       it("fails, rather than reporting the target gone, when an older-page read errors", async () => {
@@ -4894,6 +4931,7 @@ describe("WorkspaceStore", () => {
           beforeHistorySequence: 5,
           beforeMessageId: "msg-newer",
         },
+        windowed: true,
       });
 
       const state = store.getWorkspaceState(workspaceId);
@@ -5003,6 +5041,7 @@ describe("WorkspaceStore", () => {
       expect(mockHistoryLoadMore).toHaveBeenLastCalledWith({
         workspaceId,
         cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
+        windowed: true,
       });
     });
   });
@@ -5155,6 +5194,66 @@ describe("WorkspaceStore", () => {
       mockHistoryLoadMore.mockResolvedValueOnce(page());
       expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
       expect(initRow()).toMatchObject({ status: "success" });
+    });
+
+    it("pages a windowed replay back to the start through the real backend, falling back once when not pageable", async () => {
+      // One turn longer than a windowed page sits right before the window's turns, so the page
+      // that reaches it is not pageable and must fall back to today's unbounded page.
+      const rows = Array.from({ length: 3_600 }, (_, i) =>
+        createMuxMessage(
+          `m${i}`,
+          i === 0 || (i > 1_500 && i % 2 === 0) ? "user" : "assistant",
+          `text ${i}`,
+          { timestamp: i }
+        )
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          getStreamInfo: () => undefined,
+          replayStream: () => Promise.resolve(),
+        },
+        initStateManagerOverrides: { replayInit: () => Promise.resolve() },
+      });
+      try {
+        expect((await h.historyService.appendManyToHistory(workspaceId, rows)).success).toBe(true);
+        const workspaceService = createWorkspaceServiceForTest({
+          config: h.config,
+          historyService: h.historyService,
+        });
+        const context = {
+          workspaceService: { getOrCreateSession: () => h.session },
+        } as unknown as ORPCContext;
+        mockOnChat.mockImplementation(async function* (input, options) {
+          // validateOutput: as the onChat procedure calls it (it gates replayWindow/batchReplay).
+          yield* subscribeWorkspaceChat(
+            context,
+            input as Parameters<typeof subscribeWorkspaceChat>[1],
+            options?.signal,
+            { validateOutput: true }
+          );
+        });
+        mockHistoryLoadMore.mockImplementation((input) =>
+          workspaceService.getHistoryLoadMore(input!.workspaceId, input!.cursor, {
+            windowed: input!.windowed === true,
+          })
+        );
+
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => state().isTranscriptCaughtUp, 10_000)).toBe(true);
+        expect(ids().length).toBeLessThan(rows.length);
+
+        let pages = 0;
+        while ((await store.loadOlderHistory(workspaceId)) === "loaded") pages++;
+        expect(pages).toBeGreaterThan(1);
+        expect(ids()).toEqual(rows.map((message) => message.id));
+        const unwindowed = mockHistoryLoadMore.mock.calls.filter(([input]) => !input?.windowed);
+        expect(unwindowed).toHaveLength(1);
+      } finally {
+        store.dispose();
+        await h.session.dispose();
+        await h.cleanup();
+      }
     });
 
     it("keeps a running init card visible while the window misses the epoch start", async () => {

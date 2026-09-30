@@ -7,7 +7,10 @@ export interface TimelineRevealStore {
   getWorkspaceState: (
     workspaceId: string
   ) => Pick<WorkspaceState, "messages" | "muxMessages" | "hasOlderHistory">;
-  loadOlderHistory: (workspaceId: string) => Promise<HistoryLoadResult>;
+  loadOlderHistory: (
+    workspaceId: string,
+    options?: { windowed?: boolean }
+  ) => Promise<HistoryLoadResult>;
 }
 
 export type TimelineRevealResult = "revealed" | "not-found" | "error" | "cancelled";
@@ -88,12 +91,16 @@ export async function revealTimelineTarget(options: {
     }
   }
 
-  for (let page = 0; page < maxHistoryPages; page++) {
+  // Windowed pages (#4961) are bounded slices of the active epoch and get their own budget. Past
+  // it, one unbounded page loads the rest of the epoch, then pages continue into older epochs.
+  for (let page = 0; page < maxHistoryPages * 2; page++) {
     if (!workspaceStore.getWorkspaceState(workspaceId).hasOlderHistory) {
       break;
     }
 
-    const loadResult = await workspaceStore.loadOlderHistory(workspaceId);
+    const loadResult = await workspaceStore.loadOlderHistory(workspaceId, {
+      windowed: page < maxHistoryPages,
+    });
     if (cancelled()) {
       return "cancelled";
     }

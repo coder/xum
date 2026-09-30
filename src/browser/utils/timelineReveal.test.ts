@@ -165,4 +165,28 @@ describe("revealTimelineTarget", () => {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }
   });
+
+  it("past the windowed page budget, loads one unbounded page that reaches the target", async () => {
+    const store = createStore({ hasOlderHistory: true });
+    // Windowed pages (#4961) are bounded slices of the epoch; the target lies further back.
+    const loadOlderHistory = mock((_workspaceId: string, options?: { windowed?: boolean }) => {
+      if (options?.windowed === false) store.state.messages = [makeUserMessage("prompt-far")];
+      return Promise.resolve("loaded" as const);
+    });
+    store.loadOlderHistory = loadOlderHistory;
+
+    const result = await revealTimelineTarget({
+      workspaceId,
+      getTarget: () => ({ messageId: "prompt-far" }),
+      workspaceStore: store,
+      pinTarget: mock(() => undefined),
+      maxHistoryPages: 2,
+    });
+    expect(result).toBe("revealed");
+    expect(loadOlderHistory.mock.calls.map(([, options]) => options?.windowed)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+  });
 });

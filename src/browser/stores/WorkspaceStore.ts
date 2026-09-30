@@ -2878,7 +2878,14 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
-  async loadOlderHistory(workspaceId: string): Promise<HistoryLoadResult> {
+  /**
+   * Loads the page before the oldest loaded row. `windowed` (default) asks for a bounded page of
+   * the active epoch (#4961); `windowed: false` loads today's unbounded rest of the epoch.
+   */
+  async loadOlderHistory(
+    workspaceId: string,
+    options?: { windowed?: boolean }
+  ): Promise<HistoryLoadResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
       "loadOlderHistory requires a non-empty workspaceId"
@@ -2927,10 +2934,21 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
 
     try {
-      const result = await client.workspace.history.loadMore({
+      const windowed = options?.windowed ?? true;
+      let result = await client.workspace.history.loadMore({
         workspaceId,
         cursor: requestedCursor,
+        windowed,
       });
+      if (result.notPageable === true) {
+        // The rows before the cursor cannot be cut into bounded pages: today's unbounded page
+        // for the same cursor is contiguous with what this client holds. Accepted limitation:
+        // such sessions (rare) load the rest of the epoch at once.
+        console.debug(
+          `[WorkspaceStore] windowed loadMore not pageable for ${workspaceId}; loading an unbounded page`
+        );
+        result = await client.workspace.history.loadMore({ workspaceId, cursor: requestedCursor });
+      }
 
       const aggregator = this.aggregators.get(workspaceId);
       const latestPagination = this.historyPagination.get(workspaceId);
