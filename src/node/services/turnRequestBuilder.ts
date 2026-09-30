@@ -84,7 +84,6 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -2610,7 +2609,7 @@ export class TurnRequestBuilder {
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
+            hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
             effectivePolicy,

@@ -45,60 +45,41 @@ describe("Config", () => {
     expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
   });
 
-  describe("Daybreak visibility migration", () => {
-    const blue = "openai:daybreak-blue-latest";
-    const red = "openai:daybreak-red-latest";
+  describe("hidden-model preferences", () => {
     const unrelated = "openrouter:openai/gpt-5";
 
-    const malformedHiddenModels = [
-      undefined,
-      null,
-      "invalid",
-      {},
-      [null],
-      [""],
-      ["  "],
-      ["invalid"],
-      ["mux-gateway:openai"],
-      [42, false, {}],
-    ].map((hiddenModels) => ({ hiddenModels }));
+    it.each(
+      [
+        undefined,
+        null,
+        "invalid",
+        {},
+        [null],
+        [""],
+        ["  "],
+        ["invalid"],
+        ["mux-gateway:openai"],
+        [42, false, {}],
+      ].map((hiddenModels) => ({ hiddenModels }))
+    )("reopens preference recovery for malformed hides: %j", async ({ hiddenModels }) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels,
+          migrations: { hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toBeUndefined();
+      expect(reloaded.hiddenModelsInitialized).toBe(false);
 
-    it.each(malformedHiddenModels)(
-      "keeps legacy fallback for malformed hides: %j",
-      async ({ hiddenModels }) => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({ projects: [], hiddenModels })
-        );
-        await flushConfigEdits();
-        const reloaded = new Config(tempDir).getClientConfig();
-        expect(reloaded.hiddenModels).toEqual([blue, red]);
-        expect(reloaded.hiddenModelsInitialized).toBe(false);
-      }
-    );
-
-    it.each(malformedHiddenModels)(
-      "reopens preference recovery for malformed hides after migration: %j",
-      async ({ hiddenModels }) => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({
-            projects: [],
-            hiddenModels,
-            migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
-          })
-        );
-        await flushConfigEdits();
-        const reloaded = new Config(tempDir).getClientConfig();
-        expect(reloaded.hiddenModels).toBeUndefined();
-        expect(reloaded.hiddenModelsInitialized).toBe(false);
-
-        await config.updateModelPreferences({ hiddenModels: [] });
-        const recovered = new Config(tempDir).getClientConfig();
-        expect(recovered.hiddenModels).toEqual([]);
-        expect(recovered.hiddenModelsInitialized).toBe(true);
-      }
-    );
+      await config.updateModelPreferences({ hiddenModels: [] });
+      const recovered = new Config(tempDir).getClientConfig();
+      expect(recovered.hiddenModels).toEqual([]);
+      expect(recovered.hiddenModelsInitialized).toBe(true);
+    });
 
     it("preserves valid hides when discarding malformed entries", async () => {
       fs.writeFileSync(
@@ -106,7 +87,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           hiddenModels: [null, unrelated, ""],
-          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+          migrations: { hiddenModelsInitialized: true },
         })
       );
       await flushConfigEdits();
@@ -115,38 +96,33 @@ describe("Config", () => {
       expect(reloaded.hiddenModelsInitialized).toBe(true);
     });
 
-    it.each([
+    it.each<{ name: string; persisted: boolean; hiddenModels?: string[] }>([
       { name: "fresh install", persisted: false, hiddenModels: undefined },
-      { name: "legacy local-only preferences", persisted: true, hiddenModels: undefined },
-      { name: "explicit empty backend preferences", persisted: true, hiddenModels: [] },
-      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated, blue] },
-    ])("seeds once for $name and preserves later choices", async ({ persisted, hiddenModels }) => {
-      if (persisted) {
+      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated] },
+    ])("loads $name without seeding hides and persists later choices", async (scenario) => {
+      if (scenario.persisted) {
         fs.writeFileSync(
           path.join(tempDir, "config.json"),
           JSON.stringify({
             projects: [],
             defaultModel: KNOWN_MODELS.GPT.id,
-            hiddenModels,
+            hiddenModels: scenario.hiddenModels,
           })
         );
       }
-      const seeded = config.getClientConfig();
-      expect(seeded.hiddenModels).toEqual([...new Set([...(hiddenModels ?? []), blue, red])]);
-      expect(seeded.hiddenModelsInitialized).toBe(hiddenModels !== undefined);
-      expect(seeded.defaultModel).toBe(persisted ? KNOWN_MODELS.GPT.id : undefined);
+      const loaded = config.getClientConfig();
+      expect(loaded.hiddenModels).toEqual(scenario.hiddenModels);
+      // Load must not claim initialization, or the client skips importing legacy local hides.
+      expect(loaded.hiddenModelsInitialized).toBe(false);
       await flushConfigEdits();
 
-      for (const visible of [[blue], [red], [blue, red], []]) {
-        const hidden = [unrelated, ...[blue, red].filter((id) => !visible.includes(id))];
+      for (const hidden of [[unrelated, KNOWN_MODELS.GPT_6_LUNA.id], []]) {
         await config.updateModelPreferences({ hiddenModels: hidden });
         const reloaded = new Config(tempDir).getClientConfig();
         expect(reloaded.hiddenModels).toEqual(hidden);
         expect(reloaded.hiddenModelsInitialized).toBe(true);
-        expect(reloaded.defaultModel).toBe(seeded.defaultModel);
+        expect(reloaded.defaultModel).toBe(loaded.defaultModel);
       }
-      await config.updateModelPreferences({ hiddenModels: [] });
-      expect(new Config(tempDir).getClientConfig().hiddenModels).toEqual([]);
     });
   });
 
@@ -3348,7 +3324,6 @@ describe("Config", () => {
             persistentSubagentsDefaulted: true,
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            daybreakModelsHidden: true,
           },
         })
       );

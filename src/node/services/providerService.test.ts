@@ -7,7 +7,6 @@ import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
@@ -1795,11 +1794,7 @@ describe("ProviderService custom provider mutations", () => {
 
       const appConfig = freshConfig.loadConfigOrDefault();
       expect(appConfig.defaultModel).toBeUndefined();
-      expect(appConfig.hiddenModels).toEqual([
-        "openai:gpt-5",
-        "other-custom:model",
-        ...DEFAULT_HIDDEN_MODELS,
-      ]);
+      expect(appConfig.hiddenModels).toEqual(["openai:gpt-5", "other-custom:model"]);
       expect(appConfig.routeOverrides).toEqual({
         "openai:gpt-4": "openai",
         "other-custom:model": "other-custom",

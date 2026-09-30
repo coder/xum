@@ -100,7 +100,7 @@ describe("WorkspaceContext", () => {
   test.each(["resolves", "rejects", "stalls"])(
     "hydrates preferences when migration persistence %s",
     async (writeState) => {
-      const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+      const backendHidden = ["openai:gpt-6-luna", "openai:gpt-6-astra"];
       const legacyHidden = "openrouter:openai/gpt-5";
       const defaultModel = "openai:gpt-5.6-terra";
       createMockAPI({
@@ -120,7 +120,7 @@ describe("WorkspaceContext", () => {
         getConfig: () =>
           Promise.resolve({
             ...cfg,
-            hiddenModels: seeded,
+            hiddenModels: backendHidden,
             hiddenModelsInitialized: false,
             runtimeEnablement: { ssh: false },
           }),
@@ -129,13 +129,13 @@ describe("WorkspaceContext", () => {
       await setup();
       await waitFor(() => {
         expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
-          ...seeded,
+          ...backendHidden,
           legacyHidden,
         ]);
       });
       expect(updateModelPreferences).toHaveBeenCalledWith({
         defaultModel,
-        hiddenModels: [...seeded, legacyHidden],
+        hiddenModels: [...backendHidden, legacyHidden],
       });
       expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
       expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
@@ -152,8 +152,8 @@ describe("WorkspaceContext", () => {
   )(
     "keeps %s %s preference edits ahead of stale startup config until reconnect",
     async (source, changed) => {
-      const blue = "openai:daybreak-blue-latest";
-      const red = "openai:daybreak-red-latest";
+      const luna = "openai:gpt-6-luna";
+      const astra = "openai:gpt-6-astra";
       const legacyHidden = "openrouter:openai/gpt-5";
       const legacyDefault = "openai:gpt-5.6-terra";
       const chosenDefault = "anthropic:claude-opus-4-6";
@@ -188,13 +188,13 @@ describe("WorkspaceContext", () => {
           writePreference(DEFAULT_MODEL_KEY, chosenDefault);
           if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
         } else {
-          writePreference(HIDDEN_MODELS_KEY, [red, legacyHidden]);
+          writePreference(HIDDEN_MODELS_KEY, [astra, legacyHidden]);
           if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
         }
       });
       resolveConfig({
         ...cfg,
-        hiddenModels: [blue, red],
+        hiddenModels: [luna, astra],
         hiddenModelsInitialized: false,
         runtimeEnablement: { ssh: false },
       });
@@ -206,14 +206,14 @@ describe("WorkspaceContext", () => {
       );
       expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
         changed.startsWith("default")
-          ? [blue, red, legacyHidden]
+          ? [luna, astra, legacyHidden]
           : changed === "hidden"
-            ? [red, legacyHidden]
+            ? [astra, legacyHidden]
             : [legacyHidden]
       );
       expect(updateModelPreferences).toHaveBeenCalledWith(
         changed.startsWith("default")
-          ? { hiddenModels: [blue, red, legacyHidden] }
+          ? { hiddenModels: [luna, astra, legacyHidden] }
           : { defaultModel: legacyDefault }
       );
 

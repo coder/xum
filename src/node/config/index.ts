@@ -63,7 +63,6 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -1665,9 +1664,7 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
       migrations: {
-        daybreakModelsHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
@@ -2076,19 +2073,6 @@ export class Config {
     if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
       hiddenMigrations.hiddenModelsInitialized = false;
       parsed.migrations = hiddenMigrations;
-      configModified = true;
-    }
-    if (hiddenMigrations.daybreakModelsHidden !== true) {
-      // Seed once, without losing unrelated hides or re-hiding models users later enable.
-      parsed.migrations = {
-        ...hiddenMigrations,
-        daybreakModelsHidden: true,
-        hiddenModelsInitialized:
-          hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
-      };
-      parsed.hiddenModels = [
-        ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
-      ];
       configModified = true;
     }
     const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);

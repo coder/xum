@@ -1,6 +1,5 @@
 import { useCallback, useMemo } from "react";
 import { readPersistedString, usePersistedState } from "./usePersistedState";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
@@ -37,6 +36,8 @@ import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 export { filterHiddenModels, getSuggestedModels };
 
 const BUILT_IN_MODEL_SET = new Set<string>(BUILT_IN_MODELS);
+// Module-level so the persisted-state default keeps a stable identity across renders.
+const NO_HIDDEN_MODELS: string[] = [];
 
 function getAllCustomModels(config: ProvidersConfigMap | null): string[] {
   if (!config) return [];
@@ -134,7 +135,7 @@ export function useModelsFromSettings() {
 
   const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(
     HIDDEN_MODELS_KEY,
-    DEFAULT_HIDDEN_MODELS,
+    NO_HIDDEN_MODELS,
     {
       listener: true,
     }

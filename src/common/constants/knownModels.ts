@@ -144,16 +144,6 @@ const MODEL_DEFINITIONS = {
     // Same Daybreak constraint as GPT (see its cyberAccessProgram).
     cyberAccessProgram: "daybreak_blue",
   },
-  DAYBREAK_BLUE: {
-    provider: "openai",
-    providerModelId: "daybreak-blue-latest",
-    tokenizerOverride: "openai/gpt-5",
-  },
-  DAYBREAK_RED: {
-    provider: "openai",
-    providerModelId: "daybreak-red-latest",
-    tokenizerOverride: "openai/gpt-5",
-  },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
     provider: "google",
@@ -258,8 +248,6 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
-export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
-
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)
   .map((model) => model.id);
@@ -279,6 +267,8 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:daybreak-blue-latest": "openai/gpt-5",
+  "openai:daybreak-red-latest": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
