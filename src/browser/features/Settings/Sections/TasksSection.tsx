@@ -57,7 +57,7 @@ const INHERIT = "__inherit__";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
 // memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
-// apply reasoningMode. Never offer a Pro toggle that cannot affect requests.
+// apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
@@ -316,8 +316,8 @@ interface AiDefaultsControlsProps {
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
   applyMinimumThinkingLevel?: boolean;
-  /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
-  allowProMode?: boolean;
+  /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
+  allowReasoningModes?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -377,7 +377,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             reasoningMode={props.reasoningModeValue}
             reasoningModeInherited={props.reasoningModeInherited}
             onReasoningModeChange={props.onReasoningModeChange}
-            allowProMode={props.allowProMode}
+            allowReasoningModes={props.allowReasoningModes}
             variant="box"
             inheritOption={{
               label: inheritLabel,
@@ -777,8 +777,10 @@ export function TasksSection() {
     return { modelString, reasoningMode };
   };
 
-  const baseChainInheritsPro = (agentId: string): boolean =>
-    resolveBaseChainDefaults(agentId).reasoningMode === "pro";
+  const baseChainSuppliesNonStandardMode = (agentId: string): boolean => {
+    const inherited = resolveBaseChainDefaults(agentId).reasoningMode;
+    return inherited !== undefined && inherited !== "standard";
+  };
 
   // Definitions may pin ai.model (possibly an alias like "sonnet"); ACP/task
   // resolution slots it below Settings overrides and above the ambient
@@ -788,14 +790,14 @@ export function TasksSection() {
 
   const setAgentReasoningMode = (agentId: string, mode: OpenAIReasoningMode) => {
     // "standard" is the wire default; keep entries sparse by only persisting
-    // "pro", unless a base agent supplies pro, where deleting the override
-    // would silently fall back to pro (see baseChainInheritsPro).
-    const inheritsPro = baseChainInheritsPro(agentId);
+    // non-standard modes, unless a base agent supplies one, where deleting the
+    // override would silently fall back to it.
+    const inheritsNonStandard = baseChainSuppliesNonStandardMode(agentId);
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
-        if (mode === "pro") {
-          updated.reasoningMode = "pro";
-        } else if (inheritsPro) {
+        if (mode !== "standard") {
+          updated.reasoningMode = mode;
+        } else if (inheritsNonStandard) {
           updated.reasoningMode = "standard";
         } else {
           delete updated.reasoningMode;
@@ -1084,7 +1086,7 @@ export function TasksSection() {
           modelValue={modelValue}
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
-          allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
           // Intuition clamps to model capabilities, not the chat's minimum effort.
           applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}

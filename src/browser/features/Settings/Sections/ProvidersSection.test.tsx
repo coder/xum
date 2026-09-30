@@ -489,6 +489,32 @@ describe("ProvidersSection", () => {
     });
   });
 
+  test.each([
+    { name: "on", initial: false, persisted: true },
+    { name: "off (removes the key)", initial: true, persisted: "" },
+  ])("persists the cyber model setting when toggled $name", async (testCase) => {
+    const view = renderProvidersSection();
+    if (testCase.initial) view.providersConfig.openai.cyberModelEnabled = true;
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+
+    fireEvent.click(openAiButton);
+
+    const cyberToggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: /Enable cyber model/i,
+    });
+    expect(cyberToggle.getAttribute("aria-checked")).toBe(String(testCase.initial));
+
+    fireEvent.click(cyberToggle);
+
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: "openai",
+        keyPath: ["cyberModelEnabled"],
+        value: testCase.persisted,
+      });
+    });
+  });
+
   test("shows the OpenAI WebSocket transport toggle when Codex OAuth is the active default", async () => {
     const view = renderProvidersSection();
     view.providersConfig.openai.codexOauthSet = true;

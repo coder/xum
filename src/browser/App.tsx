@@ -632,13 +632,13 @@ function AppInner() {
 
   // Keep palette choices local until a user message sends the full settings.
   const toggleReasoningModeFromPalette = useCallback(
-    (workspaceId: string) => {
+    (workspaceId: string, mode: Exclude<OpenAIReasoningMode, "standard">) => {
       if (!workspaceId) {
         return;
       }
 
       const next: OpenAIReasoningMode =
-        getReasoningModeForWorkspace(workspaceId) === "pro" ? "standard" : "pro";
+        getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
       const model = getModelForWorkspace(workspaceId);
       const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
 

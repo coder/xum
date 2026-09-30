@@ -1728,6 +1728,72 @@ test.each(["coder", "mux-gateway", "direct"])(
     })
 );
 
+test.each([
+  {
+    name: "supported model with the setting on",
+    model: "openai:gpt-6.1-sol",
+    enabled: true,
+    route: "direct",
+    shown: true,
+  },
+  {
+    name: "setting off",
+    model: "openai:gpt-6.1-sol",
+    enabled: false,
+    route: "direct",
+    shown: false,
+  },
+  {
+    name: "unsupported model",
+    model: "openai:gpt-6-luna",
+    enabled: true,
+    route: "direct",
+    shown: false,
+  },
+  {
+    // Coder OpenAI instances deliver Pro but not the direct-only Cyber field.
+    name: "Coder gateway route",
+    model: "coder:prod-openai/gpt-6-astra",
+    enabled: true,
+    route: "coder",
+    shown: false,
+  },
+])("Cyber palette command gating: $name", async (testCase) =>
+  withTestWindow(async () => {
+    const onToggleReasoningMode = mock((_workspaceId: string, _mode: string) => undefined);
+    const actions = getActions({
+      getEffectiveComposerModel: () => testCase.model,
+      providersConfig: {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          ...(testCase.enabled ? { cyberModelEnabled: true } : {}),
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+        },
+      },
+      getRouteForModel: () => testCase.route,
+      getEffectiveRouteForModel: () => testCase.route,
+      onToggleReasoningMode,
+    });
+    const cyberAction = actions.find((action) => action.id === CommandIds.toggleCyberReasoning());
+
+    expect(cyberAction != null).toBe(testCase.shown);
+    if (!cyberAction) return;
+    await cyberAction.run();
+    await actions.find((action) => action.id === CommandIds.toggleProReasoning())?.run();
+    expect(onToggleReasoningMode.mock.calls).toEqual([
+      ["w1", "cyber"],
+      ["w1", "pro"],
+    ]);
+  })
+);
+
 test("plugin component action is gated and only targets present managed installs without mutation", async () => {
   const openSettings = mock(() => undefined);
   expect(

@@ -3021,6 +3021,38 @@ export function ProvidersSection() {
                               )}
 
                               <div className="border-border-light border-t pt-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <label className="text-foreground block text-xs font-medium">
+                                      Enable cyber model
+                                    </label>
+                                    <span className="text-muted text-xs">
+                                      Shows a Cyber option in the thinking menu for supported
+                                      models. Requires OpenAI Daybreak approval for this API
+                                      key&apos;s project.
+                                    </span>
+                                  </div>
+                                  <Switch
+                                    checked={config?.openai?.cyberModelEnabled === true}
+                                    disabled={!api}
+                                    onCheckedChange={(nextChecked) => {
+                                      if (!api) return;
+
+                                      updateOptimistically("openai", {
+                                        cyberModelEnabled: nextChecked ? true : undefined,
+                                      });
+                                      void api.providers.setProviderConfig({
+                                        provider: "openai",
+                                        keyPath: ["cyberModelEnabled"],
+                                        value: nextChecked ? true : "",
+                                      });
+                                    }}
+                                    aria-label="Enable cyber model"
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="border-border-light border-t pt-3">
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">
                                     Response storage
