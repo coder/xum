@@ -976,6 +976,11 @@ interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
   /**
+   * The delegated turn this message waits for (undefined when it queued behind a drain). Any
+   * other live turn is a replacement, which the message never waits through (#5271).
+   */
+  handleId: string | undefined;
+  /**
    * Stop generations from first admission; a stop since then refuses the message. The target's
    * entry is refreshed once when the drain starts (see flushParkedPeerSends).
    */
@@ -2511,12 +2516,31 @@ export class TaskService implements AgentTaskIntegration {
     const parked = this.parkedPeerSendsByTarget.get(targetId);
     let drainStarted = false;
     while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
-      if (
-        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
-        this.isWorkspaceStopInProgress(targetId)
-      ) {
+      const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
+      if (live != null) {
+        // A message waits once, for the turn it was parked behind. A replacement turn that
+        // registered after that turn released (before or during this drain) drops the messages
+        // still waiting, instead of holding them through a second delegated turn (#5271).
+        const replaced = parked.filter(
+          (waiting) => waiting.awaitedDelegatedTurn.handleId !== live.handleId
+        );
+        if (replaced.length > 0) {
+          parked.splice(
+            0,
+            parked.length,
+            ...parked.filter((waiting) => !replaced.includes(waiting))
+          );
+          for (const waiting of replaced) {
+            log.debug("Dropped a peer message: another delegated turn started before delivery", {
+              senderWorkspaceId: waiting.senderWorkspaceId,
+              targetId,
+            });
+          }
+          if (parked.length === 0) this.parkedPeerSendsByTarget.delete(targetId);
+        }
         return;
       }
+      if (this.isWorkspaceStopInProgress(targetId)) return;
       if (!drainStarted) {
         drainStarted = true;
         // The owner's explicit interrupt of the delegated turn bumps the target's stop epoch (so
@@ -10089,7 +10113,12 @@ export class TaskService implements AgentTaskIntegration {
         parkedThisAttempt = true;
         this.parkPeerSend({
           ...spec,
-          awaitedDelegatedTurn: { unrelatedConsent, stopEpochs: new Map(capturedStopEpochs) },
+          awaitedDelegatedTurn: {
+            unrelatedConsent,
+            handleId:
+              this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId)?.handleId,
+            stopEpochs: new Map(capturedStopEpochs),
+          },
         });
       };
       const waitForDelegatedTurn = () => {

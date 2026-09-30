@@ -385,4 +385,54 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
     expect(s.peerSends).toHaveLength(0);
     await expectOnlyLaterMessageDelivered(s, 0);
   });
+
+  // #5271: a message waits only for the delegated turn it was parked behind. A replacement turn
+  // that registers once that turn released (before or during the drain) drops what still waits.
+  test("messages still waiting when a replacement turn starts mid-drain are dropped", async () => {
+    const s = await setUp();
+    for (const message of ["first", "second"]) {
+      expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, message)).success).toBe(
+        true
+      );
+    }
+    const internals = s.taskService as unknown as TaskServiceInternals;
+    const flushes = spyOn(internals, "flushParkedPeerSends");
+    const release = s.holdPeerSends();
+    await settle.completed(s);
+    // "first" is being delivered; another workspace's delegated turn starts before "second".
+    await s.peerSendCount(1);
+    await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_other", "owner-2");
+    release();
+    await Promise.all(flushes.mock.results.map((result) => result.value as Promise<void>));
+    flushes.mockRestore();
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      TARGET_ID
+    );
+    await expectOnlyLaterMessageDelivered(s, 1);
+    expect(s.peerSends.some((args) => payloadText(args).includes("second"))).toBe(false);
+  });
+
+  test("messages are dropped when a replacement turn starts before the drain", async () => {
+    const s = await setUp();
+    expect((await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).success).toBe(
+      true
+    );
+    const internals = s.taskService as unknown as TaskServiceInternals;
+    const original = internals.flushParkedPeerSends.bind(s.taskService);
+    const flushes = spyOn(internals, "flushParkedPeerSends").mockImplementationOnce(
+      async (targetId) => {
+        // The original turn released; a replacement registers before the drain runs.
+        await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_other", "owner-2");
+        return original(targetId);
+      }
+    );
+    await settle.completed(s);
+    expect(flushes).toHaveBeenCalled();
+    await Promise.all(flushes.mock.results.map((result) => result.value as Promise<void>));
+    flushes.mockRestore();
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      TARGET_ID
+    );
+    await expectOnlyLaterMessageDelivered(s, 0);
+  });
 });
