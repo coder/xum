@@ -5,7 +5,8 @@
 # Usage: formal/peer-limits/check.sh [config-name-glob]   (default: all MC_*.cfg)
 # Env:   TLC (default ~/.local/bin/tlc), WORKERS (default 8),
 #        BUDGET seconds per run (default 300; an unfinished search that found
-#        no violation reports "bounded", which counts as holding),
+#        no violation reports "bounded", which fails the check: only an
+#        exhaustive search shows an invariant holds),
 #        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 set -euo pipefail
@@ -55,7 +56,13 @@ echo "results in $out"
 printf '%-22s %-24s %-9s %-8s %12s %6s\n' config invariant result expect distinct secs
 for cfg in "$here"/$glob.cfg; do
   name=$(basename "$cfg" .cfg)
-  expected=" ${EXPECT[$name]-UNKNOWN} "
+  # A config without an expectation fails instead of defaulting to "all hold".
+  if [[ -z ${EXPECT[$name]+set} ]]; then
+    echo "$name: no EXPECT entry" >&2
+    status=1
+    continue
+  fi
+  expected=" ${EXPECT[$name]} "
   read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
   for inv in "${invs[@]}"; do
     tmpcfg="$out/$name.$inv.cfg"
@@ -67,7 +74,8 @@ for cfg in "$here"/$glob.cfg; do
     (cd "$here" && timeout "$budget" "$tlc" -workers "$workers" -deadlock -noGenerateSpecTE \
       -metadir "$out/meta.$name.$inv" -config "$tmpcfg" PeerLimits.tla) >"$log" 2>&1 || rc=$?
     secs=$(($(date +%s) - start))
-    distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1)
+    # A run killed before TLC printed a state count has none (grep exits 1).
+    distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)
     case $rc in
       0) result=holds ;;
       12) result=VIOLATED ;;
@@ -75,7 +83,7 @@ for cfg in "$here"/$glob.cfg; do
       *) result="error($rc)" ;;
     esac
     if [[ $expected == *" $inv "* ]]; then want=VIOLATED; else want=holds; fi
-    [[ $result == "$want" || ($result == bounded && $want == holds) ]] || status=1
+    [[ $result == "$want" ]] || status=1
     printf '%-22s %-24s %-9s %-8s %12s %6s\n' "$name" "$inv" "$result" "$want" "${distinct:-?}" "$secs"
   done
 done
