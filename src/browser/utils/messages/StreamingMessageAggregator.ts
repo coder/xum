@@ -852,7 +852,10 @@ export class StreamingMessageAggregator {
     updatePersistedState(getStatusStateKey(this.workspaceId), {
       emoji: truncateStringToChars(emoji, STATUS_STATE_EMOJI_MAX_CHARS),
       message: truncateStringToChars(message, STATUS_STATE_MESSAGE_MAX_CHARS),
-      url: url !== undefined && JSON.stringify(url).length <= STATUS_STATE_URL_MAX_CHARS ? url : undefined,
+      url:
+        url !== undefined && JSON.stringify(url).length <= STATUS_STATE_URL_MAX_CHARS
+          ? url
+          : undefined,
     });
   }
 

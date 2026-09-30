@@ -676,26 +676,22 @@ describe("ModelsSection manual model IDs", () => {
   );
 
   // A selected "provider:id" longer than the per-workspace model key would not survive a restart.
-  test(
-    "rejects an ID too long to persist as the selected model, accepts one at the limit",
-    async () => {
-      const ui = await setup();
-      const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
-      await ui.type("m".repeat(maxIdChars + 1));
-      fireEvent.click(ui.add);
-      expect(ui.save).not.toHaveBeenCalled();
-      expect(ui.input.getAttribute("aria-invalid")).toBe("true");
+  // Typing over a hundred characters takes several seconds, hence the longer timeout.
+  test("rejects an ID too long to persist as the selected model, accepts one at the limit", async () => {
+    const ui = await setup();
+    const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
+    await ui.type("m".repeat(maxIdChars + 1));
+    fireEvent.click(ui.add);
+    expect(ui.save).not.toHaveBeenCalled();
+    expect(ui.input.getAttribute("aria-invalid")).toBe("true");
 
-      await ui.user.type(ui.input, "{Backspace}");
-      fireEvent.click(ui.add);
-      expect(ui.save.mock.calls[0][0]).toEqual({
-        provider: "anthropic",
-        models: ["m".repeat(maxIdChars)],
-      });
-    },
-    // Typing well over a hundred characters takes a few seconds.
-    15_000
-  );
+    await ui.user.type(ui.input, "{Backspace}");
+    fireEvent.click(ui.add);
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["m".repeat(maxIdChars)],
+    });
+  }, 15_000);
 
   test("accepts IDs with characters beyond the common set", async () => {
     const ui = await setup();

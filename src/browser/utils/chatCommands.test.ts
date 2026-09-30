@@ -487,7 +487,10 @@ describe("processSlashCommand model and gating results", () => {
       { type: "model-set", modelString: `openai:${"m".repeat(MODEL_KEY_MAX_CHARS)}` },
       createEnv({
         api: {
-          providers: { getConfig: mock(() => Promise.resolve({ openai: { models: [] } })), setModels },
+          providers: {
+            getConfig: mock(() => Promise.resolve({ openai: { models: [] } })),
+            setModels,
+          },
         } as unknown as SlashCommandEnv["api"],
       })
     );
