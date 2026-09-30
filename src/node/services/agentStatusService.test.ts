@@ -8,6 +8,7 @@ import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
+import { buildContextListingMessages } from "./contextListing";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -315,6 +316,26 @@ describe("AgentStatusService", () => {
     );
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("context listing rows never read as the newest user message", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Fix the flaky test")
+    );
+    const [listing] = buildContextListingMessages(
+      [],
+      [{ key: "skills", title: "Available skills", body: "- secret-skill-catalog" }]
+    );
+    await historyHandle.historyService.appendToHistory(workspaceId, listing);
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Fix the flaky test");
+    expect(transcript).not.toContain("secret-skill-catalog");
   });
 
   test("hidden plan-review records do not consume the status transcript window", async () => {

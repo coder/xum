@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import type { MuxMessage } from "@/common/types/message";
 
 import {
+  CONTEXT_LISTING_MAX_BODY_CHARS,
   CONTEXT_LISTING_TAG,
   buildContextListingMessages,
   type ContextListingSection,
@@ -57,5 +58,21 @@ describe("buildContextListingMessages", () => {
     );
     // Only the row's own opening and closing tags remain.
     expect(text(row).match(new RegExp(`<\\s*/?\\s*${CONTEXT_LISTING_TAG}`, "gi"))).toHaveLength(2);
+  });
+
+  it("bounds an oversized section at whole entries and says how many were cut", () => {
+    const entries = Array.from(
+      { length: 100 },
+      (_, index) => `- skill-${index}: ${"x".repeat(1000)}`
+    );
+    const [row] = buildContextListingMessages([], [prompts(entries.join("\n"))]);
+    const rendered = text(row);
+    // The row stays near the bound instead of growing with the section.
+    expect(rendered.length).toBeLessThan(CONTEXT_LISTING_MAX_BODY_CHARS + 500);
+    const shown = entries.filter((entry) => rendered.includes(entry)).length;
+    expect(shown).toBeGreaterThan(0);
+    expect(rendered).toContain(`(${entries.length - shown} more lines not shown)`);
+    // Unchanged input renders the same bounded row, so it is not re-appended.
+    expect(buildContextListingMessages([row], [prompts(entries.join("\n"))])).toHaveLength(0);
   });
 });

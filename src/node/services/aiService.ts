@@ -892,6 +892,7 @@ export class AIService extends EventEmitter {
           return this.streamMessage(options, { request: result.request, controller, context });
         },
         [Symbol.asyncDispose]: () => result.request[Symbol.asyncDispose](),
+        admittedRows: result.request.admittedRows,
       });
     } catch (error) {
       return Err({ type: "unknown", raw: "Failed to prepare request: " + getErrorMessage(error) });

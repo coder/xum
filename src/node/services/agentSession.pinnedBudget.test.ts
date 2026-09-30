@@ -5,6 +5,7 @@ import { QuickJSRuntimeFactory } from "./ptc/quickjsRuntime";
 import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
+import { isContextListingMessage } from "./contextListing";
 import { MemoryMetaService } from "./memoryMeta";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fs from "node:fs/promises";
@@ -498,6 +499,48 @@ describe("pinned full-payload rollover admission", () => {
       expect(windowSection).toContain("w:0");
       expect(JSON.stringify(request.messages)).toContain(
         `[id: ${String(trigger?.metadata?.historySequence)}]`
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+  test("a rollover persists its context listings with the fresh window", async () => {
+    const fixture = await setup("small");
+    const { h, service, config, historyService, assembleTools, start } = fixture;
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(config.rootDir)
+    );
+    spyOn(fixture.experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY
+    );
+    const lesson = { path: "/memories/global/lesson.md", description: "a lesson" };
+    spyOn(service, "buildMemorySessionContext").mockResolvedValue({
+      indexEntries: [lesson],
+      hotMemoriesBlock: null,
+    });
+    assembleTools.mockResolvedValue({ session_history: smallTool, memory: smallTool });
+    try {
+      const result = await h.session.sendMessage("Small follow-up", {
+        model,
+        agentId: "exec",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      expect(result.success).toBe(true);
+      const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!after.success) throw new Error(after.error);
+      expect(after.data[0].metadata?.muxMetadata?.type).toBe("context-window-rollover");
+      const listing = after.data.findIndex(isContextListingMessage);
+      const userIndex = after.data.findLastIndex(
+        (row) => row.role === "user" && !isContextListingMessage(row)
+      );
+      // The listing row follows the input, as in the admitted request.
+      expect(listing).toBeGreaterThan(userIndex);
+      expect(JSON.stringify(start.mock.calls[0][0].messages)).toContain(lesson.path);
+      // Replay rebuilds the request from history up to its watermark.
+      const assistant = after.data.findLast((row) => row.role === "assistant");
+      expect(assistant?.metadata?.requestHistorySequence).toBe(
+        after.data[listing].metadata?.historySequence
       );
     } finally {
       await fixture.cleanup();
