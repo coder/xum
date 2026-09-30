@@ -629,6 +629,40 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // #5198: a queued ACP prompt gets no correlated event while it waits, so the queue event must
+  // name it for the ACP agent to hold its correlation timeout until the entry leaves the queue.
+  test("queue events list the ACP prompts still queued", async () => {
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)))
+    );
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-acp-prompt-ids",
+      captureEvents: true,
+      aiServiceOverrides: { streamMessage },
+    });
+    const lastQueueEvent = () =>
+      h.events.findLast((event) => event.type === "queued-message-changed");
+    try {
+      h.session.queueMessage("acp prompt", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        acpPromptId: "acp-prompt-1",
+      });
+      h.session.queueMessage("plain follow-up", { model: TEST_MODEL, agentId: "exec" });
+      expect(lastQueueEvent()).toMatchObject({ acpPromptIds: ["acp-prompt-1"] });
+
+      h.session.sendQueuedMessages();
+      expect(await waitForCondition(() => streamMessage.mock.calls.length > 0)).toBe(true);
+      expect(lastQueueEvent()).toMatchObject({
+        queuedMessages: ["plain follow-up"],
+        acpPromptIds: [],
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
   // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
   test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {

@@ -983,6 +983,11 @@ export class MessageQueue {
     return this.getReviewsForEntries(this.getVisibleEntries());
   }
 
+  /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
+  getAcpPromptIds(): string[] {
+    return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
+  }
+
   /** Stop restores authored input, including an entry already dequeued into preparation. */
   getInputForRestore(): QueuedInput | undefined {
     return this.inputForRestore(this.entries);

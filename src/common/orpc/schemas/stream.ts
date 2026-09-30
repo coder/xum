@@ -740,6 +740,11 @@ export const QueuedMessageChangedEventSchema = z.object({
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest: z.boolean().optional(),
+  /**
+   * ACP prompts whose entries are still queued (hidden entries included). A queued prompt gets no
+   * correlated event while it waits, so the ACP agent pauses its pre-correlation timeout (#5198).
+   */
+  acpPromptIds: z.array(z.string()).optional(),
 });
 
 export const RestoreToInputEventSchema = z.object({
