@@ -238,7 +238,12 @@ import {
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
-import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
+import {
+  RetryManager,
+  type AutoRetryAbandonedEvent,
+  type RetryFailureError,
+  type RetryStatusEvent,
+} from "./retryManager";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
@@ -1149,6 +1154,8 @@ export class AgentSession {
   private autoRetryEnabledPreference: boolean | null = null;
   private legacyAutoRetryEnabledHint: boolean | null = null;
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
+  // The live abandoned event is one-shot; replay keeps the stop reason for later subscribers.
+  private autoRetryAbandonedStatus: AutoRetryAbandonedEvent | null = null;
   // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
   private autoRetryStateUnrecorded = false;
   private autoRetryStateVersion = 0;
@@ -1833,6 +1840,7 @@ export class AgentSession {
     if (this.coordinator.disposed) {
       return;
     }
+    this.autoRetryAbandonedStatus = event.type === "auto-retry-abandoned" ? { ...event } : null;
     this.emitChatEvent(event);
   }
 
@@ -2166,6 +2174,9 @@ export class AgentSession {
   }
 
   async handleProviderConfigChanged(): Promise<void> {
+    if (isProviderConfigFixableError(this.autoRetryAbandonedStatus?.reason ?? "")) {
+      this.autoRetryAbandonedStatus = null;
+    }
     await this.loadAutoRetryEnabledPreference();
     if (!isProviderConfigFixableError(this.startupAutoRetryAbandon?.reason ?? "")) {
       return;
@@ -3635,13 +3646,15 @@ export class AgentSession {
         listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
       }
 
-      // Rehydrate pending auto-retry countdown state on reconnect/reload so
-      // RetryBarrier keeps showing "Stop" while a backend timer is already armed.
-      const pendingRetrySnapshot = this.retryManager.getScheduledStatusSnapshot();
-      if (pendingRetrySnapshot) {
+      // Rehydrate auto-retry state on reconnect/reload so RetryBarrier keeps showing "Stop"
+      // while a backend timer is armed, or the stop reason after auto-retry gave up.
+      const retryStatusSnapshot =
+        this.retryManager.getScheduledStatusSnapshot() ??
+        (this.autoRetryAbandonedStatus ? { ...this.autoRetryAbandonedStatus } : null);
+      if (retryStatusSnapshot) {
         listener({
           workspaceId: this.workspaceId,
-          message: pendingRetrySnapshot,
+          message: retryStatusSnapshot,
         });
       }
 
@@ -9263,6 +9276,7 @@ export class AgentSession {
         return;
       }
       if (payload.type === "stream-start" && this.coordinator.streamStarted(payload)) {
+        this.autoRetryAbandonedStatus = null;
         this.adoptPreparedRouting(payload);
         this.emitChatEvent(payload);
       }
@@ -9513,6 +9527,7 @@ export class AgentSession {
 
   private publishTurnPhase(next: TurnPhase, isCurrent: () => boolean): void {
     this.clearPreparingRuntimeStatus();
+    if (next === "preparing") this.autoRetryAbandonedStatus = null;
     if (next !== "idle") {
       this.terminalStreamLifecycle = null;
       this.terminalStreamError = null;

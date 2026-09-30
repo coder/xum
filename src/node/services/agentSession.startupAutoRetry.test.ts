@@ -1233,6 +1233,77 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test.each([
+    {
+      name: "replays the stop reason of an abandoned auto-retry",
+      errorType: "authentication",
+      after: "none",
+      expected: [{ type: "auto-retry-abandoned", reason: "authentication" }],
+    },
+    {
+      name: "drops a stop reason the provider config change may have fixed",
+      errorType: "authentication",
+      after: "provider-config",
+      expected: [],
+    },
+    {
+      name: "keeps a stop reason a provider config change cannot fix",
+      errorType: "model_not_found",
+      after: "provider-config",
+      expected: [{ type: "auto-retry-abandoned", reason: "model_not_found" }],
+    },
+    {
+      name: "drops the stop reason once a new turn is admitted",
+      errorType: "authentication",
+      after: "new-turn",
+      expected: [],
+    },
+    {
+      name: "replays only the pending schedule after a retryable failure",
+      errorType: "network",
+      after: "none",
+      expected: ["auto-retry-scheduled"],
+    },
+  ] as const)("$name for a late subscriber", async ({ errorType, after, expected }) => {
+    const workspaceId = `late-retry-status-${errorType}-${after}`;
+    // Virtual-time backoff: a scheduled retry stays pending instead of firing mid-test.
+    const clock = makeTestEffectRunner();
+    const { session, aiService, cleanup } = await createSessionBundle(workspaceId, undefined, {
+      clock,
+    });
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await failTurnWith(session, aiService, errorType);
+    if (after === "provider-config") {
+      await session.handleProviderConfigChanged();
+    } else if (after === "new-turn") {
+      spyOn(aiService, "streamMessage").mockImplementationOnce(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-next")))
+      );
+      const next = await session.sendMessage("Next prompt", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(next.success).toBe(true);
+    }
+
+    const replayEvents: WorkspaceChatMessage[] = [];
+    await session.replayHistory(({ message }) => {
+      replayEvents.push(message);
+    });
+
+    const caughtUpIndex = replayEvents.findIndex((event) => event.type === "caught-up");
+    expect(caughtUpIndex).toBeGreaterThanOrEqual(0);
+    const retryStatuses = replayEvents
+      .slice(0, caughtUpIndex)
+      .filter(
+        (event) => event.type === "auto-retry-abandoned" || event.type === "auto-retry-scheduled"
+      );
+    expect(
+      retryStatuses.map((event) => (event.type === "auto-retry-scheduled" ? event.type : event))
+    ).toEqual([...expected]);
+  });
+
   test.each(
     (["unrelated", "sibling"] as const).flatMap((relationship) =>
       [false, true].flatMap((correlated) =>

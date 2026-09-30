@@ -4953,9 +4953,9 @@ export class WorkspaceStore {
         // closed, and abort the attempt so the loop retries with increasing backoff.
         assert(!transient.caughtUp, "a failed caught-up must not arrive after catch-up");
         transient.historicalMessages.length = 0;
-        // The retry snapshot is only replayed while a retry is scheduled, so its absence is
-        // authoritative: a retry that resolved while disconnected must not keep its banner
-        // (and Stop) alive through the outage.
+        // The retry snapshot is only replayed while a retry is scheduled or abandoned, so its
+        // absence is authoritative: a retry that resolved while disconnected must not keep its
+        // banner (and Stop) alive through the outage.
         transient.autoRetryStatus = null;
         // Held inputs are replayed only while non-empty (like the retry snapshot).
         transient.heldInputs = NO_HELD_INPUTS;
