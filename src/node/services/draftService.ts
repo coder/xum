@@ -354,7 +354,7 @@ export class DraftService extends EventEmitter {
   async deleteProjectDrafts(projectPath: string): Promise<string[]> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
     const dirName = projectDraftsDirName(projectPath);
-    const projectDir = this.projectDraftsDir(projectPath);
+    const projectDir = path.join(this.creationRoot, dirName);
     return withTargetMutationLock(this.config.rootDir, projectDir, async () => {
       // The same recheck as the GC: this runs after the removal's config write, so the path may
       // be registered again (with a new creation draft) by now; its drafts are owned again.
@@ -364,11 +364,12 @@ export class DraftService extends EventEmitter {
       // are gone the rows go too, even if the path is registered again right after.
       let delisted: string[] = [];
       await this.mutateList((entries) => {
-        const next = entries.filter((entry) => entry.projectPath !== projectPath);
         delisted = entries
           .filter((entry) => entry.projectPath === projectPath)
           .map((entry) => entry.draftId);
-        return next.length === entries.length ? null : next;
+        return delisted.length === 0
+          ? null
+          : entries.filter((entry) => entry.projectPath !== projectPath);
       });
       return delisted;
     });
