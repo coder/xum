@@ -3236,9 +3236,6 @@ export class HistoryService {
       }
 
       const partialSeq = partial.metadata?.historySequence;
-      if (partialSeq === undefined) {
-        return Err("Partial message has no historySequence");
-      }
 
       const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(workspaceId, 0);
       if (!historyResult.success) {
@@ -3246,7 +3243,35 @@ export class HistoryService {
       }
 
       const existingMessages = historyResult.data;
-      const maxExistingSequence = this.getNewestHistorySequence(existingMessages);
+
+      // Identify the partial's row by message id; the sequence is a consistency check only.
+      // Every stream appends its (empty) assistant placeholder before its first flush, so a
+      // partial without its own row at its own sequence is orphaned: an edit truncation
+      // (possibly by a foreign backend, or one that crashed before retiring partial.json)
+      // removed that turn, or a stale epoch left it behind. Committing it would resurrect the
+      // discarded reply after the edited prompt or overwrite a newer row that reused the
+      // sequence; failing instead would block every later send. Retire it (self-healing). A
+      // partial without a historySequence cannot prove it owns any row, so it is orphaned too.
+      // User rationale (stale epochs): stale partial.json files from older compaction epochs
+      // used to append old historySequence values at the tail. That made the next live send
+      // look like a mid-history edit and the renderer truncated the visible chat at an odd
+      // position.
+      const partialId = partial.id;
+      const existingMessage =
+        partialSeq === undefined
+          ? undefined
+          : existingMessages.find(
+              (message) =>
+                message.id === partialId && message.metadata?.historySequence === partialSeq
+            );
+      if (!existingMessage) {
+        log.warn("Deleting orphaned partial without its own history row", {
+          workspaceId,
+          messageId: partial.id,
+          partialSeq,
+        });
+        return this.deletePartialUnlocked(workspaceId);
+      }
 
       const commitWorthy = hasCommitWorthyParts(partial.parts);
 
@@ -3257,30 +3282,8 @@ export class HistoryService {
       const hasDurableRefusalMetadata =
         hadErrorMetadata && isRefusalFinishReason(partial.metadata?.finishReason);
 
-      const existingMessage = existingMessages.find(
-        (message) => message.metadata?.historySequence === partialSeq
-      );
-
-      if (
-        !existingMessage &&
-        maxExistingSequence !== undefined &&
-        partialSeq <= maxExistingSequence
-      ) {
-        // User rationale: stale partial.json files from older compaction epochs used to append
-        // old historySequence values at the tail. That made the next live send look like a
-        // mid-history edit and the renderer truncated the visible chat at an odd position.
-        log.warn("Deleting stale partial with non-tail historySequence", {
-          workspaceId,
-          messageId: partial.id,
-          partialSeq,
-          maxExistingSequence,
-        });
-        return this.deletePartialUnlocked(workspaceId);
-      }
-
       const shouldCommit =
-        (!existingMessage ||
-          (partial.parts?.length ?? 0) > (existingMessage.parts?.length ?? 0) ||
+        ((partial.parts?.length ?? 0) > (existingMessage.parts?.length ?? 0) ||
           hasDurableRefusalMetadata) &&
         (commitWorthy || hasDurableRefusalMetadata);
 
@@ -3288,20 +3291,12 @@ export class HistoryService {
         hadErrorMetadata &&
         !commitWorthy &&
         !hasDurableRefusalMetadata &&
-        existingMessage?.id === partial.id &&
         (existingMessage.parts?.length ?? 0) === 0;
 
       if (shouldCommit) {
-        if (existingMessage) {
-          const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
-          if (!updateResult.success) {
-            return updateResult;
-          }
-        } else {
-          const appendResult = await this.appendToHistoryUnderWriteLock(workspaceId, partial);
-          if (!appendResult.success) {
-            return appendResult;
-          }
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
+        if (!updateResult.success) {
+          return updateResult;
         }
       } else if (shouldDeleteErroredPlaceholder) {
         const deleteMessageResult = await this.deleteMessageUnderWriteLock(workspaceId, partial.id);
@@ -4805,11 +4800,17 @@ export class HistoryService {
         "updateHistory requires historySequence to be a non-negative integer"
       );
 
-      // Find and replace the message with matching historySequence
+      // Find and replace the message's own row: match by message id, with historySequence as a
+      // consistency check. After an edit truncation (possibly by a foreign backend) the sequence
+      // can be reused by a newer row, and a late completion of the discarded turn must not
+      // overwrite it.
       let found = false;
       let persistedMessage: MuxMessage | undefined;
       for (let i = 0; i < messages.length; i++) {
-        if (messages[i].metadata?.historySequence === targetSequence) {
+        if (
+          messages[i].id === message.id &&
+          messages[i].metadata?.historySequence === targetSequence
+        ) {
           const existingMessage = messages[i];
           assert(existingMessage, "updateHistory matched message must exist");
 
@@ -4840,7 +4841,7 @@ export class HistoryService {
       }
 
       if (!found || !persistedMessage) {
-        return Err(`No message found with historySequence ${targetSequence}`);
+        return Err(`No message found with historySequence ${targetSequence} and id ${message.id}`);
       }
 
       // Rewrite entire file

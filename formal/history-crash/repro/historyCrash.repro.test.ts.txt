@@ -1,8 +1,9 @@
 /**
  * Deterministic repros for the TLC findings in formal/history-crash/ (cases in check.sh).
  *
- * NOT part of CI. Each test asserts the CORRECT (crash-consistent) behavior, so on the
- * current code every test FAILS; a FAIL means "bug reproduced". Run with:
+ * NOT part of CI. Each test asserts the CORRECT (crash-consistent) behavior, so a FAIL
+ * means "bug reproduced". F1 and F2 are fixed and now pass (routed regression tests live in
+ * src/node/services/partialService.test.ts, "Orphaned partials"). Run with:
  *
  *   cp formal/history-crash/repro/historyCrash.repro.test.ts.txt \
  *      src/node/services/historyCrash.repro.test.ts

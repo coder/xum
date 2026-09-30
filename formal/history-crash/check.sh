@@ -29,7 +29,9 @@ cases=(
   "HistoryPartial|P3-two-backend-overwrite|NoLostCommittedRow|B=2 C=0 T=2 E=1 P=1 DF=FALSE CS=TRUE|NoLostCommittedRow"
   "HistoryPartial|P3-two-backend-guarded|pass|B=2 C=0 T=2 E=1 P=2 DF=FALSE G=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoLostStreamedContent NoCommitError"
   "HistoryPartial|P5-concurrent-streams|NoLostStreamedContent|B=2 C=0 T=2 E=0 P=1 DF=FALSE CS=TRUE|NoLostStreamedContent"
-  # --- HistoryPartial: candidate fixes + mutation sanity -------------------
+  # --- HistoryPartial: fixes + mutation sanity -----------------------------
+  # RR=TRUE UI=TRUE is the shipped behavior: commitPartial retires a partial without its own
+  # row, and updateHistory matches rows by message id (historyService.ts).
   "HistoryPartial|P4-fixed-all|pass|B=2 C=1 T=3 E=1 P=1 DF=FALSE RR=TRUE UI=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoLostStreamedContent NoCommitError"
   "HistoryPartial|P4-fixed-concurrent|pass|B=2 C=1 T=2 E=1 P=1 DF=FALSE RR=TRUE UI=TRUE CS=TRUE|NoGhostRow NoDuplicateRow NoDuplicateSeq NoLostCommittedRow NoCommitError"
   "HistoryPartial|M1-unlink-before-commit|NoLostStreamedContent|B=1 C=1 T=2 E=0 P=1 DF=FALSE RR=TRUE UI=TRUE MU=TRUE|NoLostStreamedContent"

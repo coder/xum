@@ -792,6 +792,12 @@ describe("WorkspaceService fork", () => {
       "Waiting on task_await",
       { historySequence: 1 }
     );
+    // The live stream's empty placeholder row precedes its partial; the fork copies it.
+    const placeholderResult = await historyService.appendToHistory(sourceWorkspaceId, {
+      ...sourcePartial,
+      parts: [],
+    });
+    expect(placeholderResult.success).toBe(true);
     const writePartialResult = await historyService.writePartial(sourceWorkspaceId, sourcePartial);
     expect(writePartialResult.success).toBe(true);
 
@@ -852,6 +858,9 @@ describe("WorkspaceService fork", () => {
       );
       expect(historyResult.success).toBe(true);
       expect(forkedMessageIds).toContain(sourcePartial.id);
+      // The snapshot was committed onto the copied placeholder, not dropped.
+      const forkedTail = await historyService.getLastMessages(newWorkspaceId, 1);
+      expect(forkedTail.success && forkedTail.data[0]?.parts).toEqual(sourcePartial.parts);
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();

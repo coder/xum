@@ -240,7 +240,7 @@ if (!result.success) throw new Error(result.error);
     );
   });
 
-  test("tool-result commitPartial certifies append but invalidates an update", async () => {
+  test("a certified placeholder append survives, its tool-result commitPartial update invalidates", async () => {
     const cursor = await startCursor();
     const partial = createMuxMessage("tool-result", "assistant", "", { historySequence: 3 }, [
       {
@@ -252,11 +252,12 @@ if (!result.success) throw new Error(result.error);
         output: { success: true },
       },
     ]);
-    expect((await fixture.historyService.writePartial(ws, partial)).success).toBe(true);
-    expect((await fixture.historyService.commitPartial(ws)).success).toBe(true);
+    // Streams append their empty placeholder row first; commitPartial then updates that row.
+    expect(
+      (await fixture.historyService.appendToHistory(ws, { ...partial, parts: [] })).success
+    ).toBe(true);
     expect((await resume(cursor)).map((row) => row.id)).toEqual(["row-1", "row-2"]);
     const after = await startCursor();
-    partial.parts.push({ type: "text", text: "update committed output" });
     expect((await fixture.historyService.writePartial(ws, partial)).success).toBe(true);
     expect((await fixture.historyService.commitPartial(ws)).success).toBe(true);
     await assertStale(after);
