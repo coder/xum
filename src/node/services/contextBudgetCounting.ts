@@ -148,23 +148,32 @@ export interface ContextBudgetAnchor extends ContextBudgetAnchorRequest {
 /**
  * Pairs a step's request with the usage the provider reported for it. Reasoning output is
  * added because the next request replays it and the local estimator skips encrypted
- * reasoning. Undefined without positive usage, so the caller falls back to the full estimate.
+ * reasoning. Undefined (so the caller uses the full estimate) when the provider reported no
+ * positive integer input total, or when the step emitted reasoning without a reported count.
  */
 export function createContextBudgetAnchor(
   request: ContextBudgetAnchorRequest | undefined,
   step:
-    | { usage: AiSdkUsageLike | undefined; providerMetadata?: Record<string, unknown> }
+    | {
+        usage: AiSdkUsageLike | undefined;
+        providerMetadata?: Record<string, unknown>;
+        reasoning?: readonly unknown[];
+      }
     | undefined
 ): ContextBudgetAnchor | undefined {
   if (request == null || step?.usage == null) return undefined;
   const normalized = normalizeUsage(step.usage);
+  // Cache or reasoning details without an input total do not count the whole request.
+  const input = normalized.inputTokens;
+  if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
   const usage = createDisplayUsage(normalized, request.model, step.providerMetadata);
   if (usage == null) return undefined;
+  // Display recovery also reads provider-metadata-only reasoning counts. Zero cannot tell
+  // "no reasoning" from "not reported", so a step that emitted reasoning needs a count.
+  const reasoning = usage.reasoning.tokens;
+  if (reasoning === 0 && (step.reasoning?.length ?? 0) > 0) return undefined;
   const providerTokens =
-    usage.input.tokens +
-    usage.cached.tokens +
-    usage.cacheCreate.tokens +
-    (normalized.reasoningTokens ?? 0);
+    usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens + reasoning;
   return Number.isSafeInteger(providerTokens) && providerTokens > 0
     ? { ...request, providerTokens }
     : undefined;
@@ -192,8 +201,8 @@ function isExactAppend(
  * Anchored estimate (#4858). Contract: the anchor is used ONLY when this request is an exact
  * append of the step whose usage it carries: same model, the same system prompt and tool set
  * objects, the same advertised tool names, a message list that starts with that step's sent
- * messages (element identity, so any rewrite of the prefix fails), and positive provider
- * usage. The estimate is then the provider's count plus the existing estimator applied to the
+ * messages (element identity, so any rewrite of the prefix fails), and a positive integer
+ * provider input total plus a reasoning count whenever the step emitted reasoning. The estimate is then the provider's count plus the existing estimator applied to the
  * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
  * condition here, never new mechanism.
  */

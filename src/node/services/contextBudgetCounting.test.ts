@@ -722,6 +722,34 @@ describe("anchored request estimate (#4858)", () => {
     ).toBeUndefined();
   });
 
+  test("cache or reasoning details without an input total yield no anchor", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    expect(
+      createContextBudgetAnchor(request, {
+        usage: {
+          outputTokens: 80,
+          inputTokenDetails: { cacheReadTokens: 600, cacheWriteTokens: 0 },
+          outputTokenDetails: { reasoningTokens: 50 },
+        },
+      })
+    ).toBeUndefined();
+  });
+
+  test("reasoning reported only in provider metadata is added; unreported reasoning falls back", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    const usage = { inputTokens: 1000, outputTokens: 80 };
+    const reasoning = [{ type: "reasoning", text: "" }];
+    expect(
+      createContextBudgetAnchor(request, {
+        usage,
+        providerMetadata: { openai: { reasoningTokens: 50 } },
+        reasoning,
+      })?.providerTokens
+    ).toBe(1050);
+    expect(createContextBudgetAnchor(request, { usage, reasoning })).toBeUndefined();
+    expect(createContextBudgetAnchor(request, { usage })?.providerTokens).toBe(1000);
+  });
+
   test("cache reads are counted once and replayed reasoning is added", () => {
     const cached = createContextBudgetAnchor(
       { model, system, tools, activeTools, messages: prefix },
