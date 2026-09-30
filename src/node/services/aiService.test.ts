@@ -2863,13 +2863,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const observations: string[] = [];
       for (const next of states) {
         state = next;
+        await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: state.toolSearch === true },
+          experiments: { tokenBudget: true, memory: true },
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
         });
@@ -2940,7 +2941,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
       // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
       {
-        label: "tool-search experiment",
+        label: "tool-search setting",
         states: [{ toolSearch: false }, { toolSearch: true }],
         observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
       },

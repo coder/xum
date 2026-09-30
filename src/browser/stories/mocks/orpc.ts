@@ -1092,6 +1092,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       // story that renders chat input; resolve empty so no groups are seeded.
       getRunStatuses: () => Promise.resolve([]),
       listActiveRuns: () => Promise.resolve([]),
+      listRuns: () => Promise.resolve([]),
     },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
@@ -1677,6 +1678,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       goalDefaults: {
         get: () => Promise.resolve(null),
         set: () => Promise.resolve({ success: true, data: undefined }),
+      },
+      plugins: {
+        slashCommands: {
+          list: () => Promise.resolve([]),
+        },
       },
       timeline: {
         list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),

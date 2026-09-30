@@ -16,6 +16,7 @@ export default {
 const BASE_SECTION_LABELS = [
   "General",
   "Agents",
+  "Heartbeats",
   "Providers",
   "Models",
   "MCP",
@@ -34,6 +35,7 @@ type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   General: /Theme/i,
   Agents: /Max Parallel Agent Tasks/i,
+  Heartbeats: /Default threshold/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,
   MCP: /MCP Servers/i,
@@ -214,6 +216,28 @@ export const FocusReturnsWhenOpenerUnmounts: AppStory = {
     await body.findByRole("dialog", { name: "Settings" });
     await closeSettingsWithEscape();
     await waitFor(() => expect(composer).toHaveFocus());
+  },
+};
+
+export const HeartbeatDefaults: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          heartbeatDefaultIntervalMs: 45 * 60_000,
+          heartbeatDefaultPrompt: "Review pending work before continuing.",
+        })
+      }
+    />
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const dialog = await openSettings(canvasElement);
+    await clickSectionButton(dialog, "Heartbeats");
+    const settings = within(dialog);
+    const threshold = await settings.findByLabelText("Default heartbeat threshold in minutes");
+    await waitFor(() => expect(threshold).toHaveValue(45));
+    const prompt = await settings.findByLabelText("Default heartbeat prompt");
+    await waitFor(() => expect(prompt).toHaveValue("Review pending work before continuing."));
   },
 };
 
