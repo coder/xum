@@ -11,7 +11,7 @@ import path from "node:path";
 import { createRouterClient } from "@orpc/server";
 import { CHAT_FILE_NAME } from "@/common/constants/paths";
 import type { CaughtUpMessage, OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   ONCHAT_REPLAY_WINDOW_MAX_BYTES,
   ONCHAT_REPLAY_WINDOW_MAX_ROWS,
@@ -25,18 +25,14 @@ import { router } from "./router";
 
 const workspaceId = "ws-replay-window";
 
+/** HistoryService assigns sequences in append order, so row i gets sequence i. */
 const row = (sequence: number, role: "user" | "assistant") =>
-  JSON.stringify({
-    id: `m${sequence}`,
-    role,
-    parts: [{ type: "text", text: `text ${sequence}` }],
-    metadata: { historySequence: sequence, timestamp: 1_000 + sequence },
-  });
+  createMuxMessage(`m${sequence}`, role, `text ${sequence}`, { timestamp: 1_000 + sequence });
 
 /** More rows than one window holds, so a windowed replay must cut. */
 const EPOCH_ROWS = ONCHAT_REPLAY_WINDOW_MAX_ROWS + 100;
 
-async function createHarness(rows: string[]): Promise<AgentSessionHarness> {
+async function createHarness(rows: MuxMessage[]): Promise<AgentSessionHarness> {
   const harness = await createAgentSessionHarness({
     workspaceId,
     aiServiceOverrides: {
@@ -47,10 +43,19 @@ async function createHarness(rows: string[]): Promise<AgentSessionHarness> {
     },
     initStateManagerOverrides: { replayInit: mock((_workspaceId: string) => Promise.resolve()) },
   });
+  if (rows.length > 0) {
+    expect((await harness.historyService.appendManyToHistory(workspaceId, rows)).success).toBe(
+      true
+    );
+  }
+  return harness;
+}
+
+/** Legacy rows predate sequences; only a raw write can produce them. */
+async function writeRawChat(harness: AgentSessionHarness, rows: string[]): Promise<void> {
   const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
   await mkdir(sessionDir, { recursive: true });
   await writeFile(path.join(sessionDir, CHAT_FILE_NAME), rows.join("\n") + "\n");
-  return harness;
 }
 
 function createClient(harness: AgentSessionHarness) {
@@ -169,6 +174,22 @@ describe("onChat windowed full replay (#4961)", () => {
     expect(plain.caughtUp.replay).toBe("full");
     expect(plain.caughtUp.downgradeReason).toBe("oldest-mismatch");
     expect(plain.rows.length).toBe(EPOCH_ROWS + 1);
+  });
+
+  test("a window whose older rows cannot be paged falls back to the full replay", async () => {
+    harness = await createHarness([]);
+    // Legacy rows without sequences: no floor with older rows below it can be established.
+    const legacy = Array.from({ length: EPOCH_ROWS }, (_, i) =>
+      JSON.stringify({
+        id: `legacy${i}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        parts: [{ type: "text", text: `legacy ${i}` }],
+      })
+    );
+    await writeRawChat(harness, legacy);
+    const replay = await collectReplay(createClient(harness), { replayWindow: true });
+    expect(replay.rows.length).toBe(EPOCH_ROWS);
+    expect(ids(replay.rows)[0]).toBe("legacy0");
   });
 
   test("a downgraded since and a turn longer than the window fall back to the full replay", async () => {
