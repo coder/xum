@@ -76,6 +76,7 @@ import { log } from "@/node/services/log";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
+import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
 import {
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
@@ -86,6 +87,8 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -537,6 +540,10 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
+    // Only commands on this host can clutter this host's home dir.
+    ...(config.runtime instanceof LocalBaseRuntime
+      ? [new HomeClutterReminderSource({ homeDir: os.homedir(), workspaceId: config.workspaceId })]
+      : []),
   ]);
 
   const wrappedTools: Record<string, Tool> = {};
