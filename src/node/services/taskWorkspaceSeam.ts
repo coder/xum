@@ -524,9 +524,9 @@ export interface TurnAdmissionHost {
    */
   hasPendingUserInput(workspaceId: string): boolean;
   /**
-   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the queue head (the queue is
-   * empty or holds only hidden turn-end entries), so it would cut the active stream. False while
-   * any user-authored entry or tool-end entry is queued.
+   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the next dispatchable entry
+   * (only hidden withdrawn entries stay ahead of it), so it would cut the active stream. False
+   * while a user-authored entry, or a live tool-end entry that already cuts, would stay ahead.
    */
   promotedToolEndWouldLeadQueue(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;

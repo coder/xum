@@ -343,6 +343,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const fakeSession = {
         ...createCompactionAdmissionMocks(),
         isBusy: mock(() => false),
+        hasQueuedMessages: mock(() => false),
         emitMetadata: mock(() => undefined),
         drainQueuedMessagesIfIdle: mock(() => undefined),
         onChatEvent: mock(() => () => undefined),

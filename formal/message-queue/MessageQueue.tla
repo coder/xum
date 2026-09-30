@@ -26,11 +26,11 @@ CONSTANTS
   AllowWithdraw,  \* cancel signals may fire on withdrawable entries
   AllowRemove,    \* removeWorkspaceTurn / removeByDedupeKeyPrefix / removeEntry
   AllowReorder,   \* setVisibleQueueDispatchMode / prioritizeNextUserEntry
-  Mutant          \* "none" | "noDequeue" | "decisionNoDrain"
+  Mutant          \* "none" | "noDequeue" | "decisionNoDrain" | "directSend" | "trailingRun"
 
 Modes == {"tool", "turn"}
-\* Send shapes that matter for placement. "plain" batches (messageQueue.ts:732-744);
-\* "sealed" starts and seals its own entry (:702-723); "promoted" is a sealed tool-end
+\* Send shapes that matter for placement. "plain" batches (messageQueue.ts:747-759);
+\* "sealed" starts and seals its own entry (:717-738); "promoted" is a sealed tool-end
 \* add with promoteAheadOfHiddenTurnEnd (taskService.ts agent_report and the busy-owner
 \* attention wake; both carry removable dedupe keys and admission probes, so sealed).
 Kinds == {"plain", "sealed", "promoted"}
@@ -39,7 +39,7 @@ Attrs ==
   {a \in [user : BOOLEAN, mode : Modes, kind : Kinds, withdrawable : BOOLEAN,
           holdable : BOOLEAN] :
      /\ a.kind = "promoted" => (~a.user /\ a.mode = "tool")
-     \* cancel signals and task-attempt tokens seal (messageQueue.ts:692-723)
+     \* cancel signals and task-attempt tokens seal (messageQueue.ts:707-738)
      /\ (a.withdrawable \/ a.holdable) => a.kind # "plain"
      /\ a.withdrawable => ~a.holdable}
 
@@ -87,12 +87,22 @@ NextIdx == IF \E i \in 1..Len(entries) : Live(entries[i])
                     Live(entries[i]) /\ \A j \in 1..(i - 1) : ~Live(entries[j])
              ELSE 0
 
-\* messageQueue.ts:461-471 trailingHiddenTurnEndRunStart over a sequence.
+\* Mutant "trailingRun": the pre-fix rule, which stopped at the first user-authored or tool-end
+\* predecessor (finding F1).
 RECURSIVE RunStart(_, _)
 RunStart(es, k) ==
   IF k = 0 THEN 0
   ELSE IF es[k].user \/ es[k].mode # "turn" THEN k
   ELSE RunStart(es, k - 1)
+\* messageQueue.ts promotedToolEndInsertIndex: entries kept ahead of a promoted add. It goes before
+\* the first live hidden turn-end entry after the last user-authored entry, else at the end.
+RECURSIVE UserFloor(_, _)
+UserFloor(es, k) == IF k = 0 \/ es[k].user THEN k ELSE UserFloor(es, k - 1)
+PromoteAt(es) ==
+  LET f == UserFloor(es, Len(es))
+      blocking == {i \in (f + 1)..Len(es) : es[i].mode = "turn" /\ Live(es[i])}
+  IN IF blocking = {} THEN Len(es)
+     ELSE (CHOOSE i \in blocking : \A j \in blocking : i <= j) - 1
 InsertAt(s, i, x) == SubSeq(s, 1, i) \o <<x>> \o SubSeq(s, i + 1, Len(s))
 
 NewEntry(m, a) ==
@@ -100,7 +110,7 @@ NewEntry(m, a) ==
    aborted |-> FALSE, withdrawable |-> a.withdrawable, holdable |-> a.holdable,
    promoted |-> a.kind = "promoted"]
 
-\* messageQueue.ts:679-861 addInternal (+ :869-884 promotion).
+\* messageQueue.ts addInternal (+ promoteAheadOfHiddenTurnEndPredecessors).
 Enqueue(m, a) ==
   LET tail == entries[Len(entries)]
       batch == /\ entries # <<>>
@@ -110,28 +120,35 @@ Enqueue(m, a) ==
   IN IF batch
        THEN entries' = [entries EXCEPT ![Len(entries)] =
                           [@ EXCEPT !.msgs = Append(@, m),
-                                    !.mode = IF a.mode = "tool" THEN "tool" ELSE @]]  \* :739-743
+                                    !.mode = IF a.mode = "tool" THEN "tool" ELSE @]]  \* :754-758
        ELSE LET e == NewEntry(m, a)
             IN IF a.kind = "promoted"
-                 THEN entries' = InsertAt(entries, RunStart(entries, Len(entries)), e)
+                 THEN entries' = InsertAt(entries,
+                                          IF Mutant = "trailingRun"
+                                            THEN RunStart(entries, Len(entries))
+                                            ELSE PromoteAt(entries), e)
                  ELSE entries' = Append(entries, e)
 
-\* workspaceService.ts:14993-14996: queue only while the session is busy; otherwise the send
-\* starts its turn directly (AgentSession.sendMessage), whatever is queued.
+\* workspaceService.ts sendMessage `shouldQueue`: queue while the session is busy or still holds
+\* dispatchable queued work (hasQueuedMessages); an idle session with queued work then drains
+\* (drainQueuedMessagesIfIdle). Otherwise the send starts its turn directly
+\* (AgentSession.sendMessage). Mutant "directSend": the pre-fix rule, which queued only while
+\* busy (finding F2).
 Send ==
   /\ sent < N
   /\ \E a \in Attrs :
        LET m == sent + 1 IN
        /\ sent' = m
        /\ attr' = [attr EXCEPT ![m] = a]
-       /\ IF phase = "idle"
+       /\ IF phase = "idle" /\ (NextIdx = 0 \/ Mutant = "directSend")
             THEN /\ dispatched' = Append(dispatched, m)
                  /\ phase' = "streaming"
                  /\ owed' = FALSE
-                 /\ UNCHANGED entries
+                 /\ UNCHANGED <<entries, drainPending>>
             ELSE /\ Enqueue(m, a)
+                 /\ drainPending' = (drainPending \/ phase = "idle")
                  /\ UNCHANGED <<dispatched, phase, owed>>
-       /\ UNCHANGED <<removed, drainPending, decision, decisions>>
+       /\ UNCHANGED <<removed, decision, decisions>>
 
 \* A tool boundary where the stop condition sees a tool-end next entry: the stream ends and
 \* its stream-end drains the queue (agentSession.ts:9150 sendQueuedMessages("terminal")).
@@ -223,7 +240,7 @@ Seqify(S) == \* the elements of a finite set of indices, ascending
              IN Append(prev, CHOOSE x \in rest : \A y \in rest : x <= y)
   IN F[Cardinality(S)]
 
-\* messageQueue.ts:591-611 setVisibleQueueDispatchMode: user entries take the mode and move
+\* messageQueue.ts:605-625 setVisibleQueueDispatchMode: user entries take the mode and move
 \* to the head, keeping their order.
 SetVisibleMode ==
   /\ AllowReorder
@@ -235,7 +252,7 @@ SetVisibleMode ==
                      \o [k \in 1..Len(hs) |-> entries[hs[k]]]
   /\ UNCHANGED <<sent, attr, phase, dispatched, removed, drainPending, decision, decisions, owed>>
 
-\* messageQueue.ts:1120-1131 prioritizeNextUserEntry (Send now), then sendQueuedMessages.
+\* messageQueue.ts:1137-1148 prioritizeNextUserEntry (Send now), then sendQueuedMessages.
 SendNow ==
   /\ AllowReorder
   /\ UserIdx # {}
@@ -276,14 +293,15 @@ UserOrder ==
 \* for the pending report decision (whose resolution drains).
 NoStrandedQueue == (phase = "idle" /\ entries # <<>> /\ ~drainPending) => decision
 
-\* A promoted tool-end entry is never kept behind a hidden turn-end entry, except behind a
-\* user-authored entry (the user's choice governs, messageQueue.ts:170-176).
+\* A promoted tool-end entry is never kept behind a live hidden turn-end entry, except behind a
+\* user-authored entry, withdrawn or not: promotion never passes one (the user's choice governs,
+\* messageQueue.ts:170-176).
 PromotedNotBlockedByHidden ==
   \A j \in 1..Len(entries) :
     (entries[j].promoted /\ Live(entries[j])) =>
       \A i \in 1..(j - 1) :
         (Live(entries[i]) /\ ~entries[i].user /\ entries[i].mode = "turn") =>
-          \E k \in (i + 1)..(j - 1) : entries[k].user /\ Live(entries[k])
+          \E k \in (i + 1)..(j - 1) : entries[k].user
 
 \* A stream cut for a queued entry is continued by a successor turn.
 QueueCutPreserved == (phase = "idle" /\ entries = <<>> /\ ~drainPending) => ~owed

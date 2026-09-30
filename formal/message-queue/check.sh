@@ -3,7 +3,7 @@
 # expected outcome. TLC exit codes: 0 = no error, 12 = invariant violated,
 # 13 = temporal property violated.
 #
-# Usage: formal/message-queue/check.sh   (about 6 minutes, 8 workers)
+# Usage: formal/message-queue/check.sh   (about 10 minutes, 8 workers)
 # Needs `tlc` on PATH or TLC=/path/to/tlc.
 set -euo pipefail
 
@@ -17,11 +17,13 @@ runs=(
   $'MQ_safety\t0'
   $'MQ_liveness\t0'
   $'MQ_userorder_nohold\t0'
-  $'MQ_userorder\t12'
-  $'MQ_promoted\t12'
+  $'MQ_userorder\t0'
+  $'MQ_promoted\t0'
   $'MQ_queuecut\t12'
   $'MQ_mutant_nodequeue\t12'
   $'MQ_mutant_nodrain\t12'
+  $'MQ_mutant_trailingrun\t12'
+  $'MQ_mutant_directsend\t12'
 )
 
 status=0
