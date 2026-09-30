@@ -259,7 +259,7 @@ describe("buildProviderOptions - Anthropic", () => {
     const betweenTools = {
       anthropic: {
         disableParallelToolUse: false,
-        sendReasoning: false,
+        sendReasoning: true,
         thinking: { type: "between_tools" },
         effort: "low",
       },
@@ -316,7 +316,27 @@ describe("buildProviderOptions - Anthropic", () => {
       }
     });
 
-    test("the SDK sends the between_tools shape and strips replayed thinking blocks", async () => {
+    test("pins the effort for headless callers that pass the history", () => {
+      const earlierHigh = [
+        createMuxMessage("u", "user", "question"),
+        createMuxMessage("a", "assistant", "answer", { thinkingLevel: "high" }),
+      ];
+      expect(
+        buildProviderOptions(
+          sonnet55,
+          "off",
+          earlierHigh,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          directConfig(),
+          "anthropic"
+        )
+      ).toEqual(optionsFor(sonnet55, "low", directConfig(), "anthropic"));
+    });
+
+    test("the SDK sends the between_tools shape", async () => {
       const bodies: Array<Record<string, unknown>> = [];
       const captureFetch = Object.assign(
         (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -330,46 +350,24 @@ describe("buildProviderOptions - Anthropic", () => {
         },
         { preconnect: fetch.preconnect.bind(fetch) }
       );
-      // An earlier Sonnet 5.5 turn left a signed thinking block. After an edit (or a
-      // system/tools change) its prefix no longer matches, and between_tools cannot
-      // carry block_binding, so the block must not be replayed.
-      const messages: Parameters<typeof generateText>[0]["messages"] = [
-        { role: "user", content: "first question (edited)" },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "reasoning",
-              text: "earlier thinking",
-              providerOptions: { anthropic: { signature: "sig-earlier" } },
-            },
-            { type: "text", text: "earlier answer" },
-          ],
-        },
-        { role: "user", content: "follow-up" },
-      ];
       const send = async (level: "off" | "low") => {
         await generateText({
           model: createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-sonnet-5-5"),
-          messages,
+          prompt: "Return ok.",
           providerOptions: optionsFor(sonnet55, level, directConfig(), "anthropic") as Parameters<
             typeof generateText
           >[0]["providerOptions"],
           maxRetries: 0,
         });
         const body = bodies[bodies.length - 1];
-        const blocks = (body.messages as Array<{ content: Array<{ type: string }> }>).flatMap(
-          (message) => message.content.filter((block) => block.type === "thinking")
-        );
-        return { thinking: body.thinking, outputConfig: body.output_config, blocks: blocks.length };
+        return { thinking: body.thinking, outputConfig: body.output_config };
       };
 
+      // No display, budget_tokens or block_binding: the API rejects each with it.
       expect(await send("off")).toEqual({
         thinking: { type: "between_tools" },
         outputConfig: { effort: "low" },
-        blocks: 0,
       });
-      // The low adaptive fallback keeps replaying the block, guarded by drop_block.
       expect(await send("low")).toEqual({
         thinking: {
           type: "adaptive",
@@ -377,7 +375,6 @@ describe("buildProviderOptions - Anthropic", () => {
           block_binding: { prefix_mismatch_behavior: "drop_block" },
         },
         outputConfig: { effort: "low" },
-        blocks: 1,
       });
     });
   });

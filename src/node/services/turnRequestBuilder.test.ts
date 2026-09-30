@@ -486,12 +486,17 @@ describe("TurnRequestBuilder model attempt preparation", () => {
       const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off");
       expect(rebuilt?.effectiveLevel).toBe("low");
       expect(rebuilt?.providerOptions.anthropic).toMatchObject({
-        sendReasoning: true,
         thinking: { type: "adaptive", display: "summarized" },
         effort: "low",
       });
       // Already at low: "off" resolves to the same level, so nothing is rebuilt.
       expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
+      // A pre-stream override (before any provider call) looks only at the history.
+      const folded = prepared.computeRebuiltProviderOptions("off", "medium", true);
+      expect(folded?.effectiveLevel).toBe("off");
+      expect(folded?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+      });
     } finally {
       await harness.cleanup();
     }

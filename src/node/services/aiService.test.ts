@@ -3640,13 +3640,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       name: "a conversation that stayed at effort low",
       priorLevels: ["off", "low"] as const,
       expectedLevel: "off",
-      expectedAnthropic: { sendReasoning: false, thinking: { type: "between_tools" } },
+      expectedAnthropic: { thinking: { type: "between_tools" } },
     },
     {
       name: "a conversation whose effort changed earlier",
       priorLevels: ["off", "high"] as const,
       expectedLevel: "low",
-      expectedAnthropic: { sendReasoning: true, thinking: { type: "adaptive" } },
+      expectedAnthropic: { thinking: { type: "adaptive" } },
     },
   ])("maps Sonnet 5.5 'off' for $name", async (testCase) => {
     using xumHome = new DisposableTempDir("ai-service-between-tools");

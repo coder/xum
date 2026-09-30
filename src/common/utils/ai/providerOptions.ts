@@ -40,6 +40,7 @@ import {
 import {
   isGeminiFlashMinimalRejectingModelName,
   isGeminiFlashThinkingLevelModelName,
+  assistantThinkingLevels,
   resolveBetweenToolsThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import {
@@ -408,14 +409,14 @@ export function buildProviderOptions(
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
   // Sonnet 5.5 "off" is `between_tools` only for the Anthropic payload on an eligible
-  // route; elsewhere it runs as "low" adaptive. The turn path already applied the
-  // effort pin; this pass covers headless callers.
+  // route and with the effort pinned; elsewhere it runs as "low" adaptive. The turn
+  // path already resolved this; the pass covers headless callers (e.g. compaction).
   const effectiveThinking = resolveBetweenToolsThinkingLevel(
     capabilityModel,
     thinkingLevel,
     formatProvider === "anthropic" &&
       anthropicBetweenToolsRouteAvailable(modelString, routeProvider, providersConfig),
-    []
+    assistantThinkingLevels(messages ?? [])
   );
 
   log.debug("buildProviderOptions", {
@@ -507,11 +508,7 @@ export function buildProviderOptions(
 
       const anthropicOptions: AnthropicProviderOptions = {
         disableParallelToolUse: false,
-        // `between_tools` cannot carry blockBinding, and Xum's replay is not append-only
-        // (see above), so a replayed block with a changed prefix would 400 on enforced
-        // accounts. Replay none: #5086's "strip from the edited turn onward", applied to
-        // every turn, since a system prompt or tools change edits every block's prefix.
-        sendReasoning: thinking?.type !== "between_tools",
+        sendReasoning: true,
         ...(thinking && { thinking }),
         effort: effortLevel,
       };

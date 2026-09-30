@@ -13,6 +13,7 @@
  */
 
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { MuxMessage } from "@/common/types/message";
 import {
   THINKING_LEVELS,
   DEFAULT_THINKING_LEVEL,
@@ -366,6 +367,15 @@ export function resolveEffectiveThinkingLevel(
     isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
+}
+
+/** Levels recorded on the assistant turns of a request history (undefined for other rows). */
+export function assistantThinkingLevels(
+  messages: readonly MuxMessage[]
+): Array<ThinkingLevel | undefined> {
+  return messages.map((message) =>
+    message.role === "assistant" ? message.metadata?.thinkingLevel : undefined
+  );
 }
 
 /**
