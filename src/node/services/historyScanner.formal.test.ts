@@ -579,8 +579,8 @@ describe("provider history privacy findings", () => {
     for (let seed = 1; seed <= 60; seed++) {
       const random = mulberry32(seed);
       // Escaping every unit and putting an escaped separator between units makes the key token
-      // longer than the token probe's retained overlap, so at a chunk edge inside the key only the
-      // raw probe finds the marker.
+      // as long as it gets; before #5324 that exceeded the token probe's retained overlap, so at a
+      // chunk edge inside the key only the raw probe found the marker.
       const variant = random();
       const core =
         variant < 0.35
@@ -600,6 +600,28 @@ describe("provider history privacy findings", () => {
       expect(ids, `seed ${seed}`).toEqual(["new"]);
     }
     expect(floors).toBeGreaterThan(20);
+  }, 120_000);
+
+  // #5324 gap 1: escaping every unit with an escaped separator in each gap makes the key token
+  // about 630 canonical characters, longer than the old 173-character retained overlap. Split over
+  // unreadable rows only the token probe sees it, so every chunk edge in the run must still floor.
+  test("the widest escaped marker fragmented over unreadable rows floors at every chunk edge", async () => {
+    const core = `{bad ${widestEscapedMarker} tail`;
+    const third = Math.floor(core.length / 3);
+    const fragments = [core.slice(0, third), core.slice(third, 2 * third), core.slice(2 * third)];
+    expect(hasRawResetMarker(fragments.join(""))).toBe(true);
+    const coreStart = bytes(message("old")) + 1;
+    const before = coreStart + bytes(fragments.join("\n")) + 1;
+    const misses: number[] = [];
+    for (let target = coreStart; target <= before; target += 7) {
+      const ids = await providerIds([
+        message("old"),
+        ...fragments,
+        newestRowForEdge(before, target),
+      ]);
+      if (ids.join() !== "new") misses.push(target - coreStart);
+    }
+    expect(misses).toEqual([]);
   }, 120_000);
 
   test("F2 property: a raw reset marker fragmented over unreadable rows floors the read", async () => {
