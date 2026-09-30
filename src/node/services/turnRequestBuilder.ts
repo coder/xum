@@ -3324,8 +3324,7 @@ export class TurnRequestBuilder {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           // Prompt-prefix change attribution (#5254): compaction requests carry
           // their own prompt and must not move the live-turn baseline.
-          agentId: effectiveAgentId,
-          liveTurn: !isCompactionRequest,
+          promptPrefixContext: { agentId: effectiveAgentId, liveTurn: !isCompactionRequest },
         });
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,

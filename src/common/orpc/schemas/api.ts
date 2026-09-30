@@ -3104,6 +3104,20 @@ const DevToolsStepSchema = z.object({
   responseHeaders: z.record(z.string(), z.string()).nullable(),
   rawResponse: z.unknown().nullable(),
   rawChunks: z.unknown().nullable(),
+  // #5254: optional, so records from older binaries still validate.
+  promptPrefix: z
+    .object({
+      toolsHash: z.string(),
+      systemPrefixHash: z.string(),
+      systemTailHash: z.string().nullable(),
+      change: z
+        .object({
+          components: z.array(z.string()),
+          expected: z.enum(["model-switch", "agent-switch"]).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 const DevToolsRunSummarySchema = z.object({

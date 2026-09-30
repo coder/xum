@@ -43,12 +43,17 @@ describe("diffPromptPrefix (#5254)", () => {
     {
       label: "a moved cache marker",
       next: [fn("a"), fn("b", { providerOptions: cached }), fn("c")],
-      components: ["tool-options"],
+      components: ["tool-options:b", "tool-options:c"],
     },
     {
       label: "other provider options",
       next: [fn("a", { providerOptions: { anthropic: { deferLoading: true } } }), fn("b"), base[2]],
-      components: ["tool-options"],
+      components: ["tool-options:a"],
+    },
+    {
+      label: "options changed together with a description",
+      next: [fn("a", { description: "new" }), fn("b", { providerOptions: cached }), fn("c")],
+      components: ["tool-description:a", "tool-options:b", "tool-options:c"],
     },
   ])("reports $label", ({ next, components }) => {
     expect(diffPromptPrefix(fingerprint(base), fingerprint(next))).toEqual(components);

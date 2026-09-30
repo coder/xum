@@ -296,7 +296,7 @@ describe("createDevToolsMiddleware", () => {
       rawChunks: null,
     });
 
-    createDevToolsMiddleware("ws-1", service);
+    createDevToolsMiddleware("ws-1", service, "test:model");
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     const runWithSteps = await service.getRunWithSteps("ws-1", "run-1");
@@ -310,7 +310,7 @@ describe("createDevToolsMiddleware", () => {
   describe("wrapGenerate", () => {
     it("records a run + step for successful generate calls", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
       const model = createMockModel();
       const params = createMockParams();
@@ -385,7 +385,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("records error when doGenerate throws and rethrows", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
       const failure = new Error("generate failed");
 
@@ -418,7 +418,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("records the redacted request body when the provider rejects before responding", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
       const params = createMockParams();
       const failure = new Error("400 invalid_encrypted_content");
@@ -441,7 +441,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("passes through result unmodified", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
       const expectedResult = createGenerateResult();
 
@@ -457,7 +457,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("is a no-op when service is disabled", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: false }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
       const expectedResult = createGenerateResult();
       let callCount = 0;
@@ -481,7 +481,7 @@ describe("createDevToolsMiddleware", () => {
   describe("wrapStream", () => {
     it("records streamed output plus raw provider chunks on flush", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
 
       const rawChunkValue = {
@@ -565,7 +565,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("does not forward raw chunks when includeRawChunks was not requested", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
 
       const rawValue = { event: "response.output_text.delta", data: "hidden" };
@@ -606,7 +606,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("forwards raw chunks when includeRawChunks was explicitly requested", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
 
       const rawValue = { event: "response.output_text.delta", data: "visible" };
@@ -651,7 +651,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("records tool calls from stream chunks", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
 
       const chunks: LanguageModelV4StreamPart[] = [
@@ -705,7 +705,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("records the redacted request body when the stream is rejected before it starts", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const params = createMockParams();
       const failure = new Error("400 invalid_encrypted_content");
@@ -728,7 +728,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("drops the captured body on abort even when the fetch never settles", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const controller = new AbortController();
       const params = { ...createMockParams(), abortSignal: controller.signal };
@@ -763,7 +763,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("keeps no body when the provider reaches fetch only after the abort", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const controller = new AbortController();
       controller.abort();
@@ -798,7 +798,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("records 'Request aborted' on stream cancel", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
 
       const neverEndingStream = new ReadableStream<LanguageModelV4StreamPart>({
@@ -837,7 +837,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("finalizes step as aborted when AbortSignal fires during stream", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const abortController = new AbortController();
 
@@ -877,7 +877,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("leaves no closed-step mark behind when a started stream is aborted", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const abortController = new AbortController();
       const params = { ...createMockParams(), abortSignal: abortController.signal };
@@ -903,7 +903,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("does not double-finalize when abort fires after normal completion", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapStream = getWrapStream(middleware);
       const abortController = new AbortController();
 
@@ -942,7 +942,7 @@ describe("createDevToolsMiddleware", () => {
 
     it("multiple steps in one middleware instance share the same runId", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
-      const middleware = createDevToolsMiddleware("ws-1", service);
+      const middleware = createDevToolsMiddleware("ws-1", service, "test:model");
       const wrapGenerate = getWrapGenerate(middleware);
 
       await wrapGenerate({
@@ -1020,19 +1020,23 @@ describe("prompt-prefix fingerprints (#5254)", () => {
     };
   }
 
-  // One middleware per request, like providerModelFactory: each is its own run.
-  async function generate(
-    service: DevToolsService,
-    params: LanguageModelV4CallOptions,
-    runMetadata: { agentId?: string; liveTurn?: boolean }
-  ) {
+  function metadataIdOf(params: LanguageModelV4CallOptions): string {
     const metadataId = params.headers?.[DEVTOOLS_RUN_METADATA_ID_HEADER];
     if (typeof metadataId !== "string") throw new Error("expected a run metadata id");
-    service.setPendingRunMetadata("ws-1", metadataId, runMetadata);
-    await getWrapGenerate(createDevToolsMiddleware("ws-1", service))({
+    return metadataId;
+  }
+
+  // One middleware per model attempt, like providerModelFactory: each is its own run.
+  async function attempt(
+    service: DevToolsService,
+    params: LanguageModelV4CallOptions,
+    modelString = "anthropic:model"
+  ) {
+    await getWrapGenerate(createDevToolsMiddleware("ws-1", service, modelString))({
       doGenerate: () => Promise.resolve(createGenerateResult()),
       doStream: () => Promise.reject(new Error("doStream should not be called")),
       params,
+      // Same bare SDK model id for every route: only the model string tells them apart.
       model: createMockModel(),
     });
     const runs = await service.getRuns("ws-1");
@@ -1041,11 +1045,27 @@ describe("prompt-prefix fingerprints (#5254)", () => {
     return run?.steps[0]?.promptPrefix;
   }
 
+  // A whole request: metadata registered up front and cleared at the end, like aiService.
+  async function generate(
+    service: DevToolsService,
+    params: LanguageModelV4CallOptions,
+    context: { agentId: string; liveTurn: boolean },
+    modelString?: string
+  ) {
+    const metadataId = metadataIdOf(params);
+    service.setPendingRunMetadata("ws-1", metadataId, { promptPrefixContext: context });
+    try {
+      return await attempt(service, params, modelString);
+    } finally {
+      service.clearPendingRunMetadata("ws-1", metadataId);
+    }
+  }
+
   it("computes nothing while API debug logs are off", async () => {
     const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: false }));
     const fingerprint = spyOn(promptPrefixFingerprint, "fingerprintPromptPrefix");
     let called = false;
-    await getWrapGenerate(createDevToolsMiddleware("ws-1", service))({
+    await getWrapGenerate(createDevToolsMiddleware("ws-1", service, "test:model"))({
       doGenerate: () => {
         called = true;
         return Promise.resolve(createGenerateResult());
@@ -1098,5 +1118,78 @@ describe("prompt-prefix fingerprints (#5254)", () => {
     await service.clear("ws-1");
     const afterClear = await generate(service, prefixParams({ metadataId: "m5" }), live);
     expect(afterClear?.change).toBeUndefined();
+  });
+
+  it("classifies a refusal-fallback attempt by its selected model string", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+    await generate(service, prefixParams({ metadataId: "m1" }), live, "anthropic:model");
+
+    // One request, two attempts under the same metadata ID: the fallback route
+    // shares the bare SDK model id but is a different selected model.
+    const refusedParams = prefixParams({ metadataId: "m2", readDescription: "Read any file" });
+    const fallbackParams = prefixParams({
+      metadataId: "m2",
+      readDescription: "Read any file",
+      tail: "Fallback route",
+    });
+    service.setPendingRunMetadata("ws-1", "m2", { promptPrefixContext: live });
+    const refused = await attempt(service, refusedParams, "anthropic:model");
+    const fallback = await attempt(service, fallbackParams, "coder:anthropic/model");
+    service.clearPendingRunMetadata("ws-1", "m2");
+    expect(refused?.change).toEqual({ components: ["tool-description:file_read"] });
+    expect(fallback?.change).toEqual({
+      components: ["system-tail-only"],
+      expected: "model-switch",
+    });
+
+    // The baseline now sits on the fallback route.
+    const next = await generate(
+      service,
+      prefixParams({ metadataId: "m3", readDescription: "Read any file", tail: "Fallback route" }),
+      live,
+      "coder:anthropic/model"
+    );
+    expect(next?.change).toBeUndefined();
+  });
+
+  it("starts a fresh baseline when debug logging is toggled", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+    await generate(service, prefixParams({ metadataId: "m1" }), live);
+    service.resetPromptPrefixBaselines();
+    const afterToggle = await generate(
+      service,
+      prefixParams({ metadataId: "m2", readDescription: "Read any file" }),
+      live
+    );
+    expect(afterToggle?.change).toBeUndefined();
+  });
+
+  it("keeps the baseline when the step could not be persisted", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+    await generate(service, prefixParams({ metadataId: "m1" }), live);
+
+    const originalAppendFile = fs.appendFile;
+    const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+      if (String(args[1]).includes('"type":"step"')) {
+        throw new Error("ENOSPC: no space left on device");
+      }
+      return originalAppendFile(...args);
+    });
+    try {
+      await generate(service, prefixParams({ metadataId: "m2", tail: "Unlogged" }), live);
+    } finally {
+      appendFileSpy.mockRestore();
+    }
+
+    // Compared with m1, not with the request that never reached the log.
+    const next = await generate(
+      service,
+      prefixParams({ metadataId: "m3", readDescription: "Read any file" }),
+      live
+    );
+    expect(next?.change).toEqual({ components: ["tool-description:file_read"] });
   });
 });

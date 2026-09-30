@@ -14,10 +14,6 @@ export interface DevToolsRun {
    * toggling). Absent on runs recorded by older binaries.
    */
   requestHistorySequence?: number;
-  /** Effective agent of a live turn; a switch explains a prompt-prefix change (#5254). */
-  agentId?: string;
-  /** A user-facing turn (not compaction or a background call): compared for prefix changes. */
-  liveTurn?: boolean;
 }
 
 /** A "step" = a single LLM round-trip within a run. */

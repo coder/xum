@@ -493,6 +493,8 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* atomicPromise(async () => context.config.updateLlmDebugLogs(input.enabled));
+            // Unlogged turns in between would make the old baselines lie (#5254).
+            context.devToolsService.resetPromptPrefixBaselines();
           })
         ),
       updateKeepScreenAwake: t

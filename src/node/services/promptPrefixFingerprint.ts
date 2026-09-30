@@ -77,7 +77,6 @@ export function diffPromptPrefix(
 ): string[] {
   const components: string[] = [];
   if (previous.toolsHash !== next.toolsHash) {
-    const toolComponentsStart = components.length;
     const before = new Map(previous.tools.map((tool) => [tool.name, tool]));
     const after = new Map(next.tools.map((tool) => [tool.name, tool]));
     for (const name of after.keys()) if (!before.has(name)) components.push(`tool-added:${name}`);
@@ -92,9 +91,9 @@ export function diffPromptPrefix(
       if (old == null) continue;
       if (old.description !== tool.description) components.push(`tool-description:${tool.name}`);
       if (old.schema !== tool.schema) components.push(`tool-schema:${tool.name}`);
+      // Includes a moved cache marker.
+      if (old.options !== tool.options) components.push(`tool-options:${tool.name}`);
     }
-    // Only provider options changed (for example a moved cache marker).
-    if (components.length === toolComponentsStart) components.push("tool-options");
   }
   if (previous.systemPrefixHash !== next.systemPrefixHash) components.push("system-prefix");
   else if (previous.systemTailHash !== next.systemTailHash) components.push("system-tail-only");

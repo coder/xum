@@ -266,9 +266,29 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
   };
 }
 
-type PendingRunMetadata = Partial<
-  Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence" | "agentId" | "liveTurn">
->;
+/** Classifies prompt-prefix changes (#5254); never persisted. */
+export interface PromptPrefixRequestContext {
+  agentId: string;
+  /** A user-facing turn (not compaction): compared with, and moves, the baseline. */
+  liveTurn: boolean;
+}
+
+type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">> & {
+  /**
+   * Kept after createRun consumes the run fields, so refusal-fallback hops
+   * (new runs under the same metadata ID) are classified too. Cleared with the
+   * entry when the request ends (clearPendingRunMetadata).
+   */
+  promptPrefixContext?: PromptPrefixRequestContext;
+};
+
+/** A step's fingerprint plus the identity of the attempt that produced it. */
+export interface PromptPrefixObservation {
+  fingerprint: PromptPrefixFingerprint;
+  /** The attempt's selected model string (route identity, not the bare SDK id). */
+  modelString: string;
+  runMetadataId?: string;
+}
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -289,7 +309,7 @@ export class DevToolsService extends EventEmitter {
    */
   private readonly promptPrefixBaselines = new Map<
     string,
-    { fingerprint: PromptPrefixFingerprint; modelId: string; agentId: string | undefined }
+    { fingerprint: PromptPrefixFingerprint; modelString: string; agentId: string }
   >();
   private readonly maxRetainedBytesPerWorkspace: number;
 
@@ -390,8 +410,13 @@ export class DevToolsService extends EventEmitter {
     if (byWorkspace && normalizedMetadataId != null && normalizedMetadataId.length > 0) {
       const pendingMetadata = byWorkspace.get(normalizedMetadataId);
       if (pendingMetadata != null) {
-        Object.assign(run, pendingMetadata);
-        byWorkspace.delete(normalizedMetadataId);
+        const { promptPrefixContext, ...runMetadata } = pendingMetadata;
+        Object.assign(run, runMetadata);
+        if (promptPrefixContext != null) {
+          byWorkspace.set(normalizedMetadataId, { promptPrefixContext });
+        } else {
+          byWorkspace.delete(normalizedMetadataId);
+        }
       }
 
       if (byWorkspace.size === 0) {
@@ -414,7 +439,7 @@ export class DevToolsService extends EventEmitter {
   async createStep(
     workspaceId: string,
     step: DevToolsStep,
-    promptPrefix?: PromptPrefixFingerprint
+    promptPrefix?: PromptPrefixObservation
   ): Promise<void> {
     if (!this.enabled) {
       return;
@@ -425,14 +450,10 @@ export class DevToolsService extends EventEmitter {
 
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
-    if (promptPrefix != null) {
-      step.promptPrefix = this.comparePromptPrefix(
-        workspaceId,
-        data.runs.get(step.runId),
-        step.modelId,
-        promptPrefix
-      );
-    }
+    // Compared now, committed as the baseline only once the step is durable:
+    // a step that failed to persist must not become the comparison point.
+    const prefix = promptPrefix != null ? this.comparePromptPrefix(workspaceId, promptPrefix) : null;
+    if (prefix != null) step.promptPrefix = prefix.recorded;
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
@@ -447,6 +468,7 @@ export class DevToolsService extends EventEmitter {
       // would let the step's finalization write an orphan update into it.
       const clearGeneration = data.clearGeneration;
       await this.appendToFile(workspaceId, json);
+      prefix?.commit();
       if (
         isStepInFlight(step) &&
         this.workspaces.get(workspaceId) === data &&
@@ -495,6 +517,7 @@ export class DevToolsService extends EventEmitter {
         removeRun(data, healedRun.id);
       }
     });
+    prefix?.commit();
 
     if (healedRun !== undefined) {
       this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
@@ -506,26 +529,42 @@ export class DevToolsService extends EventEmitter {
   /** Compares a live turn's prefix with the workspace's previous live request (#5254). */
   private comparePromptPrefix(
     workspaceId: string,
-    run: DevToolsRun | undefined,
-    modelId: string,
-    fingerprint: PromptPrefixFingerprint
-  ): DevToolsPromptPrefix {
-    const { tools: _tools, ...recorded } = fingerprint;
+    observation: PromptPrefixObservation
+  ): { recorded: DevToolsPromptPrefix; commit: () => void } {
+    const { tools: _tools, ...recorded } = observation.fingerprint;
+    const context =
+      observation.runMetadataId == null
+        ? undefined
+        : this.pendingRunMetadata.get(workspaceId)?.get(observation.runMetadataId)
+            ?.promptPrefixContext;
     // Compaction and background calls have their own prompts; they neither
     // compare nor move the live baseline.
-    if (run?.liveTurn !== true) return recorded;
+    if (context?.liveTurn !== true) return { recorded, commit: () => undefined };
+    const commit = () =>
+      this.promptPrefixBaselines.set(workspaceId, {
+        fingerprint: observation.fingerprint,
+        modelString: observation.modelString,
+        agentId: context.agentId,
+      });
     const previous = this.promptPrefixBaselines.get(workspaceId);
-    this.promptPrefixBaselines.set(workspaceId, { fingerprint, modelId, agentId: run.agentId });
-    if (previous == null) return recorded;
-    const components = diffPromptPrefix(previous.fingerprint, fingerprint);
-    if (components.length === 0) return recorded;
+    const components =
+      previous == null ? [] : diffPromptPrefix(previous.fingerprint, observation.fingerprint);
+    if (previous == null || components.length === 0) return { recorded, commit };
     const expected =
-      previous.modelId !== modelId
+      previous.modelString !== observation.modelString
         ? "model-switch"
-        : previous.agentId !== run.agentId
+        : previous.agentId !== context.agentId
           ? "agent-switch"
           : undefined;
-    return { ...recorded, change: { components, ...(expected != null ? { expected } : {}) } };
+    return {
+      recorded: { ...recorded, change: { components, ...(expected != null ? { expected } : {}) } },
+      commit,
+    };
+  }
+
+  /** Called when API debug logging is toggled: a gap in logging voids every baseline. */
+  resetPromptPrefixBaselines(): void {
+    this.promptPrefixBaselines.clear();
   }
 
   async updateStep(
