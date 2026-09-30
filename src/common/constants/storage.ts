@@ -995,8 +995,11 @@ export const TERMINAL_TITLES_MAX_CHARS = 768;
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
-/** workspaceNameState stores at most this much of the creation message it was generated for. */
+/** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
 export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
+/** workspaceNameState stores at most this much (serialized) of a typed manual name. */
+// Valid names are at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
+export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 
 /**
  * Every key's length is capped too. Budgets bound values only: scope ids embed project paths
@@ -1131,7 +1134,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
-  // Creation-draft scopes only; lastGeneratedFor is capped at WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS.
+  // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
+  // plus suffix, title <= 60) + lastGeneratedFor 2000 + manualName 1024 (the caps above).
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
