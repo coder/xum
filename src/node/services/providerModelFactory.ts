@@ -55,6 +55,10 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import {
+  OpenAICyberAccessProgramSchema,
+  type OpenAICyberAccessProgram,
+} from "@/common/types/openaiAccessPrograms";
+import {
   openaiModelSupportsServiceTier,
   openaiServiceTierAvailable,
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
@@ -375,6 +379,19 @@ function withOpenAINoneReasoningEffort(body: Record<string, unknown>): Record<st
   return { ...body, reasoning: { ...reasoning, effort: "none" } };
 }
 
+/** Select a Daybreak access program on Responses bodies; Chat Completions has no such field. */
+function withOpenAICyberAccessProgram(
+  body: Record<string, unknown>,
+  cyber: OpenAICyberAccessProgram
+): Record<string, unknown> {
+  if ("messages" in body) return body;
+  const accessPrograms =
+    typeof body.access_programs === "object" && body.access_programs !== null
+      ? body.access_programs
+      : {};
+  return { ...body, access_programs: { ...accessPrograms, cyber } };
+}
+
 /**
  * Preserve OpenAI request options that @ai-sdk/openai drops by model-name capability
  * checks, without rewriting the raw model/endpoint routing identity.
@@ -382,7 +399,12 @@ function withOpenAINoneReasoningEffort(body: Record<string, unknown>): Record<st
 function createOpenAIModelWithPreservedOptions(
   createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
   baseFetch: typeof fetch,
-  options: { serviceTierAvailable: boolean; wireModelId: string }
+  options: {
+    serviceTierAvailable: boolean;
+    wireModelId: string;
+    /** Only the direct OpenAI API accepts access_programs; other callers strip the key. */
+    cyberAccessProgramAvailable?: boolean;
+  }
 ): LanguageModelV4 {
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
@@ -393,7 +415,6 @@ function createOpenAIModelWithPreservedOptions(
   // runtime code rather than a bun patch because npm installs of the published
   // package would not apply a bun patch.
   const preserveNoneEffort = isGpt6LunaModel(options.wireModelId);
-  if (!options.serviceTierAvailable && !preserveNoneEffort) return model;
 
   const createPreservingCall = (params: LanguageModelV4CallOptions) => {
     const openaiOptions = params.providerOptions?.openai;
@@ -401,7 +422,14 @@ function createOpenAIModelWithPreservedOptions(
       ? ServiceTierSchema.optional().parse(openaiOptions?.serviceTier)
       : undefined;
     const noneEffort = preserveNoneEffort && openaiOptions?.reasoningEffort === "none";
-    if (tier == null && !noneEffort) return undefined;
+    // buildProviderOptions' private Cyber key. @ai-sdk/openai through 4.0.83 has
+    // no access_programs option, so the key never reaches the SDK and is
+    // serialized here, only where the caller allows it.
+    const hasCyberKey = openaiOptions?.cyberAccessProgram !== undefined;
+    const cyber = options.cyberAccessProgramAvailable
+      ? OpenAICyberAccessProgramSchema.optional().parse(openaiOptions?.cyberAccessProgram)
+      : undefined;
+    if (tier == null && !noneEffort && !hasCyberKey) return undefined;
     // The SDK drops tiers for opaque gateway aliases and "none" for GPT-6 IDs.
     // Serialize them after SDK capability checks instead. Per-call adapters keep
     // concurrent requests' overrides independent.
@@ -409,14 +437,20 @@ function createOpenAIModelWithPreservedOptions(
     if (noneEffort) {
       callFetch = wrapFetchWithJsonBodyPatch(callFetch, withOpenAINoneReasoningEffort);
     }
+    if (cyber != null) {
+      callFetch = wrapFetchWithJsonBodyPatch(callFetch, (body) =>
+        withOpenAICyberAccessProgram(body, cyber)
+      );
+    }
+    const { cyberAccessProgram: _cyberKey, ...sdkOpenAIOptions } = openaiOptions ?? {};
     return {
-      model: createModel(callFetch),
+      model: callFetch === baseFetch ? model : createModel(callFetch),
       params: {
         ...params,
         providerOptions: {
           ...params.providerOptions,
           openai: {
-            ...openaiOptions,
+            ...sdkOpenAIOptions,
             ...(tier != null && { serviceTier: undefined }),
             // Omit it from SDK options so the SDK does not emit an unsupported warning.
             ...(noneEffort && { reasoningEffort: undefined }),
@@ -2061,6 +2095,8 @@ export class ProviderModelFactory {
               serviceTierAvailable:
                 !shouldRouteThroughCodexOauth && serviceTierAvailable && isMappedAlias,
               wireModelId: modelId,
+              // Codex OAuth's ChatGPT backend is not the API the Daybreak program covers.
+              cyberAccessProgramAvailable: !shouldRouteThroughCodexOauth,
             }
           );
           const model =

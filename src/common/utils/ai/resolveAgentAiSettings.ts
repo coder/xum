@@ -257,11 +257,9 @@ export function resolveAgentAiSettings(
 
   const proAvailable =
     input.proModeAvailable ?? openaiProModeAvailable(model.value, { providersConfig });
-  const cyberAvailable =
-    input.cyberModeAvailable ?? openaiCyberModeAvailable(model.value, { providersConfig });
   const effectiveReasoning =
     (reasoning?.value === "pro" && !proAvailable) ||
-    (reasoning?.value === "cyber" && !cyberAvailable)
+    (reasoning?.value === "cyber" && !openaiCyberModeAvailable(model.value, { providersConfig }))
       ? undefined
       : reasoning?.value;
 
