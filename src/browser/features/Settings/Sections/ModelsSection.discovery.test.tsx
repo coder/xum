@@ -451,6 +451,19 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(ui.input.value).toBe("");
   });
 
+  test("a failed search retires the previous query's matches", async () => {
+    const ui = await setup("openai", null, {
+      catalog: (input) =>
+        input.query === "fable" ? searchModelCatalog(input) : Promise.reject(new Error("offline")),
+    });
+    ui.open();
+    await ui.type("fable");
+    await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    await ui.user.type(ui.input, "x");
+    await act(() => Promise.resolve());
+    expect(ui.view.queryAllByRole("option").length).toBe(0);
+  });
+
   test.each<ProviderModelDiscoveryResult>([
     { status: "not-configured" },
     { status: "ok", modelIds: [] },

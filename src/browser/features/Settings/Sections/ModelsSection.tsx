@@ -298,13 +298,18 @@ export function ModelsSection() {
             });
           }
         },
-        // Catalogue suggestions are optional; manual entry and discovery still work.
-        () => undefined
+        // Catalogue suggestions are optional; manual entry and discovery still
+        // work. A failed search still retires the previous query's matches.
+        () => {
+          if (!controller.signal.aborted) {
+            setCatalog(null);
+          }
+        }
       );
     return () => controller.abort();
   }, [api, suggestionsSession, catalogQuery, effectivePolicy]);
 
-  // Previous-query matches stay visible until the new reply lands to avoid
+  // Previous-query matches stay visible until the new search settles to avoid
   // flicker while typing; a new session, client, or policy revokes them.
   const activeCatalog =
     catalogQueryActive &&
