@@ -134,9 +134,11 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
   // the final assembled-payload preflight remains authoritative before dispatch.
   // Contract (#5223): a stage prompt is delivered as a new turn, so a stage opens when the full
-  // estimate of that turn's request crosses the stage point, and only while that estimate plus
-  // the stage's reserve still fits under the ceiling. Every published prompt is then deliverable.
-  // Settlement passes that estimate and the send carries it, so both open the same stage.
+  // estimate of the next request, as known at settlement, crosses the stage point, and only while
+  // that estimate plus the stage's reserve still fits under the ceiling. Settlement passes that
+  // estimate and the send carries it, so both open the same stage. Instruction-file or system
+  // prompt growth during the turn is not reflected; the turn-start check remains the backstop
+  // (forced rollover, as before #5223). Deciding from the built turn request is #5286.
   // Settlement omits it (a full recount) only when no stage is still open, where it cannot change
   // the decision.
   const nextTurn = input.nextTurnRequestTokens ?? 0;
