@@ -8,8 +8,8 @@ import * as path from "path";
  * (backend refuses when off), one-run-at-a-time-per-workspace locking
  * (concurrent invocations are REJECTED, not queued — an explicit /refine has
  * nothing to gain from running twice over the same trajectory), trajectory
- * assembly (recent chat.jsonl + timeline events), model resolution, journal-row correlation, and the completion chat
- * message.
+ * assembly (recent chat.jsonl + timeline events), model resolution,
+ * journal-row correlation, and the completion chat message.
  *
  * v1 tradeoff (intentional, no proposal/approval UI): edits are auto-applied
  * and the summary row points at the r6 rollback paths ("bun run debug

@@ -1651,10 +1651,10 @@ export class TurnRequestBuilder {
       ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
       : null;
 
-    // Tier-1 plugin hooks: reconcile discovered
-    // hooks.js modules with the event spine BEFORE request assembly so both
-    // request.assemble and tool.execute middleware are in place for this
-    // turn. Failure posture: a broken plugin never blocks a send.
+    // Tier-1 plugin hooks: reconcile discovered hooks.js modules with the
+    // event spine BEFORE request assembly so both request.assemble and
+    // tool.execute middleware are in place for this turn. Failure posture: a
+    // broken plugin never blocks a send.
     if (!requestAssemblySnapshot) {
       await prepareWorkspaceRequestHooks({
         config: this.dependencies.config,

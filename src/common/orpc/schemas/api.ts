@@ -1128,7 +1128,7 @@ export const mcp = {
 };
 
 /**
- * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ * Managed Agent Plugin installs (global scope only).
  *
  * Human-driven surfaces only (Settings + palette) — there is deliberately no
  * agent-facing installer tool in v1. All endpoints return Result values; the

@@ -38,8 +38,8 @@ describe("discoverWorkflowScripts (agent plugins)", () => {
       projectTrusted: true,
     };
 
-    const withPlugins = await discoverWorkflowScripts(input);
-    const pluginEntry = withPlugins.find(
+    const discovered = await discoverWorkflowScripts(input);
+    const pluginEntry = discovered.find(
       (workflow) => workflow.scriptPath === "plugin://my-unique-fixture-plugin/release.js"
     );
     expect(pluginEntry).toBeDefined();

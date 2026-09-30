@@ -1354,9 +1354,9 @@ describe("agentSkillsService", () => {
   });
 });
 
-// Agent Plugins: plugin skills join discovery at the
-// lowest per-scope precedence. See src/node/services/agentPlugins/ for the
-// container/manifest layer.
+// Agent Plugins: plugin skills join discovery at the lowest per-scope
+// precedence. See src/node/services/agentPlugins/ for the container/manifest
+// layer.
 describe("agentSkillsService agent plugins", () => {
   const PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -1636,22 +1636,22 @@ describe("agentSkillsService agent plugins", () => {
     using project = new DisposableTempDir("agent-skills-plugin-roots");
     const runtime = new LocalRuntime(project.path);
 
-    const onRoots = getDefaultAgentSkillsRoots(runtime, project.path);
-    expect(onRoots.projectPluginRoots).toEqual([
+    const roots = getDefaultAgentSkillsRoots(runtime, project.path);
+    expect(roots.projectPluginRoots).toEqual([
       path.join(project.path, ".xum", "plugins"),
       path.join(project.path, ".mux", "plugins"),
       path.join(project.path, ".agents", "plugins"),
     ]);
-    expect(onRoots.globalPluginRoots).toEqual(["~/.xum/plugins", "~/.agents/plugins"]);
+    expect(roots.globalPluginRoots).toEqual(["~/.xum/plugins", "~/.agents/plugins"]);
   });
 
   test("getDefaultAgentSkillsRoots never includes plugin containers for remote runtimes", () => {
     using project = new DisposableTempDir("agent-skills-plugin-remote");
     const runtime = new RemotePathMappedRuntime(project.path, "/remote/workspace");
 
-    const onRoots = getDefaultAgentSkillsRoots(runtime, "/remote/workspace");
-    expect(onRoots.projectPluginRoots).toBeUndefined();
-    expect(onRoots.globalPluginRoots).toBeUndefined();
+    const roots = getDefaultAgentSkillsRoots(runtime, "/remote/workspace");
+    expect(roots.projectPluginRoots).toBeUndefined();
+    expect(roots.globalPluginRoots).toBeUndefined();
   });
 
   test("default discovery (no containment options) rejects project plugins symlinked outside the checkout", async () => {

@@ -450,8 +450,8 @@ interface StreamRequestConfig {
   toolPolicy?: ToolPolicy;
   /**
    * Tool-search deferral state. Owned and mutated by
-   * aiService/tool_catalog_search.execute; prepareStep reads it each step to compute
-   * `activeTools`. Absent when the feature is inactive.
+   * aiService/tool_catalog_search.execute; prepareStep reads it each step to
+   * compute `activeTools`. Absent when the feature is inactive.
    */
   toolSearchState?: ToolSearchStreamState;
   /**
@@ -2934,9 +2934,9 @@ export class StreamManager {
           stepTracker.latestMessages = effectiveMessages;
         }
         request.onStepMessages?.(effectiveMessages);
-        // Tool search: scope the advertised tool list
-        // to core tools + activated deferred tools. Read per step so tools
-        // activated by tool_catalog_search.execute appear on the following step.
+        // Tool search: scope the advertised tool list to core tools +
+        // activated deferred tools. Read per step so tools activated by
+        // tool_catalog_search.execute appear on the following step.
         // undefined when the feature is inactive, keeping the return value
         // byte-identical to the pre-feature behavior.
         const searchedActiveTools = computeActiveToolNames(request.toolSearchState);

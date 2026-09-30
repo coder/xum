@@ -410,8 +410,8 @@ export interface ToolConfiguration {
     abortSignal: AbortSignal;
   };
   /**
-   * Runtime holder for the tool_catalog_search tool (tool-search experiment; present
-   * only when the experiment is enabled and MCP tools exist for this stream).
+   * Runtime holder for the tool_catalog_search tool (present only when tool
+   * search is enabled and MCP tools exist for this stream).
    * `state` is assigned by aiService after policy filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;

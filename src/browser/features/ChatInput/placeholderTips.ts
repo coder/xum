@@ -97,15 +97,14 @@ function isStorybookRuntime(): boolean {
  * baselines are insulated from tip-list reordering.
  */
 export function getPlaceholderTip(): string {
-  const tips = PLACEHOLDER_TIPS;
   if (isStorybookRuntime()) {
-    return tips[STORYBOOK_PINNED_TIP_INDEX];
+    return PLACEHOLDER_TIPS[STORYBOOK_PINNED_TIP_INDEX];
   }
   const ts = Date.now();
   if (!Number.isFinite(ts) || ts < 0) {
-    return tips[0];
+    return PLACEHOLDER_TIPS[0];
   }
   const bucket = Math.floor(ts / TIP_ROTATION_INTERVAL_MS);
-  const index = bucket % tips.length;
-  return tips[index];
+  const index = bucket % PLACEHOLDER_TIPS.length;
+  return PLACEHOLDER_TIPS[index];
 }

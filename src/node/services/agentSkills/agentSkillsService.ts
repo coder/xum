@@ -64,8 +64,8 @@ const UNIVERSAL_SKILLS_ROOT = "~/.agents/skills";
 // Claude Code compatibility roots (claude-skills-compat experiment): discovery-only,
 // lowest precedence within each scope. Write tools never target these roots.
 const CLAUDE_SKILLS_ROOT = "~/.claude/skills";
-// Agent Plugins containers: discovery-only, host-local,
-// lowest precedence within each scope. Write tools never target plugin roots.
+// Agent Plugins containers: discovery-only, host-local, lowest precedence
+// within each scope. Write tools never target plugin roots.
 const UNIVERSAL_PLUGINS_ROOT = UNIVERSAL_AGENT_PLUGINS_CONTAINER;
 
 export interface AgentSkillsRoots {
@@ -216,8 +216,8 @@ interface AgentSkillScanCandidate {
 }
 
 /**
- * Agent Plugins: expand plugin container dirs into
- * per-plugin `skills/` scan candidates. Host-local filesystem only (v1).
+ * Agent Plugins: expand plugin container dirs into per-plugin `skills/` scan
+ * candidates. Host-local filesystem only (v1).
  */
 async function buildPluginScanCandidates(args: {
   containers: string[];

@@ -309,9 +309,6 @@ function collectExperiments(value: string, previous: string[]): string[] {
   if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
     return previous;
   }
-  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
-    return previous;
-  }
   // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
   // flag activates exactly the old exclusive posture — keep existing
   // automation that passes the removed ID working instead of erroring.
