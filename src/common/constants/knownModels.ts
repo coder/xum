@@ -2,6 +2,7 @@
  * Centralized model metadata. Update model versions here and everywhere else will follow.
  */
 
+import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
 type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
@@ -21,6 +22,16 @@ interface KnownModelDefinition {
   warm?: boolean;
   /** Optional tokenizer override for ai-tokenizer */
   tokenizerOverride?: string;
+  /**
+   * OpenAI `access_programs.cyber` value sent in Cyber mode. Set only for the
+   * exact request model ids OpenAI's Daybreak guide maps to a program
+   * (https://developers.openai.com/api/docs/guides/daybreak, retrieved
+   * 2026-09-30). The value follows the model, not the organization's approval
+   * level. GPT-6 Luna is not listed, and GPT-6 Sol is listed but no longer a
+   * Xum model. Daybreak aliases and gpt-5.6-cyber accept only one program,
+   * which the API already selects when the field is omitted.
+   */
+  cyberAccessProgram?: OpenAICyberAccessProgram;
 }
 
 interface KnownModel extends KnownModelDefinition {
@@ -111,6 +122,9 @@ const MODEL_DEFINITIONS = {
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
+    // OpenAI requires Daybreak Red approval for reduced refusals, yet the model
+    // rejects daybreak_red.
+    cyberAccessProgram: "daybreak_blue",
   },
   // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
   GPT_6_LUNA: {
@@ -127,6 +141,8 @@ const MODEL_DEFINITIONS = {
     aliases: ["astra", "gpt-6-astra"],
     // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
+    // Same Daybreak constraint as GPT (see its cyberAccessProgram).
+    cyberAccessProgram: "daybreak_blue",
   },
   DAYBREAK_BLUE: {
     provider: "openai",

@@ -10,7 +10,7 @@ import type { ORPCClient } from "../../src/node/acp/serverConnection";
 interface WorkspaceAiSettings {
   model: string;
   thinkingLevel: "off" | "low" | "medium" | "high" | "xhigh" | "max";
-  reasoningMode?: "standard" | "pro";
+  reasoningMode?: "standard" | "pro" | "cyber";
 }
 
 interface WorkspaceState {

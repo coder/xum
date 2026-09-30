@@ -195,6 +195,8 @@ export interface ResolveAgentAiSettingsInput {
    * resolver falls back to providersConfig-based capability gating.
    */
   proModeAvailable?: boolean;
+  /** Route-aware Cyber availability, like proModeAvailable. */
+  cyberModeAvailable?: boolean;
 }
 
 export interface ResolvedAgentAiSettings {

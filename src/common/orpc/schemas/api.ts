@@ -331,6 +331,8 @@ export const ProviderConfigInfoSchema = z.object({
   /** OpenAI/xAI Responses storage. Set false for ZDR orgs. */
   store: z.boolean().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** OpenAI-only: offer Cyber (Daybreak access program) on supported models. */
+  cyberModelEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
   /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */

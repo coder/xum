@@ -392,6 +392,7 @@ export class ProviderService {
         wireFormat?: string;
         store?: unknown;
         webSocketTransportEnabled?: unknown;
+        cyberModelEnabled?: unknown;
         cacheTtl?: unknown;
         speed?: unknown;
         disableBetaFeatures?: unknown;
@@ -502,6 +503,10 @@ export class ProviderService {
 
       if (provider === "openai" && typeof config.webSocketTransportEnabled === "boolean") {
         providerInfo.webSocketTransportEnabled = config.webSocketTransportEnabled;
+      }
+
+      if (provider === "openai" && typeof config.cyberModelEnabled === "boolean") {
+        providerInfo.cyberModelEnabled = config.cyberModelEnabled;
       }
 
       // Anthropic-specific fields
