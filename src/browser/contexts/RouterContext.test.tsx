@@ -209,6 +209,35 @@ describe("modal background location", () => {
     expect(view.getByTestId("analyticsOpen").textContent).toBe("false");
   });
 
+  test("opens dispatched before a re-render push a single analytics history entry", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    // Keydowns fired in one task all see the pre-open location before React re-renders.
+    act(() => {
+      const router = latestRouter!;
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+
+    act(() => {
+      void latestNavigate!(-1);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+
+    // Back to the same history entry must still be able to open analytics again.
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+  });
+
   test("keeps the project draft and its location.state behind analytics and restores them", async () => {
     installWindow("https://mux.example.com/workspace/test");
     const view = await renderRouter();

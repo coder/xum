@@ -421,6 +421,14 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
     void navigateRef.current("/");
   }, []);
 
+  // Key of the rendered location that already navigated to analytics; see navigateToAnalytics.
+  // Cleared on every location change so returning to that same history entry (back) can open
+  // analytics again.
+  const analyticsOpenedFromKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    analyticsOpenedFromKeyRef.current = null;
+  }, [location.key]);
+
   // These close over the rendered location (not a ref updated in an effect): settings redirect
   // effects run in children before this provider's effects, so a ref could still be stale.
   const navigateToSettings = useCallback(
@@ -458,6 +466,10 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
 
   const navigateToAnalytics = useCallback(() => {
     if (location.pathname === ANALYTICS_ROUTE) return;
+    // Opens dispatched before the next render (e.g. keydowns fired in one task) all see the old
+    // location, so without this each would push its own /analytics history entry.
+    if (analyticsOpenedFromKeyRef.current === location.key) return;
+    analyticsOpenedFromKeyRef.current = location.key;
     const resolved = resolveModalLocation({
       pathname: location.pathname,
       search: location.search,
@@ -474,7 +486,7 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
     void navigateRef.current(ANALYTICS_ROUTE, {
       state: { analyticsBackground: resolved.page satisfies ModalBackgroundLocation },
     });
-  }, [location.pathname, location.search, locationState]);
+  }, [location.key, location.pathname, location.search, locationState]);
 
   const navigateFromAnalytics = useCallback(() => {
     const resolved = resolveModalLocation({

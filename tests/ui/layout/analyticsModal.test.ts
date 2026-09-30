@@ -41,11 +41,24 @@ describe("Analytics modal", () => {
       expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
 
       // Escape in the open Sample Queries menu closes only that menu, not the whole modal.
-      fireEvent.click(within(dialog).getByRole("button", { name: /Sample Queries/ }));
+      const sampleQueriesButton = within(dialog).getByRole("button", { name: /Sample Queries/ });
+      fireEvent.click(sampleQueriesButton);
       const sampleItem = await body.findByRole("button", { name: "Top Models by Cost" });
       fireEvent.keyDown(sampleItem, { key: "Escape" });
       await waitFor(() => {
         expect(body.queryByRole("button", { name: "Top Models by Cost" })).toBeNull();
+      });
+      expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
+
+      // A click on the dimmed overlay while the (named) menu is open closes only the menu, like
+      // Settings stacked over analytics; it used to close both layers and drop unsaved SQL.
+      fireEvent.click(sampleQueriesButton);
+      const sampleMenu = await body.findByRole("dialog", { name: "Sample queries" });
+      const overlay = dialog.previousElementSibling;
+      expect(overlay).not.toBeNull();
+      fireEvent.pointerDown(overlay!);
+      await waitFor(() => {
+        expect(sampleMenu.isConnected).toBe(false);
       });
       expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
 

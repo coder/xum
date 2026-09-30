@@ -146,8 +146,10 @@ export function SqlExplorer(props: SqlExplorerProps) {
           <h2 className="text-sm font-semibold">SQL Explorer</h2>
         </div>
         {/* A Radix popover (not an inline div) is its own dismissable layer inside the Analytics
-            dialog, so Escape and outside clicks close only this menu, not the whole modal. */}
-        <Popover open={showSamples} onOpenChange={setShowSamples}>
+            dialog, so Escape and outside clicks close only this menu, not the whole modal. It is
+            modal so the dialog underneath ignores that outside click (as with Settings stacked
+            over Analytics); a non-modal popover lets one overlay click close both layers. */}
+        <Popover modal open={showSamples} onOpenChange={setShowSamples}>
           <PopoverTrigger asChild>
             <Button
               variant="ghost"
@@ -160,7 +162,7 @@ export function SqlExplorer(props: SqlExplorerProps) {
               />
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="end" className="w-64 p-1">
+          <PopoverContent align="end" aria-label="Sample queries" className="w-64 p-1">
             {SAMPLE_QUERIES.map((sample) => (
               <button
                 key={sample.label}

@@ -17,6 +17,17 @@ import {
   formatCompactNumber,
 } from "./analyticsUtils";
 
+// Long model IDs overflowed the 160px category axis and were clipped at the dialog edge. About 22
+// characters of the 11px axis font fit that width; the tooltip still shows the full model name.
+const MAX_MODEL_TICK_CHARS = 22;
+
+function formatModelTick(value: unknown): string {
+  const label = String(value);
+  return label.length > MAX_MODEL_TICK_CHARS
+    ? `${label.slice(0, MAX_MODEL_TICK_CHARS - 1)}\u2026`
+    : label;
+}
+
 interface TokensByModelChartProps {
   data: TokensByModelItem[] | null;
   loading: boolean;
@@ -131,6 +142,7 @@ export function TokensByModelChart(props: TokensByModelChartProps) {
                 type="category"
                 dataKey="model"
                 width={160}
+                tickFormatter={formatModelTick}
                 tick={CHART_AXIS_TICK}
                 stroke={CHART_AXIS_STROKE}
               />
