@@ -146,15 +146,16 @@ Palette. Cyber and Pro are mutually exclusive.
 
 Cyber appears only for models with a documented Daybreak value. GPT-6.1 Sol and GPT-6 Astra send
 `daybreak_blue`. OpenAI requires Daybreak Red approval for reduced refusals on these models, but
-they still take `daybreak_blue`. Cyber works only with a direct OpenAI API key on the `responses`
-wire format; gateways, Codex OAuth, and Chat Completions use standard safeguards.
+they still take `daybreak_blue`. Cyber works only with the built-in OpenAI provider's API key on
+the `responses` wire format. A custom base URL on the built-in provider also receives the field.
+Gateways, custom providers, Codex OAuth, and Chat Completions use standard safeguards.
 
 If OpenAI rejects the program, Xum shows OpenAI's message and does not retry:
 
 | Error code                   | Meaning                                                  |
 | ---------------------------- | -------------------------------------------------------- |
 | `invalid_access_program`     | The model needs a different program value.               |
-| `unsupported_access_program` | The model does not support Daybreak.                     |
+| `unsupported_access_program` | OpenAI does not offer Daybreak on this model to you.     |
 | `access_program_not_enabled` | The API key's project or organization lacks the program. |
 
 ### Custom providers

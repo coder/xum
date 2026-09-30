@@ -633,8 +633,10 @@ function isStreamTruncatedMessage(message: string): boolean {
 // message names the required program or approval level, so it is kept.
 const OPENAI_ACCESS_PROGRAM_ERROR_HINTS: Record<string, string> = {
   invalid_access_program: "This model needs a different OpenAI Daybreak access program.",
+  // OpenAI also returns this for Daybreak models whose reduced refusals need
+  // approval the project lacks, so do not claim the model has no Daybreak.
   unsupported_access_program:
-    "This model does not support OpenAI Daybreak. Turn off Cyber in the thinking menu.",
+    "OpenAI did not accept Cyber mode for this model. Turn off Cyber in the thinking menu to use standard safeguards.",
   access_program_not_enabled:
     "The OpenAI API key's project does not have this Daybreak program enabled. Ask your OpenAI organization admin, or turn off Cyber in the thinking menu to use standard safeguards.",
 };
@@ -5272,7 +5274,8 @@ export class StreamManager {
       providerId: streamInfo.initialMetadata?.routeProvider ?? "",
       error: actualError,
     });
-    if (openAIResponsesBaseUrlHint) {
+    // An access-program rejection proves the endpoint speaks Responses.
+    if (openAIResponsesBaseUrlHint && accessProgramError == null) {
       errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
     }
 

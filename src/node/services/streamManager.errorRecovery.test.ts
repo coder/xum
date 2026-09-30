@@ -11,6 +11,8 @@ import {
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
+import type { MuxMetadata } from "@/common/types/message";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -127,6 +129,7 @@ function createRecoveryHarness() {
     modelString?: string;
     messages?: ModelMessage[];
     providerOptions?: Record<string, unknown>;
+    initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
   }) {
@@ -147,6 +150,7 @@ function createRecoveryHarness() {
         ...(input.modelString != null ? { modelString: input.modelString } : {}),
         ...(input.messages != null ? { messages: input.messages } : {}),
         providerOptions: input.providerOptions,
+        ...(input.initialMetadata != null ? { initialMetadata: input.initialMetadata } : {}),
         providedRuntimeTempDir: "",
       })
     );
@@ -944,9 +948,12 @@ describe("StreamManager - stream error classification", () => {
   });
 
   describe("OpenAI Daybreak access program rejections", () => {
+    // Built-in OpenAI provider with a custom base URL, the route that gets the
+    // Responses base-URL hint on generic 400s.
     const accessProgramError = (code: string, statusCode: number, message: string) =>
       createApiCallErrorForTests({
         message: "Bad Request",
+        url: "https://proxy.example.com/v1/responses",
         statusCode,
         responseBody: JSON.stringify({ error: { code, message } }),
         isRetryable: false,
@@ -959,6 +966,7 @@ describe("StreamManager - stream error classification", () => {
       await harness.run({
         workspaceId: `access-program-${++runs}`,
         attempts: [failingAttempt(error)],
+        initialMetadata: { routeProvider: "openai" },
       });
       const [event] = harness.errors();
       return { type: event?.errorType, message: event?.error };
@@ -994,6 +1002,7 @@ describe("StreamManager - stream error classification", () => {
         const surfaced = await surfacedError(accessProgramError(code, statusCode, "Nope."));
         expect(surfaced.type).not.toBe("authentication");
         expect(surfaced.message).not.toContain("OpenAI: ");
+        if (statusCode === 400) expect(surfaced.message).toContain(OPENAI_RESPONSES_BASE_URL_HINT);
       }
     });
   });
